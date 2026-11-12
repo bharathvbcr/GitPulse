@@ -539,6 +539,44 @@ impl Resolver {
         None
     }
 
+    /// Rust: the file of the one trait `name` that `call_file` itself names, when
+    /// other declarations share the bare name.
+    ///
+    /// Exactly one trait of the name must exist in the corpus, and the calling
+    /// file must declare it or bind the name through an import (a glob included)
+    /// to the file that does. A namesake trait, or a calling file with no such
+    /// evidence, gives `None`: the dispatch candidates are keyed by the bare
+    /// trait name, so with two traits they could belong to either.
+    fn rust_trait_named_by(
+        &self,
+        family: LangFamily,
+        call_file: &str,
+        name: &str,
+    ) -> Option<String> {
+        if family != LangFamily::Rust {
+            return None;
+        }
+        let mut traits = self
+            .symbol_index
+            .get(name)?
+            .iter()
+            .filter(|(_, kind, candidate, _)| {
+                family.admits(*candidate) && matches!(kind, SymbolKind::Trait)
+            })
+            .map(|(path, ..)| path.as_str());
+        let trait_file = traits.next()?;
+        if traits.any(|path| path != trait_file) {
+            return None;
+        }
+        let named_here = trait_file == call_file
+            || self
+                .import_bindings
+                .get(call_file)
+                .and_then(|bindings| bindings.get(name))
+                .is_some_and(|(file, _)| file == trait_file);
+        named_here.then(|| trait_file.to_string())
+    }
+
     /// Swift: the protocol method `method` of `protocol`, and the in-repo
     /// conformers' declarations of it. Rust: the same for a trait and its
     /// `impl Trait for Type` implementors.
@@ -553,6 +591,7 @@ impl Resolver {
     pub(super) fn protocol_dispatch(
         &self,
         family: LangFamily,
+        call_file: &str,
         protocol: &str,
         method: &str,
     ) -> Option<ProtocolDispatch> {
@@ -562,13 +601,20 @@ impl Resolver {
                 .filter(|(_, _, candidate, _)| family.admits(*candidate));
             kinds.all(|(_, kind, _, _)| matches!(kind, SymbolKind::Interface | SymbolKind::Trait))
         });
-        if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
-            return None;
-        }
+        // A name another declaration shares - a struct called like the trait -
+        // is no reason to refuse a Rust trait the calling file itself names.
+        let named_trait_file = if is_protocol && self.type_name_is_identifiable(family, protocol) {
+            None
+        } else {
+            Some(self.rust_trait_named_by(family, call_file, protocol)?)
+        };
         let mut declared = self
             .type_methods
             .get(&(family, protocol.to_string(), method.to_string()))?
             .clone();
+        if let Some(trait_file) = &named_trait_file {
+            declared.retain(|(file, _)| file == trait_file);
+        }
         declared.sort();
         declared.dedup();
         let [direct] = declared.as_slice() else {

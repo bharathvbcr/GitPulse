@@ -99,7 +99,9 @@ pub struct PartialParseGap {
 pub struct CoverageGapSample {
     /// Every row of this kind in the generation.
     pub total: usize,
-    /// At most [`COVERAGE_GAP_SAMPLE`] of them, by path.
+    /// At most [`COVERAGE_GAP_SAMPLE`] of them, by path; `partial_parse` rows
+    /// are the exception, listed charged first and by bytes lost, so the cap
+    /// drops the harmless ones.
     pub shown: Vec<CoverageGapRow>,
 }
 

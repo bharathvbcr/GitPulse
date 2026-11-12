@@ -76,6 +76,10 @@ name = "module_private_widening"
 required-features = ["parse"]
 
 [[test]]
+name = "svelte_template_scope"
+required-features = ["parse"]
+
+[[test]]
 name = "member_use_liveness"
 required-features = ["parse"]
 

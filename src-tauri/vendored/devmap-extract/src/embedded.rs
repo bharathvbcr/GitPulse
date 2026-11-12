@@ -68,14 +68,15 @@
 //! JavaScript is a correct answer, not a failure to parse one.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use tree_sitter::Node;
 
-use crate::languages::LANGUAGE_SPECS;
+use crate::languages::{is_svelte_rune, LANGUAGE_SPECS};
 use crate::model::{
-    ExtractedCall, ExtractedReference, Extraction, ParseOutcome, ReferenceKind, Span, SymbolKind,
-    TextRange,
+    ExtractedCall, ExtractedReference, Extraction, LocalBinding, ParseOutcome, ReferenceKind, Span,
+    SymbolKind, TextRange,
 };
 
 /// Most embedded regions read from one file.
@@ -87,6 +88,21 @@ use crate::model::{
 /// as unparsed, so the file reports `Partial` rather than a clean answer over
 /// text nothing read.
 const MAX_EMBEDDED_REGIONS: usize = 256;
+
+/// Most template expressions parsed from one file.
+///
+/// A different bound from [`MAX_EMBEDDED_REGIONS`], because the two count
+/// different things: a file holds a handful of `<script>` elements and hundreds
+/// of `{...}` expressions. Sharing the script bound capped a real component at
+/// its last 256 expressions (GitPulse's `TaskBoard.svelte` holds about 600), so
+/// every expression at the top of the template, where the snippets sit, was
+/// recorded as unread and the functions only they called read as dead.
+///
+/// Each expression is a parse of a few bytes, and the extraction deadline still
+/// bounds the sum. Expressions past the bound are **not** silently dropped: they
+/// are charged as unparsed, in document order, so it is the tail of the
+/// template that is charged and the same tail on every build.
+const MAX_TEMPLATE_EXPRESSIONS: usize = 4096;
 
 thread_local! {
     /// Whether this thread is already inside an embedded extraction.
@@ -358,7 +374,9 @@ pub(crate) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
 
 /// Template expressions the outer grammar keeps as unparsed text.
 ///
-/// A lone identifier (`onclick={publishRelease}`) is a Call. Anything else
+/// A lone identifier (`onclick={publishRelease}`) is a `Name` reference in
+/// Svelte, a value read, and a Call in Vue. A literal keyword (`false`, `null`,
+/// `this`) is neither: it names nothing. Anything else
 /// that is still JavaScript — `onclick={() => copyText(name)}` — is parsed
 /// with the same embedded language the `<script>` block uses, so the inner
 /// call is visible to liveness. Svelte `{#if}` / `{@html}` blocks are not JS
@@ -367,6 +385,14 @@ pub(crate) fn child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node
 /// A `<script>` element's failure is folded before this walk. An expression
 /// failure has to be folded here: the outer grammar treats the attribute as
 /// text, so dropping the inner outcome would leave the file `Clean`.
+///
+/// **The walk carries a scope** ([`Scopes`]): the one owner of which names the
+/// template itself binds. `{#each rows as row}` binds `row`, and so do an
+/// index, a destructured name, a snippet parameter, a `{@const}`, an
+/// `{#await}` result and a `let:` directive, each for the block it opens. A use
+/// of such a name inside its block is the block's own value, so it makes no
+/// edge to a function or import of that name elsewhere. Snippets are scoped the
+/// same way: a `{@render r()}` reaches the `{#snippet r()}` of its own block.
 fn absorb_template_expressions(
     extraction: &mut Extraction,
     root: Node,
@@ -375,12 +401,29 @@ fn absorb_template_expressions(
     deadline: Instant,
 ) {
     let file_path = extraction.file_path.clone();
-    let mut stack: Vec<Node> = vec![root];
-    let mut parsed = 0usize;
-    let mut unparsed: Vec<TextRange> = Vec::new();
-    let mut diagnostics: Vec<String> = Vec::new();
-    let mut cap_noted = false;
-    while let Some(node) = stack.pop() {
+    let svelte = extraction.language == "svelte";
+    let mut walk = TemplateWalk {
+        source,
+        file_path: &file_path,
+        language,
+        deadline,
+        parsed: 0,
+        unparsed: Vec::new(),
+        diagnostics: Vec::new(),
+        cap_noted: false,
+        scopes: Scopes::new(),
+        declared: HashSet::new(),
+    };
+    let top_nodes = children_of(root);
+    let top = walk.enter_list(extraction, &top_nodes, 0, Vec::new());
+    // Reversed, so the pop order is document order: when the bound is
+    // reached it is the end of the template that is charged, not the top.
+    let mut stack: Vec<(Node, usize)> = top_nodes
+        .into_iter()
+        .rev()
+        .map(|node| (node, top))
+        .collect();
+    while let Some((node, at)) = stack.pop() {
         match node.kind() {
             "script_element" | "style_element" | "frontmatter" => continue,
             // Svelte `{...}` is `expression` / `svelte_raw_text`. Vue `{{ }}` is
@@ -389,89 +432,531 @@ fn absorb_template_expressions(
             // `directive_attribute`. A plain attribute is neither, so
             // `class="not js ("` is not parsed as JavaScript.
             "expression" | "raw_text_expr" | "svelte_raw_text" => {
-                take_template_expression(
-                    node,
-                    source,
+                take_template_expression(node, extraction, &mut walk, at);
+                continue;
+            }
+            // `{#snippet name(params)}…{/snippet}`: a function of the
+            // component, declared in the template and bound in the block that
+            // holds it (see `TemplateWalk::enter_list`). Its parameters are
+            // bound inside its body.
+            "snippet_statement" if svelte => {
+                if !walk.declared.contains(&node.id()) {
+                    if let Some((name, declared)) = declare_snippet(extraction, node, source) {
+                        walk.scopes.bind(at, name, Bound::Snippet(declared));
+                    }
+                }
+                // A snippet's parameter defaults are read by its parameter parse.
+                let names = match child_of_kind(node, "snippet_start")
+                    .and_then(|start| child_of_kind(start, "svelte_raw_text"))
+                {
+                    Some(list) => walk.bind_node(extraction, list, at, false),
+                    None => Vec::new(),
+                };
+                push_block(&mut walk, extraction, node, at, names, &mut stack, &[]);
+                continue;
+            }
+            // `{#each xs as pattern, index (key)}`: the collection is read
+            // outside the block, the key inside it, and the pattern and the
+            // index are bound for its body. An `{:else}` branch is outside it.
+            "each_statement" if svelte => {
+                if let Some(start) = child_of_kind(node, "each_start") {
+                    let parameter = start.child_by_field_name("parameter");
+                    let (list, key) = parameter
+                        .map(|node| split_each_parameter(node, source))
+                        .unwrap_or_default();
+                    let names = match parameter {
+                        Some(node) => {
+                            walk.bind_list(extraction, &list, node.start_byte(), at, true)
+                        }
+                        None => Vec::new(),
+                    };
+                    if let Some(collection) = start.child_by_field_name("identifier") {
+                        take_template_expression(collection, extraction, &mut walk, at);
+                    }
+                    let inside = push_block(
+                        &mut walk,
+                        extraction,
+                        node,
+                        at,
+                        names,
+                        &mut stack,
+                        &["each_start"],
+                    );
+                    if let Some(key) = key {
+                        // The key is read in the block's own scope.
+                        let span = Span {
+                            start_byte: key.offset,
+                            end_byte: key.offset + key.body.len(),
+                        };
+                        take_expression(key, span, extraction, &mut walk, inside);
+                    }
+                    continue;
+                }
+            }
+            // `{#await promise}`, `{#await promise then value}` and
+            // `{#await promise catch error}`: the shorthand binds its name for
+            // the block's own content, which is its `then` or `catch` branch.
+            "await_statement" if svelte => {
+                if let Some(start) = child_of_kind(node, "await_start") {
+                    let (expression, pattern) = child_of_kind(start, "svelte_raw_text")
+                        .map(|raw| split_await_header(raw, source))
+                        .unwrap_or_default();
+                    if let Some((expression, span)) = expression {
+                        take_expression(expression, span, extraction, &mut walk, at);
+                    }
+                    let names = match pattern {
+                        Some((list, span)) => {
+                            walk.bind_list(extraction, &list, span.start_byte, at, true)
+                        }
+                        None => Vec::new(),
+                    };
+                    push_block(
+                        &mut walk,
+                        extraction,
+                        node,
+                        at,
+                        names,
+                        &mut stack,
+                        &["await_start"],
+                    );
+                    continue;
+                }
+            }
+            // `{:then value}` and `{:catch error}` bind for their branch.
+            "then_block" | "catch_block" if svelte => {
+                let header = if node.kind() == "then_block" {
+                    "then_start"
+                } else {
+                    "catch_start"
+                };
+                let names = match child_of_kind(node, header)
+                    .and_then(|start| child_of_kind(start, "svelte_raw_text"))
+                {
+                    Some(list) => walk.bind_node(extraction, list, at, true),
+                    None => Vec::new(),
+                };
+                push_block(
+                    &mut walk,
                     extraction,
-                    &file_path,
-                    language,
-                    deadline,
-                    &mut parsed,
-                    &mut unparsed,
-                    &mut diagnostics,
-                    &mut cap_noted,
+                    node,
+                    at,
+                    names,
+                    &mut stack,
+                    &[header],
                 );
                 continue;
             }
+            // `{@const name = expression}` binds for the rest of the block that
+            // holds it. The expression is read before the name is bound.
+            "const_tag" if svelte => {
+                if let Some(raw) = child_of_kind(node, "svelte_raw_text") {
+                    let (list, expression) = split_const_tag(raw, source);
+                    if let Some((expression, span)) = expression {
+                        take_expression(expression, span, extraction, &mut walk, at);
+                    }
+                    for name in walk.bind_list(extraction, &list, raw.start_byte(), at, true) {
+                        walk.scopes.bind(at, name, Bound::Local);
+                    }
+                    continue;
+                }
+            }
+            // A block's branches, and an element: `let:` directives bind for
+            // the element's children.
+            "if_statement" | "key_statement" | "else_if_block" | "else_block" if svelte => {
+                push_block(&mut walk, extraction, node, at, Vec::new(), &mut stack, &[]);
+                continue;
+            }
+            "element" if svelte => {
+                let names = match child_of_kind(node, "start_tag") {
+                    Some(tag) => let_names(tag, extraction, &mut walk, at),
+                    None => Vec::new(),
+                };
+                push_block(&mut walk, extraction, node, at, names, &mut stack, &[]);
+                continue;
+            }
+            // `use:action`, `transition:fade`, `in:`, `out:`, `animate:`: the
+            // directive names a function the runtime calls. It is a use of the
+            // name, however the file imported or declared it. `let:` binds a
+            // name for the children (above) and is not a use of anything.
+            "attribute" if svelte => {
+                if is_let_directive(node, source) {
+                    continue;
+                }
+                if let Some(reference) = directive_reference(node, source, &file_path) {
+                    extraction.references.push(reference);
+                }
+            }
+            // The parameter list is TypeScript parameters, not an expression.
+            "snippet_start" => {
+                if let Some(args) = child_of_kind(node, "svelte_raw_text") {
+                    take_snippet_parameters(args, extraction, &mut walk, at);
+                }
+                continue;
+            }
             "interpolation" => {
-                let mut cursor = node.walk();
-                if let Some(text) = node
-                    .children(&mut cursor)
-                    .find(|child| child.kind() == "raw_text")
-                {
-                    take_template_expression(
-                        text,
-                        source,
-                        extraction,
-                        &file_path,
-                        language,
-                        deadline,
-                        &mut parsed,
-                        &mut unparsed,
-                        &mut diagnostics,
-                        &mut cap_noted,
-                    );
+                if let Some(text) = child_of_kind(node, "raw_text") {
+                    take_template_expression(text, extraction, &mut walk, at);
                 }
                 continue;
             }
             "directive_attribute" => {
                 if let Some(value) = vue_directive_value(node) {
-                    take_template_expression(
-                        value,
-                        source,
-                        extraction,
-                        &file_path,
-                        language,
-                        deadline,
-                        &mut parsed,
-                        &mut unparsed,
-                        &mut diagnostics,
-                        &mut cap_noted,
-                    );
+                    take_template_expression(value, extraction, &mut walk, at);
                 }
                 continue;
             }
             _ => {}
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
+        stack.extend(children_of(node).into_iter().rev().map(|child| (child, at)));
     }
-    extraction.diagnostics.extend(diagnostics);
-    fold_unparsed_ranges(&mut extraction.parse_outcome, unparsed);
+    extraction.diagnostics.extend(walk.diagnostics);
+    fold_unparsed_ranges(&mut extraction.parse_outcome, walk.unparsed);
 }
 
-/// One template expression: a lone identifier is a Call, and anything else is
+/// What a template binds a name to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bound {
+    /// A value the block opened: an `{#each}` item, a `{@const}`, a `let:`.
+    Local,
+    /// A `{#snippet}` of the block, under the name the file declares it by
+    /// (`name`, or `name#2` for the second snippet of one name).
+    Snippet(String),
+}
+
+struct Frame {
+    parent: Option<usize>,
+    names: Vec<(String, Bound)>,
+}
+
+/// The lexical scopes of one template: a frame per block that binds anything,
+/// each pointing at the one around it. Frame `0` is the template itself.
+struct Scopes {
+    frames: Vec<Frame>,
+}
+
+impl Scopes {
+    fn new() -> Self {
+        Self {
+            frames: vec![Frame {
+                parent: None,
+                names: Vec::new(),
+            }],
+        }
+    }
+
+    fn open(&mut self, parent: usize) -> usize {
+        self.frames.push(Frame {
+            parent: Some(parent),
+            names: Vec::new(),
+        });
+        self.frames.len() - 1
+    }
+
+    fn bind(&mut self, frame: usize, name: String, bound: Bound) {
+        self.frames[frame].names.push((name, bound));
+    }
+
+    /// What `name` is where `frame` is read: the innermost binding wins, and in
+    /// one frame the last.
+    fn lookup(&self, mut frame: usize, name: &str) -> Option<&Bound> {
+        loop {
+            let here = &self.frames[frame];
+            if let Some((_, bound)) = here.names.iter().rev().find(|(bound, _)| bound == name) {
+                return Some(bound);
+            }
+            frame = here.parent?;
+        }
+    }
+
+    /// Whether any block of this template binds a name.
+    fn is_empty(&self) -> bool {
+        self.frames.len() == 1 && self.frames[0].names.is_empty()
+    }
+}
+
+/// What one walk over a file's template expressions shares: the text, the
+/// budget, the scopes, and the running record of what was read and what was not.
+struct TemplateWalk<'a> {
+    source: &'a str,
+    file_path: &'a str,
+    language: &'a str,
+    deadline: Instant,
+    parsed: usize,
+    unparsed: Vec<TextRange>,
+    diagnostics: Vec<String>,
+    cap_noted: bool,
+    scopes: Scopes,
+    /// The snippet statements already declared when their block was entered.
+    declared: HashSet<usize>,
+}
+
+impl TemplateWalk<'_> {
+    /// The scope of a list of sibling nodes: `names` bound for all of them, and
+    /// the snippets and `{@const}`s they hold bound in it. A list that binds
+    /// nothing is read in the scope around it.
+    ///
+    /// Snippets are declared here, when the block is entered, not when the walk
+    /// reaches them: `{@render row()}` may come before `{#snippet row()}`, and
+    /// two snippets of one name in different blocks are two declarations, each
+    /// the one its own block's render reaches.
+    fn enter_list(
+        &mut self,
+        extraction: &mut Extraction,
+        nodes: &[Node],
+        parent: usize,
+        names: Vec<String>,
+    ) -> usize {
+        let svelte = extraction.language == "svelte";
+        let binds = svelte
+            && nodes
+                .iter()
+                .any(|node| matches!(node.kind(), "snippet_statement" | "const_tag"));
+        if names.is_empty() && !binds {
+            return parent;
+        }
+        let frame = self.scopes.open(parent);
+        for name in names {
+            self.scopes.bind(frame, name, Bound::Local);
+        }
+        if svelte {
+            for node in nodes
+                .iter()
+                .filter(|node| node.kind() == "snippet_statement")
+            {
+                if let Some((name, declared)) = declare_snippet(extraction, *node, self.source) {
+                    self.declared.insert(node.id());
+                    self.scopes.bind(frame, name, Bound::Snippet(declared));
+                }
+            }
+        }
+        frame
+    }
+
+    /// The names a binding list (`item`, `{ a, b }, index`, `a: T, b?: U`)
+    /// binds, as the node spells it. A list that could not be read before the
+    /// deadline binds nothing and is charged as unread.
+    fn bind_node(
+        &mut self,
+        extraction: &mut Extraction,
+        node: Node,
+        at: usize,
+        defaults: bool,
+    ) -> Vec<String> {
+        let list = text_of(node, self.source);
+        self.bind_list(extraction, &list, node.start_byte(), at, defaults)
+    }
+
+    /// The names `list` binds, which starts at byte `offset` of the file. The
+    /// default values of its patterns (`{ a = f() }`) are expressions the
+    /// template runs, and with `defaults` they are read here in scope `at`:
+    /// the scope outside the binding, which a default does not see the names
+    /// of its own pattern in.
+    fn bind_list(
+        &mut self,
+        extraction: &mut Extraction,
+        list: &str,
+        offset: usize,
+        at: usize,
+        defaults: bool,
+    ) -> Vec<String> {
+        let Some(bindings) = binding_names(list, self.deadline) else {
+            self.diagnostics.push(format!(
+                "extraction budget was exhausted before the names bound at bytes {}..{} \
+                 were read",
+                offset,
+                offset + list.len()
+            ));
+            self.unparsed.push(TextRange {
+                start_byte: offset,
+                end_byte: offset + list.len(),
+            });
+            return Vec::new();
+        };
+        if defaults {
+            for (start, end) in bindings.defaults {
+                if let Some((expr, span)) = list
+                    .get(start..end)
+                    .and_then(|text| trimmed_expression(text, offset + start))
+                {
+                    take_expression(expr, span, extraction, self, at);
+                }
+            }
+        }
+        bindings.names
+    }
+}
+
+/// The children of `node`, in order.
+fn children_of<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).collect()
+}
+
+/// A node that opens or closes a block, or a tag, and is read in the scope
+/// around it.
+fn is_block_edge(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_start"
+            | "if_end"
+            | "else_if_start"
+            | "else_start"
+            | "each_start"
+            | "each_end"
+            | "await_start"
+            | "await_end"
+            | "then_start"
+            | "catch_start"
+            | "key_start"
+            | "key_end"
+            | "snippet_start"
+            | "snippet_end"
+            | "start_tag"
+            | "end_tag"
+            | "self_closing_tag"
+    )
+}
+
+/// A branch of a block: its own scope, around which the block's names do not
+/// reach.
+fn is_branch(kind: &str) -> bool {
+    matches!(
+        kind,
+        "else_if_block" | "else_block" | "then_block" | "catch_block"
+    )
+}
+
+/// Push the children of a block in the scopes they are read in: the content
+/// in the block's own scope (`names` bound), a branch and what follows it in
+/// the scope around the block, and the block's edges where they stand. `skip`
+/// names children the caller has read itself. Returns the block's own scope.
+fn push_block<'t>(
+    walk: &mut TemplateWalk,
+    extraction: &mut Extraction,
+    node: Node<'t>,
+    at: usize,
+    names: Vec<String>,
+    stack: &mut Vec<(Node<'t>, usize)>,
+    skip: &[&str],
+) -> usize {
+    let children = children_of(node);
+    let (mut content, mut after) = (Vec::new(), Vec::new());
+    let mut branched = false;
+    for child in &children {
+        let kind = child.kind();
+        if skip.contains(&kind) || is_block_edge(kind) {
+            continue;
+        }
+        if is_branch(kind) {
+            branched = true;
+            continue;
+        }
+        if branched {
+            after.push(*child);
+        } else {
+            content.push(*child);
+        }
+    }
+    let inside = walk.enter_list(extraction, &content, at, names);
+    let beyond = walk.enter_list(extraction, &after, at, Vec::new());
+    let mut items = Vec::with_capacity(children.len());
+    let mut branched = false;
+    for child in children {
+        let kind = child.kind();
+        if skip.contains(&kind) {
+            continue;
+        }
+        if is_block_edge(kind) {
+            items.push((child, at));
+        } else if is_branch(kind) {
+            branched = true;
+            items.push((child, at));
+        } else {
+            items.push((child, if branched { beyond } else { inside }));
+        }
+    }
+    stack.extend(items.into_iter().rev());
+    inside
+}
+
+/// One template expression: a lone identifier is a `Name` reference in Svelte
+/// and a Call in Vue, a literal keyword records nothing, and anything else is
 /// parsed or recorded. `node` is the expression text, not the surrounding
 /// braces or quotes.
 fn take_template_expression(
     node: Node,
-    source: &str,
     extraction: &mut Extraction,
-    file_path: &str,
-    language: &str,
-    deadline: Instant,
-    parsed: &mut usize,
-    unparsed: &mut Vec<TextRange>,
-    diagnostics: &mut Vec<String>,
-    cap_noted: &mut bool,
+    walk: &mut TemplateWalk,
+    at: usize,
 ) {
-    let Some(expr) = js_expression_body(node, source) else {
-        return;
-    };
+    if let Some(expr) = js_expression_body(node, walk.source) {
+        take_expression(expr, span_of(node), extraction, walk, at);
+    }
+}
+
+/// One expression, read in scope `at`. `span` is the range charged as unread
+/// if the expression cannot be parsed.
+fn take_expression(
+    expr: JsExpr,
+    span: Span,
+    extraction: &mut Extraction,
+    walk: &mut TemplateWalk,
+    at: usize,
+) {
+    let file_path = walk.file_path;
+    let svelte = extraction.language == "svelte";
     if let Some(name) = lone_js_identifier(&expr.body) {
-        let span = span_of(node);
+        if svelte {
+            match walk.scopes.lookup(at, &name) {
+                // The block's own value: nothing outside it is named.
+                Some(Bound::Local) => return,
+                // `{row}` or `prop={row}` naming a snippet hands it over; it is
+                // not called here. It is a reference to the snippet.
+                Some(Bound::Snippet(declared)) => {
+                    extraction.references.push(ExtractedReference {
+                        name: declared.clone(),
+                        kind: ReferenceKind::Name,
+                        span,
+                        enclosing_symbol: Some(file_path.to_string()),
+                        assigned_to: None,
+                        receiver_expr: None,
+                    });
+                    return;
+                }
+                None => {}
+            }
+            // `{$store}`: the name is a store auto-subscription, a read of
+            // `store`. It is not a call, and no function is named `$store`.
+            if let Some(store) = store_name(&name) {
+                if store_can_be_a_target(extraction, store) {
+                    extraction.references.push(ExtractedReference {
+                        name: store.to_string(),
+                        kind: ReferenceKind::Name,
+                        span,
+                        enclosing_symbol: Some(file_path.to_string()),
+                        assigned_to: None,
+                        receiver_expr: None,
+                    });
+                }
+                return;
+            }
+            // A lone identifier in Svelte markup (`{size}`, `value={size}`,
+            // `onclick={save}`, `on:click={save}`) is a value read, never a
+            // call: nothing in the template invokes it. The TypeScript and
+            // TSX extractor records an identifier in value position (an
+            // argument, a JSX attribute value, a JSX text expression) as a
+            // `Name` reference and a call only at a callee position
+            // (`treesitter/references.rs`), and Svelte follows the same rule.
+            extraction.references.push(ExtractedReference {
+                name,
+                kind: ReferenceKind::Name,
+                span,
+                enclosing_symbol: Some(file_path.to_string()),
+                assigned_to: None,
+                receiver_expr: None,
+            });
+            return;
+        }
         extraction.calls.push(ExtractedCall {
             caller_symbol: Some(file_path.to_string()),
             callee_name: name.clone(),
@@ -488,49 +973,287 @@ fn take_template_expression(
         });
         return;
     }
-    let span = span_of(node);
-    let node_range = TextRange {
-        start_byte: span.start_byte,
-        end_byte: span.end_byte,
+    // `{` here is an object literal (`:class="{ active: isActive }"`). The
+    // statement grammar reads a leading `{` as a block, and a quoted key
+    // then fails, so the file would be Partial over JavaScript it accepts.
+    let wrap = if expr.body.starts_with('{') {
+        Wrap::ObjectLiteral
+    } else {
+        Wrap::Bare
     };
-    if *parsed >= MAX_EMBEDDED_REGIONS {
-        if !*cap_noted {
-            diagnostics.push(format!(
-                "template expressions past {MAX_EMBEDDED_REGIONS} were not parsed"
-            ));
-            *cap_noted = true;
+    parse_template_text(span, &expr, wrap, extraction, walk, at);
+}
+
+/// The parameters of a `{#snippet}`, parsed as an arrow function's parameters.
+fn take_snippet_parameters(
+    node: Node,
+    extraction: &mut Extraction,
+    walk: &mut TemplateWalk,
+    at: usize,
+) {
+    let raw = text_of(node, walk.source);
+    let body = raw.trim();
+    if body.is_empty() {
+        return;
+    }
+    let offset = node.start_byte() + (raw.len() - raw.trim_start().len());
+    let expr = JsExpr {
+        offset,
+        body: body.to_string(),
+    };
+    parse_template_text(
+        span_of(node),
+        &expr,
+        Wrap::SnippetParameters,
+        extraction,
+        walk,
+        at,
+    );
+}
+
+/// Declare `{#snippet name(…)}` as a function symbol of the file, so that
+/// `{@render name()}` has something to call. Returns the name written and the
+/// name declared.
+///
+/// A snippet given to a component as a child of its tag is a prop the
+/// component renders, and nothing in this file names it: it is recorded as
+/// reached by the runtime, like a framework callback. A second snippet of a
+/// name the file already declares is a different function with the same name
+/// (a sibling in another branch, or a nested block): it is declared as
+/// `name#2`, `name#3`, in the order their blocks are entered, under that name
+/// in the graph too, so the resolver tells them apart and a render reaches the
+/// one in its own block.
+fn declare_snippet(
+    extraction: &mut Extraction,
+    node: Node,
+    source: &str,
+) -> Option<(String, String)> {
+    let start = child_of_kind(node, "snippet_start")?;
+    let name_node = child_of_kind(start, "snippet_name")?;
+    let written = text_slice(name_node, source).to_string();
+    let mut declared = written.clone();
+    let mut qualified = format!("{}::{declared}", extraction.file_path);
+    let mut ordinal = 1usize;
+    while extraction
+        .symbols
+        .iter()
+        .any(|symbol| symbol.qualified_name == qualified)
+    {
+        ordinal += 1;
+        declared = format!("{written}#{ordinal}");
+        qualified = format!("{}::{declared}", extraction.file_path);
+    }
+    let signature: String = text_slice(start, source).chars().take(200).collect();
+    extraction.symbols.push(crate::model::ExtractedSymbol {
+        name: declared.clone(),
+        qualified_name: qualified.clone(),
+        kind: SymbolKind::Function,
+        span: span_of(node),
+        is_exported: false,
+        docstring: None,
+        signature: Some(signature),
+        parent_symbol: None,
+        body_signature: None,
+        declaration_hash: None,
+        return_type: None,
+    });
+    if let Some(component) = component_parent(node, source) {
+        extraction.wiring.push(crate::model::WiringAnnotation {
+            kind: crate::model::WiringKind::RuntimeEntryPoint,
+            target_symbol: qualified,
+            details: format!(
+                "snippet passed to <{component}> as a child, rendered by the component"
+            ),
+        });
+    }
+    Some((written, declared))
+}
+
+/// Whether `node` is a `let:` directive of an element.
+fn is_let_directive(node: Node, source: &str) -> bool {
+    child_of_kind(node, "attribute_name")
+        .is_some_and(|name| text_slice(name, source).starts_with("let:"))
+}
+
+/// The names the `let:` directives of an element's start tag bind for its
+/// children: `let:item` binds `item`, `let:thing={renamed}` binds `renamed`,
+/// and `let:thing={{ a, b }}` binds `a` and `b`.
+fn let_names(
+    tag: Node,
+    extraction: &mut Extraction,
+    walk: &mut TemplateWalk,
+    at: usize,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for attribute in children_of(tag)
+        .into_iter()
+        .filter(|child| child.kind() == "attribute")
+    {
+        let Some(name) = child_of_kind(attribute, "attribute_name") else {
+            continue;
+        };
+        let Some(directive) = text_slice(name, walk.source).strip_prefix("let:") else {
+            continue;
+        };
+        let value = child_of_kind(attribute, "expression")
+            .and_then(|expression| child_of_kind(expression, "svelte_raw_text"));
+        match value {
+            Some(value) if !text_slice(value, walk.source).trim().is_empty() => {
+                names.extend(walk.bind_node(extraction, value, at, true));
+            }
+            _ => {
+                let bound = directive.split('|').next().unwrap_or(directive);
+                if is_identifier(bound) {
+                    names.push(bound.to_string());
+                }
+            }
         }
-        unparsed.push(node_range);
+    }
+    names
+}
+
+/// The reference a Svelte directive makes to its function: `use:focus` names
+/// `focus`, `transition:fade|local` names `fade`, and `use:actions.focus`
+/// names `actions`. Any other attribute, and `class:` / `bind:` / `on:` /
+/// `let:`, which name no function, are `None`.
+fn directive_reference(node: Node, source: &str, file_path: &str) -> Option<ExtractedReference> {
+    let name_node = child_of_kind(node, "attribute_name")?;
+    let text = text_slice(name_node, source);
+    let (kind, rest) = text.split_once(':')?;
+    if !matches!(kind, "use" | "transition" | "in" | "out" | "animate") {
+        return None;
+    }
+    let function = rest.split('|').next()?.split('.').next()?;
+    lone_js_identifier(function).filter(|name| name == function)?;
+    let start = name_node.start_byte() + kind.len() + 1;
+    Some(ExtractedReference {
+        name: function.to_string(),
+        kind: ReferenceKind::Name,
+        span: Span {
+            start_byte: start,
+            end_byte: start + function.len(),
+        },
+        enclosing_symbol: Some(file_path.to_string()),
+        assigned_to: None,
+        receiver_expr: None,
+    })
+}
+
+/// The tag name of the component whose tag directly holds `node`, when it is
+/// a component (`<Comp>`, `<ns.Comp>`, `<svelte:boundary>`) rather than an
+/// HTML element.
+fn component_parent(node: Node, source: &str) -> Option<String> {
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        if parent.kind() == "element" {
+            let tag = child_of_kind(parent, "start_tag")?;
+            let name = text_slice(child_of_kind(tag, "tag_name")?, source);
+            // `<svelte:boundary>` takes its `pending` and `failed` snippets
+            // the way a component takes its props.
+            let component = name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_uppercase())
+                || name.contains('.')
+                || name == "svelte:boundary";
+            return component.then(|| name.to_string());
+        }
+        at = parent.parent();
+    }
+    None
+}
+
+/// How the text of a template expression is made a program on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    /// The text is parsed as it stands.
+    Bare,
+    /// The text is an object literal, which the statement grammar would read
+    /// as a block: it is parenthesised.
+    ObjectLiteral,
+    /// The text is the parameter list of a `{#snippet name(...)}`: it is
+    /// written as the parameters of an arrow function. Parsed as an expression
+    /// it is a labelled statement (`status: TaskStatus`) or a syntax error
+    /// (`info?: Item`), and the file would be `Partial` over text that is
+    /// ordinary TypeScript.
+    SnippetParameters,
+}
+
+impl Wrap {
+    /// The program the grammar reads. Its first byte is the one the spans are
+    /// rebased by, so every wrapper opens with exactly one byte of its own.
+    fn program(self, body: &str) -> Option<String> {
+        match self {
+            Wrap::Bare => None,
+            Wrap::ObjectLiteral => Some(format!("({body})")),
+            Wrap::SnippetParameters => Some(format!("({body}) => {{}}")),
+        }
+    }
+}
+
+/// Parse (or record as unread) the text of one template expression, read in
+/// scope `at`. `node_span` is the expression's range in the outer file and
+/// `expr` its text within it.
+fn parse_template_text(
+    node_span: Span,
+    expr: &JsExpr,
+    wrap: Wrap,
+    extraction: &mut Extraction,
+    walk: &mut TemplateWalk,
+    at: usize,
+) {
+    let (source, file_path, language, deadline) =
+        (walk.source, walk.file_path, walk.language, walk.deadline);
+    let node_range = TextRange {
+        start_byte: node_span.start_byte,
+        end_byte: node_span.end_byte,
+    };
+    if walk.parsed >= MAX_TEMPLATE_EXPRESSIONS {
+        if !walk.cap_noted {
+            walk.diagnostics.push(format!(
+                "template expressions past {MAX_TEMPLATE_EXPRESSIONS} were not parsed"
+            ));
+            walk.cap_noted = true;
+        }
+        walk.unparsed.push(node_range);
         return;
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        diagnostics.push(format!(
+        walk.diagnostics.push(format!(
             "extraction budget was exhausted before the template expression \
              at bytes {}..{}; the expression was not parsed",
             node_range.start_byte, node_range.end_byte
         ));
-        unparsed.push(node_range);
+        walk.unparsed.push(node_range);
         return;
     }
-    // `{` here is an object literal (`:class="{ active: isActive }"`). The
-    // statement grammar reads a leading `{` as a block, and a quoted key
-    // then fails, so the file would be Partial over JavaScript it accepts.
-    // The parentheses are not in the file. Spans are rebased by that byte.
+    // The wrapper's bytes are not in the file. Spans are rebased by its one
+    // opening byte.
     let outer_source = source;
-    let parenthesized = expr.body.starts_with('{');
-    let owned;
-    let source: &str = if parenthesized {
-        owned = format!("({})", expr.body);
-        owned.as_str()
-    } else {
-        owned = String::new();
-        expr.body.as_str()
-    };
+    let wrapped = wrap.program(&expr.body);
+    let program: &str = wrapped.as_deref().unwrap_or(expr.body.as_str());
+    // Store reads: past the bound and the deadline above they are not read,
+    // and the expression is charged as unread; here they are, under the same
+    // deadline as the parse.
+    if wrap != Wrap::SnippetParameters && extraction.language == "svelte" {
+        let lead = usize::from(wrap != Wrap::Bare);
+        if push_store_reads(extraction, program, expr.offset, lead, deadline).is_err() {
+            walk.diagnostics.push(format!(
+                "extraction budget was exhausted before the store reads of the template \
+                 expression at bytes {}..{}; they were not read",
+                node_range.start_byte, node_range.end_byte
+            ));
+            walk.unparsed.push(node_range.clone());
+        }
+    }
     let mut inner =
-        crate::treesitter::extract_treesitter_with_budget(file_path, language, source, remaining);
-    if parenthesized {
+        crate::treesitter::extract_treesitter_with_budget(file_path, language, program, remaining);
+    if wrap != Wrap::Bare {
         rebase_parenthesized_expression(&mut inner, expr.body.len());
+    }
+    if extraction.language == "svelte" {
+        apply_template_scope(&mut inner, &walk.scopes, at);
     }
     if record_template_parse(
         extraction,
@@ -538,12 +1261,85 @@ fn take_template_expression(
         expr.offset,
         expr.body.len(),
         node_range,
-        unparsed,
-        diagnostics,
+        &mut walk.unparsed,
+        &mut walk.diagnostics,
         outer_source,
     ) {
-        *parsed += 1;
+        walk.parsed += 1;
     }
+}
+
+/// Mark the uses in one parsed expression of names the template binds, in
+/// scope `at`.
+///
+/// A name a block binds is that block's own value, so a call of it, a read of
+/// it, and a member used through it are not uses of any function, import or
+/// variable of that name elsewhere. They are marked with the same
+/// [`LocalBinding`] a script parameter gets, which the resolver already reads
+/// as "a local, not the namesake": no edge, and a call is recorded as one the
+/// resolver could not follow rather than bound to the wrong function. A name
+/// that is a snippet of the block is renamed to the name the file declares it
+/// by, so a render reaches the snippet of its own block.
+fn apply_template_scope(inner: &mut Extraction, scopes: &Scopes, at: usize) {
+    if scopes.is_empty() {
+        return;
+    }
+    let mut local: Vec<(usize, String)> = Vec::new();
+    for call in &mut inner.calls {
+        match call.receiver_expr.as_deref() {
+            None => match scopes.lookup(at, &call.callee_name) {
+                Some(Bound::Local) => local.push((call.span.start_byte, call.callee_name.clone())),
+                Some(Bound::Snippet(declared)) => call.callee_name.clone_from(declared),
+                None => {}
+            },
+            Some(receiver) => {
+                let root = root_identifier(receiver);
+                if matches!(scopes.lookup(at, root), Some(Bound::Local)) {
+                    local.push((call.span.start_byte, root.to_string()));
+                }
+            }
+        }
+    }
+    for reference in &mut inner.references {
+        if !matches!(
+            reference.kind,
+            ReferenceKind::Name | ReferenceKind::Call | ReferenceKind::Constructor
+        ) {
+            continue;
+        }
+        match reference.receiver_expr.as_deref() {
+            None => match scopes.lookup(at, &reference.name) {
+                Some(Bound::Local) => {
+                    local.push((reference.span.start_byte, reference.name.clone()))
+                }
+                Some(Bound::Snippet(declared)) => reference.name.clone_from(declared),
+                None => {}
+            },
+            Some(receiver) => {
+                let root = root_identifier(receiver);
+                if matches!(scopes.lookup(at, root), Some(Bound::Local)) {
+                    local.push((reference.span.start_byte, root.to_string()));
+                }
+            }
+        }
+    }
+    inner
+        .local_bindings
+        .extend(local.into_iter().map(|(start_byte, name)| LocalBinding {
+            start_byte,
+            name,
+            scope: None,
+            declared_type: None,
+            initializer: None,
+        }));
+}
+
+/// The identifier an expression starts with: `item` for `item.sub[0]`.
+fn root_identifier(expr: &str) -> &str {
+    let end = expr
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(expr.len());
+    &expr[..end]
 }
 
 /// Drop the one parenthesis added around an object literal.
@@ -630,7 +1426,7 @@ fn vue_directive_value(node: Node) -> Option<Node> {
 /// Fold one template expression's inner outcome onto the outer extraction.
 ///
 /// Returns whether the expression spent a nested parse that produced symbols
-/// worth counting toward [`MAX_EMBEDDED_REGIONS`]. A failure or a skip did not
+/// worth counting toward [`MAX_TEMPLATE_EXPRESSIONS`]. A failure or a skip did not
 /// absorb anything, so a later expression that does parse is still counted.
 fn record_template_parse(
     extraction: &mut Extraction,
@@ -754,6 +1550,15 @@ fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
     })
 }
 
+/// The identifier a template expression consists of, if it is exactly one.
+///
+/// Literal keywords are not identifiers: the TypeScript and TSX grammar gives
+/// `true`, `false`, `null`, `undefined`, `this` and `super` node kinds of their
+/// own, so the TSX extractor records nothing for them in value position
+/// (`treesitter/references.rs` matches only `identifier`), while `NaN`,
+/// `Infinity`, `arguments` and `globalThis` are plain identifiers and are
+/// recorded. This returns `None` for exactly those six, so both the Svelte and
+/// the Vue path hand them to the expression parser, which records nothing.
 fn lone_js_identifier(text: &str) -> Option<String> {
     let trimmed = text
         .trim()
@@ -771,7 +1576,434 @@ fn lone_js_identifier(text: &str) -> Option<String> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
         return None;
     }
+    if matches!(
+        trimmed,
+        "true" | "false" | "null" | "undefined" | "this" | "super"
+    ) {
+        return None;
+    }
     Some(trimmed.to_string())
+}
+
+/// `store` for a Svelte store auto-subscription `$store`, and `None` for a
+/// rune (`$state`), a compiler variable (`$$props`) and anything else.
+fn store_name(name: &str) -> Option<&str> {
+    let store = name.strip_prefix('$')?;
+    let mut chars = store.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    (!is_svelte_rune(store)).then_some(store)
+}
+
+/// Whether `text` holds a `$name` that is not a rune: the only way a store
+/// read can start. A cheap test that spares the parse below for the
+/// expressions and scripts that cannot hold one. A Svelte 5 script is full of
+/// runes (`$state`, `$derived.by`, `$props`), so a bare `$` test would send
+/// nearly every one of them to a second parse for nothing.
+///
+/// A superset of what [`store_reads`] finds, never a subset: a `$name` inside a
+/// string or a comment passes, and the parse then refuses it.
+fn may_read_a_store(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        if bytes[at] == b'$' && (bytes[at + 1].is_ascii_alphabetic() || bytes[at + 1] == b'_') {
+            let start = at + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if !is_svelte_rune(&text[start..end]) {
+                return true;
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    false
+}
+
+/// Whether `node` is the name a declaration, a parameter or a pattern binds,
+/// as opposed to a use of a name.
+fn binds_the_name(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    ["name", "pattern", "parameter"].iter().any(|field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    })
+}
+
+/// `program` parsed as TypeScript, or `None` when the deadline passed first.
+fn parse_typescript(program: &str, deadline: Instant) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .ok()?;
+    let (tree, cancelled) = crate::treesitter::parse_until(&mut parser, program, deadline);
+    if cancelled {
+        return None;
+    }
+    tree
+}
+
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// The characters of `text` that are outside every bracket pair, string and
+/// template literal, with their byte offsets. An opening bracket and the
+/// closing one that matches it are included, so a caller can find where a
+/// parenthesised group starts and ends. Enough to split a template header
+/// (`rows as { a, b }, i (key)`, `p then v`, `x = f(a, b)`) without parsing it.
+fn top_level(text: &str) -> Vec<(usize, char)> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => {
+                if depth == 0 {
+                    out.push((at, c));
+                }
+                depth += 1;
+            }
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    out.push((at, c));
+                }
+            }
+            _ if depth == 0 => out.push((at, c)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `text` trimmed, as an expression that starts `base` bytes into the file.
+fn trimmed_expression(text: &str, base: usize) -> Option<(JsExpr, Span)> {
+    let body = text.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let offset = base + (text.len() - text.trim_start().len());
+    let span = Span {
+        start_byte: offset,
+        end_byte: offset + body.len(),
+    };
+    Some((
+        JsExpr {
+            offset,
+            body: body.to_string(),
+        },
+        span,
+    ))
+}
+
+/// The parameter of `{#each xs as PATTERN, INDEX (KEY)}`: the binding list
+/// `PATTERN, INDEX` as written, and the key expression when there is one.
+fn split_each_parameter(node: Node, source: &str) -> (String, Option<JsExpr>) {
+    let raw = text_of(node, source);
+    let end = raw.trim_end().len();
+    let open = top_level(&raw)
+        .into_iter()
+        .find(|&(_, c)| c == '(')
+        .map(|(at, _)| at);
+    if let Some(open) = open.filter(|open| raw[..end].ends_with(')') && open + 1 < end) {
+        let key = trimmed_expression(&raw[open + 1..end - 1], node.start_byte() + open + 1)
+            .map(|(expression, _)| expression);
+        return (raw[..open].to_string(), key);
+    }
+    (raw, None)
+}
+
+/// The expression of an `{#await}` header, and the binding its shorthand names.
+type AwaitHeader = (Option<(JsExpr, Span)>, Option<(String, Span)>);
+
+/// The header of `{#await EXPRESSION}`, `{#await EXPRESSION then PATTERN}` and
+/// `{#await EXPRESSION catch PATTERN}`: the expression, and the binding the
+/// shorthand names for the block's content.
+fn split_await_header(node: Node, source: &str) -> AwaitHeader {
+    let raw = text_of(node, source);
+    let base = node.start_byte();
+    let keyword = top_level(&raw).into_iter().find_map(|(at, c)| {
+        if !matches!(c, 't' | 'c') {
+            return None;
+        }
+        let rest = &raw[at..];
+        let word = ["then", "catch"]
+            .into_iter()
+            .find(|word| rest.starts_with(word))?;
+        let before = raw[..at].chars().next_back();
+        let after = rest[word.len()..].chars().next();
+        (before.is_some_and(char::is_whitespace) && after.is_none_or(char::is_whitespace))
+            .then_some((at, word.len()))
+    });
+    match keyword {
+        Some((at, len)) => {
+            let rest = &raw[at + len..];
+            let start = base + at + len + (rest.len() - rest.trim_start().len());
+            (
+                trimmed_expression(&raw[..at], base),
+                Some((
+                    rest.trim().to_string(),
+                    Span {
+                        start_byte: start,
+                        end_byte: base + raw.len(),
+                    },
+                )),
+            )
+        }
+        None => (trimmed_expression(&raw, base), None),
+    }
+}
+
+/// The text of `{@const PATTERN = EXPRESSION}`: the binding, and the expression
+/// it is given.
+fn split_const_tag(node: Node, source: &str) -> (String, Option<(JsExpr, Span)>) {
+    let raw = text_of(node, source);
+    let base = node.start_byte();
+    let assign = top_level(&raw).into_iter().find_map(|(at, c)| {
+        if c != '=' {
+            return None;
+        }
+        let before = raw[..at].chars().next_back();
+        let after = raw[at + 1..].chars().next();
+        (!matches!(before, Some('=' | '!' | '<' | '>')) && !matches!(after, Some('=' | '>')))
+            .then_some(at)
+    });
+    match assign {
+        Some(at) => (
+            raw[..at].to_string(),
+            trimmed_expression(&raw[at + 1..], base + at + 1),
+        ),
+        None => (String::new(), trimmed_expression(&raw, base)),
+    }
+}
+
+/// What a binding list binds, and the default-value expressions inside its
+/// patterns as byte ranges of the list.
+struct Bindings {
+    names: Vec<String>,
+    defaults: Vec<(usize, usize)>,
+}
+
+/// The names a binding list binds: `item`, `item, index`, `{ a, b: c }, i`, or
+/// the parameters of a snippet (`a: T, b?: U`), with the defaults of its
+/// patterns. `None` when the deadline passed before a list that needed a parse
+/// was read.
+fn binding_names(list: &str, deadline: Instant) -> Option<Bindings> {
+    if list.trim().is_empty() {
+        return Some(Bindings {
+            names: Vec::new(),
+            defaults: Vec::new(),
+        });
+    }
+    // The common case is plain identifiers, which need no parse.
+    let mut pieces = Vec::new();
+    let mut from = 0;
+    for (at, c) in top_level(list) {
+        if c == ',' {
+            pieces.push(&list[from..at]);
+            from = at + 1;
+        }
+    }
+    pieces.push(&list[from..]);
+    if pieces.iter().all(|piece| is_identifier(piece.trim())) {
+        return Some(Bindings {
+            names: pieces
+                .iter()
+                .map(|piece| piece.trim().to_string())
+                .collect(),
+            defaults: Vec::new(),
+        });
+    }
+    // The wrapper's one opening byte is not in the list.
+    let program = format!("({list}) => {{}}");
+    let tree = parse_typescript(&program, deadline)?;
+    let mut bindings = Bindings {
+        names: Vec::new(),
+        defaults: Vec::new(),
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "formal_parameters" {
+            for parameter in children_of(node) {
+                if matches!(
+                    parameter.kind(),
+                    "required_parameter" | "optional_parameter"
+                ) {
+                    if let Some(pattern) = parameter.child_by_field_name("pattern") {
+                        pattern_names(pattern, &program, &mut bindings);
+                    }
+                }
+            }
+            break;
+        }
+        stack.extend(children_of(node).into_iter().rev());
+    }
+    for (start, end) in &mut bindings.defaults {
+        *start = start.saturating_sub(1).min(list.len());
+        *end = end.saturating_sub(1).min(list.len());
+    }
+    Some(bindings)
+}
+
+/// The names one binding pattern binds, and its default values. A property key
+/// and a type are not names, so only the identifiers in binding position are
+/// taken; a default (`{ a = f() }`) is an expression, kept as a range.
+fn pattern_names(pattern: Node, program: &str, out: &mut Bindings) {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                out.names.push(text_slice(node, program).to_string());
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    out.defaults.push((right.start_byte(), right.end_byte()));
+                }
+                stack.extend(node.child_by_field_name("left"));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every text [`store_reads`] has parsed on any thread, so a test can say a
+/// component never reached it. Tests run in parallel, so a test looks for text
+/// of its own rather than counting.
+#[cfg(test)]
+static STORE_READ_PROGRAMS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Every `$store` auto-subscription in `program`, as `(store, start, end)`
+/// with the byte range of the `$store` token, or `None` when the deadline
+/// passed before the parse finished.
+///
+/// A store read is an identifier in expression position in the syntax tree. A
+/// string, a template literal's text, a regular expression, a comment, an
+/// object key, a property name (`obj.$x`), a destructuring key and a label are
+/// each a node of another kind, so none of them can match: there is no text
+/// scan. Only the TypeScript grammar's `identifier` and
+/// `shorthand_property_identifier` nodes (`{ $x }`) are candidates, and a name
+/// that a declaration or a parameter binds is not a use.
+fn store_reads(program: &str, deadline: Instant) -> Option<Vec<(String, usize, usize)>> {
+    #[cfg(test)]
+    STORE_READ_PROGRAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(program.to_string());
+    let tree = parse_typescript(program, deadline)?;
+    let mut found = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "identifier" | "shorthand_property_identifier") {
+            if let Some(store) = program
+                .get(node.start_byte()..node.end_byte())
+                .and_then(store_name)
+            {
+                if !binds_the_name(node) {
+                    found.push((store.to_string(), node.start_byte(), node.end_byte()));
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    found.sort_by_key(|(_, start, _)| *start);
+    Some(found)
+}
+
+/// Whether a `$name` can be a subscription to a name of this component.
+///
+/// Svelte reads `$name` as a subscription to whatever `name` is, so a store
+/// read of a same-component function or class is a mistake in the program and
+/// not a use of that function: it is not recorded, so it cannot keep the
+/// function alive. An import or a variable can be a store and DevMap does not
+/// know the type of either, so a read of one is recorded and resolves like any
+/// other reference to that name, at the tier the resolver gives it.
+fn store_can_be_a_target(extraction: &Extraction, name: &str) -> bool {
+    !extraction.symbols.iter().any(|symbol| {
+        symbol.name == name && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
+    })
+}
+
+/// Record the store reads of `program` as references to the stores read.
+/// `base` is the byte of the file `program` starts at, less `lead` bytes of
+/// wrapper in front of the text. `Err` is a deadline: nothing was read.
+fn push_store_reads(
+    extraction: &mut Extraction,
+    program: &str,
+    base: usize,
+    lead: usize,
+    deadline: Instant,
+) -> Result<(), ()> {
+    if !may_read_a_store(program) {
+        return Ok(());
+    }
+    let reads = store_reads(program, deadline).ok_or(())?;
+    for (store, start, end) in reads {
+        if !store_can_be_a_target(extraction, &store) {
+            continue;
+        }
+        let at = base.saturating_add(start.saturating_sub(lead));
+        let enclosing = extraction
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && symbol.span.start_byte <= at
+                    && at < symbol.span.end_byte
+            })
+            .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
+            .map_or_else(
+                || extraction.file_path.clone(),
+                |symbol| symbol.qualified_name.clone(),
+            );
+        extraction.references.push(ExtractedReference {
+            name: store,
+            kind: ReferenceKind::Name,
+            span: Span {
+                start_byte: at,
+                end_byte: base.saturating_add(end.saturating_sub(lead)),
+            },
+            enclosing_symbol: Some(enclosing),
+            assigned_to: None,
+            receiver_expr: None,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn span_of(node: Node) -> Span {
@@ -1202,6 +2434,19 @@ pub(crate) fn merge_embedded_scripts(
         }
 
         absorb(extraction, inner, region.content.start_byte, source);
+        if outer_grammar == "svelte"
+            && push_store_reads(extraction, text, region.content.start_byte, 0, deadline).is_err()
+        {
+            diagnostics.push(format!(
+                "extraction budget was exhausted before the store reads of the script at bytes \
+                 {}..{}; they were not read",
+                region.content.start_byte, region.content.end_byte
+            ));
+            unparsed.push(TextRange {
+                start_byte: region.element.start_byte,
+                end_byte: region.element.end_byte,
+            });
+        }
     }
 
     extraction.diagnostics.extend(diagnostics);
@@ -1735,7 +2980,7 @@ mod tests {
         use std::time::Duration;
 
         let mut source = String::new();
-        for index in 0..(MAX_EMBEDDED_REGIONS + 1) {
+        for index in 0..(MAX_TEMPLATE_EXPRESSIONS + 1) {
             source.push_str(&format!(
                 "<button onclick={{() => f{index}()}}>x</button>\n"
             ));
@@ -1772,7 +3017,7 @@ mod tests {
             .count();
         assert_eq!(
             recorded,
-            MAX_EMBEDDED_REGIONS,
+            MAX_TEMPLATE_EXPRESSIONS,
             "one expression is past the cap and the rest are still calls: {:?}",
             extraction
                 .calls
@@ -1788,6 +3033,46 @@ mod tests {
                 .any(|line| line.contains("were not parsed")),
             "the cap has to say why it stopped: {:?}",
             extraction.diagnostics
+        );
+    }
+
+    /// The bound charges the end of the template, never its top: the walk is in
+    /// document order, so the expressions kept are the first ones.
+    #[test]
+    fn the_expressions_past_the_cap_are_the_last_ones() {
+        use std::time::Duration;
+
+        let mut source = String::new();
+        for index in 0..(MAX_TEMPLATE_EXPRESSIONS + 1) {
+            source.push_str(&format!(
+                "<button onclick={{() => f{index}()}}>x</button>\n"
+            ));
+        }
+        let mut extraction =
+            crate::treesitter::extract_treesitter("Cap.svelte", "svelte", "<p>hi</p>\n");
+        extraction.parse_outcome = ParseOutcome::Clean;
+        extraction.calls.clear();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_svelte_ng::LANGUAGE.into())
+            .expect("the svelte grammar loads");
+        let tree = parser.parse(&source, None).expect("the template parses");
+        absorb_template_expressions(
+            &mut extraction,
+            tree.root_node(),
+            &source,
+            "typescript",
+            Instant::now() + Duration::from_secs(180),
+        );
+        let names: Vec<&str> = extraction
+            .calls
+            .iter()
+            .map(|call| call.callee_name.as_str())
+            .collect();
+        assert!(names.contains(&"f0"), "the top of the template is read");
+        assert!(
+            !names.contains(&format!("f{MAX_TEMPLATE_EXPRESSIONS}").as_str()),
+            "the expression past the bound is the last one"
         );
     }
 
@@ -1846,6 +3131,74 @@ mod tests {
         assert!(
             DepthGuard::enter().is_some(),
             "the flag is released even though the inner attempt was refused"
+        );
+    }
+
+    #[test]
+    fn only_a_dollar_name_that_is_not_a_rune_can_be_a_store_read() {
+        for runes_only in [
+            "let a = $state(0);",
+            "$state.raw([])",
+            "$derived.by(() => 1)",
+            "$effect.pre(run)",
+            "const { size } = $props();",
+            "$bindable()",
+            "$inspect(a)",
+            "$host()",
+            "$$props.a",
+            "$state(1) + $derived(2)",
+        ] {
+            assert!(!may_read_a_store(runes_only), "{runes_only}");
+        }
+        for maybe_a_store in ["$store", "$stateful", "$state + $store", "x = $x_1", "$_"] {
+            assert!(may_read_a_store(maybe_a_store), "{maybe_a_store}");
+        }
+    }
+
+    fn parsed_for_store_reads(marker: &str) -> bool {
+        STORE_READ_PROGRAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|program| program.contains(marker))
+    }
+
+    #[test]
+    fn a_runes_only_component_triggers_no_store_read_parse() {
+        let marker = "RunesOnlyMarker7f3a";
+        let source = format!(
+            "<script lang=\"ts\">\n  let {marker} = $state(0);\n  let double = $derived({marker} * 2);\n  \
+             $effect(() => {{ console.log(double); }});\n  const {{ size }} = $props();\n  \
+             let raw = $state.raw([]);\n  $inspect({marker});\n</script>\n\
+             <p title={{String($state.snapshot({marker}))}}>{{{marker}}}</p>\n"
+        );
+        crate::extract_file_with_budget(
+            "src/R.svelte",
+            &source,
+            std::time::Duration::from_secs(600),
+        );
+        assert!(
+            !parsed_for_store_reads(marker),
+            "a component whose only `$name` tokens are runes was parsed for store reads"
+        );
+    }
+
+    #[test]
+    fn a_component_that_reads_a_store_is_still_parsed_for_it() {
+        let marker = "StoreReadMarker91c2";
+        let source = format!(
+            "<script lang=\"ts\">\n  import {{ store }} from './s';\n  let {marker} = $store + $state(0);\n</script>\n"
+        );
+        let extraction = crate::extract_file_with_budget(
+            "src/S.svelte",
+            &source,
+            std::time::Duration::from_secs(600),
+        );
+        assert!(parsed_for_store_reads(marker));
+        assert!(
+            extraction.references.iter().any(|r| r.name == "store"),
+            "{:?}",
+            extraction.references
         );
     }
 }

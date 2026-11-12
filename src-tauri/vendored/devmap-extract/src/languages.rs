@@ -775,6 +775,7 @@ pub fn detect_language(path: &Path) -> &'static str {
             // protobuf `message`/`service`/`rpc` and PowerShell `function`.
             "proto" => "protobuf",
             "ps1" | "psm1" | "psd1" => "powershell",
+            "lean" => "lean",
             // A notebook is source, and `crate::notebook` knows how to read it
             // (G5). Named here for the same reason as the two above: discovery
             // admits only what `detect_language` names, so an unnamed extension
@@ -840,6 +841,14 @@ pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities, LivenessUnit)] = &[
     // already charged to coverage as `PatternRecovered`.
     ("protobuf", Capabilities::NONE, LivenessUnit::Module),
     ("powershell", Capabilities::NONE, LivenessUnit::Module),
+    // Dedicated reader (`crate::lean`), no linked tree-sitter grammar. Recovers
+    // declarations, `extends` supertypes (`HERITAGE`), and type/identifier/call
+    // uses on `Extraction::references` (`REFERENCES`).
+    (
+        "lean",
+        Capabilities::new(REFERENCES | HERITAGE),
+        LivenessUnit::Module,
+    ),
     // Prose, data and config. No grammar is wanted and none will come; these
     // report `ExtractionEngine::NotApplicable` and are excluded from coverage
     // by `Extraction::is_parse_failure`.
@@ -1078,6 +1087,23 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
         return true;
     }
     false
+}
+
+/// The runes Svelte 5 compiles, without the `$`: `$state`, `$derived`,
+/// `$effect`, `$props`, `$bindable`, `$inspect` and `$host` (the rune list of
+/// the Svelte documentation; `$state.raw`, `$derived.by`, `$effect.pre`,
+/// `$props.id` and the like are members of these).
+///
+/// The one list. The extractor reads it to tell a rune from a `$store` read,
+/// and the resolver's host-global table answers from it, so neither keeps a
+/// copy that can drift from the other.
+pub const SVELTE_RUNES: &[&str] = &[
+    "state", "derived", "effect", "props", "bindable", "inspect", "host",
+];
+
+/// Whether `name` (the identifier after the `$`) is a Svelte rune.
+pub fn is_svelte_rune(name: &str) -> bool {
+    SVELTE_RUNES.contains(&name)
 }
 
 /// Environment variable naming extra path prefixes to exclude from discovery.

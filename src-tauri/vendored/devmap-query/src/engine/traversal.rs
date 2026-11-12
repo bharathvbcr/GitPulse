@@ -277,6 +277,18 @@ pub(super) fn indexed_traversal_starts(
                     ids.extend_from_slice(group);
                 }
             }
+            // A name that is no symbol may be a component: `MarkdownBody` is
+            // `MarkdownBody.svelte`, which the graph holds as a file node. Only
+            // when no symbol answers to the name, so a real symbol is never
+            // shadowed, and through the same ambiguity refusal below.
+            if ids.is_empty() {
+                for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
+                    cancel.check_every(checked)?;
+                    if crate::query_match::component_file_matches(candidate, name) {
+                        ids.extend_from_slice(group);
+                    }
+                }
+            }
         }
     }
     ids.retain(|id| index.admits(*id, min_confidence));
@@ -303,6 +315,55 @@ pub(super) fn indexed_traversal_starts(
         refuse_ambiguous(target, &starts)?;
     }
     Ok(starts)
+}
+
+/// What an answer says about a component its bare name did not reach.
+///
+/// A component is its file, found by its stem only when no symbol answers to
+/// the name. Two silences follow, and this names both: the symbol won and a
+/// component of the same stem exists (`impact Real` is `Real.ts::Real`), and
+/// nothing matched but a component differs from the name only in case.
+/// `None` for a path, a qualified name or a name that needs neither.
+pub(super) fn component_note(
+    index: &GenerationEdges,
+    target: &str,
+    reverse: bool,
+    cancel: &Cancel,
+) -> anyhow::Result<Option<String>> {
+    let crate::query_match::StartQuery::Symbol(name) = crate::query_match::classify(target) else {
+        return Ok(None);
+    };
+    let mut symbol_hit = false;
+    let mut exact: BTreeSet<&str> = BTreeSet::new();
+    let mut folded: BTreeSet<&str> = BTreeSet::new();
+    for (checked, (candidate, _)) in index.symbols(reverse).enumerate() {
+        cancel.check_every(checked)?;
+        if crate::query_match::symbol_matches(candidate, name) {
+            symbol_hit = true;
+        }
+        if let Some(stem) = crate::query_match::component_stem(candidate) {
+            if stem == name {
+                exact.insert(candidate);
+            } else if stem.eq_ignore_ascii_case(name) {
+                folded.insert(candidate);
+            }
+        }
+    }
+    let list = |paths: &BTreeSet<&str>| paths.iter().copied().collect::<Vec<_>>().join(", ");
+    Ok(if symbol_hit && !exact.is_empty() {
+        Some(format!(
+            "`{name}` was answered as a symbol; a component of that name also exists ({}) and \
+             was passed over, ask for it by its path",
+            list(&exact)
+        ))
+    } else if !symbol_hit && exact.is_empty() && !folded.is_empty() {
+        Some(format!(
+            "no symbol or component is named `{name}`; a component differs only in case: {}",
+            list(&folded)
+        ))
+    } else {
+        None
+    })
 }
 
 /// The one rule for a bare name that resolves to several symbols: refuse and

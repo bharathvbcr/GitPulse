@@ -35,6 +35,8 @@ pub mod langfields;
 #[cfg(feature = "parse")]
 pub mod langimports;
 pub mod languages;
+/// Dedicated reader and Trusted Computing Base boundary auditor for Lean 4 (`.lean`).
+pub mod lean;
 /// The markup and stylesheet halves of a template, HTML or CSS file.
 ///
 /// Ungated: its stylesheet and text scanners are pure string readers that the
@@ -127,7 +129,7 @@ use rayon::prelude::*;
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
     is_resolution_input_name, parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings,
-    ProjectManifests, RustCrateManifest,
+    ProjectManifests, RustCrateManifest, RustDependency,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,

@@ -2726,6 +2726,15 @@ enum PartialRegionVerdict<'a> {
     ZeroWidth,
 }
 
+/// Whether `symbol` is a `{#snippet}` block, which `devmap-extract` declares as
+/// a function whose signature is the opening tag.
+fn is_template_snippet(symbol: &ExtractedSymbol) -> bool {
+    symbol
+        .signature
+        .as_deref()
+        .is_some_and(|signature| signature.starts_with("{#snippet"))
+}
+
 /// Every error region of `ext`'s partial parse with its verdict, in the order
 /// the extractor reported them, duplicates removed. Empty for any other
 /// outcome.
@@ -2754,6 +2763,11 @@ fn partial_region_verdicts(ext: &Extraction) -> Vec<(TextRange, PartialRegionVer
                     .iter()
                     .filter(|symbol| {
                         symbol.kind != SymbolKind::File
+                            // A Svelte snippet is a declaration of markup. What
+                            // is lost inside it is a call the template made,
+                            // and the snippet surviving says nothing about the
+                            // callee that call named.
+                            && !is_template_snippet(symbol)
                             && symbol.span.start_byte <= range.start_byte
                             && range.end_byte <= symbol.span.end_byte
                     })
@@ -2904,6 +2918,50 @@ fn partial_parse_reason(ext: &Extraction) -> String {
         sentence.push_str(&format!("; not charged: {}", exempt.join(", ")));
     }
     sentence
+}
+
+/// What a dead row says about its own file when that file is charged as
+/// partially parsed: the call that would keep the symbol alive may be among
+/// the bytes the parse lost. `None` for a file that is not charged.
+fn charged_partial_note(ext: &Extraction) -> Option<String> {
+    if !partial_parse_charged(ext) {
+        return None;
+    }
+    let ParseOutcome::Partial { error_ranges, .. } = &ext.parse_outcome else {
+        return None;
+    };
+    Some(format!(
+        "{} is charged as partially parsed ({}), so a call that would keep this symbol alive may \
+         be among the bytes lost",
+        ext.file_path,
+        partial_parse_lost(error_ranges)
+    ))
+}
+
+/// `reason`, with the note about the row's own file appended when there is one.
+/// Appended, so a reason that is matched by its prefix still is.
+fn with_file_note(reason: String, note: &Option<String>) -> String {
+    match note {
+        Some(note) => format!("{reason}; {note}"),
+        None => reason,
+    }
+}
+
+/// How bad a stored `partial_parse` reason is, for ordering a capped listing:
+/// whether the file is charged against the ceiling, and how many bytes the
+/// tree lost. Reads back exactly what [`partial_parse_reason`] writes; a reason
+/// it cannot read is `(false, 0)`, which sorts last, never first.
+///
+/// A listing cut at fifty rows by path showed fifty harmless rows and hid the
+/// file with an eleven-kilobyte hole.
+pub fn partial_parse_severity(reason: &str) -> (bool, usize) {
+    let charged = reason.contains("; charged: ");
+    let lost = reason
+        .split_once(" byte(s) lost")
+        .and_then(|(head, _)| head.rsplit(", ").next())
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .unwrap_or(0);
+    (charged, lost)
 }
 
 /// The byte ranges a partial parse lost, merged and stated.
@@ -3690,6 +3748,9 @@ pub fn analyze_liveness_with_coverage(
         // `trace` refuse an empty answer with, so the two surfaces cannot
         // disagree about which files were never looked at.
         let file_is_call_blind = ext.is_call_blind();
+        // Once per file: a dead verdict for a symbol of a file that lost bytes to
+        // a parse says so on the row, whatever the corpus-wide reason is.
+        let own_file_note = charged_partial_note(ext);
 
         // Every finding about a symbol in this file, priced against the
         // blindness that actually bears on it.
@@ -3970,7 +4031,10 @@ pub fn analyze_liveness_with_coverage(
                         file_path: ext.file_path.clone(),
                         confidence: UNPROVEN_TIER_CONFIDENCE,
                         is_exempt: false,
-                        exemption_reason: Some(confident_tier_unproven_reason(language)),
+                        exemption_reason: Some(with_file_note(
+                            confident_tier_unproven_reason(language),
+                            &own_file_note,
+                        )),
                         evidence: Some(DeadEvidence::none()),
                     });
                 } else {
@@ -3990,7 +4054,10 @@ pub fn analyze_liveness_with_coverage(
                         } else if coverage.is_complete_for(language) {
                             None
                         } else {
-                            Some(COVERAGE_LOSS_REASON.to_string())
+                            Some(with_file_note(
+                                COVERAGE_LOSS_REASON.to_string(),
+                                &own_file_note,
+                            ))
                         },
                         evidence: None,
                     });
@@ -4539,6 +4606,65 @@ mod tests {
                 .iter()
                 .all(|r| !r.symbol_name.contains("inside") || r.is_exempt),
             "a symbol inside an error range must be exempt: {overlapping:?}"
+        );
+    }
+
+    /// A snippet that survives does not excuse an expression lost inside it:
+    /// the call that expression made is not in the graph, and the function it
+    /// named would read as dead with no charge against the ceiling.
+    #[test]
+    fn a_region_lost_inside_a_snippet_is_charged() {
+        let ext = devmap_extract::extract_file(
+            "src/A.svelte",
+            "<script>function f(){}</script>\n{#snippet s()}\n<button onclick={() => broken(}>x</button>\n{/snippet}\n",
+        );
+        assert!(
+            ext.symbols.iter().any(|symbol| symbol.name == "s"),
+            "the snippet is declared: {:?}",
+            ext.symbols
+        );
+        let verdicts = partial_region_verdicts(&ext);
+        assert!(!verdicts.is_empty(), "the broken expression is a region");
+        assert!(
+            verdicts
+                .iter()
+                .all(|(_, verdict)| *verdict == PartialRegionVerdict::Charged),
+            "{verdicts:?}"
+        );
+    }
+
+    /// The severity read back from a stored reason is what the producer wrote.
+    #[test]
+    fn partial_parse_severity_reads_the_producers_sentence() {
+        let charged = devmap_extract::extract_file(
+            "src/A.svelte",
+            "<script>function f(){}</script>\n<button onclick={() => broken(}>x</button>\n",
+        );
+        let reason = partial_parse_reason(&charged);
+        let (is_charged, lost) = partial_parse_severity(&reason);
+        assert!(is_charged, "{reason}");
+        assert!(lost > 0, "{reason}");
+        assert_eq!(partial_parse_severity("unrelated text"), (false, 0));
+    }
+
+    /// A dead verdict for a symbol of a file that lost bytes to a parse says
+    /// so on the row, not only in the corpus-wide sentence.
+    #[test]
+    fn a_dead_row_in_a_charged_partial_file_names_that_file() {
+        let ext = devmap_extract::extract_file(
+            "src/Cap.svelte",
+            "<script>function lonely(){}</script>\n<button onclick={() => broken(}>x</button>\n",
+        );
+        assert!(partial_parse_charged(&ext), "{:?}", ext.parse_outcome);
+        let rows = reports_with(ext, Vec::new());
+        let lonely = rows
+            .iter()
+            .find(|row| row.symbol_name.contains("lonely"))
+            .expect("the unused function is reported");
+        let reason = lonely.exemption_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("src/Cap.svelte is charged as partially parsed"),
+            "{lonely:?}"
         );
     }
 }

@@ -236,13 +236,19 @@ export function sources(env = process.env, from = REPO) {
         // took it as a hard dependency upstream (it withholds secret paths from
         // the code graph), so a re-vendor without it fails to resolve.
         "dc-glob",
+        // The Lean trusted-computing-base analysis. `devmap-extract` reads
+        // `.lean` files through `dc_evidence::lean_tcb` upstream (20e58a70),
+        // its one owner, so dcverify and the code graph agree. A re-vendor
+        // without it fails to resolve.
+        "dc-evidence",
         // The credential table the ledger redacts with — the same one
         // dc-verify's secret gate blocks on, so the two cannot disagree about
         // what a secret is. GitPulse vendored all of dc-verify for this until
         // upstream split it out: dc-verify links tree-sitter 0.25 for its stub
         // detection, markdev-highlight links 0.26, and cargo admits one package
         // per `links = "tree-sitter"`. dc-verify's own dependencies, dc-glob and
-        // dc-evidence, left with it; nothing here used them directly.
+        // dc-evidence, left with it; both came back later, through
+        // devmap-extract.
         "dc-redact",
         // Which commits could have caused a symptom: git blame joined to the
         // code graph. `dc-regress` is the analysis and knows nothing about

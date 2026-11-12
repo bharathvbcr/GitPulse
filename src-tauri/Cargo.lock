@@ -730,6 +730,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-evidence"
+version = "0.2.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "dc-glob"
 version = "0.2.5"
 
@@ -849,6 +858,7 @@ version = "0.2.5"
 dependencies = [
  "anyhow",
  "cc",
+ "dc-evidence",
  "dc-glob",
  "dc-proc",
  "dc-redact",

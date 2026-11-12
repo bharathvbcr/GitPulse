@@ -541,8 +541,23 @@ impl Store {
     }
 
     pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
+        Self::validate_schema_skipping(conn, &[])
+    }
+
+    /// [`Self::validate_schema`] without asking the full-text table for its
+    /// columns, which is the one question that reads the index's configuration
+    /// and so fails on a damaged index. Everything else is checked as usual;
+    /// this is how an open decides that the index is the only thing wrong.
+    pub(super) fn validate_schema_without_full_text(conn: &Connection) -> Result<()> {
+        Self::validate_schema_skipping(conn, &["nodes_fts"])
+    }
+
+    fn validate_schema_skipping(conn: &Connection, skip: &[&str]) -> Result<()> {
         Self::reject_triggers(conn)?;
         for (table, required_columns) in REQUIRED_SCHEMA {
+            if skip.contains(table) {
+                continue;
+            }
             let object_type: Option<String> = conn
                 .query_row(
                     "SELECT type FROM sqlite_master WHERE name = ?1",

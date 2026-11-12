@@ -2,11 +2,18 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-/// Cache identity for per-file resolution reuse.
+/// Identity of the resolver rules that produced a resolution.
 ///
-/// The blobs live in the repository state directory, not in sqlite. A resolver
-/// change that alters a file's edges without changing its content hash bumps
-/// this; a mismatch is a miss, and the file is resolved again.
+/// It does two things. It names the per-file reuse directory
+/// (`resolution-reuse-<epoch>`, in the repository state directory, not in
+/// sqlite), so blobs written under another epoch are never read. And the store
+/// stamps it into every generation it writes (`$.resolver_epoch` in
+/// `generations.analysis_json`), so a stored generation from another epoch, or
+/// from before the stamp, is not current: the no-change shortcut, `--affected`
+/// and the daemon drain re-resolve it instead of trusting its edges. It never
+/// looks at the rules themselves. It is moved by hand, and a resolver change
+/// that alters any file's edges without moving it is reused as if current.
+/// Moving it costs each store one full resolve (no re-parse) on its next build.
 pub const RESOLUTION_REUSE_EPOCH: &str = "2";
 
 /// One file's resolution before the whole-tree post-pass.
@@ -431,7 +438,7 @@ impl Resolver {
                             if let Some((target_f, target_symbol)) = self
                                 .type_methods
                                 .get(&key)
-                                .and_then(|hits| self.type_method_target(&ext.file_path, &class_type, hits))
+                                .and_then(|hits| self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte)))
                             {
                                 resolution = Some(Arc::new(Resolution::ReceiverType {
                                     target_symbol: target_symbol.to_string(),
@@ -466,7 +473,7 @@ impl Resolver {
                                 let key = (family, class_type.clone(), call.callee_name.clone());
                                 if let Some((target_f, target_symbol)) =
                                     self.type_methods.get(&key).and_then(|hits| {
-                                        self.type_method_target(&ext.file_path, &class_type, hits)
+                                        self.type_method_target(&ext.file_path, &class_type, hits, Site::of(call.span.start_byte))
                                     })
                                 {
                                     resolution = Some(Arc::new(Resolution::ReceiverType {
@@ -760,7 +767,7 @@ impl Resolver {
                                     LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => (!(family
                                         == LangFamily::Swift
                                         && Self::swift_call_chain_split(recv).is_some()))
-                                    .then(|| self.protocol_dispatch(family, &class_type, &call.callee_name))
+                                    .then(|| self.protocol_dispatch(family, &ext.file_path, &class_type, &call.callee_name))
                                     .flatten()
                                     .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -849,7 +856,7 @@ impl Resolver {
                             })
                         {
                             if let Some((direct, targets)) =
-                                self.protocol_dispatch(family, &bound, &call.callee_name)
+                                self.protocol_dispatch(family, &ext.file_path, &bound, &call.callee_name)
                             {
                                 resolution = Some(self.dispatch_through_interface(
                                     ext, call, &mut edges, &bound, direct, targets,
@@ -977,7 +984,7 @@ impl Resolver {
                                         .then(|| self.self_type_at(&ext.file_path, family, caller))
                                         .flatten()
                                         .and_then(|own| {
-                                            self.protocol_dispatch(family, &own, &call.callee_name)
+                                            self.protocol_dispatch(family, &ext.file_path, &own, &call.callee_name)
                                                 .map(|found| (own, found))
                                         });
                                     resolution = Some(match through_protocol {
@@ -1028,12 +1035,16 @@ impl Resolver {
                     // DETERMINISTIC — a confident edge to a function the code
                     // demonstrably does not call, and one that also hands the
                     // real method one fewer caller than it has.
-                    if resolution.is_none() && call.receiver_expr.is_none() {
-                        if let Some((target_f, target_sym)) = self.import_binding_at(
+                    if resolution.is_none()
+                        && call.receiver_expr.is_none()
+                        && !self.rust_import_rung_declines(family, &ext.file_path, &call.callee_name, Site::of(call.span.start_byte))
+                    {
+                        if let Some((target_f, target_sym)) = self.import_binding_for_site(
                             family,
                             &ext.file_path,
                             read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                             &call.callee_name,
+                            Site::of(call.span.start_byte),
                         ) {
                             // A whole-module handle called as a function is the
                             // module's own value, which is what its default
@@ -1165,13 +1176,15 @@ impl Resolver {
                             (String::new(), String::new())
                         };
                         if !recv.is_empty() && !method.is_empty()
-                            && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
+                            && ext.local_binding_at(call.span.start_byte, &recv).is_none()
+                            && !self.rust_import_rung_declines(family, &ext.file_path, &recv, Site::of(call.span.start_byte)) {
                             {
-                                if let Some((target_f, imported)) = self.import_binding_at(
+                                if let Some((target_f, imported)) = self.import_binding_for_site(
                                     family,
                                     &ext.file_path,
                                     read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                     &recv,
+                                    Site::of(call.span.start_byte),
                                 ) {
                                     // A module member: a member of a module
                                     // handle, of an imported type, or of an
@@ -1353,6 +1366,9 @@ impl Resolver {
                         if call.receiver_expr.is_none() {
                             if let Some(target_symbol) = self
                                 .lexical_call_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                                .filter(|_| {
+                                    !self.rust_same_file_rung_declines(family, &ext.file_path, &call.callee_name, Site::of(call.span.start_byte))
+                                })
                                 .filter(|identity| {
                                     !self.file_declares_as(&ext.file_path, identity, |kind| {
                                         Self::never_a_call_target(family, kind)
@@ -1404,7 +1420,7 @@ impl Resolver {
                             }) => self
                                 .declaring_type_of(target_file, target_symbol)
                                 .and_then(|own| {
-                                    self.protocol_dispatch(family, own, &call.callee_name)
+                                    self.protocol_dispatch(family, &ext.file_path, own, &call.callee_name)
                                         .map(|found| (own.to_string(), found))
                                 })
                                 .filter(|(_, (_, targets))| !targets.is_empty()),
@@ -1480,6 +1496,7 @@ impl Resolver {
                                             &ext.file_path,
                                             type_name,
                                             hits,
+                                            Site::of(call.span.start_byte),
                                         )
                                     {
                                         resolution = Some(Arc::new(Resolution::ReceiverType {
@@ -1855,7 +1872,15 @@ impl Resolver {
                                     target_f,
                                     target_identity,
                                 );
-                            if !out_of_scope {
+                            if !out_of_scope
+                                && !self.rust_unique_rung_declines(
+                                    family,
+                                    &ext.file_path,
+                                    &call.callee_name,
+                                    target_f,
+                                    Site::of(call.span.start_byte),
+                                )
+                            {
                                 resolution = Some(Arc::new(Resolution::UniqueGlobal {
                                     target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
                                 }));
@@ -2030,6 +2055,14 @@ impl Resolver {
                                             &call.callee_name,
                                             false,
                                         )
+                                        .or_else(|| {
+                                            self.rust_multi_impl_reason(
+                                                family,
+                                                &ext.file_path,
+                                                call.receiver_expr.as_deref(),
+                                                &call.callee_name,
+                                            )
+                                        })
                                         .unwrap_or_else(|| {
                                             format!(
                                                 "no resolution ladder rung matched {:?} in {} family {:?}",
@@ -2059,7 +2092,7 @@ impl Resolver {
                     let Some((target_f, target_sym)) = self
                         .type_methods
                         .get(&key)
-                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits))
+                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits, Site::of(conversion.span.start_byte)))
                     else {
                         continue;
                     };

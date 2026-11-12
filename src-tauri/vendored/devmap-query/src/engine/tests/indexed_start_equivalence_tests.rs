@@ -401,3 +401,149 @@ fn a_cancelled_start_lookup_stops_instead_of_scanning_every_symbol() {
         "a cancelled start lookup ran to completion"
     );
 }
+
+/// "Who uses MarkdownBody?" asked by the component's name.
+///
+/// A component is its file, so the bare name matched no symbol and the answer
+/// was an empty `Available` one while four components imported it.
+#[test]
+fn a_component_is_found_by_its_file_stem() {
+    let rows = vec![
+        stored(
+            "ui/Host.svelte",
+            "ui/Host.svelte",
+            "ui/MarkdownBody.svelte",
+            "ui/MarkdownBody.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/MarkdownBody.svelte",
+            "ui/MarkdownBody.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/MarkdownBody.svelte::render",
+            "ui/MarkdownBody.svelte",
+            EdgeKind::Calls,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Shared.svelte",
+            "ui/Shared.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "lib/Shared.vue",
+            "lib/Shared.vue",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.ts::Real",
+            "ui/Real.ts",
+            EdgeKind::Calls,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.svelte",
+            "ui/Real.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+    ];
+    let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
+    let cancel = Cancel::new();
+
+    let starts = indexed_traversal_starts(&index, "MarkdownBody", true, 0.0, &cancel)
+        .expect("a component name is not ambiguous");
+    assert!(!starts.is_empty(), "the component name found no start");
+    assert!(
+        starts
+            .iter()
+            .all(|(symbol, file)| symbol == "ui/MarkdownBody.svelte"
+                && file == "ui/MarkdownBody.svelte"),
+        "only the component's file node starts the walk: {starts:?}"
+    );
+
+    // Two components of one name are two candidates, refused like two symbols.
+    let error = indexed_traversal_starts(&index, "Shared", true, 0.0, &cancel)
+        .expect_err("two components named Shared");
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+
+    // A real symbol of the name wins; the component is not consulted.
+    let starts = indexed_traversal_starts(&index, "Real", true, 0.0, &cancel).expect("starts");
+    assert_eq!(
+        starts,
+        vec![("ui/Real.ts::Real".to_string(), "ui/Real.ts".to_string())]
+    );
+
+    // A stem is the whole stem, and a non-component file is not a component.
+    assert!(
+        indexed_traversal_starts(&index, "Markdown", true, 0.0, &cancel)
+            .expect("starts")
+            .is_empty()
+    );
+}
+
+/// The two silences of a component lookup are named in the answer's note.
+#[test]
+fn a_component_passed_over_or_missed_by_case_is_named() {
+    let rows = vec![
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/MarkdownBody.svelte",
+            "ui/MarkdownBody.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.ts::Real",
+            "ui/Real.ts",
+            EdgeKind::Calls,
+            1.0,
+        ),
+        stored(
+            "ui/Pane.svelte",
+            "ui/Pane.svelte",
+            "ui/Real.svelte",
+            "ui/Real.svelte",
+            EdgeKind::Imports,
+            1.0,
+        ),
+    ];
+    let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
+    let cancel = Cancel::new();
+    let note = |query: &str| component_note(&index, query, true, &cancel).expect("note");
+
+    let passed_over = note("Real").expect("a symbol won over a component");
+    assert!(passed_over.contains("ui/Real.svelte"), "{passed_over}");
+    let case_only = note("markdownbody").expect("a case-only miss");
+    assert!(case_only.contains("ui/MarkdownBody.svelte"), "{case_only}");
+    assert!(
+        note("MarkdownBody").is_none(),
+        "an exact component needs no note"
+    );
+    assert!(note("nothing_here").is_none());
+    assert!(
+        note("ui/Real.svelte").is_none(),
+        "a path is not a bare name"
+    );
+}

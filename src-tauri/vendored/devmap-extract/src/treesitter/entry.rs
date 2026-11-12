@@ -987,12 +987,17 @@ pub(super) fn extract_treesitter_before_deadline(
                     );
                 }
 
-                let (rust_inline_modules, rust_deref_targets, rust_blanket_impl_params) =
-                    if lang == "rust" {
-                        collect_rust_item_facts(root, source)
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new())
-                    };
+                let rust_item_facts = if lang == "rust" {
+                    collect_rust_item_facts(root, source)
+                } else {
+                    RustItemFacts::default()
+                };
+                let RustItemFacts {
+                    inline_modules: rust_inline_modules,
+                    scope_facts: rust_scope_facts,
+                    deref_targets: rust_deref_targets,
+                    blanket_impl_params: rust_blanket_impl_params,
+                } = rust_item_facts;
                 // One call per fact family, each answering for its own
                 // languages and returning an empty set for the rest, so a new
                 // fact is added in `jvmfacts` or `pyfacts` and never here.
@@ -1051,6 +1056,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     // a second time.
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
                     rust_inline_modules,
+                    rust_scope_facts,
                     rust_deref_targets,
                     rust_blanket_impl_params,
                     rust_implicit_calls,

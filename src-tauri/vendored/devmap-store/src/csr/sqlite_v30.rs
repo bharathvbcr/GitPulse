@@ -1,32 +1,9 @@
-//! Schema v30 SQLite Optimizations and Topologically Scoped Incremental Digest Engine.
+//! Topologically Scoped Incremental Digest Engine.
 
-use anyhow::{Context, Result};
-use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 
 use super::bitset::FastBitSet;
 use super::graph::CsrGraphReader;
-
-/// Mandatory SQLite PRAGMAs for Schema v30 high-throughput WAL concurrency.
-pub const V30_PRAGMAS: &[&str] = &[
-    "PRAGMA journal_mode = WAL;",
-    "PRAGMA synchronous = NORMAL;",
-    "PRAGMA wal_autocheckpoint = 1000;",
-    "PRAGMA busy_timeout = 10000;",
-    "PRAGMA foreign_keys = ON;",
-    "PRAGMA temp_store = MEMORY;",
-    "PRAGMA mmap_size = 268435456;", // 256MB mmap
-    "PRAGMA cache_size = -64000;",   // 64MB page cache
-];
-
-/// Apply Schema v30 PRAGMA optimizations to an open SQLite connection.
-pub fn apply_v30_pragmas(conn: &Connection) -> Result<()> {
-    for pragma in V30_PRAGMAS {
-        conn.execute_batch(pragma)
-            .with_context(|| format!("Failed to apply pragma: {}", pragma))?;
-    }
-    Ok(())
-}
 
 /// 1-Hop Topologically Scoped Incremental Digest Engine.
 ///

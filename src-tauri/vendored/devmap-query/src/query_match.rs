@@ -137,6 +137,29 @@ fn separator_insensitive_eq(left: &[u8], right: &[u8]) -> bool {
             .all(|(a, b)| as_separator(*a) == as_separator(*b))
 }
 
+/// Whether `symbol` is the `File` node of a template component whose file stem
+/// is `name`: `src/lib/MarkdownBody.svelte` for `MarkdownBody`.
+///
+/// A component has no symbol of its own. It is its file, so the name an agent
+/// writes for it ("who uses MarkdownBody?") matches nothing by symbol and the
+/// answer was an empty `Available` one. Only a file node qualifies (it has no
+/// `::`), only the template-component extensions, and only the whole stem, so
+/// `Foo.test.svelte` is not `Foo`.
+pub fn component_file_matches(symbol: &str, name: &str) -> bool {
+    component_stem(symbol) == Some(name)
+}
+
+/// The stem of a template component's `File` node (`MarkdownBody` for
+/// `src/lib/MarkdownBody.svelte`), and `None` for anything else.
+pub fn component_stem(symbol: &str) -> Option<&str> {
+    if symbol.contains("::") {
+        return None;
+    }
+    let file = symbol.rsplit(['/', '\\']).next().unwrap_or(symbol);
+    let (stem, extension) = file.rsplit_once('.')?;
+    matches!(extension, "svelte" | "vue" | "astro").then_some(stem)
+}
+
 pub fn symbol_matches(symbol: &str, query: &str) -> bool {
     if symbol == query {
         return true;

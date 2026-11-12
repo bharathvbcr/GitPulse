@@ -1,7 +1,7 @@
 //! Unified Zero-Copy mmap Compressed Sparse Row (CSR) Graph Storage for DevMap (`devmap-store::csr`).
 //!
 //! Provides ultra-low latency (<100ns) graph queries, lock-free atomic generation swaps,
-//! fast chunked bitsets for dirty node invalidation, and Schema v30 SQLite optimizations.
+//! fast chunked bitsets for dirty node invalidation, and the incremental digest engine.
 
 pub mod bitset;
 pub mod graph;
@@ -10,10 +10,11 @@ pub mod sqlite_v30;
 
 pub use bitset::FastBitSet;
 pub use graph::{
-    CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord, DC_GRAPH_MAGIC, DC_GRAPH_VERSION,
+    CsrFileChanged, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord, DC_GRAPH_MAGIC,
+    DC_GRAPH_VERSION,
 };
 pub use handle::AtomicGraphHandle;
-pub use sqlite_v30::{apply_v30_pragmas, IncrementalDigestEngine, V30_PRAGMAS};
+pub use sqlite_v30::IncrementalDigestEngine;
 
 #[cfg(test)]
 mod tests {
@@ -218,15 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_v30_pragmas_and_incremental_digest() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        apply_v30_pragmas(&conn).unwrap();
-
-        let journal_mode: String = conn
-            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
-            .unwrap();
-        assert!(!journal_mode.is_empty());
-
+    fn test_incremental_digest() {
         let mut writer = CsrGraphWriter::new(10);
         let n0 = writer.add_node(CsrNodeRecord {
             node_id: 0,

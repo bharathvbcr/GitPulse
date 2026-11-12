@@ -184,6 +184,9 @@ impl Resolver {
             // so its `super` is `deep`, which lives in `src/deep/mod.rs` or
             // `src/deep.rs`.
             if clean_spec == "super" {
+                if let Some(declaring) = self.rust_path_modules.get(current_file) {
+                    return Some(declaring.clone());
+                }
                 for module_dir in self
                     .rust_module_dirs(current_file)
                     .iter()
@@ -266,8 +269,18 @@ impl Resolver {
             // Both readings of "where does this module keep its children", best
             // first — see `rust_module_dirs`. Each `super::` walks one directory
             // up from whichever base is being tried.
+            // A `#[path]` module's first `super` is the file that declares it,
+            // so the walk starts from that file's own child directories.
+            let (walk_from, hops) = match self
+                .rust_path_modules
+                .get(current_file)
+                .filter(|_| hops > 0)
+            {
+                Some(declaring) => (declaring.as_str(), hops - 1),
+                None => (current_file, hops),
+            };
             let bases: Vec<String> = self
-                .rust_module_dirs(current_file)
+                .rust_module_dirs(walk_from)
                 .into_iter()
                 .map(|mut module_dir| {
                     for _ in 0..hops {

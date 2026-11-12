@@ -407,13 +407,8 @@ const JS_BUILTINS: &[&str] = &[
 /// File API, XHR, CSSOM/CSSOM View, W3C Background Tasks and the observer
 /// specifications; and the Node.js "Global objects" documentation.
 const HOST_GLOBALS: &[(&str, &str)] = &[
-    // Svelte runes — compiler-injected, not ECMA-262. Sorted before ASCII
-    // letters (`$` < `A`). Authority: Svelte 5 rune documentation.
-    ("$bindable", "svelte"),
-    ("$derived", "svelte"),
-    ("$effect", "svelte"),
-    ("$props", "svelte"),
-    ("$state", "svelte"),
+    // Svelte runes are not listed here: `host_global_environment` answers them
+    // from `devmap_extract::languages::SVELTE_RUNES`, the one list.
     ("AbortController", "web+node"),
     ("AbortSignal", "web+node"),
     ("Blob", "web+node"),
@@ -1546,6 +1541,14 @@ pub fn host_global_environment(family: LangFamily, name: &str) -> Option<&'stati
     if family != LangFamily::JsTs {
         return None;
     }
+    // Svelte runes: compiler-injected, not ECMA-262. Authority: the Svelte 5
+    // rune documentation, as `SVELTE_RUNES` records it.
+    if name
+        .strip_prefix('$')
+        .is_some_and(devmap_extract::languages::is_svelte_rune)
+    {
+        return Some("svelte");
+    }
     HOST_GLOBALS
         .binary_search_by_key(&name, |(global, _)| *global)
         .ok()
@@ -1707,6 +1710,42 @@ mod tests {
                  runtime call"
             );
         }
+    }
+
+    /// The runes Svelte 5 compiles: `$state`, `$derived`, `$effect`, `$props`,
+    /// `$bindable`, `$inspect` and `$host`.
+    #[test]
+    fn every_svelte_rune_is_a_host_global_and_a_store_is_not() {
+        for rune in devmap_extract::languages::SVELTE_RUNES {
+            assert_eq!(
+                host_global_environment(LangFamily::JsTs, &format!("${rune}")),
+                Some("svelte"),
+                "${rune}"
+            );
+        }
+        for rune in [
+            "$state",
+            "$derived",
+            "$effect",
+            "$props",
+            "$bindable",
+            "$inspect",
+            "$host",
+        ] {
+            assert_eq!(
+                host_global_environment(LangFamily::JsTs, rune),
+                Some("svelte"),
+                "{rune}"
+            );
+        }
+        for not_a_rune in ["$markers", "$$props", "$", "$stateful"] {
+            assert_eq!(
+                host_global_environment(LangFamily::JsTs, not_a_rune),
+                None,
+                "{not_a_rune}"
+            );
+        }
+        assert_eq!(host_global_environment(LangFamily::Python, "$state"), None);
     }
 
     #[test]

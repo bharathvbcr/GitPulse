@@ -11,7 +11,9 @@ pub(crate) mod payload_codec;
 pub mod schema;
 pub mod seed;
 
-pub use delta::{DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore, DeltaSymbolRecord};
+pub use delta::{
+    DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore, DeltaSymbolRecord,
+};
 
 pub use coverage::{
     add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,
@@ -20,17 +22,17 @@ pub use coverage::{
     GAP_RESOLUTION_BUDGET,
 };
 pub use csr::{
-    apply_v30_pragmas, AtomicGraphHandle, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord,
-    FastBitSet, IncrementalDigestEngine, DC_GRAPH_MAGIC, DC_GRAPH_VERSION, V30_PRAGMAS,
+    AtomicGraphHandle, CsrFileChanged, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord,
+    FastBitSet, IncrementalDigestEngine, DC_GRAPH_MAGIC, DC_GRAPH_VERSION,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
     FileSymbolsPage, GenerationWriteOpts, KeywordNarrowing, LiteralPage, PageSizeConversion,
     PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede, PendingWatermark,
-    QuerySourceFreshness, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
+    QuerySourceFreshness, ReaderMemory, ResolverStamp, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
     StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow, UnresolvedSitesByName,
     UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
-    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
+    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS, RESOLVER_NEWER_REASON,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

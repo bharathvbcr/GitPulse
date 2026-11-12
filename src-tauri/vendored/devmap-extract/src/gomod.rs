@@ -219,6 +219,39 @@ pub struct RustCrateManifest {
     /// without a `path` is Cargo's auto-discovered `src/bin/<name>.rs` or
     /// `src/main.rs`, which the path convention already places.
     pub bin_paths: Vec<String>,
+    /// The dependencies this package names, in every `[dependencies]`,
+    /// `[dev-dependencies]`, `[build-dependencies]` and `[target.*.*]` table. The
+    /// one place the names a crate's code may spell are told apart from the
+    /// packages they stand for; see [`RustDependency`].
+    pub dependencies: Vec<RustDependency>,
+}
+
+/// One dependency entry: the name the crate's code spells it by and the package
+/// it is.
+///
+/// `log = { package = "dep", path = "../dep" }` is spelled `log` and is the
+/// package `dep`. Names are as Rust spells them (`-` read as `_`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustDependency {
+    /// The name the code writes (`log`).
+    pub name: String,
+    /// The package when the entry renames it with `package = ".."`; `None` is
+    /// "the package of the same name".
+    pub package: Option<String>,
+    /// `name = { workspace = true }` whose workspace entry was not found, so
+    /// what package it is stays unknown. A reader must not take it for the one
+    /// the name suggests.
+    pub unresolved_inherited: bool,
+}
+
+impl RustDependency {
+    /// The package this entry is, unless it is unknown.
+    pub fn package_name(&self) -> Option<&str> {
+        if self.unresolved_inherited {
+            return None;
+        }
+        Some(self.package.as_deref().unwrap_or(&self.name))
+    }
 }
 
 /// What one `Cargo.toml` declares: its package (absent for a virtual
@@ -228,6 +261,59 @@ pub struct RustCrateManifest {
 pub struct CargoManifest {
     pub package: Option<RustCrateManifest>,
     pub workspace_members: Vec<String>,
+    /// `[workspace.dependencies]`, which a member's `name = { workspace = true }`
+    /// takes its package from.
+    pub workspace_dependencies: Vec<RustDependency>,
+}
+
+/// The entries of one dependency table, `name = "1"` or `name = { .. }`. An
+/// entry that says `workspace = true` is marked unresolved until the walk has the
+/// workspace's table to resolve it against.
+fn cargo_dependency_entries(table: &toml::Value, out: &mut Vec<RustDependency>) {
+    let Some(table) = table.as_table() else {
+        return;
+    };
+    for (key, value) in table {
+        let package = value
+            .as_table()
+            .and_then(|entry| entry.get("package"))
+            .and_then(toml::Value::as_str)
+            .map(|package| package.replace('-', "_"));
+        let inherited = value
+            .as_table()
+            .and_then(|entry| entry.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        out.push(RustDependency {
+            name: key.replace('-', "_"),
+            package,
+            unresolved_inherited: inherited,
+        });
+    }
+}
+
+/// Every dependency table of a manifest: the three kinds, and the same three
+/// under each `[target.<cfg>.*]`.
+fn cargo_dependencies(manifest: &toml::Table) -> Vec<RustDependency> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut out = Vec::new();
+    for kind in KINDS {
+        if let Some(table) = manifest.get(kind) {
+            cargo_dependency_entries(table, &mut out);
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values().filter_map(toml::Value::as_table) {
+            for kind in KINDS {
+                if let Some(table) = target.get(kind) {
+                    cargo_dependency_entries(table, &mut out);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// A target `path` from a manifest at `dir`, repo-relative.
@@ -274,14 +360,33 @@ pub fn parse_cargo_manifest(dir: &str, source: &str) -> Result<CargoManifest, St
     };
     let Some(package) = manifest.get("package") else {
         if manifest.contains_key("workspace") {
+            let mut workspace_dependencies = Vec::new();
+            if let Some(table) = manifest
+                .get("workspace")
+                .and_then(toml::Value::as_table)
+                .and_then(|workspace| workspace.get("dependencies"))
+            {
+                cargo_dependency_entries(table, &mut workspace_dependencies);
+            }
             return Ok(CargoManifest {
                 package: None,
                 workspace_members,
+                workspace_dependencies,
             });
         }
         return Err("declares neither a `[package]` nor a `[workspace]`".to_string());
     };
     let package = package.as_table().ok_or("`package` is not a table")?;
+    let workspace_dependencies = manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .map(|table| {
+            let mut out = Vec::new();
+            cargo_dependency_entries(table, &mut out);
+            out
+        })
+        .unwrap_or_default();
     let name = package
         .get("name")
         .and_then(toml::Value::as_str)
@@ -319,8 +424,10 @@ pub fn parse_cargo_manifest(dir: &str, source: &str) -> Result<CargoManifest, St
             names,
             lib_path,
             bin_paths,
+            dependencies: cargo_dependencies(&manifest),
         }),
         workspace_members,
+        workspace_dependencies,
     })
 }
 
@@ -332,6 +439,37 @@ pub fn parse_cargo_crate_names(source: &str) -> Option<Vec<String>> {
         .ok()?
         .package
         .map(|package| package.names)
+}
+
+/// Resolve each `name = { workspace = true }` against the nearest enclosing
+/// manifest whose `[workspace.dependencies]` has the name. One that no table
+/// answers stays marked unresolved, which a reader treats as unknown.
+fn resolve_inherited_dependencies(
+    crates: &mut [RustCrateManifest],
+    workspaces: &[(String, Vec<RustDependency>)],
+) {
+    for package in crates {
+        let dir = package.dir.clone();
+        for dependency in package
+            .dependencies
+            .iter_mut()
+            .filter(|dependency| dependency.unresolved_inherited)
+        {
+            let inherited = workspaces
+                .iter()
+                .filter(|(workspace_dir, _)| {
+                    workspace_dir.is_empty()
+                        || dir == *workspace_dir
+                        || dir.starts_with(&format!("{workspace_dir}/"))
+                })
+                .max_by_key(|(workspace_dir, _)| workspace_dir.len())
+                .and_then(|(_, table)| table.iter().find(|entry| entry.name == dependency.name));
+            if let Some(entry) = inherited {
+                dependency.package = entry.package.clone();
+                dependency.unresolved_inherited = false;
+            }
+        }
+    }
 }
 
 /// The declared paths of one read `Cargo.toml` that do not exist: target
@@ -396,6 +534,8 @@ impl ProjectManifests {
 struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
+    /// `(directory, [workspace.dependencies])` of each manifest that has any.
+    rust_workspace_dependencies: Vec<(String, Vec<RustDependency>)>,
     python_roots: Vec<crate::pyproject::PythonSourceRoots>,
     swift_targets: Vec<crate::swifttargets::SwiftTarget>,
     gradle_modules: Vec<GradleSettings>,
@@ -512,6 +652,11 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
                                     ),
                                 },
                             ));
+                        }
+                        if !manifest.workspace_dependencies.is_empty() {
+                            found
+                                .rust_workspace_dependencies
+                                .push((dir.clone(), manifest.workspace_dependencies));
                         }
                         if let Some(package) = manifest.package {
                             found.rust_crates.push(package);
@@ -771,6 +916,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let Found {
         mut modules,
         mut rust_crates,
+        rust_workspace_dependencies,
         mut python_roots,
         mut swift_targets,
         mut gradle_modules,
@@ -800,6 +946,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    resolve_inherited_dependencies(&mut rust_crates, &rust_workspace_dependencies);
     package_manifests.sort_by(|left, right| left.0.cmp(&right.0));
     let workspaces = crate::workspaces::link_workspaces(&package_manifests);
     refusals.extend(

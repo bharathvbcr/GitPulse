@@ -50,12 +50,24 @@ pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
 use self::traversal::{
-    bare_callee_name, blast_radius_from_edges, family_of_path, indexed_traversal_starts,
-    indexed_traversed_edges, node_id_of, reached_by, BlastBand, BlastWalk, NamesakeRead,
-    AFFECTED_SYMBOL_SAMPLE, DEAD_SYMBOL_TOKENS, EDGE_TOKENS, EXPLORE_DEFINITION_OVERHEAD_TOKENS,
-    TRAVERSAL_MAX_NODES,
+    bare_callee_name, blast_radius_from_edges, component_note, family_of_path,
+    indexed_traversal_starts, indexed_traversed_edges, node_id_of, reached_by, BlastBand,
+    BlastWalk, NamesakeRead, AFFECTED_SYMBOL_SAMPLE, DEAD_SYMBOL_TOKENS, EDGE_TOKENS,
+    EXPLORE_DEFINITION_OVERHEAD_TOKENS, TRAVERSAL_MAX_NODES,
 };
 pub use self::traversal::{traversal_starts, traversed_resolution_edges};
+
+/// Add what the query said about a component to the answer's `note`, after any
+/// note the walk already set.
+fn attach_component_note<T>(response: &mut Response<T>, component: Option<String>) {
+    let Some(component) = component else {
+        return;
+    };
+    response.note = Some(match response.note.take() {
+        Some(existing) => format!("{existing}; {component}"),
+        None => component,
+    });
+}
 use self::verdict::StoreVerdict;
 pub use self::workspace::{link_candidates, workspace_search};
 // Only the parse-gated test modules count source-span reads.
@@ -1274,13 +1286,17 @@ impl<'a> StoreQueryEngine<'a> {
             }));
         };
         let direction = index.directed(reverse, req.min_confidence);
+        let component = component_note(&index, req.query.trim(), reverse, &self.cancel)?;
         if !reverse {
-            return self.traverse_over(&index, &direction, req, min_rung);
+            let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
+            attach_component_note(&mut response, component);
+            return Ok(response);
         }
         let target = req.query.clone();
         let min_confidence = req.min_confidence;
         let token_budget = req.token_budget;
         let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
+        attach_component_note(&mut response, component);
         self.attach_unresolved_namesakes(
             generation,
             &index,

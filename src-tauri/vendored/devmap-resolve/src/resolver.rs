@@ -390,6 +390,32 @@ pub struct Resolver {
     /// module path segment that is no child of a file may be a module one of
     /// these publishes (see `rust_module_through_globs`).
     rust_module_globs: BTreeMap<String, Vec<String>>,
+    /// Rust files whose set of published names the index cannot be sure it
+    /// holds whole: an item-position macro invocation, a partial parse, or a
+    /// `pub use m::*;` whose source is not indexed.
+    rust_opaque_publishers: BTreeSet<String>,
+    /// What could rebind a macro name, per crate (see `rust_site_scope::NO_MANIFEST`
+    /// and `rust_site_scope::rust_crate_key_in` for what a crate is).
+    rust_crate_macros: BTreeMap<String, rust_site_scope::CrateMacros>,
+    /// The crate key of every indexed Rust file, so a call site's crate is one
+    /// lookup rather than a scan of the manifests.
+    rust_crate_of_file: BTreeMap<String, String>,
+    /// For a glob import written in a block of a file's own module, keyed by
+    /// `(file, import start byte)`: every name the glob might provide, with the
+    /// one declaration it comes from (`None` when that is not one declaration).
+    /// Present only when the index can prove the set whole.
+    rust_glob_names: BTreeMap<(String, usize), rust_site_scope::GlobNames>,
+    /// Rust: a file a `#[path = "x.rs"] mod x;` declaration names -> the one
+    /// file that declares it. That file is the module's parent, whatever the
+    /// directory layout says (see `compute_rust_path_modules`).
+    rust_path_modules: BTreeMap<String, String>,
+    /// Rust: `<file>` -> the module files its `use m::*;` globs name, private
+    /// ones included. A child module sees what its parent's private globs
+    /// brought in, which `rust_module_globs` (the `pub use` surface) does not say.
+    rust_scope_globs: BTreeMap<String, Vec<String>>,
+    /// Rust: `<file>` -> `(name, file, name)` for each unaliased name its `use`
+    /// lines import by name. The same child-module visibility as the globs above.
+    rust_scope_named: BTreeMap<String, Vec<(String, String)>>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -724,6 +750,15 @@ pub struct Resolver {
     /// Per Rust file, the names of the inline `mod name { … }` blocks it
     /// declares. See `Extraction::rust_inline_modules`.
     rust_inline_modules: BTreeMap<String, BTreeSet<String>>,
+    /// Per Rust file, what its modules, declarations and imports let a call
+    /// site see. See `rust_site_scope`.
+    rust_site_scope: BTreeMap<String, rust_site_scope::RustFileScope>,
+    /// `(file, import start byte, local name)` -> the `(file, declared name)` that
+    /// one Rust `use` binds. The file-wide bindings keep one answer per name; a
+    /// `use` inside a block binds the same name to something else for that block.
+    rust_import_targets: BTreeMap<(String, usize, String), (String, String)>,
+    /// `(file, qualified name)` of the Rust bodies that sit under `#[cfg]`.
+    rust_cfg_bodies: BTreeSet<(String, String)>,
     /// Rust type name → the type it `Deref`s to; `None` when two indexed
     /// `impl Deref` blocks disagree about a type of that name.
     rust_deref_targets: BTreeMap<String, Option<String>>,
@@ -790,6 +825,13 @@ impl Resolver {
             reexport_chains: BTreeMap::new(),
             reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
+            rust_opaque_publishers: BTreeSet::new(),
+            rust_crate_macros: BTreeMap::new(),
+            rust_crate_of_file: BTreeMap::new(),
+            rust_glob_names: BTreeMap::new(),
+            rust_path_modules: BTreeMap::new(),
+            rust_scope_globs: BTreeMap::new(),
+            rust_scope_named: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -847,6 +889,9 @@ impl Resolver {
             swift_module_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             rust_inline_modules: BTreeMap::new(),
+            rust_site_scope: BTreeMap::new(),
+            rust_import_targets: BTreeMap::new(),
+            rust_cfg_bodies: BTreeSet::new(),
             rust_deref_targets: BTreeMap::new(),
             rust_blanket_methods: BTreeMap::new(),
             max_indexed_path_depth: 0,
@@ -901,6 +946,9 @@ pub use resolve_all::{
 mod candidates;
 
 mod rust_modules;
+
+mod rust_site_scope;
+use rust_site_scope::{RustOrigin, Site};
 
 mod scope;
 

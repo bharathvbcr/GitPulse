@@ -265,11 +265,12 @@ pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
 /// files counted as parse failures, every one of them prose or data, hiding the
 /// 16 real ones.
 pub fn has_dedicated_reader(language: &str) -> bool {
-    matches!(language, "css" | "html")
+    matches!(language, "css" | "html" | "lean")
 }
 
 pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> FallbackScan {
     match language {
+        "lean" => return crate::lean::scan_lean(file_path, source),
         "css" => {
             return from_markup(
                 crate::markup::scan_stylesheet(file_path, source),

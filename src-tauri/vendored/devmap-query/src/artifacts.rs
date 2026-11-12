@@ -618,6 +618,82 @@ impl ArtifactStamp {
     }
 }
 
+/// Whether the consumer artifacts on disk were written from the store's
+/// current generation.
+///
+/// The question a consumer that reads `repo_map.json` / `code_graph.json`
+/// directly has no cheap way to ask: a plain `devmap build` advances the store
+/// and writes neither file, so the files keep describing an older generation
+/// and, read on their own, look healthy. The answer comes from the sidecar —
+/// bytes the artifacts' own `freshness.generation_id` already agrees with — so
+/// asking never opens a 78 MB file.
+///
+/// Fail-closed: no sidecar, no recorded generation, a store with no generation,
+/// or an output that no longer stats as written is `current: false`, with the
+/// reason named. "Could not tell" never reads as "current".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactCurrency {
+    pub current: bool,
+    /// The generation the sidecar says the artifacts were written from.
+    pub written_from_generation: Option<u64>,
+    pub store_generation: Option<u64>,
+    /// Why `current` is false; `None` when it is true.
+    pub reason: Option<String>,
+    /// Per output role, whether the file still stats exactly as it was written.
+    pub outputs: BTreeMap<String, bool>,
+}
+
+impl ArtifactCurrency {
+    pub fn of(stamp: Option<&ArtifactStamp>, store_generation: Option<u32>) -> Self {
+        let store_generation = store_generation.map(u64::from);
+        let Some(stamp) = stamp else {
+            return Self {
+                current: false,
+                written_from_generation: None,
+                store_generation,
+                reason: Some(
+                    "no artifact stamp: the consumer artifacts were never written by \
+                     this store, or were written before stamps existed"
+                        .to_string(),
+                ),
+                outputs: BTreeMap::new(),
+            };
+        };
+        let written = stamp
+            .inputs
+            .get("generation_id")
+            .and_then(serde_json::Value::as_u64);
+        let outputs: BTreeMap<String, bool> = stamp
+            .outputs
+            .iter()
+            .map(|record| (record.role.clone(), record.still_describes_disk()))
+            .collect();
+        let reason = match (written, store_generation) {
+            (_, None) => Some("the store holds no generation to compare against".to_string()),
+            (None, _) => Some("the artifact stamp records no generation".to_string()),
+            (Some(written), Some(store)) if written != store => Some(format!(
+                "the artifacts were written from generation {written} and the store is at \
+                 {store}; run `devmap build --manifest` to rewrite them"
+            )),
+            _ => outputs
+                .iter()
+                .find(|(_, intact)| !**intact)
+                .map(|(role, _)| format!("{role} no longer stats as it was written")),
+        };
+        Self {
+            current: reason.is_none() && !outputs.is_empty(),
+            written_from_generation: written,
+            store_generation,
+            reason: reason.or_else(|| {
+                outputs
+                    .is_empty()
+                    .then(|| "the artifact stamp lists no outputs".to_string())
+            }),
+            outputs,
+        }
+    }
+}
+
 /// Skip regeneration when fingerprint matches existing artifact header (V14).
 pub fn should_regenerate(path: &Path, fp: &ArtifactFingerprint) -> bool {
     if !path.exists() {
@@ -681,6 +757,35 @@ mod tests {
         map.insert("generation_id".to_string(), generation.into());
         map.insert("content_fingerprint".to_string(), "c2:abc".into());
         map
+    }
+
+    /// Currency is false whenever it cannot be proved: no stamp, no store
+    /// generation, an older generation, or an output that changed on disk.
+    #[test]
+    fn artifact_currency_is_proved_never_assumed() {
+        let dir = stamp_dir("currency");
+        let map = dir.join("repo_map.json");
+        fs::write(&map, br#"{"map_engine":"devmap-rust"}"#).unwrap();
+        let outputs = [("repo_map", map.as_path())];
+        let stamp = ArtifactStamp::of(inputs(7), None, &outputs).unwrap();
+
+        let current = ArtifactCurrency::of(Some(&stamp), Some(7));
+        assert!(current.current, "{current:?}");
+        assert_eq!(current.written_from_generation, Some(7));
+        assert_eq!(current.reason, None);
+
+        let lagging = ArtifactCurrency::of(Some(&stamp), Some(9));
+        assert!(!lagging.current);
+        let reason = lagging.reason.expect("a lag names its reason");
+        assert!(reason.contains('7') && reason.contains('9'), "{reason}");
+
+        assert!(!ArtifactCurrency::of(None, Some(7)).current);
+        assert!(!ArtifactCurrency::of(Some(&stamp), None).current);
+
+        fs::write(&map, br#"{"map_engine":"other"}"#).unwrap();
+        let changed = ArtifactCurrency::of(Some(&stamp), Some(7));
+        assert!(!changed.current, "an edited output is not the one written");
+        assert_eq!(changed.outputs.get("repo_map"), Some(&false));
     }
 
     /// The whole point of the sidecar: after a write, the same inputs skip; any

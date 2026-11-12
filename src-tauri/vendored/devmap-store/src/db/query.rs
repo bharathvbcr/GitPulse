@@ -1,10 +1,10 @@
 use super::{
     append_kinds, append_languages, append_narrowing, append_paths, checked_min_confidence,
-    checked_span, decode_stored_outcome, distinct_kinds, fts_failure, fts_match_query,
-    literal_predicate, lock_conn, refusal, sqlite_limit, stored_symbol_from_row, CallersPage,
-    DeadPage, EdgeSide, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks,
-    SearchNarrowing, SearchPage, Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
-    FTS_ORD_SQL, FTS_PAYLOAD_SQL, LITERAL_SITES,
+    checked_span, decode_stored_outcome, distinct_kinds, fts_match_query, literal_predicate,
+    lock_conn, refusal, sqlite_limit, stored_symbol_from_row, CallersPage, DeadPage, EdgeSide,
+    FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks, SearchNarrowing, SearchPage,
+    Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol, FTS_ORD_SQL, FTS_PAYLOAD_SQL,
+    LITERAL_SITES,
 };
 use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
@@ -60,7 +60,7 @@ impl Store {
             }
             Ok(out)
         };
-        read().map_err(fts_failure)
+        read().map_err(|error| Self::fts_verdict(&snapshot, error))
     }
 
     /// Search only the latest persisted generation. This never reads or parses
@@ -263,7 +263,7 @@ impl Store {
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
             ))
-            .map_err(fts_failure)?;
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         let rows = stmt
             .query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
                 let name: String = row.get(0)?;
@@ -280,10 +280,13 @@ impl Store {
                     content_hash: row.get::<_, i64>(7)? as u64,
                 })
             })
-            .map_err(fts_failure)?;
-        let page = rows.collect::<Result<Vec<_>>>().map_err(fts_failure)?;
+            .map_err(|error| Self::fts_verdict(conn, error))?;
+        let page = rows
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         if page.is_empty() {
-            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
+            Self::require_searchable_index(conn, gen)
+                .map_err(|error| Self::fts_verdict(conn, error))?;
         }
         Ok(page)
     }
@@ -320,9 +323,10 @@ impl Store {
                 params![gen, match_query],
                 |row| row.get(0),
             )
-            .map_err(fts_failure)?;
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         if count == 0 {
-            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
+            Self::require_searchable_index(conn, gen)
+                .map_err(|error| Self::fts_verdict(conn, error))?;
         }
         u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
     }
@@ -424,11 +428,12 @@ impl Store {
         };
         let (predicate, mut params) = literal_predicate(generation, query, exact);
         let count_sql = format!("SELECT COUNT(*) FROM {LITERAL_SITES} WHERE {predicate}");
-        let count: i64 = snapshot
-            .query_row(&count_sql, params_from_iter(params.iter()), |row| {
+        // These statements read the literal sites and never `nodes_fts`, so a
+        // corrupt read here is not index damage and is not worded as such.
+        let count: i64 =
+            snapshot.query_row(&count_sql, params_from_iter(params.iter()), |row| {
                 row.get(0)
-            })
-            .map_err(fts_failure)?;
+            })?;
         let total =
             u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
         let page_sql = format!(
@@ -441,22 +446,20 @@ impl Store {
         );
         let limit = i64::try_from(page_cap.max(1)).unwrap_or(i64::MAX);
         params.push(Box::new(limit));
-        let mut stmt = snapshot.prepare(&page_sql).map_err(fts_failure)?;
-        let rows = stmt
-            .query_map(params_from_iter(params.iter()), |row| {
-                Ok(StoredLiteral {
-                    file_path: row.get(0)?,
-                    line: u32::try_from(row.get::<_, i64>(1)?).unwrap_or(u32::MAX),
-                    span_start: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
-                    value: row.get(3)?,
-                    qualified_name: row.get(4)?,
-                    symbol_name: row.get(5)?,
-                })
+        let mut stmt = snapshot.prepare(&page_sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            Ok(StoredLiteral {
+                file_path: row.get(0)?,
+                line: u32::try_from(row.get::<_, i64>(1)?).unwrap_or(u32::MAX),
+                span_start: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                value: row.get(3)?,
+                qualified_name: row.get(4)?,
+                symbol_name: row.get(5)?,
             })
-            .map_err(fts_failure)?;
+        })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(fts_failure)?);
+            out.push(row?);
         }
         Ok(Some(LiteralPage { total, rows: out }))
     }
@@ -516,9 +519,10 @@ impl Store {
             .query_row(&count_sql, params_from_iter(count_params.iter()), |row| {
                 row.get(0)
             })
-            .map_err(fts_failure)?;
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         if count == 0 {
-            Self::require_searchable_index(conn, generation).map_err(fts_failure)?;
+            Self::require_searchable_index(conn, generation)
+                .map_err(|error| Self::fts_verdict(conn, error))?;
         }
         let total =
             u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
@@ -540,18 +544,21 @@ impl Store {
         append_narrowing(&mut page_sql, &mut page_params, filter);
         page_sql.push_str(" ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start LIMIT ?");
         page_params.push(Box::new(sqlite_limit(limit)));
-        let mut stmt = conn.prepare(&page_sql).map_err(fts_failure)?;
+        let mut stmt = conn
+            .prepare(&page_sql)
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         let mapped = stmt
             .query_map(params_from_iter(page_params.iter()), |row| {
                 stored_symbol_from_row(row)
             })
-            .map_err(fts_failure)?;
+            .map_err(|error| Self::fts_verdict(conn, error))?;
         let mut rows = Vec::new();
         for row in mapped {
-            rows.push(row.map_err(fts_failure)?);
+            rows.push(row.map_err(|error| Self::fts_verdict(conn, error))?);
         }
         if rows.is_empty() {
-            Self::require_searchable_index(conn, generation).map_err(fts_failure)?;
+            Self::require_searchable_index(conn, generation)
+                .map_err(|error| Self::fts_verdict(conn, error))?;
         }
         let narrowing = Self::narrowing_counts(conn, generation, filter)?;
         Ok((total, rows, Some(narrowing)))
@@ -1229,27 +1236,32 @@ impl Store {
             return Ok(None);
         };
         let csr_path = Self::csr_sidecar_path(db_path);
-        let mut tmp_name = csr_path.file_name().map_or_else(
-            || std::ffi::OsString::from("devmap.sqlite.csr"),
-            |n| n.to_os_string(),
-        );
-        tmp_name.push(format!(".tmp.{}", std::process::id()));
-        let tmp_path = csr_path.with_file_name(tmp_name);
-        if let Err(err) = index.to_csr_writer().write_to_file(&tmp_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(anyhow::anyhow!(
-                "cannot write CSR sidecar {}: {err}",
-                tmp_path.display()
-            ));
+        // `write_to_file` owns the one temp-then-rename layer (with the
+        // directory fsync and the replaced file's mode), so the sidecar is
+        // written straight to its final name.
+        match index.to_csr_writer().write_to_file(&csr_path) {
+            Ok(()) => Ok(Some(csr_path)),
+            // Written, with its durability unconfirmed: say so, not "cannot write".
+            Err(err)
+                if err
+                    .downcast_ref::<crate::csr::graph::CsrWrittenUnsynced>()
+                    .is_some() =>
+            {
+                Err(err)
+            }
+            // The temp file was written and could not be placed.
+            Err(err) => match err.downcast_ref::<crate::csr::graph::CsrPlaceFailed>() {
+                Some(placed) => Err(anyhow::anyhow!(
+                    "cannot place CSR sidecar {}: {}",
+                    csr_path.display(),
+                    placed.source
+                )),
+                None => Err(anyhow::anyhow!(
+                    "cannot write CSR sidecar {}: {err}",
+                    csr_path.display()
+                )),
+            },
         }
-        if let Err(err) = std::fs::rename(&tmp_path, &csr_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(anyhow::anyhow!(
-                "cannot place CSR sidecar {}: {err}",
-                csr_path.display()
-            ));
-        }
-        Ok(Some(csr_path))
     }
 
     /// Best-effort wrapper around [`Self::write_latest_csr_sidecar_strict`] for
@@ -1262,7 +1274,14 @@ impl Store {
         }
         // A store with no readable edges is an error, not a missing sidecar.
         self.generation_edges_with_id()?;
-        Ok(self.write_latest_csr_sidecar_strict().ok().flatten())
+        match self.write_latest_csr_sidecar_strict() {
+            Ok(written) => Ok(written),
+            // The sidecar is in place and valid; only the directory sync is
+            // unconfirmed, and this wrapper's job is to have the file.
+            Err(err) => Ok(err
+                .downcast_ref::<crate::csr::graph::CsrWrittenUnsynced>()
+                .map(|unsynced| unsynced.path.clone())),
+        }
     }
 
     /// Open a zero-copy [`crate::csr::CsrGraphReader`] for the store's latest generation.

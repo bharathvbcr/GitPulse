@@ -10,10 +10,10 @@
 //! not reach the network, and a pinned table is auditable against a pinned
 //! upstream tag.
 //!
-//! Four ids resolve to [`NEUTRAL_COLOR`] and must never be dressed up as if
+//! Five ids resolve to [`NEUTRAL_COLOR`] and must never be dressed up as if
 //! Linguist had an opinion about them:
 //!
-//! * `cobol` and `protobuf` are Linguist languages that declare no `color`.
+//! * `cobol`, `lean` and `protobuf` are Linguist languages that declare no `color`.
 //! * `config` and `generic` are ours, not Linguist's — the buckets
 //!   [`devmap_extract::detect_language`] returns for manifests and for anything
 //!   it could not classify.
@@ -65,6 +65,7 @@ const TABLE: &[(&str, Option<&str>, &str)] = &[
     ("javascript", Some("#f1e05a"), "JavaScript"),
     ("json", Some("#292929"), "JSON"),
     ("kotlin", Some("#A97BFF"), "Kotlin"),
+    ("lean", None, "Lean 4"), // Linguist declares no colour
     ("liquid", Some("#67b8de"), "Liquid"),
     ("lua", Some("#000080"), "Lua"),
     ("luau", Some("#00A2FF"), "Luau"),
@@ -201,7 +202,7 @@ mod tests {
         // The honesty contract: a language Linguist has no colour for must be
         // distinguishable from one it does, or the legend lies about which
         // greys were a choice.
-        for id in ["cobol", "protobuf", "config", "generic"] {
+        for id in ["cobol", "lean", "protobuf", "config", "generic"] {
             let s = swatch(id);
             assert_eq!(s.color, NEUTRAL_COLOR, "{id} should be neutral");
             assert!(!s.official, "{id} must not claim an official colour");

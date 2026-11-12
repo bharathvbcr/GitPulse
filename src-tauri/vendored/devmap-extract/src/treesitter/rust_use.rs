@@ -253,22 +253,198 @@ pub(super) fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> 
 /// A `mod name;` declaration has no body and names a file, so it is not an
 /// inline module. The walk is an explicit worklist, bounded by the same
 /// deadline every other whole-tree pass here honours.
-pub(super) fn collect_rust_item_facts(
-    root: Node,
-    source: &str,
-) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
+pub(super) fn collect_rust_item_facts(root: Node, source: &str) -> RustItemFacts {
     let mut modules = BTreeSet::new();
+    let mut scopes: Vec<RustScopeSpan> = Vec::new();
+    let mut macros = BTreeSet::new();
+    let mut macro_calls: Vec<RustMacroCall> = Vec::new();
+    let mut macros_defined = BTreeSet::new();
+    let mut attr_macros: Vec<RustAttrMacro> = Vec::new();
+    let mut macro_use = false;
+    let mut no_std = false;
+    let mut no_implicit_prelude = false;
+    let mut extern_crates: Vec<RustExternCrate> = Vec::new();
+    let mut macro_use_mods: BTreeSet<String> = BTreeSet::new();
+    let mut pending_derives: Vec<(Vec<String>, usize)> = Vec::new();
+    let mut foreign_derive_names: BTreeSet<String> = BTreeSet::new();
+    let mut restricted: Vec<(usize, String)> = Vec::new();
+    let mut cfg_spans: Vec<(usize, usize)> = Vec::new();
     let mut derefs = BTreeSet::new();
     let mut blankets = BTreeSet::new();
+    let mut complete = true;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if walk_deadline_passed() {
+            complete = false;
             break;
         }
         match node.kind() {
-            "mod_item" if node.child_by_field_name("body").is_some() => {
+            "mod_item" => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    if let Some(name) = get_child_text(node, "name", source) {
+                        scopes.push(RustScopeSpan {
+                            kind: RustScopeKind::Module,
+                            name: name.clone(),
+                            start: body.start_byte(),
+                            end: body.end_byte(),
+                        });
+                        modules.insert(name);
+                    }
+                }
+            }
+            "block" => {
+                let mut cursor = node.walk();
+                let holds_names = node.named_children(&mut cursor).any(|child| {
+                    rust_node_declares_names(child.kind()) || rust_statement_macro(child)
+                });
+                if holds_names {
+                    scopes.push(RustScopeSpan {
+                        kind: RustScopeKind::Block,
+                        name: String::new(),
+                        start: node.start_byte(),
+                        end: node.end_byte(),
+                    });
+                }
+            }
+            // An invocation that stands where an item would: its parent is an
+            // item list, or the `;`-terminated statement the grammar wraps it
+            // in at that position. One that stands as a statement of a block
+            // can declare items and `use`s for that block as well. One inside
+            // an expression cannot.
+            "macro_invocation" => {
+                let as_item = rust_macro_stands_as_item(node);
+                if as_item || rust_macro_stands_as_statement(node) {
+                    if let Some(path) = node.child_by_field_name("macro") {
+                        let name = get_node_text(path, source);
+                        if as_item {
+                            macros.insert(name.clone());
+                        }
+                        let declares = if name.rsplit("::").next() == Some("thread_local") {
+                            rust_thread_local_statics(node, source)
+                        } else {
+                            Vec::new()
+                        };
+                        macro_calls.push(RustMacroCall {
+                            name,
+                            start: node.start_byte(),
+                            declares,
+                        });
+                    }
+                }
+            }
+            "attribute_item" | "inner_attribute_item" => {
+                let text = get_node_text(node, source);
+                let inner = rust_attribute_body(&text);
+                let leaves = rust_attribute_leaves(inner);
+                // The prelude facts: `#![no_std]` (possibly through a `cfg_attr`)
+                // and `#![no_implicit_prelude]` change which macros every module
+                // of the crate sees before any import.
+                no_std |= leaves.iter().any(|leaf| leaf.name == "no_std");
+                no_implicit_prelude |= leaves.iter().any(|leaf| leaf.name == "no_implicit_prelude");
+                let mut next = node.next_sibling();
+                while let Some(n) = next {
+                    if matches!(
+                        n.kind(),
+                        "attribute_item" | "line_comment" | "block_comment"
+                    ) {
+                        next = n.next_sibling();
+                    } else {
+                        break;
+                    }
+                }
+                // `#[macro_use]` on a module publishes that module's own
+                // `macro_rules!`, which the crate's `defined` names once the
+                // module's file is read: an inline module is read here, an
+                // out-of-line one only when its file is indexed, so its name is
+                // recorded for the resolver to check (a `#[path]` module is not
+                // followed at all). On an `extern crate` it is recorded with the
+                // item. Anywhere else (or with no item after it) it is not
+                // understood.
+                if leaves.iter().any(|leaf| leaf.name == "macro_use") {
+                    let item = next.filter(|_| node.kind() == "attribute_item");
+                    match item.map(|item| item.kind()) {
+                        Some("extern_crate_declaration") => {}
+                        Some("mod_item") => {
+                            let item = item.expect("a mod item");
+                            if item.child_by_field_name("body").is_none() {
+                                let path_attr = rust_item_attribute_leaves(item, source)
+                                    .iter()
+                                    .any(|leaf| leaf.name == "path");
+                                match (
+                                    get_child_text(item, "name", source),
+                                    rust_inline_module_chain(item, source),
+                                ) {
+                                    (Some(name), Some(mut chain)) if !path_attr => {
+                                        chain.push(name);
+                                        macro_use_mods.insert(chain.join("/"));
+                                    }
+                                    _ => macro_use = true,
+                                }
+                            }
+                        }
+                        _ => macro_use = true,
+                    }
+                }
+                // An inner attribute (`#![..]`) belongs to the module or crate that
+                // holds it, and stable Rust has no inner attribute macro, so it is
+                // never a macro on the item that follows it.
+                let eligible = || {
+                    let in_block = node.parent().is_some_and(|p| p.kind() == "block");
+                    node.kind() == "attribute_item"
+                        && next
+                            .filter(|n| rust_node_declares_names(n.kind()))
+                            .is_some_and(|item| {
+                                in_block
+                                    || matches!(
+                                        item.kind(),
+                                        "use_declaration" | "mod_item" | "extern_crate_declaration"
+                                    )
+                            })
+                };
+                if let Some(leaf) = leaves
+                    .iter()
+                    .find(|leaf| !rust_attribute_is_inert(&leaf.name, &leaf.whole))
+                {
+                    if eligible() {
+                        attr_macros.push(RustAttrMacro {
+                            name: leaf.name.clone(),
+                            start: node.start_byte(),
+                        });
+                    }
+                } else {
+                    // Every derive here names a bare std trait. It is the std one
+                    // unless a `use` of another crate rebinds the name, which is
+                    // known once the walk has seen every `use`.
+                    let bare: Vec<String> = leaves
+                        .iter()
+                        .filter(|leaf| leaf.name == "derive")
+                        .flat_map(|leaf| rust_bare_derive_names(&leaf.whole))
+                        .collect();
+                    if !bare.is_empty() && eligible() {
+                        pending_derives.push((bare, node.start_byte()));
+                    }
+                }
+            }
+            "use_declaration" => {
+                let text = get_node_text(node, source);
+                for name in rust_foreign_derive_imports(&text) {
+                    foreign_derive_names.insert(name);
+                }
+            }
+            "extern_crate_declaration" => {
                 if let Some(name) = get_child_text(node, "name", source) {
-                    modules.insert(name);
+                    extern_crates.push(RustExternCrate {
+                        name,
+                        alias: get_child_text(node, "alias", source),
+                        macro_use: rust_item_attribute_leaves(node, source)
+                            .iter()
+                            .any(|leaf| leaf.name == "macro_use"),
+                    });
+                }
+            }
+            "macro_definition" => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    macros_defined.insert(name);
                 }
             }
             "impl_item" => {
@@ -281,13 +457,461 @@ pub(super) fn collect_rust_item_facts(
             }
             _ => {}
         }
+        if matches!(
+            node.kind(),
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "mod_item"
+                | "function_signature_item"
+        ) {
+            let mut cursor = node.walk();
+            let modifier = node
+                .children(&mut cursor)
+                .find(|child| child.kind() == "visibility_modifier");
+            if let Some(modifier) = modifier {
+                let text = get_node_text(modifier, source);
+                if text.contains('(') {
+                    restricted.push((
+                        node.start_byte(),
+                        text.split_whitespace().collect::<String>(),
+                    ));
+                }
+            }
+        }
+        if matches!(
+            node.kind(),
+            "function_item" | "impl_item" | "mod_item" | "use_declaration"
+        ) && rust_item_has_cfg_attribute(node, source)
+        {
+            cfg_spans.push((node.start_byte(), node.end_byte()));
+        }
         push_named_children(node, &mut stack);
     }
-    (
-        modules.into_iter().collect(),
-        derefs.into_iter().collect(),
-        blankets.into_iter().collect(),
+    for (names, start) in pending_derives {
+        if names.iter().any(|name| foreign_derive_names.contains(name)) {
+            attr_macros.push(RustAttrMacro {
+                name: "derive".to_string(),
+                start,
+            });
+        }
+    }
+    scopes.sort_by_key(|scope| (scope.start, scope.end));
+    scopes.dedup();
+    restricted.sort();
+    restricted.dedup();
+    cfg_spans.sort();
+    cfg_spans.dedup();
+    macro_calls.sort_by_key(|call| call.start);
+    macro_calls.dedup();
+    RustItemFacts {
+        inline_modules: modules.into_iter().collect(),
+        scope_facts: complete.then(|| RustScopeFacts {
+            scopes,
+            item_macros: macros.into_iter().collect(),
+            restricted_visibility: restricted,
+            cfg_spans,
+            macros: Some(RustMacroFacts {
+                facts_version: RUST_MACRO_FACTS_VERSION,
+                no_std,
+                no_implicit_prelude,
+                calls: macro_calls,
+                defined: macros_defined.into_iter().collect(),
+                attrs: attr_macros,
+                macro_use,
+                extern_crates,
+                macro_use_mods: macro_use_mods.into_iter().collect(),
+            }),
+        }),
+        deref_targets: derefs.into_iter().collect(),
+        blanket_impl_params: blankets.into_iter().collect(),
+    }
+}
+
+/// Whether a node of this kind, as a direct child of a block, declares or
+/// imports a name that only that block can see.
+fn rust_node_declares_names(kind: &str) -> bool {
+    matches!(
+        kind,
+        "use_declaration"
+            | "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "impl_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "mod_item"
+            | "macro_definition"
+            | "extern_crate_declaration"
+            | "foreign_mod_item"
     )
+}
+
+/// Whether the attributes written directly above `node` include a `cfg` or
+/// `cfg_attr`.
+fn rust_item_has_cfg_attribute(node: Node, source: &str) -> bool {
+    let mut previous = node.prev_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                let text = get_node_text(sibling, source);
+                // The attribute's name is the identifier after `#[`, however it
+                // is spaced: `#[cfg (x)]` and `#[ cfg(x) ]` are `cfg` too.
+                let inner = text.trim_start_matches("#[").trim_start();
+                let name_end = inner
+                    .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .unwrap_or(inner.len());
+                if matches!(&inner[..name_end], "cfg" | "cfg_attr") {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => return false,
+        }
+        previous = sibling.prev_sibling();
+    }
+    false
+}
+
+/// The std derives that emit an `impl` and nothing else.
+const STD_DERIVES: &[&str] = &[
+    "Debug",
+    "Clone",
+    "Copy",
+    "PartialEq",
+    "Eq",
+    "Hash",
+    "PartialOrd",
+    "Ord",
+    "Default",
+];
+
+/// The attributes written directly above `item`, comments between them skipped.
+fn rust_item_attribute_leaves(item: Node, source: &str) -> Vec<AttributeLeaf> {
+    let mut leaves = Vec::new();
+    let mut previous = item.prev_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                let text = get_node_text(sibling, source);
+                leaves.extend(rust_attribute_leaves(rust_attribute_body(&text)));
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_sibling();
+    }
+    leaves
+}
+
+/// The bare names a `derive(..)` attribute lists (no path).
+fn rust_bare_derive_names(whole: &str) -> Vec<String> {
+    let args = whole
+        .split_once('(')
+        .map_or("", |(_, rest)| rest.trim_end_matches(')'));
+    rust_split_top_level_commas(args)
+        .into_iter()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.contains("::"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The inline modules (`mod outer { .. }`) that hold `item`, outermost first;
+/// `None` when it sits in a block, whose module path the file layout does not
+/// follow.
+fn rust_inline_module_chain(item: Node, source: &str) -> Option<Vec<String>> {
+    let mut chain = Vec::new();
+    let mut current = item.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "block" => return None,
+            "declaration_list" => {
+                if let Some(module) = parent.parent().filter(|m| m.kind() == "mod_item") {
+                    chain.push(get_child_text(module, "name", source)?);
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    chain.reverse();
+    Some(chain)
+}
+
+/// The std derive names a `use` declaration may bind to something that is not
+/// std's: any listed name that appears in a `use` path that does not start at
+/// `std`, `core` or `alloc`. A braced list is taken apart, so
+/// `use {std::fmt::Debug, dep::Clone};` names dep's `Clone` and not std's `Debug`.
+fn rust_foreign_derive_imports(use_text: &str) -> Vec<String> {
+    let body = use_text
+        .split_once("use")
+        .map_or(use_text, |(_, rest)| rest)
+        .trim()
+        .trim_end_matches(';');
+    rust_foreign_derive_tree(body)
+}
+
+fn rust_foreign_derive_tree(tree: &str) -> Vec<String> {
+    let tree = tree.trim().trim_start_matches("::").trim_start();
+    if let Some(inner) = tree.strip_prefix('{') {
+        let inner = inner.trim_end().strip_suffix('}').unwrap_or(inner);
+        return rust_split_top_level_commas(inner)
+            .into_iter()
+            .flat_map(rust_foreign_derive_tree)
+            .collect();
+    }
+    let root = tree
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("");
+    if matches!(root, "std" | "core" | "alloc") {
+        return Vec::new();
+    }
+    tree.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|token| STD_DERIVES.contains(token))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What sits between `#[` and `]` (or `#![` and `]`) of an attribute item.
+fn rust_attribute_body(text: &str) -> &str {
+    text.trim()
+        .trim_start_matches("#!")
+        .trim_start_matches("#")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+}
+
+/// One attribute as the compiler will see it: its path and its whole text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttributeLeaf {
+    name: String,
+    whole: String,
+}
+
+/// The attributes an attribute body stands for. `cfg_attr(pred, a, b(..))` is
+/// `a` and `b(..)` whenever `pred` holds; the predicate is not evaluated, so each
+/// inner attribute counts as possibly present. Nesting is followed to a bounded
+/// depth; a `cfg_attr` that cannot be taken apart is itself returned, and it is
+/// not inert.
+fn rust_attribute_leaves(body: &str) -> Vec<AttributeLeaf> {
+    let mut leaves = Vec::new();
+    rust_attribute_leaves_into(body, 0, &mut leaves);
+    leaves
+}
+
+fn rust_attribute_leaves_into(body: &str, depth: usize, out: &mut Vec<AttributeLeaf>) {
+    let body = body.trim();
+    let end = body
+        .find(|c: char| c == '(' || c == '=' || c.is_whitespace())
+        .unwrap_or(body.len());
+    let name = body[..end].trim();
+    if name != "cfg_attr" {
+        out.push(AttributeLeaf {
+            name: name.to_string(),
+            whole: body.to_string(),
+        });
+        return;
+    }
+    let args = body[end..]
+        .trim_start()
+        .strip_prefix('(')
+        .and_then(|rest| rest.trim_end().strip_suffix(')'));
+    match args {
+        Some(args) if depth < 8 => {
+            // The first argument is the predicate; the rest are attributes.
+            for attribute in rust_split_top_level_commas(args).into_iter().skip(1) {
+                if !attribute.trim().is_empty() {
+                    rust_attribute_leaves_into(attribute, depth + 1, out);
+                }
+            }
+        }
+        _ => out.push(AttributeLeaf {
+            name: name.to_string(),
+            whole: body.to_string(),
+        }),
+    }
+}
+
+/// `text` split at the commas that are not inside brackets or a string literal.
+fn rust_split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for (at, c) in text.char_indices() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Attributes that cannot emit an item or a `use`. A `derive` is inert only when
+/// every trait it names is a std one that emits an `impl` and nothing else: a bare
+/// std name, or a path rooted at `std`, `core` or `alloc`.
+fn rust_attribute_is_inert(name: &str, whole: &str) -> bool {
+    const INERT: &[&str] = &[
+        "cfg",
+        "allow",
+        "warn",
+        "deny",
+        "forbid",
+        "expect",
+        "doc",
+        "inline",
+        "must_use",
+        "test",
+        "ignore",
+        "should_panic",
+        "repr",
+        "non_exhaustive",
+        "deprecated",
+        "track_caller",
+        "cold",
+        "link",
+        "link_name",
+        "link_section",
+        "no_mangle",
+        "export_name",
+        "path",
+        "macro_use",
+        "macro_export",
+        "global_allocator",
+        "automatically_derived",
+    ];
+    if INERT.contains(&name) || name.starts_with("clippy::") || name.starts_with("rustfmt::") {
+        return true;
+    }
+    if name == "derive" {
+        let args = whole
+            .split_once('(')
+            .map_or("", |(_, rest)| rest.trim_end_matches(')'));
+        return rust_split_top_level_commas(args)
+            .into_iter()
+            .map(|t| t.trim().trim_start_matches("::").trim())
+            .filter(|t| !t.is_empty())
+            .all(|t| {
+                let mut segments = t.split("::").map(str::trim);
+                let first = segments.next().unwrap_or("");
+                let last = t.rsplit("::").next().unwrap_or("").trim();
+                let rooted_in_std = t.contains("::") && matches!(first, "std" | "core" | "alloc");
+                (!t.contains("::") || rooted_in_std) && STD_DERIVES.contains(&last)
+            });
+    }
+    false
+}
+
+/// The names a `thread_local!` invocation declares: the identifier after each
+/// `static` keyword among the invocation's own tokens. Strings, comments and the
+/// `'static` lifetime are nodes of their own and never read as the keyword, and
+/// what sits inside a nested token tree (an initializer) declares nothing here.
+fn rust_thread_local_statics(invocation: Node, source: &str) -> Vec<String> {
+    let mut cursor = invocation.walk();
+    let Some(tokens) = invocation
+        .children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut after_static = false;
+    let mut after_apostrophe = false;
+    let mut cursor = tokens.walk();
+    for token in tokens.children(&mut cursor) {
+        if matches!(token.kind(), "line_comment" | "block_comment") {
+            continue;
+        }
+        let text = get_node_text(token, source);
+        // In a macro's token tree the apostrophe of `'static` is a token of its
+        // own, so the lifetime's name reads as the keyword unless it is checked.
+        let quoted = std::mem::replace(&mut after_apostrophe, text == "'");
+        if after_static {
+            after_static = false;
+            if token.kind() == "identifier" {
+                names.push(text);
+                continue;
+            }
+        }
+        after_static = text == "static"
+            && !quoted
+            && !matches!(
+                token.kind(),
+                "string_literal" | "raw_string_literal" | "token_tree"
+            );
+    }
+    names
+}
+
+/// Whether the invocation is a statement of a block: directly, or wrapped in
+/// the expression statement the grammar puts around `mk!();`.
+fn rust_macro_stands_as_statement(node: Node) -> bool {
+    match node.parent() {
+        Some(p) if p.kind() == "block" => true,
+        Some(p) if p.kind() == "expression_statement" => {
+            p.parent().is_some_and(|b| b.kind() == "block")
+        }
+        _ => false,
+    }
+}
+
+/// Whether a child of a block is a statement-position macro invocation.
+fn rust_statement_macro(child: Node) -> bool {
+    match child.kind() {
+        "macro_invocation" => true,
+        "expression_statement" => {
+            let mut cursor = child.walk();
+            let first = child.named_children(&mut cursor).next();
+            first.is_some_and(|inner| inner.kind() == "macro_invocation")
+        }
+        _ => false,
+    }
+}
+
+fn rust_macro_stands_as_item(node: Node) -> bool {
+    let item_list = |n: Node| matches!(n.kind(), "source_file" | "declaration_list");
+    match node.parent() {
+        Some(p) if item_list(p) => true,
+        Some(p) if p.kind() == "expression_statement" => p.parent().is_some_and(item_list),
+        _ => false,
+    }
+}
+
+/// What one pass over a Rust file's items collects. Every list is sorted and
+/// deduplicated, and every one is empty for a file with nothing to report.
+#[derive(Default)]
+pub(super) struct RustItemFacts {
+    pub inline_modules: Vec<String>,
+    /// `None` when the walk was cut short: the facts are then absent, not partial.
+    pub scope_facts: Option<RustScopeFacts>,
+    pub deref_targets: Vec<(String, String)>,
+    pub blanket_impl_params: Vec<String>,
 }
 
 /// `T` for a blanket impl, `impl<T: Display> Describe for T`: a trait impl

@@ -1645,6 +1645,238 @@ pub const MAX_CALL_BLIND_SITES: usize = 8_000;
 /// reason, so a capped file does not look complete.
 pub const CALLS_DROPPED_PREFIX: &str = "call sites dropped at the scan cap: ";
 
+/// One scope a Rust name can be declared or imported in below the file level:
+/// an inline `mod name { .. }` body, or a block that directly holds an item or a
+/// `use` (a function body, a nested block). Blocks that hold neither name nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustScopeSpan {
+    pub kind: RustScopeKind,
+    /// The module's name; empty for a block.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RustScopeKind {
+    Module,
+    Block,
+}
+
+/// One macro invocation that stands where an item or a statement would: a
+/// `mk!();` in a module body or a block. Such an invocation can declare items
+/// and `use`s the index never sees, in the scope that holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustMacroCall {
+    /// The macro path as written (`mk`, `std::println`).
+    pub name: String,
+    pub start: usize,
+    /// For `thread_local!`: the `static` names its invocation writes, which are
+    /// all it declares. Empty for every other macro.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declares: Vec<String>,
+}
+
+/// An attribute macro (anything but a known inert built-in) written on an item
+/// that can hold or bring in names. It can emit items and `use`s beside the item.
+///
+/// Recorded only where that matters to a reader today: on an item inside a
+/// block, and on a `use`, `mod` or `extern crate` item at any depth. The
+/// attributes inside a `cfg_attr(pred, ..)` count as written (the predicate is
+/// not evaluated), and a `derive` is inert only when every path it names is a
+/// std/core one.
+///
+/// Known limit, deliberately not closed: an attribute macro on a module-level
+/// item (`#[pm::with_use(crate::db::Dup)] struct S;`) or on the function that
+/// encloses the call (`#[pm::rewrite] fn run() { .. }`) can emit a `use` or
+/// rewrite the body, and is not recorded, so the resolver does not take that
+/// scope as unknown. Taking every such attribute (`#[test]`, `#[tokio::main]`,
+/// `#[tauri::command]`, `#[instrument]`) as unknown would leave nearly every
+/// function without an edge. The `rs.s46*` rows of the accuracy fixture state
+/// the true expectation and are known-failing for this reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustAttrMacro {
+    /// The attribute path as written (`pm::with_use`).
+    pub name: String,
+    pub start: usize,
+}
+
+/// One `extern crate name [as alias];` item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustExternCrate {
+    /// The crate as written (`dep`, `self`).
+    pub name: String,
+    /// The name it binds when that is not its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// A `#[macro_use]` (or a `cfg_attr(.., macro_use)`) is on the item.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub macro_use: bool,
+}
+
+/// The macros a Rust file invokes in item or statement position and the ones it
+/// defines with `macro_rules!`, plus what can rebind a macro's name.
+///
+/// `facts_version` says which reading of these fields wrote the payload. A
+/// payload that predates it (or a field added later) reads as version 0, and
+/// absence of `macro_use_mods`, `no_std`, `no_implicit_prelude` in it is "not
+/// recorded", not "none": a reader must treat the file as unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustMacroFacts {
+    /// [`RUST_MACRO_FACTS_VERSION`] when the extractor wrote the payload.
+    #[serde(default)]
+    pub facts_version: u32,
+    pub calls: Vec<RustMacroCall>,
+    pub defined: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<RustAttrMacro>,
+    /// A `#[macro_use]` sits on something this file cannot account for: not an
+    /// inline module, an out-of-line module without a `#[path]` (those are in
+    /// `macro_use_mods`), or an `extern crate` item (that is in
+    /// [`RustExternCrate::macro_use`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub macro_use: bool,
+    /// Every `extern crate` item of the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extern_crates: Vec<RustExternCrate>,
+    /// The names of the out-of-line modules (`mod name;`) a `#[macro_use]` is on.
+    /// The macros such a module publishes are known only when its file is
+    /// indexed, which the resolver checks. An inline module is read in place, and
+    /// one with a `#[path]` is recorded in `macro_use` instead.
+    ///
+    /// A module nested in inline modules is written as the chain joined by `/`
+    /// (`outer/m` for `mod outer { #[macro_use] mod m; }`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_use_mods: Vec<String>,
+    /// The file carries `#![no_std]` (or `#![cfg_attr(.., no_std)]`, which may be
+    /// on): the std prelude's macros are not all in scope for the crate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_std: bool,
+    /// A `#![no_implicit_prelude]` or `#[no_implicit_prelude]` is written in the
+    /// file. Taken as holding for the whole crate: the cautious direction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_implicit_prelude: bool,
+}
+
+/// The reading of [`RustMacroFacts`] the extractor writes now. A resolver that
+/// meets a lower number must not trust the absence of anything in them. The
+/// comparison is `>=`, so a resolver that meets a *higher* number trusts the
+/// facts as they are: a downgraded binary reads facts newer than it understands.
+pub const RUST_MACRO_FACTS_VERSION: u32 = 1;
+
+/// The module a Rust `mod` declaration names, read from the declaration's own
+/// text (`ExtractedImport::raw_import`, which for a `mod_item` is the whole item
+/// and starts at its visibility): `mod log;`, `pub mod log;`, `pub(crate) mod
+/// log;`, `pub(in a::b) mod log;`. `None` for anything that is not a `mod`
+/// declaration, a `use` above all. The one reading every resolver rule shares, so
+/// a visibility prefix cannot turn a module into something else.
+pub fn rust_mod_declaration_name(raw_import: &str) -> Option<&str> {
+    let mut rest = raw_import.trim_start();
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        let after_pub_trimmed = after_pub.trim_start();
+        rest = if after_pub_trimmed.starts_with('(') {
+            let mut depth = 0usize;
+            let mut end = None;
+            for (at, ch) in after_pub_trimmed.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(at + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &after_pub_trimmed[end?..]
+        } else if after_pub.starts_with(char::is_whitespace) {
+            after_pub_trimmed
+        } else {
+            return None;
+        };
+    }
+    let rest = rest.trim_start().strip_prefix("mod")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = rest.trim_start();
+    let end = name
+        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '#'))
+        .unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
+#[cfg(test)]
+mod rust_mod_declaration_name_tests {
+    use super::rust_mod_declaration_name;
+
+    #[test]
+    fn every_visibility_form_names_the_module() {
+        for (raw, name) in [
+            ("mod log;", "log"),
+            ("  mod log ;", "log"),
+            ("pub mod log;", "log"),
+            ("pub(crate) mod log;", "log"),
+            ("pub(super) mod log;", "log"),
+            ("pub(self) mod log;", "log"),
+            ("pub(in crate::a) mod log;", "log"),
+            ("pub (crate) mod log;", "log"),
+            ("pub  mod  r#type;", "r#type"),
+            ("mod\tlog;", "log"),
+        ] {
+            assert_eq!(rust_mod_declaration_name(raw), Some(name), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_mod_declaration_is_none() {
+        for raw in [
+            "use log;",
+            "pub use log::mod_x;",
+            "pub(crate) use a::b;",
+            "module log;",
+            "public mod log;",
+            "pubmod log;",
+            "pub(crate mod log;",
+            "mod;",
+            "",
+        ] {
+            assert_eq!(rust_mod_declaration_name(raw), None, "{raw:?}");
+        }
+    }
+}
+
+/// Rust facts the symbol table cannot carry. See [`Extraction::rust_scope_facts`].
+///
+/// The extractor files an inline module's items, and the items of a function
+/// body, under the enclosing namespace, so "this file declares `Dup`" says nothing
+/// about which code can see that declaration. These facts say where each scope
+/// sits, so a resolver can ask which declarations and imports a byte offset sees.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustScopeFacts {
+    /// Every module body and item-holding block, in source order.
+    pub scopes: Vec<RustScopeSpan>,
+    /// The macro name of every item-position macro invocation (`mk!();`), at any
+    /// depth. Such an invocation can declare names the index never sees.
+    pub item_macros: Vec<String>,
+    /// `(item start byte, visibility text)` for every item whose visibility is
+    /// restricted: `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`. A
+    /// plain `pub` and a private item are told apart by `is_exported`.
+    pub restricted_visibility: Vec<(usize, String)>,
+    /// Spans of the functions, impl blocks and modules under a `#[cfg(..)]`
+    /// attribute: two bodies of one method that both sit in such spans are
+    /// alternatives, not two impls.
+    pub cfg_spans: Vec<(usize, usize)>,
+    /// The macros invoked in item or statement position and the ones defined.
+    /// `None` is "not recorded" (a payload written before they were), which a
+    /// reader must treat as unknown, never as "no macros".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macros: Option<RustMacroFacts>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub file_path: String,
@@ -1764,6 +1996,13 @@ pub struct Extraction {
     /// tells the two apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_inline_modules: Vec<String>,
+    /// The scopes, item macros, restricted visibilities and `#[cfg]` items of a
+    /// Rust file, or `None` when none were collected - every other language, and
+    /// an extraction written before this field existed. `None` is not "empty":
+    /// a reader must treat it as "scope unknown" and never read it as "this file
+    /// declares nothing a call site could not see".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_scope_facts: Option<RustScopeFacts>,
     /// `(type, target)` for every `impl Deref for type { type Target = target; }`
     /// a Rust file declares, both reduced to their bare names. Sorted and
     /// deduplicated; empty for every other language.

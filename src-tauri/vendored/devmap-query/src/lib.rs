@@ -25,6 +25,7 @@ pub mod guides;
 pub mod host;
 pub mod hygiene;
 pub mod inventory;
+pub mod lean_tcb;
 pub mod linguist;
 pub mod manifest;
 pub mod map_preview;
@@ -51,11 +52,13 @@ pub use devmap_extract::paths;
 pub use devmap_store;
 
 pub use artifacts::{
-    should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
-    ArtifactStamp,
+    should_regenerate, write_atomic, writer_identity, ArtifactCurrency, ArtifactFingerprint,
+    ArtifactRecord, ArtifactStamp,
 };
 pub use ask::*;
-pub use bounded::{bounded_reason, bounded_text, MAX_REASON_COMPONENT_BYTES};
+pub use bounded::{
+    bounded_reason, bounded_text, is_agent_unsafe, is_bidi_control, MAX_REASON_COMPONENT_BYTES,
+};
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     build_code_graph_value, build_graph_core_value, decode_compact, encode_compact,
@@ -73,6 +76,12 @@ pub use engine::{
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
+pub use lean_tcb::{
+    analyze_lean_tcb, audit_lean_tcb_tree, audit_lean_tcb_tree_with_mode, LeanKernelMode,
+    LeanTcbDeclaration, LeanTcbFileAudit, LeanTcbFileDeclaration, LeanTcbFileHole, LeanTcbHole,
+    LeanTcbHoleKind, LeanTcbReport, LeanTcbRole, LeanTcbSkippedPath, LeanTcbTreeReport,
+    LeanVerificationTier, DEFAULT_MAX_LEAN_FILES,
+};
 pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};
 pub use manifest::{
     generate_lean_manifest_json, generate_manifest, generate_manifest_with_edges,

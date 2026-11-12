@@ -13,6 +13,7 @@ use rusqlite::{params_from_iter, Connection, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod generation;
+pub use generation::{ResolverStamp, RESOLVER_NEWER_REASON};
 mod integrity;
 mod maintenance;
 mod migrate;
@@ -85,9 +86,39 @@ fn fts_failure(error: rusqlite::Error) -> rusqlite::Error {
     if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseCorrupt) {
         return error;
     }
-    refusal(fts_damage_reason(&format!(
+    let message = fts_damage_reason(&format!(
         "the full-text index (`nodes_fts`) could not be read: {error}"
-    )))
+    ));
+    rusqlite::Error::ToSqlConversionFailure(Box::new(FtsDamage {
+        message,
+        source: error,
+    }))
+}
+
+/// A corrupt read of the full-text index, worded for the reader and still
+/// carrying the SQLite error that caused it.
+///
+/// This used to be a bare [`StoreRefusal`], whose text no caller could tell
+/// from any other refusal: a server holding a stale handle saw the repair text
+/// and had no way to know the connection, not the index, was at fault.
+/// [`Store::sqlite_error_is_corrupt`] recognises it, so one predicate answers
+/// for every read.
+#[derive(Debug)]
+pub(crate) struct FtsDamage {
+    message: String,
+    source: rusqlite::Error,
+}
+
+impl std::fmt::Display for FtsDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FtsDamage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Typed refusal when a store's stamped schema is not this binary's.
@@ -535,6 +566,45 @@ fn lock_conn(
         })
 }
 
+/// What a read-only open is asked for: the memory its connection may use for
+/// SQLite's page cache and file mapping, and whether it may open a store whose
+/// full-text index alone is damaged.
+///
+/// A named record rather than loose arguments so the open path and a benchmark
+/// that compares settings share one definition. See
+/// `devmap-serve/examples/mcp_reader_memory_bench.rs` for the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderMemory {
+    /// SQLite `cache_size`, in KiB.
+    pub cache_kib: u32,
+    /// SQLite `mmap_size`, in bytes; 0 reads through the page cache only.
+    pub mmap_bytes: u64,
+    /// Open a store whose only damage is in its full-text index (`nodes_fts`
+    /// and its shadow tables) instead of refusing it. The `Store` records the
+    /// damage ([`Store::full_text_damage`]) and every search refuses with the
+    /// typed full-text error; everything that does not read the index answers.
+    /// Damage that is not provably confined to the index is still refused.
+    /// `false` is the strict open every other caller gets.
+    pub tolerate_full_text_damage: bool,
+}
+
+impl ReaderMemory {
+    /// What every read-only connection uses.
+    pub const CURRENT: Self = Self {
+        cache_kib: (-Store::CACHE_SIZE_KIB) as u32,
+        mmap_bytes: 0,
+        tolerate_full_text_damage: false,
+    };
+
+    /// These settings, opening a store with a damaged full-text index degraded.
+    pub const fn tolerating_full_text_damage(self) -> Self {
+        Self {
+            tolerate_full_text_damage: true,
+            ..self
+        }
+    }
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     /// The file this store was opened from, when it has one.
@@ -555,6 +625,10 @@ pub struct Store {
     /// refused by name ([`Store::refuse_if_read_only`]) instead of by SQLite
     /// error code.
     read_only: bool,
+    /// Why the full-text index was found damaged when this store was opened
+    /// degraded (see [`ReaderMemory::tolerate_full_text_damage`]); `None` for
+    /// every store that opened strictly.
+    full_text_damage: Option<String>,
     /// Worktree root override when this `Store` is an immutable shared base
     /// snapshot (`?immutable=1`, `chmod 0444`) opened on behalf of a linked
     /// worktree by `StackedStore`. `None` for every ordinary or seeded store.
@@ -622,6 +696,23 @@ pub struct Store {
     /// on the ScholarLM corpus is milliseconds; `devmap status` asks for it on
     /// every call and nothing else about it can change.
     generation_analysis_status: Mutex<Option<(u32, AnalysisStatus)>>,
+    /// Whole-generation reads `status` makes on every call.
+    ///
+    /// Scans of the generation's rows (`generation_files` for the payload
+    /// identities and the file hashes, `generation_edges` for the confidence
+    /// ladder, 14 to 18 ms on this repository). A reader with a small page
+    /// cache paid for them again on every warm `status`; held, they are read
+    /// once. Unlike `generation_counts` these are *not* keyed by the generation
+    /// id alone: they are integrity checks, and a row they judge can be
+    /// rewritten in place under a standing id by another connection (a kernel
+    /// upgrade rewriting payload identities, a repair). Each is keyed by the
+    /// generation and a [`ConnectionStamp`], so a commit by any other
+    /// connection *or* by this store's own ends it, and bounded in age by
+    /// [`GENERATION_CHECK_MAX_AGE`] so damage no key can see is still found.
+    /// Only the newest key is held of each. The file-hash map is not capped:
+    /// it is one `String` and one `u64` per indexed file (about 0.4 MB at
+    /// 3,320 files) and lives as long as the `Store`.
+    generation_checks: Mutex<GenerationChecks>,
     /// Last whole-tree source-freshness verdict from [`Store::status`].
     ///
     /// Query envelopes read this rather than re-walking the tree: status is the
@@ -629,6 +720,104 @@ pub struct Store {
     /// generation they answered from, or an explicit unverified reason when
     /// nothing has been checked in this process.
     source_freshness_cache: Mutex<Option<CachedSourceFreshness>>,
+}
+
+/// How long a held integrity answer may stand before it is read again.
+///
+/// Neither the generation, `data_version` nor the connection's own change
+/// count moves for damage to pages (a bad sector, a file overwritten in place
+/// by something that is not SQLite), so without a bound a pass read once would
+/// be reported for the life of the process while a fresh read fails. Sixty
+/// seconds: `status` is a health poll (session start, `mcp:doctor`, a human at
+/// a prompt), not a per-query call, so the common poller pays the 14 to 18 ms
+/// scan at most once a minute, while a fault that cannot be seen from the key
+/// is reported within a minute. (How often hooks call `status` was not
+/// measured; the bound is the largest delay in reporting damage judged
+/// acceptable for a diagnostic, not a figure derived from the call rate.)
+const GENERATION_CHECK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    /// Added to the memo clock by tests, so age is advanced and never slept.
+    static MEMO_CLOCK_SKEW: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// The memo's clock: `Instant::now()`, plus the test skew under `cfg(test)`.
+fn memo_now() -> std::time::Instant {
+    #[cfg(test)]
+    {
+        std::time::Instant::now() + MEMO_CLOCK_SKEW.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Instant::now()
+    }
+}
+
+/// What one connection's view of the database looked like when a held answer
+/// was read.
+///
+/// `data_version` is SQLite's `PRAGMA data_version`: it changes when a
+/// *different* connection commits. `changes` is this connection's own
+/// `total_changes()`: it counts every row the connection's `INSERT`, `UPDATE`
+/// and `DELETE` statements (triggers included) have touched, so it moves on
+/// every write this store makes without any write path having to remember to
+/// say so. The pair covers every committed row change from any connection; what
+/// it cannot see (page damage, DDL, an in-place overwrite of the file) is what
+/// [`GENERATION_CHECK_MAX_AGE`] bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionStamp {
+    data_version: i64,
+    changes: u64,
+}
+
+/// A value computed for one generation as one connection saw it, and when.
+#[derive(Debug)]
+struct Keyed<T> {
+    generation: u32,
+    stamp: ConnectionStamp,
+    held_at: std::time::Instant,
+    value: T,
+}
+
+impl<T> Keyed<T> {
+    fn new(generation: u32, stamp: ConnectionStamp, value: T) -> Self {
+        Self {
+            generation,
+            stamp,
+            held_at: memo_now(),
+            value,
+        }
+    }
+
+    /// The held value, if it was read for this generation and stamp and is
+    /// younger than [`GENERATION_CHECK_MAX_AGE`].
+    fn holds(slot: &Option<Self>, generation: u32, stamp: ConnectionStamp) -> Option<&T> {
+        let now = memo_now();
+        slot.as_ref()
+            .filter(|held| {
+                held.generation == generation
+                    && held.stamp == stamp
+                    && now.saturating_duration_since(held.held_at) < GENERATION_CHECK_MAX_AGE
+            })
+            .map(|held| &held.value)
+    }
+}
+
+/// Memo of the integrity answers `status` repeats; see
+/// [`Store::generation_checks`].
+#[derive(Debug, Default)]
+struct GenerationChecks {
+    /// Every file's payload identity is the running build's.
+    payload_current: Option<Keyed<bool>>,
+    /// Edges whose confidence contradicts their resolution.
+    edge_confidence_mismatches: Option<Keyed<usize>>,
+    /// Path to content hash, for the freshness comparison.
+    file_hashes: Option<Keyed<std::sync::Arc<BTreeMap<String, u64>>>>,
+    /// No unconverted payload was found (a clean answer only; a fault is
+    /// re-read, since another process's writer open can heal it).
+    payload_encoding_clean: Option<Keyed<()>>,
 }
 
 /// Process-local memo of the last [`Store::status`] source check.

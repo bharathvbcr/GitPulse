@@ -64,13 +64,14 @@
 //! caller keeps its contract and gains the bounds.
 
 pub mod diskio;
+pub mod lean_kernel;
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1927,7 +1928,6 @@ pub fn terminate_group_with_escalation(leader: u32, grace: Duration) -> std::io:
     }
 }
 
-
 /// Off unix there are no process groups to signal, so this reports that it
 /// did nothing rather than claiming the group was terminated.
 #[cfg(not(unix))]
@@ -1937,7 +1937,6 @@ pub fn terminate_group_with_escalation(_leader: u32, _grace: Duration) -> std::i
         "process groups are not available on this platform",
     ))
 }
-
 
 /// The one `kill(2)` in the workspace. Every signal goes through here so the
 /// audited surface stays one call.
@@ -3145,4 +3144,3 @@ mod tests {
         assert!(probe.is_err());
     }
 }
-

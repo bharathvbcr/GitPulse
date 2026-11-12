@@ -58,6 +58,17 @@ const FTS_50_SQL: &str = concat!(
 #[cfg(feature = "parse")]
 const PAYLOAD_WINDOW_PER_THREAD: usize = 2;
 
+/// What `generations.analysis_json` holds: the analysis summary, flattened, and
+/// the epoch of the resolver that produced the generation's edges. See
+/// `Store::latest_generation_resolver_stamp` for the reader.
+#[cfg(feature = "parse")]
+#[derive(serde::Serialize)]
+struct StampedAnalysis<'a> {
+    #[serde(flatten)]
+    summary: &'a AnalysisSummary,
+    resolver_epoch: &'static str,
+}
+
 /// The most actual JSON, in bytes, the write holds that has been serialized and
 /// not yet inserted before it stops handing out more extractions.
 ///
@@ -976,10 +987,20 @@ impl Store {
         // `dead_confident`/`dead_ambiguous` counts far below — and a summary of
         // this repository carries 4,927 dead-symbol rows, so the copy was
         // several thousand string allocations that existed to be dropped.
+        //
+        // Stamped with the identity of the resolver that wrote this
+        // generation's edges. `analysis_json` is a free-form document, so the
+        // stamp moves no table, column or schema version; readers that
+        // deserialize `AnalysisSummary` ignore the extra key. Every writer of
+        // a generation passes through here, so the stamp cannot be forgotten by
+        // the CLI or the daemon. `latest_generation_payload_is_current` reads it.
         let analysis_json = {
             let _charge = charge(&mut spent.serialize);
-            serde_json::to_string(analysis)
-                .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?
+            serde_json::to_string(&StampedAnalysis {
+                summary: analysis,
+                resolver_epoch: devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH,
+            })
+            .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?
         };
 
         tx.execute(

@@ -90,6 +90,45 @@ pub struct DeltaSnapshot {
     pub edges: Vec<DeltaEdgeRecord>,
 }
 
+/// A read or write of the stacked delta store failed with `SQLITE_CORRUPT`.
+///
+/// Carried as error context, added where the delta's own connection failed, so
+/// a caller that sees a corrupt error from a stacked lane knows which of the
+/// lane's two SQLite files it came from: this one, or (anything untagged) the
+/// shared base snapshot. Attribution by probing afterwards would blame the
+/// wrong file whenever the probe happened not to touch the damaged page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaDamaged {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for DeltaDamaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the stacked delta store {} is damaged",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for DeltaDamaged {}
+
+/// Tag `result`'s error as damage to the delta at `path`, if it is damage.
+fn tag_damage<T>(path: &Path, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if crate::Store::is_database_corrupt(&error)
+            && error.downcast_ref::<DeltaDamaged>().is_none()
+        {
+            error.context(DeltaDamaged {
+                path: path.to_path_buf(),
+            })
+        } else {
+            error
+        }
+    })
+}
+
 pub struct DeltaStore {
     conn: Mutex<Connection>,
     path: PathBuf,
@@ -114,7 +153,11 @@ fn symlinked_sidecars(db: &Path) -> Vec<PathBuf> {
 
 impl DeltaStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        tag_damage(path.as_ref(), Self::open_untagged(path.as_ref()))
+    }
+
+    fn open_untagged(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -142,7 +185,11 @@ impl DeltaStore {
     /// be read without creating those sidecars: in a read-only directory that is
     /// an error naming the reason, never an empty or stale answer.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Option<Self>> {
-        let path = path.as_ref().to_path_buf();
+        tag_damage(path.as_ref(), Self::open_read_only_untagged(path.as_ref()))
+    }
+
+    fn open_read_only_untagged(path: &Path) -> Result<Option<Self>> {
+        let path = path.to_path_buf();
         if !path.is_file() {
             return Ok(None);
         }
@@ -162,34 +209,39 @@ impl DeltaStore {
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // SQLite opens lazily: read now, so a refusal is reported here.
-        conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
-            .map_err(|err| {
-                let code = match &err {
-                    rusqlite::Error::SqliteFailure(e, _) => Some(*e),
-                    _ => None,
-                };
-                let why = match code {
-                    Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
-                        "an interrupted writer left a hot rollback journal that a read-only open \
+        conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|err| {
+            let code = match &err {
+                rusqlite::Error::SqliteFailure(e, _) => Some(*e),
+                _ => None,
+            };
+            let why = match code {
+                Some(e) if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
+                    "an interrupted writer left a hot rollback journal that a read-only open \
                          cannot roll back; run `devmap seed --sync-delta`"
-                    }
-                    Some(e)
-                        if matches!(
-                            e.code,
-                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                        ) =>
-                    {
-                        "another process holds a write lock on it; wait for that writer (often a \
+                }
+                Some(e)
+                    if matches!(
+                        e.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    "another process holds a write lock on it; wait for that writer (often a \
                          running `devmap seed --sync-delta`) to finish and retry"
-                    }
-                    Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
-                        "a WAL-mode delta from an earlier build in a read-only state directory is \
+                }
+                Some(e) if e.code == rusqlite::ErrorCode::ReadOnly => {
+                    "a WAL-mode delta from an earlier build in a read-only state directory is \
                          unreadable, not empty"
-                    }
-                    _ => "the database could not be read",
-                };
-                anyhow::Error::new(err).context(format!("delta store {} cannot be read ({why})", path.display()))
-            })?;
+                }
+                _ => "the database could not be read",
+            };
+            anyhow::Error::new(err).context(format!(
+                "delta store {} cannot be read ({why})",
+                path.display()
+            ))
+        })?;
         Ok(Some(Self {
             conn: Mutex::new(conn),
             path,
@@ -244,6 +296,10 @@ impl DeltaStore {
     }
 
     pub fn dirty_file_count(&self) -> Result<usize> {
+        tag_damage(&self.path, self.dirty_file_count_untagged())
+    }
+
+    fn dirty_file_count_untagged(&self) -> Result<usize> {
         let conn = self
             .conn
             .lock()
@@ -253,6 +309,10 @@ impl DeltaStore {
     }
 
     pub fn file_hash(&self, rel_path: &str) -> Result<Option<(String, bool)>> {
+        tag_damage(&self.path, self.file_hash_untagged(rel_path))
+    }
+
+    fn file_hash_untagged(&self, rel_path: &str) -> Result<Option<(String, bool)>> {
         let conn = self
             .conn
             .lock()
@@ -267,6 +327,26 @@ impl DeltaStore {
     }
 
     pub fn upsert_extracted_file(
+        &self,
+        rel_path: &str,
+        content_hash: &str,
+        extraction: &Extraction,
+        edges: &[DeltaEdgeRecord],
+        updated_at_ms: u64,
+    ) -> Result<()> {
+        tag_damage(
+            &self.path,
+            self.upsert_extracted_file_untagged(
+                rel_path,
+                content_hash,
+                extraction,
+                edges,
+                updated_at_ms,
+            ),
+        )
+    }
+
+    fn upsert_extracted_file_untagged(
         &self,
         rel_path: &str,
         content_hash: &str,
@@ -330,6 +410,18 @@ impl DeltaStore {
         tombstone_marker: &str,
         updated_at_ms: u64,
     ) -> Result<()> {
+        tag_damage(
+            &self.path,
+            self.tombstone_file_untagged(rel_path, tombstone_marker, updated_at_ms),
+        )
+    }
+
+    fn tombstone_file_untagged(
+        &self,
+        rel_path: &str,
+        tombstone_marker: &str,
+        updated_at_ms: u64,
+    ) -> Result<()> {
         if rel_path.is_empty() {
             bail!("delta file path must not be empty");
         }
@@ -349,6 +441,10 @@ impl DeltaStore {
     }
 
     pub fn remove_clean_file(&self, rel_path: &str) -> Result<()> {
+        tag_damage(&self.path, self.remove_clean_file_untagged(rel_path))
+    }
+
+    fn remove_clean_file_untagged(&self, rel_path: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
@@ -358,6 +454,10 @@ impl DeltaStore {
     }
 
     pub fn load_snapshot(&self) -> Result<DeltaSnapshot> {
+        tag_damage(&self.path, self.load_snapshot_untagged())
+    }
+
+    fn load_snapshot_untagged(&self) -> Result<DeltaSnapshot> {
         let conn = self
             .conn
             .lock()
@@ -447,7 +547,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("devmap-delta-test-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("devmap-delta-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -475,24 +576,44 @@ mod tests {
         let path = dir.join("delta.sqlite");
         {
             let writer = DeltaStore::open(&path).unwrap();
-            writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+            writer
+                .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+                .unwrap();
         }
-        assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()], "fixture: a closed writer leaves one file");
+        assert_eq!(
+            names_in(&dir),
+            vec!["delta.sqlite".to_string()],
+            "fixture: a closed writer leaves one file"
+        );
 
         let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
         assert_eq!(reader.dirty_file_count().unwrap(), 1);
         assert_eq!(reader.load_snapshot().unwrap().files.len(), 1);
         drop(reader);
-        assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()], "a read created a sidecar");
+        assert_eq!(
+            names_in(&dir),
+            vec!["delta.sqlite".to_string()],
+            "a read created a sidecar"
+        );
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let reader = DeltaStore::open_read_only(&path);
-        let rows = reader.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.dirty_file_count().unwrap());
+        let rows = reader
+            .as_ref()
+            .ok()
+            .and_then(|r| r.as_ref())
+            .map(|r| r.dirty_file_count().unwrap());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(reader.is_ok(), "a read-only directory must still open: {:?}", reader.err());
+        assert!(
+            reader.is_ok(),
+            "a read-only directory must still open: {:?}",
+            reader.err()
+        );
         assert_eq!(rows, Some(1));
         assert_eq!(names_in(&dir), vec!["delta.sqlite".to_string()]);
-        assert!(DeltaStore::open_read_only(dir.join("missing.sqlite")).unwrap().is_none());
+        assert!(DeltaStore::open_read_only(dir.join("missing.sqlite"))
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -503,8 +624,12 @@ mod tests {
         let dir = temp_dir("livewriter");
         let path = dir.join("delta.sqlite");
         let writer = DeltaStore::open(&path).unwrap();
-        writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
-        writer.tombstone_file("src/b.rs", "CAS_TOMBSTONE", 2).unwrap();
+        writer
+            .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+            .unwrap();
+        writer
+            .tombstone_file("src/b.rs", "CAS_TOMBSTONE", 2)
+            .unwrap();
         let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
         assert_eq!(reader.dirty_file_count().unwrap(), 2);
         drop(reader);
@@ -521,7 +646,9 @@ mod tests {
         let path = dir.join("delta.sqlite");
         {
             let writer = DeltaStore::open(&path).unwrap();
-            writer.tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1).unwrap();
+            writer
+                .tombstone_file("src/a.rs", "CAS_TOMBSTONE", 1)
+                .unwrap();
         }
         let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
         assert_eq!(reader.dirty_file_count().unwrap(), 1);
@@ -554,8 +681,11 @@ mod tests {
         // A live writer: its rows sit in the `-wal`, not in the main file, so an
         // immutable read of the main file alone would answer 0.
         let conn = Connection::open(&path).unwrap();
-        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
-        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
+        let _: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
         conn.execute_batch(DELTA_SCHEMA_DDL).unwrap();
         conn.execute(
             "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
@@ -563,7 +693,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(dir.join("delta.sqlite-wal").is_file(), "the rows must be in the -wal");
+        assert!(
+            dir.join("delta.sqlite-wal").is_file(),
+            "the rows must be in the -wal"
+        );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let opened = DeltaStore::open_read_only(&path);
         let rows = match &opened {
@@ -577,7 +710,10 @@ mod tests {
             Ok(None) => panic!("the delta exists"),
             Err(err) => {
                 let text = format!("{err:#}");
-                assert!(text.contains("read-only") && text.contains("not empty"), "{text}");
+                assert!(
+                    text.contains("read-only") && text.contains("not empty"),
+                    "{text}"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -596,7 +732,9 @@ mod tests {
         }
         let mut conn = Connection::open(src.join("delta.sqlite")).unwrap();
         conn.execute_batch("PRAGMA cache_size = 1;").unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         for i in 0..400 {
             tx.execute(
                 "INSERT INTO delta_files (path, content_hash, tombstoned, extraction_json, updated_at_ms)
@@ -605,9 +743,16 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(src.join("delta.sqlite-journal").metadata().unwrap().len() > 0, "fixture: a live journal");
+        assert!(
+            src.join("delta.sqlite-journal").metadata().unwrap().len() > 0,
+            "fixture: a live journal"
+        );
         std::fs::copy(src.join("delta.sqlite"), &path).unwrap();
-        std::fs::copy(src.join("delta.sqlite-journal"), dir.join("delta.sqlite-journal")).unwrap();
+        std::fs::copy(
+            src.join("delta.sqlite-journal"),
+            dir.join("delta.sqlite-journal"),
+        )
+        .unwrap();
         drop(tx);
         drop(conn);
         let _ = std::fs::remove_dir_all(&src);
@@ -617,16 +762,24 @@ mod tests {
     /// FIX-A: a read-only open cannot roll a hot journal back; it names the
     /// cause and the recovery command, and a writable open recovers.
     #[test]
-    fn a_hot_rollback_journal_is_refused_read_only_with_the_recovery_command_and_a_writer_recovers() {
+    fn a_hot_rollback_journal_is_refused_read_only_with_the_recovery_command_and_a_writer_recovers()
+    {
         let dir = temp_dir("hotjournal");
         let path = hot_journal_delta(&dir);
-        let err = format!("{:#}", DeltaStore::open_read_only(&path).expect_err("a hot journal is refused"));
+        let err = format!(
+            "{:#}",
+            DeltaStore::open_read_only(&path).expect_err("a hot journal is refused")
+        );
         assert!(err.contains("hot rollback journal"), "{err}");
         assert!(err.contains("devmap seed --sync-delta"), "{err}");
         assert!(!err.contains("WAL-mode delta"), "wrong cause named: {err}");
         drop(DeltaStore::open(&path).unwrap());
         let reader = DeltaStore::open_read_only(&path).unwrap().expect("exists");
-        assert_eq!(reader.dirty_file_count().unwrap(), 1, "the interrupted transaction rolled back");
+        assert_eq!(
+            reader.dirty_file_count().unwrap(),
+            1,
+            "the interrupted transaction rolled back"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -637,9 +790,12 @@ mod tests {
         let dir = temp_dir("stayswal");
         let path = dir.join("delta.sqlite");
         let held = Connection::open(&path).unwrap();
-        let _: String = held.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+        let _: String = held
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
         held.execute_batch(DELTA_SCHEMA_DDL).unwrap();
-        held.execute_batch("BEGIN; SELECT COUNT(*) FROM delta_files;").unwrap();
+        held.execute_batch("BEGIN; SELECT COUNT(*) FROM delta_files;")
+            .unwrap();
         let err = format!("{:#}", DeltaStore::open(&path).expect_err("must refuse"));
         assert!(err.contains("rollback-journal mode"), "{err}");
         held.execute_batch("COMMIT;").unwrap();

@@ -62,6 +62,19 @@ impl Resolver {
             ext.local_binding_at(reference.span.start_byte, root)
                 .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
         };
+        // Rust: `value.name` that is not a call is a FIELD read. A method can
+        // only be named as a value through a path (`Type::method`), never as
+        // `value.method`, so a reference whose receiver is a value - the `self`
+        // parameter, a dotted chain such as `self.inner`, or a local or
+        // parameter - cannot name a method of the same spelling. Without this
+        // `self.attended.lock()` bound its `attended` read to the method
+        // `attended` at full confidence, and every read of a field named like a
+        // method became a fabricated caller of that method.
+        if family == LangFamily::Rust
+            && (receiver == "self" || receiver.contains('.') || binding.is_some())
+        {
+            return None;
+        }
         let receiver_type = self.receiver_type_for(
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
@@ -167,10 +180,15 @@ impl Resolver {
             && binding.is_none()
         {
             let key = (family, receiver.to_string(), name.to_string());
-            if let Some((target_file, target_symbol)) = self
-                .type_methods
-                .get(&key)
-                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            if let Some((target_file, target_symbol)) =
+                self.type_methods.get(&key).and_then(|hits| {
+                    self.type_method_target(
+                        &ext.file_path,
+                        receiver,
+                        hits,
+                        Site::of(reference.span.start_byte),
+                    )
+                })
             {
                 return Some(self.reference_edge(
                     ext,
@@ -195,10 +213,15 @@ impl Resolver {
         {
             for member in Self::read_members(family, name) {
                 let key = (family, receiver.to_string(), member);
-                if let Some((target_file, target_symbol)) = self
-                    .type_methods
-                    .get(&key)
-                    .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+                if let Some((target_file, target_symbol)) =
+                    self.type_methods.get(&key).and_then(|hits| {
+                        self.type_method_target(
+                            &ext.file_path,
+                            receiver,
+                            hits,
+                            Site::of(reference.span.start_byte),
+                        )
+                    })
                 {
                     return Some(self.reference_edge(
                         ext,

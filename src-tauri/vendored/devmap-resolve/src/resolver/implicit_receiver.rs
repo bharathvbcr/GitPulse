@@ -508,6 +508,7 @@ impl Resolver {
         call_file: &str,
         type_name: &str,
         hits: &'a [(String, String)],
+        site: Site,
     ) -> Option<(&'a str, &'a str)> {
         let mut uniq: Vec<&(String, String)> = hits.iter().collect();
         uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -532,7 +533,56 @@ impl Resolver {
         if let Some(narrowed) = self.js_module_scoped_hits(call_file, type_name, &uniq) {
             uniq = narrowed;
         }
+        // Rust: which declaration of the type a name means is the module's
+        // answer, not the file's. Its own declaration (which shadows a glob)
+        // narrows to this file; an import or glob narrows to the file it binds;
+        // a name the site cannot place - a namesake only in a module around
+        // the site, or a binding the file's extents do not separate - narrows
+        // nothing, and is refused rather than guessed.
+        let rust_origin = if call_file.ends_with(".rs") {
+            self.rust_origin_at(call_file, type_name, site)
+        } else {
+            None
+        };
+        let all_hits = uniq.clone();
+        if let Some(origin) = rust_origin {
+            if origin == RustOrigin::Unknown {
+                return None;
+            }
+            // The type is declared in scope here, yet no body of the method is
+            // filed under it (a function-local type's methods are filed under
+            // the function). A namesake elsewhere is not its method.
+            if origin == RustOrigin::Own && !uniq.iter().any(|hit| hit.0 == call_file) {
+                return None;
+            }
+            if uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+                if origin == RustOrigin::Absent && uniq[0].0 == call_file {
+                    return None;
+                }
+            } else {
+                let bound = self
+                    .import_binding_for_site(LangFamily::Rust, call_file, None, type_name, site)
+                    .map(|(file, _)| file.as_str());
+                let evidence = if origin == RustOrigin::Own {
+                    Some(call_file)
+                } else {
+                    bound
+                };
+                if let Some(file) = evidence {
+                    let narrowed: Vec<&(String, String)> =
+                        uniq.iter().copied().filter(|hit| hit.0 == file).collect();
+                    if !narrowed.is_empty() {
+                        uniq = narrowed;
+                    }
+                }
+            }
+        }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+            return None;
+        }
+        if rust_origin.is_some()
+            && self.rust_method_is_overloaded_across_impls(type_name, &all_hits, &uniq[0].0)
+        {
             return None;
         }
         let (target_file, target_symbol) = uniq[0];
@@ -565,6 +615,90 @@ impl Resolver {
                 _ => false,
             };
         corroborated.then_some((target_file.as_str(), target_symbol.as_str()))
+    }
+
+    /// Whether the method a Rust call names has several bodies the type's
+    /// name cannot tell apart: impls in files that do not declare the type
+    /// (`impl From<A> for E` beside `impl From<B> for E` elsewhere), or two
+    /// bodies in one file whose signatures differ (two trait impls, which the
+    /// extractor files as `m` and `m@<start>` just as it files a `#[cfg]` copy).
+    ///
+    /// Which impl runs depends on the argument's type, which no call site here
+    /// records, so a type's own file is not the answer: binding it would be a
+    /// confident edge to one impl of several. The caller declines, leaving the
+    /// call unresolved rather than wrong. A `#[cfg]` copy has the same
+    /// signature as its base and stays one method.
+    fn rust_method_is_overloaded_across_impls(
+        &self,
+        type_name: &str,
+        all_hits: &[&(String, String)],
+        chosen: &str,
+    ) -> bool {
+        // A file that declares no type of this name but binds the name to the
+        // chosen file holds an impl of *that* type. A file that declares its
+        // own, or binds the name elsewhere, holds a namesake's.
+        let foreign_impl = all_hits.iter().any(|hit| {
+            hit.0 != chosen
+                && !self
+                    .rust_site_scope
+                    .get(hit.0.as_str())
+                    .is_some_and(|scope| scope.declares_anywhere(type_name))
+                && self
+                    .import_bindings
+                    .get(hit.0.as_str())
+                    .and_then(|bindings| bindings.get(type_name))
+                    .is_some_and(|(file, _)| file == chosen)
+        });
+        if foreign_impl {
+            return true;
+        }
+        let own: Vec<&&(String, String)> = all_hits.iter().filter(|hit| hit.0 == chosen).collect();
+        // Bodies under `#[cfg]` are alternatives of one method.
+        let live: Vec<&&&(String, String)> = own
+            .iter()
+            .filter(|hit| {
+                !self
+                    .rust_cfg_bodies
+                    .contains(&(hit.0.clone(), hit.1.clone()))
+            })
+            .collect();
+        let signatures: BTreeSet<Option<&String>> = live
+            .iter()
+            .map(|hit| self.rust_signatures.get(&(hit.0.clone(), hit.1.clone())))
+            .collect();
+        live.len() > 1 && signatures.len() > 1
+    }
+
+    /// The reason text for a Rust `Type::method(..)` call left unresolved because
+    /// the type has several bodies of that method, or `None` when that is not why.
+    pub(super) fn rust_multi_impl_reason(
+        &self,
+        family: LangFamily,
+        file: &str,
+        receiver: Option<&str>,
+        method: &str,
+    ) -> Option<String> {
+        if family != LangFamily::Rust {
+            return None;
+        }
+        let type_name = receiver.filter(|r| Self::is_plain_ident(r))?;
+        let hits = self
+            .type_methods
+            .get(&(family, type_name.to_string(), method.to_string()))?;
+        let mut uniq: Vec<&(String, String)> = hits.iter().collect();
+        uniq.sort();
+        uniq.dedup();
+        let files: BTreeSet<&str> = uniq.iter().map(|hit| hit.0.as_str()).collect();
+        files
+            .iter()
+            .any(|chosen| self.rust_method_is_overloaded_across_impls(type_name, &uniq, chosen))
+            .then(|| {
+                format!(
+                    "several impls of {type_name}::{method} exist ({} bodies in {} files in this index); which one runs depends on the argument's type, which this call site does not record (called from {file})",
+                    uniq.len(),
+                    files.len()
+                )
+            })
     }
 
     /// Every `type_methods` hit a Swift type spelling reaches from `call_file`

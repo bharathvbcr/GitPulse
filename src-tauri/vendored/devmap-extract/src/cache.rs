@@ -811,7 +811,39 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The commit that bumps the number only adds the fields, the empty emitters
 /// (`jvmfacts::collect`, `pyfacts::collect`) and the `langdecl::java` seam, and
 /// leaves every symbol, call, reference and edge as v97 wrote them.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "98";
+///
+/// v99 closes the bundle. A v98 row may have been written by any build from
+/// the scaffold on, so it can predate any change made after it. Those changes
+/// include the following:
+/// - The bundle's lanes filling the side tables.
+/// - Svelte templates are read whole, in document order, with a scope. A name
+///   an `{#each}`, snippet parameter, `{@const}`, `{#await}` or `let:` binds
+///   makes no call outside its block. A second same-named snippet is
+///   `name#2`. Store reads come from the tree. Binding-pattern defaults are
+///   expressions.
+/// - A lone identifier in markup is a Name reference, not a Call, and a lone
+///   literal keyword records nothing, in Svelte and in Vue.
+/// - Kotlin properties and type aliases are symbols, and the accessor and
+///   one-line-body repairs were extended.
+/// - Java records, record components, compact constructors and enum
+///   constants are symbols.
+/// - Swift wrapper properties and parameter receivers are typed. Tuple
+///   destructures, metatypes, bare-cast members and doubly-declared names
+///   abstain.
+/// - SQL tables and views the grammar swallowed are recovered.
+/// - A Rust `self::` path binds the module function, and each cfg copy keeps
+///   its calls on its own span.
+/// - Fallback call sites stay off the call graph.
+/// - Lean 4 files are read.
+///
+/// A store whose latest generation carries a v98 identity is therefore not
+/// current. The build's affected closure asks
+/// `latest_generation_payload_is_current` before any content hash, so the
+/// first v99 build re-extracts and re-resolves every file and reads no
+/// resolution-reuse blob. That also retires edges written under the resolver
+/// rules that changed after `RESOLUTION_REUSE_EPOCH` 2, so the epoch does not
+/// move with this bump.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "99";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

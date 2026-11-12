@@ -1,4 +1,7 @@
-use super::{refusal, sidecar_links, SidecarLinks, Store, WriterLock, CONNECTION_SETUP};
+use super::{
+    refusal, sidecar_links, GenerationChecks, ReaderMemory, SidecarLinks, Store, WriterLock,
+    CONNECTION_SETUP,
+};
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
 use std::path::Path;
@@ -221,10 +224,58 @@ impl Store {
     /// even when the application has write access to the file. A writer must
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref()))
+        Self::open_read_only_with(db_path, ReaderMemory::CURRENT)
     }
 
-    fn open_read_only_once(db_path: &Path) -> Result<Self> {
+    /// [`Self::open_read_only`] with the connection's page cache and file
+    /// mapping set to `memory` instead of [`ReaderMemory::CURRENT`].
+    pub fn open_read_only_with<P: AsRef<Path>>(db_path: P, memory: ReaderMemory) -> Result<Self> {
+        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref(), memory))
+    }
+
+    fn set_reader_memory(conn: &Connection, memory: ReaderMemory) -> Result<()> {
+        conn.pragma_update(None, "cache_size", -i64::from(memory.cache_kib))?;
+        if memory.mmap_bytes != 0 {
+            conn.pragma_update(None, "mmap_size", memory.mmap_bytes as i64)?;
+        }
+        Ok(())
+    }
+
+    /// Change this connection's page cache and file mapping after it was opened,
+    /// for a store handed back by an opener that does not take
+    /// [`ReaderMemory`] (a stacked lane's immutable base).
+    pub fn apply_reader_memory(&self, memory: ReaderMemory) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::set_reader_memory(&conn, memory)
+    }
+
+    /// The page cache and file mapping this connection is using now, read back
+    /// from SQLite rather than from what was asked for.
+    pub fn memory_settings(&self) -> Result<ReaderMemory> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache: i64 = conn.query_row("PRAGMA cache_size", [], |row| row.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let mmap: i64 = conn.query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
+        // A negative cache_size is KiB; a positive one is pages.
+        let cache_kib = if cache < 0 {
+            cache.unsigned_abs()
+        } else {
+            cache as u64 * page_size as u64 / 1024
+        };
+        Ok(ReaderMemory {
+            cache_kib: u32::try_from(cache_kib).unwrap_or(u32::MAX),
+            mmap_bytes: mmap.max(0) as u64,
+            tolerate_full_text_damage: self.full_text_damage.is_some(),
+        })
+    }
+
+    fn open_read_only_once(db_path: &Path, memory: ReaderMemory) -> Result<Self> {
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
@@ -281,18 +332,38 @@ impl Store {
         Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)?;
         Self::reject_triggers(&conn)?;
         Self::configure_connection(&conn)?;
-        Self::validate_schema(&conn)?;
+        Self::set_reader_memory(&conn, memory)?;
+        // A store whose full-text index alone is damaged comes back as that
+        // typed error, so a caller can tell it from every other refusal. A
+        // reader that asked to tolerate it opens the store degraded instead:
+        // the index is the only thing wrong, so nothing else is.
+        let full_text_damage = match Self::validate_schema_naming_index_damage(&conn)? {
+            None => None,
+            Some(damage) if memory.tolerate_full_text_damage => Some(damage.to_string()),
+            Some(damage) => return Err(damage),
+        };
         Ok(Self {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            full_text_damage,
             repo_root_override: None,
         })
+    }
+
+    /// Why the full-text index was found damaged when this store was opened
+    /// degraded ([`ReaderMemory::tolerate_full_text_damage`]); `None` for a
+    /// store that opened strictly. Searches on a store with this set refuse
+    /// with the typed full-text error while the index stays unreadable; every
+    /// other question is answered.
+    pub fn full_text_damage(&self) -> Option<&str> {
+        self.full_text_damage.as_deref()
     }
 
     /// Whether a read-only open may read a store stamped `stamped`.
@@ -454,9 +525,11 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
+            full_text_damage: None,
             repo_root_override: None,
         })
     }
@@ -1197,9 +1270,11 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            full_text_damage: None,
             repo_root_override,
         })
     }
@@ -1215,9 +1290,11 @@ impl Store {
             generation_counts: Mutex::new(None),
             fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
+            generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
+            full_text_damage: None,
             repo_root_override: None,
         })
     }

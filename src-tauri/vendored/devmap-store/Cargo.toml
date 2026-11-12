@@ -51,6 +51,11 @@ required-features = ["parse"]
 name = "strict_csr_sidecar"
 required-features = ["parse"]
 
+# Builds its generation from extracted source.
+[[test]]
+name = "full_text_damage_open"
+required-features = ["parse"]
+
 # The carry-forward guards these tests exercise live in `save_generation_timed`,
 # which is `#[cfg(feature = "parse")]`: a build without grammars writes no
 # generation, so the decision under test is never reached. Gated rather than
@@ -84,6 +89,16 @@ required-features = ["parse"]
 
 [[test]]
 name = "head_stamp"
+required-features = ["parse"]
+
+# Builds its generation from extracted source, and asks the working-tree check
+# that only exists with the parsing frontend.
+[[test]]
+name = "resolver_epoch_stamp"
+required-features = ["parse"]
+
+[[test]]
+name = "resolver_epoch_attack"
 required-features = ["parse"]
 
 [[test]]

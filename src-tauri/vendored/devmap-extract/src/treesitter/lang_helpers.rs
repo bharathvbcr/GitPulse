@@ -762,7 +762,12 @@ pub(super) fn member_access_receiver(node: Node, source: &str) -> Option<String>
     // Same distinction as a call: `self::name` is the module, `self.name` is
     // the value. Only the bare keyword changes; `self::child` already carries
     // `::`.
-    if text == "self" && matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier") {
+    if text == "self"
+        && matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        )
+    {
         text.push_str("::");
     }
     (!text.is_empty()).then_some(text)

@@ -290,6 +290,10 @@ impl Resolver {
             return found;
         }
         if path == "super" {
+            if let Some(declaring) = self.rust_path_modules.get(file) {
+                self.consider_indexed(&mut found, declaring.clone());
+                return found;
+            }
             let parent = Self::parent_dir(&self.rust_call_base(file));
             self.consider_module_dir(&mut found, &parent);
             return found;
@@ -314,7 +318,12 @@ impl Resolver {
                 hops += 1;
                 tail = more;
             }
-            let mut base = self.rust_call_base(file);
+            // A `#[path]` module's first `super` is its declaring file.
+            let (anchor, hops) = match self.rust_path_modules.get(file) {
+                Some(declaring) => (declaring.as_str(), hops - 1),
+                None => (file, hops),
+            };
+            let mut base = self.rust_call_base(anchor);
             for _ in 0..hops {
                 base = Self::parent_dir(&base);
             }
