@@ -66,4 +66,46 @@ describe("FileTreePanel source contracts", () => {
     expect(functionBody(source, "stageFile")).toContain("return await repoStore.stageFile(path);");
     expect(functionBody(source, "unstageFile")).toContain("return await repoStore.unstageFile(path);");
   });
+
+  /**
+   * The filter sits in a rounded-full pill. `app.css` still paints
+   * `box-shadow: var(--ring-focus)` on every `input:focus-visible`, and that
+   * ring is a rectangle. `focus:outline-hidden` never sets `box-shadow`, so it
+   * does not win. The pill border is the focus chrome; the input cancels the
+   * ring.
+   */
+  it("keeps filter focus on the rounded pill and cancels the input ring", () => {
+    const css = readFileSync(new URL("../../../app.css", import.meta.url), "utf8");
+    const focusRuleStart = css.indexOf("button:focus-visible");
+    expect(focusRuleStart).toBeGreaterThan(-1);
+    const focusRule = css.slice(focusRuleStart, css.indexOf("}", focusRuleStart) + 1);
+    expect(focusRule).toContain("input:focus-visible");
+    expect(focusRule).toContain("box-shadow: var(--ring-focus)");
+
+    const marker = 'placeholder="Filter files"';
+    const at = source.indexOf(marker);
+    expect(at).toBeGreaterThan(-1);
+    const field = source.slice(source.lastIndexOf("<div", at), source.indexOf("/>", at));
+    expect(field).toContain("file-tree-filter-pill");
+    expect(field).toContain("rounded-full");
+    expect(field).toContain("focus-within:border-accent/70");
+    expect(field).not.toContain("focus-within:shadow-(--ring-focus)");
+    expect(field).not.toContain("focus:outline-hidden");
+
+    const styleAt = source.indexOf("<style>");
+    expect(styleAt).toBeGreaterThan(-1);
+    const style = source.slice(styleAt, source.indexOf("</style>", styleAt));
+    const ruleStart = style.indexOf(".file-tree-filter:focus");
+    expect(ruleStart).toBeGreaterThan(-1);
+    const rule = style.slice(ruleStart, style.indexOf("}", ruleStart) + 1);
+    expect(rule).toContain(".file-tree-filter:focus-visible");
+    expect(rule).toMatch(/box-shadow:\s*none/);
+    expect(rule).toMatch(/outline-width:\s*0/);
+    expect(rule).not.toContain("var(--ring-focus)");
+    const forcedAt = style.indexOf("@media (forced-colors: active)");
+    expect(forcedAt).toBeGreaterThan(ruleStart);
+    const forced = style.slice(forcedAt, style.indexOf("}", style.indexOf("{", forcedAt)) + 1);
+    expect(forced).toContain(".file-tree-filter-pill:focus-within");
+    expect(forced).not.toContain(".file-tree-filter:focus");
+  });
 });

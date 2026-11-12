@@ -979,7 +979,7 @@
   </div>
 
   <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain border-b border-border/60 gp-section-edge bg-surface/30 space-y-1.5">
-    <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
+    <div class="file-tree-filter-pill flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
       <Search size={12} class="text-textMuted shrink-0" />
       <input
         type="text"
@@ -991,7 +991,7 @@
         placeholder="Filter files"
         title={QUERY_SYNTAX}
         spellcheck="false"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
+        class="file-tree-filter w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60"
       />
       {#if query}
         <button
@@ -1390,3 +1390,27 @@
     </button>
   </div>
 {/if}
+
+<style>
+  /*
+   * app.css `input:focus-visible` paints `box-shadow: var(--ring-focus)`, a
+   * rectangle. `focus:outline-hidden` does not set box-shadow, so it never
+   * cancelled that ring inside this rounded pill. The pill's focus-within
+   * border is the focus chrome. Forced colours drop box-shadow and author
+   * border colours, so the same pill — not the input — keeps a real outline.
+   */
+  .file-tree-filter:focus,
+  .file-tree-filter:focus-visible {
+    outline: none;
+    outline-width: 0;
+    box-shadow: none;
+    background-color: transparent;
+  }
+
+  @media (forced-colors: active) {
+    .file-tree-filter-pill:focus-within {
+      outline: 2px solid Highlight;
+      outline-offset: 2px;
+    }
+  }
+</style>
