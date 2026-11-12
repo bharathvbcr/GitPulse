@@ -625,8 +625,8 @@
         <button
           type="button"
           class="gp-icon-btn p-1!"
-          aria-label="Reload file from disk"
-          title="Reload file from disk"
+          aria-label="Refresh file from disk"
+          title="Refresh file from disk"
           onclick={() => void reloadFromDisk()}
         >
           <RotateCw size={12} class={isLoading || diffLoading ? "animate-spin" : ""} />
@@ -755,10 +755,10 @@
                       }
                     }}
                   >
-                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/30">
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-faint tabular-nums select-none bg-surface/30">
                       {row.oldNo ?? ""}
                     </span>
-                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/40">
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-faint tabular-nums select-none bg-surface/40">
                       {row.newNo ?? ""}
                     </span>
                     <span class="w-4 shrink-0 text-center select-none text-textMuted">
@@ -772,10 +772,10 @@
                       ? 'bg-danger/12 text-danger'
                       : 'text-textPrimary/90'}"
                   >
-                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/30">
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-faint tabular-nums select-none bg-surface/30">
                       {row.oldNo ?? ""}
                     </span>
-                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-textMuted/70 tabular-nums select-none bg-surface/40">
+                    <span class="w-10 shrink-0 px-1.5 text-right text-micro text-faint tabular-nums select-none bg-surface/40">
                       {row.newNo ?? ""}
                     </span>
                     <span class="w-4 shrink-0 text-center select-none text-textMuted">

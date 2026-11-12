@@ -295,6 +295,7 @@
     "allow-cmd-terminal-save-clipboard-image",
     "allow-cmd-terminal-incidents",
     "allow-cmd-terminal-kill",
+    "allow-cmd-terminal-listening-ports",
     "allow-cmd-terminal-read-agent-artifact",
     "allow-cmd-terminal-resize",
     "allow-cmd-terminal-run",

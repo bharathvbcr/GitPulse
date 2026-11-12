@@ -247,7 +247,7 @@ export async function installAgentKickoffRequests(): Promise<UnlistenFn> {
             onReady: (path) => (canonical = path),
           });
           const targetRepo = opened ? (canonical ?? next.repo) : null;
-          if (!targetRepo) throw new Error(`${next.repo} could not be opened`);
+          if (!targetRepo) throw new Error(`${next.repo} couldn't be opened`);
           repoStore.setTerminalOpen(true);
           for (let waited = 0; terminalLaunchRequests.busy; waited += 100) {
             if (waited >= KICKOFF_WAIT_MS) throw new Error(TERMINAL_SESSION_PENDING);

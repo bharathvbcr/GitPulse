@@ -39,6 +39,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("engine/git_writer.rs", 2, "both slice a Vec: `lines[lines.len().saturating_sub(20)..]` (Vec<&str>) and `prefix[1..prefix.len() - 1]` (Vec<String>)"),
     ("secrets/report.rs", 1, "slice of a Vec<&str> (`parts`), not a str"),
     ("terminal/ring.rs", 1, "slice of a `&[u8]` ring chunk, not a str"),
+    ("terminal/orchestrate.rs", 1, "slice of the base64-decoded `Vec<u8>` tail (`raw`), not a str; `delta <= raw.len()` is checked just above"),
     ("storage/mod.rs", 1, "slice of a Vec<Component> (`parts`), not a str"),
 ];
 

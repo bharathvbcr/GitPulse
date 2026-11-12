@@ -114,12 +114,12 @@ export async function clipboardImageToPngBase64(blob: Blob): Promise<string> {
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
     const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Could not initialize 2D canvas to encode clipboard image.");
+    if (!ctx) throw new Error("Couldn't initialize 2D canvas to encode clipboard image.");
     ctx.drawImage(bitmap, 0, 0);
     const pngBlob = await new Promise<Blob>((resolve, reject) => {
       canvas.toBlob((out) => {
         if (out) resolve(out);
-        else reject(new Error("Could not encode clipboard image as PNG."));
+        else reject(new Error("Couldn't encode clipboard image as PNG."));
       }, "image/png");
     });
     if (pngBlob.size > MAX_CLIPBOARD_IMAGE_BYTES) {

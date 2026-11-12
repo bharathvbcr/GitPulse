@@ -2430,7 +2430,7 @@
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
           >
-            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent/80 mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
+            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
           <button
             type="button"
