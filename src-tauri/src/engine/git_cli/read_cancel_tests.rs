@@ -18,9 +18,46 @@ fn gone_within() -> Duration {
 /// 60 s ran out inside the burst test's "nothing cancelled it" window under
 /// coverage (that window is `gone_within`, eight times longer when
 /// instrumented): the deadline, not a cancel, ended a child, and the test saw
-/// 7 of 8 alive at exactly 60 s.
+/// 7 of 8 alive at exactly 60 s. Held to the runner's ceiling: relaxed by load
+/// as well (up to 1,920 s), the runner refused every read unrun.
 fn read_deadline() -> Duration {
-    coverage_relaxed(Duration::from_secs(60))
+    read_deadline_from(coverage_relaxed(READ_DEADLINE))
+}
+
+/// The unrelaxed rig read deadline.
+const READ_DEADLINE: Duration = Duration::from_secs(60);
+
+fn read_deadline_from(relaxed: Duration) -> Duration {
+    relaxed.min(NETWORK_TIMEOUT)
+}
+
+#[test]
+fn the_rigs_read_deadline_is_one_the_runner_accepts() {
+    use crate::test_support::env::{relaxed_for, MAX_LOAD_FACTOR};
+    // Instrumented, at and past the load cap: the worst `coverage_relaxed` gives.
+    let cpus = 18;
+    let saturated = Some((MAX_LOAD_FACTOR * cpus as f64 * 2.0, cpus));
+    let worst = read_deadline_from(relaxed_for(READ_DEADLINE, true, saturated));
+    assert!(
+        worst <= NETWORK_TIMEOUT,
+        "{worst:?} is past the runner's ceiling"
+    );
+    assert!(
+        relaxed_for(READ_DEADLINE, true, saturated) > NETWORK_TIMEOUT,
+        "the worst case no longer reaches the ceiling, so this test shows nothing"
+    );
+    // On this host: never tighter than unrelaxed, and longer than the burst
+    // test's "nothing cancelled it" window, which its children must outlive.
+    let here = read_deadline();
+    assert!(
+        here >= READ_DEADLINE,
+        "{here:?} is tighter than the unrelaxed read"
+    );
+    assert!(
+        here > gone_within(),
+        "{here:?} ends inside the {:?} window",
+        gone_within()
+    );
 }
 
 /// The shell fragment a child runs to record itself: its pid and its own start
