@@ -11,7 +11,19 @@ use crate::test_support::{coverage_relaxed, process_alive, wait_gone, wait_until
 /// How long a cancelled child may take to leave: the ask, the grace
 /// ([`crate::procguard::CHILD_GRACE`]) and a margin, relaxed under coverage.
 fn gone_within() -> Duration {
-    coverage_relaxed(crate::procguard::CHILD_GRACE + Duration::from_secs(3))
+    coverage_relaxed(GONE_WITHIN_BASE)
+}
+
+/// [`gone_within`] before relaxing. [`wait_until`] relaxes the limit it is
+/// given, so a window that must be exactly `gone_within` is passed as this.
+const GONE_WITHIN_BASE: Duration = Duration::from_millis(3_500);
+
+#[test]
+fn gone_within_base_is_the_grace_and_its_margin() {
+    assert_eq!(
+        GONE_WITHIN_BASE,
+        crate::procguard::CHILD_GRACE + Duration::from_secs(3)
+    );
 }
 
 /// A rig read's own deadline, relaxed like the windows the tests watch. A fixed
@@ -484,6 +496,11 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
             }
         }
         // The last click has settled: give the cancelled children their grace.
+        // Both arms watch exactly `gone_within`: `wait_until` relaxes what it is
+        // given, so it gets the base. Given `gone_within()` it relaxed twice
+        // (about 224 s at no load under coverage, growing with the square of
+        // the load factor) and outran `lifetime`, which grows linearly: the
+        // children ended on their own and the uncancelled arm saw 7 alive.
         let alive_now = || {
             rig.started()
                 .iter()
@@ -492,7 +509,7 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
         };
         if cancellable {
             assert!(
-                wait_until(gone_within(), || alive_now() <= 1),
+                wait_until(GONE_WITHIN_BASE, || alive_now() <= 1),
                 "the cancelled children were not gone within the grace: {} alive",
                 alive_now()
             );
@@ -501,7 +518,7 @@ fn a_burst_of_superseded_clicks_leaves_one_child_running() {
             // after the same window: that the condition "fewer are alive" never
             // holds for the whole of it is what is being shown.
             assert!(
-                !wait_until(gone_within(), || alive_now() < CLICKS),
+                !wait_until(GONE_WITHIN_BASE, || alive_now() < CLICKS),
                 "a child exited although nothing cancelled it: {} alive",
                 alive_now()
             );
