@@ -6399,17 +6399,20 @@ mod tests {
             };
             let (wt_path_buf, state_path) =
                 resolve_campaign_state_path(&wt_repo).expect("campaign path");
-            let schema_c0 = crate::engine::git_cli::git_text(&wt_path_buf, &["rev-parse", "HEAD~1"])
-                .expect("schema c0")
-                .trim()
-                .to_string();
+            let schema_c0 =
+                crate::engine::git_cli::git_text(&wt_path_buf, &["rev-parse", "HEAD~1"])
+                    .expect("schema c0")
+                    .trim()
+                    .to_string();
             let schema_c1 = crate::engine::git_cli::git_text(&wt_path_buf, &["rev-parse", "HEAD"])
                 .expect("schema c1")
                 .trim()
                 .to_string();
             let mut ctrl = CampaignController::try_new(&schema_c0).expect("genesis");
-            ctrl.register_lane("worker-a", LaneRole::Worker).expect("worker-a");
-            ctrl.register_lane("worker-b", LaneRole::Worker).expect("worker-b");
+            ctrl.register_lane("worker-a", LaneRole::Worker)
+                .expect("worker-a");
+            ctrl.register_lane("worker-b", LaneRole::Worker)
+                .expect("worker-b");
             ctrl.register_lane("integrator", LaneRole::Integrator)
                 .expect("integrator");
             ctrl.acquire_leases(
@@ -6431,7 +6434,8 @@ mod tests {
                 .expect("proposal");
             ctrl.commit_target_branch("integrator", pid, &schema_c0, &schema_c1, true)
                 .expect("commit");
-            ctrl.save_verified_atomic(&state_path).expect("save campaign");
+            ctrl.save_verified_atomic(&state_path)
+                .expect("save campaign");
         }
         for name in [
             "gitpulse_worktree_inbox",
@@ -6727,8 +6731,10 @@ mod tests {
             .trim()
             .to_string();
         let mut ctrl = CampaignController::try_new(&oid_base_0).expect("genesis");
-        ctrl.register_lane("worker-alpha", LaneRole::Worker).expect("alpha");
-        ctrl.register_lane("worker-beta", LaneRole::Worker).expect("beta");
+        ctrl.register_lane("worker-alpha", LaneRole::Worker)
+            .expect("alpha");
+        ctrl.register_lane("worker-beta", LaneRole::Worker)
+            .expect("beta");
         ctrl.register_lane("integrator-main", LaneRole::Integrator)
             .expect("integrator");
         ctrl.acquire_leases(
@@ -6746,7 +6752,11 @@ mod tests {
         ctrl.post_bulletin("worker-alpha", "handoff", "single-writer lease acquired")
             .expect("bulletin");
         let prop_id = ctrl
-            .stage_proposal("worker-alpha", &oid_base_0, &["src/engine/campaign_formal.rs"])
+            .stage_proposal(
+                "worker-alpha",
+                &oid_base_0,
+                &["src/engine/campaign_formal.rs"],
+            )
             .expect("proposal");
         ctrl.commit_target_branch("integrator-main", prop_id, &oid_base_0, &oid_base_1, true)
             .expect("integrate");
@@ -6771,8 +6781,7 @@ mod tests {
         assert_eq!(sc["active_leases"][0]["lane"], "worker-beta", "{sc}");
         assert_eq!(sc["bulletin_total"], 2, "{sc}");
         assert_eq!(
-            sc["target_commits"][0]["committer_role"],
-            "Integrator",
+            sc["target_commits"][0]["committer_role"], "Integrator",
             "{sc}"
         );
 
@@ -6902,7 +6911,12 @@ mod tests {
         // 3. Rogue direct commit on the primary target worktree bypassing Integrator MUST fail closed!
         crate::test_support::git_in(
             repo_dir.path(),
-            &["commit", "--allow-empty", "-m", "rogue direct commit on main"],
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "rogue direct commit on main",
+            ],
         );
         let c2 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
             .expect("c2")
@@ -6918,7 +6932,10 @@ mod tests {
                 }),
             );
             let rsc = &rogue["structuredContent"];
-            assert_eq!(rsc["ok"], false, "rogue commit bypassed audit ({probe_repo}): {rsc}");
+            assert_eq!(
+                rsc["ok"], false,
+                "rogue commit bypassed audit ({probe_repo}): {rsc}"
+            );
             assert_eq!(rsc["invariants_verified"], false, "{rsc}");
             assert_eq!(rsc["sole_committer_enforced"], false, "{rsc}");
             assert_eq!(rsc["head_oid"], c2, "{rsc}");

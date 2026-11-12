@@ -1489,13 +1489,24 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let write_res = (|| -> Result<(), String> {
-        let mut f = opts
-            .open(&tmp_path)
-            .map_err(|e| format!("cannot create temp campaign state {}: {e}", tmp_path.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("cannot write temp campaign state {}: {e}", tmp_path.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("cannot fsync temp campaign state {}: {e}", tmp_path.display()))?;
+        let mut f = opts.open(&tmp_path).map_err(|e| {
+            format!(
+                "cannot create temp campaign state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
+        f.write_all(bytes).map_err(|e| {
+            format!(
+                "cannot write temp campaign state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
+        f.sync_all().map_err(|e| {
+            format!(
+                "cannot fsync temp campaign state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
         Ok(())
     })();
     if let Err(err) = write_res {
@@ -1558,7 +1569,10 @@ impl CampaignOdbStateAnchor {
             target_commits_len,
         ))
         .map_err(|e| format!("cannot serialize campaign ODB anchor HMAC payload: {e}"))?;
-        let tag = hmac_sha256(key, &[b"gitpulse-campaign-odb-anchor-hmac-v1\0", &canonical]);
+        let tag = hmac_sha256(
+            key,
+            &[b"gitpulse-campaign-odb-anchor-hmac-v1\0", &canonical],
+        );
         Ok(Self {
             schema_version: 1,
             chain_seq,
@@ -1586,7 +1600,10 @@ impl CampaignOdbStateAnchor {
             self.target_commits_len,
         ))
         .map_err(|e| format!("cannot serialize campaign ODB anchor HMAC payload: {e}"))?;
-        let expected = hmac_sha256(key, &[b"gitpulse-campaign-odb-anchor-hmac-v1\0", &canonical]);
+        let expected = hmac_sha256(
+            key,
+            &[b"gitpulse-campaign-odb-anchor-hmac-v1\0", &canonical],
+        );
         let claimed = decode_hex_32(&self.anchor_hmac_sha256)
             .map_err(|e| format!("CampaignOdbAnchorHmacMalformed: {e}"))?;
         if !ct_eq_32(&expected, &claimed) {
@@ -1772,14 +1789,13 @@ fn verify_odb_state_anchor(
     // Verify `<git-common-dir>/logs/refs/gitpulse/campaign/state` reflog continuity so
     // `git update-ref refs/gitpulse/campaign/state <older_oid>` + `campaign.json` replay is convicted!
     let reflog_path = common.join("logs").join(CAMPAIGN_STATE_REF);
-    let reflog_bytes = read_regular_bounded_file(&reflog_path, MAX_CAMPAIGN_STATE_BYTES).map_err(
-        |e| {
+    let reflog_bytes =
+        read_regular_bounded_file(&reflog_path, MAX_CAMPAIGN_STATE_BYTES).map_err(|e| {
             format!(
                 "MissingOrInvalidCampaignOdbReflog: required reflog {} unreadable ({e})",
                 reflog_path.display()
             )
-        },
-    )?;
+        })?;
     let reflog_text = String::from_utf8_lossy(&reflog_bytes);
     let mut last_new_oid: Option<&str> = None;
     let mut reflog_candidates: BTreeSet<String> = BTreeSet::new();
