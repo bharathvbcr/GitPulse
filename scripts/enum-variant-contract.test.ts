@@ -84,6 +84,22 @@ const NO_TS_MIRROR = new Map<string, string>([
     "Place",
     "part of a terminal host spawn request (app to gitpulse-ptyd); the frontend spawns with repoPath/startDir or a task run id and never sees it",
   ],
+  [
+    "LaneRole",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+  ],
+  [
+    "LeaseMode",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+  ],
+  [
+    "LeaseScope",
+    "campaign model (engine/campaign_formal.rs): read by agents over MCP (`gitpulse_campaign_audit`, gitpulse://campaign) and by the gitpulse-worktree CLI; no Tauri command returns it and the frontend has no consumer",
+  ],
+  [
+    "CampaignViolation",
+    "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`gitpulse_campaign_audit`) and by the gitpulse-worktree CLI; no Tauri command returns them and the frontend has no consumer",
+  ],
 ]);
 
 /** serde's rename_all, for the rules this repo uses. */
