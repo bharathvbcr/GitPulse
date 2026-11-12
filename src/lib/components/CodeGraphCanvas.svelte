@@ -49,7 +49,7 @@
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { getLanguageIconColor, type LanguageIconKey } from "../language/languageLogos";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
 
   /**
@@ -625,7 +625,7 @@
         <button type="button" class="gp-btn" data-size="sm" data-testid="map-filters-toggle" class:text-accent={filtersActive} aria-haspopup="true" aria-expanded={filtersOpen} onclick={() => filtersOpen = !filtersOpen}>Filters</button>
         {#if filtersOpen}
           <div class="map-filters gp-menu absolute right-0 top-full mt-1 w-64 max-h-[70vh] overflow-y-auto! text-xs" style={`z-index:${LAYERS.MENU}`}
-            use:popover={filtersDismissal} role="group" aria-label="Graph filters">
+            use:popover={filtersDismissal} out:popoverExit role="group" aria-label="Graph filters">
             <!-- The row is the menu item and owns the visible text; Checkbox is
                  the box alone (it takes the row's words as its name). -->
             <label class="gp-menu-item cursor-pointer" title="Identified by conventional test directory and filename patterns"><Checkbox ariaLabel="Hide tests" checked={hideTests} onchange={(next) => { hideTests = next; filtersChanged(); }} /> Hide tests</label>

@@ -170,10 +170,23 @@ function countStatuses(cache: ProjectionCache, statuses: readonly FileStatus[]) 
   return cache.counts;
 }
 
-/** Every `OpenRepoTab` field is a primitive, so equal keys and values is equal. */
+/**
+ * Every `OpenRepoTab` field is a primitive except `sync`, which `projectTab`
+ * builds fresh on every call; it is compared by value, or no rebuilt row would
+ * ever equal the one it replaces and the array would lose its identity on
+ * every publish.
+ */
 function sameRow(a: OpenRepoTab, b: OpenRepoTab): boolean {
   const keys = Object.keys(a) as (keyof OpenRepoTab)[];
-  return keys.length === Object.keys(b).length && keys.every((key) => Object.is(a[key], b[key]));
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every((key) => (key === "sync" ? sameSync(a.sync, b.sync) : Object.is(a[key], b[key])))
+  );
+}
+
+function sameSync(a: OpenRepoTab["sync"], b: OpenRepoTab["sync"]): boolean {
+  if (a == null || b == null) return Object.is(a, b);
+  return a.ahead === b.ahead && a.behind === b.behind;
 }
 
 export function project(
