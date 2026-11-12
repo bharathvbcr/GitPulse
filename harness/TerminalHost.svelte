@@ -1,7 +1,6 @@
 <script lang="ts">
   import TerminalDock from "../src/lib/components/TerminalDock.svelte";
   import CodeViewer from "../src/lib/components/files/CodeViewer.svelte";
-  import ScanProposals from "../src/lib/components/ScanProposals.svelte";
   import { repoStore } from "../src/lib/stores/repoStore";
   import { themeStore } from "../src/lib/stores/themeStore";
   const load = () => import("../src/lib/components/TerminalPanel.svelte");
@@ -36,9 +35,9 @@
   </div>
   <div class="flex-1 min-h-0 flex flex-col border border-border rounded-lg overflow-hidden">
     <!-- The view above the dock, in the shape App gives it: `.gp-view` around
-         Work's 36px section bar and the tasks surface, whose Proposals pill
-         floats over the board's corner. An expanded dock leaves this no
-         room, and what is positioned inside it must not show over the dock. -->
+         Work's 36px section bar and the surface under it. An expanded dock
+         leaves this no room, and what is positioned inside it must not show
+         over the dock. -->
     <div class="flex-1 min-h-0 flex flex-col" data-view-host style:visibility={covered ? "hidden" : null} inert={covered}>
       <div class="h-9 shrink-0 border-b border-border/60"></div>
       <div class="relative flex-1 min-h-0 flex flex-col">
@@ -49,7 +48,6 @@
         {:else}
           <div class="flex-1 min-h-0 overflow-hidden p-4 text-textMuted">Terminal verification · Simulated PTY transport, real components and xterm. No commands execute.</div>
         {/if}
-        <ScanProposals repositoryPath={$repoStore.currentPath ?? ""} />
       </div>
     </div>
     <TerminalDock bind:expanded open={$repoStore.terminalOpen} onClose={() => repoStore.setTerminalOpen(false)} {load} />

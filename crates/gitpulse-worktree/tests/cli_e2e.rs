@@ -982,3 +982,145 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
         "merge teardown must auto-release merge-worker lane slot, remaining={remaining_agents:?}"
     );
 }
+
+#[test]
+fn cli_campaign_init_audit_and_tamper_conviction_e2e() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("campaign-repo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "Campaign E2E"]);
+    git(&anchor, &["config", "user.email", "campaign@example.com"]);
+    fs::write(anchor.join("src_a.rs"), "pub fn a() {}\n").unwrap();
+    git(&anchor, &["add", "."]);
+    git(&anchor, &["commit", "-q", "-m", "genesis"]);
+    approve_in_isolated_home(&anchor, home.path());
+
+    let anchor_str = anchor.to_str().unwrap();
+
+    // 1. Initialize authenticated campaign state over CLI.
+    let init = run_cli_json_ok(
+        home.path(),
+        &["campaign", "--repo", anchor_str, "--action", "init"],
+    );
+    assert_eq!(init["ok"], true, "{init}");
+    let state_path = PathBuf::from(init["state_path"].as_str().unwrap());
+    let key_path = state_path.parent().unwrap().join("campaign.key");
+    assert!(state_path.is_file(), "campaign.json must exist");
+    assert!(key_path.is_file(), "campaign.key must exist");
+    let genesis_snapshot = fs::read_to_string(&state_path).unwrap();
+
+    // Duplicate `init` must fail closed rather than resetting an active campaign.
+    let dup_init = run_cli(
+        home.path(),
+        &[
+            "--json", "campaign", "--repo", anchor_str, "--action", "init",
+        ],
+    );
+    assert_eq!(dup_init.status.code(), Some(1));
+
+    // 2. Register lane, acquire lease, post bulletin, and verify `status` + `audit`.
+    run_cli_json_ok(
+        home.path(),
+        &[
+            "campaign",
+            "--repo",
+            anchor_str,
+            "--action",
+            "register-lane",
+            "--lane",
+            "worker-1",
+            "--role",
+            "worker",
+        ],
+    );
+    run_cli_json_ok(
+        home.path(),
+        &[
+            "campaign",
+            "--repo",
+            anchor_str,
+            "--action",
+            "acquire-lease",
+            "--lane",
+            "worker-1",
+            "--mode",
+            "write",
+            "--files",
+            "src_a.rs",
+        ],
+    );
+    run_cli_json_ok(
+        home.path(),
+        &[
+            "campaign",
+            "--repo",
+            anchor_str,
+            "--action",
+            "bulletin",
+            "--lane",
+            "worker-1",
+            "--kind",
+            "status",
+            "--body",
+            "editing src_a.rs",
+        ],
+    );
+
+    let audit_ok = run_cli_json_ok(
+        home.path(),
+        &["campaign", "--repo", anchor_str, "--action", "audit"],
+    );
+    assert_eq!(audit_ok["ok"], true, "{audit_ok}");
+    assert_eq!(audit_ok["key_permissions_valid"], true, "{audit_ok}");
+    assert_eq!(audit_ok["hmac_authenticated"], true, "{audit_ok}");
+    assert_eq!(audit_ok["odb_anchor_verified"], true, "{audit_ok}");
+    let odb_oid = audit_ok["odb_state_ref_oid"]
+        .as_str()
+        .expect("odb_state_ref_oid");
+    assert_eq!(odb_oid.len(), 40);
+
+    // 3. Loosened key permissions (0644) must fail CLI `audit` with exit 1.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let bad_perm = run_cli(
+            home.path(),
+            &[
+                "--json", "campaign", "--repo", anchor_str, "--action", "audit",
+            ],
+        );
+        assert_eq!(bad_perm.status.code(), Some(1));
+        let err_payload: Value = serde_json::from_slice(&bad_perm.stdout).unwrap();
+        assert_eq!(err_payload["ok"], false);
+        assert!(
+            err_payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("0600"),
+            "expected 0600 permission error, got: {err_payload}"
+        );
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // 4. Replaying valid HMAC-signed genesis `campaign.json` must fail ODB rollback detection.
+    fs::write(&state_path, &genesis_snapshot).unwrap();
+    let rollback = run_cli(
+        home.path(),
+        &[
+            "--json", "campaign", "--repo", anchor_str, "--action", "status",
+        ],
+    );
+    assert_eq!(rollback.status.code(), Some(1));
+    let rollback_payload: Value = serde_json::from_slice(&rollback.stdout).unwrap();
+    assert_eq!(rollback_payload["ok"], false);
+    assert!(
+        rollback_payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refs/gitpulse/campaign/state"),
+        "expected ODB rollback refusal, got: {rollback_payload}"
+    );
+}

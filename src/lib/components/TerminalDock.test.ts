@@ -27,6 +27,8 @@ describe("TerminalDock", () => {
     }).body;
     expect(body).toContain("data-terminal-dock");
     expect(body).toContain("Terminal");
+    expect(body).toContain("rounded-t-lg");
+    expect(body).not.toContain("rounded-b-lg");
   });
 
   // Rendered in harness/terminal.html: "hide/show preserves both sessions";
@@ -35,8 +37,7 @@ describe("TerminalDock", () => {
   // restores both original tabs"; "Go to switches to that repository without
   // spawning anything new" and "Go to leaves its dock showing"; "the dock's
   // resize separator grows on ArrowUp and shrinks back on ArrowDown,
-  // reporting its value"; expand and restore, with the view's Proposals pill
-  // hidden and unfocusable while expanded and back after restore.
+  // reporting its value"; expand and restore of the dock height.
   it("hosts a repository's panel, unseen, while a task terminal waits for it", () => {
     // A launch from a task sheet must start its agent without opening the
     // dock or showing the repository; the queued request is what asks for
@@ -149,11 +150,10 @@ describe("App hosts the terminal as a dock, not a view", () => {
   });
 
   it("hides the view, and takes it out of the tab order, while an open dock is expanded", () => {
-    // The expanded dock leaves the view zero height, and Work's Proposals pill
-    // (absolute, z-index 20) hung out of that box over the terminal. The rule
-    // is the view's, not the pill's, so every positioned control is covered.
-    // harness/terminal.html renders it: "an expanded dock hides the view's
-    // Proposals pill rather than painting it over the terminal".
+    // The expanded dock leaves the view zero height. A control positioned
+    // inside that box still paints over the terminal and stays in the tab
+    // order unless the view itself is hidden. harness/terminal.html covers
+    // expand and restore of the dock.
     expect(source).toContain("expanded = $bindable(false)");
     expect(source).not.toContain("let expanded = $state(");
     expect(app).toContain("bind:expanded={terminalDockExpanded}");

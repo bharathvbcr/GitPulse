@@ -289,4 +289,14 @@ describe("FileViewer", () => {
     expect(path).toContain('target={pathStrip} axis="x"');
     expect(path).not.toContain("max-w-[14ch]");
   });
+
+  it("sizes the explorer from the shared file-tree column instead of a fixed w-72", () => {
+    // The column used to be `w-72 shrink-0` (288px) with no handle. Blame
+    // renders beside it in the editor pane, so this is the only tree width.
+    const row = source.slice(source.indexOf("flex-1 flex min-h-0 overflow-hidden relative"));
+    expect(row).toContain("<FileTreeColumn");
+    expect(row).toContain("reserve={explorerReserve}");
+    expect(row).not.toContain("w-72");
+    expect(source).toContain('import FileTreeColumn from "./files/FileTreeColumn.svelte"');
+  });
 });

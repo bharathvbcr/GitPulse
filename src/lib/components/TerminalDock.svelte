@@ -55,8 +55,8 @@
     /**
      * The dock fills its column, leaving the view above it no height. Bound
      * by the host, which must then hide that view: a zero-height view still
-     * paints whatever it positions — Work's Proposals pill, a banner — over
-     * the terminal, and keeps those controls in the tab order.
+     * paints whatever it positions over the terminal, and keeps those
+     * controls in the tab order.
      */
     expanded?: boolean;
   } = $props();
@@ -270,7 +270,7 @@
   <div
     bind:this={host}
     use:popover={dockDismissOptions}
-    class="gp-dock-motion flex flex-col bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
+    class="gp-dock-motion flex flex-col overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
     class:hidden={!open && !leaving}
     style="height: {height}px; --gp-dock-exit-ms: {exitMs}ms;{overlay ? ` z-index: ${LAYERS.STICKY};` : ''}"
     data-terminal-dock

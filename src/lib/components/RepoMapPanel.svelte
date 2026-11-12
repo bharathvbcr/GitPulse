@@ -52,6 +52,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
+  import { crossfade } from "svelte/transition";
   import { beginGeneration } from "../async/guard";
   import { reportPanelError } from "../diagnostics/report";
   import { paneDetails } from "../diagnostics/paneCrash";
@@ -59,9 +60,12 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
+  import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
   import { Loader2, Network } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
   import { requestReveal } from "../files/revealRequests";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -128,12 +132,17 @@
   import { formatError } from "../ui/formatError";
   import CodeGraphCanvas from "./CodeGraphCanvas.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
   import {
     classifyMapFailure,
     mapFailureMessage,
   } from "../tools/externalTools";
+
+  const macos = isMacOS();
+  // Same glass pill the header's section tabs glide. Labels stay put.
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   /**
    * Code → Map: navigate the consumer `repo_map.json`, draw the code /
@@ -793,6 +802,26 @@
     setView(MAP_VIEWS[move.index].id);
     focusTabAt(tablistEl, move.index);
   }
+
+  // The strip hides its scrollbar, same as the repository bar. A vertical
+  // wheel pans it once the tabs no longer fit; while they fit, the wheel
+  // stays with the page.
+  $effect(() => {
+    const el = tablistEl;
+    if (!el) return;
+    return bindHorizontalWheel(el);
+  });
+
+  // Keep the selected tab inside this strip. `scrollIntoView` would also
+  // pan the map canvas.
+  $effect(() => {
+    const scroller = tablistEl;
+    const id = tabId("map-view", mapView);
+    if (!scroller) return;
+    const child = scroller.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+    if (!child) return;
+    scroller.scrollLeft = scrollChildIntoHorizontalView(scroller, child);
+  });
 </script>
 
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
@@ -913,26 +942,42 @@
     </div>
   {/if}
 
-  <!-- View switcher: navigator vs canvases vs docs vs links -->
-  <div
-    bind:this={tablistEl}
-    class="shrink-0 flex flex-wrap items-center gap-1 px-2 py-1 text-meta"
-    role="tablist"
-    aria-label="Map views"
-    tabindex="-1"
-    onkeydown={onTablistKeydown}
-  >
-    {#each MAP_VIEWS as view (view.id)}
-      <button
-        type="button"
-        {...tabProps("map-view", view.id, mapView === view.id)}
-        class="rounded px-2 py-0.5 {mapView === view.id ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-        onclick={() => setView(view.id)}
-        title={view.title}
-      >
-        {view.label}
-      </button>
-    {/each}
+  <!-- View switcher: the header's segmented tabs, one scrolling line. -->
+  <div class="relative flex w-full min-w-0 shrink-0 px-3 py-1">
+    <div
+      bind:this={tablistEl}
+      class={[
+        "gp-header-scroll gp-segmented relative min-w-0 w-max max-w-full flex-nowrap items-center",
+        { "gp-liquid-tabs": macos },
+      ]}
+      role="tablist"
+      aria-label="Map views"
+      tabindex="-1"
+      onkeydown={onTablistKeydown}
+    >
+      {#each MAP_VIEWS as view (view.id)}
+        {@const selected = mapView === view.id}
+        <button
+          type="button"
+          {...tabProps("map-view", view.id, selected)}
+          data-active={selected ? "true" : "false"}
+          class="gp-seg-btn relative inline-flex h-7 shrink-0 items-center whitespace-nowrap py-0!"
+          onclick={() => setView(view.id)}
+          title={view.title}
+        >
+          {#if macos && selected}
+            <span
+              class="gp-liquid-selection gp-gpu"
+              aria-hidden="true"
+              in:receiveSelection={{ key: "map-view" }}
+              out:sendSelection={{ key: "map-view" }}
+            ></span>
+          {/if}
+          <span class="whitespace-nowrap">{view.label}</span>
+        </button>
+      {/each}
+    </div>
+    <ScrollCue target={tablistEl} axis="x" />
   </div>
 
   {#if actionNote}

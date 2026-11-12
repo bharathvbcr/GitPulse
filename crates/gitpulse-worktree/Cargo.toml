@@ -9,6 +9,9 @@ license = "MIT"
 name = "gitpulse_worktree"
 path = "src/lib.rs"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [[bin]]
 name = "gitpulse-worktree"
 path = "src/main.rs"

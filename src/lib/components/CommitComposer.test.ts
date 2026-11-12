@@ -140,6 +140,10 @@ describe("CommitComposer", () => {
     // dialog; the words are the sparkle's accessible name, not a second label.
     const { body } = render(CommitComposer);
     expect(body).not.toMatch(/>\s*Ask agent\s*</);
+    expect(body).not.toContain(">Ask Agent<");
+    // The old trigger's visible label, in either casing, is gone from the footer.
+    expect(body).not.toContain("Ask Agent to Commit");
+    expect(body).not.toContain("Ask agent to commit");
 
     const splitAt = body.indexOf("data-commit-split");
     const menuAt = body.indexOf("data-agent-commit-menu");
@@ -148,7 +152,8 @@ describe("CommitComposer", () => {
     expect(menuAt).toBeGreaterThan(splitAt);
     expect(sparkAt).toBeGreaterThan(menuAt);
 
-    // As wide as the message box, not a shrink-wrapped inline group.
+    // The group used to be an inline-flex shrink wrap, only as wide as
+    // "Commit (0)" plus the sparkle. It now uses the message box's w-full.
     const groupTag = body.slice(body.lastIndexOf("<div", splitAt), body.indexOf(">", splitAt) + 1);
     expect(groupTag).toContain("w-full");
     expect(groupTag).toContain('role="group"');
@@ -164,19 +169,37 @@ describe("CommitComposer", () => {
     expect(commitButton).toContain("disabled");
     // A clean tree says why Commit is off, in the agent menu's own words.
     expect(commitButton).toContain("No uncommitted changes to commit.");
+    // The sparkle keeps a fixed width beside the stretching Commit.
+    expect(split).toContain("shrink-0");
 
     const sparkleButton = body.slice(
       body.lastIndexOf("<button", sparkAt),
       body.indexOf("</button>", sparkAt) + "</button>".length,
     );
     expect(sparkleButton).toContain('aria-haspopup="dialog"');
+    expect(sparkleButton).not.toContain("justify-center");
     expect(sparkleButton).toContain("disabled");
     expect(sparkleButton).toContain("<svg");
+    expect(sparkleButton).not.toMatch(/>\s*Ask agent\s*</i);
 
     const footer = source.slice(source.indexOf("<!-- The two toggles"));
     expect(footer).toContain("void handleCommit()");
     expect(footer).toMatch(/<AgentCommitMenu segment\b/);
     expect(footer).not.toContain("compact={true}");
+
+    const menuSource = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "AgentCommitMenu.svelte"),
+      "utf8",
+    );
+    const segmentStart = menuSource.indexOf("{#if segment}");
+    const segmentEnd = menuSource.indexOf("{:else if compact}");
+    expect(segmentStart).toBeGreaterThan(-1);
+    expect(segmentEnd).toBeGreaterThan(segmentStart);
+    const segment = menuSource.slice(segmentStart, segmentEnd);
+    expect(segment).toContain("onclick={toggle}");
+    expect(segment).toContain('aria-haspopup="dialog"');
+    expect(segment).toContain('aria-label="Ask agent"');
+    expect(segment).not.toMatch(/>\s*Ask agent\s*</i);
   });
 
   it("writes a commit message without waiting for a loopback model", () => {

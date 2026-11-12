@@ -66,4 +66,48 @@ describe("FileTreePanel source contracts", () => {
     expect(functionBody(source, "stageFile")).toContain("return await repoStore.stageFile(path);");
     expect(functionBody(source, "unstageFile")).toContain("return await repoStore.unstageFile(path);");
   });
+
+  /**
+   * The filter sits in a rounded-full pill, and the pill's edge is the focus
+   * chrome. A rectangular ring inside it is what this guards against: `app.css`
+   * gives a typed text box no ring (owner decision 2026-11-11), so the input
+   * needs no cancelling rule of its own, and must not have one: an unlayered
+   * `outline: none` on it would also remove the forced-colours outline, the
+   * floor that keeps keyboard focus visible in high contrast.
+   */
+  it("keeps filter focus on the rounded pill, with no rectangular ring and the forced-colours floor intact", () => {
+    const css = readFileSync(new URL("../../../app.css", import.meta.url), "utf8");
+    const ringRuleStart = css.indexOf("button:focus-visible");
+    expect(ringRuleStart).toBeGreaterThan(-1);
+    const ringRule = css.slice(ringRuleStart, css.indexOf("}", ringRuleStart) + 1);
+    expect(ringRule).toContain("box-shadow: var(--ring-focus)");
+    // The ring goes to controls you operate, never to a text box you type in.
+    expect(ringRule).not.toMatch(/(^|[\s,])input:focus-visible/);
+    const textRuleStart = css.indexOf("input:not([type=\"checkbox\"]");
+    expect(textRuleStart).toBeGreaterThan(-1);
+    const textRule = css.slice(textRuleStart, css.indexOf("}", textRuleStart) + 1);
+    expect(textRule).not.toContain("box-shadow");
+    const forcedAt = css.indexOf("@media (forced-colors: active)");
+    expect(forcedAt).toBeGreaterThan(-1);
+    const forced = css.slice(forcedAt, css.indexOf("}", css.indexOf("{", css.indexOf("{", forcedAt) + 1)) + 1);
+    expect(forced).toContain("input:focus-visible");
+    expect(forced).toContain("outline: 2px solid Highlight");
+
+    const marker = 'placeholder="Filter files"';
+    const at = source.indexOf(marker);
+    expect(at).toBeGreaterThan(-1);
+    const field = source.slice(source.lastIndexOf("<div", at), source.indexOf("/>", at));
+    expect(field).toContain("file-tree-filter-pill");
+    expect(field).toContain("rounded-full");
+    // The field focus edge every text field uses, on the pill.
+    expect(field).toContain("focus-within:border-(--field-focus-edge)");
+    expect(field).not.toContain("focus-within:shadow-(--ring-focus)");
+    expect(field).not.toContain("focus:outline-hidden");
+
+    // Nothing scoped re-adds a ring or takes the forced-colours outline away.
+    const styleAt = source.indexOf("<style>");
+    const style = styleAt === -1 ? "" : source.slice(styleAt, source.indexOf("</style>", styleAt));
+    expect(style).not.toContain("var(--ring-focus)");
+    expect(style).not.toMatch(/\.file-tree-filter:focus/);
+  });
 });

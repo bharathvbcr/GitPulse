@@ -99,6 +99,35 @@ describe("metricsFromLanguages", () => {
     expect(metrics.loc_language).toBe("Rust");
   });
 
+  it("leaves documentation out of the lines, the headline language and the mix", () => {
+    const metrics = metricsFromLanguages(
+      report({
+        stats: [
+          { language: "Markdown", color_hex: "#3", category: "prose", code_lines: 5000, file_count: 40, percentage: 70 },
+          { language: "Rust", color_hex: "#0", category: "programming", code_lines: 900, file_count: 3, percentage: 20 },
+          { language: "JSON", color_hex: "#2", category: "data", code_lines: 100, file_count: 1, percentage: 8 },
+          { language: "Text", color_hex: "#4", category: "data", code_lines: 40, file_count: 2, percentage: 2 },
+        ],
+      }),
+    );
+    expect(metrics.loc).toBe(1000);
+    expect(metrics.loc_language).toBe("Rust");
+    expect(metrics.languages?.map((stat) => stat.language)).toEqual(["Rust", "JSON"]);
+  });
+
+  it("names no language for a repository that holds only documentation", () => {
+    const metrics = metricsFromLanguages(
+      report({
+        stats: [
+          { language: "Markdown", color_hex: "#3", category: "prose", code_lines: 50, file_count: 1, percentage: 100 },
+        ],
+      }),
+    );
+    expect(metrics.loc).toBe(0);
+    expect(metrics.loc_language).toBeNull();
+    expect(metrics.languages).toEqual([]);
+  });
+
   it("carries the backend's truncation flag through", () => {
     // A capped scan counted part of the tree; the flag is what stops the grid
     // rendering that partial total like a complete one.

@@ -5,3 +5,4 @@
 //! `gitpulse-worktree build` / `cache-stats` subcommands.
 
 pub mod build_cache;
+pub mod campaign_formal;

@@ -989,8 +989,11 @@
   </div>
 
   <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain bg-surface/30 space-y-1.5">
-    <div class="relative">
-      <Search size={12} class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted" />
+    <!-- The pill is the field: its edge carries focus, the input inside it
+         draws none. The clear button sits over the pill's right end so the
+         pill keeps one height whether or not there is a query. -->
+    <div class="file-tree-filter-pill relative flex items-center gap-1.5 bg-background border border-edge rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-(--field-focus-edge) transition-colors">
+      <Search size={12} class="pointer-events-none text-textMuted shrink-0" />
       <input
         type="text"
         bind:value={query}
@@ -1001,7 +1004,7 @@
         placeholder="Filter files"
         title={QUERY_SYNTAX}
         spellcheck="false"
-        class="gp-field w-full pl-7! {query ? 'pr-8!' : ''}"
+        class="file-tree-filter w-full min-w-0 bg-transparent text-xs text-textPrimary placeholder:text-faint {query ? 'pr-5' : ''}"
       />
       {#if query}
         <button
@@ -1009,7 +1012,7 @@
           onclick={() => { query = ""; applyQuery.cancel(); debouncedQuery = ""; }}
           aria-label="Clear filter"
           title="Clear filter"
-          class="gp-icon-btn absolute right-1 top-1/2 -translate-y-1/2"
+          class="gp-icon-btn absolute right-0.5 top-1/2 -translate-y-1/2"
           data-size="sm"
         >
           <X size={11} />
@@ -1408,3 +1411,23 @@
     </button>
   </div>
 {/if}
+
+<style>
+  /*
+   * The pill's focus-within edge is the only focus chrome. app.css no longer
+   * rings a text box being typed in, but this input still cancels any ring,
+   * outline or fill outright, so a later global focus rule cannot draw a
+   * rectangle inside the rounded pill. Forced colours drop box-shadow and
+   * author border colours, so the same pill, not the input, keeps a real
+   * outline there.
+   *
+   * WKWebView ignores `color` on form controls in a transparent window; the
+   * fill colour is what paints typed text and the placeholder (as gp-field).
+   */
+  .file-tree-filter {
+    -webkit-text-fill-color: rgb(var(--c-text));
+  }
+  .file-tree-filter::placeholder {
+    -webkit-text-fill-color: rgb(var(--c-text-faint));
+  }
+</style>

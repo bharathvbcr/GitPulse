@@ -4,46 +4,13 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { render } from "svelte/server";
 import { compile } from "svelte/compiler";
-import ScanProposals from "./ScanProposals.svelte";
 import TaskRefine from "./TaskRefine.svelte";
-import { refineResult, scanView } from "../workbench/proposals";
-import { proposal, refine, task, view } from "../workbench/proposals.fixtures";
+import { refineResult } from "../workbench/proposals";
+import { refine, task } from "../workbench/proposals.fixtures";
 import type { Task } from "../workbench/client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const here = dirname(fileURLToPath(import.meta.url));
-const drawer = (initial: unknown) => render(ScanProposals, { props: { repositoryPath: "/r", startOpen: true, initial: initial === null ? null : scanView(initial) } }).body;
-
-describe("ScanProposals renders", () => {
-  it("lists a proposal with both of its signals and offers Accept, Edit and Dismiss", () => {
-    const body = drawer(view());
-    expect(body).toContain("Remove quuxify");
-    expect(body).toContain("devmap dead_symbols");
-    expect(body).toContain("dcgrep -uu");
-    for (const id of ["proposal-accept", "proposal-edit", "proposal-dismiss"]) expect(body).toContain(id);
-    expect(body).not.toContain("Partial result");
-  });
-  it("a capped, partial scan says so with both numbers and never reads as clean", () => {
-    const partial = drawer(view({ complete: false, over_cap: 17, coverage: [{ category: "dead_symbols", status: "truncated", detail: "60 of 140 checked", hidden: 80 }] }));
-    expect(partial).toContain("Partial result");
-    expect(partial).toContain("1 of 18 new proposals");
-    expect(partial).toContain("60 of 140 checked");
-    const empty = drawer(view({ complete: false, proposals: [], new_count: 0, coverage: [{ category: "dead_symbols", status: "degraded" }] }));
-    expect(empty).toContain("not a clean result");
-    expect(empty).not.toContain("No gaps found");
-    expect(drawer(view({ proposals: [], new_count: 0 }))).toContain("No gaps found");
-  });
-  it("a proposal the board already holds is shown as held, with nothing to file", () => {
-    const body = drawer(view({ proposals: [{ ...proposal, status: "attached", attached_item_id: "ft-1", attached_item_title: "Existing card" }] }));
-    expect(body).toContain("Existing card");
-    expect(body).toContain("Nothing to file");
-    expect(body).not.toContain("proposal-accept");
-  });
-  it("is closed until opened and offers no scan without an open repository", () => {
-    expect(render(ScanProposals, { props: { repositoryPath: "/r" } }).body).not.toContain("proposals-drawer");
-    expect(render(ScanProposals, { props: { repositoryPath: "" } }).body).not.toContain("proposals-open");
-  });
-});
 
 describe("TaskRefine renders", () => {
   const shown = (over: Record<string, unknown> = {}, t: Task = task) => render(TaskRefine, { props: { task: t, repositoryPath: "/r", onApplied: () => {}, initial: refineResult(refine(over)) } }).body;
@@ -107,13 +74,6 @@ describe("TaskRefine renders", () => {
 
 describe("glass that floats over content is blurred", () => {
   const read = (file: string) => readFileSync(join(here, file), "utf8");
-  it("the proposals drawer is a float-tier surface, not bare thin glass", () => {
-    const body = drawer(view());
-    const classes = /<aside class="([^"]*)"[^>]*data-testid="proposals-drawer"/.exec(body)?.[1] ?? "";
-    expect(classes).toContain("shadow-float");
-    expect(classes).not.toContain("gp-glass");
-    expect(read("ScanProposals.svelte")).toMatch(/\.drawer\{[^}]*background-color:rgb\(var\(--c-surface\) \/ 0\.9\d?\)/);
-  });
   // `gp-glass` alone paints a 40-58% fill and no blur (`app.css`: only
   // `.gp-menu`, `shadow-float` and `shadow-pop` are filtered). A surface in the
   // flow of the page sits on the shell's smooth field, where that is the design;
@@ -173,13 +133,12 @@ describe("glass that floats over content is blurred", () => {
   });
 });
 
-describe("the new components compile cleanly and are mounted without touching the board", () => {
-  it.each(["ScanProposals.svelte", "TaskRefine.svelte"])("%s compiles", (file) => {
-    const { warnings } = compile(readFileSync(join(here, file), "utf8"), { generate: "client", filename: file });
+describe("TaskRefine compiles and is mounted in the task editor", () => {
+  it("TaskRefine compiles", () => {
+    const { warnings } = compile(readFileSync(join(here, "TaskRefine.svelte"), "utf8"), { generate: "client", filename: "TaskRefine.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
   });
-  it("RepositoryTasks hosts the dock beside the board and TaskEditor hosts refine in the assist section", () => {
-    expect(readFileSync(join(here, "RepositoryTasks.svelte"), "utf8")).toContain("<ScanProposals");
+  it("TaskEditor hosts refine in the assist section", () => {
     expect(readFileSync(join(here, "TaskEditor.svelte"), "utf8")).toContain("<TaskRefine");
   });
 });

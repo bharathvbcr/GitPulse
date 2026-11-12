@@ -29,4 +29,19 @@ describe("BlameViewer source contracts", () => {
     // the ring); that nothing bypasses it with `String(err)` is only visible here.
     expect(source).not.toMatch(/String\(\s*(err|reason|error|e)\s*\)/);
   });
+
+  it("owns no file tree: it renders beside Explorer's one column, so the two cannot fork a width", () => {
+    // Blame is a lens inside Explorer's editor pane (a2efee26), not a page with
+    // its own tree. One tree, one column, one width: a tree or a fixed w-72 here
+    // would be a second width to keep in step with fileTreeColumn.
+    const body = source.slice(source.indexOf("<!-- Body -->"));
+    expect(body).not.toContain("w-72");
+    expect(source).not.toContain("<FileTreeColumn");
+    expect(source).not.toContain("<FileTreePanel");
+    const viewer = readFileSync(join(here, "FileViewer.svelte"), "utf8");
+    const row = viewer.slice(viewer.indexOf("flex-1 flex min-h-0 overflow-hidden relative"));
+    const column = row.indexOf("<FileTreeColumn reserve={explorerReserve}>");
+    expect(column).toBeGreaterThan(-1);
+    expect(row.indexOf('<LazyView load={loadBlame} name="Blame" />')).toBeGreaterThan(column);
+  });
 });

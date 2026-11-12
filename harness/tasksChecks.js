@@ -84,9 +84,8 @@ let failList = false, corruptSave = false, loseSave = false, holdSave = false, r
 /** Hold the catalog read a background refresh starts with, and any next-page task read, to open the gap between them. */
 let holdCatalog = false, heldCatalog = [], holdPages = false, heldPages = [];
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
-// Manvi's refinements and gap scans, and the host's two writes that accept
-// them (`proposals.apply`, `proposals.file`). `reviewProtocol` holds what the
-// host was sent and what it answered, so the checks can read the protocol.
+// Manvi's refinements, and the host write that accepts one (`proposals.apply`).
+// `proposalCalls` holds what the host was sent, so the checks can read the protocol.
 const refinements = new Map(), proposalCalls = [];
 let refineCriteria = ["Exports CSV with a header row"], refineSplits = [{title: "Index the export", description: "part"}];
 // How many open tasks look related to whatever is filed or split. The host
@@ -95,9 +94,6 @@ let relatedCount = 0, failGetTaskId = "";
 const MAX_RELATED = 25;
 const relatedTasks = () => Array.from({length: relatedCount}, (_, i) => ({item_id: `ft-rel-${String(i).padStart(3, "0")}`, title: `Related task ${i}`, status: "todo"}));
 const unreviewedRelated = input => relatedTasks().filter(related => !(input.reviewed_related ?? []).includes(related.item_id)).slice(0, MAX_RELATED);
-const SCAN_FPS = ["0123456789abcdef", "fedcba9876543210"];
-const scanProposal = (fingerprint, n) => ({fingerprint, category: "dead_symbols", status: "new", title: `Remove unused helper ${n}`, description: `Helper ${n} has no callers.`, kind: "maintenance", priority: 2, labels: ["manvi-scan"], signals: [{source: "devmap dead_symbols", result: "confidence 0.9"}]});
-const filedFingerprints = new Map();
 const verdicts = new Map(), verdictReads = [];
 // Parent links as the store holds them (child id -> parent id). `items.lineage`
 // derives each card's parent and subtask progress from these and from the
@@ -326,20 +322,6 @@ mockIPCWithEvents(async (cmd, args) => {
       tasks[index] = {...tasks[index], acceptance_criteria: [...tasks[index].acceptance_criteria, ...criteria], revision: tasks[index].revision + 1};
       refinements.set(stored.id, {...stored, revision: stored.revision + 1, state: "accepted", accepted_fields: input.fields});
       return JSON.stringify({ok: true, outcome: "applied", item_id: stored.task_id, enhancement_id: stored.id, revision: tasks[index].revision, criteria_added: criteria.length, links_added: 0, created_item_ids: input.fields.includes("split_into") ? ["ft-split-1"] : []});
-    }
-    case "proposals.file": {
-      proposalCalls.push({method: args.method, ...structuredClone(input)});
-      const fingerprint = input.origin.fingerprint;
-      if (filedFingerprints.has(fingerprint)) return JSON.stringify({ok: true, outcome: "already_filed", item_id: filedFingerprints.get(fingerprint), title: input.title});
-      const held = unreviewedRelated(input);
-      if (held.length) return JSON.stringify({ok: false, outcome: "related_tasks_exist", related: held, compared: 40, scan_complete: true});
-      filedFingerprints.set(fingerprint, `ft-filed-${fingerprint}`);
-      return JSON.stringify({ok: true, outcome: "filed", item_id: `ft-filed-${fingerprint}`, title: input.title});
-    }
-    case "scans.start": case "scans.get": case "scans.cancel": {
-      proposalCalls.push({method: args.method, ...structuredClone(input)});
-      return JSON.stringify({scan_id: "scan-fixture", state: "done", repo_root: "/fixture/GitPulse", max_proposals: 25, started_at: 1, finished_at: 2, complete: true, board_complete: true,
-        new_count: 2, attached_count: 0, over_cap: 0, coverage: [{category: "dead_symbols", status: "ok"}], proposals: SCAN_FPS.map((fingerprint, n) => scanProposal(fingerprint, n + 1))});
     }
     case "enhancements.create": case "enhancements.generate": case "enhancements.complete": case "enhancements.accept": case "enhancements.undo": case "enhancements.dismiss": {
       if (args.method === "enhancements.dismiss" && refinements.has(input.id)) {
@@ -4031,11 +4013,10 @@ if (params.has("check")) {
       check("the global board does not offer a link to itself", !root.querySelector('[data-testid="task-board-all"]'));
     } catch (error) { check(`the global navigation checks ran to the end (${error.message} at ${guardStep})`, false); }
 
-    // ---- Proposals: Manvi's refinement of a task, and the gap scan ---------
-    // Both only propose; what a person accepts is written by the host's
-    // `proposals.apply` and `proposals.file`, whose related-task protection
-    // pages 25 at a time. The fixture answers as the host does (see the
-    // `proposals.*` routes), so these checks read the protocol, not a stub.
+    // ---- Refinement: Manvi proposes, and proposals.apply writes what was accepted
+    // Refinement only proposes; what a person accepts is written by the host's
+    // `proposals.apply`, whose related-task protection pages 25 at a time. The
+    // fixture answers as the host does, so these checks read the protocol.
     let proposalStep = "start";
     try {
       await click("GitPulse fixture"); await wait(() => card("task-1"));
@@ -4122,51 +4103,6 @@ if (params.has("check")) {
       check("Ask is available on a task with no suggestion in flight", (await askState({...pendingFor("none-1", 0), state: "dismissed"})) === false);
       check("a pending suggestion that has not expired still blocks Ask", (await askState(pendingFor("live-1", nowSeconds + 600))) === true);
       check("an expired pending suggestion does not block Ask", (await askState(pendingFor("expired-1", nowSeconds - 60))) === false);
-
-      // -- The gap scan: drawer, drafts and the reviewed set.
-      proposalStep = "scan";
-      const trigger = () => root.querySelector('[data-testid="proposals-open"]');
-      trigger().click(); await wait(() => root.querySelector('[data-testid="proposals-drawer"]'));
-      root.querySelector('[data-testid="proposals-scan"]').click(); await wait(() => root.querySelector(`[data-testid="proposal-${SCAN_FPS[0]}"]`));
-      check("a scan lists its proposals through scans.start", proposalCalls.some(call => call.method === "scans.start") && SCAN_FPS.every(fp => root.querySelector(`[data-testid="proposal-${fp}"]`)));
-
-      const drawer = root.querySelector('[data-testid="proposals-drawer"]');
-      const alphaOf = color => { const m = /\/\s*([\d.]+)(%?)\s*\)$/.exec(color) ?? /rgba\([^)]*,\s*([\d.]+)\s*\)$/.exec(color); return m ? (m[2] === "%" ? parseFloat(m[1]) / 100 : parseFloat(m[1])) : 1; };
-      const hadMacos = document.documentElement.classList.contains("macos"), hadLight = document.documentElement.classList.contains("light");
-      document.documentElement.classList.add("macos");
-      const surfaces = [];
-      for (const theme of ["dark", "light"]) {
-        document.documentElement.classList.toggle("light", theme === "light"); document.documentElement.classList.toggle("dark", theme === "dark");
-        await settle(50);
-        const css = getComputedStyle(drawer);
-        surfaces.push({theme, alpha: alphaOf(css.backgroundColor), blur: `${css.backdropFilter} ${css.webkitBackdropFilter}`.includes("blur")});
-      }
-      document.documentElement.classList.toggle("macos", hadMacos); document.documentElement.classList.toggle("light", hadLight); document.documentElement.classList.toggle("dark", !hadLight);
-      check(`the proposals drawer is opaque or blurred over the board in light and dark on macOS (${JSON.stringify(surfaces)})`, surfaces.length === 2 && surfaces.every(surface => surface.alpha >= 0.9 || surface.blur));
-      const probe = drawer.getBoundingClientRect();
-      check("the drawer is the topmost surface over the busy board", drawer.contains(document.elementFromPoint(probe.left + probe.width / 2, probe.top + probe.height / 2)));
-
-      const panel = fp => root.querySelector(`[data-testid="proposal-${fp}"]`);
-      const inPanel = (fp, id) => panel(fp)?.querySelector(`[data-testid="${id}"]`);
-      const fileCalls = fp => proposalCalls.filter(call => call.method === "proposals.file" && call.origin.fingerprint === fp);
-      relatedCount = 60;
-      const [first, second] = SCAN_FPS;
-      inPanel(first, "proposal-edit").click(); await settle();
-      await change(inPanel(first, "proposal-edit-title"), "A, edited by hand");
-      inPanel(first, "proposal-file-edited").click(); await wait(() => inPanel(first, "proposal-file-anyway"));
-      inPanel(second, "proposal-edit").click(); await settle();
-      await change(inPanel(second, "proposal-edit-title"), "B, edited by hand");
-      check("each proposal keeps its own edit while another is being edited", inPanel(first, "proposal-edit-title")?.value === "A, edited by hand" && inPanel(second, "proposal-edit-title")?.value === "B, edited by hand");
-      for (let round = 0; round < 6 && inPanel(first, "proposal-file-anyway"); round++) { inPanel(first, "proposal-file-anyway").click(); await settle(100); }
-      await wait(() => inPanel(first, "proposal-filed"));
-      const sent = fileCalls(first);
-      check("File anyway files the proposal's own edited text, not another proposal's", sent.length >= 2 && sent.every(call => call.title === "A, edited by hand") && fileCalls(second).length === 0);
-      check("File anyway with 60 related tasks accumulates the reviewed set and succeeds", JSON.stringify(sent.map(call => call.reviewed_related.length)) === "[0,25,50,60]" && /Filed in the inbox/.test(inPanel(first, "proposal-filed").textContent));
-      check("the other proposal's edit survived the first one being filed", inPanel(second, "proposal-edit-title")?.value === "B, edited by hand");
-      relatedCount = 0;
-      inPanel(second, "proposal-file-edited").click(); await wait(() => inPanel(second, "proposal-filed"));
-      check("an edited proposal files as edited once the related tasks are out of the way", fileCalls(second).at(-1).title === "B, edited by hand" && fileCalls(second).length === 1);
-      root.querySelector('button[aria-label="Close proposals"]').click(); await settle();
     } catch (error) { check(`the proposals checks ran to the end (${error.message} at ${proposalStep}; refine error: ${editor()?.querySelector('[data-testid="task-refine-error"]')?.textContent ?? "none"}; refine message: ${editor()?.querySelector('[data-testid="task-refine-message"]')?.textContent ?? "none"}; apply calls: ${JSON.stringify(proposalCalls.filter(call => call.method === "proposals.apply").map(call => call.reviewed_related.length))})`, false); if (editor()) { await click("Close task details").catch(() => {}); } }
     relatedCount = 0; failGetTaskId = "";
 

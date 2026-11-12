@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { latestEnhancement, listEnhancements, WorkbenchError } from "./client";
-import { FP, proposal, refine, storedRefine, task, view } from "./proposals.fixtures";
+import { refine, storedRefine, task } from "./proposals.fixtures";
 import {
-  applyConflict, applyRefine, confirmReviewed, coverageNotes, dismissFingerprint, dismissRefine, dismissedFingerprints, fileScanProposal, getScan, refineDiff, refineResult,
-  requestRefine, scanIsPartial, scanView, selectableParts, startScan, MAX_REVIEWED_RELATED,
+  applyConflict, applyRefine, confirmReviewed, dismissRefine, refineDiff, refineResult,
+  requestRefine, selectableParts, MAX_REVIEWED_RELATED,
 } from "./proposals";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -13,80 +13,6 @@ beforeEach(() => { native.mockReset(); });
 
 const wire = (n = 0) => JSON.parse(String((native.mock.calls[n]?.[1] as { input: string }).input));
 const method = (n = 0) => (native.mock.calls[n]?.[1] as { method: string }).method;
-
-describe("scan wire and decoding", () => {
-  it("starts a scan with the repository path and reads it back", async () => {
-    native.mockResolvedValueOnce(JSON.stringify(view({ state: "running" })));
-    expect((await startScan("/r", { since: " main ", maxProposals: 7 })).state).toBe("running");
-    expect(method()).toBe("scans.start");
-    expect(wire()).toEqual({ repo_path: "/r", since: "main", max_proposals: 7 });
-    native.mockResolvedValueOnce(JSON.stringify(view()));
-    expect((await getScan("scan-1")).proposals[0]?.signals).toHaveLength(2);
-  });
-
-  it("a sidecar that is down is an error with its code, never an empty scan", async () => {
-    native.mockRejectedValueOnce({ code: "not_installed", message: "no manvi binary" });
-    await expect(startScan("/r")).rejects.toMatchObject({ code: "not_installed", message: "no manvi binary" });
-    native.mockRejectedValueOnce({ code: "E_BAD_ROOT", message: "repo_root is not a git work tree" });
-    await expect(startScan("/r")).rejects.toMatchObject({ code: "E_BAD_ROOT" });
-  });
-
-  it.each([
-    ["unknown state", view({ state: "weird" })], ["short fingerprint", view({ proposals: [{ ...proposal, fingerprint: "abc" }] })],
-    ["missing coverage", { ...view(), coverage: undefined }], ["unknown proposal status", view({ proposals: [{ ...proposal, status: "x" }] })],
-  ])("refuses a malformed reply whole: %s", (_name, bad) => { expect(() => scanView(bad)).toThrow(WorkbenchError); });
-});
-
-describe("a partial scan says so, with both numbers", () => {
-  it("states shown and total when capped, and every non-ok category", () => {
-    const partial = scanView(view({ complete: false, over_cap: 17, max_proposals: 25, new_count: 25, proposals: [proposal],
-      coverage: [{ category: "dead_symbols", status: "truncated", detail: "60 of 140 checked", hidden: 80 }, { category: "doc_drift", status: "ok" }] }));
-    expect(scanIsPartial(partial)).toBe(true);
-    const notes = coverageNotes(partial).join("\n");
-    expect(notes).toContain("Showing 1 of 18 new proposals (cap 25)");
-    expect(notes).toContain("60 of 140 checked");
-    expect(notes).toContain("80 hidden");
-    expect(notes).not.toContain("Stale doc paths");
-  });
-  it("a complete finished scan is not partial; an unfinished or failed one is", () => {
-    expect(scanIsPartial(scanView(view()))).toBe(false);
-    expect(coverageNotes(scanView(view()))).toEqual([]);
-    expect(scanIsPartial(scanView(view({ state: "deadline", complete: true })))).toBe(true);
-    expect(coverageNotes(scanView(view({ state: "failed", error: "boom" }))).join()).toContain("boom");
-    expect(coverageNotes(scanView(view({ board_complete: false }))).join()).toContain("duplicate");
-  });
-});
-
-describe("filing a proposal", () => {
-  const draft = { title: "T", description: "D", kind: "maintenance", priority: 2, labels: [] };
-  it("sends the scan fingerprint as the origin, so filing twice is one card", async () => {
-    native.mockResolvedValue(JSON.stringify({ ok: true, outcome: "filed", item_id: "ft-1", title: "T" }));
-    const p = scanView(view()).proposals[0]!;
-    expect((await fileScanProposal("/r", p, draft)).outcome).toBe("filed");
-    expect(method()).toBe("proposals.file");
-    expect(wire().origin).toEqual({ kind: "scan", fingerprint: FP });
-  });
-  it("decodes the related-task hold, and refuses a receipt that is neither", async () => {
-    const p = scanView(view()).proposals[0]!;
-    native.mockResolvedValueOnce(JSON.stringify({ ok: false, outcome: "related_tasks_exist", related: [{ item_id: "ft-2", title: "Similar", status: "todo" }] }));
-    expect(await fileScanProposal("/r", p, draft)).toEqual({ outcome: "related_tasks_exist", related: [{ item_id: "ft-2", title: "Similar", status: "todo" }] });
-    native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "weird" }));
-    await expect(fileScanProposal("/r", p, draft)).rejects.toBeInstanceOf(WorkbenchError);
-  });
-});
-
-describe("dismissal is per viewer and never needs storage", () => {
-  it("works without localStorage (node) and with it", () => {
-    expect(dismissedFingerprints("/r").size).toBe(0);
-    expect(dismissFingerprint("/r", FP).has(FP)).toBe(true);
-    const store = new Map<string, string>();
-    vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
-    dismissFingerprint("/r", FP);
-    expect(dismissedFingerprints("/r").has(FP)).toBe(true);
-    expect(dismissedFingerprints("/other").size).toBe(0);
-    vi.unstubAllGlobals();
-  });
-});
 
 describe("refinement", () => {
   it("sends the repository, the task and its revision; a proposal that claims it applied is refused", async () => {
@@ -191,33 +117,6 @@ describe("the reviewed set accumulates across refusals", () => {
     const carried = confirmReviewed(confirmReviewed([], page(0, MAX_REVIEWED_RELATED - 1)), page(MAX_REVIEWED_RELATED - 1, MAX_REVIEWED_RELATED + 40));
     expect(carried).toHaveLength(MAX_REVIEWED_RELATED);
     expect(new Set(carried).size).toBe(MAX_REVIEWED_RELATED);
-  });
-  it("boundary: 25 and 26 related tasks need one and two confirmations, 60 needs three", async () => {
-    // A host that behaves as intake.rs does: it names the first 25 related tasks not yet reviewed.
-    const confirmationsFor = async (related: number) => {
-      const all = page(0, related).map((r) => ({ ...r, title: `T ${r.item_id}`, status: "todo" }));
-      native.mockReset();
-      native.mockImplementation(async (_cmd, args) => {
-        const sent = JSON.parse(String((args as { input: string }).input)) as { reviewed_related: string[] };
-        const unreviewed = all.filter((r) => !sent.reviewed_related.includes(r.item_id)).slice(0, 25);
-        return JSON.stringify(unreviewed.length === 0 ? { ok: true, outcome: "filed", item_id: "ft-new", title: "T" } : { ok: false, outcome: "related_tasks_exist", related: unreviewed });
-      });
-      const p = scanView(view()).proposals[0]!;
-      const draft = { title: "T", description: "D", kind: "maintenance", priority: 2, labels: [] };
-      let reviewed: string[] = [];
-      let outcome = await fileScanProposal("/r", p, draft, reviewed);
-      let confirmations = 0;
-      while (outcome.outcome === "related_tasks_exist") {
-        confirmations += 1;
-        if (confirmations > 10) throw new Error("the review does not converge");
-        reviewed = confirmReviewed(reviewed, outcome.related);
-        outcome = await fileScanProposal("/r", p, draft, reviewed);
-      }
-      return { confirmations, outcome: outcome.outcome };
-    };
-    expect(await confirmationsFor(25)).toEqual({ confirmations: 1, outcome: "filed" });
-    expect(await confirmationsFor(26)).toEqual({ confirmations: 2, outcome: "filed" });
-    expect(await confirmationsFor(60)).toEqual({ confirmations: 3, outcome: "filed" });
   });
 });
 

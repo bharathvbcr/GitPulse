@@ -444,7 +444,7 @@
         · <span class="text-warn">budget estimated locally</span>
       {/if}
     </div>
-    {#each generation.warnings as warning}
+    {#each generation.warnings as warning, index (index)}
       <div class="text-micro text-warn flex items-start gap-1">
         <AlertTriangle size={11} class="mt-px shrink-0" />
         <span>{warning}</span>

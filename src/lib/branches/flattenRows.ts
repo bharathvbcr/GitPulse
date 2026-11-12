@@ -38,6 +38,42 @@ export type FlatRow = SectionHeaderRow | FolderHeaderRow | BranchRow | TagRow;
 /** Mirrors BranchList's collapsed-state lookup (folders pass kind "local"). */
 export type CollapsedLookup = (id: string, kind: BranchSection["kind"]) => boolean;
 
+export interface FolderToggle {
+  /** False when no section or folder exists for expand/collapse to change. */
+  enabled: boolean;
+  /** The action that changes the tree. Stays "expand" when disabled so the chip does not disappear. */
+  action: "expand" | "collapse";
+}
+
+/**
+ * Header fold control. Walks the same sections and folders expandAll and
+ * collapseAll write, through the list's own collapsed lookup. Any closed
+ * node means Expand; every node open means Collapse.
+ */
+export function folderToggleAction(
+  sections: readonly BranchSection[],
+  isCollapsed: CollapsedLookup,
+): FolderToggle {
+  let nodes = 0;
+  let anyCollapsed = false;
+  const visit = (id: string, kind: BranchSection["kind"]) => {
+    nodes += 1;
+    if (isCollapsed(id, kind)) anyCollapsed = true;
+  };
+  const walk = (folders: readonly BranchFolder[]) => {
+    for (const folder of folders) {
+      visit(folder.id, "local");
+      walk(folder.folders);
+    }
+  };
+  for (const section of sections) {
+    visit(section.id, section.kind);
+    walk(section.folders);
+  }
+  if (nodes === 0) return { enabled: false, action: "expand" };
+  return { enabled: true, action: anyCollapsed ? "expand" : "collapse" };
+}
+
 /**
  * Flattens grouped sections into render-order rows for the sidebar's single
  * shared scroller. Collapsed sections/folders contribute only their header

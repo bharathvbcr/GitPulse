@@ -39,7 +39,7 @@
 
 import { invoke } from "../ipc/invoke";
 import type { CoverageReport } from "../coverage/types";
-import type { LanguageStatsReport } from "../language/barStats";
+import { isMarkdownOrNote, type LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";
 import { formatDiagnosticFailure, reportPanelError } from "../diagnostics/report";
 import { createMetric, createMetricRegistry, type Metric } from "./freshness";
@@ -156,8 +156,19 @@ repoMetrics.register(locMetric as never);
 repoMetrics.register(coverageMetric as never);
 repoMetrics.register(storageMetric as never);
 
-/** Total code lines in a report, or null when there is nothing measured. */
+/**
+ * Total lines of code in a report, or null when there is nothing measured.
+ *
+ * Documentation is left out: a docs-heavy repository's Markdown would
+ * otherwise outweigh its source in a number labelled "lines of code". "Docs"
+ * is `isMarkdownOrNote`, the same predicate the language bar's code-only mode
+ * uses, so the headline and that bar agree on what counts as code. Data files
+ * (JSON, YAML, SQL) stay in, as they do on the bar.
+ */
 export function totalCodeLines(report: LanguageStatsReport | null): number | null {
   if (!report || !Array.isArray(report.stats)) return null;
-  return report.stats.reduce((sum, stat) => sum + (stat.code_lines ?? 0), 0);
+  return report.stats.reduce(
+    (sum, stat) => (isMarkdownOrNote(stat) ? sum : sum + (stat.code_lines ?? 0)),
+    0,
+  );
 }

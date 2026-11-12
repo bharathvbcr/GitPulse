@@ -17,7 +17,7 @@
  */
 
 import { invoke } from "../ipc/invoke";
-import type { LanguageStatsReport } from "../language/barStats";
+import { isMarkdownOrNote, type LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";
 import type { DepsHealthReport } from "../health/types";
 import type { CoverageReport } from "../coverage/types";
@@ -98,16 +98,19 @@ export function recordFleetMetrics(
 export const MAX_RECORDED_LANGUAGES = 16;
 
 /**
- * Total lines and the dominant language.
+ * Total lines of code and the dominant language.
  *
- * Summed across every reported language rather than programming ones alone:
- * the column says "lines of code in this repository", and silently dropping
- * the data and markup would make two repositories with identical trees report
- * different sizes depending on what they are written in. The headline language
- * is the largest by the backend's own percentage.
+ * Documentation (`isMarkdownOrNote`, the same check as the Pulse headline and
+ * the language bar's code-only mode) is left out of the lines, the headline
+ * language and the recorded breakdown, so the column and the mix stay two
+ * readings of one set of rows. Data and markup stay in rather than keeping
+ * programming languages alone: dropping them would make two repositories with
+ * identical trees report different sizes depending on what they are written
+ * in. The headline language is the largest code language by the backend's own
+ * percentage.
  */
 export function metricsFromLanguages(report: LanguageStatsReport): FleetMetricsInput {
-  const stats = report.stats ?? [];
+  const stats = (report.stats ?? []).filter((stat) => !isMarkdownOrNote(stat));
   let lines = 0;
   for (const stat of stats) {
     if (Number.isFinite(stat.code_lines)) lines += stat.code_lines;

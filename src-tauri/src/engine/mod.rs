@@ -1,5 +1,6 @@
 pub mod agent_bus;
 pub mod budget;
+pub mod campaign_formal;
 pub mod churn_store;
 pub mod commit_signature;
 pub mod content_search;
