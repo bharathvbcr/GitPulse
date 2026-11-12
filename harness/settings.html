@@ -374,7 +374,8 @@
           check("Agents carries a Capability boundary card", heading(agents, "Capability boundary"));
           check("Agents carries a Local model servers card", heading(agents, "Local model servers"));
           check("no card is called Harness & AI", !/Harness & AI|MANVI harness/.test(agents.textContent));
-          check("the policy card reports the live connection", agents.textContent.includes("Connected · protocol 3, mode enforce"));
+          // The posture reads as words (harnessPostureLabel), not as "mode enforce".
+          check("the policy card reports the live connection", agents.textContent.includes("Connected · protocol 3, enforce") && !agents.textContent.includes("mode enforce"));
           check("the policy card lists the operations the gate covers", ["commit", "push", "merge"].every((op) => agents.textContent.includes(op)));
           check("the scoped runner reads as guarded while connected", agents.textContent.includes("Scoped action runner") && agents.textContent.includes("Guarded"));
           check("the interactive shell is marked user only", agents.textContent.includes("Interactive shell") && agents.textContent.includes("User only"));

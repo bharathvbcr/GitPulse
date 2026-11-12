@@ -120,6 +120,11 @@ if(params.has("check")){
   const host=document.createElement("div");host.style.cssText="flex:1;min-height:0;display:flex;flex-direction:column";root.replaceChildren(host);
   const policy=mount(WorkOverviewPane,{target:host,props:{loadConflict:()=>Promise.resolve({default:ConflictEditor})}});
   await waitFor(()=>host.querySelectorAll("textarea").length===2&&host.querySelector(".work-overview"));
+  // LazyView hands the editor over with a short rise (a translate on its wrapper);
+  // measured mid-rise the editor sits a few px low. Geometry is read once it lands.
+  // The intro starts on a frame (settle yields none), so let two pass first.
+  for(let i=0;i<2;i++)await new Promise(resolve=>requestAnimationFrame(resolve));
+  await Promise.all((host.querySelector("[data-lazy-view-handoff]")?.getAnimations()??[]).map(a=>a.finished));
   const scroller=host.querySelector("[data-overview-layout='with-conflicts']"), page=host.querySelector(".resolve-page"), overview=host.querySelector(".work-overview");
   check("overview leads with the conflict editor at full pane height, the workspace below",scroller&&Math.abs(page.getBoundingClientRect().height-scroller.clientHeight)<=2&&overview.getBoundingClientRect().top>=page.getBoundingClientRect().bottom-1);
   scroller.scrollTop=scroller.scrollHeight;await settle();

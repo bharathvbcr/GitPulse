@@ -132,6 +132,7 @@ const HistoryView=(await import("../src/lib/components/HistoryView.svelte")).def
 const loadReflog=()=>import("../src/lib/components/ReflogViewer.svelte");
 const loadSuspects=()=>import("../src/lib/components/SuspectsList.svelte");
 const {suspectsQuery}=await import("../src/lib/codeintel/suspectsQuery.ts");
+const {pageSearchFor}=await import("../src/lib/search/pageSearch.svelte.ts");
 const {promptState,completePrompt}=await import("../src/lib/stores/modalStore.ts");
 const {results,check,stopped}=createChecks();
 const preview=document.getElementById("preview");
@@ -146,7 +147,9 @@ const inspect=(selector)=>entry(selector)?.querySelector('button[aria-label^="In
 const details=()=>preview.querySelector(".h-64");
 const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
 const symptomField=()=>preview.querySelector('input[aria-label="Symptom symbol"]');
-const filterField=()=>preview.querySelector('input[placeholder^="Search commits"]');
+// The commit filter is the view bar's search field (42689867), which Graph's
+// Commits and HEAD moves lists register as a filter; Suspects registers none.
+const filterField=()=>pageSearchFor("history:graph")?.kind==="filter";
 const suspectRow=(n)=>[...preview.querySelectorAll('[aria-label="Regression suspects"] li > button')].find(b=>b.textContent.includes(`#${n}`));
 const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("input",{bubbles:true}));};
 (async()=>{try{
@@ -272,7 +275,7 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  const hadFilter=Boolean(filterField());
  option("Suspects").click();
  await until(()=>symptomField()&&preview.querySelector('[aria-label="Regression suspects"]'),"suspects question and its lazy list");
- check("the suspects question replaces the commit filter in the context bar",()=>hadFilter&&!filterField()&&get(repoStore).historyList==="suspects");
+ check("the suspects question replaces the commit filter: the view bar's field stops filtering commits",()=>hadFilter&&!filterField()&&get(repoStore).historyList==="suspects");
  check("before a run the list asks its question rather than claiming no suspects",()=>text().includes("Which commit broke it?")&&!text().includes("Nothing in the cone"));
  check("the details pane stays under the suspects list",()=>details()&&details().textContent.includes(ORPHAN.slice(0,8)));
  type(symptomField(),"parser::parse");

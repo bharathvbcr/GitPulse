@@ -174,6 +174,8 @@
           collect_forced_off: false, socket: null, store: null, transport_supported: false,
         }),
         cmd_host_load_settings: () => ({ enabled: true, govern_launches: false }),
+        // Settings -> Agents holds the Claude key row (LocalModelServers): no key saved.
+        cmd_claude_key_status: () => false,
         // The store's own defaults in the wire shape, so this answer cannot drift from them.
         cmd_agent_defaults: async () => {
           const { DEFAULT_AGENT_DEFAULTS_VIEW: view } = await import("../src/lib/stores/agentDefaultsStore.ts");
@@ -616,7 +618,9 @@
           type(await need("the file filter", fileFilter), "src/alpha");
           type(await need("the branch filter", branchFilter), "feat");
           chip("Local")?.click();
-          (await need("the create-branch button", () => $('button[aria-label="Create branch"]'))).click();
+          (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
+          await settle();
+          (await need("the Create menu's Branch item", () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]'))).click();
           await settle();
           type(await need("the new-branch name input", createInput), "feat/half-typed");
           (await need("the create-worktree button", worktreeAdd)).click();

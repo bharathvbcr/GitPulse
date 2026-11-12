@@ -650,8 +650,15 @@ if(params.has("check")) {
         pick.length>=3&&numbersOk&&pick.some(b=>b.compared_to==="main"&&b.commits_behind_base>0&&b.commits_ahead_of_base>0));
       branches=saved;await repoStore.refresh();await settle();
     }
-    // A failed create keeps the form open with the typed name.
-    await click("Create branch");
+    // A failed create keeps the form open with the typed name. The header
+    // Create pill opens a menu; the form appears once Branch is chosen.
+    const createTrigger=document.querySelector("[data-branch-create-trigger]");
+    check("the Create pill opens a menu rather than the form",createTrigger?.getAttribute("aria-haspopup")==="menu");
+    createTrigger.focus();createTrigger.click();await settle();
+    const branchItem=document.querySelector('#branch-create-menu [role="menuitem"][aria-label="Create branch"]');
+    check("the Create menu offers Branch",!!branchItem&&createTrigger.getAttribute("aria-expanded")==="true");
+    branchItem.click();await settle();
+    check("choosing Branch closes the menu",!document.querySelector("#branch-create-menu [role=menuitem]")||createTrigger.getAttribute("aria-expanded")==="false");
     const nameField=()=>document.querySelector('#sidebar input[placeholder="feat/name"]');
     failCreate=true;nameField().value="feat/kept";nameField().dispatchEvent(new Event("input",{bubbles:true}));await settle();
     nameField().form.requestSubmit();await waitFor(()=>branchCreates.length===1);await settle();
