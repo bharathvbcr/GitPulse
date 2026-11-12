@@ -3,7 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { compile } from "svelte/compiler";
-import { settleMapBeforeStatus } from "./RepoMapPanel.svelte";
+import { render } from "svelte/server";
+import RepoMapPanel, { settleMapBeforeStatus } from "./RepoMapPanel.svelte";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "RepoMapPanel.svelte"), "utf8");
@@ -291,6 +292,56 @@ describe("RepoMapPanel map view tablist", () => {
     expect(source).toContain("const MAP_VIEWS");
     for (const id of ["navigator", "files", "symbols", "subsystems", "docgraph", "docs", "links"]) {
       expect(source).toContain(`{ id: "${id}"`);
+    }
+  });
+
+  it("scrolls the seven views as tabs instead of a wrapping 11px text row", () => {
+    const labels = ["Navigator", "Files", "Symbols", "Subsystems", "Doc graph", "Docs", "Links"];
+    const views = source.slice(source.indexOf("const MAP_VIEWS"), source.indexOf("const CODE_GRAPH_VIEWS"));
+    const positions = labels.map((label) => views.indexOf(`label: "${label}"`));
+    expect(positions.every((at) => at >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+
+    const marker = template.indexOf('aria-label="Map views"');
+    const open = template.lastIndexOf("<div", marker);
+    const tablistTag = template.slice(open, template.indexOf(">", marker) + 1);
+    const classSource = tablistTag.match(/class=\{(\[[\s\S]*?\])\}/)?.[1]
+      ?? tablistTag.match(/class="([^"]*)"/)?.[1]
+      ?? "";
+    const tokens = classSource.split(/[\s'"]+/).filter(Boolean);
+    // The old row was `flex flex-wrap ... text-[11px]`. `flex-nowrap` is a
+    // different token and must not be mistaken for the wrapping class.
+    expect(tokens).not.toContain("flex-wrap");
+    expect(tokens).not.toContain("text-[11px]");
+    expect(tokens).toContain("flex-nowrap");
+    expect(tokens).toContain("gp-header-scroll");
+    expect(tablistTag).toContain('role="tablist"');
+
+    const stripOpen = template.lastIndexOf("<div", open - 1);
+    const stripTag = template.slice(stripOpen, template.indexOf(">", stripOpen) + 1);
+    const stripClass = stripTag.match(/class="([^"]*)"/)?.[1] ?? "";
+    expect(stripClass).toContain("relative");
+    expect(stripClass.split(/\s+/)).not.toContain("border-b");
+    expect(stripClass).not.toContain("border-border/50");
+
+    const { body } = render(RepoMapPanel);
+    const at = body.indexOf('aria-label="Map views"');
+    expect(at).toBeGreaterThan(-1);
+    const renderedTag = body.slice(body.lastIndexOf("<div", at), body.indexOf(">", at) + 1);
+    const renderedClass = renderedTag.match(/class="([^"]*)"/)?.[1] ?? "";
+    expect(renderedClass.split(/\s+/)).not.toContain("flex-wrap");
+    expect(renderedClass).not.toContain("text-[11px]");
+    const region = body.slice(body.lastIndexOf("<div", at), body.indexOf('role="tabpanel"', at));
+    const tabs = [...region.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].filter((match) =>
+      /\brole="tab"/.test(match[1] ?? ""),
+    );
+    expect(tabs).toHaveLength(7);
+    expect(tabs.map((match) => (match[2] ?? "").replace(/<[^>]+>/g, "").trim())).toEqual(labels);
+    expect(tabs[0]?.[1]).toContain('aria-selected="true"');
+    expect(tabs[0]?.[1]).toContain('tabindex="0"');
+    for (const tab of tabs.slice(1)) {
+      expect(tab[1]).toContain('aria-selected="false"');
+      expect(tab[1]).toContain('tabindex="-1"');
     }
   });
 
