@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
+import { folderToggleAction } from "../branches/flattenRows";
+import { groupBranches } from "../branches/groupBranches";
+import type { BranchInfo, BranchSection } from "../branches/types";
 import BranchList from "./BranchList.svelte";
 
 const source = readFileSync(
@@ -11,15 +14,219 @@ const source = readFileSync(
   "utf8"
 );
 
+/** Header action: the visible title, the label it was shortened from, and the click handler. */
+const HEADER_ACTIONS = [
+  {
+    aria: "Locate checked-out branch",
+    title: "Locate",
+    handler: "onclick={locateCurrentBranch}",
+  },
+  {
+    aria: "Clean stale branches",
+    title: "Clean stale",
+    handler: 'onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:branch-cleanup"))}',
+  },
+] as const;
+
+function sourceButton(header: string, aria: string): string {
+  const at = header.indexOf(`aria-label="${aria}"`);
+  expect(at, aria).toBeGreaterThan(-1);
+  const open = header.lastIndexOf("<button", at);
+  const close = header.indexOf("</button>", at);
+  expect(open).toBeGreaterThan(-1);
+  expect(close).toBeGreaterThan(at);
+  return header.slice(open, close + "</button>".length);
+}
+
+/** Text a reader sees. Attributes, icon markup, and `{...}` expressions are not the title. */
+function visibleLabel(buttonHtml: string): string {
+  return buttonHtml
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
+    .replace(/\{[\s\S]*?\}/g, "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+describe("BranchList header", () => {
+  it("puts the branch title on its own row and shows each action title", () => {
+    const start = source.indexOf("<!-- Header Bar -->");
+    const end = source.indexOf('aria-label="Merge branches"');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const header = source.slice(start, end);
+
+    // The old header was one justify-between row: the count and the icon
+    // buttons shared it. The title element now closes before any action.
+    expect(header).not.toContain("justify-between");
+    expect(header).toContain("flex-col");
+    expect(header).toContain('class="flex flex-nowrap gap-1 min-w-0"');
+    expect(header).not.toContain("flex-wrap");
+    expect(header).not.toContain("grid-cols-2");
+    const titleRow = header.match(
+      /<div class="[^"]*uppercase[^"]*">\s*Branches \(\{\$repoStore\.branches\.length\}\)\s*<\/div>/
+    );
+    expect(titleRow).not.toBeNull();
+    const titleMarkup = titleRow?.[0] ?? "";
+    expect(titleMarkup).not.toContain("<button");
+    const afterTitle = header.slice(header.indexOf(titleMarkup) + titleMarkup.length);
+    expect(afterTitle).toContain("<button");
+    expect(header).not.toContain("+All");
+    expect(header).not.toContain("-All");
+
+    const actionClass = source.slice(
+      source.indexOf("const headerActionClass"),
+      source.indexOf("let gapChips"),
+    );
+    expect(actionClass).toContain("h-6");
+    expect(actionClass).toContain("flex-1");
+    expect(actionClass).toContain("basis-0");
+    expect(actionClass).toContain("min-w-0");
+    expect(actionClass).not.toContain("w-full");
+    expect(actionClass).not.toContain("shrink-0");
+    expect(actionClass).not.toContain("min-h-6");
+    const chipRowAt = header.indexOf('<div class="flex flex-nowrap gap-1 min-w-0">');
+    expect(chipRowAt).toBeGreaterThan(-1);
+    const chipRow = header.slice(chipRowAt, header.indexOf("</div>", chipRowAt) + "</div>".length);
+    expect(chipRow.match(/<button/g)).toHaveLength(4);
+    // Words on the chips fail this. Names stay on aria-label and title.
+    expect(visibleLabel(chipRow)).toBe("");
+
+    const { body } = render(BranchList);
+    const mergeAt = body.indexOf('aria-label="Merge branches"');
+    const rendered = body.slice(0, mergeAt);
+    expect(rendered).toMatch(/Branches \(\d+\)/);
+
+    for (const action of HEADER_ACTIONS) {
+      const markup = sourceButton(header, action.aria);
+      expect(markup).toContain(action.handler);
+      expect(markup).toContain(`title="`);
+      expect(visibleLabel(markup)).toBe("");
+      expect(action.aria.startsWith(action.title)).toBe(true);
+
+      const renderedButton = sourceButton(rendered, action.aria);
+      expect(visibleLabel(renderedButton)).toBe("");
+    }
+
+    // Expand and Collapse are one chip. Two static chips fail this.
+    expect(header).not.toContain('aria-label="Expand all folders"');
+    expect(header).not.toContain('aria-label="Collapse all folders"');
+    expect(header).not.toContain("onclick={expandAll}");
+    expect(header).not.toContain("onclick={collapseAll}");
+    const foldAt = header.indexOf("offerExpand ? expandAll() : collapseAll()");
+    expect(foldAt).toBeGreaterThan(-1);
+    const foldOpen = header.lastIndexOf("<button", foldAt);
+    const foldClose = header.indexOf("</button>", foldAt);
+    const fold = header.slice(foldOpen, foldClose);
+    expect(fold).toContain('title={offerExpand ? "Expand all folders" : "Collapse all folders"}');
+    expect(fold).toContain('aria-label={offerExpand ? "Expand all folders" : "Collapse all folders"}');
+    expect(fold).toContain("disabled={!folderToggle.enabled}");
+    expect(visibleLabel(fold)).toBe("");
+    expect(fold).not.toContain('aria-haspopup="menu"');
+
+    // Empty tree: nothing to toggle, so the chip stays and stays disabled.
+    const renderedFold = sourceButton(rendered, "Expand all folders");
+    expect(visibleLabel(renderedFold)).toBe("");
+    expect(renderedFold).toMatch(/\sdisabled(?:=""|>|\s)/);
+    expect(rendered).not.toContain('aria-label="Collapse all folders"');
+
+    // Create opens the menu. The pill is named, and it has no visible word.
+    expect(header).toContain('aria-label="Create branch"');
+    expect(header).not.toContain('aria-label="Create tag"');
+    expect(header).not.toContain("onclick={() => (creating = !creating)}");
+    expect(header).not.toContain("onclick={() => void runCreateTag()}");
+    const createPill = sourceButton(header, "Create branch");
+    expect(createPill).toContain("onclick={toggleCreateMenu}");
+    expect(createPill).toContain('aria-haspopup="menu"');
+    expect(createPill).toContain('title="Create branch"');
+    expect(visibleLabel(createPill)).toBe("");
+    expect(visibleLabel(sourceButton(rendered, "Create branch"))).toBe("");
+
+    const branchAt = source.indexOf("onclick={chooseCreateBranch}");
+    expect(branchAt).toBeGreaterThan(-1);
+    const branchItem = source.slice(
+      source.lastIndexOf("<button", branchAt),
+      source.indexOf("</button>", branchAt) + "</button>".length,
+    );
+    const tagItem = sourceButton(source, "Create tag");
+    expect(branchItem).toContain('role="menuitem"');
+    expect(branchItem).toContain('title="Create branch"');
+    expect(branchItem).toContain("onclick={chooseCreateBranch}");
+    expect(visibleLabel(branchItem)).toBe("Branch");
+    expect(tagItem).toContain('role="menuitem"');
+    expect(tagItem).toContain('title="Create tag at HEAD"');
+    expect(tagItem).toContain("onclick={chooseCreateTag}");
+    expect(visibleLabel(tagItem)).toBe("Tag");
+    expect(functionBody(source, "chooseCreateBranch")).toContain("creating = !creating");
+    expect(functionBody(source, "chooseCreateBranch")).not.toContain("runCreateTag");
+    expect(functionBody(source, "chooseCreateTag")).toContain("void runCreateTag()");
+    expect(functionBody(source, "chooseCreateTag")).not.toContain("creating = !creating");
+    expect(functionBody(source, "toggleCreateMenu")).not.toContain("creating = !creating");
+    expect(functionBody(source, "toggleCreateMenu")).not.toContain("runCreateTag");
+    expect(source).toContain('escape: "capture"');
+  });
+
+  it("offers Expand while a folder is closed and Collapse only when every folder is open", () => {
+    const lookup = (record: Record<string, boolean>) => (id: string, kind: BranchSection["kind"]) =>
+      id in record ? record[id] : kind === "remote" || kind === "tags";
+    const ref = (partial: Partial<BranchInfo> & Pick<BranchInfo, "name">): BranchInfo => ({
+      is_current: false,
+      is_remote: false,
+      tip_commit_id: "abc",
+      ahead_count: 0,
+      behind_count: 0,
+      is_default: false,
+      is_gone: false,
+      last_commit_timestamp: 1,
+      last_author: "Ada",
+      last_summary: "feat: work",
+      commits_ahead_of_base: 0,
+      commits_behind_base: 0,
+      additions: 0,
+      deletions: 0,
+      files_changed: 0,
+      ...partial,
+    });
+
+    const empty = folderToggleAction([], lookup({}));
+    expect(empty.enabled).toBe(false);
+    expect(empty.action).toBe("expand");
+
+    const local = groupBranches([ref({ name: "main" })]);
+    expect(folderToggleAction(local, lookup({})).enabled).toBe(true);
+    expect(folderToggleAction(local, lookup({})).action).toBe("collapse");
+
+    const nested = groupBranches([ref({ name: "feat/auth" })]);
+    expect(folderToggleAction(nested, lookup({})).action).toBe("collapse");
+    expect(folderToggleAction(nested, lookup({ "local/feat": true })).action).toBe("expand");
+
+    const withRemote = groupBranches([
+      ref({ name: "main" }),
+      ref({ name: "origin/main", is_remote: true, remote_name: "origin" }),
+    ]);
+    expect(folderToggleAction(withRemote, lookup({})).action).toBe("expand");
+    expect(
+      folderToggleAction(withRemote, lookup({ local: false, "remote:origin": false })).action,
+    ).toBe("collapse");
+  });
+});
+
 describe("BranchList", () => {
   it("offers a visible merge picker without opening a branch menu", () => {
     const { body } = render(BranchList);
     expect(body).toContain('aria-label="Merge branches"');
   });
 
-  it("labels the create-branch button for screen readers", () => {
+  it("labels the create-branch menu item for screen readers", () => {
+    const at = source.indexOf("onclick={chooseCreateBranch}");
+    const item = source.slice(source.lastIndexOf("<button", at), source.indexOf("</button>", at));
+    expect(item).toContain('role="menuitem"');
+    expect(item).toContain('aria-label="Create branch"');
     const { body } = render(BranchList);
+    // The header control keeps the name; the menu item is not mounted until it opens.
     expect(body).toContain('aria-label="Create branch"');
+    expect(body).not.toContain('role="menuitem"');
   });
 
   it("labels the sparkles button, which only mounts once the create form opens", () => {

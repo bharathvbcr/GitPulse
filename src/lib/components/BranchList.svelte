@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AiGeneration } from "../stores/harnessStore";
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
@@ -26,6 +26,7 @@
   } from "../branches/groupBranches";
   import {
     flattenRows,
+    folderToggleAction,
     type FolderHeaderRow,
     type SectionHeaderRow,
     type TagRow,
@@ -47,7 +48,7 @@
     totalRowHeight,
     windowFromOffsets,
   } from "../sidebar/rowWindow";
-  import { popover } from "../ui/popover";
+  import { popover, restoreFocusTo, type DismissReason } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
   import { repoScope } from "../repos/repoScope.svelte";
@@ -107,6 +108,9 @@
   // Compact stays genuinely tight. Class literals are spelled out in full so
   // Tailwind's scanner sees every variant.
   let gapBand = $derived($densityStore === "compact" ? "mb-1" : "mb-1.5");
+  // Equal icon pills: one literal so Tailwind keeps every utility.
+  const headerActionClass =
+    "gp-chip h-6 min-w-0 flex-1 basis-0 justify-center bg-surface font-medium text-textMuted hover:bg-surfaceHover hover:text-textPrimary";
   let gapChips = $derived($densityStore === "compact" ? "mb-1.5" : "mb-2");
   let scrollerAir = $derived($densityStore === "compact" ? "" : "pb-1");
 
@@ -120,6 +124,10 @@
   let locateName = $state<string | null>(null);
   let menu = $state<{ x: number; y: number; branch?: BranchInfo; tag?: TagInfo } | null>(null);
   let menuEl: HTMLDivElement | undefined = $state();
+  /** Header Create pill. Separate from the row context menu so opening it cannot run both actions. */
+  let createMenuOpen = $state(false);
+  let createMenuTrigger = $state<HTMLButtonElement | null>(null);
+  let createMenuEl = $state<HTMLDivElement | null>(null);
   /** Element focused when the menu opened; Escape/Tab hand focus back to it. */
   let openerEl: HTMLElement | null = null;
   /** Roving index among [role=menuitem] children for arrow-key cycling. */
@@ -190,6 +198,11 @@
     if (id in collapsed) return collapsed[id];
     return kind === "remote" || kind === "tags";
   }
+
+  // Same lookup the rows use. A last-click flag would stay on Expand after
+  // the reader opened the one folder that was closed.
+  let folderToggle = $derived(folderToggleAction(groupedSections, isCollapsed));
+  let offerExpand = $derived(folderToggle.action === "expand");
 
   function toggle(id: string, kind: BranchSection["kind"]) {
     collapsed = { ...collapsed, [id]: !isCollapsed(id, kind) };
@@ -485,6 +498,7 @@
   function openBranchMenu(e: MouseEvent, branch: BranchInfo) {
     e.preventDefault();
     e.stopPropagation();
+    createMenuOpen = false;
     trackOpener(e);
     menu = { x: e.clientX, y: e.clientY, branch };
   }
@@ -492,6 +506,7 @@
   function openTagMenu(e: MouseEvent, tag: TagInfo) {
     e.preventDefault();
     e.stopPropagation();
+    createMenuOpen = false;
     trackOpener(e);
     menu = { x: e.clientX, y: e.clientY, tag };
   }
@@ -510,6 +525,34 @@
     // A refresh can delete the branch whose row opened this menu; focusing a
     // detached node silently drops keyboard focus to <body>.
     if (opts.restoreFocus && opener?.isConnected) opener.focus();
+  }
+
+  function closeCreateMenu(opts: { restoreFocus?: boolean } = {}) {
+    if (!createMenuOpen) return;
+    createMenuOpen = false;
+    if (opts.restoreFocus) restoreFocusTo(createMenuTrigger);
+  }
+
+  async function toggleCreateMenu() {
+    if (createMenuOpen) {
+      closeCreateMenu({ restoreFocus: true });
+      return;
+    }
+    // One menu at a time. The pill only opens this menu; Branch and Tag run later.
+    closeMenu();
+    createMenuOpen = true;
+    await tick();
+    createMenuEl?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+  }
+
+  function chooseCreateBranch() {
+    closeCreateMenu();
+    creating = !creating;
+  }
+
+  function chooseCreateTag() {
+    closeCreateMenu();
+    void runCreateTag();
   }
 
   /** Live item query: conditional gating (is_current/is_remote) changes the
@@ -709,6 +752,25 @@
     onDismiss: () => closeMenu(),
   });
 
+  const createMenuPopover = $derived({
+    anchor: {
+      kind: "element" as const,
+      element: createMenuTrigger,
+      gap: 6,
+      place: "below" as const,
+    },
+    estimate: { width: 168, height: 76 },
+    inset: 8,
+    dismiss: {
+      inside: "[data-branch-create-trigger], [data-branch-create-menu]",
+      pointer: "pointerdown" as const,
+      escape: "capture" as const,
+      scroll: true,
+      resize: true,
+    },
+    onDismiss: (reason: DismissReason) => closeCreateMenu({ restoreFocus: reason === "escape" }),
+  });
+
   $effect(() => {
     menuShape;
     const el = menuEl;
@@ -749,6 +811,7 @@
       selectedIndex = -1;
       locateName = null;
       closeMenu();
+      closeCreateMenu();
       scrollTop = 0;
       if (containerEl) containerEl.scrollTop = 0;
       pinnedSignature = null;
@@ -1131,62 +1194,57 @@
   onkeydown={handleKeydown}
 >
   <!-- Header Bar -->
-  <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 {gapBand}">
-    <span>Branches ({$repoStore.branches.length})</span>
-    <div class="flex items-center gap-0.5">
+  <div class="flex flex-col gap-1 px-2 min-w-0 {gapBand}">
+    <div class="text-[10px] font-bold text-textMuted uppercase tracking-wider">
+      Branches ({$repoStore.branches.length})
+    </div>
+    <div class="flex flex-nowrap gap-1 min-w-0">
       <button
         type="button"
         onclick={locateCurrentBranch}
         title="Locate checked-out branch"
         aria-label="Locate checked-out branch"
-        class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors"
+        class={headerActionClass}
       >
-        <Crosshair size={12} />
+        <Crosshair size={12} aria-hidden="true" class="shrink-0" />
       </button>
       <button
         type="button"
-        onclick={expandAll}
-        title="Expand all folders"
-        aria-label="Expand all folders"
-        class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
+        onclick={() => (offerExpand ? expandAll() : collapseAll())}
+        title={offerExpand ? "Expand all folders" : "Collapse all folders"}
+        aria-label={offerExpand ? "Expand all folders" : "Collapse all folders"}
+        disabled={!folderToggle.enabled}
+        class="{headerActionClass} disabled:cursor-not-allowed disabled:opacity-40"
       >
-        +All
+        {#if offerExpand}
+          <ChevronDown size={12} aria-hidden="true" class="shrink-0" />
+        {:else}
+          <ChevronRight size={12} aria-hidden="true" class="shrink-0" />
+        {/if}
       </button>
       <button
+        bind:this={createMenuTrigger}
         type="button"
-        onclick={collapseAll}
-        title="Collapse all folders"
-        aria-label="Collapse all folders"
-        class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
-      >
-        -All
-      </button>
-      <button
-        type="button"
-        onclick={() => (creating = !creating)}
+        onclick={toggleCreateMenu}
         title="Create branch"
         aria-label="Create branch"
-        class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors ml-0.5"
+        aria-haspopup="menu"
+        aria-expanded={createMenuOpen}
+        aria-controls="branch-create-menu"
+        data-branch-create-trigger
+        class={headerActionClass}
       >
-        <Plus size={12} />
-      </button>
-      <button
-        type="button"
-        onclick={() => void runCreateTag()}
-        title="Create tag at HEAD"
-        aria-label="Create tag"
-        class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors"
-      >
-        <Tag size={12} />
+        <Plus size={12} aria-hidden="true" class="shrink-0" />
+        <ChevronDown size={10} aria-hidden="true" class="shrink-0" />
       </button>
       <button
         type="button"
         onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:branch-cleanup"))}
         title="Clean stale branches (Deadbranch)"
         aria-label="Clean stale branches"
-        class="p-1 rounded-full hover:bg-surfaceHover hover:text-emerald-400 text-textMuted transition-colors"
+        class={headerActionClass}
       >
-        <Sparkles size={12} />
+        <Sparkles size={12} aria-hidden="true" class="shrink-0" />
       </button>
     </div>
   </div>
@@ -1357,6 +1415,43 @@
 
 {#if mergeRequest}
   <MergeBranchDialog request={mergeRequest} onClose={() => { mergeRequest = null; }} />
+{/if}
+
+{#if createMenuOpen}
+  <div
+    bind:this={createMenuEl}
+    id="branch-create-menu"
+    data-branch-create-menu
+    use:portal={"body"}
+    use:popover={createMenuPopover}
+    class="fixed z-50 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
+    role="menu"
+    aria-label="Create"
+    tabindex="-1"
+  >
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      title="Create branch"
+      aria-label="Create branch"
+      onclick={chooseCreateBranch}
+    >
+      <GitBranch size={12} aria-hidden="true" />
+      Branch
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      title="Create tag at HEAD"
+      aria-label="Create tag"
+      onclick={chooseCreateTag}
+    >
+      <Tag size={12} aria-hidden="true" />
+      Tag
+    </button>
+  </div>
 {/if}
 
 {#if menu}
