@@ -1,14 +1,11 @@
 /**
- * Manvi's proposals, as the board's reviewer sees them.
+ * Manvi's refinement proposals, as the board's reviewer sees them.
  *
- * Two Manvi ops only *propose*: `work.scan.gaps` (tasks the repository seems to
- * need) and `work.enhancements.refine` (acceptance criteria, splits and
- * duplicate links for one task). Neither writes the board. This module is the
- * client side of the host methods that start, read and stop them, and of the
- * two that write what a person accepted:
+ * `work.enhancements.refine` only *proposes* acceptance criteria, splits and
+ * duplicate links for one task. It does not write the board. This module is
+ * the client side of the host method that starts that proposal, and of the one
+ * that writes what a person accepted:
  *
- * - `proposals.file` files a proposal through the board's task-intake path, so
- *   the related-task protection holds and filing twice is one card;
  * - `proposals.apply` accepts the selected parts of the refinement Manvi stored,
  *   at the proposal and task revisions that were reviewed, and is refused if
  *   the task moved. It is the one apply path: dc-store's own accept, which
@@ -21,9 +18,8 @@ import { getRefinement, newID, request, REFINE_PARTS, WorkbenchError, type Refin
 import { selectionWire, type ModelSelection } from "./taskModel";
 
 export type ProposalMethod =
-  | "scans.start" | "scans.get" | "scans.cancel"
   | "enhancements.refine"
-  | "proposals.file" | "proposals.apply";
+  | "proposals.apply";
 
 // ---------------------------------------------------------------------------
 // Decoding. A reply that is not exactly the contract is refused whole.
@@ -41,117 +37,10 @@ function optStr(value: unknown, what: string): string | undefined { return value
 function int(value: unknown, what: string): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : invalid(what);
 }
-function bool(value: unknown, what: string): boolean { return typeof value === "boolean" ? value : invalid(what); }
 function list<T>(value: unknown, what: string, decode: (item: unknown) => T, max = 1000): T[] {
   if (!Array.isArray(value) || value.length > max) return invalid(what);
   return value.map(decode);
 }
-
-export const SCAN_STATES = ["running", "done", "deadline", "cancelled", "failed"] as const;
-export type ScanState = (typeof SCAN_STATES)[number];
-export const PROPOSAL_STATUSES = ["new", "known", "attached"] as const;
-export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
-
-export interface ScanCoverage { category: string; status: string; detail: string; hidden: number }
-export interface ScanSignal { source: string; result: string }
-export interface ScanProposal {
-  fingerprint: string; category: string; status: ProposalStatus;
-  attached_item_id: string | null; attached_item_title: string | null;
-  title: string; description: string; kind: string; priority: number; labels: string[]; signals: ScanSignal[];
-}
-export interface ScanView {
-  scan_id: string; state: ScanState; repo_root: string; since: string; max_proposals: number;
-  joined: boolean; started_at: number; finished_at: number | null; error: string;
-  coverage: ScanCoverage[]; complete: boolean; board_complete: boolean;
-  new_count: number; attached_count: number; over_cap: number; proposals: ScanProposal[];
-}
-
-export function scanProposal(value: unknown): ScanProposal {
-  const raw = obj(value, "proposal");
-  const status = PROPOSAL_STATUSES.find((s) => s === raw.status) ?? invalid("proposal status");
-  const fingerprint = str(raw.fingerprint, "proposal");
-  if (!/^[0-9a-f]{16}$/.test(fingerprint)) return invalid("proposal fingerprint");
-  return {
-    fingerprint, status, category: str(raw.category, "proposal"),
-    attached_item_id: optStr(raw.attached_item_id, "proposal") ?? null,
-    attached_item_title: optStr(raw.attached_item_title, "proposal") ?? null,
-    title: str(raw.title, "proposal"), description: str(raw.description, "proposal"), kind: str(raw.kind, "proposal"),
-    priority: int(raw.priority, "proposal"),
-    labels: list(raw.labels, "proposal", (l) => str(l, "proposal"), 64),
-    signals: raw.signals === undefined ? [] : list(raw.signals, "proposal", (s) => {
-      const signal = obj(s, "proposal signal");
-      return { source: str(signal.source, "proposal signal"), result: str(signal.result, "proposal signal") };
-    }, 16),
-  };
-}
-
-export function scanView(value: unknown): ScanView {
-  const raw = obj(value, "scan");
-  const state = SCAN_STATES.find((s) => s === raw.state) ?? invalid("scan state");
-  const scan_id = str(raw.scan_id, "scan");
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(scan_id)) return invalid("scan id");
-  return {
-    scan_id, state, repo_root: str(raw.repo_root, "scan"), since: optStr(raw.since, "scan") ?? "",
-    max_proposals: int(raw.max_proposals, "scan"), joined: raw.joined === true,
-    started_at: int(raw.started_at, "scan"),
-    finished_at: raw.finished_at === undefined ? null : int(raw.finished_at, "scan"),
-    error: optStr(raw.error, "scan") ?? "",
-    coverage: list(raw.coverage, "scan coverage", (c) => {
-      const row = obj(c, "scan coverage");
-      return { category: str(row.category, "scan coverage"), status: str(row.status, "scan coverage"),
-        detail: optStr(row.detail, "scan coverage") ?? "", hidden: row.hidden === undefined ? 0 : int(row.hidden, "scan coverage") };
-    }, 32),
-    complete: bool(raw.complete, "scan"), board_complete: bool(raw.board_complete, "scan"),
-    new_count: int(raw.new_count, "scan"), attached_count: int(raw.attached_count, "scan"), over_cap: int(raw.over_cap, "scan"),
-    proposals: list(raw.proposals, "scan proposals", scanProposal, 200),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Scan: start, read, stop
-// ---------------------------------------------------------------------------
-
-/** Start (or join) a gap scan of the open repository. */
-export async function startScan(repoPath: string, options: { since?: string; maxProposals?: number } = {}): Promise<ScanView> {
-  const input: Record<string, unknown> = { repo_path: repoPath };
-  if (options.since?.trim()) input.since = options.since.trim();
-  if (options.maxProposals !== undefined) input.max_proposals = options.maxProposals;
-  return scanView(await request("scans.start", input));
-}
-export async function getScan(scanId: string): Promise<ScanView> { return scanView(await request("scans.get", { scan_id: scanId })); }
-export async function cancelScan(scanId: string): Promise<ScanView> { return scanView(await request("scans.cancel", { scan_id: scanId })); }
-
-export function scanFinished(view: ScanView): boolean { return view.state !== "running"; }
-
-/**
- * What the reviewer must be told about how much of the repository was seen.
- * Every line carries both numbers (what is shown, and what exists or was
- * hidden); an empty result is only "nothing found" when `complete` is true.
- */
-export function coverageNotes(view: ScanView): string[] {
-  const notes: string[] = [];
-  const shown = view.proposals.filter((p) => p.status !== "attached").length;
-  if (view.over_cap > 0) notes.push(`Showing ${shown} of ${shown + view.over_cap} new proposals (cap ${view.max_proposals}); ${view.over_cap} more were found and are not listed.`);
-  if (view.state !== "done") notes.push(view.state === "running" ? "The scan is still running; this list is not final." : `The scan ended early (${view.state}${view.error ? `: ${view.error}` : ""}); the list is incomplete.`);
-  if (!view.board_complete) notes.push("The board was not read in full, so a proposal may duplicate a task already on it.");
-  for (const c of view.coverage) {
-    if (c.status === "ok") continue;
-    const hidden = c.hidden > 0 ? `; ${c.hidden} hidden` : "";
-    notes.push(`${categoryLabel(c.category)}: ${c.status}${c.detail ? ` (${c.detail})` : ""}${hidden}.`);
-  }
-  return notes;
-}
-/** True when finding nothing, or few things, must not be read as the repository being clean. */
-export function scanIsPartial(view: ScanView): boolean { return !view.complete || view.over_cap > 0 || view.state !== "done"; }
-
-const CATEGORY_LABELS: Record<string, string> = {
-  dead_symbols: "Unused code", changed_untested: "Changed without tests", verification_gaps: "Open verification gaps", doc_drift: "Stale doc paths",
-};
-export function categoryLabel(category: string): string { return CATEGORY_LABELS[category] ?? category; }
-
-// ---------------------------------------------------------------------------
-// Filing a scan proposal
-// ---------------------------------------------------------------------------
 
 export interface RelatedTask { item_id: string; title: string; status: string }
 
@@ -168,9 +57,9 @@ export const MAX_REVIEWED_RELATED = 500;
  * A refusal names one page of related tasks (25) and omits those already
  * reviewed, so the next refusal is the next page. Sending back only the page on
  * screen drops the earlier ones, which then reappear: past 25 related tasks the
- * two refusals alternate for ever. This is the single owner of that set for
- * every proposal path (filing a scan proposal, applying a refinement); the host
- * is the other half of the protocol (`is_reviewed` in intake.rs).
+ * two refusals alternate for ever. This is the single owner of that set when
+ * applying a refinement; the host is the other half of the protocol
+ * (`is_reviewed` in intake.rs).
  */
 export function confirmReviewed(reviewed: readonly string[], shown: readonly Pick<RelatedTask, "item_id">[]): string[] {
   const kept = new Set<string>();
@@ -179,56 +68,6 @@ export function confirmReviewed(reviewed: readonly string[], shown: readonly Pic
     if (trimmed && kept.size < MAX_REVIEWED_RELATED) kept.add(trimmed);
   }
   return [...kept];
-}
-
-export type FileOutcome =
-  | { outcome: "filed" | "already_filed"; item_id: string; title: string }
-  | { outcome: "related_tasks_exist"; related: RelatedTask[] };
-export interface FileDraft { title: string; description: string; kind: string; priority: number; labels: string[] }
-
-type Origin = { kind: "scan"; fingerprint: string };
-
-async function file(repoPath: string, origin: Origin, draft: FileDraft, reviewedRelated: readonly string[]): Promise<FileOutcome> {
-  const raw = obj(await request("proposals.file", {
-    repo_path: repoPath, origin, title: draft.title, description: draft.description, kind: draft.kind,
-    priority: draft.priority, labels: draft.labels, reviewed_related: reviewedRelated,
-  }), "filing receipt");
-  if (raw.outcome === "related_tasks_exist") {
-    if (raw.ok !== false) return invalid("filing receipt");
-    return { outcome: "related_tasks_exist", related: list(raw.related, "filing receipt", (r) => {
-      const row = obj(r, "related task");
-      return { item_id: str(row.item_id, "related task"), title: str(row.title, "related task"), status: str(row.status, "related task") };
-    }, 25) };
-  }
-  if (raw.ok !== true || (raw.outcome !== "filed" && raw.outcome !== "already_filed")) return invalid("filing receipt");
-  return { outcome: raw.outcome, item_id: str(raw.item_id, "filing receipt"), title: str(raw.title, "filing receipt") };
-}
-
-/** File a scan proposal, as edited. Filing it again returns `already_filed`. */
-export function fileScanProposal(repoPath: string, proposal: ScanProposal, draft: FileDraft, reviewedRelated: readonly string[] = []): Promise<FileOutcome> {
-  return file(repoPath, { kind: "scan", fingerprint: proposal.fingerprint }, draft, reviewedRelated);
-}
-export function draftOf(proposal: ScanProposal): FileDraft {
-  return { title: proposal.title, description: proposal.description, kind: proposal.kind, priority: proposal.priority, labels: [...proposal.labels] };
-}
-
-// ---------------------------------------------------------------------------
-// Dismissal. A per-viewer convenience: a dismissed proposal stays out of this
-// person's list on later scans. It never touches the board.
-// ---------------------------------------------------------------------------
-
-const DISMISSED_KEY = "gitpulse.scan-dismissed:";
-export const MAX_DISMISSED = 500;
-export function dismissedFingerprints(repoPath: string): Set<string> {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(DISMISSED_KEY + repoPath) ?? "[]");
-    return new Set(Array.isArray(parsed) ? parsed.filter((f): f is string => typeof f === "string") : []);
-  } catch { return new Set(); }
-}
-export function dismissFingerprint(repoPath: string, fingerprint: string): Set<string> {
-  const kept = [...dismissedFingerprints(repoPath).add(fingerprint)].slice(-MAX_DISMISSED);
-  try { localStorage.setItem(DISMISSED_KEY + repoPath, JSON.stringify(kept)); } catch { /* the dismissal lasts this session only */ }
-  return new Set(kept);
 }
 
 // ---------------------------------------------------------------------------

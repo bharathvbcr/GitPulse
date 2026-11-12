@@ -1,7 +1,6 @@
 <script lang="ts">
   import PromptModal from "../src/lib/components/PromptModal.svelte";
   import TaskBoard from "../src/lib/components/TaskBoard.svelte";
-  import ScanProposals from "../src/lib/components/ScanProposals.svelte";
   let repositoryPath = $state<string | null>(null);
 </script>
 
@@ -15,10 +14,9 @@
      layout and paint, which makes it the containing block of every
      `position: fixed` descendant; a board mounted bare here hid that. -->
 <div class="gp-workspace flex-1 flex flex-col min-h-0 bg-background gp-pane">
-  <!-- As RepositoryTasks hosts them in the app: the proposals dock sits over the board's corner. -->
+  <!-- The same pane wrapper RepositoryTasks gives the board. -->
   <div class="repo-tasks">
     <TaskBoard {repositoryPath} acceptsOpenRequests={repositoryPath === null} />
-    {#if repositoryPath}<ScanProposals {repositoryPath} />{/if}
   </div>
 </div>
 <PromptModal />
