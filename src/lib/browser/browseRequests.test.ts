@@ -50,6 +50,21 @@ describe("agents' browser session requests", () => {
     expect(fake.failures).toEqual([]);
   });
 
+  it("waits on real timers when no sleep is given, and settles once the request is handled", async () => {
+    const fake = fakeDeps();
+    let checks = 0;
+    fake.deps.busy = () => ++checks < 3;
+    const { open, showDock, busy, launch, fail } = fake.deps;
+    const queue = createBrowseQueue({ open, showDock, busy, launch, fail });
+    const started = Date.now();
+    queue.push({ repo: "/a", url: "http://localhost:1/" });
+    await queue.settled();
+    // Two busy answers cost two 100 ms waits on the default sleep before the launch.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(180);
+    expect(fake.log).toEqual(["open /a", "dock", "launch /a http://localhost:1/"]);
+    expect(fake.failures).toEqual([]);
+  });
+
   it("says when a request could not be carried out, and goes on to the next", async () => {
     const { deps, log, failures } = fakeDeps({
       open: async (repo) => (repo === "/gone" ? null : repo),

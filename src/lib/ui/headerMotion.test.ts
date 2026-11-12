@@ -1,7 +1,18 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { DURATION_MS, EXIT_MS } from "../motion/tokens";
-import { HEADER_ENTER_MS, HEADER_EXIT_MS, HEADER_FRAMES, headerTransition, swapRow } from "./headerMotion";
+import {
+  HEADER_ENTER_MS,
+  HEADER_EXIT_MS,
+  HEADER_FRAMES,
+  headerTransition,
+  markEnter,
+  markExit,
+  popupEnter,
+  swapRow,
+  tabEnter,
+  tabExit,
+} from "./headerMotion";
 
 const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), "utf8");
 const KINDS = Object.keys(HEADER_FRAMES) as (keyof typeof HEADER_FRAMES)[];
@@ -19,6 +30,25 @@ describe("header motion tokens (HEADER_SPEC section 6)", () => {
       expect(out).toBeLessThanOrEqual(70);
       expect(out).toBeLessThan(headerTransition(kind, true, FULL).duration as number);
     }
+  });
+
+  it("gives each Svelte transition its own frame and direction, under the live preference", () => {
+    // Svelte passes (node, params, { direction }); the wrappers ignore them and read the live preference.
+    const wrappers = [
+      [tabEnter, "tab", true],
+      [tabExit, "tab", false],
+      [popupEnter, "popup", true],
+      [markEnter, "mark", true],
+      [markExit, "mark", false],
+    ] as const;
+    for (const [wrapper, kind, entering] of wrappers) {
+      const config = wrapper(undefined, undefined, { direction: entering ? "in" : "out" });
+      expect(config).toEqual(headerTransition(kind, entering));
+      expect(config.css).toBe(HEADER_FRAMES[kind]);
+    }
+    // A swapped pair would play the exit curve on the way in.
+    expect(tabEnter().easing).not.toBe(tabExit().easing);
+    expect(markEnter().easing).toBe(tabEnter().easing);
   });
 
   it("is instant under reduced motion, for every piece and both directions", () => {
