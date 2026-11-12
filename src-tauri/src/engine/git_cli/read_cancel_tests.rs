@@ -14,6 +14,15 @@ fn gone_within() -> Duration {
     coverage_relaxed(crate::procguard::CHILD_GRACE + Duration::from_secs(3))
 }
 
+/// A rig read's own deadline, relaxed like the windows the tests watch. A fixed
+/// 60 s ran out inside the burst test's "nothing cancelled it" window under
+/// coverage (that window is `gone_within`, eight times longer when
+/// instrumented): the deadline, not a cancel, ended a child, and the test saw
+/// 7 of 8 alive at exactly 60 s.
+fn read_deadline() -> Duration {
+    coverage_relaxed(Duration::from_secs(60))
+}
+
 /// The shell fragment a child runs to record itself: its pid and its own start
 /// time, as `ps` reports it, on one line. Written by the child, so the start
 /// time is the child's and not whichever process holds the pid by the time the
@@ -115,7 +124,7 @@ impl Rig {
             let _in = scope.enter();
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", script.as_str()]).current_dir(&cwd);
-            run_read_shared(cmd, "cancel-test", Duration::from_secs(60), 4096, gate)
+            run_read_shared(cmd, "cancel-test", read_deadline(), 4096, gate)
         })
     }
 
@@ -511,7 +520,7 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", rig.script("queued", "echo ran").as_str()])
         .current_dir(&rig.cwd);
-    let outcome = run_read_shared(cmd, "queued-test", Duration::from_secs(60), 4096, rig.gate);
+    let outcome = run_read_shared(cmd, "queued-test", read_deadline(), 4096, rig.gate);
     canceller.join().unwrap();
     let error = outcome.expect_err("a cancelled read does not run");
     assert_eq!(
