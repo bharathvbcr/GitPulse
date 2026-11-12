@@ -292,6 +292,12 @@ export function visiblePaneIds(
   return activeId ? [activeId] : [];
 }
 
+/** Whether `zoomedPaneId` names a pane that is shown, so it alone fills the area. */
+function zoomApplies(root: SplitNode | null, activeId: string | null, zoomedPaneId: string | null): boolean {
+  if (!zoomedPaneId) return false;
+  return (root?.kind === "branch" && hasPane(root, zoomedPaneId)) || (!root && zoomedPaneId === activeId);
+}
+
 export function computeSplitLayout(
   root: SplitNode | null,
   activeId: string | null,
@@ -303,7 +309,7 @@ export function computeSplitLayout(
   const panes: Record<string, NormalizedBox> = {};
   const sashes: SashDescriptor[] = [];
 
-  if (zoomedPaneId && ((root?.kind === "branch" && hasPane(root, zoomedPaneId)) || (!root && zoomedPaneId === activeId))) {
+  if (zoomedPaneId && zoomApplies(root, activeId, zoomedPaneId)) {
     panes[zoomedPaneId] = FULL_BOX;
     return { panes, sashes };
   }
@@ -347,6 +353,42 @@ export function computeSplitLayout(
 
   walk(root, FULL_BOX);
   return { panes, sashes };
+}
+
+/**
+ * The least height a pane is laid out at; a shorter dock scrolls its panes.
+ * A pane's own chrome (status row, footer) takes about 48px and Find another
+ * 36px in the active one, so this leaves a grid of about 96px with Find open.
+ */
+export const MIN_PANE_HEIGHT_PX = 180;
+
+/**
+ * The height the pane area must be for every visible pane of
+ * `computeSplitLayout` to get at least `minPanePx`.
+ *
+ * Pane boxes are fractions of the pane area, so on their own they can only
+ * shrink with it: a short dock would squeeze each pane of a split down to a
+ * grid of no rows. Laying the panes out on a canvas at least this tall lets
+ * the pane area scroll instead. A split right needs its taller side; a split
+ * down needs each side's minimum at its own share of the height, which an
+ * uneven ratio makes larger than the sum.
+ */
+export function minimumSplitHeight(
+  root: SplitNode | null,
+  activeId: string | null,
+  zoomedPaneId: string | null = null,
+  minPanePx: number = MIN_PANE_HEIGHT_PX,
+): number {
+  if (zoomApplies(root, activeId, zoomedPaneId) || !root || root.kind === "leaf") return minPanePx;
+  const need = (node: SplitNode): number => {
+    if (node.kind === "leaf") return minPanePx;
+    const a = need(node.a);
+    const b = need(node.b);
+    if (node.direction === "row") return Math.max(a, b);
+    const r = clampSplitRatio(node.ratio);
+    return Math.max(a / r, b / (1 - r));
+  };
+  return need(root);
 }
 
 /**

@@ -18,7 +18,48 @@ import {
   splitPane,
   swapPanes,
   visiblePaneIds,
+  minimumSplitHeight,
+  MIN_PANE_HEIGHT_PX,
 } from "./splitTree";
+
+describe("minimumSplitHeight", () => {
+  const min = MIN_PANE_HEIGHT_PX;
+
+  it("asks one pane's minimum for no split, a lone leaf and a zoomed pane", () => {
+    expect(minimumSplitHeight(null, "p1")).toBe(min);
+    expect(minimumSplitHeight(null, null)).toBe(min);
+    const root = splitPane(null, "p1", "p2", "col", "after", 0.5);
+    expect(minimumSplitHeight(root, "p1", "p1")).toBe(min);
+  });
+
+  it("stacks the minimums of a split down and keeps the taller side of a split right", () => {
+    const down = splitPane(null, "p1", "p2", "col", "after", 0.5);
+    expect(minimumSplitHeight(down, "p1")).toBe(2 * min);
+    const right = splitPane(null, "p1", "p2", "row", "after", 0.5);
+    expect(minimumSplitHeight(right, "p1")).toBe(min);
+    // A split right whose right side is split down needs that side's height.
+    const nested = splitPane(right, "p2", "p3", "col", "after", 0.5);
+    expect(minimumSplitHeight(nested, "p1")).toBe(2 * min);
+  });
+
+  it("honours an uneven ratio, so the smaller side still gets its minimum", () => {
+    const uneven = splitPane(null, "p1", "p2", "col", "after", 0.25);
+    const total = minimumSplitHeight(uneven, "p1");
+    const boxes = computeSplitLayout(uneven, "p1").panes;
+    for (const id of ["p1", "p2"]) expect(boxes[id].height * total).toBeGreaterThanOrEqual(min - 1e-9);
+    expect(total).toBeCloseTo(min / 0.25);
+  });
+
+  it("gives every pane of a full grid at least its minimum at the returned height", () => {
+    let root = splitPane(null, "p1", "p2", "col", "after", 0.3);
+    root = splitPane(root, "p2", "p3", "col", "after", 0.6);
+    root = splitPane(root, "p1", "p4", "row", "after", 0.5);
+    const total = minimumSplitHeight(root, "p1");
+    for (const box of Object.values(computeSplitLayout(root, "p1").panes)) {
+      expect(box.height * total).toBeGreaterThanOrEqual(min - 1e-9);
+    }
+  });
+});
 
 describe("splitTree", () => {
   it("creates a 2-pane split from null and preserves order for before/after", () => {

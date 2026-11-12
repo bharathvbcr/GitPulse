@@ -81,6 +81,7 @@
     hasPane,
     leafPaneIds,
     MAX_SPLIT_PANES,
+    minimumSplitHeight,
     movePaneToSplit,
     parsePersistedSplitWorkspace,
     remapSplitTree,
@@ -310,6 +311,8 @@
   const visibleIds = $derived(visiblePaneIds(splitRoot, activeId, zoomedPaneId));
   const splitIds = $derived(splitRoot ? visibleIds : null);
   const splitLayout = $derived(computeSplitLayout(splitRoot, activeId, zoomedPaneId));
+  /** The pane canvas's least height; below it the pane area scrolls (`minimumSplitHeight`). */
+  const paneCanvasMinHeight = $derived(minimumSplitHeight(splitRoot, activeId, zoomedPaneId));
   const hasVisibleFilePane = $derived(
     tabState.tabs.some(
       (tab) => tab.launcher === "file" && (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
@@ -2651,7 +2654,11 @@
         {/if}
       </form>
     {/if}
-    <div bind:this={panesContainerEl} class="terminal-panes flex-1 min-h-0 relative" data-split={splitRoot !== null ? "true" : "false"} class:hidden={mode !== "shell"}>
+    <div class="terminal-panes flex-1 min-h-0 relative" data-split={splitRoot !== null ? "true" : "false"} class:hidden={mode !== "shell"}>
+      <!-- Pane boxes are fractions of this canvas, which is never shorter
+           than every pane's minimum: a short dock scrolls its panes instead
+           of squeezing a split to grids with no rows. Sash drags measure it. -->
+      <div bind:this={panesContainerEl} class="terminal-panes-canvas relative h-full" style:min-height={`${paneCanvasMinHeight}px`}>
       {#if !repoPath}
         <div class="h-full flex items-center justify-center text-textMuted text-xs">
           Open a repository to start a shell.
@@ -2884,6 +2891,7 @@
           </div>
         {/each}
       {/if}
+      </div>
     </div>
 
   {#if mode === "console"}
@@ -3108,9 +3116,7 @@
   .terminal-tab-label { max-width: 14rem; }
   [data-crowded="true"] .terminal-tab-label { max-width: 7rem; }
   .terminal-panes { container-type: inline-size; overflow: auto; }
-  /* Keep a readable grid after Find, warnings, popovers, and the footer
-     take their space. Short docks scroll their panes instead of crushing
-     them to zero. */
-  .terminal-pane { min-height: 120px; }
-  .terminal-panes[data-split="true"] .terminal-pane { min-height: 0; }
+  /* Each pane keeps at least MIN_PANE_HEIGHT_PX through the canvas's
+     min-height (`minimumSplitHeight`), so Find, warnings and the footer leave
+     a readable grid and short docks scroll their panes instead. */
 </style>

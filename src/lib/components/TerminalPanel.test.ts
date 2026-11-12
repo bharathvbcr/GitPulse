@@ -283,10 +283,15 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain("sameRepo(payload.repo_path, repoPath, pathOpts)");
   });
 
-  it("gates cold-boot split hydration on detached session adoption, clears split min-height, formats drops for recipient launcher, and guards 8-pane tab drops", () => {
+  it("gates cold-boot split hydration on detached session adoption, keeps split panes at their minimum height by scrolling, formats drops for recipient launcher, and guards 8-pane tab drops", () => {
     expect(source).toContain("detachedAdoptionSettled");
     expect(source).toContain("serializeSplitWorkspace(");
-    expect(source).toContain('.terminal-panes[data-split="true"] .terminal-pane { min-height: 0; }');
+    // Panes are fractions of a canvas at least `minimumSplitHeight` tall, so a
+    // short dock scrolls instead of crushing a split's grids to no rows; a
+    // split pane's own min-height is never zeroed again.
+    expect(source).toContain("minimumSplitHeight(splitRoot, activeId, zoomedPaneId)");
+    expect(source).toContain("style:min-height={`${paneCanvasMinHeight}px`}");
+    expect(source).not.toContain('.terminal-pane { min-height: 0; }');
     expect(source).toContain("function sendPathsToPreferredSession(paths: readonly string[])");
     expect(source).toContain("repoPath={tab.checkout ?? repoPath}");
     expect(source).toContain("fallbackPath={tab.fallbackPath}");
