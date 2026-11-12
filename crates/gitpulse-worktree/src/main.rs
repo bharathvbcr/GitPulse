@@ -37,7 +37,10 @@ use gitpulse_lib::engine::worktree::{
 use gitpulse_lib::ipc_error::CommandError;
 use gitpulse_worktree::build_cache::{
     inspect_or_prune_cache, resolve_build_cache_dir, resolve_gitpulse_rustc_bin,
-    ENV_BUILD_CACHE_DIR, ENV_WORKTREE_ROOT,
+    resolve_repo_build_cache_dir, ENV_BUILD_CACHE_DIR, ENV_WORKTREE_ROOT,
+};
+use gitpulse_worktree::campaign_formal::{
+    audit_repo_campaign, CampaignController, LaneRole, LeaseMode, LeaseScope,
 };
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -154,6 +157,10 @@ SUBCOMMANDS:
       --repo <path>      Repository checkout path (required)
       --prune            Evict oldest blobs and invalidated manifests above --max-bytes
       --max-bytes <n>    Maximum retained blob bytes when --prune is set (default: 4 GiB)
+
+    campaign             Enforce formal multi-lane leases, SHA-256 BULLETIN & sole-integrator commits
+      --repo <path>      Repository checkout path (required)
+      --action <act>     init | status | audit | register-lane | acquire-lease | release-lease | bulletin | stage | integrate
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +305,24 @@ enum Subcommand {
         prune: bool,
         max_bytes: Option<u64>,
     },
+    Campaign(Box<CampaignArgs>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CampaignArgs {
+    repo: String,
+    action: String,
+    lane: Option<String>,
+    role: Option<LaneRole>,
+    mode: Option<LeaseMode>,
+    files: Vec<String>,
+    dirs: Vec<String>,
+    kind: Option<String>,
+    body: Option<String>,
+    base_oid: Option<String>,
+    new_oid: Option<String>,
+    proposal_id: Option<u64>,
+    verified: bool,
 }
 
 fn split_csv_into(raw: &str, out: &mut Vec<String>) -> Result<(), String> {
@@ -835,6 +860,102 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                 prune,
                 max_bytes,
             }
+        }
+        "campaign" => {
+            let mut repo = None;
+            let mut action = None;
+            let mut lane = None;
+            let mut role = None;
+            let mut mode = None;
+            let mut files = Vec::new();
+            let mut dirs = Vec::new();
+            let mut kind = None;
+            let mut body = None;
+            let mut base_oid = None;
+            let mut new_oid = None;
+            let mut proposal_id = None;
+            let mut verified = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--repo" => repo = Some(take_val(rest, &mut i, "--repo").map_err(map_err)?),
+                    "--action" => {
+                        action = Some(take_val(rest, &mut i, "--action").map_err(map_err)?)
+                    }
+                    "--lane" => lane = Some(take_val(rest, &mut i, "--lane").map_err(map_err)?),
+                    "--role" => {
+                        let raw = take_val(rest, &mut i, "--role").map_err(map_err)?;
+                        role = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                            "worker" => LaneRole::Worker,
+                            "integrator" => LaneRole::Integrator,
+                            other => {
+                                return Err((
+                                    json_mode,
+                                    format!(
+                                        "invalid --role {other:?} (expected worker or integrator)"
+                                    ),
+                                ))
+                            }
+                        });
+                    }
+                    "--mode" => {
+                        let raw = take_val(rest, &mut i, "--mode").map_err(map_err)?;
+                        mode = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                            "read" => LeaseMode::Read,
+                            "write" => LeaseMode::Write,
+                            other => {
+                                return Err((
+                                    json_mode,
+                                    format!("invalid --mode {other:?} (expected read or write)"),
+                                ))
+                            }
+                        });
+                    }
+                    "--files" => {
+                        let v = take_val(rest, &mut i, "--files").map_err(map_err)?;
+                        split_csv_into(&v, &mut files).map_err(map_err)?;
+                    }
+                    "--dirs" => {
+                        let v = take_val(rest, &mut i, "--dirs").map_err(map_err)?;
+                        split_csv_into(&v, &mut dirs).map_err(map_err)?;
+                    }
+                    "--kind" => kind = Some(take_val(rest, &mut i, "--kind").map_err(map_err)?),
+                    "--body" => body = Some(take_val(rest, &mut i, "--body").map_err(map_err)?),
+                    "--base-oid" => {
+                        base_oid = Some(take_val(rest, &mut i, "--base-oid").map_err(map_err)?)
+                    }
+                    "--new-oid" => {
+                        new_oid = Some(take_val(rest, &mut i, "--new-oid").map_err(map_err)?)
+                    }
+                    "--proposal-id" => {
+                        let raw = take_val(rest, &mut i, "--proposal-id").map_err(map_err)?;
+                        let parsed = raw.parse::<u64>().map_err(|_| {
+                            (json_mode, format!("invalid u64 for --proposal-id: {raw:?}"))
+                        })?;
+                        proposal_id = Some(parsed);
+                    }
+                    "--verified" => verified = true,
+                    other => {
+                        return Err((json_mode, format!("unknown flag for campaign: {other}")))
+                    }
+                }
+                i += 1;
+            }
+            Subcommand::Campaign(Box::new(CampaignArgs {
+                repo: require_flag(repo, "--repo", "campaign").map_err(map_err)?,
+                action: require_flag(action, "--action", "campaign").map_err(map_err)?,
+                lane,
+                role,
+                mode,
+                files,
+                dirs,
+                kind,
+                body,
+                base_oid,
+                new_oid,
+                proposal_id,
+                verified,
+            }))
         }
         other => {
             return Err((
@@ -1605,6 +1726,174 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 "report": report,
             }))
         }
+        Subcommand::Campaign(camp) => {
+            let CampaignArgs {
+                repo,
+                action,
+                lane,
+                role,
+                mode,
+                files,
+                dirs,
+                kind,
+                body,
+                base_oid,
+                new_oid,
+                proposal_id,
+                verified,
+            } = *camp;
+            gitpulse_lib::repository_trust::require(Path::new(&repo))
+                .map_err(CommandError::into_message)?;
+            let family =
+                resolve_worktree_family(&repo, &repo).map_err(CommandError::into_message)?;
+            let cache_dir = resolve_repo_build_cache_dir(&family.worktree)?;
+            let state_path = cache_dir
+                .parent()
+                .ok_or_else(|| "cannot resolve <git-common-dir>/gitpulse directory".to_string())?
+                .join("campaign.json");
+            match action.trim().to_ascii_lowercase().as_str() {
+                "init" => {
+                    let existing =
+                        audit_repo_campaign(&repo, None, None).map_err(CommandError::into_message)?;
+                    if existing.initialized {
+                        return Err(format!(
+                            "campaign state is already initialized at {} (refusing to overwrite active campaign)",
+                            existing.state_path
+                        ));
+                    }
+                    let rev = base_oid.as_deref().unwrap_or("HEAD");
+                    if rev.is_empty() || rev.starts_with('-') {
+                        return Err(format!("invalid --base-oid revision {rev:?}"));
+                    }
+                    let spec = format!("{rev}^{{commit}}");
+                    let out = capture_command(
+                        "git",
+                        &["rev-parse", "--verify", &spec],
+                        Some(&family.anchor),
+                        Duration::from_secs(5),
+                        &[],
+                    )
+                    .map_err(CommandError::into_message)?;
+                    if !out.success {
+                        return Err(format!(
+                            "cannot resolve {rev} on primary worktree for campaign init: {}",
+                            out.stderr_text().trim()
+                        ));
+                    }
+                    let genesis = out.stdout_text().trim().to_string();
+                    let ctrl = CampaignController::try_new(&genesis)
+                        .map_err(|e| format!("campaign init rejected: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({
+                        "ok": true,
+                        "state_path": state_path,
+                        "genesis_oid": ctrl.genesis_oid(),
+                        "target_oid": ctrl.target_oid(),
+                    }))
+                }
+                "status" | "audit" => {
+                    let report =
+                        audit_repo_campaign(&repo, None, None).map_err(CommandError::into_message)?;
+                    if !report.initialized {
+                        return Err(format!(
+                            "campaign state does not exist at {}",
+                            report.state_path
+                        ));
+                    }
+                    if !report.ok {
+                        return Err(report.verification_error.unwrap_or_else(|| {
+                            "campaign audit failed invariant or HEAD parity check".to_string()
+                        }));
+                    }
+                    serde_json::to_value(report)
+                        .map_err(|e| format!("cannot serialize campaign audit report: {e}"))
+                }
+                "register-lane" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign register-lane")?;
+                    let lane_role = role.ok_or_else(|| {
+                        "campaign register-lane requires --role <worker|integrator>".to_string()
+                    })?;
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    ctrl.register_lane(&lane_id, lane_role)
+                        .map_err(|e| format!("register-lane failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({ "ok": true, "lane": lane_id, "role": lane_role }))
+                }
+                "acquire-lease" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign acquire-lease")?;
+                    let lease_mode = mode.unwrap_or(LeaseMode::Write);
+                    let mut scopes = Vec::with_capacity(files.len() + dirs.len());
+                    for f in &files {
+                        scopes.push(
+                            LeaseScope::file(f)
+                                .map_err(|e| format!("invalid --files scope {f:?}: {e:?}"))?,
+                        );
+                    }
+                    for d in &dirs {
+                        scopes.push(
+                            LeaseScope::dir(d)
+                                .map_err(|e| format!("invalid --dirs scope {d:?}: {e:?}"))?,
+                        );
+                    }
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    ctrl.acquire_leases(&lane_id, lease_mode, scopes)
+                        .map_err(|e| format!("acquire-lease failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({
+                        "ok": true,
+                        "lane": lane_id,
+                        "active_leases": ctrl.active_leases(),
+                    }))
+                }
+                "release-lease" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign release-lease")?;
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    let released = ctrl
+                        .release_lane_leases(&lane_id)
+                        .map_err(|e| format!("release-lease failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({ "ok": true, "lane": lane_id, "released": released }))
+                }
+                "bulletin" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign bulletin")?;
+                    let msg_kind = require_flag(kind, "--kind", "campaign bulletin")?;
+                    let msg_body = require_flag(body, "--body", "campaign bulletin")?;
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    let entry = ctrl
+                        .post_bulletin(&lane_id, &msg_kind, &msg_body)
+                        .map_err(|e| format!("bulletin append failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({ "ok": true, "entry": entry }))
+                }
+                "stage" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign stage")?;
+                    let base = require_flag(base_oid, "--base-oid", "campaign stage")?;
+                    let raw_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    let pid = ctrl
+                        .stage_proposal(&lane_id, &base, &raw_refs)
+                        .map_err(|e| format!("stage proposal failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({ "ok": true, "proposal_id": pid, "target_oid": ctrl.target_oid() }))
+                }
+                "integrate" => {
+                    let lane_id = require_flag(lane, "--lane", "campaign integrate")?;
+                    let pid = proposal_id
+                        .ok_or_else(|| "campaign integrate requires --proposal-id".to_string())?;
+                    let parent = require_flag(base_oid, "--base-oid", "campaign integrate")?;
+                    let next = require_flag(new_oid, "--new-oid", "campaign integrate")?;
+                    let mut ctrl = CampaignController::load_verified(&state_path)?;
+                    let rec = ctrl
+                        .commit_target_branch(&lane_id, pid, &parent, &next, verified)
+                        .map_err(|e| format!("integrate failed: {e:?}"))?;
+                    ctrl.save_verified_atomic(&state_path)?;
+                    Ok(json!({ "ok": true, "commit": rec, "target_oid": ctrl.target_oid() }))
+                }
+                other => Err(format!(
+                    "unknown campaign --action {other:?} (expected init, status, audit, register-lane, acquire-lease, release-lease, bulletin, stage, or integrate)"
+                )),
+            }
+        }
     }
 }
 
@@ -1955,6 +2244,46 @@ mod tests {
                     prune: true,
                     max_bytes: Some(1_048_576),
                 }
+            }
+        );
+
+        let camp = parse_cli(&vec_str(&[
+            "campaign",
+            "--repo",
+            "/tmp/repo",
+            "--action",
+            "integrate",
+            "--lane",
+            "integ",
+            "--proposal-id",
+            "7",
+            "--base-oid",
+            "oid-0",
+            "--new-oid",
+            "oid-1",
+            "--verified",
+            "--json",
+        ]))
+        .expect("campaign integrate");
+        assert_eq!(
+            camp,
+            Invocation::Command {
+                json: true,
+                cmd: Subcommand::Campaign(Box::new(CampaignArgs {
+                    repo: "/tmp/repo".to_string(),
+                    action: "integrate".to_string(),
+                    lane: Some("integ".to_string()),
+                    role: None,
+                    mode: None,
+                    files: Vec::new(),
+                    dirs: Vec::new(),
+                    kind: None,
+                    body: None,
+                    base_oid: Some("oid-0".to_string()),
+                    new_oid: Some("oid-1".to_string()),
+                    proposal_id: Some(7),
+                    verified: true,
+                }))
             }
         );
     }

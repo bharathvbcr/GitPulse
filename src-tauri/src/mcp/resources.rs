@@ -91,6 +91,11 @@ const FACETS: &[Facet] = &[
         title: "Code graph status",
         description: "Whether the devmap code graph is present for this repository, and how current it is.",
     },
+    Facet {
+        name: "campaign",
+        title: "Verified campaign audit",
+        description: "Formal multi-agent campaign invariant audit over <git-common-dir>/gitpulse/campaign.json: single-writer file/directory leases, SHA-256 hash-chained BULLETIN entries, sole-committer Integrator target-branch commits, 0600 CSPRNG HMAC-SHA256 authentication, and refs/gitpulse/campaign/state Git ODB anchoring.",
+    },
 ];
 
 /// Server documents that need no repository. These are the whole of
@@ -545,6 +550,9 @@ pub(super) fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
             Ok(json!(crate::tasks::view(&address.anchor)))
         }
         "codeintel" => Ok(json!(crate::codeintel::status(repo))),
+        "campaign" => crate::engine::campaign_formal::audit_repo_campaign(repo, None, None)
+            .map(|report| json!(report))
+            .map_err(|error| ReadError::Internal(error.into_message())),
         other => Err(ReadError::NotFound(format!(
             "no facet named {other:?}; known: [{}]",
             facet_names().join(", ")

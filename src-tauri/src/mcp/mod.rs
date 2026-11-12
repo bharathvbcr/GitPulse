@@ -1010,6 +1010,22 @@ tool_args! {
 }
 
 tool_args! {
+    struct CampaignAuditArgs {
+        repo_path: String = repo_spec(),
+        since_seq: Option<u64> = Spec::int(
+            "Return BULLETIN entries with seq strictly greater than since_seq (default 0)",
+            0,
+            MAX_REVISION,
+        ),
+        limit: Option<u32> = Spec::int(
+            "Maximum BULLETIN entries to return (default 100, max 256)",
+            1,
+            crate::engine::campaign_formal::MAX_CAMPAIGN_AUDIT_ITEMS as u64,
+        ),
+    }
+}
+
+tool_args! {
     struct WorktreeOverlaySyncArgs {
         repo_path: String = repo_spec(),
         worktree_path: Option<String> = path_spec(
@@ -2216,6 +2232,120 @@ fn build_tools() -> Vec<Value> {
                     "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated", "scan_errors"
                 ]
             }),
+        ),
+        tool(
+            "gitpulse_campaign_audit",
+            "Verified multi-agent campaign invariant audit",
+            "Audit <git-common-dir>/gitpulse/campaign.json in read-only mode against the formal campaign safety invariants and cryptographic/ODB seals: (1) pairwise hierarchical single-writer file/directory lease disjointness across lanes, (2) genesis-to-head FIPS 180-4 SHA-256 BULLETIN hash-chain integrity, (3) sole-committer Integrator target-branch authority with acyclic parent->child lineage, (4) strict 0600 non-symlink owner-UID campaign.key hygiene and constant-time domain-separated HMAC-SHA256 authentication over the envelope, BULLETIN entries, and target commits, and (5) Git ODB state-anchor parity under refs/gitpulse/campaign/state. Creates nothing on disk; an uninitialized repository reports initialized: false and invariants_verified: false rather than claiming verification passed.",
+            CampaignAuditArgs::properties(),
+            &CampaignAuditArgs::required(),
+            {
+                let lane_item = json!({
+                    "type": "object",
+                    "properties": {
+                        "lane": { "type": "string" },
+                        "role": { "type": "string", "enum": ["Worker", "Integrator"] }
+                    },
+                    "required": ["lane", "role"]
+                });
+                let lease_item = json!({
+                    "type": "object",
+                    "properties": {
+                        "lane": { "type": "string" },
+                        "mode": { "type": "string", "enum": ["Read", "Write"] },
+                        "scope_kind": { "type": "string", "enum": ["FileExact", "DirSubtree"] },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["lane", "mode", "scope_kind", "path"]
+                });
+                let bulletin_item = json!({
+                    "type": "object",
+                    "properties": {
+                        "seq": { "type": "integer", "minimum": 1 },
+                        "author_lane": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "body": { "type": "string" },
+                        "prev_hash_sha256": { "type": "string" },
+                        "entry_hash_sha256": { "type": "string" }
+                    },
+                    "required": [
+                        "seq", "author_lane", "kind", "body",
+                        "prev_hash_sha256", "entry_hash_sha256"
+                    ]
+                });
+                let proposal_item = json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 },
+                        "worker_lane": { "type": "string" },
+                        "base_oid": { "type": "string" },
+                        "touched_files": { "type": "array", "items": { "type": "string" } },
+                        "integrated": { "type": "boolean" }
+                    },
+                    "required": ["id", "worker_lane", "base_oid", "touched_files", "integrated"]
+                });
+                let commit_item = json!({
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": { "type": "integer", "minimum": 1 },
+                        "worker_lane": { "type": "string" },
+                        "committer_lane": { "type": "string" },
+                        "committer_role": { "type": "string", "enum": ["Worker", "Integrator"] },
+                        "parent_oid": { "type": "string" },
+                        "new_oid": { "type": "string" },
+                        "touched_files": { "type": "array", "items": { "type": "string" } },
+                        "verification_passed": { "type": "boolean" }
+                    },
+                    "required": [
+                        "proposal_id", "worker_lane", "committer_lane", "committer_role",
+                        "parent_oid", "new_oid", "touched_files", "verification_passed"
+                    ]
+                });
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "repo_path": { "type": "string" },
+                        "state_path": { "type": "string" },
+                        "initialized": { "type": "boolean" },
+                        "invariants_verified": { "type": "boolean" },
+                        "sole_committer_enforced": { "type": "boolean" },
+                        "key_permissions_valid": { "type": "boolean" },
+                        "hmac_authenticated": { "type": "boolean" },
+                        "odb_anchor_verified": { "type": "boolean" },
+                        "odb_state_ref_oid": { "type": ["string", "null"] },
+                        "verification_error": { "type": ["string", "null"] },
+                        "genesis_oid": { "type": ["string", "null"] },
+                        "target_oid": { "type": ["string", "null"] },
+                        "head_oid": { "type": ["string", "null"] },
+                        "head_matches_target": { "type": ["boolean", "null"] },
+                        "bulletin_head_sha256": { "type": ["string", "null"] },
+                        "lanes": { "type": "array", "items": lane_item },
+                        "active_leases": { "type": "array", "items": lease_item },
+                        "bulletin_entries": { "type": "array", "items": bulletin_item },
+                        "bulletin_total": { "type": "integer", "minimum": 0 },
+                        "bulletin_returned": { "type": "integer", "minimum": 0 },
+                        "bulletin_truncated": { "type": "boolean" },
+                        "proposals": { "type": "array", "items": proposal_item },
+                        "proposals_total": { "type": "integer", "minimum": 0 },
+                        "target_commits": { "type": "array", "items": commit_item },
+                        "target_commits_total": { "type": "integer", "minimum": 0 },
+                        "truncated": { "type": "boolean" }
+                    },
+                    "required": [
+                        "ok", "repo_path", "state_path", "initialized",
+                        "invariants_verified", "sole_committer_enforced",
+                        "key_permissions_valid", "hmac_authenticated", "odb_anchor_verified",
+                        "odb_state_ref_oid", "verification_error",
+                        "genesis_oid", "target_oid", "head_oid", "head_matches_target",
+                        "bulletin_head_sha256",
+                        "lanes", "active_leases", "bulletin_entries",
+                        "bulletin_total", "bulletin_returned", "bulletin_truncated",
+                        "proposals", "proposals_total", "target_commits", "target_commits_total",
+                        "truncated"
+                    ]
+                })
+            },
         ),
         mutating_tool(
             "gitpulse_worktree_overlay_sync",
@@ -3710,6 +3840,16 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 // Depends on zc/fix-engine 9b404787 (RadarReport::scan_errors).
                 "scan_errors": report.scan_errors
             }))
+        }
+        "gitpulse_campaign_audit" => {
+            let a: CampaignAuditArgs = parse(name, arguments)?;
+            let report = crate::engine::campaign_formal::audit_repo_campaign(
+                &a.repo_path,
+                a.since_seq,
+                a.limit,
+            )
+            .map_err(CommandError::into_message)?;
+            Ok(json!(report))
         }
         "gitpulse_worktree_overlay_sync" => {
             let a: WorktreeOverlaySyncArgs = parse(name, arguments)?;
@@ -6253,9 +6393,50 @@ mod tests {
                 &mut validated,
             );
         }
+        {
+            use crate::engine::campaign_formal::{
+                resolve_campaign_state_path, CampaignController, LaneRole, LeaseMode, LeaseScope,
+            };
+            let (wt_path_buf, state_path) =
+                resolve_campaign_state_path(&wt_repo).expect("campaign path");
+            let schema_c0 = crate::engine::git_cli::git_text(&wt_path_buf, &["rev-parse", "HEAD~1"])
+                .expect("schema c0")
+                .trim()
+                .to_string();
+            let schema_c1 = crate::engine::git_cli::git_text(&wt_path_buf, &["rev-parse", "HEAD"])
+                .expect("schema c1")
+                .trim()
+                .to_string();
+            let mut ctrl = CampaignController::try_new(&schema_c0).expect("genesis");
+            ctrl.register_lane("worker-a", LaneRole::Worker).expect("worker-a");
+            ctrl.register_lane("worker-b", LaneRole::Worker).expect("worker-b");
+            ctrl.register_lane("integrator", LaneRole::Integrator)
+                .expect("integrator");
+            ctrl.acquire_leases(
+                "worker-a",
+                LeaseMode::Write,
+                vec![LeaseScope::dir("src/auth").expect("scope")],
+            )
+            .expect("lease a");
+            ctrl.acquire_leases(
+                "worker-b",
+                LeaseMode::Write,
+                vec![LeaseScope::file("src/lib.rs").expect("scope")],
+            )
+            .expect("lease b");
+            ctrl.post_bulletin("worker-a", "handoff", "schema fixture bulletin entry")
+                .expect("bulletin");
+            let pid = ctrl
+                .stage_proposal("worker-a", &schema_c0, &["src/auth/mod.rs"])
+                .expect("proposal");
+            ctrl.commit_target_branch("integrator", pid, &schema_c0, &schema_c1, true)
+                .expect("commit");
+            ctrl.save_verified_atomic(&state_path).expect("save campaign");
+        }
         for name in [
             "gitpulse_worktree_inbox",
             "gitpulse_worktree_radar",
+            "gitpulse_campaign_audit",
             "gitpulse_inbox_read",
         ] {
             let tool = tools()
@@ -6501,6 +6682,282 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn campaign_audit_tool_and_resource_verify_leases_bulletin_and_sole_committer_integrator() {
+        use crate::engine::campaign_formal::{
+            resolve_campaign_state_path, CampaignController, LaneRole, LeaseMode, LeaseScope,
+        };
+        let repo_dir = crate::test_support::git_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // 1. Uninitialized repo over MCP wire: creates nothing on disk and never claims verified.
+        let absent = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": repo_path }
+            }),
+        );
+        assert_eq!(absent["isError"], false, "{absent}");
+        let absent_sc = &absent["structuredContent"];
+        assert_eq!(absent_sc["ok"], true, "{absent_sc}");
+        assert_eq!(absent_sc["initialized"], false, "{absent_sc}");
+        assert_eq!(absent_sc["invariants_verified"], false, "{absent_sc}");
+        assert_eq!(absent_sc["sole_committer_enforced"], false, "{absent_sc}");
+        let (_, state_path) = resolve_campaign_state_path(repo_path).expect("state path");
+        assert!(!state_path.exists(), "audit must not create campaign.json");
+
+        // 2. Seed verified multi-lane campaign with single-writer leases, BULLETIN, and sole-committer Integrator.
+        crate::test_support::git_in(
+            repo_dir.path(),
+            &["commit", "--allow-empty", "-m", "base 0"],
+        );
+        let oid_base_0 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
+            .expect("base 0")
+            .trim()
+            .to_string();
+        crate::test_support::git_in(
+            repo_dir.path(),
+            &["commit", "--allow-empty", "-m", "base 1"],
+        );
+        let oid_base_1 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
+            .expect("base 1")
+            .trim()
+            .to_string();
+        let mut ctrl = CampaignController::try_new(&oid_base_0).expect("genesis");
+        ctrl.register_lane("worker-alpha", LaneRole::Worker).expect("alpha");
+        ctrl.register_lane("worker-beta", LaneRole::Worker).expect("beta");
+        ctrl.register_lane("integrator-main", LaneRole::Integrator)
+            .expect("integrator");
+        ctrl.acquire_leases(
+            "worker-alpha",
+            LeaseMode::Write,
+            vec![LeaseScope::dir("src/engine").expect("dir")],
+        )
+        .expect("lease alpha");
+        ctrl.acquire_leases(
+            "worker-beta",
+            LeaseMode::Write,
+            vec![LeaseScope::file("src/mcp/mod.rs").expect("file")],
+        )
+        .expect("lease beta");
+        ctrl.post_bulletin("worker-alpha", "handoff", "single-writer lease acquired")
+            .expect("bulletin");
+        let prop_id = ctrl
+            .stage_proposal("worker-alpha", &oid_base_0, &["src/engine/campaign_formal.rs"])
+            .expect("proposal");
+        ctrl.commit_target_branch("integrator-main", prop_id, &oid_base_0, &oid_base_1, true)
+            .expect("integrate");
+        ctrl.save_verified_atomic(&state_path).expect("persist");
+
+        let verified = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": repo_path }
+            }),
+        );
+        let sc = &verified["structuredContent"];
+        assert_eq!(sc["ok"], true, "{sc}");
+        assert_eq!(sc["initialized"], true, "{sc}");
+        assert_eq!(sc["invariants_verified"], true, "{sc}");
+        assert_eq!(sc["sole_committer_enforced"], true, "{sc}");
+        assert_eq!(sc["target_oid"], oid_base_1, "{sc}");
+        assert_eq!(sc["head_oid"], oid_base_1, "{sc}");
+        assert_eq!(sc["head_matches_target"], true, "{sc}");
+        assert_eq!(sc["active_leases"].as_array().unwrap().len(), 1, "{sc}");
+        assert_eq!(sc["active_leases"][0]["lane"], "worker-beta", "{sc}");
+        assert_eq!(sc["bulletin_total"], 2, "{sc}");
+        assert_eq!(
+            sc["target_commits"][0]["committer_role"],
+            "Integrator",
+            "{sc}"
+        );
+
+        // Resource template `gitpulse://campaign{+repo_path}` serves the identical verified document.
+        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        let res = modern_call("resources/read", json!({ "uri": uri }));
+        let res_doc: Value =
+            serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
+        assert_eq!(res_doc["invariants_verified"], true, "{res_doc}");
+        assert_eq!(res_doc["target_oid"], oid_base_1, "{res_doc}");
+        assert_eq!(res_doc["head_oid"], oid_base_1, "{res_doc}");
+        assert_eq!(res_doc["head_matches_target"], true, "{res_doc}");
+
+        // 3. Corrupt BULLETIN hash chain on disk -> both tool and resource fail closed!
+        let raw = std::fs::read_to_string(&state_path).expect("read");
+        std::fs::write(
+            &state_path,
+            raw.replace("single-writer lease acquired", "TAMPERED"),
+        )
+        .expect("tamper");
+        let corrupted = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": repo_path }
+            }),
+        );
+        let csc = &corrupted["structuredContent"];
+        assert_eq!(csc["ok"], false, "{csc}");
+        assert_eq!(csc["invariants_verified"], false, "{csc}");
+        assert!(
+            csc["verification_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("BulletinHashChainBroken"),
+            "{csc}"
+        );
+    }
+
+    #[test]
+    fn campaign_audit_convicts_rogue_direct_commit_and_forged_unanchored_oids() {
+        use crate::engine::campaign_formal::{
+            resolve_campaign_state_path, CampaignController, LaneRole, LeaseMode, LeaseScope,
+        };
+        let repo_dir = crate::test_support::git_repo();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        crate::test_support::git_in(
+            repo_dir.path(),
+            &["commit", "--allow-empty", "-m", "genesis"],
+        );
+        let c0 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
+            .expect("c0")
+            .trim()
+            .to_string();
+
+        let src_dir = repo_dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).expect("mkdir src");
+        std::fs::write(src_dir.join("lib.rs"), "pub fn v() -> u32 { 1 }\n").expect("write lib.rs");
+        crate::test_support::git_in(repo_dir.path(), &["add", "src/lib.rs"]);
+        crate::test_support::git_in(repo_dir.path(), &["commit", "-m", "integrated commit"]);
+        let c1 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
+            .expect("c1")
+            .trim()
+            .to_string();
+
+        let (_, state_path) = resolve_campaign_state_path(repo_path).expect("state path");
+        let mut ctrl = CampaignController::try_new(&c0).expect("genesis");
+        ctrl.register_lane("worker-alpha", LaneRole::Worker)
+            .expect("worker-alpha");
+        ctrl.register_lane("integrator-main", LaneRole::Integrator)
+            .expect("integrator-main");
+        ctrl.acquire_leases(
+            "worker-alpha",
+            LeaseMode::Write,
+            vec![LeaseScope::file("src/lib.rs").expect("file")],
+        )
+        .expect("lease");
+        let prop_id = ctrl
+            .stage_proposal("worker-alpha", &c0, &["src/lib.rs"])
+            .expect("proposal");
+        ctrl.commit_target_branch("integrator-main", prop_id, &c0, &c1, true)
+            .expect("integrate");
+        ctrl.save_verified_atomic(&state_path).expect("persist");
+
+        // 1. Clean ODB-anchored campaign matches primary worktree HEAD.
+        let clean = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": repo_path }
+            }),
+        );
+        let clean_sc = &clean["structuredContent"];
+        assert_eq!(clean_sc["ok"], true, "{clean_sc}");
+        assert_eq!(clean_sc["invariants_verified"], true, "{clean_sc}");
+        assert_eq!(clean_sc["sole_committer_enforced"], true, "{clean_sc}");
+        assert_eq!(clean_sc["head_oid"], c1, "{clean_sc}");
+        assert_eq!(clean_sc["head_matches_target"], true, "{clean_sc}");
+
+        // 2. Linked worker worktree advancing its own feature branch does NOT invalidate
+        // the primary target worktree's sole-committer authority.
+        let wt_parent = tempfile::tempdir().expect("wt parent");
+        let wt_path_buf = wt_parent.path().join("wt-worker-alpha");
+        let wt_path = wt_path_buf.to_str().unwrap();
+        crate::test_support::git_in(
+            repo_dir.path(),
+            &["worktree", "add", "-b", "feat/worker-alpha", wt_path],
+        );
+        crate::test_support::trust_repo(&wt_path_buf);
+        crate::test_support::git_in(
+            &wt_path_buf,
+            &["commit", "--allow-empty", "-m", "worker local progress"],
+        );
+        let from_worker = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": wt_path }
+            }),
+        );
+        let worker_sc = &from_worker["structuredContent"];
+        assert_eq!(worker_sc["ok"], true, "{worker_sc}");
+        assert_eq!(worker_sc["head_oid"], c1, "{worker_sc}");
+        assert_eq!(worker_sc["head_matches_target"], true, "{worker_sc}");
+
+        // 3. Rogue direct commit on the primary target worktree bypassing Integrator MUST fail closed!
+        crate::test_support::git_in(
+            repo_dir.path(),
+            &["commit", "--allow-empty", "-m", "rogue direct commit on main"],
+        );
+        let c2 = crate::engine::git_cli::git_text(repo_dir.path(), &["rev-parse", "HEAD"])
+            .expect("c2")
+            .trim()
+            .to_string();
+
+        for probe_repo in [repo_path, wt_path] {
+            let rogue = modern_call(
+                "tools/call",
+                json!({
+                    "name": "gitpulse_campaign_audit",
+                    "arguments": { "repo_path": probe_repo }
+                }),
+            );
+            let rsc = &rogue["structuredContent"];
+            assert_eq!(rsc["ok"], false, "rogue commit bypassed audit ({probe_repo}): {rsc}");
+            assert_eq!(rsc["invariants_verified"], false, "{rsc}");
+            assert_eq!(rsc["sole_committer_enforced"], false, "{rsc}");
+            assert_eq!(rsc["head_oid"], c2, "{rsc}");
+            assert_eq!(rsc["head_matches_target"], false, "{rsc}");
+            assert!(
+                !rsc["verification_error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{rsc}"
+            );
+        }
+
+        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        let res = modern_call("resources/read", json!({ "uri": uri }));
+        let res_doc: Value =
+            serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
+        assert_eq!(res_doc["ok"], false, "{res_doc}");
+        assert_eq!(res_doc["sole_committer_enforced"], false, "{res_doc}");
+        assert_eq!(res_doc["head_matches_target"], false, "{res_doc}");
+
+        // 4. Forged non-ODB genesis OID written directly to campaign.json MUST fail closed!
+        let forged_ctrl = CampaignController::try_new("oid-forged-unanchored").expect("forged");
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&forged_ctrl).expect("serialize forged"),
+        )
+        .expect("write forged");
+        let forged = modern_call(
+            "tools/call",
+            json!({
+                "name": "gitpulse_campaign_audit",
+                "arguments": { "repo_path": repo_path }
+            }),
+        );
+        let fsc = &forged["structuredContent"];
+        assert_eq!(fsc["ok"], false, "{fsc}");
+        assert_eq!(fsc["invariants_verified"], false, "{fsc}");
+        assert_eq!(fsc["sole_committer_enforced"], false, "{fsc}");
     }
 
     #[test]
@@ -8974,6 +9431,7 @@ mod tests {
             ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
             ("gitpulse_kickoff_agent", KickoffAgentArgs),
             ("gitpulse_worktree_radar", RepoArgs),
+            ("gitpulse_campaign_audit", CampaignAuditArgs),
             ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
             ("gitpulse_codeintel_search", SearchArgs),
             ("gitpulse_codeintel_impact", CodeintelImpactArgs),
@@ -9092,6 +9550,7 @@ mod tests {
                 ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
                 ("gitpulse_kickoff_agent", KickoffAgentArgs),
                 ("gitpulse_worktree_radar", RepoArgs),
+                ("gitpulse_campaign_audit", CampaignAuditArgs),
                 ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
                 ("gitpulse_codeintel_search", SearchArgs),
                 ("gitpulse_codeintel_impact", CodeintelImpactArgs),

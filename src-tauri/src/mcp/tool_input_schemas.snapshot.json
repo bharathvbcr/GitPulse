@@ -683,6 +683,33 @@
     ],
     "type": "object"
   },
+  "gitpulse_campaign_audit": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "description": "Maximum BULLETIN entries to return (default 100, max 256)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Return BULLETIN entries with seq strictly greater than since_seq (default 0)",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_change_context": {
     "additionalProperties": false,
     "properties": {
