@@ -8983,7 +8983,11 @@ mod tests {
         init_test_repo(&repo);
         let mbox_dir = tempfile::tempdir().unwrap();
         let mailbox = crate::agent_mailbox::Mailbox::new(
-            mbox_dir.path().canonicalize().unwrap().join("agent-mailbox"),
+            mbox_dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("agent-mailbox"),
         );
         let conv_id = "11111111-2222-3333-4444-555555555555";
         let now = std::time::SystemTime::now();
@@ -9020,10 +9024,9 @@ mod tests {
         let _pid = crate::sysload::procscan::tests::fixture_pid(&pidfile);
 
         // 1. Empty mailbox -> Ok(false)
-        assert_eq!(
-            deliver_peer_wake_with_mailbox(&state, &mailbox, &agy_session.id, conv_id, now)
-                .unwrap(),
-            false
+        assert!(
+            !deliver_peer_wake_with_mailbox(&state, &mailbox, &agy_session.id, conv_id, now)
+                .unwrap()
         );
 
         // Deposit one peer envelope.
@@ -9078,10 +9081,9 @@ mod tests {
         );
 
         // 3. Live `agy` foreground -> Ok(true) and envelope STILL pending for PreInvocation!
-        assert_eq!(
+        assert!(
             deliver_peer_wake_with_mailbox(&state, &mailbox, &agy_session.id, conv_id, now)
-                .unwrap(),
-            true
+                .unwrap()
         );
         assert!(
             mailbox.has_pending(conv_id, now).unwrap(),

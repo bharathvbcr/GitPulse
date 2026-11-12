@@ -2031,7 +2031,10 @@ fn agent_deliver_echoes_request_id_and_caps_concurrent_handlers_at_four() {
         let release = release.clone();
         let entered = entered.clone();
         owner.attach_agent_deliver(Arc::new(move |request| {
-            let Request::AgentDeliver { peer_id, msg_id, .. } = request else {
+            let Request::AgentDeliver {
+                peer_id, msg_id, ..
+            } = request
+            else {
                 return Err("unexpected request".into());
             };
             entered.fetch_add(1, Ordering::AcqRel);

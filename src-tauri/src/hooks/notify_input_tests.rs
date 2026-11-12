@@ -28,8 +28,11 @@ fn the_walk_reads_what_a_whole_parse_reads() {
         let value = match field {
             "tool_input" => json!({"command": "ls", "file_path": "/a/b", "old_string": "q"}),
             "workspace_roots" | "workspaceRoots" | "workspacePaths" => json!(["/ws/one"]),
-            "toolCall" => json!({"id": "tc-1", "name": "run_command", "args": {"CommandLine": "ls"}}),
+            "toolCall" => {
+                json!({"id": "tc-1", "name": "run_command", "args": {"CommandLine": "ls"}})
+            }
             "fullyIdle" => json!(true),
+            "invocationNum" => json!(2),
             "cursor_version" => json!("1.2.3"),
             _ => json!(format!("v-{field}")),
         };

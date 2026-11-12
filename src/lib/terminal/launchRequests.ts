@@ -36,16 +36,17 @@ export function agentPromptArgs(launcher: SessionKind, prompt?: string): string[
 }
 
 /**
- * The arguments that pick a Claude Code conversation back up, optionally with a
- * first prompt: `claude --resume <id> -- <prompt>`. `claude [options] [prompt]`
- * takes the prompt positionally (`claude --help`), and `--` is the separator
- * `agentPromptArgs` already uses for every initial prompt, so the text is one
- * argument whatever it looks like — a flag, a shell word, a settings object.
- * Nothing here goes through a shell. The prompt is held to the same ceiling as
- * an initial prompt; `sessionId` must be the canonical form Claude Code takes.
+ * The arguments that pick a Claude Code or Antigravity conversation back up,
+ * optionally with a first prompt: `claude --resume <id> -- <prompt>` or
+ * `agy --conversation <id> --prompt-interactive <prompt>`. Nothing here goes
+ * through a shell. The prompt is held to the same ceiling as an initial prompt;
+ * `sessionId` must be a valid canonical session UUID.
  */
-export function resumeArgs(sessionId: string, prompt?: string): string[] {
+export function resumeArgs(sessionId: string, prompt?: string, provider: "claude" | "agy" = "claude"): string[] {
   if (!isSessionId(sessionId)) throw new Error("Only a Claude Code conversation with a valid session id can be resumed.");
+  if (provider === "agy") {
+    return ["--conversation", sessionId, ...(agentPromptArgs("agy", prompt) ?? [])];
+  }
   return ["--resume", sessionId, ...(agentPromptArgs("claude", prompt) ?? [])];
 }
 

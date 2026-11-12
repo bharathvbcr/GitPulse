@@ -595,7 +595,8 @@ export function taskRun(value: unknown): TaskRun {
   const turn = raw.provider_turn_id === undefined ? undefined : nullableText(raw.provider_turn_id);
   if (providerState && ["ready", "running", "completed"].includes(providerState) && !thread?.trim()) return invalid();
   if (providerState && ["running", "completed"].includes(providerState) && !turn?.trim()) return invalid();
-  if ((thread !== undefined || turn !== undefined) && (!providerState || !thread?.trim())) return invalid();
+  if (thread !== undefined && (!thread.trim() || (kind === "external_terminal" && state === "prepared") || (kind === "managed" && !providerState))) return invalid();
+  if (turn !== undefined && (!providerState || !thread?.trim())) return invalid();
   const named = asAgentProvider(provider);
   if (!state || !permission || !named) return invalid();
   const source = integer(raw.source_revision);
@@ -786,6 +787,8 @@ export interface AgentSendPreview {
   listening?: boolean;
   /** Managed: Manvi's reading of the run, `parked` (between turns) or `running`. */
   managedState?: "parked" | "running";
+  /** Resume: saved conversation provider (`"claude"` | `"agy"`), when reported by the host. */
+  resumeProvider?: ResumableProvider;
 }
 /**
  * What a confirmed send did. `sent` is a tri-state. `true` is a message that left GitPulse: `queued` is in the
@@ -813,7 +816,8 @@ function sendPreview(raw: Record<string, unknown>): AgentSendPreview {
   const reason = text(raw.reason);
   if (raw.ok !== true || !route || !reason.trim()) return invalid();
   const managed = raw.managed_state === undefined ? undefined : (raw.managed_state === "parked" || raw.managed_state === "running" ? raw.managed_state : invalid());
-  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}) };
+  const resumeProvider = raw.provider === undefined ? undefined : (RESUMABLE_PROVIDERS.find((p) => p === raw.provider) ?? invalid());
+  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}), ...(resumeProvider ? { resumeProvider } : {}) };
 }
 /** Asks which way `text` would go to the agent behind an attempt, and sends nothing. */
 export async function previewAgentMessage(runId: string, message: string, requestId: string): Promise<AgentSendPreview> {

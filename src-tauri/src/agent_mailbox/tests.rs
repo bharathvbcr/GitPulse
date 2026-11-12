@@ -747,12 +747,7 @@ fn external_waiters_are_capped_at_sixteen_and_never_starve_hosted_sessions() {
         .ensure_session(&extra_hosted, SystemTime::now())
         .unwrap();
     assert!(matches!(
-        Waiter::register_in_pool(
-            &mailbox,
-            &extra_hosted_dir,
-            &extra_hosted,
-            WaitPool::Hosted
-        ),
+        Waiter::register_in_pool(&mailbox, &extra_hosted_dir, &extra_hosted, WaitPool::Hosted),
         Err(MailboxError::Full(_))
     ));
     drop(external_held);
@@ -814,10 +809,17 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
             !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
         })
         .unwrap();
-    assert!(matches!(wait_res, EnvelopeWait::Declined(_)), "{wait_res:?}");
+    assert!(
+        matches!(wait_res, EnvelopeWait::Declined(_)),
+        "{wait_res:?}"
+    );
     // Still pending for manual / boundary inspection!
     assert_eq!(mailbox.status(SESSION, "msg-hop-max"), Delivery::Pending);
-    assert!(mailbox.mark_claimed_by_id(SESSION, "msg-hop-max", now).unwrap());
-    assert!(!mailbox.mark_claimed_by_id(SESSION, "msg-hop-max", now).unwrap());
+    assert!(mailbox
+        .mark_claimed_by_id(SESSION, "msg-hop-max", now)
+        .unwrap());
+    assert!(!mailbox
+        .mark_claimed_by_id(SESSION, "msg-hop-max", now)
+        .unwrap());
     assert_eq!(mailbox.status(SESSION, "msg-hop-max"), Delivery::Claimed);
 }

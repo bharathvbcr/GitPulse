@@ -175,6 +175,7 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
+  import { LAYERS } from "../ui/layers";
   import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
@@ -748,9 +749,7 @@
     // passes through here, gets the same ones.
     const prompt = takeResumePrompt();
     const args = resume
-      ? (kind === "agy"
-          ? ["--conversation", resume.sessionId, ...(agentPromptArgs("agy", prompt) ?? [])]
-          : resumeArgs(resume.sessionId, prompt))
+      ? resumeArgs(resume.sessionId, prompt, kind === "agy" ? "agy" : "claude")
       : agentPromptArgs(kind, initialPrompt) ?? [];
     return kind === "shell" ? {} : { program: kind, args };
   }
@@ -1937,6 +1936,7 @@
       <div
         role="status"
         data-testid="terminal-peer-inbox-pill"
+        style="z-index: {LAYERS.SCROLL_CUE}"
         class="gp-card absolute top-3 right-5 flex items-center gap-1.5 bg-surface/95 px-2.5 py-1.5 text-xs text-textPrimary shadow-lg"
       >
         <span class="truncate max-w-48">
@@ -1974,6 +1974,7 @@
            started and printed nothing. -->
       <div
         data-terminal-acknowledge
+        style="z-index: {LAYERS.MODAL}"
         class="absolute inset-2 bg-surface/95 flex flex-col items-center justify-center gap-2 px-6 text-center"
         role="alertdialog"
         aria-labelledby="gp-bypass-title-{tabId}"

@@ -142,7 +142,7 @@ fn decide() -> i32 {
     if worktree_hook {
         hooks::worktree::begin();
     }
-    let input = match hooks::read_for(&subcommand, argument.as_deref(), io::stdin()) {
+    let mut input = match hooks::read_for(&subcommand, argument.as_deref(), io::stdin()) {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
@@ -157,6 +157,10 @@ fn decide() -> i32 {
             };
         }
     };
+    let effective_host = hooks::effective_host_kind(input.host, hooks::is_antigravity_env());
+    if !input.is_cursor {
+        input.host = effective_host;
+    }
 
     if worktree_hook {
         let finished = hooks::worktree::run(&subcommand, &input);
@@ -179,7 +183,8 @@ fn decide() -> i32 {
             } else {
                 output
             };
-            if let Some(json) = output.render_for_host_kind(input.host, &input.hook_event_name) {
+            if let Some(json) = output.render_for_host_kind(effective_host, &input.hook_event_name)
+            {
                 emit(format!("{json}\n"));
             }
             0
@@ -195,7 +200,7 @@ fn decide() -> i32 {
         // One line per invocation, at the level the outcome calls for: a
         // transport this platform does not have is information, not a failure.
         Err(error) => {
-            if input.host == hooks::HostKind::Antigravity {
+            if effective_host == hooks::HostKind::Antigravity {
                 emit("{}\n".into());
             }
             let diagnostic = hooks::diagnostic(&error);

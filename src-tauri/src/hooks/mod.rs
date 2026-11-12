@@ -184,7 +184,11 @@ pub fn read_for(
     reader: impl std::io::Read + Send + 'static,
 ) -> Result<HookInput, String> {
     if matches!(subcommand, "peer-inbox" | "stop-or-notify") {
-        return read_input_within(reader, PEER_INBOX_BUDGET);
+        return notify_input::read_notify_input_within(
+            reader,
+            notify_input::MAX_READ_BYTES,
+            PEER_INBOX_BUDGET,
+        );
     }
     if subcommand != "notify" {
         return read_input(reader);
@@ -232,6 +236,18 @@ pub fn is_antigravity_env() -> bool {
         || std::env::var(AGENT_KIND_ENV).ok().as_deref() == Some("agy")
         || std::env::var_os("PLUGIN_ROOT")
             .is_some_and(|p| p.to_string_lossy().contains("gitpulse-agy"))
+}
+
+/// Promotes a default `HostKind::Claude` payload to `HostKind::Antigravity` when
+/// `gitpulse-hook` is running inside an Antigravity environment (`GITPULSE_HOST=antigravity`,
+/// `GITPULSE_AGENT_KIND=agy`, or `PLUGIN_ROOT` under `gitpulse-agy`), so empty `{}`
+/// or degraded payloads still emit `"{}"` rather than 0-byte stdout.
+pub fn effective_host_kind(host: HostKind, antigravity_env: bool) -> HostKind {
+    if host == HostKind::Claude && antigravity_env {
+        HostKind::Antigravity
+    } else {
+        host
+    }
 }
 
 /// The subset of the host's hook JSON these handlers read.
@@ -300,6 +316,10 @@ pub struct HookInput {
     pub termination_reason: String,
     /// Antigravity `Stop` payload's `fullyIdle` flag (`true` when quiescent).
     pub fully_idle: Option<bool>,
+    /// Antigravity `PreInvocation`'s 1-based step index within the current turn.
+    pub invocation_num: Option<u64>,
+    /// Transcript path (`transcript_path` or Antigravity `transcriptPath`), when provided.
+    pub transcript_path: String,
     /// `WorktreeCreate`'s `name`: the slug Claude Code would have put the
     /// worktree under (`bold-oak-a3f2`). See [`worktree`].
     pub worktree_name: String,
@@ -314,7 +334,7 @@ pub struct HookInput {
     pub discard_changes: bool,
 }
 
-fn first_non_empty<'a>(candidates: impl IntoIterator<Item = String>) -> String {
+fn first_non_empty(candidates: impl IntoIterator<Item = String>) -> String {
     candidates
         .into_iter()
         .find(|s| !s.is_empty())
@@ -369,6 +389,10 @@ impl HookInput {
             string_at(Some(value), "tool_use_id"),
             string_at(tool_call, "id"),
         ]);
+        let transcript_path = first_non_empty([
+            string_at(Some(value), "transcript_path"),
+            string_at(Some(value), "transcriptPath"),
+        ]);
         HookInput {
             host,
             hook_event_name,
@@ -395,6 +419,8 @@ impl HookInput {
             stop_hook_active: value.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
             termination_reason: string_at(Some(value), "terminationReason"),
             fully_idle: value.get("fullyIdle").and_then(Value::as_bool),
+            invocation_num: value.get("invocationNum").and_then(Value::as_u64),
+            transcript_path,
             worktree_name: string_at(Some(value), "name"),
             worktree_path: string_at(Some(value), "worktree_path"),
             discard_changes: value.get("discard_changes").and_then(Value::as_bool) == Some(true),
@@ -827,9 +853,7 @@ impl HookOutput {
                     .and_then(|s| s.additional_context.as_deref()),
                 self.system_message.as_deref(),
             ) {
-                (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
-                    Some(format!("{a}\n{b}"))
-                }
+                (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => Some(format!("{a}\n{b}")),
                 (Some(a), _) if !a.is_empty() => Some(a.to_string()),
                 (_, Some(b)) if !b.is_empty() => Some(b.to_string()),
                 _ => None,
@@ -3179,16 +3203,20 @@ fn parent_agent_process_identity() -> (Option<u32>, Option<u64>) {
 
 fn peer_provider_and_surface(input: &HookInput) -> (&'static str, &'static str) {
     let provider = match input.host {
-        HostKind::Antigravity => "antigravity",
+        HostKind::Antigravity => "agy",
         HostKind::Cursor => "cursor",
         HostKind::Claude => "claude",
     };
+    let is_agy_ide_transcript = !input.transcript_path.contains("antigravity-cli")
+        && (input.transcript_path.contains("/antigravity/")
+            || input.transcript_path.contains("\\antigravity\\")
+            || input.transcript_path.contains("/antigravity-ide/"));
     let surface = if session_env().is_some() {
-        "hosted_terminal"
+        "terminal"
     } else if input.host == HostKind::Antigravity
-        && std::env::var_os("ANTIGRAVITY_EDITOR_APP_ROOT").is_some()
+        && (std::env::var_os("ANTIGRAVITY_EDITOR_APP_ROOT").is_some() || is_agy_ide_transcript)
     {
-        "antigravity_ide"
+        "ide"
     } else {
         "external_cli"
     };
@@ -3222,7 +3250,8 @@ fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<
             auto_wake: None,
             pid,
             proc_start_ns,
-            transcript_path: None,
+            transcript_path: (!input.transcript_path.is_empty())
+                .then(|| input.transcript_path.clone()),
         },
     )
     .ok()?;
@@ -3245,17 +3274,47 @@ fn trusted_hook_root(input: &HookInput) -> Option<PathBuf> {
         .filter(|root| crate::repository_trust::require(root).is_ok())
 }
 
+/// Advances per-turn epoch and continuation state on hook boundaries, returning
+/// `true` iff this event begins a fresh user turn (so `prompt_submitted` does
+/// not clear `dirtyPrompt` on mid-turn `PreInvocation(invocationNum > 1)` or
+/// `Stop:continue` continuations).
+fn advance_turn_boundary(mailbox: &crate::agent_mailbox::Mailbox, input: &HookInput) -> bool {
+    if crate::agent_mailbox::session_key(&input.session_id).is_err() {
+        return matches!(
+            input.hook_event_name.as_str(),
+            "SessionStart" | "UserPromptSubmit"
+        );
+    }
+    match input.hook_event_name.as_str() {
+        "SessionStart" => {
+            let _ = mailbox.clear_stop_continue(&input.session_id);
+            true
+        }
+        "UserPromptSubmit" => {
+            let _ = mailbox.bump_turn_epoch(&input.session_id);
+            true
+        }
+        "PreInvocation" => {
+            if input.invocation_num.unwrap_or(1) > 1 {
+                let _ = mailbox.clear_stop_continue(&input.session_id);
+                false
+            } else {
+                mailbox.begin_user_turn(&input.session_id).unwrap_or(true)
+            }
+        }
+        _ => false,
+    }
+}
+
 fn peer_inbox_in_default(input: &HookInput) -> HookOutput {
     if trusted_hook_root(input).is_none() {
         return HookOutput::silent();
     }
-    if input.host == HostKind::Antigravity
-        && matches!(
-            input.hook_event_name.as_str(),
-            "SessionStart" | "PreInvocation"
-        )
-        && session_env().is_some()
-    {
+    let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() else {
+        return HookOutput::silent();
+    };
+    let (output, fresh_user_turn) = peer_inbox_in_with_boundary(&mailbox, input);
+    if input.host == HostKind::Antigravity && session_env().is_some() && fresh_user_turn {
         let mut active = input.clone();
         active.fully_idle = Some(false);
         let _ = run_notify_within(
@@ -3266,42 +3325,41 @@ fn peer_inbox_in_default(input: &HookInput) -> HookOutput {
             Some(Duration::from_millis(300)),
         );
     }
-    let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() else {
-        return HookOutput::silent();
-    };
-    peer_inbox_in(&mailbox, input)
+    output
 }
 
+#[cfg(test)]
 pub(crate) fn peer_inbox_in(
     mailbox: &crate::agent_mailbox::Mailbox,
     input: &HookInput,
 ) -> HookOutput {
+    peer_inbox_in_with_boundary(mailbox, input).0
+}
+
+fn peer_inbox_in_with_boundary(
+    mailbox: &crate::agent_mailbox::Mailbox,
+    input: &HookInput,
+) -> (HookOutput, bool) {
     let Some(root) = (!input.cwd.is_empty())
         .then(|| find_git_root(Path::new(&input.cwd)))
         .flatten()
         .filter(|root| crate::repository_trust::require(root).is_ok())
     else {
-        return HookOutput::silent();
+        return (HookOutput::silent(), false);
     };
 
     let reader_id = upsert_hook_peer(&root, input, "working");
+    let fresh_user_turn = advance_turn_boundary(mailbox, input);
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
-        return HookOutput::silent();
-    }
-    if matches!(
-        input.hook_event_name.as_str(),
-        "UserPromptSubmit" | "PreInvocation"
-    ) {
-        let _ = mailbox.bump_turn_epoch(&input.session_id);
+        return (HookOutput::silent(), fresh_user_turn);
     }
 
-    let Ok(claimed) =
-        mailbox.try_claim_batch(&input.session_id, 8, std::time::SystemTime::now())
+    let Ok(claimed) = mailbox.try_claim_batch(&input.session_id, 8, std::time::SystemTime::now())
     else {
-        return HookOutput::silent();
+        return (HookOutput::silent(), fresh_user_turn);
     };
     if claimed.is_empty() {
-        return HookOutput::silent();
+        return (HookOutput::silent(), fresh_user_turn);
     }
 
     let fallback_reader = format!(
@@ -3324,34 +3382,36 @@ pub(crate) fn peer_inbox_in(
     }
     let combined = parts.join("\n");
 
-    let hook_event_name = if input.host == HostKind::Antigravity
-        && input.hook_event_name == "PostInvocation"
-    {
-        let under_cap = mailbox
-            .continuation_count(&input.session_id)
-            .unwrap_or(u32::MAX)
-            < crate::agent_mailbox::MAX_CONTINUATIONS;
-        if any_wakeable && under_cap {
-            let _ = mailbox.bump_continuation(&input.session_id);
-            "PostInvocation:force_continue".to_string()
+    let hook_event_name =
+        if input.host == HostKind::Antigravity && input.hook_event_name == "PostInvocation" {
+            let under_cap = mailbox
+                .continuation_count(&input.session_id)
+                .unwrap_or(u32::MAX)
+                < crate::agent_mailbox::MAX_CONTINUATIONS;
+            if any_wakeable && under_cap {
+                let _ = mailbox.bump_continuation(&input.session_id);
+                "PostInvocation:force_continue".to_string()
+            } else {
+                "PostInvocation".to_string()
+            }
+        } else if input.hook_event_name.is_empty() {
+            "PostToolUse".to_string()
         } else {
-            "PostInvocation".to_string()
-        }
-    } else if input.hook_event_name.is_empty() {
-        "PostToolUse".to_string()
-    } else {
-        input.hook_event_name.clone()
-    };
+            input.hook_event_name.clone()
+        };
 
-    HookOutput {
-        hook_specific_output: Some(HookSpecificOutput {
-            hook_event_name,
-            permission_decision: None,
-            permission_decision_reason: None,
-            additional_context: Some(combined),
-        }),
-        system_message: None,
-    }
+    (
+        HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name,
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(combined),
+            }),
+            system_message: None,
+        },
+        fresh_user_turn,
+    )
 }
 
 /// Antigravity `Stop` handler: checks the narrow window between `PostInvocation`
@@ -3399,7 +3459,7 @@ pub(crate) fn stop_continue_in(
             deliver::wake_filter,
         ) {
             if !claimed.is_empty() {
-                let _ = mailbox.bump_continuation(&input.session_id);
+                let _ = mailbox.bump_continuation_from_stop(&input.session_id);
                 let reader_id = upsert_hook_peer(&root, input, "working");
                 let fallback_reader = format!(
                     "{}:{}",
@@ -3425,6 +3485,9 @@ pub(crate) fn stop_continue_in(
                 });
             }
         }
+    }
+    if crate::agent_mailbox::session_key(&input.session_id).is_ok() {
+        let _ = mailbox.clear_stop_continue(&input.session_id);
     }
     let _ = upsert_hook_peer(&root, input, "idle");
     None
@@ -5077,6 +5140,8 @@ mod tests {
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            ide_hosted: false,
+            terminal_session_id: None,
         }
     }
 
@@ -7741,6 +7806,8 @@ done
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            ide_hosted: false,
+            terminal_session_id: None,
         };
         let kind = |kind: &str, ok, sessions| LiveKindStatus {
             kind: kind.into(),
@@ -9724,7 +9791,9 @@ done
             assert_eq!(parsed.file_path, "/tmp/ws/src/main.rs");
             assert_eq!(
                 parsed.incoming,
-                Some(insights::IncomingEdit::Replacing(vec!["fn old() {}".into()]))
+                Some(insights::IncomingEdit::Replacing(
+                    vec!["fn old() {}".into()]
+                ))
             );
 
             // Clean pass renders "{}" (never empty, never auto-approving "allow").
@@ -9918,10 +9987,7 @@ done
             .unwrap();
             assert_eq!(rendered["decision"], "continue");
             assert!(
-                rendered["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains(&large_body),
+                rendered["reason"].as_str().unwrap().contains(&large_body),
                 "hydrated full >6KiB body from agent_bus"
             );
 
@@ -9996,6 +10062,244 @@ done
                 deliver::run(&stop_trusted),
                 Err(HookError::Wake(_))
             ));
+        }
+
+        #[test]
+        fn multistep_pre_invocation_preserves_continuation_cap_streams_large_stdin_and_records_canonical_peer(
+        ) {
+            let serial = crate::test_support::env::env_serial();
+            let (_dir, home, repo) = init_trusted_repo();
+            let _env = crate::test_support::env::bind_env(&serial)
+                .set("HOME", &home)
+                .set("XDG_CONFIG_HOME", home.join(".config"))
+                .set(
+                    "ANTIGRAVITY_EDITOR_APP_ROOT",
+                    "/Applications/Antigravity.app",
+                )
+                .remove(crate::alerts::bridge::SESSION_ENV);
+
+            let mailbox = Mailbox::at_default().unwrap();
+            let repo_str = repo.to_string_lossy().into_owned();
+
+            // 1. `read_for("peer-inbox", ...)` must stream >4 MiB tool outputs (up to 16 MiB)
+            // instead of failing at the 4 MiB whole-payload ceiling, and extract `transcriptPath`.
+            let huge = json!({
+                "hookEventName": "PostInvocation",
+                "conversationId": AGY_SESSION,
+                "cwd": repo_str,
+                "transcriptPath": "/tmp/agy-ide-transcript.pb",
+                "toolCall": { "id": "tc-big", "name": "run_command", "args": { "CommandLine": "cat huge" } },
+                "toolOutput": "x".repeat(5 * 1024 * 1024),
+            })
+            .to_string();
+            assert!(huge.len() > MAX_INPUT_BYTES);
+            let parsed_big = read_for("peer-inbox", None, std::io::Cursor::new(huge.into_bytes()))
+                .expect("peer-inbox must stream >4 MiB tool payloads via notify_input");
+            assert_eq!(parsed_big.host, HostKind::Antigravity);
+            assert_eq!(parsed_big.session_id, AGY_SESSION);
+
+            // 2. Multi-step Antigravity turn: PreInvocation(1) -> PostInvocation(#1) ->
+            // PreInvocation(2) -> PostInvocation(#2) -> Stop:continue(#3) ->
+            // PreInvocation(1, stop-continued) -> PostInvocation(#4 MUST NOT force_continue!).
+            let pre_step = |n: u64| -> HookInput {
+                parse_input(
+                    &json!({
+                        "hookEventName": "PreInvocation",
+                        "conversationId": AGY_SESSION,
+                        "cwd": repo_str,
+                        "invocationNum": n,
+                        "transcriptPath": "/tmp/agy-ide-transcript.pb",
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+            };
+            let post_step = || -> HookInput {
+                parse_input(
+                    &json!({
+                        "hookEventName": "PostInvocation",
+                        "conversationId": AGY_SESSION,
+                        "cwd": repo_str,
+                        "transcriptPath": "/tmp/agy-ide-transcript.pb",
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+            };
+            let stop_step = || -> HookInput {
+                parse_input(
+                    &json!({
+                        "hookEventName": "Stop",
+                        "conversationId": AGY_SESSION,
+                        "cwd": repo_str,
+                        "terminationReason": "NO_TOOL_CALL",
+                        "fullyIdle": true,
+                        "transcriptPath": "/tmp/agy-ide-transcript.pb",
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+            };
+
+            // User starts fresh turn: invocationNum = 1.
+            assert!(peer_inbox_in(&mailbox, &pre_step(1)).is_silent());
+
+            // Check canonical peer record written by `upsert_hook_peer`:
+            let peers = crate::engine::agent_bus::list_reconciled_peers(&repo_str).unwrap();
+            let ide_peer = peers
+                .iter()
+                .find(|p| p.record.provider_session_id.as_deref() == Some(AGY_SESSION))
+                .expect("hook registered peer");
+            assert_eq!(ide_peer.record.provider, "agy");
+            assert_eq!(ide_peer.record.surface, "ide");
+            assert_eq!(
+                ide_peer.record.transcript_path.as_deref(),
+                Some("/tmp/agy-ide-transcript.pb")
+            );
+
+            let deposit_peer = |id: &str, body: &str, hop: u32| {
+                mailbox
+                    .deposit_with_provenance(
+                        AGY_SESSION,
+                        id,
+                        body,
+                        EnvelopeProvenance::PeerAgent {
+                            msg_id: id.into(),
+                            from_peer: "claude:lead".into(),
+                            provider: "claude".into(),
+                            branch: "main".into(),
+                            thread_key: "a2a".into(),
+                            hop,
+                            max_hops: 6,
+                            truncated_in_bus: false,
+                            repo_root: repo_str.clone(),
+                        },
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+            };
+
+            // Continuation #1 via PostInvocation.
+            deposit_peer("m-cont-1", "step 1 peer msg", 1);
+            let out1 = peer_inbox_in(&mailbox, &post_step());
+            let j1: Value = serde_json::from_str(
+                &out1
+                    .render_for_host_kind(HostKind::Antigravity, "PostInvocation")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(j1["terminationBehavior"], "force_continue");
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 1);
+
+            // Next model step within SAME turn (`invocationNum: 2`) MUST NOT reset continuations!
+            assert!(peer_inbox_in(&mailbox, &pre_step(2)).is_silent());
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 1);
+
+            // Continuation #2 via PostInvocation.
+            deposit_peer("m-cont-2", "step 2 peer msg", 2);
+            let out2 = peer_inbox_in(&mailbox, &post_step());
+            let j2: Value = serde_json::from_str(
+                &out2
+                    .render_for_host_kind(HostKind::Antigravity, "PostInvocation")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(j2["terminationBehavior"], "force_continue");
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 2);
+
+            // Continuation #3 via Stop:continue.
+            deposit_peer("m-cont-3", "step 3 late msg", 3);
+            let out3 = stop_continue_in(&mailbox, &stop_step()).expect("3rd continuation allowed");
+            let j3: Value = serde_json::from_str(
+                &out3
+                    .render_for_host_kind(HostKind::Antigravity, "Stop")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(j3["decision"], "continue");
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 3);
+
+            // Stop:continue triggers PreInvocation(invocationNum = 1) for the continued turn —
+            // MUST NOT reset continuations to 0!
+            assert!(peer_inbox_in(&mailbox, &pre_step(1)).is_silent());
+            assert_eq!(
+                mailbox.continuation_count(AGY_SESSION).unwrap(),
+                3,
+                "Stop:continue follow-up PreInvocation(1) must preserve continuation cap"
+            );
+
+            // 4th peer message in the same turn hits MAX_CONTINUATIONS = 3:
+            // PostInvocation still injects `injectSteps`, WITHOUT `terminationBehavior: force_continue`,
+            // and Stop returns None instead of continuing forever!
+            deposit_peer("m-cont-4", "4th msg over cap", 4);
+            let out4 = peer_inbox_in(&mailbox, &post_step());
+            let j4: Value = serde_json::from_str(
+                &out4
+                    .render_for_host_kind(HostKind::Antigravity, "PostInvocation")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(j4["injectSteps"].is_array());
+            assert!(
+                j4.get("terminationBehavior").is_none(),
+                "4th continuation must NOT force_continue: {j4}"
+            );
+
+            deposit_peer("m-cont-5", "5th msg at stop", 5);
+            assert!(
+                stop_continue_in(&mailbox, &stop_step()).is_none(),
+                "Stop must stop at MAX_CONTINUATIONS = 3"
+            );
+
+            // Now a genuine fresh user turn (`PreInvocation(1)` after normal Stop) resets continuations to 0!
+            let _ = peer_inbox_in(&mailbox, &pre_step(1));
+            assert_eq!(mailbox.continuation_count(AGY_SESSION).unwrap(), 0);
+        }
+
+        #[test]
+        fn gitpulse_hook_binary_emits_json_object_under_antigravity_env_on_empty_payload() {
+            use crate::procguard::LockedSpawn;
+            let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("debug")
+                .join("gitpulse-hook");
+            if !bin.exists() {
+                let status = std::process::Command::new("cargo")
+                    .args([
+                        "build",
+                        "--manifest-path",
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+                        "--bin",
+                        "gitpulse-hook",
+                    ])
+                    .status_locked()
+                    .expect("build gitpulse-hook");
+                assert!(status.success());
+            }
+            let mut child = std::process::Command::new(&bin)
+                .arg("peer-inbox")
+                .env("GITPULSE_HOST", "antigravity")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn_locked()
+                .expect("spawn gitpulse-hook");
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"{}")
+                    .expect("write {} stdin");
+            }
+            let output = child.wait_with_output().expect("wait gitpulse-hook");
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "{}\n",
+                "Antigravity hook must never emit 0-byte stdout under GITPULSE_HOST=antigravity"
+            );
         }
     }
 }

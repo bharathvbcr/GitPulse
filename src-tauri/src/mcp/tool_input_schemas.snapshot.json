@@ -723,10 +723,11 @@
         "type": "boolean"
       },
       "provider": {
-        "description": "Optional provider filter ('claude', 'agy', or 'codex')",
+        "description": "Optional provider filter ('claude', 'agy', 'antigravity', or 'codex')",
         "enum": [
           "claude",
           "agy",
+          "antigravity",
           "codex"
         ],
         "maxLength": 32,
@@ -784,10 +785,11 @@
         "type": "integer"
       },
       "provider": {
-        "description": "Agent runtime provider ('claude', 'agy', or 'codex'; inferred from existing session when omitted)",
+        "description": "Agent runtime provider ('claude', 'agy', 'antigravity', or 'codex'; inferred from existing session when omitted)",
         "enum": [
           "claude",
           "agy",
+          "antigravity",
           "codex"
         ],
         "maxLength": 32,

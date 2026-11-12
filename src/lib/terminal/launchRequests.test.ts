@@ -10,13 +10,16 @@ describe("resumeArgs", () => {
 
   it("is the plain resume with no prompt, exactly as before", () => {
     expect(resumeArgs(ID)).toEqual(["--resume", ID]);
+    expect(resumeArgs(ID, undefined, "agy")).toEqual(["--conversation", ID]);
   });
 
-  it("puts the prompt after `--` as one argument, so no flag or shell word in it is read as one", () => {
+  it("puts the prompt after `--` for Claude Code and `--prompt-interactive` for Antigravity, so no flag or shell word in it is read as one", () => {
     // The real CLI form: `claude [options] [prompt]` (`claude --help`), and the
-    // `--` separator this repository already uses for every initial prompt.
+    // `--` separator this repository already uses for every initial prompt;
+    // Antigravity uses `--conversation <id> --prompt-interactive <prompt>`.
     for (const text of ["fix it", "--settings {}", "-p", "$(touch /tmp/x) `id` ; rm -rf ~", "multi\nline\ttext ✓"]) {
       expect(resumeArgs(ID, text)).toEqual(["--resume", ID, "--", text]);
+      expect(resumeArgs(ID, text, "agy")).toEqual(["--conversation", ID, "--prompt-interactive", text]);
     }
   });
 

@@ -119,7 +119,7 @@ impl Route {
                 } else {
                     "Claude Code"
                 };
-                json!({
+                let mut body = json!({
                     "route": "resume",
                     "session_id": found["session_id"],
                     "cwd": found["cwd"],
@@ -127,7 +127,11 @@ impl Route {
                     "reason": format!(
                         "This attempt has ended and {agent} saved its conversation. Sending resumes it in a new tab, in the attempt's own permission mode, with this message as its first prompt."
                     ),
-                })
+                });
+                if let Some(provider) = found.get("provider").filter(|v| v.is_string()) {
+                    body["provider"] = provider.clone();
+                }
+                body
             }
             Self::Managed {
                 state,
@@ -435,9 +439,8 @@ pub(super) fn send_with_homes(
             ),
         }
     } else {
-        let row = state.with_store(|store| {
-            query(store, "runs.get", &json!({"id": request.id}).to_string())
-        })?;
+        let row = state
+            .with_store(|store| query(store, "runs.get", &json!({"id": request.id}).to_string()))?;
         let run = &row["item"];
         let id = request.id.clone();
         let route = decide(

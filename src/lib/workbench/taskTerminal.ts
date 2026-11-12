@@ -350,6 +350,14 @@ export async function resumeTaskConversation(
   }
   const conversation = await findConversation(run.id);
   if (!conversation.resumable) return { outcome: "unavailable", reason: conversation.reason };
+  const resolvedProvider = conversation.provider ?? run.provider ?? "claude";
+  if (prompt !== undefined) {
+    try {
+      agentPromptArgs(resolvedProvider, prompt);
+    } catch (cause) {
+      return { outcome: "unavailable", reason: explainError(cause) };
+    }
+  }
   if (disposition === "show" && prompt === undefined) {
     const live = get(terminalSessions).find((record) => record.continuesRunId === run.id && record.reveal);
     if (live && (await focusTerminalSession(live)).ok) return { outcome: "opened" };
@@ -362,7 +370,7 @@ export async function resumeTaskConversation(
   const request: TaskTerminalRequest = {
     runId: run.id,
     repoPath: place.root,
-    provider: conversation.provider ?? run.provider ?? "claude",
+    provider: resolvedProvider,
     title: run.task_title,
     resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id, ...(prompt !== undefined ? { prompt } : {}) },
     ...(place.startDir ? { startDir: place.startDir } : {}),

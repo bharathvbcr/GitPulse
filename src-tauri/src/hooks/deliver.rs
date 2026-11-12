@@ -165,14 +165,7 @@ pub(crate) fn format_claimed_message(
                 }
             }
             format_peer_xml(
-                msg_id,
-                from_peer,
-                provider,
-                branch,
-                thread_key,
-                *hop,
-                *max_hops,
-                &body,
+                msg_id, from_peer, provider, branch, thread_key, *hop, *max_hops, &body,
             )
         }
     }
@@ -313,9 +306,9 @@ pub(super) fn run_in(
     }
     // Every stop waits, `stop_hook_active` or not; see the module documentation.
     match mailbox.wait_filtered(&input.session_id, wait, wake_filter) {
-        Ok(EnvelopeWait::Message(envelope)) => {
-            Err(HookError::Wake(format_claimed_message(&envelope, None, None)))
-        }
+        Ok(EnvelopeWait::Message(envelope)) => Err(HookError::Wake(format_claimed_message(
+            &envelope, None, None,
+        ))),
         Ok(EnvelopeWait::TimedOut) => Ok(HookOutput::silent()),
         Ok(EnvelopeWait::Declined(why)) => {
             log::debug!(target: "hook", "deliver did not wait: {why}");

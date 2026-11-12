@@ -333,7 +333,9 @@ impl Request {
                 if let Some(p) = prompt.as_deref() {
                     if p.trim().is_empty() || p.len() > MAX_KICKOFF_PROMPT_BYTES || p.contains('\0')
                     {
-                        return Err("deliver prompt is empty, contains NUL or exceeds 16 KiB".into());
+                        return Err(
+                            "deliver prompt is empty, contains NUL or exceeds 16 KiB".into()
+                        );
                     }
                 }
                 if let Some(tid) = task_id.as_deref() {

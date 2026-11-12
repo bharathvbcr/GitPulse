@@ -153,6 +153,14 @@ pub struct LiveSession {
     /// in the parent checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_cwd: Option<String>,
+    /// Internal classification flag from `procscan` (`true` for IDE processes,
+    /// `false` for CLI processes like `agy` / `claude`).
+    #[serde(skip)]
+    pub(crate) ide_hosted: bool,
+    /// Hosted terminal session id (`GITPULSE_SESSION_ID`), preserved even when
+    /// `GITPULSE_RUN_ID` is also set (`tree == "run:<id>"`).
+    #[serde(skip)]
+    pub(crate) terminal_session_id: Option<String>,
 }
 
 /// One session in the forest [`LiveWorktree::children`] holds.

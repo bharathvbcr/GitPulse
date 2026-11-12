@@ -180,6 +180,8 @@ fn busy_main(farm: &Farm, dirty: bool) -> live_sessions::Observation {
         session_id: Some(format!("s{pid}")),
         proc_start: None,
         registry_cwd: None,
+        ide_hosted: false,
+        terminal_session_id: None,
     };
     vec![live_sessions::KindObservation {
         kind: "claude".into(),

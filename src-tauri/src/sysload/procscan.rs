@@ -222,10 +222,7 @@ pub(crate) fn is_exec_ide_hosted(exec: &str, kind: AgentKind) -> bool {
     if !kind.is_ide_hosted() {
         return false;
     }
-    Path::new(exec)
-        .file_name()
-        .and_then(|n| n.to_str())
-        != Some("agy")
+    Path::new(exec).file_name().and_then(|n| n.to_str()) != Some("agy")
 }
 
 /// A name the kernel reports for a versioned installer binary: empty, or a
@@ -644,6 +641,7 @@ pub(crate) struct Identity {
     /// Every argument, kept only for memguard, whose flags Health shows.
     pub argv: Vec<String>,
     pub kind: Option<AgentKind>,
+    pub ide_hosted: bool,
     pub launch: Option<LaunchKey>,
     pub memguard: bool,
 }
@@ -656,6 +654,11 @@ impl Identity {
         launch: Option<LaunchKey>,
     ) -> Self {
         let kind = exec.as_deref().and_then(|e| classify_argv(e, &argv));
+        let ide_hosted = match (exec.as_deref(), kind) {
+            (Some(e), Some(k)) => is_exec_ide_hosted(e, k),
+            (_, Some(k)) => k.is_ide_hosted(),
+            _ => false,
+        };
         let memguard = name == "memguard"
             || exec
                 .as_deref()
@@ -666,6 +669,7 @@ impl Identity {
             exec,
             argv: if memguard { argv } else { Vec::new() },
             kind,
+            ide_hosted,
             launch,
             memguard,
         }
@@ -752,6 +756,10 @@ pub struct AgentSession {
     pub footprint: Reading<u64>,
     pub members: u32,
     pub unreadable_members: u32,
+    #[serde(skip)]
+    pub(crate) ide_hosted: bool,
+    #[serde(skip)]
+    pub(crate) terminal_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1307,6 +1315,8 @@ impl Scanner {
                 footprint: sum.reading(),
                 members: sum.readable + sum.unreadable,
                 unreadable_members: sum.unreadable,
+                ide_hosted: f.ident.ide_hosted,
+                terminal_session_id: f.ident.launch.as_ref().and_then(|k| k.session_id.clone()),
             });
         }
         sessions.sort_by_key(|s| s.pid);
@@ -1675,6 +1685,8 @@ fn assemble_sessions(
             footprint: Reading::Unavailable(Why::Unsupported),
             members: 1,
             unreadable_members: 0,
+            ide_hosted: row.ide_hosted,
+            terminal_session_id: row.launch.as_ref().and_then(|key| key.session_id.clone()),
         })
         .collect())
 }
@@ -3461,7 +3473,10 @@ pub(crate) mod tests {
         );
         assert!(is_exec_ide_hosted(AG_APP, AgentKind::Antigravity));
         assert!(is_exec_ide_hosted(AG_LS, AgentKind::Antigravity));
-        assert!(!is_exec_ide_hosted("/Users/me/.local/bin/agy", AgentKind::Antigravity));
+        assert!(!is_exec_ide_hosted(
+            "/Users/me/.local/bin/agy",
+            AgentKind::Antigravity
+        ));
         // Without readable arguments the flag cannot be checked.
         let row = session_row(7, 1, 4, SessionProbe::ArgsOf(AG_LS.into()), None, || None);
         assert!(row.is_none());
@@ -3491,7 +3506,13 @@ pub(crate) mod tests {
         let mut table = SessionTable::from(vec![agy_row]);
         let mut fx = ProcFixture::default();
         fx.cwds.insert(42, home.clone());
-        fx.add(&mut table, 43, 42, repo.to_str().unwrap(), &["git", "status"]);
+        fx.add(
+            &mut table,
+            43,
+            42,
+            repo.to_str().unwrap(),
+            &["git", "status"],
+        );
         let sessions = sessions_for(table, &fx);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].kind, AgentKind::Antigravity);

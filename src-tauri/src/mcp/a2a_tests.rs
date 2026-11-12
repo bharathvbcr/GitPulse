@@ -9,12 +9,13 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant, SystemTime};
 
 fn trusted_git_repo() -> (tempfile::TempDir, String) {
+    use crate::procguard::LockedSpawn;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().into_owned();
     let run = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .args(args)
-            .output()
+            .output_locked()
             .expect("git");
         assert!(
             out.status.success(),
@@ -100,7 +101,9 @@ fn register_and_peers_reconcile_live_and_exited_sessions() {
     .expect("list active peers");
     let peers = active_only["peers"].as_array().expect("peers array");
     assert!(
-        peers.iter().any(|p| p["provider_session_id"] == live_sid && p["liveness"] == "live"),
+        peers
+            .iter()
+            .any(|p| p["provider_session_id"] == live_sid && p["liveness"] == "live"),
         "live peer must be visible: {peers:?}"
     );
     assert!(
@@ -226,7 +229,11 @@ fn large_payload_hydrates_from_bus_without_duplication_and_cross_acks_mailbox() 
     )
     .expect("peek inbox");
     let peek_msgs = peeked["messages"].as_array().expect("messages");
-    assert_eq!(peek_msgs.len(), 1, "bus + mailbox must deduplicate by msg_id");
+    assert_eq!(
+        peek_msgs.len(),
+        1,
+        "bus + mailbox must deduplicate by msg_id"
+    );
     assert_eq!(peek_msgs[0]["body"].as_str().unwrap().len(), 10 * 1024);
     assert_eq!(mb.status(sid, "msg_large_10k"), Delivery::Pending);
 
@@ -309,7 +316,10 @@ fn hop_ceiling_pauses_auto_wake_while_human_resets_hop_to_zero() {
 
 #[test]
 fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
-    assert_eq!(clamp_wait_timeout_ms(Some(60_000), 60_000), MAX_WAIT_TIMEOUT_MS);
+    assert_eq!(
+        clamp_wait_timeout_ms(Some(60_000), 60_000),
+        MAX_WAIT_TIMEOUT_MS
+    );
     assert_eq!(clamp_wait_timeout_ms(Some(45_000), 20_000), 15_000);
     assert_eq!(clamp_wait_timeout_ms(Some(10_000), 4_000), 0);
 
@@ -375,8 +385,13 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(120));
         let mb = Mailbox::at_default().expect("mailbox");
-        mb.deposit(sid, "msg_fs_wake", "Wake from sibling process", SystemTime::now())
-            .expect("deposit");
+        mb.deposit(
+            sid,
+            "msg_fs_wake",
+            "Wake from sibling process",
+            SystemTime::now(),
+        )
+        .expect("deposit");
         crate::engine::agent_bus::post_peer_message(
             &repo_writer,
             "agy:sender",
@@ -487,4 +502,56 @@ fn kickoff_agent_spawn_routes_to_desktop_owner_over_instance_socket() {
 
     drop(owner);
     crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[test]
+fn antigravity_provider_alias_canonicalizes_in_register_and_peers_filter() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "66666666-6666-4666-8666-666666666666";
+
+    let reg = handle_tool_call(
+        "gitpulse_agent_register",
+        &json!({
+            "repo_path": repo,
+            "provider": "antigravity",
+            "surface": "terminal",
+            "provider_session_id": sid,
+            "role": "agy-alias-peer",
+            "pid": std::process::id(),
+        }),
+    )
+    .expect("register with provider=antigravity");
+    assert_eq!(reg["peer"]["provider"], "agy");
+    assert_eq!(reg["peer"]["peer_id"], format!("agy:{sid}"));
+
+    // Re-registering without explicit ids in the same worktree using `provider: "antigravity"`
+    // must match the existing `"agy"` live peer rather than inventing `"antigravity:..."`.
+    let rereg = handle_tool_call(
+        "gitpulse_agent_register",
+        &json!({
+            "repo_path": repo,
+            "provider": "antigravity",
+            "role": "agy-alias-peer",
+        }),
+    )
+    .expect("re-register with provider=antigravity");
+    assert_eq!(rereg["peer"]["peer_id"], format!("agy:{sid}"));
+
+    // Filtering `gitpulse_agent_peers` by `"antigravity"` or `"agy"` must both return the peer.
+    for query_prov in ["antigravity", "agy"] {
+        let listed = handle_tool_call(
+            "gitpulse_agent_peers",
+            &json!({
+                "repo_path": repo,
+                "provider": query_prov,
+                "include_exited": true,
+            }),
+        )
+        .expect("list peers");
+        let peers = listed["peers"].as_array().unwrap();
+        assert!(
+            peers.iter().any(|p| p["peer_id"] == format!("agy:{sid}")),
+            "provider filter '{query_prov}' missed canonical agy peer: {listed}"
+        );
+    }
 }

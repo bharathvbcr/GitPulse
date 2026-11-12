@@ -745,11 +745,8 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
                     return;
                 };
                 let _ = workbench.with_store(|store| {
-                    let current = super::query(
-                        store,
-                        "runs.get",
-                        &json!({ "id": run_id }).to_string(),
-                    )?;
+                    let current =
+                        super::query(store, "runs.get", &json!({ "id": run_id }).to_string())?;
                     let item = &current["item"];
                     if item["run_kind"] != "external_terminal" {
                         return Ok(());

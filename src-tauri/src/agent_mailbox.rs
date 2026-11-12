@@ -557,6 +557,7 @@ impl Mailbox {
                 let _ = std::fs::remove_file(self.root.join(".locks").join(format!("{name}.lock")));
                 let _ = std::fs::remove_file(self.root.join(".epochs").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".continuations").join(&name));
+                let _ = std::fs::remove_file(self.root.join(".stop_continued").join(&name));
                 let _ = std::fs::remove_dir_all(self.root.join(".meta").join(&name));
             }
         }
@@ -576,11 +577,9 @@ impl Mailbox {
             } else {
                 continue;
             };
-            if age(now, modified) > ttl {
-                if std::fs::remove_file(dir.join(&name)).is_ok() {
-                    if let Some((_, _, id)) = parse_message_name(&name) {
-                        self.remove_provenance(session_uuid, id);
-                    }
+            if age(now, modified) > ttl && std::fs::remove_file(dir.join(&name)).is_ok() {
+                if let Some((_, _, id)) = parse_message_name(&name) {
+                    self.remove_provenance(session_uuid, id);
                 }
             }
         }
@@ -950,7 +949,28 @@ impl Mailbox {
         let next = self.read_u64_counter(".epochs", &key)?.saturating_add(1);
         self.write_u64_counter(".epochs", &key, next, now)?;
         self.write_u64_counter(".continuations", &key, 0, now)?;
+        self.write_u64_counter(".stop_continued", &key, 0, now)?;
         Ok(next)
+    }
+
+    /// Starts an Antigravity `PreInvocation(invocationNum == 1)` turn: if the
+    /// immediately preceding `Stop` returned `decision: "continue"`, consumes
+    /// `.stop_continued` without resetting `.continuations` or bumping `.epochs`
+    /// and returns `Ok(false)`. Otherwise bumps `.epochs`, resets `.continuations`
+    /// to `0`, and returns `Ok(true)`.
+    pub(crate) fn begin_user_turn(&self, session: &str) -> Result<bool, MailboxError> {
+        let key = session_key(session)?;
+        let _session_lock = self.lock_session(&key)?;
+        let now = SystemTime::now();
+        if self.read_u64_counter(".stop_continued", &key)? > 0 {
+            self.write_u64_counter(".stop_continued", &key, 0, now)?;
+            return Ok(false);
+        }
+        let next = self.read_u64_counter(".epochs", &key)?.saturating_add(1);
+        self.write_u64_counter(".epochs", &key, next, now)?;
+        self.write_u64_counter(".continuations", &key, 0, now)?;
+        self.write_u64_counter(".stop_continued", &key, 0, now)?;
+        Ok(true)
     }
 
     /// Reads the current per-turn continuation count for Antigravity hooks.
@@ -970,6 +990,29 @@ impl Mailbox {
             .saturating_add(1);
         self.write_u64_counter(".continuations", &key, next, now)?;
         Ok(u32::try_from(next).unwrap_or(u32::MAX))
+    }
+
+    /// Increments the per-turn continuation count for `Stop:continue` and marks
+    /// `.stop_continued = 1` so the immediate follow-up `PreInvocation(1)` does
+    /// not wipe the cap.
+    pub(crate) fn bump_continuation_from_stop(&self, session: &str) -> Result<u32, MailboxError> {
+        let key = session_key(session)?;
+        let _session_lock = self.lock_session(&key)?;
+        let now = SystemTime::now();
+        let next = self
+            .read_u64_counter(".continuations", &key)?
+            .saturating_add(1);
+        self.write_u64_counter(".continuations", &key, next, now)?;
+        self.write_u64_counter(".stop_continued", &key, 1, now)?;
+        Ok(u32::try_from(next).unwrap_or(u32::MAX))
+    }
+
+    /// Clears `.stop_continued` when a step or normal `Stop` finishes without
+    /// `Stop:continue`.
+    pub(crate) fn clear_stop_continue(&self, session: &str) -> Result<(), MailboxError> {
+        let key = session_key(session)?;
+        let _session_lock = self.lock_session(&key)?;
+        self.write_u64_counter(".stop_continued", &key, 0, SystemTime::now())
     }
 
     /// Where a deposited message stands.
@@ -1029,7 +1072,9 @@ impl Mailbox {
     /// Waits for a plain [`Claim`] under the global [`MAX_WAITERS_TOTAL`] cap.
     #[cfg(test)]
     pub(crate) fn wait(&self, session: &str, limit: Duration) -> Result<Wait, MailboxError> {
-        match self.wait_with_cap(session, limit, WaitPool::Hosted, MAX_WAITERS_TOTAL, |_| true)? {
+        match self.wait_with_cap(session, limit, WaitPool::Hosted, MAX_WAITERS_TOTAL, |_| {
+            true
+        })? {
             EnvelopeWait::Message(env) => Ok(Wait::Message(env.claim)),
             EnvelopeWait::TimedOut => Ok(Wait::TimedOut),
             EnvelopeWait::Declined(why) => Ok(Wait::Declined(why)),
@@ -1259,7 +1304,10 @@ impl Waiter {
         let mut by_session: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
         for (sess, wname) in &live {
-            by_session.entry(sess.as_str()).or_default().push(wname.as_str());
+            by_session
+                .entry(sess.as_str())
+                .or_default()
+                .push(wname.as_str());
         }
         let mut staying_total = 0usize;
         let mut staying_hosted = 0usize;
@@ -1305,7 +1353,9 @@ impl Waiter {
     /// on this session or [`MAX_WAITERS_PER_SESSION`] newer waiters arrived.
     fn displaced_reason(&mut self) -> Result<Option<String>, MailboxError> {
         if !self.session_uuid.is_empty() {
-            let current_epoch = self.mailbox.read_u64_counter(".epochs", &self.session_uuid)?;
+            let current_epoch = self
+                .mailbox
+                .read_u64_counter(".epochs", &self.session_uuid)?;
             if current_epoch > self.registered_epoch {
                 return Ok(Some(
                     "a newer turn started on this session; prior stop waiter displaced.".into(),

@@ -199,8 +199,8 @@ pub(crate) fn handle_agent_register(a: super::AgentRegisterArgs) -> Result<Value
     let inferred_from_id = peer_id.as_deref().and_then(|id| {
         id.split_once(':')
             .map(|(prefix, _)| prefix)
-            .filter(|p| matches!(*p, "claude" | "agy" | "codex"))
-            .map(str::to_owned)
+            .filter(|p| matches!(*p, "claude" | "agy" | "antigravity" | "codex"))
+            .map(agent_bus::canonical_provider)
     });
     let explicit_match = reconciled.iter().find(|p| {
         (peer_id.is_some() && Some(p.record.peer_id.as_str()) == peer_id.as_deref())
@@ -213,9 +213,10 @@ pub(crate) fn handle_agent_register(a: super::AgentRegisterArgs) -> Result<Value
 
     let mut resolved_provider = a
         .provider
-        .clone()
+        .as_deref()
+        .map(agent_bus::canonical_provider)
         .or(inferred_from_id)
-        .or_else(|| explicit_match.map(|p| p.record.provider.clone()));
+        .or_else(|| explicit_match.map(|p| agent_bus::canonical_provider(&p.record.provider)));
 
     if peer_id.is_none()
         && provider_session_id.is_none()
@@ -229,7 +230,7 @@ pub(crate) fn handle_agent_register(a: super::AgentRegisterArgs) -> Result<Value
                     && p.record.worktree_path == worktree_path
                     && resolved_provider
                         .as_deref()
-                        .is_none_or(|prov| p.record.provider == prov)
+                        .is_none_or(|prov| agent_bus::providers_match(&p.record.provider, prov))
             })
             .collect();
         if live_in_wt.len() > 1 {
@@ -334,7 +335,7 @@ pub(crate) fn handle_agent_peers(a: super::AgentPeersArgs) -> Result<Value, Stri
     let mut peers =
         agent_bus::list_reconciled_peers(&a.repo_path).map_err(CommandError::into_message)?;
     if let Some(ref provider) = a.provider {
-        peers.retain(|p| &p.record.provider == provider);
+        peers.retain(|p| agent_bus::providers_match(&p.record.provider, provider));
     }
     if !a.include_exited.unwrap_or(false) {
         peers.retain(|p| p.liveness != "exited");
@@ -423,8 +424,13 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
                         repo_root: root_repo.clone(),
                     }
                 };
-                let _ =
-                    mb.deposit_with_provenance(sid, &msg_id, &preview, provenance, SystemTime::now());
+                let _ = mb.deposit_with_provenance(
+                    sid,
+                    &msg_id,
+                    &preview,
+                    provenance,
+                    SystemTime::now(),
+                );
             }
         }
     }
@@ -668,12 +674,9 @@ fn collect_deduped_peer_inbox(
 
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
-        let returned_ids: Vec<String> = combined
-            .iter()
-            .filter_map(|m| m.msg_id.clone())
-            .collect();
-        acked_count = agent_bus::ack_messages(repo_path, &canonical_reader, &returned_ids)
-            .unwrap_or(0);
+        let returned_ids: Vec<String> = combined.iter().filter_map(|m| m.msg_id.clone()).collect();
+        acked_count =
+            agent_bus::ack_messages(repo_path, &canonical_reader, &returned_ids).unwrap_or(0);
         if let (Some(ref sid), Ok(mb)) = (&resolved_session_id, Mailbox::at_default()) {
             let now = SystemTime::now();
             for mid in &returned_ids {
@@ -769,8 +772,8 @@ pub(crate) fn handle_agent_wait_with_counter(
         }));
     }
 
-    let messages_path = agent_bus::lanes_messages_path(&a.repo_path, true)
-        .map_err(CommandError::into_message)?;
+    let messages_path =
+        agent_bus::lanes_messages_path(&a.repo_path, true).map_err(CommandError::into_message)?;
     let (fs_tx, fs_rx) = mpsc::sync_channel::<()>(8);
     let waker_tx = fs_tx.clone();
     let mut watcher = RecommendedWatcher::new(

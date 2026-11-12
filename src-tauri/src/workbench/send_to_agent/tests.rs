@@ -810,6 +810,7 @@ fn ended_antigravity_attempts_route_to_resume_when_saved_conversation_exists() {
         );
         let preview = route.preview();
         assert_eq!(preview["route"], "resume");
+        assert_eq!(preview["provider"], "agy", "{preview}");
         assert!(
             preview["reason"].as_str().unwrap().contains("Antigravity"),
             "{preview}"
@@ -1145,7 +1146,8 @@ fn warm_managed_run_transitions_from_managed_route_to_resume_after_idle_expiry()
 #[test]
 fn live_antigravity_terminal_attempt_and_peer_id_route_through_mailbox() {
     let mut agy_run = run("external_terminal", "agy", "running", "run-agy-1");
-    let Route::Unavailable { reason } = decide(&agy_run, never_listening, no_conversation, no_manvi)
+    let Route::Unavailable { reason } =
+        decide(&agy_run, never_listening, no_conversation, no_manvi)
     else {
         panic!("unbound agy run should be unavailable until conversationId is bound");
     };

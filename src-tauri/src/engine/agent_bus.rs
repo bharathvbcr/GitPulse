@@ -826,7 +826,10 @@ pub fn post_thread_message(
     body: &str,
     branch: Option<&str>,
 ) -> Result<AgentBusMessage, CommandError> {
-    let is_human = matches!(from_agent.trim(), "developer" | "human" | "human-dev" | "user");
+    let is_human = matches!(
+        from_agent.trim(),
+        "developer" | "human" | "human-dev" | "user"
+    );
     let hop = if is_human { 0 } else { 1 };
     post_peer_message(
         repo_path,
@@ -1033,11 +1036,12 @@ pub fn ack_messages(
                 .msg_id
                 .clone()
                 .unwrap_or_else(|| format!("msg-{}", msg.seq));
-            if wanted.contains(&eff_id) && !msg.read_by.contains(&reader) {
-                if msg.read_by.len() < MAX_READ_BY_ENTRIES {
-                    msg.read_by.push(reader.clone());
-                    updated += 1;
-                }
+            if wanted.contains(&eff_id)
+                && !msg.read_by.contains(&reader)
+                && msg.read_by.len() < MAX_READ_BY_ENTRIES
+            {
+                msg.read_by.push(reader.clone());
+                updated += 1;
             }
         }
         if updated > 0 {
@@ -1116,7 +1120,7 @@ pub fn read_messages_for_peer(
 
 /* ── Peer Registry (`peers.json`) & Liveness Reconciliation ───────────────── */
 
-fn canonical_provider(raw: &str) -> String {
+pub(crate) fn canonical_provider(raw: &str) -> String {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
         "antigravity" | "agy" => "agy".to_string(),
@@ -1124,7 +1128,17 @@ fn canonical_provider(raw: &str) -> String {
     }
 }
 
-fn providers_match(record_provider: &str, query_provider: &str) -> bool {
+pub(crate) fn canonical_surface(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => "external_cli".to_string(),
+        "hosted_terminal" | "terminal" => "terminal".to_string(),
+        "antigravity_ide" | "ide" => "ide".to_string(),
+        "managed" => "managed".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn providers_match(record_provider: &str, query_provider: &str) -> bool {
     canonical_provider(record_provider) == canonical_provider(query_provider)
 }
 
@@ -1172,15 +1186,7 @@ pub(crate) fn is_antigravity_presence_locked(homes: &[PathBuf], session_id: &str
 /// Upserts a peer record in `<git-common-dir>/gitpulse/lanes/peers.json` under `.bus.lock`.
 pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, CommandError> {
     let provider = sanitize_token("provider", &canonical_provider(&update.provider), 32)?;
-    let surface = sanitize_token(
-        "surface",
-        if update.surface.trim().is_empty() {
-            "external_cli"
-        } else {
-            update.surface.trim()
-        },
-        32,
-    )?;
+    let surface = sanitize_token("surface", &canonical_surface(&update.surface), 32)?;
     let worktree_clean = if update.worktree_path.trim().is_empty() {
         repo_path.trim().to_string()
     } else {
@@ -1206,7 +1212,12 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
         .filter(|s| !s.is_empty())
         .map(|s| sanitize_token("run_id", s, 128))
         .transpose()?;
-    let derived_peer_id = match update.peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let derived_peer_id = match update
+        .peer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(explicit) => sanitize_token("peer_id", explicit, 128)?,
         None => {
             if let Some(ref sid) = provider_sid {
@@ -1338,11 +1349,10 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
 /// Returns `provider_session_id` recorded in `peers.json` for `run_id` when present.
 pub(crate) fn peer_session_id_for_run(repo_path: &str, run_id: &str) -> Option<String> {
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path).ok()?;
-    let state: PeersState =
-        with_bus_lock(&lanes_dir, false, || {
-            read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
-        })
-        .ok()?;
+    let state: PeersState = with_bus_lock(&lanes_dir, false, || {
+        read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
+    })
+    .ok()?;
     state
         .peers
         .into_iter()
@@ -1397,6 +1407,23 @@ pub(crate) fn list_reconciled_peers_with(
     alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
     has_transcript: &dyn Fn(&str, &str) -> bool,
 ) -> Result<Vec<ReconciledPeer>, CommandError> {
+    let live_obs = crate::insights::live_sessions::observe();
+    list_reconciled_peers_from_observation(
+        repo_path,
+        agy_homes,
+        &live_obs,
+        alive_probe,
+        has_transcript,
+    )
+}
+
+pub(crate) fn list_reconciled_peers_from_observation(
+    repo_path: &str,
+    agy_homes: &[PathBuf],
+    live_obs: &crate::insights::live_sessions::Observation,
+    alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
+    has_transcript: &dyn Fn(&str, &str) -> bool,
+) -> Result<Vec<ReconciledPeer>, CommandError> {
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     let stored: PeersState = with_bus_lock(&lanes_dir, false, || {
         read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
@@ -1408,8 +1435,7 @@ pub(crate) fn list_reconciled_peers_with(
         .map(|w| (w.path.clone(), w.branch.clone()))
         .collect();
 
-    let live_obs = crate::insights::live_sessions::observe();
-    let live_facet = crate::insights::live_sessions::attribute(&live_obs, &wt_paths);
+    let live_facet = crate::insights::live_sessions::attribute(live_obs, &wt_paths);
     let mut live_by_pid: HashMap<u32, (&crate::insights::LiveSession, &str)> = HashMap::new();
     let mut live_by_sid: HashMap<String, (&crate::insights::LiveSession, &str)> = HashMap::new();
     for wt in &live_facet.worktrees {
@@ -1426,6 +1452,8 @@ pub(crate) fn list_reconciled_peers_with(
     let mut covered_sids = BTreeSet::new();
 
     for mut peer in stored.peers {
+        peer.provider = canonical_provider(&peer.provider);
+        peer.surface = canonical_surface(&peer.surface);
         if peer.branch.is_none() {
             if let Some(Some(br)) = wt_branch_by_path.get(&peer.worktree_path) {
                 peer.branch = Some(br.clone());
@@ -1446,10 +1474,9 @@ pub(crate) fn list_reconciled_peers_with(
         let mut unknown_reason: Option<String> = None;
 
         if let Some(ref s) = sid_lower {
-            if live_by_sid.contains_key(s) {
-                is_alive = true;
-            } else if providers_match(&peer.provider, "agy")
-                && is_antigravity_presence_locked(agy_homes, s)
+            if live_by_sid.contains_key(s)
+                || (providers_match(&peer.provider, "agy")
+                    && is_antigravity_presence_locked(agy_homes, s))
             {
                 is_alive = true;
             }
@@ -1511,20 +1538,21 @@ pub(crate) fn list_reconciled_peers_with(
                 continue;
             }
             let provider = canonical_provider(&sess.kind);
-            let surface = if sess.tree.as_deref().is_some_and(|t| t.starts_with("session:")) {
+            let term_sid = sess.terminal_session_id.clone().or_else(|| {
+                sess.tree
+                    .as_deref()
+                    .and_then(|t| t.strip_prefix("session:"))
+                    .map(str::to_string)
+            });
+            let surface = if term_sid.is_some() {
                 "terminal".to_string()
+            } else if sess.ide_hosted {
+                "ide".to_string()
             } else if sess.run_id.is_some() {
                 "managed".to_string()
-            } else if sess.kind == "antigravity" && sess.entrypoint.is_empty() {
-                "external_cli".to_string()
             } else {
                 "external_cli".to_string()
             };
-            let term_sid = sess
-                .tree
-                .as_deref()
-                .and_then(|t| t.strip_prefix("session:"))
-                .map(str::to_string);
             let peer_id = match sid_lower.as_deref() {
                 Some(s) => format!("{provider}:{s}"),
                 None => format!("{provider}:pid-{}", sess.pid),
@@ -2964,6 +2992,7 @@ mod tests {
         let stale_lock_path = presence_dir.join(format!("{conv_stale}.lock"));
         let live_lock_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&live_lock_path)
@@ -2974,7 +3003,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let rc = unsafe { libc::flock(live_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            let rc =
+                unsafe { libc::flock(live_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             assert_eq!(rc, 0, "test holds active flock on conv_live");
         }
 
@@ -3208,5 +3238,155 @@ mod tests {
 
         let unread_after = read_unread_for_peer(anchor, &aliases, 0, None, true).unwrap();
         assert!(unread_after.messages.is_empty());
+    }
+
+    #[test]
+    fn reconcile_classifies_surface_and_canonicalizes_legacy_hook_surfaces() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        // Legacy hook surface spellings canonicalize on upsert.
+        let legacy_ide = upsert_peer(
+            anchor,
+            PeerUpsert {
+                peer_id: None,
+                provider: "antigravity".into(),
+                surface: "antigravity_ide".into(),
+                provider_session_id: Some("88888888-8888-4888-8888-888888888881".into()),
+                terminal_session_id: None,
+                run_id: None,
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                role: None,
+                turn_state: Some("idle".into()),
+                auto_wake: None,
+                pid: Some(99001),
+                proc_start_ns: Some(100),
+                transcript_path: Some("/tmp/ide.pb".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_ide.provider, "agy");
+        assert_eq!(legacy_ide.surface, "ide");
+
+        let legacy_term = upsert_peer(
+            anchor,
+            PeerUpsert {
+                peer_id: None,
+                provider: "antigravity".into(),
+                surface: "hosted_terminal".into(),
+                provider_session_id: Some("88888888-8888-4888-8888-888888888882".into()),
+                terminal_session_id: Some("term-99".into()),
+                run_id: None,
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                role: None,
+                turn_state: Some("idle".into()),
+                auto_wake: None,
+                pid: Some(99002),
+                proc_start_ns: Some(100),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_term.provider, "agy");
+        assert_eq!(legacy_term.surface, "terminal");
+
+        // Process-scanned sessions distinguish IDE, external_terminal task run, managed run, and external_cli.
+        let obs = vec![crate::insights::live_sessions::KindObservation {
+            kind: "antigravity".into(),
+            ok: true,
+            live: vec![
+                // 1. Antigravity IDE (`ide_hosted: true`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88001,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: None,
+                    run_id: None,
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: true,
+                    terminal_session_id: None,
+                },
+                // 2. External-terminal task run (`GITPULSE_RUN_ID` + `GITPULSE_SESSION_ID` -> `tree: "run:r1"`, `terminal_session_id: Some("term-1")`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88002,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: Some("run:r1".into()),
+                    run_id: Some("r1".into()),
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: Some("term-1".into()),
+                },
+                // 3. Managed run (`run_id: Some("r2")`, no `terminal_session_id`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88003,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: Some("run:r2".into()),
+                    run_id: Some("r2".into()),
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: None,
+                },
+                // 4. Plain external `agy` CLI (`ide_hosted: false`, no launch ids)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88004,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: None,
+                    run_id: None,
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: None,
+                },
+            ],
+            ..Default::default()
+        }];
+        let reconciled = list_reconciled_peers_from_observation(
+            anchor,
+            &[],
+            &obs,
+            &|_, _| crate::workbench::process_birth::Liveness::Gone,
+            &|_, _| false,
+        )
+        .unwrap();
+        let by_pid = |pid: u32| {
+            reconciled
+                .iter()
+                .find(|p| p.record.pid == Some(pid))
+                .unwrap_or_else(|| panic!("missing pid {pid} in {reconciled:?}"))
+        };
+        assert_eq!(by_pid(88001).record.surface, "ide");
+        assert_eq!(by_pid(88002).record.surface, "terminal");
+        assert_eq!(
+            by_pid(88002).record.terminal_session_id.as_deref(),
+            Some("term-1")
+        );
+        assert_eq!(by_pid(88002).record.run_id.as_deref(), Some("r1"));
+        assert_eq!(by_pid(88003).record.surface, "managed");
+        assert_eq!(by_pid(88004).record.surface, "external_cli");
     }
 }

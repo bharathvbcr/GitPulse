@@ -980,6 +980,7 @@ tool_args! {
 }
 
 const KICKOFF_PROVIDERS: &[&str] = &["claude", "agy", "codex"];
+const PEER_PROVIDERS: &[&str] = &["claude", "agy", "antigravity", "codex"];
 const KICKOFF_SPAWN_SURFACES: &[&str] = &["terminal", "managed"];
 const PEER_SURFACES: &[&str] = &["terminal", "managed", "external_cli", "ide"];
 const PEER_WAKE_MODES: &[&str] = &["boundary", "auto"];
@@ -1030,8 +1031,8 @@ tool_args! {
             128,
         ),
         provider: Option<String> = Spec::one_of(
-            "Agent runtime provider ('claude', 'agy', or 'codex'; inferred from existing session when omitted)",
-            KICKOFF_PROVIDERS,
+            "Agent runtime provider ('claude', 'agy', 'antigravity', or 'codex'; inferred from existing session when omitted)",
+            PEER_PROVIDERS,
         ),
         surface: Option<String> = Spec::one_of(
             "Execution surface ('terminal', 'managed', 'external_cli', or 'ide')",
@@ -1088,8 +1089,8 @@ tool_args! {
     pub(crate) struct AgentPeersArgs {
         repo_path: String = repo_spec(),
         provider: Option<String> = Spec::one_of(
-            "Optional provider filter ('claude', 'agy', or 'codex')",
-            KICKOFF_PROVIDERS,
+            "Optional provider filter ('claude', 'agy', 'antigravity', or 'codex')",
+            PEER_PROVIDERS,
         ),
         include_exited: Option<bool> = Spec::flag(
             "Include exited non-resumable peers in addition to live and resumable sessions (default false)",
@@ -4000,9 +4001,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     "Delegated task {} on branch {}: {}",
                     a.task_id,
                     branch,
-                    a.instructions
-                        .as_deref()
-                        .unwrap_or("Execute delegated task inside claimed files and report status.")
+                    a.instructions.as_deref().unwrap_or(
+                        "Execute delegated task inside claimed files and report status."
+                    )
                 );
                 let msg_id = message
                     .msg_id
@@ -8505,10 +8506,7 @@ mod tests {
                 "gitpulse_agent_register",
                 json!({ "repo_path": repo, "provider": "agy", "role": "probe" }),
             ),
-            (
-                "gitpulse_agent_peers",
-                json!({ "repo_path": repo }),
-            ),
+            ("gitpulse_agent_peers", json!({ "repo_path": repo })),
             (
                 "gitpulse_agent_send",
                 json!({ "repo_path": repo, "from_peer": "claude:a", "to_peer": "agy:b", "body": "probe" }),

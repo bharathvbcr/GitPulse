@@ -485,8 +485,8 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
 /// parked Managed run (`managed_run::deliver_peer_follow_up`), or spawns an
 /// unattended kickoff session (`gitpulse_kickoff_agent`).
 #[cfg(target_os = "macos")]
-pub fn serve_agent_deliver(
-    app: &AppHandle,
+pub fn serve_agent_deliver<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     request: &instance::Request,
 ) -> Result<serde_json::Value, String> {
     let instance::Request::AgentDeliver {
@@ -621,29 +621,37 @@ pub fn serve_agent_deliver(
         }
     }
 
-    if peer.record.provider == "agy"
-        && (peer.record.terminal_session_id.is_some() || peer.record.provider_session_id.is_some())
-    {
-        let _ = app.emit(
-            PEER_INBOX_EVENT,
-            serde_json::json!({
-                "session_id": peer.record.terminal_session_id,
-                "provider_session_id": peer.record.provider_session_id,
-                "peer_id": peer.record.peer_id,
-                "from_peer": msg.as_ref().map(|m| m.from_agent.as_str()),
-                "msg_id": msg_id,
-                "repo": repo,
-            }),
-        );
-        let outcome = if peer.record.auto_wake {
-            "woken_immediately"
-        } else {
-            "awaiting_banner_confirm"
-        };
-        return Ok(serde_json::json!({
-            "ok": true,
-            "delivery_outcome": outcome,
-        }));
+    if peer.record.provider == "agy" && peer.record.turn_state != "working" {
+        if let Some(tid) = peer.record.terminal_session_id.as_deref() {
+            let agy_foreground = app
+                .try_state::<crate::terminal::TerminalSessions>()
+                .and_then(|ts| crate::terminal::session_context(ts.inner(), tid).ok())
+                .is_some_and(|ctx| {
+                    crate::terminal::is_agy_foreground_process(ctx.process.as_deref())
+                });
+            if agy_foreground {
+                let _ = app.emit(
+                    PEER_INBOX_EVENT,
+                    serde_json::json!({
+                        "session_id": peer.record.terminal_session_id,
+                        "provider_session_id": peer.record.provider_session_id,
+                        "peer_id": peer.record.peer_id,
+                        "from_peer": msg.as_ref().map(|m| m.from_agent.as_str()),
+                        "msg_id": msg_id,
+                        "repo": repo,
+                    }),
+                );
+                let outcome = if peer.record.auto_wake && peer.record.turn_state == "idle" {
+                    "woken_immediately"
+                } else {
+                    "awaiting_banner_confirm"
+                };
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "delivery_outcome": outcome,
+                }));
+            }
+        }
     }
 
     if peer.record.provider == "claude" {
@@ -668,8 +676,8 @@ pub fn serve_agent_deliver(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn serve_kickoff_spawn(
-    app: &AppHandle,
+fn serve_kickoff_spawn<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     repo: &str,
     request_id: &str,
     mode: &str,
@@ -1440,5 +1448,101 @@ mod tests {
         exit::settle(handle, pending, false);
         assert_eq!(exit_choice(), ExitChoice::Leave);
         crate::harness::hosted::reset_exit_choice();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serve_agent_deliver_rejects_ide_external_and_working_agy_peers_without_emitting_banner() {
+        use tauri::Listener;
+        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        crate::test_support::trust_repo(repo_dir.path());
+
+        let my_pid = std::process::id();
+        let my_birth = crate::workbench::process_birth::started_unix_nanos(my_pid).unwrap();
+
+        // 1. Live Antigravity IDE peer (`terminal_session_id: None`, `surface: "ide"`).
+        let ide_sid = "99999999-9999-4999-8999-999999999901";
+        let ide_peer = crate::engine::agent_bus::upsert_peer(
+            &repo,
+            crate::engine::agent_bus::PeerUpsert {
+                peer_id: None,
+                provider: "agy".into(),
+                surface: "ide".into(),
+                provider_session_id: Some(ide_sid.into()),
+                terminal_session_id: None,
+                run_id: None,
+                worktree_path: repo.clone(),
+                branch: Some("main".into()),
+                role: Some("ide-agent".into()),
+                turn_state: Some("idle".into()),
+                auto_wake: Some(true),
+                pid: Some(my_pid),
+                proc_start_ns: Some(my_birth),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+        // 2. Hosted `agy` terminal tab whose `TerminalSessions` has no live `"agy"` foreground PTY.
+        let dead_pty_sid = "99999999-9999-4999-8999-999999999902";
+        let dead_pty_peer = crate::engine::agent_bus::upsert_peer(
+            &repo,
+            crate::engine::agent_bus::PeerUpsert {
+                peer_id: None,
+                provider: "agy".into(),
+                surface: "terminal".into(),
+                provider_session_id: Some(dead_pty_sid.into()),
+                terminal_session_id: Some("term-missing-42".into()),
+                run_id: None,
+                worktree_path: repo.clone(),
+                branch: Some("main".into()),
+                role: Some("missing-pty".into()),
+                turn_state: Some("idle".into()),
+                auto_wake: Some(true),
+                pid: Some(my_pid),
+                proc_start_ns: Some(my_birth),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .manage(crate::terminal::TerminalSessions::default())
+            .build(crate::context())
+            .unwrap();
+        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let emitted_sink = std::sync::Arc::clone(&emitted);
+        let _listener = app.listen_any(PEER_INBOX_EVENT, move |_| {
+            emitted_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        for (label, pid_key) in [
+            ("ide", ide_peer.peer_id.clone()),
+            ("missing_pty", dead_pty_peer.peer_id.clone()),
+        ] {
+            let req = instance::Request::AgentDeliver {
+                id: format!("req_{label}"),
+                repo: repo.clone(),
+                peer_id: pid_key,
+                msg_id: format!("msg_{label}"),
+                spawn: None,
+                provider: None,
+                branch: None,
+                prompt: None,
+                task_id: None,
+            };
+            let ans = serve_agent_deliver(app.handle(), &req).expect("serve_agent_deliver");
+            assert_eq!(
+                ans["delivery_outcome"], "queued_for_hook_boundary",
+                "{label} must queue for hook boundary instead of claiming banner/wake: {ans}"
+            );
+        }
+        assert_eq!(
+            emitted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "PEER_INBOX_EVENT must not be emitted when no hosted agy PTY is in the foreground"
+        );
     }
 }
