@@ -13,6 +13,7 @@
   import HookRunNotice from "./HookRunNotice.svelte";
   import IdentityPrompt from "./IdentityPrompt.svelte";
   import { ipcErrorKind, type IpcErrorKind } from "../ipc/invoke";
+  import { AGENT_COMMIT_CLEAN } from "../commit/agentCommit";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
   import { repoScope } from "../repos/repoScope.svelte";
@@ -71,10 +72,18 @@
 
   let quickCommit = $derived(includeUnstaged && !isAmending);
   let commitCount = $derived(quickCommit ? dirtyCount : stagedFiles.length);
+  let nothingToCommit = $derived(
+    quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending,
+  );
   let commitDisabled = $derived(
-    !commitMessage.trim() ||
-      conflictedCount > 0 ||
-      (quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending),
+    !commitMessage.trim() || conflictedCount > 0 || nothingToCommit,
+  );
+  let commitTitle = $derived(
+    nothingToCommit
+      ? AGENT_COMMIT_CLEAN
+      : quickCommit
+        ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
+        : "Commit staged files (Cmd/Ctrl+Enter)",
   );
 
   // A1: one preview batch for staged paths — DiffFileRail reads the same store.
@@ -430,7 +439,7 @@
         · <span class="text-amber-400">budget estimated locally</span>
       {/if}
     </div>
-    {#each generation.warnings as warning}
+    {#each generation.warnings as warning, index (index)}
       <div class="text-[10px] text-amber-400 flex items-start gap-1">
         <AlertTriangle size={11} class="mt-px shrink-0" />
         <span>{warning}</span>
@@ -477,11 +486,10 @@
     </div>
   {/if}
 
-  <!-- The two toggles keep their own text on one line and the ROW wraps when
-       the sidebar is too narrow for all three controls. Without this, "Include
-       unstaged" broke across two lines inside its own label and dragged the
-       commit button's row height with it. -->
-  <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+  <!-- The two toggles keep their own text on one line and their row wraps
+       when the sidebar is too narrow. The split commit control spans the
+       same width as the message box; the sparkle stays a fixed icon. -->
+  <div class="flex flex-col gap-1.5">
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
       <label
         class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-textMuted cursor-pointer"
@@ -511,19 +519,32 @@
         <span>Include unstaged</span>
       </label>
     </div>
-    <div class="flex items-center gap-1.5 shrink-0">
-      <AgentCommitMenu compact={true} align="right" direction="up" />
+    <div
+      role="group"
+      aria-label="Commit"
+      data-commit-split
+      class="flex w-full min-w-0 items-stretch overflow-hidden rounded-full"
+      style:box-shadow={commitDisabled ? "none" : "var(--shadow-glow)"}
+    >
       <button
+        type="button"
         onclick={() => void handleCommit()}
         disabled={commitDisabled}
-        title={quickCommit
-          ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
-          : "Commit staged files (Cmd/Ctrl+Enter)"}
-        class="gp-btn-primary shrink-0 whitespace-nowrap"
+        title={commitTitle}
+        class="gp-btn-primary min-w-0 flex-1 justify-center whitespace-nowrap shadow-none"
+        style="border-radius: 0; box-shadow: none"
       >
         <Send size={12} />
         <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
       </button>
+      <span
+        data-commit-split-divider
+        class="w-px shrink-0 self-stretch bg-white/50"
+        aria-hidden="true"
+      ></span>
+      <div class="flex shrink-0 self-stretch">
+        <AgentCommitMenu segment align="right" direction="up" />
+      </div>
     </div>
   </div>
 </div>

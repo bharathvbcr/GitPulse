@@ -133,6 +133,70 @@ describe("CommitComposer", () => {
     expect((footer.match(/whitespace-nowrap/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
+  it("merges Ask Agent into one centered commit split button", () => {
+    // The composer used to draw a separate "Ask Agent" pill beside Commit.
+    // One split control holds Commit and an icon-only sparkle that opens the
+    // same dialog. The words are the sparkle's accessible name, not a second label.
+    const { body } = render(CommitComposer);
+    expect(body).not.toContain(">Ask Agent<");
+    expect(body).not.toContain("Ask Agent to Commit");
+
+    const splitAt = body.indexOf("data-commit-split");
+    const menuAt = body.indexOf("data-agent-commit-menu");
+    const sparkAt = body.indexOf('aria-label="Ask Agent"');
+    expect(splitAt).toBeGreaterThan(-1);
+    expect(menuAt).toBeGreaterThan(splitAt);
+    expect(sparkAt).toBeGreaterThan(menuAt);
+
+    // The group used to be an inline-flex shrink wrap, only as wide as
+    // "Commit (0)" plus the sparkle. It now uses the message box's w-full.
+    const groupTag = body.slice(body.lastIndexOf("<div", splitAt), body.indexOf(">", splitAt) + 1);
+    expect(groupTag).toContain("w-full");
+    expect(groupTag).toContain('role="group"');
+    expect(groupTag).not.toContain("inline-flex");
+    const message = body.match(/<textarea\b[^>]*>/)?.[0] ?? "";
+    expect(message).toContain("w-full");
+    const split = body.slice(splitAt, sparkAt);
+    expect(split).toContain("data-commit-split-divider");
+    const commitButton = split.match(/<button\b[^>]*>[\s\S]*?Commit \(0\)[\s\S]*?<\/button>/);
+    expect(commitButton?.[0]).toContain("flex-1");
+    expect(commitButton?.[0]).toContain("justify-center");
+    expect(commitButton?.[0]).not.toContain("shrink-0");
+    expect(commitButton?.[0]).toContain("disabled");
+    expect(commitButton?.[0]).toContain("No uncommitted changes to commit.");
+    expect(split).toContain("shrink-0");
+
+    const sparkleButton = body.slice(
+      body.lastIndexOf("<button", sparkAt),
+      body.indexOf("</button>", sparkAt) + "</button>".length,
+    );
+    expect(sparkleButton).toContain('aria-haspopup="dialog"');
+    expect(sparkleButton).not.toContain("justify-center");
+    expect(sparkleButton).toContain("disabled");
+    expect(sparkleButton).toContain("<svg");
+    expect(sparkleButton).not.toMatch(/>\s*Ask Agent\s*</);
+
+    const footer = source.slice(source.indexOf("<!-- The two toggles"));
+    expect(footer).toContain("void handleCommit()");
+    expect(footer).toContain("<AgentCommitMenu");
+    expect(footer).toContain("segment");
+    expect(footer).not.toContain("compact={true}");
+
+    const menuSource = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "AgentCommitMenu.svelte"),
+      "utf8",
+    );
+    const segmentStart = menuSource.indexOf("{#if segment}");
+    const segmentEnd = menuSource.indexOf("{:else if compact}");
+    expect(segmentStart).toBeGreaterThan(-1);
+    expect(segmentEnd).toBeGreaterThan(segmentStart);
+    const segment = menuSource.slice(segmentStart, segmentEnd);
+    expect(segment).toContain("onclick={toggle}");
+    expect(segment).toContain('aria-haspopup="dialog"');
+    expect(segment).toContain('aria-label="Ask Agent"');
+    expect(segment).not.toContain(">Ask Agent<");
+  });
+
   it("writes a commit message without waiting for a loopback model", () => {
     // The patch is classified in the app. A missing model server is not a
     // reason to leave the composer blank, and Apple Intelligence is only the

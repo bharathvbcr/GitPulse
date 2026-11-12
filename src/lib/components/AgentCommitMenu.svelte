@@ -41,10 +41,16 @@
 
   let {
     compact = false,
+    segment = false,
     align = "left",
     direction = "down",
   }: {
     compact?: boolean;
+    /**
+     * Icon-only trailing segment of a split button. The parent draws the pill
+     * and the divider; this trigger only opens the dialog.
+     */
+    segment?: boolean;
     /** Which trigger edge the panel lines up with. */
     align?: "left" | "right";
     /** Preferred side; the panel flips when that side cannot hold it. */
@@ -327,8 +333,27 @@
   }
 </script>
 
-<div class="relative inline-flex items-center" data-agent-commit-menu={uid}>
-  {#if compact}
+<div
+  class="relative inline-flex {segment ? 'items-stretch self-stretch' : 'items-center'}"
+  data-agent-commit-menu={uid}
+>
+  {#if segment}
+    <button
+      bind:this={triggerEl}
+      type="button"
+      onclick={toggle}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      aria-controls={open ? panelId : undefined}
+      aria-label="Ask Agent"
+      disabled={Boolean(disabledReason)}
+      title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
+      class="gp-btn-primary h-full px-2.5! shadow-none"
+      style="border-radius: 0; box-shadow: none"
+    >
+      <Sparkles size={12} class="shrink-0" />
+    </button>
+  {:else if compact}
     <button
       bind:this={triggerEl}
       type="button"
