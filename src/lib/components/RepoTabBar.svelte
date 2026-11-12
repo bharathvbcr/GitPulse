@@ -266,6 +266,7 @@
   );
   const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
   const agentsOpen = $derived($interfaceStore.globalSurface === "agents");
+  const fleetOpen = $derived($interfaceStore.globalSurface === "fleet");
   // The Agents plane's own definition, over the directories it last read, so
   // the chip and the plane's "live terminals" are one number.
   const liveAgents = $derived(liveAgentCount($terminalSessions, $agentDirectories));
@@ -1301,17 +1302,33 @@
   <div class="gp-glass gp-repo-tabs relative z-20 h-11 bg-surface border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-xs px-2 gap-1.5">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
-    <button
-      type="button"
-      class={surfaceChipClass($interfaceStore.globalSurface === "fleet")}
-      aria-pressed={$interfaceStore.globalSurface === "fleet"}
-      data-testid="fleet-tab-chip"
-      onclick={() => interfaceStore.toggleFleet()}
-      title="Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health."
-    >
-      <LayoutGrid size={12} />
-      <span>Fleet</span>
-    </button>
+    <div class="{surfaceChipClass(fleetOpen)} pr-1!" data-testid="fleet-tab-chip">
+      <button
+        type="button"
+        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
+        aria-pressed={fleetOpen}
+        onclick={() => interfaceStore.toggleFleet()}
+        title="Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health."
+      >
+        <LayoutGrid size={12} />
+        <span>Fleet</span>
+      </button>
+      {#if fleetOpen}
+        <button
+          type="button"
+          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
+          data-testid="fleet-tab-close"
+          aria-label="Close Fleet"
+          title="Close Fleet"
+          onclick={(event) => {
+            event.stopPropagation();
+            interfaceStore.setFleetOpen(false);
+          }}
+        >
+          <X size={11} />
+        </button>
+      {/if}
+    </div>
     <div class="{surfaceChipClass(agentsOpen)} pr-1!" data-testid="agents-tab-chip">
       <button
         type="button"

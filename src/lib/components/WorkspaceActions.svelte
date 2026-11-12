@@ -151,7 +151,7 @@
 </script>
 
 {#if visible}
-  <div class="flex items-center gap-1">
+  <div class="flex shrink-0 items-center gap-1">
     <button
       type="button"
       class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5"
