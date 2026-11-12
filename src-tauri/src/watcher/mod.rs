@@ -4123,7 +4123,9 @@ mod tests {
                 let _ = crate::engine::git_cli::run_bounded(
                     cmd,
                     "git fsmonitor--daemon stop",
-                    crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET),
+                    // Held to the runner's ceiling: relaxed past it, the stop is refused unrun.
+                    crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET)
+                        .min(crate::engine::git_cli::NETWORK_TIMEOUT),
                     None,
                 );
             }

@@ -13856,7 +13856,9 @@ some-future-field whatever
             let _ = crate::engine::git_cli::run_bounded(
                 cmd,
                 "hdiutil detach",
-                crate::test_support::coverage_relaxed(HDIUTIL_BUDGET),
+                // Held to the runner's ceiling: relaxed past it, the detach is refused unrun.
+                crate::test_support::coverage_relaxed(HDIUTIL_BUDGET)
+                    .min(crate::engine::git_cli::NETWORK_TIMEOUT),
                 None,
             );
         }

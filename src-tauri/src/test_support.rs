@@ -145,12 +145,18 @@ pub(crate) use env::{coverage_relaxed, wait_until};
 /// The command is run exactly as built: binary, environment and working
 /// directory are the caller's. Only stdin is closed. The exit status is left
 /// to the caller.
+///
+/// A budget past the runner's ceiling ([`crate::engine::git_cli::NETWORK_TIMEOUT`])
+/// is held to it: [`coverage_relaxed`] scales budgets by instrumentation and
+/// host load, and an unclamped 60 s reached 1,920 s on a loaded instrumented
+/// run, which the runner refuses without starting the helper.
 #[cfg(all(test, unix))]
 pub(crate) fn run_within(
     cmd: Command,
     label: &str,
     budget: std::time::Duration,
 ) -> crate::engine::git_cli::BoundedRun {
+    let budget = budget.min(crate::engine::git_cli::NETWORK_TIMEOUT);
     crate::engine::git_cli::run_bounded(cmd, label, budget, None)
         .and_then(|run| run.require_complete(label))
         .unwrap_or_else(|why| {
@@ -727,6 +733,20 @@ mod tests {
             (&b"out"[..], &b"err"[..])
         );
         assert_eq!((run.success, run.status_code), (false, 3));
+    }
+
+    /// A budget relaxed past the runner's ceiling (60 s x 8 instrumented x 4 at
+    /// the load cap is 1,920 s) still runs the helper. Passed through as is,
+    /// the runner refused it at once: "deadline exceeds 1800s".
+    #[cfg(unix)]
+    #[test]
+    fn run_within_runs_a_helper_whose_budget_is_past_the_runners_ceiling() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf ran"]);
+        let past = crate::engine::git_cli::NETWORK_TIMEOUT + Duration::from_secs(120);
+        let run = run_within(cmd, "relaxed-helper", past);
+        assert_eq!(run.stdout.as_slice(), &b"ran"[..]);
+        assert!(run.success);
     }
 
     #[test]
