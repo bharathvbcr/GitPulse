@@ -79,3 +79,21 @@ jobs:
           set -euo pipefail
           out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact storage::hygiene::tests::installed_go_cleans_only_the_reviewed_temporary_cache 2>&1 | tee /dev/stderr)"
           grep -q "test result: ok. 1 passed" <<<"$out"
+
+      - name: Install Kani CBMC model checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+
+      - name: Kani bounded model checking (gitpulse-worktree)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kani_log="$(mktemp)"
+          trap 'rm -f "$kani_log"' EXIT
+          cargo kani --manifest-path crates/gitpulse-worktree/Cargo.toml 2>&1 | tee "$kani_log"
+          grep -q "VERIFICATION:- SUCCESSFUL" "$kani_log"
+          grep -Eq "Complete - [1-9][0-9]* successfully verified harnesses, 0 failures" "$kani_log"
+          if grep -q "VERIFICATION:- FAILED" "$kani_log"; then exit 1; fi
