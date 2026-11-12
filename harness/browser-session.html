@@ -60,7 +60,14 @@
   const seen = el => el && el.getClientRects().length > 0;
   const byLabel = name => [...document.querySelectorAll(`[aria-label="${name}"]`)].find(seen);
   const byText = (selector, text) => [...document.querySelectorAll(selector)].find(el => seen(el) && el.textContent.trim() === text);
-  const session = () => [...document.querySelectorAll("[data-browser-session]")].find(seen);
+  // The session in front is the one in the selected tab's panel. Opening a
+  // session splits it beside the one that was active, so several can be
+  // visible at once; the first visible one is not the one brought forward.
+  const session = () => {
+    const tab = [...document.querySelectorAll('[role=tab][aria-selected="true"]')].find(seen);
+    const panel = tab && document.getElementById(tab.getAttribute("aria-controls"));
+    return panel?.querySelector("[data-browser-session]") ?? null;
+  };
   const placeholder = () => session()?.querySelector("[data-browser-host]");
   const of = name => calls.filter(c => c.cmd === name);
   const lastVisible = () => of("cmd_browser_set_visible").at(-1)?.args.visible;
