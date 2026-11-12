@@ -479,9 +479,6 @@
             if (words.includes("shortcuts-end")) {
               $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
               await sleepUntil(() => !!$('[role="dialog"]'), 3000);
-              await wait(400);
-              const scroller = $$("*", $('[role="dialog"]')).find((el) => el.scrollHeight > el.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(el).overflowY));
-              if (scroller) scroller.scrollTop = scroller.scrollHeight;
             }
             // The panels' own modes: `rail` collapses the docked sidebar to its rail,
             // `floating` opens it as an overlay panel, `dock` opens the terminal dock.
@@ -553,6 +550,12 @@
             let forced = 0;
             if (!animationsDone && frames < 6) {
               for (const a of finite()) if (a.playState === "running") { a.finish(); forced++; }
+            }
+            // `shortcuts-end` scrolls last: a scroll made while the sheet was still settling was
+            // lost when its list re-rendered, so it is made after everything has finished.
+            if (words.includes("shortcuts-end")) {
+              const scroller = $$("*", $('[role="dialog"]')).find((el) => el.scrollHeight > el.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(el).overflowY));
+              if (scroller) { scroller.scrollTop = scroller.scrollHeight; await raf(); await raf(); }
             }
             await raf(); await raf();
             const stillRunning = finite().filter((a) => a.playState === "running");
