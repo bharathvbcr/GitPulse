@@ -2381,6 +2381,7 @@ mod tests {
             ),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
 
         let primary = [
             ("src/caller.rs", "probe_caller", caller_src.len() as i64),

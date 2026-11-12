@@ -2156,6 +2156,7 @@ mod tests {
             ),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
         for (idx, (path, sym, span_end)) in files.iter().enumerate() {
             let id = (idx + 1) as i64;
             let raw_hash = *hashes.get(*path).expect("scanned hash");

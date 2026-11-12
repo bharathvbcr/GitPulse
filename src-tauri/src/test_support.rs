@@ -20,6 +20,28 @@ use tempfile::TempDir;
 
 static HARNESS_CLONE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Stamps every generation in a hand-built DevMap fixture store with this
+/// build's resolver epoch, the way `Store::save_generation` stamps a real one.
+///
+/// A fixture that writes payloads under `current_payload_identity` claims a
+/// store the current devmap wrote. Since the store began reading
+/// `analysis_json.resolver_epoch` (`Store::latest_generation_resolver_stamp`),
+/// a generation without the key reads as written before the stamp existed, so
+/// status reports it not fresh and affected-tests fails closed with "stored
+/// extraction payload is obsolete". Fixtures that wrote the identity and not
+/// the stamp failed five tests on the re-vendor that brought the check in,
+/// although it changed nothing they test. One owner, so the next field a
+/// current store must carry is added once.
+pub(crate) fn stamp_current_resolver_epoch(conn: &rusqlite::Connection) {
+    let stamped = conn
+        .execute(
+            "UPDATE generations SET analysis_json = json_set(analysis_json, '$.resolver_epoch', ?1)",
+            [devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH],
+        )
+        .expect("stamp the fixture's generations with the current resolver epoch");
+    assert!(stamped > 0, "the fixture store has no generation to stamp");
+}
+
 /// A private copy of this libtest image. Drop removes it after the child exits.
 pub(crate) struct IsolatedHarnessGuard {
     path: PathBuf,

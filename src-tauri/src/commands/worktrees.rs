@@ -745,6 +745,7 @@ mod tests {
             ),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
         drop(conn);
 
         let repo_str = repo_dir.to_str().expect("repo_str");

@@ -3900,6 +3900,7 @@ pub(crate) mod tests {
         }
         conn.execute("UPDATE generations SET head_sha = ?1", [&head])
             .expect("stamp generation head");
+        crate::test_support::stamp_current_resolver_epoch(&conn);
         conn.execute("UPDATE build_history SET head_sha = ?1", [&head])
             .expect("stamp build history head");
         conn.close().expect("close fixture db");
@@ -4907,8 +4908,9 @@ pub(crate) mod tests {
         repo
     }
 
-    /// Restamps every payload with the identity this build computes, so the
-    /// fixture describes a store the current analyzer wrote.
+    /// Restamps every payload with the identity this build computes, and every
+    /// generation with its resolver epoch, so the fixture describes a store the
+    /// current analyzer and resolver wrote.
     fn stamp_current_payload_identity(repo: &std::path::Path) {
         let (grammar, analyzer) = devmap_extract::cache::current_payload_identity("rust");
         let conn = rusqlite::Connection::open(map_path(repo)).unwrap();
@@ -4917,6 +4919,7 @@ pub(crate) mod tests {
             (&grammar, &analyzer),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
     }
 
     #[test]

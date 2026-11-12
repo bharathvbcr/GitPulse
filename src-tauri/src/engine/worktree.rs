@@ -14921,6 +14921,7 @@ some-future-field whatever
             ),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
         conn.execute(
             "INSERT INTO edge_rows
                (edge_id, source_file_id, target_file_id,
@@ -15111,6 +15112,7 @@ some-future-field whatever
             ),
         )
         .unwrap();
+        crate::test_support::stamp_current_resolver_epoch(&conn);
         drop(conn);
 
         // 1. Refuse `.gitpulse/worktrees/...` targets in both `add_sparse_worktree_zero_copy`
