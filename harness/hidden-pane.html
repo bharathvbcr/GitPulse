@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en" class="macos dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hidden pane under overlays</title>
+  <style>
+    body { margin: 0; background: rgb(11 14 23); }
+    #result { position: fixed; right: 8px; bottom: 8px; font: 11px ui-monospace, monospace; color: #aab; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<pre id="result">Running…</pre>
+<script type="module">
+  // OVERHAUL_PLAN §10: a pane hidden under an overlay can stop its
+  // ResizeObserver from firing, and a VirtualList whose last measurement was
+  // zero renders only its overscan band. The sidebar and the terminal dock now
+  // open as overlays over a VirtualList pane; this page opens, closes, storms
+  // and hides them and asks the list, each time, whether it re-measured and
+  // draws full rows. "Full" is judged by where the rows are, not by a counter.
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { get } from "svelte/store";
+  import { createChecks } from "./checks.ts";
+  import Host from "./HiddenPaneHost.svelte";
+
+  const params = new URLSearchParams(location.search);
+  const errors = [];
+  addEventListener("error", (event) => errors.push(event.message));
+  addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+  const root = "/workspace/alpha";
+  const fixtures = {
+    cmd_devcouncil_init: () => ({ repo: root, state_dir: `${root}/.devmap`, exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false }),
+    cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
+    cmd_get_language_stats: () => ({ stats: [], truncated: false }),
+    // Enough branches and changed files that the sidebar's body scrolls inside
+    // the 520 px shell, and a dirty repository so the rail shows its Ask agent.
+    cmd_list_branches: () => [
+      { name: "main", is_current: true, is_default: true },
+      ...Array.from({ length: 10 }, (_, i) => ({ name: `feat/branch-${i}`, is_current: false, is_default: false })),
+    ].map((b) => ({
+      is_remote: false, remote_name: null, tip_commit_id: `${b.name.length}`.padEnd(12, "a"), ahead_count: 0, behind_count: 0, upstream: null,
+      is_gone: false, last_commit_timestamp: Math.floor(Date.now() / 1000) - 3600, last_author: "Alex", last_summary: "Work",
+      commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0, compared_to: "main", ...b,
+    })),
+    cmd_get_status: () => Array.from({ length: 12 }, (_, i) => ({ path: `src/file-${String(i).padStart(2, "0")}.ts`, old_path: null, status_code: "M", is_staged: false, is_conflicted: false, additions: 3, deletions: 1 })),
+    cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
+    cmd_last_fetch_at: () => null,
+    cmd_note_tab_activated: () => null,
+    cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
+    cmd_list_worktrees: () => [{ path: root, name: "alpha", branch: "main", head: "a".repeat(40), is_main: true, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 2 }],
+    cmd_repository_trust: () => ({ path: root, git_dir: `${root}/.git`, common_dir: `${root}/.git`, identity: "fixture-identity", scope: "repository", worktrees: 1 }),
+    cmd_worktree_task: () => null,
+    cmd_ledger_tail: () => [],
+    cmd_grants_view: () => ({ available: false, path: "", grants: [], error: "" }),
+    cmd_collision_risk: () => ({ ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [], shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "" }),
+  };
+  const unexpected = [];
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (cmd.startsWith("plugin:event|")) return 1;
+      if (fixtures[cmd]) return fixtures[cmd](args);
+      unexpected.push(cmd);
+      return null;
+    },
+    transformCallback: (cb) => cb,
+  };
+
+  const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+  const { layoutStore } = await import("../src/lib/sidebar/layoutStore.ts");
+  const { panelModes } = await import("../src/lib/ui/panelMode.ts");
+  const { themeStore } = await import("../src/lib/stores/themeStore.ts");
+  const { setReduceMotionOverride } = await import("../src/lib/motion/easing.ts");
+  await repoStore.openRepo(root);
+
+  const { results, check, stopped } = createChecks();
+  const $ = (selector, scope = document) => scope.querySelector(selector);
+  const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
+  const frame = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  const settle = async () => { await tick(); await frame(); await frame(); await tick(); };
+  async function until(test, label, ms = 3000) {
+    const end = performance.now() + ms;
+    while (performance.now() < end) { await tick(); if (test()) return true; await frame(); }
+    throw new Error(`Timed out: ${label}`);
+  }
+
+  const host = mount(Host, { target: document.getElementById("app") });
+  await settle();
+
+  const pane = () => $("#pane");
+  const row = () => $("#row");
+  const sidebar = () => $("aside.gp-sidebar");
+  const panel = () => $("[data-sidebar-panel]");
+  const rail = () => $("[data-sidebar-rail-slot]");
+  const dock = () => $("[data-terminal-dock]");
+  const dockShown = () => !!dock() && getComputedStyle(dock()).display !== "none";
+  const scroller = () => {
+    let el = $("[data-row]");
+    while (el && el !== pane()) {
+      const style = getComputedStyle(el);
+      if ((style.overflowY === "auto" || style.overflowY === "scroll") && el.clientHeight > 0) return el;
+      el = el.parentElement;
+    }
+    return null;
+  };
+  /** Where the rows are against where the viewport is: judged by position, not by count. */
+  function fullRows() {
+    const el = scroller();
+    if (!el) return { ok: false, why: "no scroller" };
+    const indexes = $$("[data-row]").map((node) => Number(node.dataset.row));
+    if (!indexes.length) return { ok: false, why: "no rows" };
+    const min = Math.min(...indexes), max = Math.max(...indexes);
+    const first = Math.floor(el.scrollTop / 24), last = Math.floor((el.scrollTop + el.clientHeight - 1) / 24);
+    return { ok: min <= first && max >= last, min, max, first, last, viewport: el.clientHeight };
+  }
+  const full = () => fullRows().ok;
+  const fullEventually = async (label) => { await until(full, `${label}: ${JSON.stringify(fullRows())}`); return true; };
+  const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  const clickBtn = (selector) => { const el = $(selector); if (!el) throw new Error(`missing ${selector}`); click(el); };
+  const width = (el) => el.getBoundingClientRect().width;
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function shot() {
+    const scene = params.get("shot");
+    themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+    document.body.style.background = params.get("theme") === "light" ? "#e9ebf4" : "rgb(11 14 23)";
+    document.documentElement.classList.toggle("light", params.get("theme") === "light");
+    document.documentElement.classList.toggle("dark", params.get("theme") !== "light");
+    if (scene === "sidebar-overlay") panelModes.set("sidebar", "overlay");
+    if (scene === "rail") layoutStore.toggleCollapsed();
+    if (scene === "rail-overlay") { panelModes.set("sidebar", "overlay"); layoutStore.toggleCollapsed(); }
+    if (scene === "dock" || scene === "dock-overlay") { if (scene === "dock-overlay") panelModes.set("dock", "overlay"); host.setDockOpen(true); }
+    if (scene === "skeleton") {
+      const Skeleton = (await import("../src/lib/components/Skeleton.svelte")).default;
+      const stage = document.createElement("div");
+      stage.style.cssText = "position:fixed;inset:0;padding:24px;background:rgb(var(--c-bg));display:grid;gap:16px;align-content:start;max-width:520px";
+      document.body.append(stage);
+      mount(Skeleton, { target: stage, props: { variant: "text", width: "35%", height: "1rem" } });
+      mount(Skeleton, { target: stage, props: { variant: "card" } });
+      mount(Skeleton, { target: stage, props: { variant: "code-lines", count: 8 } });
+      mount(Skeleton, { target: stage, props: { variant: "tree-row", count: 4 } });
+    }
+    await settle(); await wait(500); await settle();
+    document.getElementById("result").textContent = "";
+    document.title = "hidden-pane shot ready";
+  }
+
+  async function run() {
+    // ---- docked, the default -------------------------------------------------
+    await fullEventually("initial mount");
+    check("the sidebar starts docked and the list draws full rows", () => sidebar().dataset.sidebarMode === "docked" && full());
+    const startWidth = width(pane());
+    const rowHeightBefore = scroller().clientHeight;
+    check("the list was measured (a non-zero viewport)", () => rowHeightBefore > 100);
+
+    // The docked toggle animates transform and opacity only, and the workspace
+    // reflows once: at the end of a collapse, at the start of an expand. Each
+    // frame is sampled (workspace width, column width, what is animating).
+    const KEYFRAME_META = new Set(["offset", "easing", "composite", "computedOffset"]);
+    const slideProps = () => [...new Set(sidebar().getAnimations().flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k))))].filter((k) => !KEYFRAME_META.has(k));
+    const openWidth = Math.round(width(sidebar()));
+    async function traceToggle() {
+      const samples = [];
+      const end = performance.now() + 2500;
+      let seen = false;
+      do {
+        const n = sidebar().getAnimations().length;
+        seen ||= n > 0;
+        samples.push({ w: Math.round(width(pane())), sw: Math.round(width(sidebar())), n, props: slideProps() });
+        await frame();
+      } while (performance.now() < end && (sidebar().getAnimations().length || !seen));
+      return samples;
+    }
+    const jumps = (samples) => samples.filter((s, i) => i && Math.abs(s.w - samples[i - 1].w) > 2).length;
+    const propsOf = (samples) => [...new Set(samples.flatMap((s) => s.props))];
+
+    clickBtn('button[aria-label="Collapse sidebar"]');
+    await tick();
+    const collapse = await traceToggle();
+    check(`a docked collapse slides the panel out on transform and opacity only (${propsOf(collapse).join(", ")})`, () => propsOf(collapse).length > 0 && propsOf(collapse).every((p) => p === "transform" || p === "opacity"));
+    check("the slide spans frames with the column still wide", () => collapse.some((s) => s.n > 0 && s.sw > 100));
+    check("the workspace reflows once, and not while the panel is still leaving", () => jumps(collapse) === 1 && collapse.every((s) => !(s.sw > 100 && Math.abs(s.w - startWidth) > 2)));
+    await until(() => Math.round(width(sidebar())) === 44, "docked collapse to the 44 px rail");
+    check("collapsed, the docked sidebar is the 44 px rail with its expand button", () => !!$('[data-sidebar-rail] button[aria-label="Expand sidebar"]'));
+    // The rail is icons only: no label may spill past the 44 px column ("Ask
+    // age"), and the Ask agent button keeps its name as aria-label and tooltip.
+    const railOverflow = () => {
+      const column = sidebar().getBoundingClientRect();
+      const bad = [...sidebar().querySelectorAll("[data-sidebar-rail] *")].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && (r.left < column.left - 0.5 || r.right > column.right + 0.5);
+      });
+      return { bad: bad.map((el) => `${el.tagName}:${(el.textContent || "").trim().slice(0, 12)}`), scroll: sidebar().scrollWidth - sidebar().clientWidth, rail: $("[data-sidebar-rail]").scrollWidth - $("[data-sidebar-rail]").clientWidth };
+    };
+    await until(() => !!$('[data-sidebar-rail] [aria-label="Ask agent"]'), "the rail shows Ask agent for a dirty repository");
+    const askRail = $('[data-sidebar-rail] [aria-label="Ask agent"]');
+    check("the rail's Ask agent is an icon with the label as its name and tooltip, not text", () => (askRail.textContent || "").trim() === "" && askRail.title.length > 0);
+    check("no rail child overflows the 44 px rail's width", () => { const o = railOverflow(); if (o.bad.length || o.scroll > 0 || o.rail > 0) throw new Error(JSON.stringify(o)); return true; });
+    await until(() => sidebar().getAnimations().length === 0, "the collapse animations end");
+    check("nothing lingers after the toggle: no animation, no layout transition on the column", () => {
+      // `all` is the initial property list; it only matters with a duration.
+      const cs = getComputedStyle(sidebar());
+      const durations = cs.transitionDuration.split(",").map((d) => parseFloat(d) * (d.trim().endsWith("ms") ? 1 : 1000));
+      const layout = cs.transitionProperty.split(",").map((p) => p.trim()).filter((p, i) => /^(width|height|all)$/.test(p) && durations[i % durations.length] > 0);
+      return sidebar().getAnimations().length === 0 && layout.length === 0;
+    });
+    check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
+    clickBtn('button[aria-label="Expand sidebar"]');
+    await tick();
+    const expand = await traceToggle();
+    check(`a docked expand slides the panel in on transform and opacity only (${propsOf(expand).join(", ")})`, () => propsOf(expand).length > 0 && propsOf(expand).every((p) => p === "transform" || p === "opacity"));
+    check("the workspace has its final width on the first frame and never moves again", () => Math.abs(expand[0].w - startWidth) < 2 && jumps(expand) === 0 && Math.abs(expand[0].sw - openWidth) < 2);
+    await until(() => Math.abs(width(pane()) - startWidth) < 2, "docked expand settles back to the original pane width");
+    await until(() => sidebar().getAnimations().length === 0, "the expand animations end");
+    await fullEventually("after docked expand");
+    check("expanding restores the pane width and full rows", () => Math.abs(width(pane()) - startWidth) < 2 && full());
+
+    // ---- sidebar overlay ------------------------------------------------------
+    clickBtn("[data-sidebar-mode-toggle]");
+    await settle();
+    check("the mode toggle persists overlay", () => get(panelModes).sidebar === "overlay");
+    check("overlay keeps a 44 px rail in the column and floats the panel", () => !!rail() && Math.round(width(rail())) === 44 && !!panel());
+    const overlayPaneWidth = width(pane());
+    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - (width(row()) - 44)) < 2);
+    check("the panel floats over the workspace and wins the hit test", () => {
+      const p = panel().getBoundingClientRect();
+      const hit = document.elementFromPoint(p.left + p.width / 2, p.top + p.height / 2);
+      return p.right > pane().getBoundingClientRect().left + 100 && panel().contains(hit);
+    });
+    check("the list under the open panel still draws full rows", full);
+
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "overlay panel leaves");
+    await fullEventually("after the overlay closes");
+    check("closing the overlay leaves the rail live and the list full", () => !rail().hasAttribute("inert") && full());
+
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "overlay panel opens from the rail");
+    panel().querySelector("input")?.focus();
+    panel().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await until(() => !panel(), "Escape closes the floating panel");
+    check("Escape inside the floating panel closes it", () => !panel() && full());
+
+    // ---- outside-click dismiss, portal-aware ----------------------------------
+    const down = (el) => el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+    const portaledMenu = () => {
+      const menu = document.createElement("div");
+      menu.className = "gp-menu";
+      menu.setAttribute("role", "menu");
+      menu.innerHTML = '<button class="gp-menu-item" type="button">Item</button>';
+      document.body.appendChild(menu);
+      return menu;
+    };
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "panel for the dismiss checks");
+    down(panel().querySelector("button"));
+    await settle();
+    check("a pointerdown inside the floating sidebar leaves it open", () => !!panel());
+    const sideMenu = portaledMenu();
+    check("the menu sits outside the panel's subtree, under <body>", () => !panel().contains(sideMenu) && sideMenu.parentElement === document.body);
+    down(sideMenu.querySelector("button"));
+    await settle();
+    check("a pointerdown in a portaled menu does not close the sidebar", () => !!panel());
+    sideMenu.remove();
+    down($("[data-row]"));
+    await until(() => !panel(), "outside pointerdown closes the sidebar");
+    check("a pointerdown outside closes the floating sidebar and the list stays full", () => !panel() && !rail().hasAttribute("inert") && full());
+
+    for (let i = 0; i < 20; i += 1) {
+      clickBtn(panel() ? "[data-sidebar-panel] button[aria-label='Collapse sidebar']" : '[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+      await frame();
+    }
+    await wait(400);
+    await settle();
+    check("a 20-toggle storm leaves at most one panel and a full list", () => $$("[data-sidebar-panel]").length <= 1 && full());
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "reopen"); }
+
+    // ---- the hidden-pane class, sidebar overlay open -------------------------
+    host.setShellSize(1000, 680);
+    await settle();
+    await fullEventually("after the shell grew under an open overlay");
+    check("the list re-measures when the shell grows under an open overlay", () => scroller().clientHeight > rowHeightBefore + 100 && full());
+    host.setPaneHidden(true);
+    await settle();
+    host.setShellSize(1000, 520);
+    await settle();
+    host.setPaneHidden(false);
+    await fullEventually("after a hidden pane was resized and shown");
+    check("a pane hidden under the overlay and resized while hidden redraws full rows when shown", () => full() && scroller().clientHeight <= rowHeightBefore + 2);
+    check("it is not left with only its overscan band", () => $$("[data-row]").length * 24 >= scroller().clientHeight);
+
+    // collapse overlay panel, then hide/show with the rail only
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "overlay closes");
+    host.setPaneHidden(true); await settle();
+    host.setPaneHidden(false);
+    await fullEventually("after hide and show with the rail");
+    check("hide and show with only the rail leaves the list full", full);
+
+    // back to docked for the dock cases
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "overlay reopens");
+    clickBtn("[data-sidebar-mode-toggle]");
+    await until(() => !panel() && sidebar().dataset.sidebarMode === "docked", "back to docked");
+    await fullEventually("after returning to docked");
+
+    // ---- terminal dock, docked ----------------------------------------------
+    const listHeight = scroller().clientHeight;
+    host.setDockOpen(true);
+    await until(dockShown, "dock opens");
+    await fullEventually("docked dock open");
+    check("a docked dock takes its own row and the list shrinks to fit", () => dock().dataset.dockMode === "docked" && scroller().clientHeight < listHeight - 50);
+    check("the shrunken list still draws full rows", full);
+    down($("[data-row]"));
+    await settle();
+    check("a docked dock ignores a pointerdown elsewhere: it owns its row", dockShown);
+    host.setDockOpen(false);
+    await until(() => !dockShown(), "docked dock hides");
+    await fullEventually("after the docked dock closes");
+    check("closing the docked dock re-measures: the list is back to its full height with full rows", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+
+    // ---- terminal dock, overlay ---------------------------------------------
+    panelModes.set("dock", "overlay");
+    await settle();
+    host.setDockOpen(true);
+    await until(dockShown, "overlay dock opens");
+    // The slide-in runs 320 ms; geometry is read once it has landed.
+    // The spring overshoots, so crossing the final position is not landing:
+    // wait for the animation itself to finish.
+    await until(() => dock().getAnimations().every((animation) => animation.playState === "finished"), "the dock's slide-in finishes");
+    await settle();
+    check("an overlay dock floats over the pane's bottom edge", () => {
+      const d = dock().getBoundingClientRect(), p = pane().getBoundingClientRect();
+      const ok = dock().dataset.dockMode === "overlay" && getComputedStyle(dock()).position === "absolute" && Math.abs(d.bottom - p.bottom) < 2;
+      if (!ok) throw new Error(`mode=${dock().dataset.dockMode} position=${getComputedStyle(dock()).position} dock.bottom=${d.bottom} pane.bottom=${p.bottom}`);
+      return ok;
+    });
+    check("it does not shrink the list under it, which still draws full rows", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+    check("it rises with the slide-in phase", () => dock().dataset.phase === "slide-in");
+    host.setDockOpen(false);
+    await tick();
+    check("it is held for its exit with the slide-out phase", () => dock().dataset.phase === "slide-out" && dockShown());
+    await until(() => !dockShown(), "overlay dock hides after its exit");
+    check("then hidden, never unmounted, so a shell would survive", () => !!dock() && full());
+
+    for (let i = 0; i < 15; i += 1) { host.setDockOpen(i % 2 === 0); await frame(); }
+    host.setDockOpen(false);
+    await wait(300);
+    await settle();
+    check("a 15-toggle storm ends hidden with a full list", () => !dockShown() && full());
+
+    host.setDockOpen(true);
+    await until(dockShown, "overlay dock for the dismiss checks");
+    await until(() => dock().getAnimations().every((animation) => animation.playState === "finished"), "slide-in finishes");
+    down(dock().querySelector("[data-panel-stub]"));
+    await settle();
+    check("a pointerdown inside the floating dock leaves it open", dockShown);
+    const dockMenu = portaledMenu();
+    down(dockMenu.querySelector("button"));
+    await settle();
+    check("a pointerdown in a portaled menu does not close the dock", dockShown);
+    dockMenu.remove();
+    down($("[data-row]"));
+    await until(() => !dockShown(), "outside pointerdown closes the dock");
+    check("a pointerdown outside closes the floating dock and the list stays full", () => !dockShown() && full());
+
+    // ---- both overlays at once ----------------------------------------------
+    panelModes.set("sidebar", "overlay");
+    await settle();
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "sidebar overlay"); }
+    host.setDockOpen(true);
+    await until(dockShown, "dock over sidebar");
+    await settle();
+    check("both overlays open over the list leave it full", () => !!panel() && dockShown() && full());
+    host.setPaneHidden(true); await settle(); host.setPaneHidden(false);
+    await fullEventually("both overlays, hide and show");
+    host.setDockOpen(false);
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel() && !dockShown(), "both close");
+    await fullEventually("after both close");
+    check("after both close the list is full at its original height", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
+
+    // ---- reduced motion ------------------------------------------------------
+    setReduceMotionOverride(true);
+    document.documentElement.dataset.motion = "reduced";
+    panelModes.set("dock", "overlay");
+    host.setDockOpen(true); await until(dockShown, "dock under reduced motion");
+    host.setDockOpen(false); await tick(); await frame();
+    check("under reduced motion the overlay dock hides at once, with no held exit", () => !dockShown());
+    clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => !!panel(), "panel under reduced motion");
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "panel leaves under reduced motion", 300);
+    check("and the sidebar panel snaps shut", () => !panel() && full());
+    setReduceMotionOverride(false);
+    delete document.documentElement.dataset.motion;
+    panelModes.set("sidebar", "docked"); panelModes.set("dock", "docked");
+
+    // ---- the sidebar's tonal step from the workspace, both themes -------------
+    // Read from the computed styles, as the merge check did. Each fill is
+    // composited over the same backdrop (the theme's --c-bg), so the numbers
+    // are what a reader sees rather than two raw rgba() strings.
+    const parseColor = (value) => {
+      const m = /rgba?\(([^)]+)\)/.exec(value) ?? /color\(srgb ([^)]+)\)/.exec(value);
+      const parts = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+      const scale = value.startsWith("color(") ? 255 : 1;
+      return { rgb: parts.slice(0, 3).map((v) => v * scale), a: parts[3] ?? 1 };
+    };
+    const over = (fill, backdrop) => fill.rgb.map((c, i) => c * fill.a + backdrop[i] * (1 - fill.a));
+    const steps = {};
+    for (const theme of ["dark", "light"]) {
+      document.documentElement.classList.toggle("light", theme === "light");
+      document.documentElement.classList.toggle("dark", theme === "dark");
+      await settle();
+      const backdrop = getComputedStyle(document.documentElement).getPropertyValue("--c-bg").trim().split(/\s+/).map(Number);
+      const side = getComputedStyle(sidebar()).backgroundColor;
+      const plate = getComputedStyle(pane()).backgroundColor;
+      const a = over(parseColor(side), backdrop), b = over(parseColor(plate), backdrop);
+      const step = Math.max(...a.map((c, i) => Math.abs(c - b[i])));
+      steps[theme] = { sidebar: side, workspace: plate, composited: [a.map(Math.round), b.map(Math.round)], step: Math.round(step * 10) / 10 };
+    }
+    document.documentElement.classList.remove("light");
+    document.documentElement.classList.add("dark");
+    window.__sidebarStep = steps;
+    check(`the sidebar steps off the workspace in dark (${steps.dark.step} levels)`, () => steps.dark.step >= 5);
+    check(`and in light, at dark's strength (${steps.light.step} levels)`, () => steps.light.step >= 5 && steps.light.step >= steps.dark.step * 0.8);
+
+    // ---- the sidebar body's scroll edge -----------------------------------------
+    // The body scrolls in the open panel. While content remains below, the
+    // chevron sits in a band the content is fully faded out of (so no row is
+    // drawn under it); at the end of the list there is no fade and no chevron,
+    // and the last row clears the bottom edge.
+    // A taller shell: the branch list is the flexible part of the sidebar and
+    // collapses to its padding in 520 px, leaving nothing to scroll.
+    host.setShellSize(1000, 900);
+    panelModes.set("sidebar", "overlay");
+    await settle();
+    if (!panel()) { clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]'); await until(() => !!panel(), "panel for the scroll-edge checks"); }
+    await until(() => panel().getAnimations().every((animation) => animation.playState === "finished"), "the panel's slide-in finishes");
+    const body = () => panel().querySelector(".overflow-y-auto");
+    const list = () => panel().querySelector(".will-change-scroll.overflow-y-auto");
+    const remPx = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
+    const downCue = (scroller) => [...scroller.parentElement.children].map((c) => c !== scroller && c.querySelector('button[aria-label="Scroll down"]')).find(Boolean) || null;
+    check("the sidebar body overflows the shell", () => body().scrollHeight > body().clientHeight + 100);
+    check("the branch list scrolls inside it", () => !!list() && list().scrollHeight > list().clientHeight + 20);
+    body().scrollTop = 0;
+    list().scrollTop = 0;
+    await until(() => body().getAttribute("data-gp-fade") === "y-end" && list().getAttribute("data-gp-fade") === "y-end", "a bottom fade on the body and on the branch list");
+    for (const [name, scroller] of [["body", body()], ["branch list", list()]]) {
+      const band = parseFloat(getComputedStyle(scroller).getPropertyValue("--gp-sidebar-cue-band")) * remPx();
+      // Where the resolved mask stops being fully transparent, in px from the
+      // edge; a transparent stop with no length (the generic fade) clears 0.
+      const clear = parseFloat(/(?:transparent|rgba\(0, ?0, ?0, ?0\))\s+(-?\d+(?:\.\d+)?)px/.exec(maskOf(scroller))?.[1] ?? "0");
+      check(`the ${name}'s fade clears the cue band entirely (${Math.round(clear)} px of ${Math.round(band)} px)`, () => Number.isFinite(clear) && clear >= band - 0.5);
+      // The list yields its chevron to the body's while their edges touch, so a
+      // chevron is judged only where it is drawn.
+      const btn = downCue(scroller);
+      if (btn) {
+        const depth = scroller.getBoundingClientRect().bottom - btn.getBoundingClientRect().top;
+        check(`and the ${name}'s chevron sits wholly inside it (${Math.round(depth)} px)`, () => depth <= clear + 0.5);
+      }
+    }
+    check("at least one bottom chevron is drawn", () => $$('[data-sidebar-panel] button[aria-label="Scroll down"]').length >= 1);
+    list().scrollTop = list().scrollHeight;
+    body().scrollTop = body().scrollHeight;
+    await wait(300);
+    await settle();
+    for (const [name, scroller, clearance] of [["body", body(), 8], ["branch list", list(), 6]]) {
+      check(`at the end of the ${name} the bottom fade and chevron are gone`, () => {
+        const state = { fade: scroller.getAttribute("data-gp-fade"), top: scroller.scrollTop, max: scroller.scrollHeight - scroller.clientHeight, cue: !!downCue(scroller) };
+        if (state.fade?.includes("end") || state.fade === "y-both" || state.cue) throw new Error(JSON.stringify(state));
+        return true;
+      });
+      const edge = scroller.getBoundingClientRect().bottom;
+      const last = scroller === body() ? scroller.lastElementChild.getBoundingClientRect() : scroller.firstElementChild.getBoundingClientRect();
+      check(`and the ${name}'s last row clears the bottom edge (${Math.round(edge - last.bottom)} px)`, () => edge - last.bottom >= clearance);
+    }
+    body().scrollTop = 0;
+    list().scrollTop = 0;
+    await settle();
+    host.setShellSize(1000, 520);
+    await settle();
+
+    // ---- the floating panel off the workspace, light ---------------------------
+    // WCAG relative luminance on the composited sRGB values. The edge is a
+    // separator, so it is held to 3:1 against the workspace it overlaps.
+    {
+      document.documentElement.classList.remove("dark");
+      document.documentElement.classList.add("light");
+      await settle();
+      const lin = (c) => { const v = c / 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+      const lum = (rgb) => 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+      const ratio = (a, b) => { const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x); return (hi + 0.05) / (lo + 0.05); };
+      const bgVar = getComputedStyle(document.documentElement).getPropertyValue("--c-bg").trim().split(/\s+/).map(Number);
+      const workspace = over(parseColor(getComputedStyle(pane()).backgroundColor), bgVar);
+      const cs = getComputedStyle(panel());
+      let fill = over(parseColor(cs.backgroundColor), workspace);
+      const wash = /rgba?\([^)]+\)/.exec(cs.backgroundImage);
+      if (wash) fill = over(parseColor(wash[0]), fill);
+      const edge = over(parseColor(cs.borderTopColor), fill);
+      const m = { workspace: workspace.map(Math.round), fill: fill.map(Math.round), edge: edge.map(Math.round), fillVsWorkspace: Math.round(ratio(fill, workspace) * 100) / 100, edgeVsWorkspace: Math.round(ratio(edge, workspace) * 100) / 100, edgeVsFill: Math.round(ratio(edge, fill) * 100) / 100, levels: Math.round(Math.max(...fill.map((c, i) => Math.abs(c - workspace[i])))), blur: cs.backdropFilter };
+      window.__floatingLight = m;
+      check(`the light floating panel steps off the workspace by ${m.levels} levels (${m.fillVsWorkspace}:1)`, () => m.levels >= 14);
+      check(`its edge is a 3:1 separator against the workspace (${m.edgeVsWorkspace}:1) and the panel (${m.edgeVsFill}:1)`, () => m.edgeVsWorkspace >= 3 && m.edgeVsFill >= 3);
+      check("the floating panel keeps its blur: it is floating chrome", () => m.blur !== "none");
+      document.documentElement.classList.remove("light");
+      document.documentElement.classList.add("dark");
+      await settle();
+    }
+    clickBtn("[data-sidebar-panel] button[aria-label='Collapse sidebar']");
+    await until(() => !panel(), "the panel closes after the scroll-edge checks");
+    panelModes.set("sidebar", "docked");
+    await settle();
+
+    // ---- the docked toggle under reduced motion, and a toggle storm ---------------
+    if ($('[data-sidebar-rail] button[aria-label="Expand sidebar"]')) clickBtn('[data-sidebar-rail] button[aria-label="Expand sidebar"]');
+    await until(() => width(sidebar()) > 200 && sidebar().getAnimations().length === 0, "the docked sidebar is open for the reduced-motion checks");
+    setReduceMotionOverride(true);
+    document.documentElement.dataset.motion = "reduced";
+    clickBtn('button[aria-label="Collapse sidebar"]');
+    await tick();
+    check("under reduced motion a docked collapse is immediate: no animation, the 44 px rail", () => sidebar().getAnimations().length === 0 && Math.round(width(sidebar())) === 44 && !!$('[data-sidebar-rail]'));
+    clickBtn('button[aria-label="Expand sidebar"]');
+    await tick();
+    check("and a docked expand is immediate: no animation, the open panel", () => sidebar().getAnimations().length === 0 && width(sidebar()) > 200 && !$('[data-sidebar-rail]'));
+    setReduceMotionOverride(false);
+    delete document.documentElement.dataset.motion;
+    for (let i = 0; i < 20; i += 1) {
+      clickBtn(sidebar().querySelector('button[aria-label="Collapse sidebar"]') ? 'button[aria-label="Collapse sidebar"]' : 'button[aria-label="Expand sidebar"]');
+      await frame();
+    }
+    await wait(400);
+    await settle();
+    await until(() => sidebar().getAnimations().length === 0, "the storm's animations end");
+    {
+      // An even number of toggles from open ends open, however they overlapped.
+      check("a 20-toggle docked storm ends open, settled and with a full list", () => width(sidebar()) > 200 && !!$("[data-sidebar-panel], aside.gp-sidebar [role=separator]") && Math.abs(width(pane()) - startWidth) < 2 && full());
+    }
+
+    check("no runtime errors", () => errors.length === 0);
+    document.getElementById("result").textContent = `${results.length}/${results.length} passed`;
+  }
+
+  if (params.has("shot")) { await shot(); } else
+  try { await run(); } catch (error) { document.getElementById("result").textContent = stopped(error); }
+  document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify({ checks: results.length, sidebarStep: window.__sidebarStep, unexpected: [...new Set(unexpected)].length }) }));
+  if (!params.has("shot") && params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+</script>
+</body>
+</html>

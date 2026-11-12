@@ -90,7 +90,7 @@ export async function requestRepositoryTrust(path: string, confirmLabel: string,
     title: extending ? "Extend trust to this repository's worktrees?" : "Trust this repository?",
     message: extending
       ? extensionMessage(preview)
-      : `${preview.path}\n\nOpening or operating on this checkout can run Git hooks, helpers, and project tools with your account's permissions, including code in its submodules. Trust it only if you trust its source and contents. This decision also allows GitPulse's MCP tools to read this checkout.\n\n${scopeOf(preview)}`,
+      : `${preview.path}\n\nOpening or operating on this checkout can run Git hooks, helpers, and the repository's own tools with your account's permissions, including code in its submodules. Trust it only if you trust its source and contents. This decision also allows GitPulse's MCP tools to read this checkout.\n\n${scopeOf(preview)}`,
     confirmLabel: extending ? "Extend Trust" : confirmLabel,
     cancelLabel: extending ? "Not Now" : "Cancel",
   });

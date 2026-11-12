@@ -38,7 +38,28 @@
 </script>
 
 <script lang="ts">
+  import { motionMs } from "../motion/tokens";
+  import { springEasing } from "../ui/transitions";
   import Skeleton from "./Skeleton.svelte";
+
+  /** How far a freshly loaded view rises into place (px). */
+  const VIEW_RISE_PX = 6;
+  const spatial = springEasing("spatial");
+
+  /*
+   * Skeleton to content hand-off. The skeleton leaves in its own 70 ms exit
+   * (Skeleton.svelte); the view then enters on the `base` token with a small
+   * rise. transform and opacity only, and `motionMs` is 0 under reduced
+   * motion, so the hand-off becomes a cut. Svelte's css form compiles this to a
+   * keyframe animation, so it runs off the main thread.
+   */
+  function viewEnter(_node: Element) {
+    return {
+      duration: motionMs("base"),
+      easing: spatial,
+      css: (t: number, u: number) => `opacity: ${t}; transform: translate3d(0, ${u * VIEW_RISE_PX}px, 0)`,
+    };
+  }
 
   interface Props {
     load: ViewLoader;
@@ -59,8 +80,14 @@
   let { load, name, props = {} }: Props = $props();
 
   let view = $derived(resolved.get(load));
+  /**
+   * True once this instance has waited for a chunk. A view that was already
+   * cached mounts plainly, with no wrapper and no entrance, so a tab revisit
+   * never replays the hand-off.
+   */
+  let handedOff = $state(false);
   let failure = $state<string | null>(null);
-  /** Bumped by Retry to re-run the load effect for the same loader. */
+  /** Bumped by Try again to re-run the load effect for the same loader. */
   let attempt = $state(0);
 
   $effect(() => {
@@ -75,6 +102,13 @@
     failure = null;
     loader().then(
       (module) => {
+        // Several instances of one loader (the dock's panel per tab) all start
+        // before any chunk lands. The first to land hands off; a sibling that
+        // finds the view already resolved is mounted plainly, and flipping it
+        // to the wrapper branch now would remount the view, which a terminal
+        // panel answers by opening another shell.
+        if (resolved.has(loader)) return;
+        handedOff = true;
         resolved.set(loader, module.default);
       },
       (error: unknown) => {
@@ -88,7 +122,12 @@
   });
 </script>
 
-{#if view}
+{#if view && handedOff}
+  {@const View = view}
+  <div class="flex-1 flex flex-col min-h-0 min-w-0" in:viewEnter data-lazy-view-handoff>
+    <View {...props} />
+  </div>
+{:else if view}
   {@const View = view}
   <View {...props} />
 {:else if failure}
@@ -96,9 +135,9 @@
     class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center font-sans"
     role="alert"
   >
-    <span class="text-sm text-textPrimary">{name} could not be loaded.</span>
-    <span class="text-[11px] text-textMuted max-w-md">{failure}</span>
-    <span class="text-[11px] text-textMuted max-w-md">
+    <span class="text-sm text-textPrimary">{name} couldn't be loaded.</span>
+    <span class="text-meta text-textMuted max-w-md">{failure}</span>
+    <span class="text-meta text-textMuted max-w-md">
       This view ships as its own chunk, so a failed load means the install is
       incomplete — not that the view has nothing to show.
     </span>
@@ -106,7 +145,7 @@
          transient fetch failure is the common case, and retrying in place
          keeps the rest of the session (open tabs, terminal, selection). -->
     <button type="button" class="gp-btn mt-1" onclick={() => { failure = null; attempt += 1; }}>
-      Retry
+      Try again
     </button>
   </div>
 {:else}

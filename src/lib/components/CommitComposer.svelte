@@ -10,11 +10,15 @@
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "@lucide/svelte";
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
+  import { AGENT_COMMIT_CLEAN } from "../commit/agentCommit";
+  import Checkbox from "./Checkbox.svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import HookRunNotice from "./HookRunNotice.svelte";
   import IdentityPrompt from "./IdentityPrompt.svelte";
   import { ipcErrorKind, type IpcErrorKind } from "../ipc/invoke";
   import MarkdownBody from "./MarkdownBody.svelte";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { repoScope } from "../repos/repoScope.svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { previewStore, previewSummary } from "../codeintel/previewStore";
@@ -71,10 +75,18 @@
 
   let quickCommit = $derived(includeUnstaged && !isAmending);
   let commitCount = $derived(quickCommit ? dirtyCount : stagedFiles.length);
+  let nothingToCommit = $derived(
+    quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending,
+  );
   let commitDisabled = $derived(
-    !commitMessage.trim() ||
-      conflictedCount > 0 ||
-      (quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending),
+    !commitMessage.trim() || conflictedCount > 0 || nothingToCommit,
+  );
+  let commitTitle = $derived(
+    nothingToCommit
+      ? AGENT_COMMIT_CLEAN
+      : quickCommit
+        ? `Stage all changes and commit (${shortcutTextLabel("⌘⇧↵", $hostPlatform.os)})`
+        : `Commit staged files (${shortcutTextLabel("⌘↵", $hostPlatform.os)})`,
   );
 
   // A1: one preview batch for staged paths — DiffFileRail reads the same store.
@@ -184,7 +196,8 @@
       commitDraft.set(result.text);
     } catch (err: unknown) {
       if (!tabScope.isCurrent(epoch)) return;
-      aiError = formatError(err);
+      const failure = describeFailure({ verb: "write", object: "a commit message" }, err);
+      aiError = failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
     } finally {
       if (tabScope.isCurrent(epoch)) isGenerating = false;
     }
@@ -253,12 +266,14 @@
   }
 </script>
 
-<!-- Full width and flush to the sidebar's foot: rounded top corners mark it
-     off the list above, and the sidebar's own rounded edge clips its bottom. -->
-<div class="rounded-t-xl border-t border-border/70 p-3 bg-surface flex flex-col gap-2 shrink-0">
+<!-- Full width and flush to the sidebar's foot: rounded top corners and the
+     surface step mark it off the list above (no rule), and the sidebar's own
+     rounded edge clips its bottom. -->
+<div class="rounded-t-xl p-3 bg-surface flex flex-col gap-2 shrink-0">
   <div class="flex items-center justify-between">
-    <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Commit</span>
+    <span class="gp-label">Commit</span>
     <button
+      type="button"
       onclick={generateMessage}
       disabled={isGenerating || stagedFiles.length === 0}
       title={stagedFiles.length === 0
@@ -268,7 +283,8 @@
           : appleReady(apple)
             ? "Write the message on-device. The patch is classified in the app; Apple Intelligence only phrases the subject."
             : "Write a message from the staged diff. No model is running, so GitPulse assembles it from the change."}
-      class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+      class="gp-btn"
+      data-size="sm"
     >
       {#if isGenerating}
         <Loader size={12} class="animate-spin" />
@@ -283,29 +299,27 @@
   {#if stagedFiles.length > 0}
     <!-- A1: what this commit breaks — every PreviewReport honesty field. -->
     <div
-      class="flex flex-col gap-1 rounded-lg border border-border/60 bg-background/60 p-2"
+      class="flex flex-col gap-1 rounded-lg bg-background p-2"
       data-testid="commit-preview-breaks"
     >
       <div class="flex items-center justify-between gap-2">
-        <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted"
-          >What this commit breaks</span
-        >
+        <span class="gp-label">What this commit breaks</span>
         {#if $previewStore.loading}
-          <Loader size={11} class="animate-spin text-textMuted" />
+          <span class="text-micro text-textMuted" role="status">Checking…</span>
         {/if}
       </div>
       {#if $previewSummary}
         <p
-          class="text-[11px] leading-snug {$previewSummary.unreliableFiles > 0 ||
+          class="text-meta leading-snug {$previewSummary.unreliableFiles > 0 ||
           $previewSummary.unavailableFiles > 0 ||
           $previewSummary.brokenCallerTotal > 0
-            ? 'text-amber-500'
+            ? 'text-warn'
             : 'text-textSecondary'}"
         >
           {$previewSummary.headline}
         </p>
         {#if $previewSummary.outcomeReason}
-          <p class="text-[10px] text-textMuted">{$previewSummary.outcomeReason}</p>
+          <p class="text-micro text-textMuted">{$previewSummary.outcomeReason}</p>
         {/if}
         <!-- One row per file: the filename, and the first thing the preview
              actually found. The per-field telemetry that used to fill six
@@ -316,15 +330,15 @@
           {#each $previewSummary.files as file (file.file_path)}
             {@const marker = markerForHonesty(file)}
             <li
-              class="flex items-baseline gap-1.5 rounded px-1 py-0.5 text-[10px] leading-snug hover:bg-surfaceHover/50"
+              class="flex items-baseline gap-1.5 rounded px-1 py-0.5 text-micro leading-snug hover:bg-surfaceHover/50"
               title={marker.title}
             >
               <span
                 class="mt-px size-1.5 shrink-0 rounded-full {marker.kind === 'breaks'
-                  ? 'bg-rose-500'
+                  ? 'bg-danger'
                   : marker.kind === 'clean'
-                    ? 'bg-emerald-500'
-                    : 'bg-amber-500'}"
+                    ? 'bg-ok'
+                    : 'bg-warn'}"
                 aria-hidden="true"
               ></span>
               <span class="min-w-0 shrink truncate font-mono text-textSecondary">
@@ -334,8 +348,8 @@
                 class="min-w-0 flex-1 truncate text-right {marker.kind === 'clean'
                   ? 'text-textMuted'
                   : marker.kind === 'breaks'
-                    ? 'text-rose-500'
-                    : 'text-amber-600 dark:text-amber-400'}"
+                    ? 'text-danger'
+                    : 'text-warn'}"
               >
                 {fileGlance(file)}
               </span>
@@ -348,13 +362,13 @@
              evidence behind it. -->
         {#if $previewSummary.files.length > 0}
           <details class="mt-1">
-            <summary class="cursor-pointer text-[10px] text-textMuted hover:text-textPrimary">
+            <summary class="cursor-pointer text-micro text-textMuted hover:text-textPrimary">
               Preview details
             </summary>
             <ul class="mt-1 flex max-h-40 flex-col gap-1 overflow-y-auto gp-scroll">
               {#each $previewSummary.files as file (file.file_path)}
                 <li
-                  class="rounded border border-border/40 px-1.5 py-1 font-mono text-[9px] leading-relaxed text-textMuted"
+                  class="rounded bg-surface px-1.5 py-1 font-mono text-micro leading-relaxed text-textMuted"
                 >
                   <div class="truncate text-textSecondary" title={file.file_path}>
                     {file.file_path}
@@ -366,25 +380,25 @@
                     · delta={file.delta_available ? "yes" : "no"}
                   </div>
                   {#if file.degraded_reason}
-                    <div class="text-amber-500">degraded: {file.degraded_reason}</div>
+                    <div class="text-warn">degraded: {file.degraded_reason}</div>
                   {/if}
                   <div>
-                    bodies_not_compared={file.bodies_not_compared}
-                    · ambiguous_callers={file.ambiguous_callers}
+                    bodies not compared={file.bodies_not_compared}
+                    · ambiguous callers={file.ambiguous_callers}
                     · broken={file.broken_shown}/{file.broken_total}{file.broken_truncated
                       ? " (truncated)"
                       : ""}
                   </div>
                   {#if file.walk_incomplete}
                     {@const walk = tooltipWalkIncomplete([file.walk_incomplete])}
-                    <div class="line-clamp-2 text-amber-500" title={walk}>
+                    <div class="line-clamp-2 text-warn" title={walk}>
                       walk incomplete: {walk}
                     </div>
                   {/if}
                   {#if !file.available}
-                    <div class="text-amber-500">unavailable: {file.reason}</div>
+                    <div class="text-warn">unavailable: {file.reason}</div>
                   {:else if file.unreliable}
-                    <div class="text-amber-500">unreliable preview — not "nothing breaks"</div>
+                    <div class="text-warn">unreliable preview — not "nothing breaks"</div>
                   {/if}
                 </li>
               {/each}
@@ -410,16 +424,16 @@
     onkeydown={onMessageKeydown}
     aria-label="Commit message"
     aria-describedby={keysId}
-    placeholder="Commit message (e.g. feat: add auth)..."
+    placeholder="Commit message (e.g. feat: add auth)…"
     rows="3"
-    class="w-full bg-background border border-border/80 rounded-xl p-2.5 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden focus:border-accent/60 resize-none font-mono transition-colors"
+    class="gp-field-multi w-full resize-none font-mono"
   ></textarea>
   <span id={keysId} class="sr-only">Cmd/Ctrl Enter commits staged files. Cmd/Ctrl Shift Enter stages everything and commits.</span>
 
   {#if generation}
     <!-- Provenance for the suggestion: which model wrote it, against how much
          context, from how much of the diff, and how long it took. -->
-    <div class="text-[10px] text-textMuted leading-relaxed">
+    <div class="text-micro text-textMuted leading-relaxed">
       <span class="font-mono">{generation.model}</span>
       · {generation.context_source}
       {#if generation.prompt_tokens > 0}
@@ -427,11 +441,11 @@
       {/if}
       · {duration(generation.elapsed_ms)}
       {#if !generation.budget.planned_by_harness}
-        · <span class="text-amber-400">budget estimated locally</span>
+        · <span class="text-warn">budget estimated locally</span>
       {/if}
     </div>
     {#each generation.warnings as warning}
-      <div class="text-[10px] text-amber-400 flex items-start gap-1">
+      <div class="text-micro text-warn flex items-start gap-1">
         <AlertTriangle size={11} class="mt-px shrink-0" />
         <span>{warning}</span>
       </div>
@@ -439,7 +453,7 @@
   {/if}
 
   {#if aiError}
-    <div role="alert" class="text-[10px] text-rose-400 flex items-start gap-1">
+    <div role="alert" class="text-micro text-danger flex items-start gap-1">
       <AlertTriangle size={11} class="mt-px shrink-0" />
       <span>{aiError}</span>
     </div>
@@ -455,11 +469,11 @@
       onDismiss={() => { commitError = null; void focusMessage(); }}
     />
   {:else if commitError}
-    <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError.message}</div>
+    <div class="text-micro text-danger whitespace-pre-wrap font-mono leading-relaxed">{commitError.message}</div>
   {:else if lastVerdict}
     <div
-      class="text-[10px] flex flex-col gap-0.5 {lastVerdict.status === 'unchecked'
-        ? 'text-amber-400'
+      class="text-micro flex flex-col gap-0.5 {lastVerdict.status === 'unchecked'
+        ? 'text-warn'
         : 'text-textMuted'}"
     >
       <div class="flex items-start gap-1">
@@ -472,58 +486,66 @@
       </div>
       <MarkdownBody
         source={verdictDetail(lastVerdict)}
-        class="text-[10px] text-textMuted pl-4"
+        class="text-micro text-textMuted pl-4"
       />
     </div>
   {/if}
 
-  <!-- The two toggles keep their own text on one line and the ROW wraps when
-       the sidebar is too narrow for all three controls. Without this, "Include
-       unstaged" broke across two lines inside its own label and dragged the
-       commit button's row height with it. -->
-  <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+  <!-- The two toggles keep their own text on one line and their row wraps
+       when the sidebar is too narrow. Commit and Ask agent are one split pill
+       as wide as the message box: Commit takes the width, the sparkle stays a
+       fixed icon segment that opens the same agent dialog. -->
+  <div class="flex flex-col gap-1.5">
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
-      <label
-        class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-textMuted cursor-pointer"
-      >
-        <input
-          type="checkbox"
+      <span class="shrink-0 whitespace-nowrap">
+        <Checkbox
+          label="Amend"
           checked={isAmending}
-          onchange={(e) => repoStore.setAmending((e.currentTarget as HTMLInputElement).checked)}
-          class="rounded accent-accent"
+          onchange={(next) => repoStore.setAmending(next)}
         />
-        <span>Amend</span>
-      </label>
-      <label
-        class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-textMuted cursor-pointer {isAmending
-          ? 'opacity-40 cursor-not-allowed'
-          : ''}"
+      </span>
+      <span
+        class="shrink-0 whitespace-nowrap"
         title="Stage remaining files and commit them together (quick commit)"
       >
-        <input
-          type="checkbox"
+        <Checkbox
+          label="Include unstaged"
+          ariaLabel="Include unstaged files in this commit"
           checked={includeUnstaged}
           disabled={isAmending}
-          aria-label="Include unstaged files in this commit"
-          onchange={(e) => (includeUnstaged = (e.currentTarget as HTMLInputElement).checked)}
-          class="rounded accent-accent"
+          onchange={(next) => (includeUnstaged = next)}
         />
-        <span>Include unstaged</span>
-      </label>
+      </span>
     </div>
-    <div class="flex items-center gap-1.5 shrink-0">
-      <AgentCommitMenu compact={true} align="right" direction="up" />
+    <div
+      role="group"
+      aria-label="Commit"
+      data-commit-split
+      class="flex w-full min-w-0 items-stretch overflow-hidden rounded-full {commitDisabled
+        ? ''
+        : 'shadow-[var(--shadow-glow)]'}"
+    >
       <button
+        type="button"
         onclick={() => void handleCommit()}
         disabled={commitDisabled}
-        title={quickCommit
-          ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
-          : "Commit staged files (Cmd/Ctrl+Enter)"}
-        class="gp-btn-primary shrink-0 whitespace-nowrap"
+        title={commitTitle}
+        class="gp-btn min-w-0 flex-1 justify-center rounded-none shadow-none whitespace-nowrap"
+        data-variant="primary"
       >
         <Send size={12} />
         <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
       </button>
+      <!-- Dims with Commit: a full-strength rule across a disabled pill read
+           as a live seam. -->
+      <span
+        data-commit-split-divider
+        class="w-px shrink-0 self-stretch bg-white/40 {commitDisabled ? 'opacity-40' : ''}"
+        aria-hidden="true"
+      ></span>
+      <div class="flex shrink-0 self-stretch">
+        <AgentCommitMenu segment align="right" direction="up" />
+      </div>
     </div>
   </div>
 </div>

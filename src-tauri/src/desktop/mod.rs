@@ -579,6 +579,15 @@ fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// that silently does nothing. `host_platform` asserts the two agree.
 pub const DOCK_HIDING: bool = cfg!(target_os = "macos");
 
+/// Whether the window sits on a native translucent material.
+///
+/// The `html.macos` glass tokens (material intensity, float blur, the
+/// background field) only mean something over `NSVisualEffectView`; Windows and
+/// Linux paint an opaque window. The frontend gates the Appearance material
+/// settings on this capability, not on the OS name. `host_platform` asserts the
+/// two agree.
+pub const NATIVE_MATERIAL: bool = cfg!(target_os = "macos");
+
 /// Dock visibility for menu-bar-only mode. Pure so MockRuntime tests can pin the matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockMode {

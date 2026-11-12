@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { devmapCheckRows, runDevmapChecks, stressDevmap } from "./devmapChecks";
+  import { runDevmapChecks, stressDevmap } from "./devmapChecks";
+  import { createChecks, type CheckRow } from "./checks";
   import { onMount } from "svelte";
   import CodeGraphCanvas from "../src/lib/components/CodeGraphCanvas.svelte";
   import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
@@ -21,57 +22,65 @@
   let show = $state(true);
   let verdict = $state("");
   let checking = $state(false);
-  async function runChecks(stress = false) {
+  /** Run the runtime checks (or the stress pass) and return the rows. A failed
+   * check ends the run with a row naming where it stopped, so the verdict never
+   * reads as a shorter list of passes. */
+  async function runChecks(stress = false): Promise<{ rows: CheckRow[]; errors: string[] }> {
     checking = true;
     const errors: string[] = [];
     const onError = (event: ErrorEvent) => errors.push(event.message);
     const onRejection = (event: PromiseRejectionEvent) => errors.push(String(event.reason));
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
+    const { results, check, stopped } = createChecks();
     try {
-      const result = await (stress ? stressDevmap : (setLoad: (next: GraphVizLoad | null) => void) => runDevmapChecks(setLoad, id => focusId = id))(next => load = next);
+      const summary = stress
+        ? await stressDevmap(next => load = next, check)
+        : await runDevmapChecks(next => load = next, check, id => focusId = id);
       for (let i=0;i<3;i++) await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
-      if (errors.length) throw new Error(`Browser runtime errors: ${errors.join("; ")}`);
-      verdict = result;
+      check("no unhandled runtime errors", () => errors.length === 0);
+      verdict = summary;
     }
-    catch (error) { verdict = `FAIL: ${String(error)}`; }
+    catch (error) { verdict = `FAIL: ${stopped(error)}`; }
     finally {
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejection);
       checking = false;
     }
+    return { rows: results, errors };
   }
-  // `?check=1` (the browser runners) runs both suites and reports every guard
-  // that ran as its own row, then each suite's verdict: the runners refuse a
-  // page that reports only a handful of rows.
-  async function reportChecks() {
-    const results: Array<{ name: string; pass: boolean }> = [];
+  /** `?check=1&report=…` is how the regression gate drives a page: run both
+   * suites (runtime, then the 5,000-node stress pass), publish every check of
+   * each as its own row on the document element, and POST the page back. A
+   * suite that stopped early carries the row that says where. */
+  async function reportToGate(report: string) {
+    const results: CheckRow[] = [];
     const errors: string[] = [];
-    for (const [name, stress] of [["runtime checks", false], ["stress checks", true]] as const) {
-      devmapCheckRows.length = 0;
-      await runChecks(stress);
-      for (const row of devmapCheckRows) results.push({ name: `${name}: ${row.name}`, pass: row.pass });
-      results.push({ name, pass: verdict.startsWith("PASS") });
-      if (!verdict.startsWith("PASS")) errors.push(`${name}: ${verdict}`);
+    const verdicts: string[] = [];
+    for (const [suite, stress] of [["runtime checks", false], ["stress checks", true]] as const) {
+      const { rows, errors: suiteErrors } = await runChecks(stress);
+      for (const row of rows) results.push({ name: `${suite}: ${row.name}`, pass: row.pass });
+      for (const message of suiteErrors) errors.push(`${suite}: ${message}`);
+      verdicts.push(`${suite}: ${verdict}`);
     }
-    document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify([verdict]) })));
-    const report = new URLSearchParams(location.search).get("report");
-    if (report) await fetch(report, { method: "POST", body: document.documentElement.outerHTML });
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, diagnostics: JSON.stringify(verdicts) }));
+    if (report.startsWith("/__gp_result/")) await fetch(report, { method: "POST", body: document.documentElement.outerHTML });
   }
   onMount(async () => {
-    themeStore.setTheme(new URLSearchParams(location.search).get("theme") === "light" ? "light" : "dark");
-    if (new URLSearchParams(location.search).has("real")) {
+    const params = new URLSearchParams(location.search);
+    themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+    if (params.has("real")) {
       const response = await fetch("./.devmap-preview.json");
       if (!response.ok) throw new Error(`Preview fixture: ${response.status}`);
       load = {available: true, kind: "code_graph", payload: await response.json()};
     }
-    if (new URLSearchParams(location.search).has("check")) await reportChecks();
+    if (params.get("check") === "1") await reportToGate(params.get("report") ?? "");
   });
 </script>
 <div style="display:flex;gap:8px;align-items:center;padding:24px 20px 8px;background:#10151f;color:#9baac0;font:11px system-ui">
   <span style="flex:1">DevMap · browser verification</span>
-  <button onclick={() => runChecks()} disabled={checking || !show}>Run runtime checks</button>
-  <button onclick={() => runChecks(true)} disabled={checking || !show}>Run stress checks</button>
+  <button onclick={() => void runChecks()} disabled={checking || !show}>Run runtime checks</button>
+  <button onclick={() => void runChecks(true)} disabled={checking || !show}>Run stress checks</button>
   <span role="status" data-testid="runtime-verdict">{verdict}</span>
   <button onclick={() => themeStore.toggle()}>Toggle theme</button>
   <button onclick={() => { load = {available: true, kind: "code_graph", payload: {...fixture, nodes: fixture.nodes.map(n => ({...n, name: `Updated ${n.name}`}))}}; }}>Replace same-count payload</button>

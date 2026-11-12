@@ -110,7 +110,7 @@
           {summary.caveats.length === 1 ? "reason" : "reasons"} this is not a complete
           all-clear — show
         </span>
-        <span class="hidden group-open:inline">Hide what this scan could not establish</span>
+        <span class="hidden group-open:inline">Hide what this scan couldn't establish</span>
       </summary>
       <ul class="mt-2 space-y-1 text-meta text-textSecondary list-disc pl-4">
         {#each summary.caveats as caveat, index (`${index}:${caveat}`)}

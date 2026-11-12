@@ -58,7 +58,7 @@ const QUALIFIERS: Array<{ name: string; apply: (r: ComposedBlastRadius) => void 
 ];
 
 /** Words that tell the reader the number is not exact. Case is presentational. */
-const HEDGES = ["at least", "up to", "roughly", "interrupted", "incomplete", "could not"];
+const HEDGES = ["at least", "up to", "roughly", "interrupted", "incomplete", "couldn't"];
 
 const hedged = (headline: string) =>
   HEDGES.some((h) => headline.toLowerCase().includes(h));
@@ -175,7 +175,7 @@ describe("blastGlance direction of error", () => {
       }),
     );
     expect(g.caveats).toContain("1 file stopped before the walk finished");
-    expect(g.caveats).toContain("1 file could not be walked");
+    expect(g.caveats).toContain("1 file couldn't be walked");
   });
 });
 

@@ -179,14 +179,14 @@ export function evidenceTitle(evidence: string): string {
     return "The commit changed the body of a symbol the symptom reaches.";
   if (evidence === "moved_only")
     return "The commit moved these lines without changing the body — a reformat or a move, not a behaviour change on its own.";
-  return "Whether the body changed could not be established. Not the same as unchanged.";
+  return "Whether the body changed couldn't be established. Not the same as unchanged.";
 }
 
 /** Three states, never folded: "could not tell" is not "unchanged". */
 export function bodyChangedLabel(changed: boolean | null): string {
   if (changed === true) return "changed";
   if (changed === false) return "moved";
-  return "could not tell";
+  return "couldn't tell";
 }
 
 export function hopsLabel(distance: number): string {

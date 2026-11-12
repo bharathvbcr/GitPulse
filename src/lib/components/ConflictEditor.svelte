@@ -119,6 +119,8 @@
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { Check, GitMerge, AlertTriangle, ChevronUp, ChevronDown, FileCode2, Search, RotateCcw, Loader2 } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { LAYERS } from "../ui/layers";
   import OperationBanner from "./OperationBanner.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
@@ -286,7 +288,7 @@
         if (sequence !== probeSequence || !guard?.isLive() || isSaving || $currentRepoPath !== repo || selectedFile !== file) return;
         if (snapshot.revision !== (draft?.pending?.revision ?? draft?.snapshot.revision)) await acceptSnapshot(repo, snapshot);
       } catch (error) {
-        if (sequence === probeSequence && guard?.isLive() && $currentRepoPath === repo && selectedFile === file) sourceNotice = `Source refresh failed: ${formatError(error)}. Your draft is retained; reload before saving.`;
+        if (sequence === probeSequence && guard?.isLive() && $currentRepoPath === repo && selectedFile === file) sourceNotice = `Couldn't refresh the source. ${formatError(error)}. Your draft is retained; refresh before saving.`;
       }
     })();
   });
@@ -381,7 +383,7 @@
     conflictSessions.discard(repo, file); sessionVersion += 1; if (file === selectedFile) retryRevision += 1;
   }
   async function copyRecovery(value: unknown) {
-    sourceNotice = await copyText(JSON.stringify(value, null, 2)) ? "Draft recovery copied." : "Could not copy the recovery. Select and copy the displayed text.";
+    sourceNotice = await copyText(JSON.stringify(value, null, 2)) ? "Draft recovery copied." : "Couldn't copy the recovery. Select and copy the displayed text.";
   }
   function reapplyLatestRecovery() {
     if (!draft || !parsedDoc || isSaving) return;
@@ -419,7 +421,7 @@
           if (result.output.staged) conflictSessions.complete(repo, file, request.revision, savedState);
           else if (result.output.snapshot) conflictSessions.pending(repo, file, result.output.snapshot, request.revision, savedState);
         } catch (error) {
-          result.output.message += ` Draft recovery could not be updated: ${formatError(error)}. Reload and inspect the saved file before another action.`;
+          result.output.message += ` Couldn't update the draft recovery. ${formatError(error)}. Refresh and inspect the saved file before another action.`;
         }
         return result.output;
       });
@@ -476,16 +478,16 @@
     <details class="recovery-panel" bind:open={recoveryOpen}><summary>Draft recovery · retained choices</summary>
       {#if recoveryOpen}<div class="recovery-list">
         {#each retained.filter(item => item.recoveryCount || !conflictedFiles.some(file => file.path === item.file)) as item (item.file)}
-          <button class="text-action" aria-pressed={recoveryFile === item.file} onclick={() => { recoveryFile = item.file; recoveryVersion = Math.max(0, item.recoveryCount - 1); }}>{item.file} · {item.recoveryCount || 1} retained version{item.recoveryCount > 1 ? "s" : ""}</button>
+          <button class="gp-btn" data-variant="ghost" data-size="sm" aria-pressed={recoveryFile === item.file} onclick={() => { recoveryFile = item.file; recoveryVersion = Math.max(0, item.recoveryCount - 1); }}>{item.file} · {item.recoveryCount || 1} retained version{item.recoveryCount > 1 ? "s" : ""}</button>
         {/each}
         {#if recoveryDraft}
           <p>These choices belong to an earlier source or operation. Compare them with the current file before copying a custom replacement.</p>
-          <select aria-label="Retained source version" bind:value={recoveryVersion}>{#each recoveryVersions as version, index}<option value={index}>Version {index + 1} · {version.snapshot.revision.slice(0, 12)}</option>{/each}</select>
+          <select class="gp-select" aria-label="Retained source version" bind:value={recoveryVersion}>{#each recoveryVersions as version, index}<option value={index}>Version {index + 1} · {version.snapshot.revision.slice(0, 12)}</option>{/each}</select>
           {#if recoveryText.length > 250_000}<p role="status">Showing 250,000 of {recoveryText.length.toLocaleString()} characters. Copy this version for the complete recovery.</p>{/if}
           <pre class="source-code">{recoveryText.slice(0, 250_000)}</pre>
-          <button class="text-action" onclick={() => copyRecovery(recoveryVersions[recoveryVersion])}>Copy recovery version</button>
-          {#if recoveryFile === selectedFile && recoveryDraft.recovery.length}<button class="text-action" disabled={isSaving} onclick={reapplyLatestRecovery}>Reapply latest matching draft</button>{/if}
-          <button class="text-action" disabled={isSaving} onclick={() => recoveryFile && discardRetained(recoveryFile)}>Discard retained draft</button>
+          <button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => copyRecovery(recoveryVersions[recoveryVersion])}>Copy recovery version</button>
+          {#if recoveryFile === selectedFile && recoveryDraft.recovery.length}<button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving} onclick={reapplyLatestRecovery}>Reapply latest matching draft</button>{/if}
+          <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving} onclick={() => recoveryFile && discardRetained(recoveryFile)}>Discard retained draft</button>
         {/if}
       </div>{/if}
     </details>
@@ -498,8 +500,8 @@
       hint={parked ? "Review the staged changes below, then continue the operation above." : "No conflicted files are listed in this repository."} />
     {#if parked}
       <section class="staged-review" aria-label="Final staged review"><h3>Review staged changes</h3><p>Includes all staged files in this repository.</p>
-        <div class="review-files">{#each $repoStore.statuses.filter(file => file.is_staged) as file (file.path)}<button class="text-action" aria-pressed={reviewPath === file.path} onclick={() => reviewStaged(file.path)}>{file.path}</button>{/each}</div>
-        {#if reviewLoading}<p role="status">Loading staged diff…</p>{:else if reviewError}<p role="alert">{reviewError}</p><button class="text-action" onclick={() => reviewPath && reviewStaged(reviewPath)}>Retry staged review</button>
+        <div class="review-files">{#each $repoStore.statuses.filter(file => file.is_staged) as file (file.path)}<button class="gp-btn" data-variant="ghost" data-size="sm" aria-pressed={reviewPath === file.path} onclick={() => reviewStaged(file.path)}>{file.path}</button>{/each}</div>
+        {#if reviewLoading}<p role="status">Loading staged diff…</p>{:else if reviewError}<p role="alert">{reviewError}</p><button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => reviewPath && reviewStaged(reviewPath)}>Try again</button>
         {:else if reviewDiff}{#if reviewDiff.truncated}<p role="status">Partial staged diff: {reviewDiff.truncation_reason ?? "the display limit was reached"}. Review the complete diff in Git before continuing.</p>{/if}<pre class="source-code">{reviewDiff.text || "No textual changes for this file. Check its status and Git mode."}</pre>{/if}
       </section>
     {/if}
@@ -519,28 +521,28 @@
               {#if saved}<small>{saved.pending ? "Stage pending" : saved.whole ? "Side chosen" : `${saved.resolved}/${saved.total}`}</small>{:else}<span class="file-dot" aria-label="Unmerged"></span>{/if}
             </button>
           {/each}
-          {#if visibleFiles.length === 0}<p class="rail-empty">No matching files.<button class="text-action" onclick={() => fileFilter = ""}>Clear filter</button></p>{/if}
+          {#if visibleFiles.length === 0}<p class="rail-empty">No matching files.<button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => fileFilter = ""}>Clear filter</button></p>{/if}
         </nav>
         <p class="rail-note">Drafts survive view changes. {platformChord("⌘S", "Ctrl+S", $hostPlatform.os)} saves; Alt ↑/↓ navigates. Add Shift to skip resolved blocks.</p>
       </aside>
       <main class="editor-main">
         <div class="file-toolbar">
           <div class="file-title"><FileCode2 size={15} /><span title={selectedFile ?? ""}>{selectedFile}</span></div>
-          <select class="mobile-file-select" aria-label="Conflicted file" bind:value={selectedFile} disabled={isSaving}>
+          <select class="gp-select mobile-file-select" aria-label="Conflicted file" bind:value={selectedFile} disabled={isSaving}>
             {#each conflictedFiles as file (file.path)}<option value={file.path}>{file.path}</option>{/each}
           </select>
-          <button class="text-action" disabled={isSaving || isLoading} onclick={() => retryRevision += 1} title="Reload and compare the source; retains previous drafts">Reload source</button>
+          <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving || isLoading} onclick={() => retryRevision += 1} title="Re-read and compare the source; retains previous drafts">Refresh source</button>
           <button onclick={saveResolved} disabled={!canSave}
-            class="gp-btn-success save-button" title={hasUnresolved ? "Resolve every block in this file before saving" : "Write the resolved file and stage it"}>
+            class="gp-btn shrink-0" data-variant="success" data-size="md" title={hasUnresolved ? "Resolve every block in this file before saving" : "Write the resolved file and stage it"}>
             {#if isSaving}<Loader2 size={14} class="animate-spin" />{:else}<Check size={14} />{/if}
-            {isSaving ? "Saving & staging…" : pendingStage ? "Retry staging" : wholeChoice === "WorkingTree" ? "Stage working file" : "Save & stage file"}
+            {isSaving ? "Saving & staging…" : pendingStage ? "Stage file again" : wholeChoice === "WorkingTree" ? "Stage working file" : "Save & stage file"}
           </button>
         </div>
         {#if saveError}<div class="error-notice" role="alert"><AlertTriangle size={14} /><span>{saveError}</span></div>{/if}
         {#if sourceNotice}<div class="source-notice" role="status"><AlertTriangle size={14} /><span>{sourceNotice}</span></div>{/if}
         {#if draft && !isLoading && !loadError}
           <div class="whole-file-actions">
-            {#if hasResolution(draft)}<button class="text-action" onclick={() => draft && copyRecovery({ snapshot: draft.snapshot, state: draft.state })}>Copy current draft</button>{/if}
+            {#if hasResolution(draft)}<button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => draft && copyRecovery({ snapshot: draft.snapshot, state: draft.state })}>Copy current draft</button>{/if}
             <details open={!parsedDoc || Boolean(wholeChoice)}><summary>Whole-file resolution {wholeChoice ? "· side chosen" : ""}</summary>
               <p>{draft.snapshot.reason ?? "A complete side replaces this file, including changes outside the text conflict blocks. Git modes and binary bytes are preserved."}</p>
               <div class="whole-choices">{#each ["Ours", "Theirs"] as side (side)}
@@ -555,38 +557,38 @@
                 {#if selected?.text !== null && selected?.text !== undefined}<pre class="source-code">{selected.text || "(Empty file)"}</pre>{/if}
               {/if}
             </details>
-            {#if chunks.length === 0 && diagnostics.length === 0 && draft.snapshot.worktree_mode !== "160000"}<button class="text-action" disabled={isSaving} aria-pressed={wholeChoice === "WorkingTree"} onclick={() => chooseWhole("WorkingTree")}>Use the working file resolved externally</button>{/if}
+            {#if chunks.length === 0 && diagnostics.length === 0 && draft.snapshot.worktree_mode !== "160000"}<button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving} aria-pressed={wholeChoice === "WorkingTree"} onclick={() => chooseWhole("WorkingTree")}>Use the working file resolved externally</button>{/if}
             {#if wholeChoice === "WorkingTree"}<p role="status">Working file selected. Staging preserves the bytes and file type loaded with this source.</p>{/if}
           </div>
-          {#if diagnostics.length}<div class="error-notice" role="alert"><span>{diagnostics.join(" · ")}. Repair these markers externally and reload, or choose a complete side.</span></div>{/if}
+          {#if diagnostics.length}<div class="error-notice" role="alert"><span>{diagnostics.join(" · ")}. Repair these markers externally and refresh the source, or choose a complete side.</span></div>{/if}
         {/if}
         {#if isLoading}
-          <div class="editor-state" role="status"><Loader2 size={22} class="animate-spin" /><h3>Loading conflicts…</h3><p>Reading the selected file.</p></div>
+          <div class="editor-state" role="status"><Skeleton variant="code-lines" count={6} class="max-w-md" /><h3>Loading conflicts…</h3><p>Reading the selected file.</p></div>
         {:else if loadError}
-          <div class="editor-state" role="alert"><AlertTriangle size={24} /><h3>Could not load this file</h3><p>{loadError}</p><button class="gp-btn" onclick={() => retryRevision += 1}><RotateCcw size={13} />Retry loading</button></div>
+          <div class="editor-state" role="alert"><AlertTriangle size={24} /><h3>Couldn't load this file</h3><p>{loadError}</p><button class="gp-btn" data-size="md" onclick={() => retryRevision += 1}><RotateCcw size={13} />Try again</button></div>
         {:else if parsedDoc}
           <div class="resolution-toolbar">
             <div class="progress-copy" role="status"><span class:all-resolved={!hasUnresolved}>{resolvedCount} / {chunks.length} resolved</span><progress max={Math.max(1, chunks.length)} value={resolvedCount} aria-label="Conflicts resolved in this file"></progress></div>
             <div class="chunk-navigation" role="group" aria-label="Conflict navigation">
-              <button class="icon-button" title="Previous conflict" aria-label="Previous conflict" disabled={chunks.length === 0} onclick={() => jumpToConflict(-1)}><ChevronUp size={14} /></button>
-              <button class="icon-button" title="Next conflict" aria-label="Next conflict" disabled={chunks.length === 0} onclick={() => jumpToConflict(1)}><ChevronDown size={14} /></button>
-              <button class="text-action" disabled={remaining === 0} onclick={() => jumpToConflict(1, true)}>Next unresolved <span>{remaining}</span></button>
+              <button class="gp-icon-btn" data-size="sm" title="Previous conflict" aria-label="Previous conflict" disabled={chunks.length === 0} onclick={() => jumpToConflict(-1)}><ChevronUp size={14} /></button>
+              <button class="gp-icon-btn" data-size="sm" title="Next conflict" aria-label="Next conflict" disabled={chunks.length === 0} onclick={() => jumpToConflict(1)}><ChevronDown size={14} /></button>
+              <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={remaining === 0} onclick={() => jumpToConflict(1, true)}>Next unresolved <span>{remaining}</span></button>
             </div>
-            <button class="text-action" disabled={isSaving || !draft?.undo.length} onclick={() => travel("undo")}>Undo</button>
-            <button class="text-action" disabled={isSaving || !draft?.redo.length} onclick={() => travel("redo")}>Redo</button>
-            <details class="bulk-actions"><summary>Resolve all…</summary><div class="bulk-menu gp-menu">
+            <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving || !draft?.undo.length} onclick={() => travel("undo")}>Undo</button>
+            <button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving || !draft?.redo.length} onclick={() => travel("redo")}>Redo</button>
+            <details class="bulk-actions"><summary>Resolve all…</summary><div class="bulk-menu gp-menu" style="z-index: {LAYERS.STICKY}">
               <p>Applies to unresolved blocks. Existing choices are preserved.</p>
-              <button disabled={isSaving} onclick={() => resolveAll("AcceptOurs")}>Accept All Current (Ours)</button>
-              <button disabled={isSaving} onclick={() => resolveAll("AcceptTheirs")}>Accept All Incoming (Theirs)</button>
-              <button disabled={isSaving} onclick={() => resolveAll("Unresolved")}>Reset all choices</button>
-              <button disabled={isSaving} onclick={() => resolveAll("AcceptOurs", true)}>Replace every choice with Current</button>
-              <button disabled={isSaving} onclick={() => resolveAll("AcceptTheirs", true)}>Replace every choice with Incoming</button>
+              <button class="gp-menu-item" disabled={isSaving} onclick={() => resolveAll("AcceptOurs")}>Accept all current (ours)</button>
+              <button class="gp-menu-item" disabled={isSaving} onclick={() => resolveAll("AcceptTheirs")}>Accept all incoming (theirs)</button>
+              <button class="gp-menu-item" disabled={isSaving} onclick={() => resolveAll("Unresolved")}>Reset all choices</button>
+              <button class="gp-menu-item" disabled={isSaving} onclick={() => resolveAll("AcceptOurs", true)}>Replace every choice with current</button>
+              <button class="gp-menu-item" disabled={isSaving} onclick={() => resolveAll("AcceptTheirs", true)}>Replace every choice with incoming</button>
             </div></details>
           </div>
           {#if operationState.operation?.kind === "Rebase" || operationState.operation?.kind === "RebaseApply"}
             <p class="rebase-note">During a rebase, Current is the branch being rebased onto; Incoming is the commit being replayed. Check the labels below.</p>
           {/if}
-          {#if chunks.length > PAGE_SIZE}<div class="resolution-toolbar"><span>Showing conflicts {blockPage * PAGE_SIZE + 1}–{Math.min(chunks.length, (blockPage + 1) * PAGE_SIZE)} of {chunks.length}</span><button class="text-action" disabled={blockPage === 0} onclick={() => blockPage -= 1}>Previous blocks</button><button class="text-action" disabled={(blockPage + 1) * PAGE_SIZE >= chunks.length} onclick={() => blockPage += 1}>Next blocks</button></div>{/if}
+          {#if chunks.length > PAGE_SIZE}<div class="resolution-toolbar"><span>Showing conflicts {blockPage * PAGE_SIZE + 1}–{Math.min(chunks.length, (blockPage + 1) * PAGE_SIZE)} of {chunks.length}</span><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={blockPage === 0} onclick={() => blockPage -= 1}>Previous blocks</button><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={(blockPage + 1) * PAGE_SIZE >= chunks.length} onclick={() => blockPage += 1}>Next blocks</button></div>{/if}
           <div class="editor-panes" class:preview-expanded={previewExpanded}>
             <div class="conflict-inspector" bind:this={inspector}>
               {#if chunks.length === 0}<div class="source-notice">No text conflict blocks were found. Review the file result carefully before staging; this may be a conflict resolved outside GitPulse.</div>{/if}
@@ -598,15 +600,15 @@
                     <div class="block-heading">
                       <div><strong>Conflict {chunk.chunk_index + 1}</strong><span class="line-range">Lines {chunk.start_line}–{chunk.end_line}</span></div>
                       <div><span class="choice-status" class:resolved={chunk.resolution !== "Unresolved"}>{#if chunk.resolution !== "Unresolved"}<Check size={12} />{/if}{resolutionLabel(chunk.resolution)}</span>
-                        <button class="icon-button" title="Reset this conflict" aria-label={`Reset conflict ${chunk.chunk_index + 1}`} disabled={isSaving || chunk.resolution === "Unresolved"} onclick={() => setChunkResolution(chunk.chunk_index, "Unresolved")}><RotateCcw size={12} /></button></div>
+                        <button class="gp-icon-btn" data-size="sm" title="Reset this conflict" aria-label={`Reset conflict ${chunk.chunk_index + 1}`} disabled={isSaving || chunk.resolution === "Unresolved"} onclick={() => setChunkResolution(chunk.chunk_index, "Unresolved")}><RotateCcw size={12} /></button></div>
                     </div>
                     <ConflictComparison {chunk} disabled={isSaving} choose={(choice) => setChunkResolution(chunk.chunk_index, choice)} />
                     {#if chunk.base_content !== undefined && chunk.base_content !== null}<details class="base-context"><summary>Common ancestor</summary><pre class="source-code">{chunk.base_content || "(Empty ancestor)"}</pre></details>{/if}
                     <details class="custom-resolution" open={typeof chunk.resolution === "object"}>
                       <summary>Custom resolution <span>Write the exact replacement</span></summary>
-                      <div class="custom-body"><textarea rows={4} maxlength={1024 * 1024} aria-label={`Custom resolution for conflict ${chunk.chunk_index + 1}`} placeholder="Type the exact content this conflict should resolve to…" disabled={isSaving}
+                      <div class="custom-body"><textarea class="gp-field-multi" rows={4} maxlength={1024 * 1024} aria-label={`Custom resolution for conflict ${chunk.chunk_index + 1}`} placeholder="Type the exact content this conflict should resolve to…" disabled={isSaving}
                         value={customText(chunk)} oninput={(event) => onCustomInput(chunk.chunk_index, event.currentTarget.value)}></textarea>
-                        <div class="custom-footer"><span>Empty content removes this block. Reset clears your choice.</span><button class="text-action" disabled={isSaving} onclick={() => setChunkResolution(chunk.chunk_index, { Custom: "" })}>Use empty resolution</button></div>
+                        <div class="custom-footer"><span>Empty content removes this block. Reset clears your choice.</span><button class="gp-btn" data-variant="ghost" data-size="sm" disabled={isSaving} onclick={() => setChunkResolution(chunk.chunk_index, { Custom: "" })}>Use empty resolution</button></div>
                       </div>
                     </details>
                   </section>
@@ -616,10 +618,10 @@
               {/each}
             </div>
             <section class="result-pane" aria-label="Resolved file preview">
-              <div class="result-heading"><div><span class="eyebrow">File result</span><strong>Resolved preview</strong></div><button class="text-action" aria-pressed={previewExpanded} onclick={() => previewExpanded = !previewExpanded}>{previewExpanded ? "Split view" : "Expand"}</button></div>
+              <div class="result-heading"><div><span class="eyebrow">File result</span><strong>Resolved preview</strong></div><button class="gp-btn" data-variant="ghost" data-size="sm" aria-pressed={previewExpanded} onclick={() => previewExpanded = !previewExpanded}>{previewExpanded ? "Split view" : "Expand"}</button></div>
               <p class="result-description">{wholeChoice ? "A whole-file choice is selected above. This block preview is retained for comparison." : diagnostics.length ? "Malformed markers block text resolution." : hasUnresolved ? "Unresolved blocks still include conflict markers." : "Review this result, then save and stage the file."}</p>
-              {#if isPreviewing}<div class="preview-state" role="status"><Loader2 size={16} class="animate-spin" />Updating preview…</div>
-              {:else if previewError}<div class="error-notice" role="alert"><span>Preview failed: {previewError}</span><button class="text-action" onclick={() => parsedDoc && updatePreview(parsedDoc)}>Retry preview</button></div>
+              {#if isPreviewing}<div class="preview-state" role="status">Updating preview…</div>
+              {:else if previewError}<div class="error-notice" role="alert"><span>Couldn't update the preview. {previewError}</span><button class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => parsedDoc && updatePreview(parsedDoc)}>Try again</button></div>
               {:else if resolvedPreview === ""}<div class="preview-state">Empty file — this resolution removes all content.</div>
               {:else if resolvedPreview !== null}<div class="result-code" role="textbox" aria-readonly="true" aria-multiline="true" tabindex="0" aria-label="Resolved file content">{resolvedPreview}</div>{/if}
               <div class="result-footer"><span>{parsedDoc.crlf ? "Contains CRLF" : "LF"} · {parsedDoc.trailing_newline ? "Final newline" : "No final newline"}</span><span>{isPreviewing ? "Updating…" : previewError ? "Preview unavailable" : hasUnresolved ? `${remaining} remaining` : "Ready to stage"}</span></div>
@@ -632,15 +634,15 @@
 </div>
 
 <style>
-  .resolve-page { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; color: rgb(var(--c-text)); font-size: 12px; }
+  .resolve-page { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; color: rgb(var(--c-text)); font-size: var(--text-xs); }
   .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 16px; flex-shrink: 0; }
   .heading-copy { display: flex; align-items: center; gap: 12px; min-width: 0; }
-  .heading-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .1); }
-  h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.025em; }
-  .heading-copy p, .rail-note { margin: 4px 0 0; color: rgb(var(--c-text-muted)); font-size: 11px; line-height: 1.6; }
-  .file-count { border-radius: 20px; padding: 6px 10px; background: rgb(var(--c-surface-hover) / .7); color: rgb(var(--c-text-muted)); white-space: nowrap; font-size: 11px; }
+  .heading-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: var(--gp-r-md); color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .1); }
+  h2 { margin: 0; font-size: var(--text-lg); font-weight: 600; }
+  .heading-copy p, .rail-note { margin: 4px 0 0; color: rgb(var(--c-text-muted)); font-size: var(--text-meta); line-height: 1.6; }
+  .file-count { border-radius: var(--gp-r-full); padding: 6px 10px; background: rgb(var(--c-surface-hover) / .7); color: rgb(var(--c-text-muted)); white-space: nowrap; font-size: var(--text-meta); }
   .operation { padding: 0 16px 12px; }
-  .whole-file-actions, .recovery-panel, .staged-review { padding: 10px 18px; border-bottom: 1px solid rgb(var(--c-border) / .4); font-size: 11px; }
+  .whole-file-actions, .recovery-panel, .staged-review { padding: 10px 18px; background: var(--mac-fill-surface, rgb(var(--c-surface))); font-size: var(--text-meta); }
   .whole-file-actions p, .recovery-panel p, .staged-review p { color: rgb(var(--c-text-muted)); line-height: 1.6; margin: 8px 0; }
   .whole-choices, .review-files { display: flex; flex-wrap: wrap; gap: 8px; }
   .whole-choices button[aria-pressed="true"] { outline: 2px solid rgb(var(--c-accent)); }
@@ -648,91 +650,87 @@
   .recovery-list { overflow: auto; max-height: 220px; }
   .recovery-list pre { max-height: 140px; }
   .staged-review { flex: 1; min-height: 160px; overflow: auto; }
-  .resolve-workspace { display: flex; flex: 1; min-height: 0; border-top: 1px solid rgb(var(--c-border) / .4); }
-  .file-rail { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 16px 10px; border-right: 1px solid rgb(var(--c-border) / .4); background: rgb(var(--c-surface) / .3); }
-  .rail-heading { display: flex; justify-content: space-between; padding: 0 6px 12px; font-size: 11px; font-weight: 600; color: rgb(var(--c-text-muted)); }
-  .file-search { display: flex; align-items: center; gap: 7px; margin: 0 3px 12px; padding: 7px 8px; border: 1px solid rgb(var(--c-border) / .5); border-radius: 8px; color: rgb(var(--c-text-muted)); }
-  .file-search input { width: 100%; min-width: 0; background: transparent; outline: none; font-size: 11px; }
+  .resolve-workspace { display: flex; flex: 1; min-height: 0; }
+  .file-rail { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 16px 10px; background: var(--mac-fill-surface, rgb(var(--c-surface))); }
+  .rail-heading { display: flex; justify-content: space-between; padding: 0 6px 12px; font-size: var(--text-meta); font-weight: 600; color: rgb(var(--c-text-muted)); }
+  .file-search { display: flex; align-items: center; gap: 7px; margin: 0 3px 12px; padding: 7px 8px; border: 1px solid var(--gp-edge); border-radius: var(--gp-r-full); color: rgb(var(--c-text-muted)); }
+  .file-search input { width: 100%; min-width: 0; background: transparent; outline: none; font-size: var(--text-meta); }
   .file-search:focus-within { outline: 2px solid rgb(var(--c-accent)); }
   .file-list { overflow: auto; flex: 1; }
-  .file-row { width: 100%; display: flex; align-items: center; gap: 9px; padding: 11px 9px; border-radius: 9px; margin-bottom: 4px; text-align: left; color: rgb(var(--c-text-muted)); }
+  .file-row { width: 100%; display: flex; align-items: center; gap: 9px; padding: 11px 9px; border-radius: var(--gp-r-sm); margin-bottom: 4px; text-align: left; color: rgb(var(--c-text-muted)); cursor: pointer; transition: background-color var(--gp-dur-instant) var(--gp-ease-effect); }
+  .file-row:hover:not(:disabled) { background-color: rgb(var(--c-accent) / .12); }
+  .file-row:disabled { opacity: .4; cursor: default; }
   .file-row.current { color: rgb(var(--c-accent)); background: rgb(var(--c-accent) / .12); }
   .file-name { min-width: 0; flex: 1; }
   .file-name strong, .file-name small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-name strong { font-size: 12px; color: rgb(var(--c-text)); font-weight: 550; }
-  .file-name small { margin-top: 4px; font-size: 10px; color: rgb(var(--c-text-muted)); }
-  .file-dot { width: 5px; height: 5px; border-radius: 50%; background: #d79b45; }
-  .rail-note { padding: 14px 6px 0; font-size: 10px; }
+  .file-name strong { font-size: var(--text-xs); color: rgb(var(--c-text)); font-weight: 500; }
+  .file-name small { margin-top: 4px; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
+  .file-dot { width: 5px; height: 5px; border-radius: 50%; background: rgb(var(--c-warn)); }
+  .rail-note { padding: 14px 6px 0; font-size: var(--text-micro); }
   .rail-empty { padding: 10px; line-height: 1.8; color: rgb(var(--c-text-muted)); }
   .editor-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
   .file-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 13px 18px; background: rgb(var(--c-surface) / .4); }
-  .file-title { display: flex; gap: 8px; align-items: center; min-width: 0; flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  .file-title { display: flex; gap: 8px; align-items: center; min-width: 0; flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--text-meta); }
   .file-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .save-button { flex-shrink: 0; font-size: 11px; }
   .mobile-file-select { display: none; }
-  .resolution-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 18px; border-bottom: 1px solid rgb(var(--c-border) / .4); font-size: 11px; }
+  .resolution-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 18px; font-size: var(--text-meta); }
   .progress-copy { display: flex; gap: 10px; align-items: center; font-variant-numeric: tabular-nums; }
-  progress { width: 62px; height: 4px; border: 0; border-radius: 4px; overflow: hidden; appearance: none; }
-  progress::-webkit-progress-bar { background: rgb(var(--c-border) / .6); }
+  progress { width: 62px; height: 4px; border: 0; border-radius: var(--gp-r-xs); overflow: hidden; appearance: none; }
+  progress::-webkit-progress-bar { background: var(--gp-edge); }
   progress::-webkit-progress-value { background: rgb(var(--c-accent)); }
   progress::-moz-progress-bar { background: rgb(var(--c-accent)); }
   .all-resolved { color: rgb(var(--c-accent)); }
   .chunk-navigation { display: flex; gap: 4px; align-items: center; }
-  .icon-button { display: inline-flex; justify-content: center; align-items: center; padding: 5px; border-radius: 6px; color: rgb(var(--c-text-muted)); }
-  .text-action { display: inline-flex; align-items: center; gap: 6px; padding: 4px; border-radius: 5px; color: rgb(var(--c-accent)); font-size: 11px; }
-  .text-action span { color: rgb(var(--c-text-muted)); font-variant-numeric: tabular-nums; }
-  button { cursor: pointer; transition: background-color 120ms ease; }
-  button:hover:not(:disabled) { background-color: rgb(var(--c-accent) / .12); }
-  button:disabled { opacity: .4; cursor: default; }
-  button:focus-visible, summary:focus-visible, textarea:focus-visible, pre:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
+  .chunk-navigation span { color: rgb(var(--c-text-muted)); font-variant-numeric: tabular-nums; }
+  summary:focus-visible, textarea:focus-visible, pre:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .bulk-actions { margin-left: auto; position: relative; }
-  summary { cursor: pointer; color: rgb(var(--c-text-muted)); font-size: 11px; }
-  .bulk-actions > summary { padding: 5px 7px; border-radius: 6px; }
-  .bulk-menu { position: absolute; right: 0; top: 30px; z-index: 5; width: 230px; padding: 7px; }
-  .bulk-menu p { margin: 5px 7px; font-size: 10px; color: rgb(var(--c-text-muted)); }
-  .bulk-menu button { display: block; width: 100%; padding: 9px 7px; text-align: left; border-radius: 6px; font-size: 11px; }
+  summary { cursor: pointer; color: rgb(var(--c-text-muted)); font-size: var(--text-meta); }
+  .bulk-actions > summary { padding: 5px 7px; border-radius: var(--gp-r-sm); }
+  .bulk-menu { position: absolute; right: 0; top: 30px; width: 230px; padding: 7px; }
+  .bulk-menu p { margin: 5px 7px; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
+  .bulk-menu button { padding: 9px 7px; font-size: var(--text-meta); }
+  .bulk-menu button:disabled { opacity: .4; cursor: default; }
   .editor-panes { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(260px, 1fr); flex: 1; min-height: 0; }
   .conflict-inspector { min-height: 0; overflow: auto; padding: 16px; scroll-padding-top: 16px; }
-  .conflict-block { border: 1px solid rgb(var(--c-border) / .75); border-radius: 11px; overflow: hidden; margin-bottom: 14px; background: rgb(var(--c-surface) / .35); }
-  .conflict-block.active-block { border-color: rgb(var(--c-accent) / .7); }
-  .conflict-block:focus { outline: 2px solid rgb(var(--c-accent) / .5); outline-offset: 2px; }
+  .conflict-block { border: 1px solid var(--gp-edge); border-radius: var(--gp-r-md); overflow: hidden; margin-bottom: 14px; background: rgb(var(--c-surface) / .35); }
+  .conflict-block.active-block { border-color: rgb(var(--c-accent)); }
+  .conflict-block:focus { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .block-heading, .block-heading > div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .block-heading { justify-content: space-between; padding: 10px 12px; background: rgb(var(--c-surface-hover) / .4); }
-  .block-heading strong { font-size: 11px; font-weight: 600; }
-  .line-range { font-size: 10px; color: rgb(var(--c-text-muted)); }
-  .choice-status { display: inline-flex; gap: 4px; align-items: center; font-size: 10px; color: rgb(var(--c-text-muted)); }
+  .block-heading strong { font-size: var(--text-meta); font-weight: 600; }
+  .line-range { font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
+  .choice-status { display: inline-flex; gap: 4px; align-items: center; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); }
   .choice-status.resolved { color: rgb(var(--c-accent)); }
-  .source-code { overflow: auto; padding: 10px 12px; margin: 0; font-size: 11px; line-height: 1.8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; user-select: text; }
-  .custom-resolution, .base-context { border-top: 1px solid rgb(var(--c-border) / .4); }
+  .source-code { overflow: auto; padding: 10px 12px; margin: 0; font-size: var(--text-meta); line-height: 1.8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; user-select: text; }
+  .custom-resolution, .base-context { background: rgb(var(--c-surface-hover) / .3); }
   .custom-resolution > summary, .base-context > summary { padding: 11px 12px; }
-  .custom-resolution summary span { margin-left: 8px; font-size: 10px; opacity: .8; }
+  .custom-resolution summary span { margin-left: 8px; font-size: var(--text-micro); opacity: .8; }
   .custom-body { padding: 0 12px 10px; }
-  textarea { width: 100%; resize: vertical; min-height: 78px; border: 1px solid rgb(var(--c-border) / .7); border-radius: 7px; background: var(--mac-fill-bg, rgb(var(--c-bg))); padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.7; user-select: text; }
-  .custom-footer { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 6px; color: rgb(var(--c-text-muted)); font-size: 10px; margin-top: 5px; }
+  textarea { width: 100%; resize: vertical; min-height: 78px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--text-meta); line-height: 1.7; user-select: text; }
+  .custom-footer { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 6px; color: rgb(var(--c-text-muted)); font-size: var(--text-micro); margin-top: 5px; }
   .unchanged-context { margin: 0 0 14px; }
-  .unchanged-context summary { padding: 5px 2px; font-size: 10px; }
+  .unchanged-context summary { padding: 5px 2px; font-size: var(--text-micro); }
   .unchanged-context summary span { margin-left: 8px; opacity: .7; }
-  .result-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-left: 1px solid rgb(var(--c-border) / .45); background: rgb(var(--c-surface) / .35); }
+  .result-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: rgb(var(--c-surface) / .35); }
   .result-heading { display: flex; justify-content: space-between; align-items: center; padding: 17px 16px 6px; }
-  .result-heading strong { display: block; font-size: 12px; font-weight: 550; margin-top: 4px; }
-  .eyebrow { font-size: 9px; text-transform: uppercase; letter-spacing: .1em; color: rgb(var(--c-text-muted)); }
-  .result-description { color: rgb(var(--c-text-muted)); font-size: 10px; padding: 0 16px 12px; line-height: 1.6; }
-  .result-code { flex: 1; min-height: 0; overflow: auto; padding: 15px 16px; margin: 0; background: rgb(var(--c-bg) / .55); font: 11px/1.9 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; user-select: text; }
-  .result-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; padding: 10px 14px; font-size: 9px; color: rgb(var(--c-text-muted)); margin-top: auto; }
+  .result-heading strong { display: block; font-size: var(--text-xs); font-weight: 500; margin-top: 4px; }
+  .eyebrow { font-size: var(--text-meta); font-weight: 500; color: rgb(var(--c-text-muted)); }
+  .result-description { color: rgb(var(--c-text-muted)); font-size: var(--text-micro); padding: 0 16px 12px; line-height: 1.6; }
+  .result-code { flex: 1; min-height: 0; overflow: auto; padding: 15px 16px; margin: 0; background: rgb(var(--c-bg) / .55); font: var(--text-meta)/1.9 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; user-select: text; }
+  .result-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; padding: 10px 14px; font-size: var(--text-micro); color: rgb(var(--c-text-muted)); margin-top: auto; }
   .preview-expanded { grid-template-columns: minmax(0, 1fr); }
   .preview-expanded .conflict-inspector { display: none; }
   .editor-state { display: flex; flex: 1; flex-direction: column; justify-content: center; align-items: center; padding: 24px; gap: 10px; color: rgb(var(--c-text-muted)); overflow: auto; }
   .editor-state h3 { color: rgb(var(--c-text)); font-weight: 600; }
   .editor-state p { max-width: 600px; overflow-wrap: anywhere; text-align: center; }
-  .error-notice, .source-notice { display: flex; align-items: flex-start; gap: 8px; padding: 11px 13px; margin: 10px 14px; background: rgb(var(--c-accent) / .07); border-radius: 8px; font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
-  .error-notice { color: light-dark(#a6223e, #fda4af); background: #f43f5e10; }
+  .error-notice, .source-notice { display: flex; align-items: flex-start; gap: 8px; padding: 11px 13px; margin: 10px 14px; background: rgb(var(--c-accent) / .07); border-radius: var(--gp-r-md); font-size: var(--text-meta); line-height: 1.7; overflow-wrap: anywhere; }
+  .error-notice { color: rgb(var(--c-danger)); background: rgb(var(--c-danger) / .08); }
   .source-notice { color: rgb(var(--c-text-muted)); }
-  .preview-state { display: flex; align-items: center; gap: 8px; padding: 22px 16px; font-size: 11px; color: rgb(var(--c-text-muted)); }
-  .rebase-note { font-size: 10px; padding: 9px 18px; background: rgb(var(--c-accent) / .06); color: rgb(var(--c-text-muted)); line-height: 1.6; }
+  .preview-state { display: flex; align-items: center; gap: 8px; padding: 22px 16px; font-size: var(--text-meta); color: rgb(var(--c-text-muted)); }
+  .rebase-note { font-size: var(--text-micro); padding: 9px 18px; background: rgb(var(--c-accent) / .06); color: rgb(var(--c-text-muted)); line-height: 1.6; }
   @container (max-width: 1150px) {
     .file-rail { width: 178px; }
     .editor-panes { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(150px, 1fr) minmax(150px, 32%); }
-    .result-pane { border-left: 0; border-top: 1px solid rgb(var(--c-border) / .5); }
     .result-heading { padding: 10px 14px 4px; }
     .result-heading > div { display: flex; align-items: center; gap: 10px; }
     .result-heading strong { margin: 0; }
@@ -742,11 +740,11 @@
   @container (max-width: 760px) {
     .file-rail { display: none; }
     .file-title { display: none; }
-    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; padding: 7px 24px 7px 9px; border: 1px solid rgb(var(--c-border) / .6); border-radius: 7px; background-color: var(--mac-fill-surface, rgb(var(--c-surface))); font-size: 11px; }
+    .mobile-file-select { display: block; min-width: 0; flex: 1; max-width: 100%; }
     .page-heading { padding: 14px; }
     .heading-copy p { display: none; }
     .heading-icon { width: 30px; height: 30px; }
-    .file-count { font-size: 10px; }
+    .file-count { font-size: var(--text-micro); }
     .file-toolbar, .resolution-toolbar { padding: 10px 12px; }
   }
   @container (max-width: 480px) {

@@ -130,7 +130,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "map",
         label: "Map",
         summary:
-          "Subsystems, entry points, doc search, the code/doc graph canvas, and cross-repo link candidates. Caps and truncation are named, not dressed as complete.",
+          "Subsystems, entry points, doc search, the code and doc graph canvas, and cross-repository link candidates. Caps and truncation are named, not dressed as complete.",
         paletteCommand: "Open Map — subsystems, docs, graphs and link candidates",
       },
     ],
@@ -179,7 +179,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     id: "insights",
     label: "Insights",
     summary:
-      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that could not run is never shown as clean.",
+      "On-demand measurements of this repository: activity, coverage, health (dependencies and secrets) and disk. A scan that couldn't run is never shown as clean.",
     paletteCommand: "Open Insights — activity, dependencies, coverage, secrets and disk",
     // Scans of one subject: this repository. They were separate header
     // entries, each empty until someone ran it. As sections they share one
@@ -196,7 +196,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "coverage",
         label: "Coverage",
         summary:
-          "Line and file coverage from this project's own test commands. Truncation and failures are named, not dressed as 100%.",
+          "Line and file coverage from this repository's own test commands. Truncation and failures are named, not dressed as 100%.",
         paletteCommand: "Open Coverage",
       },
       // Secrets was a section of its own. It is a finding about this
@@ -208,7 +208,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "health",
         label: "Health",
         summary:
-          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code graph. A scanner that did not run is listed, not implied clean. No secret values are shown.",
+          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code map. A scanner that did not run is listed, not implied clean. No secret values are shown.",
         paletteCommand: "Scan dependencies and secrets",
       },
       {

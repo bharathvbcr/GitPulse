@@ -47,6 +47,9 @@
    */
   import { onMount, untrack } from "svelte";
   import { Archive, ExternalLink } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createLiveLoader } from "../workbench/liveLoader";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -241,7 +244,7 @@
 <section id="task-archive-dock" class="archive gp-glass bg-surface" aria-label="Archive" data-testid="task-archive">
   <header>
     <strong><Archive size={13} aria-hidden="true" /> Archive</strong>
-    <div class="gp-seg" role="group" aria-label="Show">
+    <div class="gp-segmented" role="group" aria-label="Show">
       <button type="button" class="gp-seg-btn" data-active={view === "archived"} aria-pressed={view === "archived"} data-testid="task-archive-view-archived" onclick={() => { view = "archived"; }}>Archived</button>
       <button type="button" class="gp-seg-btn" data-active={view === "deleted"} aria-pressed={view === "deleted"} data-testid="task-archive-view-deleted" onclick={() => { view = "deleted"; }}>Deleted</button>
     </div>
@@ -263,7 +266,7 @@
     {#if summary.partial}<span class="more-note">Load more to see the rest.</span>{/if}
     {#if (parsed.terms.length || localWords) && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
     <!-- Deferring the query while the window is in the background is the
-         Inbox's behaviour too, and worth the saved round trips. Leaving the
+         Inbox's behavior too, and worth the saved round trips. Leaving the
          reader to guess why the panel is blank is not. -->
     {#if summary.pending && !visible && !error}<span class="more-note">Paused while this window is in the background.</span>{/if}
   </p>
@@ -284,19 +287,29 @@
   <!-- Gated on a successful read, not on an empty list: "nothing here" is a
        finding, and a dock that has not run its query has not found it. -->
   {#if summary.pending}
-    <p class="empty">{error ? "The archive could not be read. Retry with Refresh." : "Reading tasks…"}</p>
+    {#if error}
+      <p class="empty">Couldn't read the archive. Try again with Refresh.</p>
+    {:else}
+      <div class="empty" aria-label="Reading tasks" role="status"><Skeleton count={3} /></div>
+    {/if}
   {:else if rows.length === 0}
-    <p class="empty">{query.trim() ? `No ${view} tasks match this search.` : view === "archived" ? `Nothing here yet. ${ARCHIVE_RULE}` : "No deleted tasks in this scope."}</p>
+    {#if query.trim()}
+      <EmptyState compact icon={Archive} title="No {view} tasks match this search" />
+    {:else if view === "archived"}
+      <EmptyState compact icon={Archive} title="Nothing here yet" hint={ARCHIVE_RULE} />
+    {:else}
+      <EmptyState compact icon={Archive} title="No deleted tasks in this scope" />
+    {/if}
   {:else}
     <!-- A row above the scroller, never a bar floating inside it. Why, and
          what was tried first, is in the component note at the top. -->
     <div class="list-head">
       <label class="pick">
-        <input
-          type="checkbox"
+        <Checkbox
+          ariaLabel="Select the {rows.length} loaded"
           checked={chosen.length === rows.length && rows.length > 0}
           indeterminate={chosen.length > 0 && chosen.length < rows.length}
-          onchange={(event) => selectLoaded(event.currentTarget.checked)}
+          onchange={(next) => selectLoaded(next)}
         />
         Select the {rows.length} loaded
       </label>
@@ -305,7 +318,7 @@
       {#each rows as card (card.id)}
         <article class:picked={selected.has(card.id)} data-testid="task-archive-row" data-card-id={card.id}>
           <label class="pick">
-            <input type="checkbox" checked={selected.has(card.id)} onchange={(event) => toggle(card.id, event.currentTarget.checked)} />
+            <Checkbox ariaLabel="Select {card.title}" checked={selected.has(card.id)} onchange={(next) => toggle(card.id, next)} />
             <span class="sr-only">Select {card.title}</span>
           </label>
           <div class="summary-cell">
@@ -330,7 +343,7 @@
     <div class="actions bg-surface" role="group" aria-label={view === "archived" ? "Archived task actions" : "Deleted task actions"}>
       <span>{chosen.length} selected</span>
       <button type="button" class="gp-btn" data-testid="task-archive-restore" onclick={() => void restore()} disabled={!canAct}>Restore</button>
-      {#if view === "archived"}<button type="button" class="gp-btn-danger" onclick={remove} disabled={!canAct}>Delete</button>{/if}
+      {#if view === "archived"}<button type="button" class="gp-btn" data-variant="danger" onclick={remove} disabled={!canAct}>Delete</button>{/if}
       <button type="button" class="gp-btn" onclick={() => selectLoaded(false)}>Clear</button>
       {#if overCap}<p class="over" role="alert">Select at most {cap} tasks per action.</p>{/if}
     </div>
@@ -343,29 +356,29 @@
      window so short that the panel's own chrome exceeds the cap: it degrades
      to a scrolling panel rather than clipping the actions off. In normal use
      `.entries` absorbs the shrink and this never engages. */
-  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:12px;color:rgb(var(--c-text))}
+  .archive{display:flex;flex-direction:column;max-height:46vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:var(--gp-r-lg);font-size:var(--text-xs);color:rgb(var(--c-text))}
   /* Every row but the list keeps its natural height and never shrinks, so
      the whole of an over-tall panel is taken out of the row list and the
      action bar cannot be the part that goes off screen. */
   .archive > *{flex:0 0 auto}
-  .problems{margin:4px 0 0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
+  .problems{margin:4px 0 0;padding:0;list-style:none;font-size:var(--text-meta);color:rgb(var(--c-warn))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   header strong{display:flex;align-items:center;gap:6px;font-weight:600}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
-  .summary{font-weight:550;color:rgb(var(--c-text))}
+  .summary{font-weight:500;color:rgb(var(--c-text))}
   .more-note{font-weight:400;color:rgb(var(--c-text-muted))}
   .rule{margin:4px 0;color:rgb(var(--c-text-muted))}
   /* No ground and no pin: it is a row of the panel's column, above the
      scroller rather than floating over it. See the note at the markup. */
-  .list-head{padding:6px 4px;border-top:1px solid rgb(var(--c-border))}
+  .list-head{padding:8px 4px 6px}
   /* The one scroller, and the only row allowed to shrink. It does not grow:
      three archived tasks draw a short panel, not a 46vh one with a gap. */
   .entries{flex:0 1 auto;min-height:0;overflow:auto}
-  article{display:flex;align-items:center;gap:10px;padding:8px 4px;border-top:1px solid rgb(var(--c-border))}
-  article.picked{border-left:2px solid rgb(var(--c-accent))}
+  article{display:flex;align-items:center;gap:10px;padding:8px 4px}
+  article.picked{box-shadow:inset 2px 0 0 rgb(var(--c-accent))}
   .pick{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted));cursor:pointer}
   .summary-cell{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
-  .summary-cell strong{font-weight:550;overflow-wrap:anywhere}
+  .summary-cell strong{font-weight:500;overflow-wrap:anywhere}
   .summary-cell span{color:rgb(var(--c-text-muted))}
   .more{margin-top:8px}
   /* Sticky as well as last. Being the final flex row already keeps it on
@@ -373,10 +386,8 @@
      the promise in the case the list cannot shrink any further and the panel
      itself starts to scroll. A selection whose only verbs have scrolled out
      of sight is the defect this panel was reported for. */
-  .actions{position:sticky;bottom:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding:10px 0 0;border-top:1px solid rgb(var(--c-border))}
-  .over{flex-basis:100%;margin:0;color:#ef9a9a}
-  button,input[type=search]{font:inherit;color:inherit;background:transparent;border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}
-  button{cursor:pointer}button:disabled{opacity:.45;cursor:default}
-  [role=alert]{color:#ef9a9a}
+  .actions{position:sticky;bottom:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding:10px 0 0}
+  .over{flex-basis:100%;margin:0;color:rgb(var(--c-danger))}
+  [role=alert]{color:rgb(var(--c-danger))}
   .empty{padding:8px 0}
 </style>

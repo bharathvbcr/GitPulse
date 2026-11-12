@@ -256,7 +256,7 @@ export function fileGlance(h: PreviewFileHonesty): string {
   if (!h.file_is_indexed) return "not in the index — callers unknown";
   if (isUnreliableParseStatus(h.parse_status)) {
     // parse_status is engine-supplied and has no documented length bound.
-    return `could not be parsed (${boundText(h.parse_status.trim().toLowerCase(), 24)})`;
+    return `couldn't be parsed (${boundText(h.parse_status.trim().toLowerCase(), 24)})`;
   }
   if (!h.delta_available) return "no before/after to compare";
   if (h.broken_total > 0) {
@@ -305,11 +305,11 @@ export function summarizePreview(
   } else if (files.length === 0) {
     headline = "No staged files to preview";
   } else if (opts.cancelled) {
-    headline = "Preview cancelled before every staged file finished";
+    headline = "Preview canceled before every staged file finished";
   } else if (filesOmitted > 0) {
     headline = `Preview fan-out capped: ${filesOmitted} of ${filesTotal} file(s) not previewed — not a clean bill of health`;
   } else if (unavailableFiles === files.length) {
-    headline = "Could not preview staged changes — not a clean bill of health";
+    headline = "Couldn't preview staged changes — not a clean bill of health";
   } else if (unreliableFiles > 0 && brokenCallerTotal === 0) {
     headline = `${unreliableFiles} file(s) have an unreliable preview — do not treat as "nothing breaks"`;
   } else if (brokenCallerTotal > 0) {

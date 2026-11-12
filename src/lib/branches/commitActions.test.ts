@@ -100,7 +100,7 @@ describe("createBranchAt", () => {
   it("reports a failure the store did not surface", async () => {
     createBranch.mockResolvedValueOnce({ ok: false, surfaced: false, error: "exists" } as never);
     expect(await createBranchAt(OID)).toBe(false);
-    expect(toasts.some((t) => t.startsWith("err:Could not create the branch"))).toBe(true);
+    expect(toasts.some((t) => t.startsWith("err:Couldn't create the branch"))).toBe(true);
   });
 });
 
@@ -145,7 +145,7 @@ describe("resetKeepTo", () => {
     previewError = new Error("not a commit");
     expect(await resetKeepTo(OID)).toBe(false);
     expect(askConfirm).not.toHaveBeenCalled();
-    expect(toasts.some((t) => t.includes("Could not preview the reset"))).toBe(true);
+    expect(toasts.some((t) => t.includes("Couldn't preview the reset"))).toBe(true);
   });
 
   it("refuses without a repository", async () => {

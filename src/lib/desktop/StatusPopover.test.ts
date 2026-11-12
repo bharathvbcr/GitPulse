@@ -96,7 +96,7 @@ describe("compact status popover", () => {
     // free to stay thin — their backdrop is already the panel above.
     expect(nativeBlock).toContain("--surface:rgb(var(--card-base) / .4)");
     // Liquid-ease cubic-bezier on interactive elements.
-    expect(nativeBlock).toContain("--liquid-ease:cubic-bezier(0.22, 1, 0.36, 1)");
+    expect(nativeBlock).toContain("--liquid-ease:var(--gp-ease-effect)");
     expect(nativeBlock).toContain("scale(0.97)");
   });
   it("tunes the browser fixture from the same rules as the native material", () => {
@@ -111,9 +111,10 @@ describe("compact status popover", () => {
     // that declares or reads a glass token has to name both materials — the
     // ladder, both appearance arms, the panel treatment and the inner cards,
     // five of them as this stands. Comments come out first: prose about one
-    // material must not stand in for a selector that targets it. The blur is
-    // the sole material-specific rule and touches no glass token, because
-    // native's blur comes from the window server rather than from CSS.
+    // material must not stand in for a selector that targets it. The preview's
+    // CSS blur is the sole material-specific rule and is not in this file at
+    // all: native's blur comes from the window server, and the fixture's
+    // stand-in lives in harness/StatusPreview.svelte.
     const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
     const tuned = [...styles.matchAll(/([^{}]+)\{([^}]*)\}/g)]
       .filter(([, selector, body]) => body.includes("--glass-") && selector.includes("data-material"))
@@ -123,6 +124,44 @@ describe("compact status popover", () => {
       expect(selector).toContain('[data-material="native"]');
       expect(selector).toContain('[data-material="preview"]');
     }
+  });
+});
+
+describe("status popover speaks the shared grammar", () => {
+  const styles = source.slice(source.indexOf("<style>")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const markup = source.slice(0, source.indexOf("<style>"));
+
+  it("paints every colour from a --c-* token", () => {
+    expect(styles).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(styles).not.toMatch(/rgba?\(\s*\d/);
+  });
+
+  it("owns no scoped button, chip or icon-button class and no blur of its own", () => {
+    for (const name of ["chip", "primary", "secondary", "icon-button", "detail-action", "details-toggle"]) {
+      expect(styles, `.${name}`).not.toMatch(new RegExp(`\\.${name}\\b`));
+    }
+    expect(styles).not.toMatch(/[;{]\s*(?:-webkit-)?backdrop-filter:\s*(?!none)\S/);
+  });
+
+  it("gets its stylesheet from the window entry, not from inside the component", () => {
+    expect(markup).not.toMatch(/import\s+["'][^"']*\.css["']/);
+    const entry = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../status.ts"), "utf8");
+    // status.css is unlayered and has to come last so its transparent body wins.
+    expect(entry.indexOf('import "./app.css"')).toBeGreaterThan(-1);
+    expect(entry.indexOf('import "./status.css"')).toBeGreaterThan(entry.indexOf('import "./app.css"'));
+  });
+
+  it("keeps the actions on gp-btn, gp-chip and gp-icon-btn with the test ids the harness uses", () => {
+    expect(markup).toContain('data-variant="primary"');
+    expect(markup).toContain('data-testid="status-primary"');
+    expect(markup).toContain('data-variant="ghost"');
+    expect(markup).toContain('data-testid="status-secondary"');
+    expect(markup).toContain('data-testid="status-details-toggle"');
+    expect(markup).toContain('class="gp-chip"');
+    expect(markup.match(/class="gp-icon-btn"/g)).toHaveLength(3);
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("empty"), onaction: () => {} } });
+    expect(body).toContain('data-variant="primary"');
+    expect(body).toContain('data-variant="ghost"');
   });
 });
 

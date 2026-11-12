@@ -147,8 +147,8 @@ describe("explainAppleError", () => {
 
   it("still says something useful for anything else", () => {
     expect(explainAppleError(new Error("boom"))).toBe("boom");
-    expect(explainAppleError(null)).toBe("Apple Intelligence could not finish.");
-    expect(explainAppleError({ message: "   " })).toBe("Apple Intelligence could not finish.");
+    expect(explainAppleError(null)).toBe("Apple Intelligence couldn't finish.");
+    expect(explainAppleError({ message: "   " })).toBe("Apple Intelligence couldn't finish.");
     expect(appleErrorCode(new Error("boom"))).toBe("worker_error");
     expect(appleErrorCode({ code: "" })).toBe("worker_error");
   });

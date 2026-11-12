@@ -369,7 +369,7 @@ function partialFailureMessage(
   if (!report.available || tiers.length === 0) return null;
   return `${label} alerts are incomplete: the ${tiers.join(", ")} severity ${
     tiers.length === 1 ? "tier" : "tiers"
-  } could not be read.`;
+  } couldn't be read.`;
 }
 
 function githubCheckFailed(snapshot: GithubAlertsSnapshot): string | null {

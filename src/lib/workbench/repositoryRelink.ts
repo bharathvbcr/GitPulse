@@ -79,7 +79,7 @@ export async function readCheckout(
   } catch (cause) {
     const message = explainError(cause);
     if (NOT_A_REPOSITORY.test(message)) return { state: "missing", path, detail: `${repo.name} was not found at ${path}. It was moved or deleted; relink it to where it is now.` };
-    return { state: "unknown", path, detail: `Could not check ${repo.name}'s checkout at ${path}: ${message}` };
+    return { state: "unknown", path, detail: `Couldn't check ${repo.name}'s checkout at ${path}. ${message}` };
   }
 }
 

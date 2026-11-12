@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
+import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
@@ -96,7 +97,7 @@ describe("terminal agent launch requests", () => {
   it("rejects duplicate pending launches and reports capacity refusal", async () => {
     const requests = createTerminalLaunchRequests();
     const launched = requests.request("/a", "claude", "Generate coverage");
-    await expect(requests.request("/a", "codex", "Another")).rejects.toThrow("already pending");
+    await expect(requests.request("/a", "codex", "Another")).rejects.toThrow(TERMINAL_SESSION_PENDING);
     requests.take("/a")?.complete("All terminal sessions are in use");
     await expect(launched).rejects.toThrow("All terminal sessions");
   });
@@ -116,7 +117,7 @@ describe("terminal agent launch requests", () => {
     const controller = new AbortController();
     const launched = requests.request("/a", "codex", "Generate coverage", controller.signal);
     controller.abort();
-    await expect(launched).rejects.toThrow("cancelled");
+    await expect(launched).rejects.toThrow(TERMINAL_SESSION_CANCELED);
     expect(requests.take("/a")).toBeNull();
   });
 

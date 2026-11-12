@@ -14,7 +14,7 @@ macOS listed first; Windows / Linux in the second column.
 | Reopen Closed Tab | `⌘⇧Y` | `Ctrl+Shift+Y` |
 | Next / Previous Tab | `Ctrl+Tab` / `Ctrl+⇧Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Move Tab Left / Right | `Ctrl+⇧+←` / `Ctrl+⇧+→` | `Ctrl+Shift+←` / `Ctrl+Shift+→` |
-| Jump to Tab 1–9 | `Ctrl+⌥1–9` | `Ctrl+Alt+1–9` |
+| Jump to Tab 1–9 (9 is the last) | `⌘1–9` | `Ctrl+1–9` |
 | Preferences | `⌘,` | `Ctrl+,` |
 
 ## Views
@@ -22,9 +22,9 @@ macOS listed first; Windows / Linux in the second column.
 | View | macOS | Windows / Linux |
 | --- | --- | --- |
 | Work | `F10` | `F10` |
-| Code | `⌘1` | `Ctrl+1` |
-| History | `⌘2` | `Ctrl+2` |
-| Insights | `⌘3` | `Ctrl+3` |
+| Code | `⌥⌘1` | `Ctrl+Shift+1` |
+| History | `⌥⌘2` | `Ctrl+Shift+2` |
+| Insights | `⌥⌘3` | `Ctrl+Shift+3` |
 | Fleet | `⌘⇧F` | `Ctrl+Shift+F` |
 | Terminal dock | `⌃\`` | `Ctrl+\`` |
 

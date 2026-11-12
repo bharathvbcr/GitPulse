@@ -12,7 +12,8 @@ describe("AutomaticEnhancements", () => {
 
   it("can render as a compact header chip instead of a permanent full-width bar", () => {
     expect(source).toContain("compact = false");
-    expect(source).toContain("gp-pill");
+    expect(source).toContain('data-size={compact ? "sm" : "md"}');
+    expect(source).not.toContain("gp-pill");
     expect(source).toContain('compact ? "Auto"');
   });
 });

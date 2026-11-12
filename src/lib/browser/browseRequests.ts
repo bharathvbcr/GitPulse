@@ -14,6 +14,7 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { formatError } from "../ui/formatError";
+import { TERMINAL_SESSION_PENDING } from "../terminal/sessionMessages";
 
 export interface BrowseRequest {
   repo: string;
@@ -57,10 +58,10 @@ export function createBrowseQueue(deps: BrowseDeps) {
 
   async function handle(request: BrowseRequest): Promise<void> {
     const repo = await deps.open(request.repo);
-    if (!repo) throw new Error(`${request.repo} could not be opened`);
+    if (!repo) throw new Error(`Couldn't open ${request.repo}.`);
     deps.showDock();
     for (let waited = 0; deps.busy(); waited += 100) {
-      if (waited >= CHANNEL_WAIT_MS) throw new Error("another terminal launch is still pending");
+      if (waited >= CHANNEL_WAIT_MS) throw new Error(TERMINAL_SESSION_PENDING);
       await sleep(100);
     }
     await deps.launch(repo, request.url);

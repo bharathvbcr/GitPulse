@@ -100,7 +100,7 @@ describe("explainEnhancementFailure", () => {
     ["model not served by endpoint", "not served", "change_model"],
     ["ErrNotServed", "not served", "change_model"],
     ["StopMaxTokens applied", "output limit", "retry"],
-    ["generation cancelled", "Cancelled: the model selection changed", "restart"],
+    ["generation cancelled", "Canceled: the model selection changed", "restart"],
     ["lease expired", "expired", "restart"],
     ["worker busy", "busy", "wait"],
     ["transport timeout", "still starting", "retry"],

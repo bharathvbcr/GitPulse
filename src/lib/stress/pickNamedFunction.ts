@@ -13,14 +13,14 @@ export function pickNamedFunction<T extends Record<string, unknown>>(
   allowed: readonly string[],
 ): T[keyof T] {
   if (!allowed.includes(name)) {
-    throw new Error(`unsupported harness component: ${name}`);
+    throw new Error(`unsupported stress component: ${name}`);
   }
   if (!Object.prototype.hasOwnProperty.call(table, name)) {
-    throw new Error(`unsupported harness component: ${name}`);
+    throw new Error(`unsupported stress component: ${name}`);
   }
   const fn = table[name];
   if (typeof fn !== "function") {
-    throw new Error(`unsupported harness component: ${name}`);
+    throw new Error(`unsupported stress component: ${name}`);
   }
   return fn as T[keyof T];
 }

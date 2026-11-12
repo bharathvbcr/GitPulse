@@ -3,6 +3,8 @@
   import { untrack } from "svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import SettingToggle from "./SettingToggle.svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import { X } from "@lucide/svelte";
   import { deleteWorkspace, explainError, newID, putWorkspace, registerRepository, workspaceDraft, WorkbenchError, type Repository, type Workspace, type WorkspaceDraft } from "../workbench/client";
   import { addableOpenTabs, openMembershipCandidates, withRepositoryId, type OpenTabRef } from "../workbench/openMembership";
   let { value, repositories, openTabs = [], onSaved, onClose }: {
@@ -14,7 +16,7 @@
   let confirming = $state(false);
   export async function canLeave(): Promise<boolean> {
     if (saving || adding || confirming) return false;
-    if (pending) { error = "Retry the save before closing this workspace."; return false; }
+    if (pending) { error = "Try the save again before closing this workspace."; return false; }
     if (JSON.stringify(draft) === originalDraft) return true;
     confirming = true;
     try { return await askConfirm({title:"Discard workspace edits?",message:"Your unsaved changes will be lost.",confirmLabel:"Discard edits",cancelLabel:"Keep editing"}); }
@@ -65,22 +67,22 @@
   }
 </script>
 <aside class="workspace-editor gp-glass bg-surface" aria-label="Workspace settings">
-  <header class="gp-glass shadow-float"><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" aria-label="Close workspace settings">✕</button></header>
+  <header class="gp-glass shadow-float"><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" class="gp-icon-btn" data-size="md" aria-label="Close workspace settings"><X size={14} aria-hidden="true" /></button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }}>
     <div class="sheet-body">
     <fieldset disabled={saving || adding || confirming || pending !== null}>
       <label>Name<input class="gp-field" bind:value={draft.name} required maxlength="300" /></label>
-      <label>Description<textarea class="gp-field" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
+      <label>Description<textarea class="gp-field-multi" bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
       <label>Icon<input class="gp-field" bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>
       <label>Color<input class="gp-field" bind:value={draft.color} maxlength="64" placeholder="Optional color name" /></label>
       <SettingToggle label="Pinned" description="Keep this workspace at the top of the navigator." checked={draft.pinned} onchange={(next) => { draft.pinned = next; }} />
       <SettingToggle label="Archived" description="Hide this workspace unless Show archived workspaces is on. Unrelated to the task Archive, which holds completed tasks." checked={draft.archived} onchange={(next) => { draft.archived = next; }} />
-      <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><input class="gp-field" type="checkbox" checked={draft.repository_ids.includes(repo.id)} onchange={(e) => { draft.repository_ids = e.currentTarget.checked ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
+      <fieldset><legend>Repositories</legend><p>A repository can belong to several workspaces.</p>{#each known as repo (repo.id)}<label class="check"><Checkbox ariaLabel={repo.name} checked={draft.repository_ids.includes(repo.id)} onchange={(next) => { draft.repository_ids = next ? [...new Set([...draft.repository_ids, repo.id])] : draft.repository_ids.filter((id) => id !== repo.id); }} />{repo.name}</label>{/each}
       {#if addable.length}
         <p>Open in GitPulse</p>
         {#each addable as tab (tab.path)}
           <label class="check" title={tab.path}>
-            <input class="gp-field" type="checkbox" checked={false} disabled={adding} onchange={(e) => { e.currentTarget.checked = false; void addOpenPaths([tab.path]); }} />
+            <Checkbox ariaLabel={`Add ${tab.label}`} checked={false} disabled={adding} onchange={() => { void addOpenPaths([tab.path]); }} />
             {tab.label}<span class="open-mark">Open</span>
           </label>
         {/each}
@@ -89,11 +91,11 @@
       {#each draft.repository_ids.filter((id) => !known.some((r) => r.id === id)) as missing (missing)}<p>Linked repository {missing} (not on this page)</p>{/each}</fieldset>
     </fieldset>
     {#if error}<p class="error" role="alert">{error}</p>{/if}
-    {#if pending}<p>Retry this save to reconcile the uncertain result.</p>{/if}
+    {#if pending}<p>Try this save again to reconcile the uncertain result.</p>{/if}
     </div>
-    <footer><button disabled={saving || adding} class="gp-btn-primary" type="submit">{saving ? "Saving…" : pending ? "Retry save" : "Save workspace"}</button>{#if value}<button type="button" class="gp-btn-danger" onclick={remove} disabled={saving || adding || pending !== null}>Delete workspace</button>{/if}</footer>
+    <footer><button disabled={saving || adding} class="gp-btn" data-variant="primary" type="submit">{saving ? "Saving…" : pending ? "Try again" : "Save workspace"}</button>{#if value}<button type="button" class="gp-btn" data-variant="danger" onclick={remove} disabled={saving || adding || pending !== null}>Delete workspace</button>{/if}</footer>
   </form>
 </aside>
 <style>
-  .workspace-editor{width:min(380px,45vw);flex-shrink:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:0;overflow:hidden;font-size:12px;display:flex;flex-direction:column}form{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}.sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}header{padding:16px 18px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}h2{font-size:16px;font-weight:650}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}input,textarea{padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:#dc6565}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:10px;margin-left:6px}
+  .workspace-editor{width:min(380px,45vw);flex-shrink:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);padding:0;overflow:hidden;font-size:var(--text-xs);display:flex;flex-direction:column}form{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}.sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px}header{padding:16px 18px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}h2{font-size:var(--text-lg);font-weight:600}fieldset{border:0;padding:0;margin:12px 0}label{display:flex;flex-direction:column;gap:6px;margin:12px 0}.check{flex-direction:row;align-items:center;gap:8px}footer{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;padding:10px 18px 16px}p{color:rgb(var(--c-text-muted));margin:10px 0}.error{color:rgb(var(--c-danger))}.open-add{display:block;width:100%;text-align:left;margin:4px 0}.open-mark{color:rgb(var(--c-text-muted));font-size:var(--text-micro);margin-left:6px}
 </style>

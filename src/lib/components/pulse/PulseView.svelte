@@ -448,7 +448,7 @@
       <EmptyState
         icon={GitCommit}
         title="No commit activity found"
-        hint="This repository does not have any commits yet, or the history could not be reached."
+        hint="This repository does not have any commits yet, or the history couldn't be reached."
         action={{
           label: "Refresh",
           onClick: () => pulseStore.reload(),

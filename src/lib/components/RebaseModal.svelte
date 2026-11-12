@@ -13,7 +13,9 @@
   import { rebasePlanProblem, seedRebasePlan, shouldReseed, type RebaseStep } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { reportPanelError } from "../diagnostics/report";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { GitMerge, Check, AlertCircle } from "@lucide/svelte";
 
   let {
@@ -91,12 +93,14 @@
 
       const result = await repoStore.rebaseInteractive(ontoBranch, steps);
       if (!result.ok) {
-        errorMsg = result.error ?? "The rebase did not complete.";
+        const failure = describeFailure({ verb: "complete", object: "the rebase" }, result.error ?? "");
+        errorMsg = result.error ? `${failure.headline} ${failure.detail ?? result.error}` : failure.headline;
         return;
       }
       onClose?.();
     } catch (err: unknown) {
-      errorMsg = reportPanelError("rebase", err);
+      const reported = reportPanelError("rebase", err);
+      errorMsg = `${describeFailure({ verb: "complete", object: "the rebase" }, err).headline} ${reported}`;
     } finally {
       isExecuting = false;
     }
@@ -128,14 +132,15 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between">
+      <div class="p-4 flex items-center justify-between">
         <h2 id="rebase-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <GitMerge size={16} class="text-accent" />
-          <span>Interactive Rebase</span>
+          <span>Interactive rebase</span>
         </h2>
         <div class="flex items-center gap-2">
-          <span class="text-textMuted font-mono">Onto:</span>
+          <label for="rebase-onto" class="gp-label font-mono">Onto</label>
           <input
+            id="rebase-onto"
             type="text"
             bind:value={ontoBranch}
             class="gp-field w-28! font-mono"
@@ -143,27 +148,32 @@
         </div>
       </div>
 
-      {#if !planCurrent}
-        <p role="alert" class="text-xs text-amber-500">Repository changed. Close and reopen this plan before rebasing.</p>
-      {/if}
-      {#if planProblem}
-        <p role="alert" class="mx-4 mt-3 text-xs text-amber-500">{planProblem}</p>
-      {/if}
-      {#if errorMsg}
-        <div class="mx-4 mt-3 p-2 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-xs flex items-center gap-2">
-          <AlertCircle size={14} class="shrink-0" />
-          <span>{errorMsg}</span>
+      {#if !planCurrent || planProblem || errorMsg}
+        <div class="flex flex-col gap-2 px-4 pb-1">
+          {#if !planCurrent}
+            <p role="alert" class="gp-notice" data-tone="warn">Repository changed. Close and reopen this plan before rebasing.</p>
+          {/if}
+          {#if planProblem}
+            <p role="alert" class="gp-notice" data-tone="warn">{planProblem}</p>
+          {/if}
+          {#if errorMsg}
+            <div class="gp-notice" data-tone="danger">
+              <AlertCircle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" />
+              <span class="min-w-0 flex-1 break-words">{errorMsg}</span>
+            </div>
+          {/if}
         </div>
       {/if}
 
-      <div class="p-4 space-y-2 max-h-80 overflow-y-auto">
+      <div class="p-4 space-y-2 max-h-80 overflow-y-auto scroll-py-8" data-dialog-body use:scrollEdgeFade>
         {#each items as commit}
-          <div class="flex items-center gap-3 p-2.5 bg-background border border-border/70 rounded-xl text-xs">
+          <div class="flex items-center gap-3 p-2.5 bg-background rounded-xl text-xs">
             <span class="font-mono text-accent w-20 truncate" title={commit.id}>{commit.id.substring(0, 8)}</span>
             <select
               bind:value={commit.action}
               onchange={() => (planDirty = true)}
-              class="bg-surface border border-border/80 rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-hidden focus:border-accent/60 font-medium transition-colors"
+              aria-label="Action for {commit.id.substring(0, 8)}"
+              class="gp-select"
             >
               <option value="Pick">pick</option>
               <option value="Squash">squash</option>
@@ -175,21 +185,24 @@
               type="text"
               bind:value={commit.summary}
               oninput={() => (planDirty = true)}
-              class="flex-1 bg-transparent border-b border-transparent focus:border-border text-xs text-textPrimary focus:outline-hidden px-1"
+              aria-label="Summary for {commit.id.substring(0, 8)}"
+              class="gp-field min-w-0 flex-1"
             />
           </div>
         {/each}
       </div>
 
-      <div class="p-4 border-t border-border/60 gp-section-edge bg-surfaceHover/30 flex justify-end gap-2">
-        <button onclick={requestClose} disabled={isExecuting} class="gp-btn">Cancel</button>
+      <div class="p-4 bg-surfaceHover/30 flex justify-end gap-2">
+        <button type="button" onclick={requestClose} disabled={isExecuting} class="gp-btn" data-variant="secondary">Cancel</button>
         <button
+          type="button"
           onclick={executeRebase}
           disabled={isExecuting || items.length === 0 || !planCurrent || planProblem !== null}
-          class="gp-btn-primary"
+          class="gp-btn"
+          data-variant="primary"
         >
           <Check size={14} />
-          <span>{isExecuting ? "Rebasing..." : "Execute Rebase"}</span>
+          <span>{isExecuting ? "Rebasing…" : "Start rebase"}</span>
         </button>
       </div>
     </div>

@@ -28,19 +28,19 @@ describe("coverage file helpers", () => {
 
   it("styles unknown lines transparent", () => {
     expect(hitBadgeClass(undefined)).toBe(
-      "w-8 px-1 text-right text-[10px] tabular-nums shrink-0 text-transparent"
+      "w-8 px-1 text-right text-micro tabular-nums shrink-0 text-transparent"
     );
   });
 
   it("styles hit lines emerald", () => {
     expect(hitBadgeClass(1)).toBe(
-      "w-8 px-1 text-right text-[10px] tabular-nums shrink-0 text-emerald-400/80"
+      "w-8 px-1 text-right text-micro tabular-nums shrink-0 text-ok"
     );
   });
 
   it("styles missed lines red", () => {
     expect(hitBadgeClass(0)).toBe(
-      "w-8 px-1 text-right text-[10px] tabular-nums shrink-0 text-red-400/80"
+      "w-8 px-1 text-right text-micro tabular-nums shrink-0 text-danger"
     );
   });
 

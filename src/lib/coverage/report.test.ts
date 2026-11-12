@@ -468,7 +468,7 @@ describe("buildCoverageIssueDraft", () => {
     expect(draft.title).toBe("test(coverage): address 82.0% line coverage");
     expect(draft.body).toContain("<!-- gitpulse:coverage-report:v1 -->");
     expect(draft.body).toContain("## Coverage snapshot");
-    expect(draft.body).toContain("## MANVI analysis");
+    expect(draft.body).toContain("## Manvi analysis");
     expect(draft.body).toContain("<repository>/src/main.py");
     expect(draft.body).not.toContain(repo);
     expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
@@ -741,7 +741,7 @@ describe("formatFailedCoverageDiagnostics", () => {
     }
     expect(
       formatFailedCoverageDiagnostics([{ label: "go -C go test ./...", detail: go, status: "failed" }]),
-    ).toContain("Hint: The project failed to build");
+    ).toContain("Hint: The code failed to build");
   });
 
   it("does not call a test failure a build failure", () => {

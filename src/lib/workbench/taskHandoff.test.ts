@@ -322,7 +322,7 @@ describe("runStateLabel", () => {
   it("names every state the wire declares, and passes an unknown one through", () => {
     expect(runStateLabel("prepared")).toBe("Prepared");
     expect(runStateLabel("exited")).toBe("Exited");
-    expect(runStateLabel("failed")).toBe("Failed to start");
+    expect(runStateLabel("failed")).toBe("Couldn't start the run");
     expect(runStateLabel("unresolved")).toBe("Unresolved");
     // An unknown state from a newer backend is shown, not swallowed.
     expect(runStateLabel("quantum")).toBe("quantum");

@@ -93,7 +93,7 @@ describe("closing a terminal with a job in it", () => {
     }
     const attempt = closeQuestion(known(leaderIsTheAgent), "Fix the importer", { ...claude, taskAttempt: true });
     expect(attempt?.title).toBe("Close Fix the importer?");
-    expect(attempt?.message).toContain("ends this attempt");
+    expect(attempt?.message).toContain("ends this run");
     expect(attempt?.message).toContain("resumed");
   });
 
@@ -126,7 +126,7 @@ describe("closing one half of a split", () => {
 describe("closing when it cannot be told whether anything is running", () => {
   const COULD_NOT_TELL = {
     title: "Close Shell?",
-    message: "GitPulse could not tell whether something is still running in this terminal. Close it anyway?",
+    message: "GitPulse couldn't tell whether something is still running in this terminal. Close it anyway?",
   };
 
   it("asks, and says it could not tell, when the read produced no answer", () => {

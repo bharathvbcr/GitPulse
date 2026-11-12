@@ -80,7 +80,7 @@ describe("importTabGroups", () => {
     const report = await importTabGroups([{ name: "Mixed", color: "", paths: ["/gone", "/code/api"] }], [], port);
     expect(report.created).toEqual([{ name: "Mixed", repositories: 1 }]);
     expect(report.failed[0]?.error).toContain("/gone");
-    expect(importSummary(report)).toBe("Created 1 workspace, 1 could not be imported.");
+    expect(importSummary(report)).toBe("Created 1 workspace, 1 couldn't be imported.");
   });
 
   it("creates nothing for a group none of whose repositories could be registered", async () => {

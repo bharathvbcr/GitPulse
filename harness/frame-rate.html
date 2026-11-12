@@ -25,6 +25,13 @@
 
       const params = new URLSearchParams(location.search);
       if (params.get("theme") === "light") document.documentElement.classList.replace("dark", "light");
+      // `?blur=<0..40>` sets Settings -> Appearance's float blur the way the applier
+      // does (apply.ts): an input var, and `data-float-blur="off"` at 0. Unset, the
+      // stylesheet's shipped 34 px is what is measured.
+      const blurParam = params.get("blur");
+      const blurPx = blurParam === null ? null : Math.min(40, Math.max(0, Math.round(Number(blurParam) || 0)));
+      if (blurPx === 0) document.documentElement.setAttribute("data-float-blur", "off");
+      else if (blurPx !== null) document.documentElement.style.setProperty("--gp-float-blur", `${blurPx}px`);
       const durationMs = Math.min(10000, Math.max(500, Number(params.get("ms") ?? 3000) || 3000));
       const errors = [];
       addEventListener("error", (event) => errors.push(event.message));
@@ -59,6 +66,9 @@
           // sampled cannot pass by having no rows to fail.
           check("html.macos is set, so the material tokens and the float blur rule apply", () => run.environment.macosClass);
           for (const phase of PHASES) {
+            // At blur 0 the float draws no blur at all, so the blur phase reports
+            // "float-blur-not-applied" by design; its check is that `none` computed.
+            if (phase === "blur" && blurPx === 0) continue;
             const p = run.phases.find((candidate) => candidate.phase === phase);
             const usable = (name, value) => check(`${phase}: ${name} (${p.status}${p.note ? `: ${p.note}` : ""}; focus ${p.focus})`, () => p.status === "ok" && Number.isFinite(value));
             usable(`rAF delivered ${p.frames} usable intervals`, p.frames);
@@ -68,7 +78,12 @@
             usable(`effective ${fixed(p.hz, 1)} Hz`, p.hz);
             usable(`${p.longFrames} long frames (> 1.5x median)`, p.longFrames);
           }
-          check("the float surface computed a backdrop blur during the blur phase", () => /blur\(/.test(run.environment.floatBlur));
+          if (blurPx === 0) {
+            check("blur 0 computed backdrop-filter none, not blur(0)", () => run.environment.floatBlur === "none");
+          } else {
+            check("the float surface computed a backdrop blur during the blur phase", () => /blur\(/.test(run.environment.floatBlur));
+            if (blurPx !== null) check(`the float surface computed blur(${blurPx}px)`, () => run.environment.floatBlur.includes(`blur(${blurPx}px)`));
+          }
           check("no unhandled runtime errors", () => errors.length === 0);
           verdict = "All phases measured. Low rates are reported above, never failed.";
         } catch (error) {

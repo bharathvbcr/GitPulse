@@ -151,7 +151,7 @@ describe("rendering helpers", () => {
   it("keeps three states and passes unknown evidence through", () => {
     expect(bodyChangedLabel(true)).toBe("changed");
     expect(bodyChangedLabel(false)).toBe("moved");
-    expect(bodyChangedLabel(null)).toBe("could not tell");
+    expect(bodyChangedLabel(null)).toBe("couldn't tell");
     expect(evidenceLabel("new_class")).toBe("new_class");
   });
 });

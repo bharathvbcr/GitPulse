@@ -58,8 +58,8 @@ export function graphClipNotice(clippedWidth: number, laneWidth: number): string
   const lanes = laneWidth > 0 ? Math.max(1, Math.ceil(clippedWidth / laneWidth)) : null;
   const limit = MAX_GRAPH_CONTENT_WIDTH.toLocaleString("en-US");
   return lanes === null
-    ? `Some branch lanes extend past the ${limit} px the graph can draw and are not shown.`
-    : `${lanes} branch lane${lanes === 1 ? "" : "s"} extend${lanes === 1 ? "s" : ""} past the ${limit} px the graph can draw and ${lanes === 1 ? "is" : "are"} not shown.`;
+    ? `Some branch columns extend past the ${limit} px the graph can draw and are not shown.`
+    : `${lanes} branch column${lanes === 1 ? "" : "s"} extend${lanes === 1 ? "s" : ""} past the ${limit} px the graph can draw and ${lanes === 1 ? "is" : "are"} not shown.`;
 }
 
 /** Graph gutter overflow; same shape as the shared overflow hint. */

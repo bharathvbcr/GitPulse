@@ -19,7 +19,7 @@ import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunche
 import { asksForReader as attentionAsks, type SessionActivity } from "../terminal/sessionActivity";
 import type { OpenRepoTab } from "../stores/repoStore";
 import { identityKey, pathSegments, type PathIdentityOptions } from "../repos/paths";
-import { runExpired, runHoldsCheckout } from "./taskHandoff";
+import { RUN_START_FAILED_LABEL, runExpired, runHoldsCheckout } from "./taskHandoff";
 import type { TaskRun } from "./client";
 
 /** One session in this window that belongs to an attempt. */
@@ -304,11 +304,11 @@ export interface AttemptStage {
 
 export function attemptStage(row: Pick<MonitoredAttempt, "run" | "view" | "tone" | "failure" | "unstarted" | "disconnected">, clock: number): AttemptStage {
   const { run } = row;
-  if (row.failure) return { stage: "failed", label: "Failed to start", tone: "bad" };
+  if (row.failure) return { stage: "failed", label: RUN_START_FAILED_LABEL, tone: "bad" };
   if (run.state === "prepared" && runExpired(run, clock)) return { stage: "expired", label: "Expired", tone: "done" };
   if (run.state === "unresolved") return { stage: "unresolved", label: "Unresolved", tone: "bad" };
   if (run.state === "failed") return { stage: "ended", label: "Failed", tone: "bad" };
-  if (run.state === "cancelled") return { stage: "ended", label: "Cancelled", tone: "done" };
+  if (run.state === "cancelled") return { stage: "ended", label: "Canceled", tone: "done" };
   if (run.state === "exited") return { stage: "ended", label: run.outcome_uncertain ? "Ended · outcome unknown" : "Exited", tone: "done" };
   if (asksForReader(row.tone)) return { stage: "needs-you", label: "Needs you", tone: "ask" };
   if (row.view.waiting?.role === "attempt") return { stage: "waiting", label: row.view.waiting.reason === "trust" ? "Needs trust" : "Starting agent", tone: row.view.waiting.reason === "trust" ? "ask" : "live" };
@@ -389,8 +389,8 @@ export function isAttemptWorktree(cwd: string, runId: string): boolean {
  */
 export function releasedNote(run: Pick<TaskRun, "id" | "cwd">): string {
   return isAttemptWorktree(run.cwd, run.id)
-    ? `Released. The attempt's worktree stays on disk at ${run.cwd}, with its changes and branch, and its checkout is free for another attempt.`
-    : "Released. The checkout is free for another attempt.";
+    ? `Released. The run's worktree stays on disk at ${run.cwd}, with its changes and branch, and its checkout is free for another run.`
+    : "Released. The checkout is free for another run.";
 }
 
 export function checkoutChanges(

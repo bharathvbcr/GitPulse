@@ -1,0 +1,6 @@
+export const GATE = `MANVI policy checks are connected.`;
+export const ROW = { label: "Harness", hint: "Open the code graph", note: "devmap is not installed" };
+export function why(n: number): string {
+  return `${n} attempts could not be read`;
+}
+export const ITEMS = [{ label: "Retry", id: "r" }, { title: "Reload the view" }];

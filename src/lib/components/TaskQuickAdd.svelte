@@ -13,6 +13,8 @@
    */
   import { CornerDownLeft, Plus, Sparkles, TriangleAlert, X } from "@lucide/svelte";
   import SettingSegment from "./SettingSegment.svelte";
+  import { hostPlatform } from "../stores/platformStore";
+  import { platformChord } from "../ui/platformCopy";
   import { priorityLabel } from "../workbench/taskPriority";
   import {
     QUICK_ADD_HINT,
@@ -116,6 +118,7 @@
       bind:this={input}
       bind:value={text}
       class="gp-field"
+      data-size={compact ? "sm" : undefined}
       type="text"
       aria-label="Quick add task"
       aria-describedby="quick-add-hint"
@@ -164,14 +167,14 @@
       </p>
       <p class="summary" role="status">
         {#if parsed.usable}
-          <span class="chip chip-title">{parsed.title}</span>
-          {#if parsed.priority !== null}<span class="chip tok-priority">{priorityLabel(parsed.priority)}</span>{/if}
-          {#if parsed.kind}<span class="chip tok-kind">{parsed.kind}</span>{/if}
-          {#if parsed.owner}<span class="chip tok-owner">{parsed.owner}</span>{/if}
-          {#if parsed.repositoryId}<span class="chip tok-repo">{repositories.find((repo) => repo.id === parsed.repositoryId)?.name ?? parsed.repositoryId}</span>{/if}
-          {#if parsed.dueAt}<span class="chip tok-due">{new Date(parsed.dueAt * 1000).toLocaleDateString()}</span>{/if}
-          {#each parsed.labels as label (label)}<span class="chip tok-label">{label}</span>{/each}
-          {#if parsed.description}<span class="chip tok-desc">notes</span>{/if}
+          <span class="gp-chip chip-title" data-kind="label" data-tone="neutral">{parsed.title}</span>
+          {#if parsed.priority !== null}<span class="gp-chip tok-priority" data-kind="label">{priorityLabel(parsed.priority)}</span>{/if}
+          {#if parsed.kind}<span class="gp-chip tok-kind" data-kind="label">{parsed.kind}</span>{/if}
+          {#if parsed.owner}<span class="gp-chip tok-owner" data-kind="label">{parsed.owner}</span>{/if}
+          {#if parsed.repositoryId}<span class="gp-chip tok-repo" data-kind="label">{repositories.find((repo) => repo.id === parsed.repositoryId)?.name ?? parsed.repositoryId}</span>{/if}
+          {#if parsed.dueAt}<span class="gp-chip tok-due" data-kind="label">{new Date(parsed.dueAt * 1000).toLocaleDateString()}</span>{/if}
+          {#each parsed.labels as label (label)}<span class="gp-chip tok-label" data-kind="label">{label}</span>{/each}
+          {#if parsed.description}<span class="gp-chip tok-desc" data-kind="label">notes</span>{/if}
         {:else}
           <span class="muted">Type a title. Markers alone do not make a task.</span>
         {/if}
@@ -185,7 +188,7 @@
       {#each parsed.warnings as warning (warning.code + warning.message)}
         <p class="warn"><TriangleAlert size={11} class="shrink-0" />{warning.message}</p>
       {/each}
-      <p id="quick-add-hint" class="hint">{QUICK_ADD_HINT}{#if onExpand} · ⇧⏎ opens the editor{/if}</p>
+      <p id="quick-add-hint" class="hint">{QUICK_ADD_HINT}{#if onExpand} · {platformChord('⇧⏎', 'Shift+Enter', $hostPlatform.os)} opens the editor{/if}</p>
     </div>
   {:else}
     <p id="quick-add-hint" class="sr-only">{QUICK_ADD_HINT}</p>
@@ -195,25 +198,23 @@
 <style>
   .quick-add{display:flex;flex-direction:column;gap:6px;min-width:0}
   .field{display:flex;align-items:center;gap:6px;min-width:0}
-  .field input{flex:1;min-width:0;font-size:12px}
-  .is-compact .field input{font-size:11px;padding:4px 7px}
-  .preview{display:flex;flex-direction:column;gap:5px;padding:7px 9px;border-radius:9px;border:1px solid rgb(var(--c-border) / 0.65)}
-  .tokens{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;color:rgb(var(--c-text))}
+  .field input{flex:1;min-width:0;font-size:var(--text-xs)}
+  .is-compact .field input{font-size:var(--text-meta)}
+  .preview{display:flex;flex-direction:column;gap:5px;padding:7px 9px;border-radius:var(--gp-r-md);border:1px solid var(--gp-edge)}
+  .tokens{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:var(--text-meta);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;color:rgb(var(--c-text))}
   .summary{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:0}
-  .chip{font-size:10px;padding:1px 6px;border-radius:5px;background:rgb(var(--c-surface-hover) / 0.7);max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .chip-title{font-weight:600;color:rgb(var(--c-text))}
-  .muted,.hint{font-size:10px;color:rgb(var(--c-text-muted));margin:0}
-  .plan{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:10px;line-height:1.45;color:rgb(var(--c-text-muted))}
-  .warn{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:10px;color:rgb(180 83 9);line-height:1.45}
-  :global(.dark) .warn{color:rgb(252 211 77)}
+  .chip-title{font-weight:600;color:rgb(var(--c-text));max-width:16rem}
+  .muted,.hint{font-size:var(--text-micro);color:rgb(var(--c-text-muted));margin:0}
+  .plan{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:var(--text-micro);line-height:1.45;color:rgb(var(--c-text-muted))}
+  .warn{display:flex;align-items:flex-start;gap:5px;margin:0;font-size:var(--text-micro);color:rgb(var(--c-warn));line-height:1.45}
   /* One hue per token kind, reused by the highlighted line and its chip so a
      reader maps colour to meaning once. */
-  .tok-priority{color:#d15a64}
+  .tok-priority{color:rgb(var(--c-danger))}
   .tok-label{color:rgb(var(--c-accent))}
-  .tok-owner{color:#7c8cf8}
-  .tok-kind{color:#2f9e6e}
-  .tok-repo{color:#c08a2e}
-  .tok-due{color:#b3722a}
+  .tok-owner{color:rgb(var(--c-info))}
+  .tok-kind{color:rgb(var(--c-ok))}
+  .tok-repo{color:rgb(var(--c-warn))}
+  .tok-due{color:rgb(var(--c-warn))}
   .tok-sep,.tok-desc{color:rgb(var(--c-text-muted))}
-  .tok-unknown{color:rgb(var(--c-text-muted));text-decoration:underline wavy rgb(244 63 94 / 0.7);text-underline-offset:2px}
+  .tok-unknown{color:rgb(var(--c-text-muted));text-decoration:underline wavy rgb(var(--c-danger));text-underline-offset:2px}
 </style>

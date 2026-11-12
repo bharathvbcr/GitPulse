@@ -10,9 +10,16 @@ import { ACCENTS } from "../ui/accents";
 import { TAB_WIDTHS } from "../ui/codeDisplay";
 import { VIEW_TABS } from "../repos/persist";
 import { viewNavItemFor } from "../views/viewNav";
+import { resetHostPlatformForTests } from "../stores/platformStore";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "SettingsModal.svelte"),
+  "utf8",
+);
+
+// Appearance rows moved out of the modal into their own component; both files stamp `data-setting` ids.
+const appearanceSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "AppearanceSettings.svelte"),
   "utf8",
 );
 
@@ -106,7 +113,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="dialog"');
     expect(body).toContain('aria-label="Theme appearance"');
-    expect(body).toContain('aria-label="Branch spacing"');
+    expect(body).toContain('aria-label="Density"');
     expect(body).toContain('aria-label="Graph width"');
     // Every option is a pressed/unpressed toggle.
     expect(body).toContain('aria-pressed="true"');
@@ -115,8 +122,9 @@ describe("SettingsModal", () => {
     expect(body).toContain("System");
     expect(body).toContain("Light");
     expect(body).toContain("Dark");
-    // Density options (sole owner since the FilterBar control moved here).
+    // Density options (sole owner since the commit filter bar dropped its control).
     expect(body).toContain("Spacious");
+    expect(body).toContain("Comfortable");
     expect(body).toContain("Compact");
     expect(body).toContain("Balanced");
     expect(body).toContain("Wide");
@@ -181,8 +189,12 @@ describe("SettingsModal layout options", () => {
     const layout = panel(body, "layout");
     expect(layout).toContain('aria-label="Status bar detail"');
     expect(layout).toContain('aria-label="Diagnostics button visibility"');
-    // Retired with the title bar's Open menu, the only control it labelled.
-    expect(layout).not.toContain('aria-label="Show labels on header action buttons"');
+    // Header button labels: Automatic follows the header's width, Icons only
+    // overrides it. Restored after the header rebuild dropped the choice.
+    expect(layout).toContain('data-setting="header-labels"');
+    expect(layout).toContain('aria-label="Header button labels"');
+    expect(layout).toContain(">Automatic");
+    expect(layout).toContain(">Icons only");
     expect(layout).toContain(
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
@@ -202,7 +214,7 @@ describe("SettingsModal layout options", () => {
 
   it("offers every status-bar and diagnostics choice, with the defaults selected", () => {
     const layout = panel(body, "layout");
-    for (const label of ["Full", "Compact", "Hidden", "Always", "When recorded"]) {
+    for (const label of ["Full", "Compact", "Hidden", "Always", "When recorded", "Automatic", "Icons only"]) {
       expect(layout, `missing option ${label}`).toContain(`>${label}`);
     }
     // *Which* options are pressed, not how many. A bare count agreed just as
@@ -214,7 +226,7 @@ describe("SettingsModal layout options", () => {
     const pressed = [...layout.matchAll(/aria-pressed="true"[^>]*>\s*([^<]*?)\s*</g)].map(
       (match) => match[1],
     );
-    expect(pressed.sort()).toEqual(["Always", "Full", "Only code files"]);
+    expect(pressed.sort()).toEqual(["Always", "Automatic", "Full", "Only code files"]);
   });
 });
 
@@ -340,9 +352,10 @@ describe("SettingsModal restore defaults", () => {
     );
     expect(fn).toContain("askConfirm");
     expect(fn).toContain("if (!confirmed) return;");
-    // All three owners, or "defaults" would silently mean "some of them".
+    // Both owners, or "defaults" would silently mean "some of them". Density
+    // is a field of the interface preferences now, so `reset()` restores it.
     expect(fn).toContain("interfaceStore.reset()");
-    expect(fn).toContain("densityStore.setDensity");
+    expect(fn).not.toContain("densityStore");
     expect(fn).toContain("setTheme(");
   });
 });
@@ -350,7 +363,7 @@ describe("SettingsModal restore defaults", () => {
 
 describe("SettingsModal is wired to the search catalog", () => {
   /** Every `data-setting` id the template stamps on a control row. */
-  const stamped = [...source.matchAll(/data-setting="([^"]+)"/g)].map((m) => m[1]);
+  const stamped = [...(source + appearanceSource).matchAll(/data-setting="([^"]+)"/g)].map((m) => m[1]);
 
   it("stamps each id exactly once, so a filter cannot half-hide a row", () => {
     expect(new Set(stamped).size).toBe(stamped.length);
@@ -362,6 +375,7 @@ describe("SettingsModal is wired to the search catalog", () => {
     // nothing in it. That is what happened to the agent rows inside
     // external-tools.
     expect(nestedSettings(source)).toEqual([]);
+    expect(nestedSettings(appearanceSource)).toEqual([]);
     expect(nestedSettings('<div data-setting="a"><div data-setting="b"></div></div>')).toEqual(["b in a"]);
     expect(nestedSettings('<div data-setting="a"></div><div data-setting="b"><div></div></div>')).toEqual([]);
   });
@@ -407,7 +421,7 @@ describe("SettingsModal is wired to the search catalog", () => {
     for (const id of stamped) {
       if (soleControl.has(id)) continue;
       expect(
-        prose(source),
+        prose(source + appearanceSource),
         `data-setting="${id}" is not gated on the filter`,
       ).toContain(`data-setting="${id}" hidden={!shown("${id}")}`);
     }
@@ -484,9 +498,9 @@ describe("SettingsModal appearance additions", () => {
     }
     // Same shape as every other single-choice control here: a labelled group
     // of aria-pressed buttons, exactly one of them pressed.
-    expect(appearance).toContain('role="group" aria-label="Accent colour"');
+    expect(appearance).toContain('role="group" aria-label="Accent color"');
     const swatches = appearance.slice(
-      appearance.indexOf('aria-label="Accent colour"'),
+      appearance.indexOf('aria-label="Accent color"'),
       appearance.indexOf('data-setting="ui-scale"'),
     );
     expect(swatches.match(/aria-pressed="true"/g) ?? []).toHaveLength(1);
@@ -630,5 +644,82 @@ describe("SettingsModal Manvi deep links", () => {
     expect(source).toContain("$effect(() => () => {\n    clearFlash();\n    clearRealign();");
     const close = source.slice(source.indexOf("if (!isOpen) {\n      clearFlash();"));
     expect(close.slice(0, 80)).toContain("clearRealign");
+  });
+});
+
+describe("SettingsModal native rendering switches", () => {
+  const MAC = {
+    os: "macos",
+    dock_hiding: true,
+    browser_sessions: true,
+    native_material: true,
+    liquid_glass: true,
+    high_refresh: true,
+  } as const;
+
+  /** The opening tag of one setting row, so the assertion reads that row and not a neighbour. */
+  function rowTag(body: string, id: string): string {
+    const start = body.indexOf(`data-setting="${id}"`);
+    expect(start, `no row for ${id}`).toBeGreaterThan(-1);
+    const open = body.lastIndexOf("<", start);
+    return body.slice(open, body.indexOf(">", start) + 1);
+  }
+
+  const isHidden = (tag: string) => /\shidden(\s|=|>|$)/.test(tag);
+
+  it.each([
+    ["native-glass", "Use the Liquid Glass window material"],
+    ["high-refresh", "Render the interface above 60 Hz"],
+  ])("shows %s on a host that has the code, switched off", (id, label) => {
+    resetHostPlatformForTests({ ...MAC });
+    const body = open();
+    expect(isHidden(rowTag(body, id))).toBe(false);
+    const at = body.indexOf(`aria-label="${label}"`);
+    expect(at, `no switch named "${label}"`).toBeGreaterThan(-1);
+    const tag = body.slice(body.lastIndexOf("<", at), body.indexOf(">", at) + 1);
+    expect(tag).toContain('aria-checked="false"');
+  });
+
+  it("hides each switch by its own capability, not by the OS name", () => {
+    resetHostPlatformForTests({ ...MAC, liquid_glass: false });
+    let body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(true);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(false);
+
+    resetHostPlatformForTests({ ...MAC, high_refresh: false });
+    body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(false);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(true);
+  });
+
+  it("hides both on a host without them, whatever the user agent says", () => {
+    resetHostPlatformForTests({ ...MAC, os: "windows", liquid_glass: false, high_refresh: false, native_material: false });
+    const body = open();
+    expect(isHidden(rowTag(body, "native-glass"))).toBe(true);
+    expect(isHidden(rowTag(body, "high-refresh"))).toBe(true);
+  });
+
+  it("says each is off until turned on, and names the private WebKit switch behind 120 Hz", () => {
+    const rows = prose(appearanceSource);
+    resetHostPlatformForTests({ ...MAC });
+    expect(open()).toContain("Needs macOS 26 or later");
+    // Liquid Glass is public AppKit (NSGlassEffectView); only the frame-rate
+    // switch is private, and the copy must not claim otherwise for either.
+    expect(rows).toContain("private WebKit switch");
+    expect(rows).not.toContain("private macOS window API");
+    expect(rows.match(/stays off unless you turn it on/g)).toHaveLength(2);
+  });
+
+  it("never draws a refusal as in effect", () => {
+    // Three states and no fourth: pending, in effect, refused with a reason.
+    const rows = prose(appearanceSource);
+    expect(rows).toContain('data-native-outcome="pending"');
+    expect(rows).toContain('data-native-outcome="active"');
+    expect(rows).toContain('data-native-outcome="refused"');
+    expect(rows).toContain('data-native-outcome="restart"');
+    // The refusal branch is tested first, so a restart note never hides it.
+    expect(rows.indexOf("{#if asked && answer !== null && !answer.active}")).toBeGreaterThan(-1);
+    expect(rows.indexOf("{#if asked && answer !== null && !answer.active}")).toBeLessThan(rows.indexOf("{:else if restartNote !== null}"));
+    expect(rows).toContain("{#if answer === null}");
   });
 });

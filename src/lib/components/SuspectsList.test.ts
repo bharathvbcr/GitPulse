@@ -120,8 +120,9 @@ describe("the list is one of Graph's lists", () => {
     expect(bar).toContain("suspectsQuery.run(repoPath)");
     expect(bar).toContain("disabled={!canRun}");
     expect(bar).toContain("canRunSuspects($suspectsQuery, repoPath)");
-    // ⌘F focuses the symptom on this list, where the filter is not shown.
-    expect(bar).toContain("window.addEventListener(FOCUS_COMMIT_SEARCH_EVENT, focusSymptom)");
+    // ⌘F focuses the symptom on this list, where the field is not the commit
+    // filter (App routes the chord through findChordTarget).
+    expect(bar).toContain("window.addEventListener(FOCUS_SUSPECTS_SYMPTOM_EVENT, focusSymptom)");
   });
 
   it("puts its verdict and its way in on the details pane", () => {

@@ -120,7 +120,7 @@ export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
     return;
   }
   if (current.length >= MAX_LIVE_RUNS) {
-    throw new Error(`${MAX_LIVE_RUNS} task terminals are already waiting to open. Open or cancel one of those attempts first.`);
+    throw new Error(`${MAX_LIVE_RUNS} task terminals are already waiting to open. Open or cancel one of those runs first.`);
   }
   pending.set([...current, request]);
 }

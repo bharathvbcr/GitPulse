@@ -41,7 +41,7 @@ export async function createBranchAt(commitId: string, label?: string): Promise<
   const trimmed = name?.trim();
   if (!trimmed) return false;
   const outcome = await repoStore.createBranch(trimmed, commitId, target);
-  if (!reportFailure(outcome, "Could not create the branch")) return false;
+  if (!reportFailure(outcome, "Couldn't create the branch")) return false;
   toastStore.success(`Created branch "${trimmed}" at ${shortHash(commitId)}`);
   return true;
 }
@@ -64,7 +64,7 @@ export async function resetKeepTo(commitId: string, label?: string): Promise<boo
   try {
     preview = await invoke<ResetPreview>("cmd_reset_preview", { repoPath: repo, target: commitId });
   } catch (err) {
-    toastStore.error(`Could not preview the reset: ${formatError(err)}`);
+    toastStore.error(`Couldn't preview the reset: ${formatError(err)}`);
     return false;
   }
   // The preview belongs to the repository it was read from.
@@ -78,7 +78,7 @@ export async function resetKeepTo(commitId: string, label?: string): Promise<boo
   });
   if (!confirmed) return false;
   const outcome = await repoStore.resetTo("keep", preview.target, target);
-  if (!reportFailure(outcome, "Could not reset")) return false;
+  if (!reportFailure(outcome, "Couldn't reset")) return false;
   // HEAD moved, so every reflog selector shifted: the label the details pane
   // would put in the next prompt (`HEAD@{2}`) now names a different entry.
   historySelectionLabel.set(null);

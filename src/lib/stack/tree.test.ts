@@ -261,7 +261,7 @@ describe("unresolvedStackNotice", () => {
 
   it("names the count and the budget when the walk was cut short", () => {
     const text = unresolvedStackNotice({ unresolved_branches: 20, walk_incomplete: true });
-    expect(text).toContain("20 branches could not be placed");
+    expect(text).toContain("20 branches couldn't be placed");
     expect(text).toContain("budget");
   });
 
@@ -280,7 +280,7 @@ describe("unresolvedStackNotice", () => {
 
   it("does not claim a budget when the history could not be read", () => {
     const text = unresolvedStackNotice({ unresolved_branches: 1, walk_incomplete: false });
-    expect(text).toContain("1 branch could not be placed");
+    expect(text).toContain("1 branch couldn't be placed");
     expect(text).not.toContain("budget");
   });
 });

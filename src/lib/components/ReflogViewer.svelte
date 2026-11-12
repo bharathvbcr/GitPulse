@@ -15,8 +15,11 @@
   import { filterStore } from "../stores/filterStore";
   import { filterReflogEntries } from "../branches/reflogFilter";
   import { invoke } from "../ipc/invoke";
-  import { History } from "@lucide/svelte";
+  import { AlertCircle, History } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { LAYERS } from "../ui/layers";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatDate, plural, shortHash } from "../format";
   import { reportPanelError } from "../diagnostics/report";
@@ -58,7 +61,8 @@
       reflogCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
-      errorMsg = reportPanelError("reflog", err);
+      const reported = reportPanelError("reflog", err);
+      errorMsg = `${describeFailure({ verb: "load", object: "the reflog" }, err).headline} ${reported}`;
       entries = [];
     } finally {
       if (guard.isLive()) loading = false;
@@ -137,22 +141,28 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background min-h-0 text-xs font-sans overflow-hidden">
-  <div class="px-4 py-1.5 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
-    <span class="text-textMuted" role="status">
+  <div class="gp-header">
+    <span class="min-w-0 flex-1 truncate text-textMuted" role="status">
       {#if $filterStore.searchQuery.trim() && entries.length > 0}
         {shown.length} of {plural(entries.length, "loaded entry", "loaded entries")} match
       {:else}
         HEAD's reflog · {plural(entries.length, "entry", "entries")}
       {/if}
     </span>
-    <button onclick={load} class="gp-btn">Refresh</button>
+    <button type="button" onclick={load} class="gp-btn" data-size="sm">Refresh</button>
   </div>
 
   <div class="flex-1 min-h-0 flex flex-col">
     {#if loading && entries.length === 0}
-      <div class="p-4 text-textMuted">Loading reflog…</div>
+      <div class="p-4"><Skeleton variant="tree-row" count={6} /></div>
     {:else if errorMsg}
-      <div class="p-4 text-rose-400">{errorMsg}</div>
+      <div class="p-4">
+        <div class="gp-notice" data-tone="unknown" role="alert">
+          <AlertCircle size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+          <span class="min-w-0 flex-1 break-words">{errorMsg}</span>
+          <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={load}>Try again</button>
+        </div>
+      </div>
     {:else if entries.length === 0}
       <EmptyState
         icon={History}
@@ -167,19 +177,21 @@
       />
     {:else}
       {#if entries.length >= REFLOG_ENTRY_LIMIT}
-        <div class="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-600 dark:text-amber-300" role="status">
-          Showing the 200 most recent reflog entries. Older reflog history may exist.
+        <div class="shrink-0 px-3 pt-2">
+          <div class="gp-notice text-meta" data-tone="warn" role="status">
+            Showing the 200 most recent reflog entries. Older reflog history may exist.
+          </div>
         </div>
       {/if}
       <div class="flex-1 min-h-0 overflow-auto">
         <table class="w-full text-left">
-          <thead class="sticky top-0 bg-surface text-[10px] uppercase text-textMuted">
+          <thead class="sticky top-0 bg-surface text-textMuted" style="z-index: {LAYERS.STICKY}">
             <tr>
-              <th class="px-3 py-2 font-medium">Selector</th>
-              <th class="px-3 py-2 font-medium">SHA</th>
-              <th class="px-3 py-2 font-medium">Action</th>
-              <th class="px-3 py-2 font-medium">Message</th>
-              <th class="px-3 py-2 font-medium">When</th>
+              <th class="gp-label px-3 py-2">Selector</th>
+              <th class="gp-label px-3 py-2">SHA</th>
+              <th class="gp-label px-3 py-2">Action</th>
+              <th class="gp-label px-3 py-2">Message</th>
+              <th class="gp-label px-3 py-2">When</th>
             </tr>
           </thead>
           <tbody>
@@ -187,7 +199,7 @@
               {@const current = entry.selector === selectedSelector && entry.commit_id === selectedCommitId}
               <tr
                 aria-current={current ? "true" : undefined}
-                class="group border-t border-border/30 hover:bg-surfaceHover/60 transition-colors focus-within:bg-surfaceHover {current ? 'bg-accent/10' : ''}"
+                class="group hover:bg-surfaceHover/60 transition-colors focus-within:bg-surfaceHover {current ? 'bg-accent/10' : ''}"
               >
                 <td class="px-3 py-1.5 font-mono rounded-l-lg">
                   <button
@@ -195,7 +207,9 @@
                     aria-label={`Inspect ${entry.selector}, commit ${shortHash(entry.commit_id, 8)}, ${entry.action}: ${entry.message}, ${formatDate(entry.timestamp)}`}
                     title="Show this commit below, where it can be branched from or reset to"
                     onclick={() => inspectEntry(entry)}
-                    class="rounded px-1 -mx-1 text-accent hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
+                    class="gp-btn -mx-2.5 font-mono focus-visible:ring-1 focus-visible:ring-accent"
+                    data-variant="ghost"
+                    data-size="sm"
                   >
                     {entry.selector}
                   </button>

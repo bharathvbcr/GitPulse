@@ -29,7 +29,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
     while (true) {
       try { if (condition()) return; }
       catch (error) { lastError = error instanceof Error ? error.message : String(error); }
-      if (Date.now() >= deadline) throw new Error(`UI did not reach the expected state: ${lastError}; ${document.querySelector("aside")?.textContent}`);
+      if (Date.now() >= deadline) throw new Error(`UI did not reach the expected state: ${lastError}; waiting for ${condition.toString().slice(0, 200)}; ${document.querySelector("aside")?.textContent}`);
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
@@ -61,14 +61,23 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", title);
   fill("Description", "textarea", description);
   fill("Acceptance criteria", "textarea", "Both repository checks remain available");
-  check("GitPulse").click();
+  // The repository picker is a popover portaled to <body>, so its rows are outside the editor.
+  const repoSummary = editor().querySelector<HTMLElement>('[data-testid="task-repo-summary"]');
+  if (!repoSummary) throw new Error("Missing repository picker trigger");
+  repoSummary.click();
+  await wait(() => Boolean(document.querySelector('[data-testid="task-repo-popup"]')));
+  const repoPopup = document.querySelector('[data-testid="task-repo-popup"]');
+  if (!repoPopup) throw new Error("Missing repository picker popup");
+  check("GitPulse", repoPopup).click();
+  repoSummary.click();
+  await wait(() => !document.querySelector('[data-testid="task-repo-popup"]'));
   await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "1");
   const assistToggle = editor().querySelector('[data-testid="task-assist-toggle"]');
   if (assistToggle instanceof HTMLElement && assistToggle.getAttribute("aria-expanded") === "false") assistToggle.click();
-  await wait(() => (editor().querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
-  assert(Boolean(editor().querySelector(".manvi-assist .change-link")), "Merged Manvi section is missing the Change link");
+  await wait(() => (editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')?.getClientRects().length ?? 0) > 0);
+  assert(Boolean(editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')), "Merged Manvi section is missing the Change link");
   assert(![...editor().querySelectorAll(".manvi-assist label")].some((label) => label.firstChild?.textContent?.trim() === "Model"), "Merged Manvi section must not expose a Model input");
   await wait(() => !enhance().matches(":disabled"));
   enhance().click();
@@ -86,7 +95,16 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   results.push("Generation leaves saved task fields unchanged");
   button("Edit suggestion", editor()).click();
   await wait(() => button("Accept selected fields", editor()).matches(":disabled"));
-  assert(button("Close task details").disabled, "Suggestion draft can be closed without saving");
+  // Since cb4ab882 closing mid-edit is not blocked: the button stays enabled and asks first (TaskEditor `leave`).
+  assert(!button("Close task details").disabled, "Close must stay available while a suggestion is being edited");
+  button("Close task details").click();
+  const prompt = () => document.querySelector<HTMLElement>('[role="dialog"][aria-modal="true"]');
+  await wait(() => prompt()?.textContent?.includes("Keep editing") === true);
+  assert(prompt()?.textContent?.includes("will be lost") === true, "The close confirmation does not say what is lost");
+  button("Keep editing", prompt() ?? document).click();
+  await wait(() => prompt() === null);
+  assert(Boolean(editor()), "Cancelling the close confirmation closed the editor");
+  assert(button("Accept selected fields", editor()).matches(":disabled"), "Cancelling the close confirmation lost the suggestion edit state");
   const revisedTitle = `${title} after review`;
   fill("Revised title", "textarea", revisedTitle);
   await wait(() => !button("Save suggestion edits", editor()).matches(":disabled"));
@@ -99,15 +117,16 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   check("Description", review()).click();
   button("Lose next acceptance reply").click();
   button("Accept selected fields", editor()).click();
-  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true || editor().textContent?.includes("The result is uncertain") === true);
+  await wait(() => editor().textContent?.includes("The result needs reconciliation") === true || editor().textContent?.includes("Couldn't confirm the result") === true);
   assert(field("Title", "input").matches(":disabled"), "Uncertain acceptance allowed task edits");
-  button("Retry pending action", editor()).click();
+  button("Try again", editor()).click();
   await wait(() => editor().dataset.taskRevision === "2" && state("Accepted"));
   assert(field("Title", "input").value === revisedTitle, "Selected edited title was not applied");
   assert(field("Description", "textarea").value === description, "Unselected description changed");
   assert(field("Acceptance criteria", "textarea").value === "Both repository checks remain available", "Acceptance criteria changed");
   assert(check("Title", review()).checked && !check("Description", review()).checked, "Accepted review marks an unaccepted field as accepted");
   results.push("Lost acceptance reply reconciles once and displays only accepted fields");
+  await wait(() => !button("Undo accepted fields", editor()).matches(":disabled"));
   button("Undo accepted fields", editor()).click();
   await wait(() => editor().dataset.taskRevision === "3" && state("Undone"));
   assert(field("Title", "input").value === title && field("Description", "textarea").value === description, "Undo did not restore the selected field");
@@ -131,7 +150,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   enhance().click();
   await wait(() => state("Generating"));
   button("Cancel", editor()).click();
-  await wait(() => state("Cancelled"));
+  await wait(() => state("Canceled"));
   assert(field("Title", "input").value === `${title} after manual review`, "Cancellation changed the task");
   results.push("Cancellation waits for worker acknowledgment and preserves the task");
   const automation = document.querySelector<HTMLElement>('section[aria-label="Automatic Manvi suggestions"]');
@@ -148,10 +167,15 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Title", "input", automaticTitle);
   button("Save task", editor()).click();
   await wait(() => editor().dataset.taskRevision === "5");
-  await wait(() => [...editor().querySelectorAll(".history button")].some((entry) => entry.textContent?.includes("Ready for review") && entry.textContent.includes("Task revision 5") && entry.textContent.includes("Automatic")));
-  const automaticEntry = [...editor().querySelectorAll<HTMLButtonElement>(".history button")].find((entry) => entry.textContent?.includes("Task revision 5") && entry.textContent.includes("Automatic"));
+  // The suggestion history is a <select> (W1), not a list of buttons.
+  const history = () => editor().querySelector<HTMLSelectElement>('[data-testid="task-assist-history"]');
+  await wait(() => Boolean([...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic"))) && ([...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic")))?.textContent?.includes("Ready for review") === true);
+  const automaticEntry = [...(history()?.options ?? [])].find((option) => option.textContent?.includes("rev 5") && option.textContent.includes("Automatic"));
   if (!automaticEntry) throw new Error("Automatic suggestion was not exposed for review");
-  automaticEntry.click();
+  const picker = history();
+  if (!picker) throw new Error("Suggestion history picker is missing");
+  picker.value = automaticEntry.value;
+  picker.dispatchEvent(new Event("change", { bubbles: true }));
   await wait(() => state("Ready for review") && review().textContent?.includes("source revision 5") === true);
   assert(field("Title", "input").value === automaticTitle && field("Description", "textarea").value === description, "Automatic inference changed saved fields");
   assert(review().querySelectorAll('input[type="checkbox"]').length === 1, "Automatic generation ignored the saved field lock");
@@ -159,8 +183,8 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   button("Stop automatic suggestions", automation).click();
   await wait(() => automation.textContent?.includes("Automatic suggestions are off") === true);
   assert(state("Ready for review"), "Disabling automatic work discarded a ready suggestion");
-  button("Reload automatic settings", automation).click();
-  await wait(() => !check("Suggest clearer task titles and descriptions automatically", automation).checked && !button("Reload automatic settings", automation).disabled);
+  button("Refresh automatic settings", automation).click();
+  await wait(() => !check("Suggest clearer task titles and descriptions automatically", automation).checked && !button("Refresh automatic settings", automation).disabled);
   results.push("Stopping automatic suggestions persists across settings reload and preserves ready reviews");
   assert(document.getElementById("errors")?.textContent === "Runtime errors: 0", "The browser reported runtime errors");
   return results;

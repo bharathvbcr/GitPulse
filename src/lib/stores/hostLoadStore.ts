@@ -403,7 +403,7 @@ export function startHostLoad(): void {
     announceRefusal(event.payload);
   }).catch((error) => {
     if (listening === attempt) listening = null;
-    diagnostics.warn("hostLoad", `could not listen for the host-load pulse; will retry: ${String(error)}`);
+    diagnostics.warn("hostLoad", `couldn't listen for the host-load pulse; will retry: ${String(error)}`);
     return null;
   });
   listening = attempt;

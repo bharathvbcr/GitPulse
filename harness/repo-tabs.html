@@ -7,11 +7,19 @@
     <style>
       body { margin: 0; background: rgb(11 14 23); }
       #stage { width: 1280px; }
+      /* RepoTabBar is row 1 of the header now, not a bar of its own: this
+         stands in for the header around it. It is the container the strip's
+         breakpoints query (`@container` on the header in App.svelte) and the
+         flex row the strip fills (`flex-1`). */
+      #bar { container-type: inline-size; height: 48px; position: relative; z-index: 20; }
+      /* The container's content box is what its queries measure, so the
+         padding lives on this inner row, as it does in App.svelte. */
+      #barRow { display: flex; align-items: center; height: 100%; padding: 0 12px; }
       #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
     </style>
   </head>
   <body>
-    <div id="stage"></div>
+    <div id="stage"><div id="bar"><div id="barRow"></div></div></div>
     <pre id="result">Loading…</pre>
     <script type="module">
       import "../src/app.css";
@@ -20,6 +28,7 @@
       const errors = [];
       const unexpected = [];
       let cloneCalls = 0;
+      let diffuseDiagnostics = "";
       addEventListener("error", (event) => errors.push(event.message));
       addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
 
@@ -101,10 +110,22 @@
 
       const { results, check, stopped } = createChecks();
       const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
-      const settle = async () => { await tick(); await wait(); await tick(); };
+      // Also waits out the header's finite entrance and exit animations (70 and
+      // 140 ms): an element that has left the model stays in the DOM until its
+      // exit ends, and a measurement taken sooner would count it twice.
+      const finite = () => document.getAnimations().filter((a) => (a.playState === "running" || a.playState === "pending") && a.effect?.getComputedTiming().iterations !== Infinity);
+      const settle = async () => {
+        await tick(); await wait(); await tick();
+        for (let i = 0; i < 30 && finite().length > 0; i += 1) await wait(20);
+      };
       const $ = (selector, root = document) => root.querySelector(selector);
       const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-      const strip = () => $('[role="tablist"][aria-label="Open repositories"]');
+      // The one tablist: surfaces and repositories (aria-label "Workspace").
+      // `scroller` is the part of it that scrolls, which is where overflow,
+      // the fade and the cue live.
+      const strip = () => $('[role="tablist"][aria-label="Workspace"]');
+      const scroller = () => $("[data-repo-strip-scroller]");
+      const announcement = () => $("[data-move-announcement]");
       const shells = () => $$("[data-stack-shell]", strip());
       const pills = () => $$("[data-tab-shell-index]", strip());
       const stackShell = (label) => shells().find((el) => el.textContent.includes(label));
@@ -131,7 +152,7 @@
           resetStackState();
           interfaceStore.setStackWorktreeTabs(true);
           interfaceStore.setAutoHideRepoTabs(false);
-          mount(RepoTabBar, { target: $("#stage"), props: { onClone: () => { cloneCalls += 1; } } });
+          mount(RepoTabBar, { target: $("#barRow"), props: { onClone: () => { cloneCalls += 1; } } });
           // A workspace pane drawn beneath the bar, later in source order and
           // lower in z-order, to prove the bar's dropdowns are not clipped by it.
           const pane = document.createElement("div");
@@ -158,11 +179,23 @@
           check("the strip keeps exactly one roving tab stop", () =>
             $$('[role="tab"]', strip()).filter((el) => el.tabIndex === 0).length === 1);
           check("a hidden checkout's uncommitted work still shows on the folded stack", () =>
-            !!$("span.bg-amber-400", switcher("GitPulse")));
+            !!$("span.bg-warn", switcher("GitPulse")));
           check("the folded stack is one line high", () =>
             stackShell("GitPulse").getBoundingClientRect().height <= 32);
           check("the strip fits its container without a horizontal scroll", () =>
-            strip().scrollWidth <= strip().clientWidth + 1);
+            scroller().scrollWidth <= scroller().clientWidth + 1);
+          check("the title bar is one tablist, Workspace, and holds Fleet, Agents and Tasks as tabs before the repositories", () => {
+            const tabs = $$('[role="tab"]', strip());
+            const surfaces = tabs.filter((el) => el.hasAttribute("data-surface-tab"));
+            return $$('[role="tablist"]').length === 1 && surfaces.map((el) => el.dataset.surfaceTab).join() === "fleet,agents,tasks" &&
+              tabs.indexOf(surfaces[2]) < tabs.findIndex((el) => el.hasAttribute("data-tab-id")) &&
+              surfaces.every((el) => el.getAttribute("aria-selected") === "false" && el.tabIndex === -1);
+          });
+          check("one repository tab is selected and it is the one roving stop", () => {
+            const tabs = $$('[role="tab"]', strip());
+            return tabs.filter((el) => el.getAttribute("aria-selected") === "true").length === 1 &&
+              tabs.filter((el) => el.tabIndex === 0).length === 1;
+          });
 
           // ---- the switcher ---------------------------------------------
           switcher("GitPulse").click();
@@ -224,7 +257,61 @@
           check("Ctrl+Shift+→ moves the whole stack past the next repository", () =>
             JSON.stringify(order()) === JSON.stringify([SITE, MAIN, WT_A, WT_B, API, API_FEATURE]));
           check("the move is announced by its place on the strip", () =>
-            $('[role="status"][aria-live="polite"]').textContent.includes("GitPulse to position 2 of 3"));
+            announcement().textContent.includes("GitPulse to position 2 of 3"));
+
+          // ---- E4: Cmd/Ctrl+digit reaches the tabs as drawn, 9 the last ---------
+          // The host's own command key, no alias. Under Tauri the native menu owns
+          // these chords; this page has no Tauri, so the window listener does.
+          const hostMac = (await import("../src/lib/platform.ts")).isMacOS();
+          const digitKey = (n, init = {}) => window.dispatchEvent(new KeyboardEvent("keydown", {
+            key: String(n), code: `Digit${n}`, metaKey: hostMac, ctrlKey: !hostMac, bubbles: true, cancelable: true, ...init,
+          }));
+          // Repository tabs only: Fleet, Agents and Tasks are chips in the same tablist.
+          const drawnTabs = () => $$('[role="tab"]', strip()).filter((el) => !/^(Fleet|Agents|Tasks)\b/.test(el.getAttribute("aria-label") ?? ""));
+          const selectedTab = () => drawnTabs().find((el) => el.getAttribute("aria-selected") === "true");
+          // This page mocks Tauri, so the webview stands down for these chords as
+          // it does in the app: the native menu owns them. The webview path
+          // (browser builds) is exercised with the Tauri marker hidden.
+          const beforeTauri = selectedTab();
+          if ("__TAURI_INTERNALS__" in window) {
+            digitKey(3); await settle(); await wait(100);
+            check("under Tauri the webview leaves Cmd/Ctrl+digit to the native menu (no double jump)", () => selectedTab() === beforeTauri);
+          }
+          const asBrowser = async (fn) => {
+            const held = window.__TAURI_INTERNALS__;
+            const had = "__TAURI_INTERNALS__" in window;
+            delete window.__TAURI_INTERNALS__;
+            try { await fn(); } finally { if (had) window.__TAURI_INTERNALS__ = held; }
+          };
+          await asBrowser(async () => {
+            digitKey(3); await settle(); await wait(200);
+            check("Cmd/Ctrl+3 selects the third tab as drawn", () => selectedTab() === drawnTabs()[2]);
+            digitKey(1); await settle(); await wait(200);
+            check("Cmd/Ctrl+1 selects the first tab as drawn", () => selectedTab() === drawnTabs()[0]);
+            digitKey(2); await settle(); await wait(200);
+            check("Cmd/Ctrl+2 selects the second tab as drawn", () => selectedTab() === drawnTabs()[1]);
+            digitKey(9); await settle(); await wait(200);
+            check("Cmd/Ctrl+9 selects the last tab as drawn, however many are open", () =>
+              drawnTabs().length > 1 && selectedTab() === drawnTabs()[drawnTabs().length - 1]);
+            digitKey(1); await settle(); await wait(200);
+            const beforeOld = selectedTab();
+            // Six tabs are open but the folded stack makes them three stops, so a
+            // fourth digit reaches nothing, and the native menu says so by
+            // leaving that item off (it counts stops from the same owner).
+            digitKey(4); await settle(); await wait(100);
+            check("Cmd/Ctrl+4 does nothing: six open tabs are three stops with the stack folded", () =>
+              get(repoStore).openTabs.length > 3 && repoStore.jumpStopCount() === 3 && selectedTab() === beforeOld);
+            const { buildMenuState, menuActionEnabled } = await import("../src/lib/desktop/menuState.ts");
+            const nativeItems = buildMenuState(get(repoStore), get(interfaceStore), "system", {}, false, undefined, undefined, 0, repoStore.jumpStopCount());
+            check("the native menu enables digits 1-3 and 9 and leaves 4 off, counting stops not tabs", () =>
+              [1, 2, 3, 9].every((n) => menuActionEnabled(nativeItems, `repo-tab-${n}`)) && !menuActionEnabled(nativeItems, "repo-tab-4"));
+            digitKey(2, { metaKey: false, ctrlKey: true, altKey: true }); await settle(); await wait(50);
+            check("the old Ctrl+Alt+digit is no longer a jump (it is AltGr on many layouts)", () => selectedTab() === beforeOld);
+            digitKey(2, { metaKey: hostMac, ctrlKey: !hostMac, altKey: hostMac, shiftKey: !hostMac }); await settle(); await wait(50);
+            check("the view chord (Option+Cmd or Ctrl+Shift) is not a tab jump", () => selectedTab() === beforeOld);
+          });
+          await repoStore.activateTab(get(repoStore).openTabs.find((t) => t.path === MAIN).id);
+          await settle();
 
           // ---- unfold / fold ---------------------------------------------
           switcher("GitPulse").click();
@@ -329,11 +416,12 @@
           // ---- overflow cue: the fade is a mask, never a painted patch ---
           // A painted fade was one colour on every host, so on the glass strip
           // it read as a blank block at the edge with nothing hovered.
-          const cueOverlays = () => $$(".gp-scroll-cue, .gp-scroll-cue-y", strip().parentElement);
+          const cueOverlays = () => $$(".gp-scroll-cue, .gp-scroll-cue-y", scroller().parentElement);
           const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
           check("a strip that fits carries no fade and no cue", () =>
-            strip().scrollWidth <= strip().clientWidth + 0.5 && strip().dataset.gpFade === undefined &&
-            maskOf(strip()) === "none" && cueOverlays().length === 0);
+            scroller().scrollWidth <= scroller().clientWidth + 0.5 && scroller().dataset.gpFade === undefined &&
+            maskOf(scroller()) === "none" && cueOverlays().length === 0);
+          check("…and no overflow menu", () => !$('[data-testid="repo-overflow"]'));
 
           // ---- the tab bar as a control: menus, focus, reorder, groups -------
           // Moved here from RepoTabBar.test.ts, which used to read the .svelte
@@ -401,7 +489,7 @@
           itemNamed(m, "Copy path").click();
           await settle(); await wait(20);
           check("a refused clipboard is reported on the store, and the menu is gone", () =>
-            writes[0] === WT_B && get(repoStore).error === "Could not copy path to clipboard" && !repoMenu());
+            writes[0] === WT_B && get(repoStore).error === "Couldn't copy path to clipboard" && !repoMenu());
           repoStore.setError(null);
           stubClipboard(async (text) => { writes.push(text); }, () => false);
           m = await openTabMenu(WT_B);
@@ -421,9 +509,33 @@
             const stops = $$('[role="tab"]', strip()).filter((el) => el.tabIndex === 0);
             return stops.length === 1 && stops[0].getAttribute("aria-selected") === "true";
           });
-          check("a tab advertises its keyboard commands", () =>
+          check("a tab advertises its keyboard commands, and has no native tooltip (the hover card replaced it)", () =>
             tabBtn(WT_B).getAttribute("aria-keyshortcuts") === "Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight" &&
-            shellOf(WT_B).title.includes("Drag to reorder"));
+            !shellOf(WT_B).hasAttribute("title"));
+          // ---- E2: the hover card, after the 500 ms intent delay ----------
+          const cardEl = () => $("[data-tab-card]");
+          shellOf(WT_B).dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
+          await wait(200);
+          check("hovering a tab opens no card at once", () => !cardEl());
+          const cardShown = await (async () => { for (let i = 0; i < 60 && !cardEl(); i += 1) await wait(50); return !!cardEl(); })();
+          check("after the intent delay a card opens, portaled to the body, with the path and the branch", () =>
+            cardShown && cardEl().parentElement === document.body && cardEl().textContent.includes(WT_B) &&
+            cardEl().textContent.includes(BRANCH[WT_B]));
+          // A background tab answers from its own session (sync and last fetch
+          // included); only what nothing has read says so, never a quiet answer.
+          check("the card reads a background tab's own fetch and sync, and says Not read yet for the agents nothing has swept", () =>
+            /Last fetch\s*(?!Not read)\S/.test(words(cardEl())) && /Branch\s*\S+\s*·\s*(?!Not read)\S/.test(words(cardEl())) &&
+            /Agents\s*Not read yet/.test(words(cardEl())));
+          check("the card sits inside the window", () => {
+            const box = cardEl().getBoundingClientRect();
+            return box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight;
+          });
+          shellOf(WT_B).dispatchEvent(new PointerEvent("pointerleave", { pointerType: "mouse" }));
+          for (let i = 0; i < 40 && cardEl(); i += 1) await wait(25);
+          check("leaving the tab closes the card after its grace", () => !cardEl());
+          shellOf(WT_B).dispatchEvent(new PointerEvent("pointerenter", { pointerType: "touch" }));
+          await wait(700);
+          check("a touch has no hover, so it opens no card", () => !cardEl());
           tabBtn(WT_B).focus();
           key(tabBtn(WT_B), { key: "p" });
           await settle();
@@ -435,8 +547,29 @@
           // ---- labels render in full, in a plate, with Open beside them ----
           const LONG = "/code/long/a-remarkably-long-repository-name-that-used-to-clip";
           BRANCH[LONG] = "feature/an-equally-long-branch-name-that-used-to-clip";
+          // §6: a tab opening plays on the compositor properties only. Svelte
+          // plays a transition with element.animate, so the call is recorded.
+          const played = [];
+          const nativeAnimate = Element.prototype.animate;
+          Element.prototype.animate = function (keyframes, options) {
+            // The transition is on the keyed item's wrapper; the tab is inside it.
+            const animation = nativeAnimate.call(this, keyframes, options);
+            const entry = { id: this.matches?.("[data-tab-motion]") ? this.querySelector("[data-tab-id]")?.getAttribute("data-tab-id") ?? null : null, keyframes, options, animation, duration: null };
+            requestAnimationFrame(() => { entry.duration = animation.effect?.getTiming().duration ?? null; });
+            played.push(entry);
+            return animation;
+          };
           await repoStore.openRepo(LONG, { activate: false });
           await settle();
+          Element.prototype.animate = nativeAnimate;
+          const entrance = played.filter((call) => call.id !== null && call.id === shellOf(LONG)?.getAttribute("data-tab-id"));
+          const entranceProps = entrance.flatMap((call) => (Array.isArray(call.keyframes) ? call.keyframes.flatMap((k) => Object.keys(k)) : Object.keys(call.keyframes ?? {})));
+          // Svelte creates the animation and then sets its timing, so the
+          // duration is read from the animation, not from the options.
+          check("a tab opening plays an opacity and transform entrance and nothing else", () =>
+            entrance.length > 0 && entrance.some((call) => call.duration === 140) &&
+            entranceProps.every((p) => ["opacity", "transform", "offset", "easing", "composite"].includes(p)) &&
+            entranceProps.includes("opacity") && entranceProps.includes("transform"));
           const longName = LONG.split("/").pop();
           const spanWith = (root, text) => [...root.querySelectorAll("span")].find((el) => el.textContent.trim() === text);
           const label = spanWith(tabBtn(LONG), longName);
@@ -446,10 +579,10 @@
             !!label && getComputedStyle(label).textOverflow !== "ellipsis" && getComputedStyle(label).whiteSpace === "nowrap" &&
             label.getBoundingClientRect().width + 1 >= ink(label));
           check("a long branch name is drawn whole as well", () =>
-            !!branchSpan && getComputedStyle(branchSpan).textOverflow !== "ellipsis" && branchSpan.getBoundingClientRect().width + 1 >= ink(branchSpan));
+            !!branchSpan && getComputedStyle(branchSpan).display !== "none" && getComputedStyle(branchSpan).textOverflow !== "ellipsis" && branchSpan.getBoundingClientRect().width + 1 >= ink(branchSpan));
           check("the tab grows past the old 14rem cap to hold both", () => {
             const shell = shellOf(LONG).getBoundingClientRect();
-            return shell.width > 224 && shell.right + 1 >= branchSpan.getBoundingClientRect().right;
+            return getComputedStyle(branchSpan).display !== "none" && shell.width > 224 && shell.right + 1 >= branchSpan.getBoundingClientRect().right;
           });
           const alpha = (color) => { const parts = color.match(/[\d.]+/g) ?? []; return parts.length > 3 ? Number(parts[3]) : 1; };
           const plate = (path) => getComputedStyle(shellOf(path));
@@ -472,7 +605,12 @@
           tasksMain.click();
           await settle();
           check("clicking the Tasks chip opens Tasks and pins the chip", () =>
-            get(interfaceStore).globalSurface === "tasks" && tasksMain.getAttribute("aria-pressed") === "true");
+            get(interfaceStore).globalSurface === "tasks" && tasksMain.getAttribute("aria-selected") === "true");
+          check("with a surface open, it is the one selected tab and the one roving stop, not the repository", () => {
+            const tabs = $$('[role="tab"]', strip());
+            return tabs.filter((el) => el.getAttribute("aria-selected") === "true").length === 1 && tasksMain.tabIndex === 0 &&
+              tabs.filter((el) => el.tabIndex === 0).length === 1;
+          });
           tasksMain.click();
           await settle();
           check("clicking it again keeps Tasks open rather than toggling it away", () => get(interfaceStore).globalSurface === "tasks");
@@ -496,7 +634,7 @@
           itemNamed(m, "Move right").click();
           await settle(); await wait(20);
           check("Move right shifts the tab one place and announces its position", () =>
-            placeOf(WT_B) === startAt + 1 && /^Moved agent-models to position \d+ of \d+$/.test($('[role="status"][aria-live="polite"]').textContent));
+            placeOf(WT_B) === startAt + 1 && /^Moved agent-models to position \d+ of \d+$/.test(announcement().textContent));
           m = await openTabMenu(WT_B);
           itemNamed(m, "Move left").click();
           await settle(); await wait(20);
@@ -643,7 +781,7 @@
           if (repoMenu()) { key(repoMenu(), { key: "Escape" }); await settle(); await wait(20); }
 
           // Strip background menu.
-          contextAt(strip());
+          contextAt(scroller());
           await settle(); await wait(20);
           const sm = $("[data-strip-menu]");
           const stripLabels = sm ? items(sm).map(words) : [];
@@ -659,7 +797,7 @@
           check("declining closes no repository", () => get(repoStore).openTabs.length === openBefore);
           await repoStore.closeTab(rec(API_FEATURE).id);
           await settle();
-          contextAt(strip());
+          contextAt(scroller());
           await settle(); await wait(20);
           check("after a close, the strip menu offers to reopen it by name", () =>
             items($("[data-strip-menu]")).some((el) => words(el) === "Reopen closed repository (Api-feature)"));
@@ -681,23 +819,48 @@
           interfaceStore.setStackWorktreeTabs(true);
           await settle();
           // A few tabs, so the strip does not overflow and there is free space
-          // between the last tab and the bar's end. Open, its menu and the
-          // workspace actions are pinned to the right edge across that space;
-          // the tab list itself must not grow into it, or its overflow cue
-          // would sit over empty space instead of the last tab.
-          check("Open and the workspace actions sit at the bar's right edge, the tab list stays its own width", () => {
+          // between the last tab and the bar's end. The drag zone fills that
+          // space, then Open, its menu and the workspace actions are pinned
+          // to the right edge; the tab list itself must not grow into it, or
+          // its overflow cue would sit over empty space instead of the last
+          // tab.
+          const openLeft = () => $('[data-testid="open-repo-tab"]').getBoundingClientRect().left;
+          // The point of pinning Open: opening or closing a tab must not move
+          // it. A browser's new-tab control moves; this one must not.
+          const openAtRest = openLeft();
+          const PROBE = "/code/fixed-position/probe";
+          await repoStore.openRepo(PROBE, { activate: false });
+          await settle(); await wait(20);
+          const openAfterOpen = openLeft();
+          const probeShown = !!$(`[role="tab"][data-tab-id="${CSS.escape(rec(PROBE).id)}"]`, strip());
+          await repoStore.closeTab(rec(PROBE).id);
+          await settle(); await wait(20);
+          const openAfterClose = openLeft();
+          check("Open's left edge does not move when a tab is opened, nor when it is closed (within 1px)", () =>
+            probeShown && Math.abs(openAfterOpen - openAtRest) <= 1 && Math.abs(openAfterClose - openAtRest) <= 1);
+          check("the drag zone sits between the tab list and Open, then Open, its menu and the workspace actions reach the bar's edge", () => {
             const openBtn = $('[data-testid="open-repo-tab"]');
+            const menuBtn = $('[data-testid="open-repo-menu"]');
+            const zone = $("[data-drag-zone]");
             const bar = openBtn.parentElement;
             const barBox = bar.getBoundingClientRect();
-            const padRight = parseFloat(getComputedStyle(bar).paddingRight);
-            const pinnedRight = Math.max(...[...bar.children]
+            const listEnd = strip().getBoundingClientRect().right;
+            const zoneBox = zone.getBoundingClientRect();
+            const openBox = openBtn.getBoundingClientRect();
+            const rightmost = Math.max(...[...bar.children]
               .filter((el) => !el.classList.contains("sr-only") && el.getBoundingClientRect().width > 0)
               .map((el) => el.getBoundingClientRect().right));
-            const listEnd = strip().lastElementChild.getBoundingClientRect().right;
-            return strip().scrollWidth <= strip().clientWidth + 1
-              && Math.abs(barBox.right - padRight - pinnedRight) < 1.5
-              && strip().getBoundingClientRect().right - listEnd < 2
-              && openBtn.getBoundingClientRect().left - listEnd > 24;
+            return scroller().scrollWidth <= scroller().clientWidth + 1
+              // The zone follows the list, is wide, and drags...
+              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 48 && zone.hasAttribute("data-tauri-drag-region")
+              // ...Open sits right of the zone, its menu arrow against it...
+              && openBox.left >= zoneBox.right - 1 && menuBtn.getBoundingClientRect().left >= openBox.right - 8
+              // ...and the last control sits at the bar's own right edge.
+              && Math.abs(barBox.right - rightmost) < 1.5;
+          });
+          check("the DOM order is the visual order: the tab list, the drag zone, Open, its menu", () => {
+            const order = [strip(), $("[data-drag-zone]"), $('[data-testid="open-repo-tab"]'), $('[data-testid="open-repo-menu"]')];
+            return order.every((el, i) => i === 0 || !!(order[i - 1].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
           });
 
           // ---- many more repositories than the watch pool ----------------
@@ -728,9 +891,14 @@
           check("repositories past the pool are parked, not dropped", () =>
             parkedPaths.length >= before + MANY - WATCH_POOL_SIZE);
           const parked = parkedPaths.find((path) => path.startsWith("/code/many/"));
-          check("a parked tab says so on the strip", () =>
-            domTab(parked)?.dataset.parked === "true" && /paused/i.test(domTab(parked).title) &&
-            /live updates paused/.test(domTab(parked).textContent));
+          const parkedShell = domTab(parked)?.closest("[data-tab-shell-index]");
+          parkedShell.dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
+          for (let i = 0; i < 60 && !$("[data-tab-card]"); i += 1) await wait(50);
+          const parkedCardSaid = /paused/i.test($("[data-tab-card]")?.textContent ?? "");
+          parkedShell.dispatchEvent(new PointerEvent("pointerleave", { pointerType: "mouse" }));
+          for (let i = 0; i < 40 && $("[data-tab-card]"); i += 1) await wait(25);
+          check("a parked tab says so on the strip, and the hover card says why", () =>
+            domTab(parked)?.dataset.parked === "true" && parkedCardSaid && /live updates paused/.test(domTab(parked).textContent));
           check("the active repository is watched", () => tabFor(activePath()).watch === "watching");
           domTab(parked).click();
           await settle();
@@ -741,11 +909,16 @@
 
           // Two hundred tabs overflow the strip; walk it from end to end.
           const frames = async () => { await settle(); await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); await tick(); };
-          strip().scrollLeft = 0;
+          scroller().scrollLeft = 0;
           await frames();
           check("an overflowing strip fades its own trailing edge", () =>
-            strip().scrollWidth > strip().clientWidth && strip().dataset.gpFade === "x-end" &&
-            maskOf(strip()) !== "none");
+            scroller().scrollWidth > scroller().clientWidth && scroller().dataset.gpFade === "x-end" &&
+            maskOf(scroller()) !== "none");
+          check("an overflowing strip offers an overflow menu that counts what it hides", () => {
+            const trigger = $('[data-testid="repo-overflow"]');
+            return !!trigger && /^\d+ more$/.test(words(trigger)) && trigger.getAttribute("aria-haspopup") === "menu" &&
+              trigger.getAttribute("aria-label").includes("more repositories");
+          });
           check("the cue overlay paints nothing behind its chevron", () => {
             const overlays = cueOverlays();
             return overlays.length === 1 && overlays.every((el) => {
@@ -753,22 +926,54 @@
               return cs.backgroundImage === "none" && cs.backgroundColor === "rgba(0, 0, 0, 0)" && cs.pointerEvents === "none";
             });
           });
-          strip().scrollLeft = Math.floor((strip().scrollWidth - strip().clientWidth) / 2);
+          scroller().scrollLeft = Math.floor((scroller().scrollWidth - scroller().clientWidth) / 2);
           await frames();
-          check("in the middle both edges fade", () => strip().dataset.gpFade === "x-both" && cueOverlays().length === 2);
-          strip().scrollLeft = strip().scrollWidth;
+          check("in the middle both edges fade", () => scroller().dataset.gpFade === "x-both" && cueOverlays().length === 2);
+          scroller().scrollLeft = scroller().scrollWidth;
           await frames();
-          check("at the end only the leading edge fades", () => strip().dataset.gpFade === "x-start" && cueOverlays().length === 1);
+          check("at the end only the leading edge fades", () => scroller().dataset.gpFade === "x-start" && cueOverlays().length === 1);
           check("the strip draws no scrollbar track under the tabs", () => {
-            const cs = getComputedStyle(strip());
+            const cs = getComputedStyle(scroller());
             return cs.overflowY === "hidden" && cs.scrollbarWidth === "none" &&
-              strip().offsetHeight - strip().clientHeight === 0;
+              scroller().offsetHeight - scroller().clientHeight === 0;
           });
-          strip().scrollLeft = 0;
+          scroller().scrollLeft = 0;
           await frames();
           const wheelEvent = new WheelEvent("wheel", { deltaY: 120, bubbles: true, cancelable: true });
-          strip().dispatchEvent(wheelEvent);
-          check("a mouse wheel pans the hidden-track strip", () => strip().scrollLeft > 0 && wheelEvent.defaultPrevented);
+          scroller().dispatchEvent(wheelEvent);
+          check("a mouse wheel pans the hidden-track strip", () => scroller().scrollLeft > 0 && wheelEvent.defaultPrevented);
+
+          // ---- the overflow menu: what the strip hides, with its marks ------
+          scroller().scrollLeft = 0;
+          await frames();
+          const overflowTrigger = $('[data-testid="repo-overflow"]');
+          const overflowMenu = () => $("#repo-overflow-menu");
+          overflowTrigger.click();
+          await settle(); await wait(20);
+          const overflowItems = items(overflowMenu());
+          check("opening it lists the off-screen units as menuitems, bounded to the window", () => {
+            const box = overflowMenu().getBoundingClientRect();
+            return overflowTrigger.getAttribute("aria-expanded") === "true" && overflowItems.length > 0 &&
+              overflowItems.length === Number(words(overflowTrigger).match(/^(\d+) more$/)[1]) &&
+              box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight &&
+              overflowItems.every((el) => !!el.dataset.overflowUnit);
+          });
+          const lastUnit = overflowItems.at(-1);
+          const lastUnitId = lastUnit.dataset.overflowUnit.split(":")[1];
+          lastUnit.click();
+          await settle(); await wait(60);
+          for (let i = 0; i < 40 && overflowMenu(); i += 1) await wait(25);
+          check("choosing one activates it, closes the menu and scrolls it into view", () => {
+            const target = get(repoStore).openTabs.find((t) => t.id === lastUnitId);
+            return !overflowMenu() && target?.isActive === true && get(interfaceStore).globalSurface === "repository";
+          });
+          overflowTrigger.click();
+          await settle(); await wait(20);
+          await press(overflowMenu(), { key: "Escape" });
+          // The menu leaves over its 70ms exit, not in the same frame.
+          for (let i = 0; i < 40 && overflowMenu(); i += 1) await wait(25);
+          check("Escape closes it and returns focus to its trigger", () =>
+            !overflowMenu() && document.activeElement === $('[data-testid="repo-overflow"]'));
 
           // ---- the recent-repositories dropdown ---------------------------------
           // By now two hundred repositories have been opened, so the recents
@@ -785,7 +990,7 @@
             rm.getAttribute("aria-label") === "Clone or open a recent repository" && recentsTrigger.getAttribute("aria-controls") === "recent-repositories-menu");
           check("focus moves onto its first item", () => items(rm)[0] === document.activeElement);
           check("Clone is the menu's first item, above the recents", () =>
-            items(rm)[0]?.dataset.testid === "clone-repo-item" && /Clone Repository/.test(items(rm)[0].textContent));
+            items(rm)[0]?.dataset.testid === "clone-repo-item" && /Clone repository/.test(items(rm)[0].textContent));
           const recentItems = items(rm);
           key(rm, { key: "ArrowDown" });
           const recentsDown = document.activeElement === recentItems[1];
@@ -798,11 +1003,18 @@
           check("its list scrolls inside the menu while the heading stays put", () =>
             getComputedStyle(list).overflowY === "auto" && list.scrollHeight > list.clientHeight &&
             rm.firstElementChild.getBoundingClientRect().height > 0 && rm.firstElementChild.getBoundingClientRect().top >= rbox.top - 1);
-          check("the bar is a stacking layer above the workspace pane that follows it", () => {
-            const bar = $('[data-testid="open-repo-tab"]').parentElement;
-            const z = Number(getComputedStyle(bar).zIndex);
-            return getComputedStyle(bar).position !== "static" && Number.isFinite(z) && z > Number(getComputedStyle(pane).zIndex);
+          // The dropdown no longer depends on the bar's own stacking layer: it
+          // is portaled to the body and clamped to the window beside its
+          // trigger, so no clipping ancestor (the title bar's containment) can
+          // cut it. The header's own z-index is pinned in App.test.ts.
+          check("the dropdown is portaled to the body, above the workspace pane by its own layer", () => {
+            const z = Number(getComputedStyle(rm).zIndex);
+            return rm.parentElement === document.body && getComputedStyle(rm).position === "fixed" &&
+              Number.isFinite(z) && z > Number(getComputedStyle(pane).zIndex);
           });
+          check("it opens under its trigger, its right edge on the trigger's end edge", () =>
+            Math.abs(rbox.right - recentsTrigger.getBoundingClientRect().right) <= 1 &&
+            rbox.top >= recentsTrigger.getBoundingClientRect().bottom - 1);
           check("the dropdown paints above a workspace pane drawn beneath the bar", () => {
             const hit = document.elementFromPoint(rbox.left + rbox.width / 2, rbox.top + Math.min(rbox.height / 2, 60));
             return !!hit && rm.contains(hit);
@@ -816,6 +1028,86 @@
           await settle();
           check("choosing Clone runs the clone action once and closes the menu", () => cloneCalls === 1 && !recentsMenu());
 
+          // Open sits near the window's right edge, so the menu must stay
+          // inside the window. The stage stands in for the window: at each
+          // width the bar fills it, and the menu must lie inside it (and the
+          // real window) however far right the trigger sits.
+          const stageEl = $("#stage");
+          const stageWidthWas = stageEl.style.width;
+          for (const width of [1400, 900]) {
+            stageEl.style.width = `${width}px`;
+            await settle(); await wait(40);
+            const trigger = $('[data-testid="open-repo-menu"]');
+            trigger.click();
+            await settle(); await wait(40);
+            const menuEl = recentsMenu();
+            const box = menuEl?.getBoundingClientRect();
+            const stageBox = stageEl.getBoundingClientRect();
+            const triggerBox = trigger.getBoundingClientRect();
+            check(`at ${width}px the recents menu opens fully inside the window, under its trigger`, () =>
+              !!box && box.left >= 0 && box.right <= Math.min(stageBox.right, innerWidth) + 0.5 &&
+              box.top >= triggerBox.bottom - 1 && box.bottom <= innerHeight &&
+              triggerBox.right <= stageBox.right && box.width > 0);
+            await press(menuEl, { key: "Escape" });
+            check(`at ${width}px Escape closes it again`, () => !recentsMenu());
+          }
+          stageEl.style.width = stageWidthWas;
+          await settle();
+
+          // ---- the diffuse edge's frame time while the strip scrolls -----------
+          // HEADER_SPEC section 5: ship the backdrop strips only if they add no
+          // frame past the 8.3 ms budget of a 120 Hz display. This measures
+          // requestAnimationFrame intervals while the overflowing strip is
+          // scrolled by script, with the strips on (the shipped float blur) and
+          // off (`data-float-blur="off"`, the mask fade alone), interleaved ABBA
+          // so a drifting load cannot favour one arm. It is the harness
+          // engine's number, not the installed app window's, and it is reported,
+          // never asserted: a window that is not on screen delivers no frames,
+          // and then the row says so instead of passing.
+          const { summarize } = await import("./FrameRate.ts");
+          const PHASE_MS = Number(params.get("diffuseMs") ?? 600);
+          const scrollFor = async (ms) => {
+            const intervals = [];
+            const el = scroller();
+            const travel = () => el.scrollWidth - el.clientWidth;
+            let last = performance.now();
+            const began = last;
+            await new Promise((resolve) => {
+              const bail = setTimeout(resolve, ms + 2000);
+              const step = (now) => {
+                intervals.push(now - last);
+                last = now;
+                const phase = (now - began) / ms;
+                el.scrollLeft = travel() * (0.1 + 0.8 * (0.5 + 0.5 * Math.sin(phase * Math.PI * 4)));
+                if (now - began < ms) requestAnimationFrame(step);
+                else { clearTimeout(bail); resolve(); }
+              };
+              requestAnimationFrame(step);
+            });
+            return intervals.slice(1);
+          };
+          const arms = { on: [], off: [] };
+          const sequence = ["on", "off", "off", "on", "on", "off", "off", "on", "on", "off", "off", "on"];
+          for (const arm of sequence) {
+            if (arm === "off") document.documentElement.setAttribute("data-float-blur", "off");
+            else document.documentElement.removeAttribute("data-float-blur");
+            await settle();
+            const strips = $$(".gp-scroll-diffuse", scroller().parentElement).filter((el) => getComputedStyle(el).display !== "none").length;
+            const stats = summarize(await scrollFor(PHASE_MS));
+            arms[arm].push({ ...stats, strips });
+          }
+          document.documentElement.removeAttribute("data-float-blur");
+          const describe = (rows) => rows.map((r) => `n=${r.frames} median ${r.medianMs.toFixed(2)} p95 ${r.p95Ms.toFixed(2)} p99 ${r.p99Ms.toFixed(2)} max ${r.maxMs.toFixed(2)} long ${r.longFrames} strips ${r.strips}`);
+          diffuseDiagnostics = JSON.stringify({
+            note: "WebKit/Chromium harness engine, not the installed app window; rAF intervals while the strip is scrolled by script",
+            phaseMs: PHASE_MS,
+            sequence,
+            on: describe(arms.on),
+            off: describe(arms.off),
+          }, null, 1);
+          check("the diffuse arm drew strips and the mask-only arm drew none", () =>
+            arms.on.every((r) => r.strips > 0) && arms.off.every((r) => r.strips === 0));
+
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);
           report_();
@@ -823,7 +1115,7 @@
           stopped(error);
           report_();
         }
-        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected, diagnostics: diffuseDiagnostics }));
         const reportPath = params.get("report");
         if (reportPath?.startsWith("/__gp_result/")) {
           await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });

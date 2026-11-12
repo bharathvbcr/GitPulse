@@ -238,7 +238,7 @@ describe("restoreTasks and restoreSummary", () => {
       throw new WorkbenchError("conflict", "Task changed since it was deleted.");
     }, { newID });
     expect(changed.deleted).toEqual([]);
-    expect(restoreSummary(changed)).toBe("Could not restore “Keep E42” (conflict: Task changed since it was deleted.).");
+    expect(restoreSummary(changed)).toBe("Couldn't restore “Keep E42” (conflict: Task changed since it was deleted.).");
 
     const two = await restoreTasks([task({ id: "a" }), task({ id: "b" })], async () => {
       throw new WorkbenchError("conflict", "changed");

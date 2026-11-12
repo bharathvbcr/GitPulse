@@ -18,15 +18,28 @@ describe("onboarding integration and native permission purposes", () => {
   });
   it("mounts the production tour with existing actions", () => {
     const app = read("src/App.svelte");
-    expect(app).toContain('<ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}');
-    expect(app).toContain('onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}');
-    expect(app).toContain('onTasks={() => interfaceStore.setTasksOpen(true)}');
+    // The tour rides its own chunk (19 KB the entry chunk was over budget for):
+    // App mounts the gate, which reads the saved tour at launch and loads the
+    // tour through the shared loader only once it is open.
+    expect(app).toContain('import ProductTour from "./lib/components/onboarding/ProductTourGate.svelte";');
+    expect(app).not.toContain('import ProductTour from "./lib/components/onboarding/ProductTour.svelte"');
+    expect(app).not.toContain("load={loadProductTour}");
+    const gate = read("src/lib/components/onboarding/ProductTourGate.svelte");
+    expect(gate).toContain('import { loadProductTour } from "../lazyLoaders";');
+    expect(gate).toContain("onMount(() => tour.initialize());");
+    expect(app).toContain("<ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}");
+    expect(app).toContain("onSettings={() => (isSettingsModalOpen = true)}");
+    expect(app).toContain('onTools={() => openSetupWizard("devmap", "explain")}');
+    expect(app).toContain("onTasks={() => interfaceStore.setTasksOpen(true)}");
     expect(app).toContain('repoStore.setActiveTab(view)');
     expect(app).toContain('repositoryPath={$repoStore.currentPath}');
     expect(app).toContain('settingsOpen={isSettingsModalOpen}');
     expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="repository"');
     expect(read("src/lib/components/ViewTabBar.svelte")).toContain('data-tour="views"');
-    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('data-tour="tasks"');
+    // The Tasks tab is a surfaceTab snippet now, so it names its tour stop as
+    // data (`tour: "tasks"`, rendered as data-tour) rather than as a literal.
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain('tour: "tasks"');
+    expect(read("src/lib/components/RepoTabBar.svelte")).toContain("data-tour={spec.tour}");
   });
 
   it("keeps the title bar clear of the walkthrough pill and replays from Settings", () => {
@@ -40,8 +53,11 @@ describe("onboarding integration and native permission purposes", () => {
 
     const settings = read("src/lib/components/SettingsModal.svelte");
     expect(settings).toContain('import { productTour } from "../tools/productTour";');
-    expect(settings).toContain('data-setting="walkthrough-replay"');
-    expect(settings).toContain("onclick={replayWalkthrough}");
+    // The row moved into AppearanceSettings; the modal still owns replayWalkthrough and hands it down.
+    const appearance = read("src/lib/components/AppearanceSettings.svelte");
+    expect(appearance).toContain('data-setting="walkthrough-replay"');
+    expect(appearance).toContain("onclick={onReplayTour}");
+    expect(settings).toContain("onReplayTour={replayWalkthrough}");
     // Settings has to close before the guide opens: the tour renders below
     // this dialog by design, and its live steps point at controls it covers.
     expect(settings).toMatch(

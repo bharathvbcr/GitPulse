@@ -3,6 +3,7 @@
   import { CheckCircle2, Info, AlertTriangle, AlertCircle, X } from "@lucide/svelte";
   import { fly, fade } from "svelte/transition";
   import { LAYERS } from "../ui/layers";
+  import { motionExitMs, motionMs } from "../motion/tokens";
   import { focusStayedInside, notificationPile } from "../ui/notificationPile";
 
   const KIND_CONFIG: Record<
@@ -11,27 +12,27 @@
   > = {
     success: {
       icon: CheckCircle2,
-      border: "border-emerald-500/40",
-      text: "text-emerald-700 dark:text-emerald-300",
-      iconColor: "text-emerald-500",
+      border: "border-ok/35",
+      text: "text-ok",
+      iconColor: "text-ok",
     },
     info: {
       icon: Info,
-      border: "border-accent/40",
+      border: "border-accent/35",
       text: "text-textPrimary",
       iconColor: "text-accent",
     },
     warning: {
       icon: AlertTriangle,
-      border: "border-amber-500/40",
-      text: "text-amber-700 dark:text-amber-300",
-      iconColor: "text-amber-500",
+      border: "border-warn/35",
+      text: "text-warn",
+      iconColor: "text-warn",
     },
     error: {
       icon: AlertCircle,
-      border: "border-rose-500/40",
-      text: "text-rose-700 dark:text-rose-300",
-      iconColor: "text-rose-500",
+      border: "border-danger/35",
+      text: "text-danger",
+      iconColor: "text-danger",
     },
   };
 
@@ -88,7 +89,7 @@
   at runtime is unreliable.
 -->
 <div
-  class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none select-none"
+  class="fixed bottom-4 right-4 flex flex-col gap-2 max-w-sm w-full pointer-events-none select-none"
   style="z-index: {LAYERS.MODAL};"
   role="region"
   aria-label="Notifications"
@@ -133,8 +134,8 @@
         {@const Icon = config.icon}
         <div
           role="presentation"
-          in:fly={{ y: 12, duration: 160 }}
-          out:fade={{ duration: 120 }}
+          in:fly={{ y: 12, duration: motionMs("fast") }}
+          out:fade={{ duration: motionExitMs("fast") }}
           class="toast pointer-events-auto gp-pop gp-card rounded-2xl p-3 border shadow-float flex items-start gap-2.5 bg-surface {config.border}"
         >
           <div class="shrink-0 mt-0.5 {config.iconColor}" aria-hidden="true">
@@ -152,7 +153,7 @@
                   type="button"
                   onclick={() => handleAction(toast)}
                   aria-label="{toast.action.label}: {toast.message}"
-                  class="gp-btn py-0.5! px-2.5! text-[11px] font-semibold hover:border-accent/60"
+                  class="gp-btn px-2.5! text-meta font-semibold hover:border-accent/65" data-size="sm"
                 >
                   {toast.action.label}
                 </button>
@@ -178,6 +179,6 @@
   /* Lips sit above the card and tuck under it by about its padding, so the message stays clear. */
   .pile{position:relative;display:flex;flex-direction:column;gap:8px}
   .pile:not(.open){padding-top:16px}
-  .toast{position:relative;z-index:1}
+  .toast{position:relative}
   .peek{position:absolute;z-index:0;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);top:calc((2 - var(--depth)) * 8px)}
 </style>

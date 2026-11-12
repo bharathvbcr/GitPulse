@@ -148,7 +148,7 @@ describe("runAcrossRepos", () => {
     // A cancelled repository is skipped, never failed — nothing went wrong
     // with it, it simply was not reached.
     expect(report.results[9].status).toBe("skipped");
-    expect(report.results[9].reason).toContain("Cancelled");
+    expect(report.results[9].reason).toContain("Canceled");
   });
 
   it("reports an already-cancelled run without running anything", async () => {
@@ -354,7 +354,7 @@ describe("summarizeRun", () => {
   });
 
   it("marks a cancelled run as cancelled", () => {
-    expect(summarizeRun(report(2, 0, 8, true), "Fetched")).toContain("(cancelled)");
+    expect(summarizeRun(report(2, 0, 8, true), "Fetched")).toContain("(canceled)");
   });
 
   it("says there was nothing to do rather than claiming success", () => {

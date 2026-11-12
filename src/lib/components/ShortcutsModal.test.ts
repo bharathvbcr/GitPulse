@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { COMMIT_FILTER_VIEW } from "../views/commitFilter";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
@@ -22,7 +23,7 @@ describe("ShortcutsModal", () => {
   it("documents the same Open, Clone, and Work accelerators the native menu binds", () => {
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Open Repository…");
-    expect(body).toContain("Clone Repository…");
+    expect(body).toContain("Clone repository…");
     expect(body).toContain("Open Work");
     expect(body).toContain("F10");
     // Native File menu binds CmdOrCtrl+O and CmdOrCtrl+Shift+O; the sheet
@@ -55,12 +56,30 @@ describe("ShortcutsModal", () => {
     expect(body).not.toContain("⌘1–9");
   });
 
+  it("gives the plain command digits to repository tabs and the views their own chord", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Jump to a repository tab; 9 is the last one");
+    // The old binding, Ctrl+Alt+digit, is AltGr on many layouts and is gone.
+    expect(body).not.toMatch(/<kbd[^>]*>Alt<\/kbd>\s*<kbd[^>]*>1–9<\/kbd>/);
+    const source = readFileSync(new URL("./ShortcutsModal.svelte", import.meta.url), "utf8");
+    expect(source).not.toContain('"Ctrl", "Alt", "1–9"');
+    expect(source).toContain('{ keys: ["⌘", "1–9"], description: "Jump to a repository tab; 9 is the last one" }');
+  });
+
   it("documents the diff's own chords, which have no menu entry to find them by", () => {
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Find in this diff");
     expect(body).toContain("Previous / next block of changes");
     expect(body).toContain("Previous / next file in this change");
     expect(body).toContain("F3");
+  });
+
+  it("includes the terminal chords that used to live on the dock", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Terminal");
+    expect(body).toContain("New shell in the directory of the shell beside it");
+    expect(body).toContain("Find in the terminal");
+    expect(body).toContain("Close session");
   });
 
   it("documents how to reorder repository tabs from the keyboard", () => {

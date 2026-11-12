@@ -88,7 +88,7 @@ describe("repoWip", () => {
     // like a clean one, and the user closes the window over unsaved work.
     const wip = repoWip(input({ loadFailed: true }));
     expect(wip.severity).toBe("unknown");
-    expect(wip.reasons[0].detail).toContain("could not be read");
+    expect(wip.reasons[0].detail).toContain("couldn't be read");
   });
 
   it("treats a not-yet-loaded repository as unknown rather than clean", () => {
@@ -215,7 +215,7 @@ describe("bulkSkipReason", () => {
   });
 
   it("skips a repository whose state could not be read", () => {
-    expect(bulkSkipReason(input({ loadFailed: true }))).toContain("could not be read");
+    expect(bulkSkipReason(input({ loadFailed: true }))).toContain("couldn't be read");
   });
 
   it("skips a repository that has not finished loading", () => {

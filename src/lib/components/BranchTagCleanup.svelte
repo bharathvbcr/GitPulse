@@ -416,7 +416,7 @@
               <span>
                 {#if tagPlan.uncompared_tags > 0}
                   <!-- Not folded into either bucket: these were never measured. -->
-                  {tagPlan.uncompared_tags} could not be compared
+                  {tagPlan.uncompared_tags} couldn't be compared
                 {:else if tagPlan.compared_to}
                   measured against {tagPlan.compared_to}
                 {:else}

@@ -35,6 +35,18 @@
   --color-onInfo: rgb(var(--c-on-info));
   --color-unknown: rgb(var(--c-unknown));
   --color-onUnknown: rgb(var(--c-on-unknown));
+  /* Code colouring: `text-syntax-keyword` and friends, one per token role. */
+  --color-syntax-keyword: var(--c-syntax-keyword);
+  --color-syntax-type: var(--c-syntax-type);
+  --color-syntax-string: var(--c-syntax-string);
+  --color-syntax-number: var(--c-syntax-number);
+  --color-syntax-function: var(--c-syntax-function);
+  --color-syntax-operator: var(--c-syntax-operator);
+  --color-syntax-attribute: var(--c-syntax-attribute);
+  --color-syntax-property: var(--c-syntax-property);
+  --color-syntax-regex: var(--c-syntax-regex);
+  --color-syntax-variable: var(--c-syntax-variable);
+  --color-syntax-punctuation: var(--c-syntax-punctuation);
   /* The three border-opacity stops (§3): `border-edgeSoft` / `border-edge` /
      `border-edgeStrong`. They follow --c-border, so a theme or imported
      palette moves them. */
@@ -42,18 +54,40 @@
   --color-edge: var(--gp-edge);
   --color-edgeStrong: var(--gp-edge-strong);
 
-  /* The two type steps below `text-xs`. `text-xs` (12px) stays Tailwind's: it
-     is already the body size. `text-sm`/`base`/`lg` are NOT redefined here;
-     that is a component change and lands with the type codemod. */
-  --text-micro: 0.625rem;
-  --text-micro--line-height: 1.3;
-  --text-meta: 0.6875rem;
-  --text-meta--line-height: 1.4;
+  /* Type (§6, §11). `--gp-font-ui` / `--gp-font-mono` are inline inputs written
+     by Settings -> Appearance (local family names, already followed by the
+     fallback stack). Unset, these are Tailwind's own default stacks, so a fresh
+     install renders exactly what it did before the setting existed. */
+  --font-sans: var(--gp-font-ui, ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");
+  --font-mono: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
 }
 
 /* Static: these are plain vocabulary, not utilities, so Tailwind must emit them
    whether or not a class in the sources names them. */
 @theme static {
+  /* The type scale (design language §6): 10 / 11 / 12 / 13 / 15 / 18, each with its
+     line height, so a utility never carries its own. Static, because a component
+     `<style>` reads them as a `var()` of the step and Tailwind would otherwise emit
+     only the steps a utility class happens to use (`text-lg` has no users).
+     `xs` keeps Tailwind's 12px and its 1.333 line height, the body size every
+     `text-xs` surface is laid out against; `sm` and `base` move from 14 and 16 to
+     13 and 15. */
+  --text-micro: 0.625rem;
+  --text-micro--line-height: 1.3;
+  --text-meta: 0.6875rem;
+  --text-meta--line-height: 1.4;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: calc(1 / 0.75);
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.45;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.3;
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.25;
+  /* Metric numerals only (a count on a card, a stat): the one step above `lg`. */
+  --text-display: 1.5rem;
+  --text-display--line-height: 1.1;
+
   /* Shape (§5). 4px grid; `full` is the pill. `pane` aliases the macOS pane
      radius that already exists, so a Windows or Linux build gets the same 14. */
   --gp-r-xs: 4px;
@@ -112,6 +146,21 @@
   --shadow-pop: var(--shadow-pop);
   --shadow-float: var(--shadow-float);
   --shadow-glow: var(--shadow-glow);
+
+  /* Tailwind's corner utilities ride the --gp-r-* ladder (§5), so `rounded-*`
+     follows Appearance → Corner style exactly as the gp-* primitives do.
+     Before this, `rounded-xl` and friends kept Tailwind's own rem values and
+     ignored the setting (and `rounded-md` sat at 6px, off the ladder).
+     Inline: the utilities read the token where they are used. `full` is a
+     static value of the utility, never scaled. */
+  --radius: var(--gp-r-xs);
+  --radius-xs: calc(var(--gp-r-xs) / 2);
+  --radius-sm: var(--gp-r-xs);
+  --radius-md: var(--gp-r-sm);
+  --radius-lg: var(--gp-r-sm);
+  --radius-xl: var(--gp-r-md);
+  --radius-2xl: var(--gp-r-lg);
+  --radius-3xl: var(--gp-r-xl);
 }
 
 /*
@@ -136,16 +185,18 @@
   /* The one button (design language §9). With no `data-variant` it is the
      secondary pill, exactly what it has always been; `data-variant` picks
      primary | secondary | ghost | danger | success and `data-size` picks
-     sm (24px) | md (28px). The `gp-btn-primary/-success/-danger` classes below
+     sm (24px, also the unmarked height) | md (28px). The `gp-btn-primary/-success/-danger` classes below
      stay as working aliases until Wave 2 migrates their call sites and empties
      them. Only colors and the press transform animate. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-xs;
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-0 text-xs font-medium text-textPrimary shadow-xs;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), the height of data-size="sm" with the wider pill padding; data-size="md" is the 28px opt-in. No vertical padding, so the line box cannot push it past 24. */
+  min-height: 24px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-instant);
   transition-timing-function: var(--gp-ease-effect);
   &:hover {
-    @apply border-accent/50 bg-surfaceHover;
+    @apply border-accent/65 bg-surfaceHover;
   }
   &:active {
     transform: scale(0.97);
@@ -161,6 +212,16 @@
   &[data-size="md"] {
     @apply justify-center py-0;
     min-height: 28px;
+  }
+  /* A link-button that sits in running text or is a list item's title: no
+     pill padding, it wraps and starts at the left. Pairs with
+     `data-variant="ghost"`. Callers used to strip the padding with scoped
+     rules, which beat the layered primitive (design-lint rule 12). */
+  &[data-size="inline"] {
+    @apply justify-start p-0 text-left;
+    min-height: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   &[data-variant="primary"] {
@@ -221,7 +282,10 @@
 
 @utility gp-btn-primary {
   /* Pill button (primary): brand gradient with a soft halo. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white;
+  transition-property: color, background-color, border-color, transform;
+  transition-duration: var(--gp-dur-fast);
+  transition-timing-function: var(--gp-ease-effect);
   background-image: var(--brand-gradient);
   box-shadow: var(--shadow-glow);
   &:hover {
@@ -237,29 +301,14 @@
   }
 }
 
-@utility gp-btn-success {
-  /* Pill button (success): same geometry as primary, green ramp. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
-  background-image: linear-gradient(135deg, #34d399, #059669);
-  box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
-  &:hover {
-    filter: brightness(1.08);
-  }
-  &:active {
-    transform: scale(0.97);
-  }
-  &:disabled {
-    @apply cursor-not-allowed opacity-40;
-    filter: none;
-    box-shadow: none;
-  }
-}
-
 @utility gp-btn-danger {
   /* Pill button (destructive): same geometry as primary, rose ramp. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
-  background-image: linear-gradient(135deg, #fb7185, #e11d48);
-  box-shadow: 0 6px 22px -8px rgb(225 29 72 / 0.55);
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white;
+  transition-property: color, background-color, border-color, transform;
+  transition-duration: var(--gp-dur-fast);
+  transition-timing-function: var(--gp-ease-effect);
+  background-image: linear-gradient(135deg, rgb(var(--c-danger) / 0.85), rgb(var(--c-danger)));
+  box-shadow: 0 6px 22px -8px rgb(var(--c-danger) / 0.55);
   &:hover {
     filter: brightness(1.08);
   }
@@ -275,7 +324,13 @@
 
 @utility gp-icon-btn {
   /* Round icon button (ghost). */
-  @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
+  @apply inline-flex select-none items-center justify-center rounded-full p-1 text-textMuted;
+  /* Unmarked, it is 24px square (DESIGN_LANGUAGE §8, the WCAG 2.2 minimum target), the same as data-size="sm"; data-size="md" is the 28px opt-in. */
+  min-height: 24px;
+  min-width: 24px;
+  transition-property: color, background-color, border-color, transform;
+  transition-duration: var(--gp-dur-fast);
+  transition-timing-function: var(--gp-ease-effect);
   &:hover {
     @apply bg-surfaceHover text-textPrimary;
   }
@@ -303,13 +358,13 @@
      Written by a dozen call sites across the GitHub, MANVI and Stack panes
      and never defined, so every one of them rendered as bare inline text
      with the `!bg-…`/`!text-…` overrides beside it landing on nothing. */
-  @apply inline-flex select-none items-center gap-1 rounded-full border border-border/70 bg-surfaceHover px-1.5 py-0.5 text-[10px] font-medium leading-none text-textMuted;
+  @apply inline-flex select-none items-center gap-1 rounded-full border border-edge bg-surfaceHover px-1.5 py-0.5 text-micro font-medium leading-none text-textMuted;
 }
 
 @utility gp-card {
   /* Elevated card. Radius 16 = --gp-r-lg; it publishes the concentric inner
      radius (outer minus padding, never below --gp-r-xs) for what it holds. */
-  @apply rounded-2xl border border-border/70 bg-surface;
+  @apply rounded-2xl border border-edge bg-surface;
   box-shadow: var(--shadow-card);
   --gp-r-outer: var(--gp-r-lg);
   --gp-r-inner: max(var(--gp-r-xs), calc(var(--gp-r-outer) - var(--gp-pad)));
@@ -390,8 +445,80 @@
   --gp-fade-mask: linear-gradient(to bottom, transparent, #000 2rem, #000 calc(100% - 2rem), transparent);
 }
 
+/* Header lane I: diffuse scroll edge */
+/* ScrollCue's opt-in `diffuse` mode: a strip at each edge that still hides
+   content. It paints no blur: a backdrop filter over a translucent title bar
+   drew a hard-edged, lighter box where the strip ended (the "3 more" tab
+   strip), and the plan allows blur on floating chrome only. The scroller's own
+   opacity mask above does the fading; the strip keeps its inward mask so a
+   future paint stays soft at both ends.
+   The strips are static while scrolling and only fade in and out (opacity,
+   by Svelte transitions that already read the motion tokens and reduced
+   motion). Chevrons in this mode show only while the scroller's parent is
+   hovered. Opt-outs: float blur off, reduced transparency (attribute, written
+   with `~=` so mac-material-contract's rule-for-rule pin on the exact
+   attribute selector is not asked to mirror it) and increased contrast (a
+   media query kept at the end of this file, where prefix searches for the
+   other contrast and transparency blocks do not land on it). */
+.gp-scroll-diffuse {
+  @apply pointer-events-none absolute z-20;
+}
+
+.gp-scroll-diffuse[data-edge="top"],
+.gp-scroll-diffuse[data-edge="bottom"] {
+  inset-inline: 0;
+  height: 40px;
+}
+
+.gp-scroll-diffuse[data-edge="left"],
+.gp-scroll-diffuse[data-edge="right"] {
+  inset-block: 0;
+  width: 40px;
+}
+
+.gp-scroll-diffuse[data-edge="top"] {
+  top: 0;
+  --gp-diffuse-dir: to bottom;
+}
+
+.gp-scroll-diffuse[data-edge="bottom"] {
+  bottom: 0;
+  --gp-diffuse-dir: to top;
+}
+
+.gp-scroll-diffuse[data-edge="left"] {
+  left: 0;
+  --gp-diffuse-dir: to right;
+}
+
+.gp-scroll-diffuse[data-edge="right"] {
+  right: 0;
+  --gp-diffuse-dir: to left;
+}
+
+.gp-scroll-diffuse-strip {
+  position: absolute;
+  inset: 0;
+  -webkit-mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
+  mask-image: linear-gradient(var(--gp-diffuse-dir), #000, transparent);
+}
+
+html[data-float-blur="off"] .gp-scroll-diffuse,
+html[data-transparency~="reduced"] .gp-scroll-diffuse {
+  display: none;
+}
+
+.gp-scroll-cue-btn[data-hover-only] {
+  opacity: 0;
+  transition: opacity var(--gp-dur-fast) var(--gp-ease-effect);
+}
+
+[data-gp-hover] .gp-scroll-cue-btn[data-hover-only] {
+  opacity: 1;
+}
+
 @utility gp-scroll-cue-btn {
-  @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-surface/90 text-textMuted;
+  @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-edge bg-surface/90 text-textMuted;
   &:hover {
     @apply bg-surfaceHover text-textPrimary;
   }
@@ -399,7 +526,7 @@
 
 @utility gp-menu {
   /* Floating menu / popover. */
-  @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
+  @apply overflow-hidden rounded-xl border border-edgeStrong bg-surface p-1;
   box-shadow: var(--shadow-pop);
   /* Radius 12 = --gp-r-md, padding 4: items inside round at --gp-r-sm (8). */
   --gp-r-outer: var(--gp-r-md);
@@ -408,7 +535,8 @@
 }
 
 @utility gp-menu-item {
-  @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-textPrimary transition-colors duration-100;
+  @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-textPrimary;
+  transition: background-color var(--gp-dur-instant) var(--gp-ease-effect), color var(--gp-dur-instant) var(--gp-ease-effect);
   &:hover {
     @apply bg-surfaceHover;
   }
@@ -423,7 +551,7 @@
   height: 2px;
   margin-block: 0.5rem;
   margin-inline: auto;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border) / 0.4);
 }
 
@@ -436,7 +564,7 @@
   height: 1px;
   margin-block: 0.25rem;
   margin-inline: auto;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border) / 0.4);
 }
 
@@ -454,7 +582,7 @@
 
 @utility gp-segmented {
   /* Segmented control: a pill track with a raised active bubble. */
-  @apply inline-flex select-none items-center gap-0.5 rounded-full border border-border/70 bg-background/70 p-0.5;
+  @apply inline-flex select-none items-center gap-0.5 rounded-full border border-edge bg-background/70 p-0.5;
 }
 
 @utility gp-surface-header {
@@ -465,7 +593,7 @@
 }
 
 @utility gp-surface-title {
-  @apply m-0 text-[15px] leading-tight font-semibold text-textPrimary;
+  @apply m-0 text-base font-semibold text-textPrimary;
 }
 
 @utility gp-header {
@@ -474,19 +602,12 @@
      on `surface`, the list on `bg` -- never by a border. The fill is the macOS
      surface material where there is one, so it thins with the other panels and
      goes opaque under Reduce Transparency; elsewhere it is plain `--c-surface`.
-     Put a `gp-header-title` and a `gp-header-actions` inside. */
+     Put a `text-sm font-semibold` title and a `gp-header-actions` inside. */
   @apply flex shrink-0 items-center;
   height: var(--gp-header-h);
   padding-inline: var(--gp-space-3);
   gap: var(--gp-space-2);
   background-color: var(--mac-fill-surface, rgb(var(--c-surface)));
-}
-
-@utility gp-header-title {
-  /* 13px / 1.45, the `text-sm` step the type codemod will make of 14. */
-  @apply m-0 min-w-0 flex-1 truncate font-semibold text-textPrimary;
-  font-size: 0.8125rem;
-  line-height: 1.45;
 }
 
 @utility gp-header-actions {
@@ -524,17 +645,13 @@
   letter-spacing: normal;
 }
 
-@utility gp-slide-docked {
-  /* The one sanctioned layout transition (design language §8.3, §8.5): a
-     docked sidebar or dock changing size on a discrete user action, inside a
-     `contain: layout paint` pane. One-shot and capped at --gp-dur-fast (140 ms,
-     under the 200 ms ceiling). Never apply it while a drag is writing the size
-     live -- remove the class for the drag, as Sidebar does with its width
-     transition today. The effect curve never overshoots, so the panel cannot
-     spring past its size. Reduced motion zeroes it in both lists below. */
-  transition-property: width, height;
-  transition-duration: var(--gp-dur-fast);
-  transition-timing-function: var(--gp-ease-effect);
+@utility gp-indeterminate {
+  /* The indeterminate progress strip's mover: a bar that sweeps across its
+     track while a long load runs (the commit graph's loading strip). It
+     animates transform only, through `@keyframes gp-slide`. Both reduced-motion
+     lists below stop it; the bar then rests at the start of the track, which
+     still reads as "working" without moving. */
+  animation: gp-slide calc(var(--gp-dur-emphasis) * 2.5) ease-in-out infinite;
 }
 
 @utility gp-notice {
@@ -597,11 +714,11 @@
 }
 
 @utility gp-notice-error {
-  @apply border-rose-500/35 bg-rose-500/[0.06] text-rose-400;
+  @apply border-danger/35 bg-danger/[0.06] text-danger;
 }
 
 @utility gp-notice-warn {
-  @apply border-amber-500/30 bg-amber-500/[0.05];
+  @apply border-warn/35 bg-warn/5;
 }
 
 @utility gp-check {
@@ -616,7 +733,7 @@
                       role, which holds 4.5:1 on every surface in both themes;
        checked        accent fill, `--c-on-accent` glyph;
        indeterminate  accent fill, a bar in place of the tick;
-       focus          the global `input:focus-visible` ring;
+       focus          the global `input[type="checkbox"]:focus-visible` ring;
        disabled       dimmed to the .4 every control uses.
      Only colors animate, at `--gp-dur-instant`; the glyph appears with the
      fill and has no transition of its own. */
@@ -663,36 +780,60 @@
 }
 
 @utility gp-seg-btn {
-  @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
+  @apply rounded-full px-2.5 py-1 text-xs text-textMuted;
+  /* The sm height (24px) whatever text size a caller picks. */
+  min-height: 24px;
+  transition-property: color, background-color;
+  transition-duration: var(--gp-dur-fast);
+  transition-timing-function: var(--gp-ease-effect);
   &:hover {
     @apply text-textPrimary;
   }
   &[data-active='true'] {
     @apply bg-surface font-semibold text-accent;
-    box-shadow:
-      0 1px 3px rgb(0 0 0 / 0.25),
-      inset 0 1px 0 rgb(255 255 255 / 0.05);
-  }
-  html.light &[data-active='true'] {
-    box-shadow:
-      0 1px 3px rgb(38 46 76 / 0.16),
-      inset 0 1px 0 rgb(255 255 255 / 0.8);
+    box-shadow: var(--shadow-bubble);
   }
 }
 
 @utility gp-field {
   /* Rounded input field. */
-  @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
+  @apply rounded-full border border-edge bg-background px-3 py-0 text-xs text-textPrimary placeholder:text-faint;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), a button's height; data-size="sm" keeps the height and narrows the padding. */
+  min-height: 24px;
+  transition: color var(--gp-dur-fast) var(--gp-ease-effect), background-color var(--gp-dur-fast) var(--gp-ease-effect), border-color var(--gp-dur-fast) var(--gp-ease-effect);
   /* WKWebView ignores `color` on form controls when the page is a transparent
      window (macOSPrivateApi). The fill colour is what actually paints, so a
      missing plate cannot revert typed text and placeholders to black. */
   -webkit-text-fill-color: rgb(var(--c-text));
+  /* No halo: the edge leans toward the accent and the caret does the rest
+     (--field-focus-edge). Increase Contrast restores the ring below. */
   &:focus {
-    @apply outline-hidden border-accent/60;
-    box-shadow: var(--ring-focus);
+    @apply outline-hidden;
+    border-color: var(--field-focus-edge);
   }
   &::placeholder {
-    -webkit-text-fill-color: rgb(var(--c-text-muted) / 0.6);
+    -webkit-text-fill-color: rgb(var(--c-text-faint));
+  }
+  /* The states a field has, shared with `gp-field-multi`:
+       invalid   `data-invalid` (not "false") or `aria-invalid="true"` turns the
+                 edge and the focus ring to the danger role;
+       disabled  `:disabled` or `aria-disabled="true"`, dimmed to the .4 every
+                 control uses. */
+  &[data-invalid]:not([data-invalid="false"]),
+  &[aria-invalid="true"] {
+    border-color: rgb(var(--c-danger));
+    &:focus {
+      border-color: rgb(var(--c-danger));
+    }
+  }
+  &:disabled,
+  &[aria-disabled="true"] {
+    @apply cursor-not-allowed opacity-40;
+  }
+  /* The compact field, the height of a `data-size="sm"` button (§8). */
+  &[data-size="sm"] {
+    @apply py-0 px-2.5;
+    min-height: 24px;
   }
 }
 
@@ -700,12 +841,8 @@
   /* The multiline field (design language §5, §9): anything that can grow past
      one line is a rounded rectangle, radius `--gp-r-md`, not a pill. It wears
      the whole `gp-field` (so `gp-field gp-field-multi` and `gp-field-multi`
-     alone are the same control) and adds the states a field has:
-       focus     the accent edge and `--ring-focus` (from gp-field);
-       invalid   `data-invalid` (not "false") or `aria-invalid="true"` turns the
-                 edge and the focus ring to the danger role;
-       disabled  `:disabled` or `aria-disabled="true"`, dimmed to the .4 every
-                 control uses, not resizable. */
+     alone are the same control, focus, invalid and disabled states included)
+     and adds the shape and the resize handle, which a disabled one loses. */
   @apply gp-field;
   /* `&&` doubles the class. Tailwind emits `gp-field` after `gp-field-multi`,
      so with both classes on an element (every call site today) the pill radius
@@ -715,17 +852,8 @@
     padding-block: var(--gp-space-2);
   }
   resize: vertical;
-  &[data-invalid]:not([data-invalid="false"]),
-  &[aria-invalid="true"] {
-    border-color: rgb(var(--c-danger));
-    &:focus {
-      border-color: rgb(var(--c-danger));
-      box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);
-    }
-  }
   &:disabled,
   &[aria-disabled="true"] {
-    @apply cursor-not-allowed opacity-40;
     resize: none;
   }
 }
@@ -737,16 +865,14 @@
      what it means; `data-kind` (count | label | removable) sets the 20px
      metrics. A removable chip holds a `gp-icon-btn` `data-size="sm"` for its
      ×. `gp-pill` is the retiring twin; new code writes this. */
-  @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border px-2 py-0.5 text-meta leading-none;
+  @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border px-2 py-0 text-meta leading-none;
+  /* 20px standalone (§8), whether or not data-kind is set; data-size="inline" below drops the floor for a tag inside a text line. */
+  min-height: 20px;
   border-color: var(--gp-edge);
   transition-property: color, background-color, border-color;
   transition-duration: var(--gp-dur-instant);
   transition-timing-function: var(--gp-ease-effect);
 
-  &[data-kind] {
-    min-height: 20px;
-    padding-block: 0;
-  }
   &[data-kind="count"] {
     @apply justify-center text-micro;
     min-width: 20px;
@@ -759,6 +885,17 @@
   &[data-kind="removable"] {
     @apply text-xs;
     padding-inline-end: 2px;
+  }
+  /* A tag set inside a line of text (a branch row's `default`, `↑14`) is
+     sized by that line, not by the 20px standalone metric: the row heights
+     the virtual list computes assume a 13px line. Declared after data-kind
+     so a count chip set inline keeps its tabular digits but not its 20px
+     floor. */
+  &[data-size="inline"] {
+    @apply text-micro;
+    min-height: 0;
+    min-width: 0;
+    padding-inline: 4px;
   }
 
   &[data-tone="neutral"] {
@@ -808,7 +945,7 @@
    * rather than solid so it never reads as an underline for emphasis, and
    * amber because it is the same caution the partial-scan notices use.
    */
-  @apply border-b border-dashed border-amber-500/70 dark:border-amber-400/60;
+  @apply border-b border-dashed border-warn/65;
 }
 
 @utility gp-select {
@@ -823,7 +960,9 @@
    * A pill with the field's metrics: it is one line tall and sits beside
    * `gp-field` pills, so it is not the rounded rectangle it used to be.
    */
-  @apply cursor-pointer truncate rounded-full border bg-background py-1 pl-3 pr-7 text-xs text-textPrimary;
+  @apply cursor-pointer truncate rounded-full border bg-background py-0 pl-3 pr-7 text-xs text-textPrimary;
+  /* Unmarked, it is 24px (DESIGN_LANGUAGE §8), a button's and a field's height; data-size="sm" keeps the height and narrows the padding. */
+  min-height: 24px;
   border-color: var(--gp-edge);
   -webkit-text-fill-color: rgb(var(--c-text));
   appearance: none;
@@ -843,14 +982,20 @@
   }
 
   &:focus-visible {
-    @apply border-accent/70 outline-hidden;
+    @apply border-accent/65 outline-hidden;
     box-shadow: var(--ring-focus);
+  }
+
+  /* The compact select, the height of a `data-size="sm"` button and field. */
+  &[data-size="sm"] {
+    @apply py-0 pl-2.5;
+    min-height: 24px;
   }
 }
 
 @utility gp-keycap {
   /* Keycap hint. */
-  @apply inline-flex items-center rounded-md border border-border/80 bg-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-textMuted;
+  @apply inline-flex items-center rounded-sm border border-edge bg-surface px-1.5 py-0.5 font-mono text-micro leading-none text-textMuted;
   box-shadow: 0 1.5px 0 rgb(var(--c-border));
 }
 
@@ -895,19 +1040,41 @@
     --c-unknown: 158 158 158;
     --c-on-unknown: 3 3 6;
 
+    /* Syntax roles (see the light block for how they are held). */
+    --c-syntax-keyword: oklch(0.8 0.125 305);
+    --c-syntax-type: oklch(0.8 0.11 205);
+    --c-syntax-string: oklch(0.8 0.12 150);
+    --c-syntax-number: oklch(0.82 0.13 70);
+    --c-syntax-function: oklch(0.8 0.1 255);
+    --c-syntax-operator: oklch(0.8 0.115 10);
+    --c-syntax-attribute: oklch(0.82 0.11 100);
+    --c-syntax-property: oklch(0.82 0.105 235);
+    --c-syntax-regex: oklch(0.82 0.125 345);
+    --c-syntax-variable: oklch(0.8 0.1 280);
+    --c-syntax-punctuation: oklch(0.76 0.03 265);
+
     /* Elevation. Soft, layered, low-contrast — bubbles, not boxes. */
-    --shadow-card:
-      inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3),
-      0 10px 28px -18px rgb(0 0 0 / 0.65);
+    /* The drop alone, for a surface whose top edge joins another (the view
+       bar under the title row); --shadow-card adds the top highlight. */
+    --shadow-card-drop: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px -18px rgb(0 0 0 / 0.65);
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), var(--shadow-card-drop);
     --shadow-pop:
       0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
     --shadow-float:
       0 8px 24px -12px rgb(0 0 0 / 0.55), 0 32px 90px -28px rgb(0 0 0 / 0.7);
+    /* The raised bubble under an active segment, and under the macOS selection. */
+    --shadow-bubble:
+      0 1px 3px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.05);
+    --shadow-bubble-lift: 0 2px 5px rgb(0 0 0 / 0.14);
     /* Derived from --c-accent, not restated: the accent is user-selectable at
      runtime (lib/ui/accents.ts writes the triplet inline on <html>), and a
      literal here would leave a teal window wearing a blue focus ring. */
     --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.55);
     --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.28);
+    /* A text field's focus: its edge leans toward the accent, with no halo.
+       The caret already says where typing goes (owner, 2026-11-11: "make the
+       focus ring less annoying"); the ring stays for operated controls. */
+    --field-focus-edge: rgb(var(--c-accent) / 0.45);
     --brand-gradient: linear-gradient(
       135deg,
       #22d3ee 0%,
@@ -927,8 +1094,7 @@
     /* Foundation roles for the light theme: deriveTokens() for the shipped
        light base. Muted text already sits on the 4.5:1 floor against the
        darkest light surface, so faint equals muted here rather than going
-       below AA; the light remap block below already keeps `/40..80` text
-       opaque for the same reason. */
+       below AA, and no text role is ever translucent. */
     --c-text-faint: 99 108 134;
     --c-on-accent: 255 255 255;
     --c-ok: 0 113 49;
@@ -942,38 +1108,40 @@
     --c-unknown: 99 99 99;
     --c-on-unknown: 255 255 255;
 
-    /* Light-theme semantic colors are deliberately darker than Tailwind's
-     dark-surface ramps so status text remains legible on every light card. */
-    --c-status-amber: 146 64 14;
-    --c-status-emerald: 6 95 70;
-    --c-status-rose: 159 18 57;
-    --c-status-red: 153 27 27;
-    --c-status-sky: 7 89 133;
-    --c-status-cyan: 21 94 117;
-    --c-status-purple: 107 33 168;
-    --c-status-green: 22 101 52;
-    --c-status-orange: 154 52 18;
-    --c-status-teal: 17 94 89;
-    --c-status-indigo: 55 48 163;
-    --c-status-blue: 29 78 216;
-    --c-status-yellow: 133 77 14;
-    --c-status-zinc: 82 82 91;
-    --c-status-slate: 71 85 105;
+    /* Syntax roles, in OKLCH so lightness is the one number that was tuned.
+       Each holds 4.5:1 against the code background, the diff row tints and
+       the selected-line tint (themeContrast.test.ts re-measures every one
+       from this block and fails on a token that loses contrast). */
+    --c-syntax-keyword: oklch(0.48 0.15 305);
+    --c-syntax-type: oklch(0.455 0.075 205);
+    --c-syntax-string: oklch(0.45 0.12 150);
+    --c-syntax-number: oklch(0.47 0.1 70);
+    --c-syntax-function: oklch(0.465 0.15 255);
+    --c-syntax-operator: oklch(0.48 0.15 10);
+    --c-syntax-attribute: oklch(0.46 0.095 100);
+    --c-syntax-property: oklch(0.46 0.095 235);
+    --c-syntax-regex: oklch(0.48 0.14 345);
+    --c-syntax-variable: oklch(0.475 0.15 280);
+    --c-syntax-punctuation: oklch(0.45 0.03 265);
 
-    --shadow-card:
-      inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
-      0 12px 32px -20px rgb(38 46 76 / 0.25);
+    --shadow-card-drop: 0 1px 2px rgb(38 46 76 / 0.06), 0 12px 32px -20px rgb(38 46 76 / 0.25);
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.8), var(--shadow-card-drop);
     --shadow-pop:
       0 2px 8px -2px rgb(38 46 76 / 0.08),
       0 18px 44px -16px rgb(38 46 76 / 0.22);
     --shadow-float:
       0 8px 24px -12px rgb(38 46 76 / 0.12),
       0 32px 90px -28px rgb(38 46 76 / 0.28);
+    --shadow-bubble:
+      0 1px 3px rgb(38 46 76 / 0.16), inset 0 1px 0 rgb(255 255 255 / 0.8);
+    --shadow-bubble-lift: 0 2px 5px rgb(0 0 0 / 0.14);
     /* Derived for the same reason as the dark pair above. The light accent is
      darker than the ring colour this replaces, which strengthens the focus
      indicator rather than weakening it. */
     --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.45);
     --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.22);
+    /* Light plates wash a pale tint out, so the edge is a little stronger. */
+    --field-focus-edge: rgb(var(--c-accent) / 0.55);
     --brand-gradient: linear-gradient(
       135deg,
       #06b6d4 0%,
@@ -982,163 +1150,6 @@
     );
 
     color-scheme: light;
-  }
-
-  /* Tailwind's opacity modifiers are tuned for the dark palette. On light
-   surfaces they can make otherwise-accessible foregrounds translucent. Keep
-   semantic text opaque in light mode and route status ramps through the
-   contrast-checked tokens above. */
-  html.light
-    :where(
-      [class~='text-textMuted/40'],
-      [class~='text-textMuted/50'],
-      [class~='text-textMuted/60'],
-      [class~='text-textMuted/70'],
-      [class~='text-textMuted/80']
-    ) {
-    color: rgb(var(--c-text-muted));
-  }
-
-  html.light
-    :where(
-      [class~='text-accent/60'],
-      [class~='text-accent/70'],
-      [class~='text-accent/80']
-    ) {
-    color: rgb(var(--c-accent));
-  }
-
-  html.light
-    :where(
-      [class~='text-amber-200'],
-      [class~='text-amber-300'],
-      [class~='text-amber-300/80'],
-      [class~='text-amber-300/90'],
-      [class~='text-amber-400'],
-      [class~='text-amber-400/80'],
-      [class~='text-amber-400/90'],
-      [class~='text-amber-500'],
-      [class~='text-amber-600']
-    ) {
-    color: rgb(var(--c-status-amber));
-  }
-
-  html.light
-    :where(
-      [class~='text-emerald-300'],
-      [class~='text-emerald-400'],
-      [class~='text-emerald-400/80'],
-      [class~='text-emerald-400/90'],
-      [class~='text-emerald-500'],
-      [class~='text-emerald-500/80'],
-      [class~='text-emerald-600']
-    ) {
-    color: rgb(var(--c-status-emerald));
-  }
-
-  html.light
-    :where(
-      [class~='text-rose-200'],
-      [class~='text-rose-300'],
-      [class~='text-rose-300/90'],
-      [class~='text-rose-400'],
-      [class~='text-rose-400/90'],
-      [class~='text-rose-500'],
-      [class~='text-rose-600']
-    ) {
-    color: rgb(var(--c-status-rose));
-  }
-
-  html.light
-    :where(
-      [class~='text-red-300'],
-      [class~='text-red-400'],
-      [class~='text-red-400/80'],
-      [class~='text-red-600']
-    ) {
-    color: rgb(var(--c-status-red));
-  }
-
-  html.light
-    :where(
-      [class~='text-sky-300'],
-      [class~='text-sky-400'],
-      [class~='text-sky-600']
-    ) {
-    color: rgb(var(--c-status-sky));
-  }
-
-  html.light
-    :where(
-      [class~='text-cyan-300'],
-      [class~='text-cyan-400'],
-      [class~='text-cyan-400/80']
-    ) {
-    color: rgb(var(--c-status-cyan));
-  }
-
-  html.light
-    :where(
-      [class~='text-purple-200'],
-      [class~='text-purple-300'],
-      [class~='text-purple-300/80'],
-      [class~='text-purple-400'],
-      [class~='text-purple-600']
-    ) {
-    color: rgb(var(--c-status-purple));
-  }
-
-  html.light
-    :where(
-      [class~='text-green-300'],
-      [class~='text-green-400'],
-      [class~='text-green-400/80']
-    ) {
-    color: rgb(var(--c-status-green));
-  }
-
-  html.light
-    :where(
-      [class~='text-orange-300'],
-      [class~='text-orange-400'],
-      [class~='text-orange-600']
-    ) {
-    color: rgb(var(--c-status-orange));
-  }
-
-  html.light :where([class~='text-teal-400'], [class~='text-teal-600']) {
-    color: rgb(var(--c-status-teal));
-  }
-
-  html.light
-    :where(
-      [class~='text-indigo-300'],
-      [class~='text-indigo-400'],
-      [class~='text-indigo-600']
-    ) {
-    color: rgb(var(--c-status-indigo));
-  }
-
-  html.light
-    :where(
-      [class~='text-blue-200'],
-      [class~='text-blue-300'],
-      [class~='text-blue-300/80'],
-      [class~='text-blue-400']
-    ) {
-    color: rgb(var(--c-status-blue));
-  }
-
-  html.light :where([class~='text-yellow-300']) {
-    color: rgb(var(--c-status-yellow));
-  }
-
-  html.light :where([class~='text-zinc-400'], [class~='text-zinc-600']) {
-    color: rgb(var(--c-status-zinc));
-  }
-
-  html.light :where([class~='text-slate-400'], [class~='text-slate-600']) {
-    color: rgb(var(--c-status-slate));
   }
 
   :root {
@@ -1157,6 +1168,18 @@
     --gp-header-h: 32px;
     --gp-pad: 12px;
     --gp-density: 1;
+
+    /* Settings -> Appearance inputs (ui/appearance/apply.ts writes these inline
+       on <html>). The values here are the shipped look, so unset and default
+       are the same thing; `initial` is the guaranteed-invalid value, which makes
+       the font hooks take their fallback stacks. Only inputs live here: the
+       `--mac-*` outputs computed from them stay in the macOS blocks, where the
+       Reduce Transparency rules can still redeclare them. */
+    --gp-material: 0;
+    --gp-float-blur: 34px;
+    --gp-radius-scale: 1;
+    --gp-font-ui: initial;
+    --gp-font-mono: initial;
 
     --ui-font-scale: 1;
     /* Columns a literal tab advances to. 8 is the CSS initial value, so the
@@ -1211,6 +1234,17 @@
     --gp-pad: 16px;
     --gp-density: 1.15;
   }
+
+  /* Corner style (§5, §11). Stamped only when the scale is not 1, so the shipped
+     radii above stay the single declaration of the ladder. `full` (pills) and
+     `pane` (the window-concentric card) are not scaled. */
+  html[data-radius-scale] {
+    --gp-r-xs: calc(4px * var(--gp-radius-scale, 1));
+    --gp-r-sm: calc(8px * var(--gp-radius-scale, 1));
+    --gp-r-md: calc(12px * var(--gp-radius-scale, 1));
+    --gp-r-lg: calc(16px * var(--gp-radius-scale, 1));
+    --gp-r-xl: calc(20px * var(--gp-radius-scale, 1));
+  }
 }
 
 @layer base {
@@ -1235,7 +1269,7 @@
     color: rgb(var(--c-text));
     /* 0.75rem is the previous 12px at the default root size, now derived from
        the root so it scales with everything else instead of separately. */
-    font-size: 0.75rem;
+    font-size: var(--text-xs);
   }
 
   /* `hidden` has to actually hide.
@@ -1253,14 +1287,30 @@
     background-color: rgb(var(--c-accent) / 0.32);
   }
 
+  /* Keyboard focus is a ring on the controls you operate: buttons, tabs,
+     boxes, sliders, colour and file pickers, selects. A text box you type
+     into (text, search, number, time…) carries none; its
+     caret marks it (owner decision 2026-11-11: "don't highlight this when
+     typing", then "turn off the global highlighting rule"). A focused text
+     box always matches :focus-visible, so this rule used to draw a box
+     inside every search pill while typing. Forced colours below still
+     outline every focused field, text included. */
   button:focus-visible,
   [role="button"]:focus-visible,
   [role="tab"]:focus-visible,
-  input:focus-visible,
-  textarea:focus-visible,
+  input[type="checkbox"]:focus-visible,
+  input[type="radio"]:focus-visible,
+  input[type="range"]:focus-visible,
+  input[type="color"]:focus-visible,
+  input[type="file"]:focus-visible,
   select:focus-visible {
     outline: none;
     box-shadow: var(--ring-focus);
+  }
+
+  input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]):focus-visible,
+  textarea:focus-visible {
+    outline: none;
   }
 }
 
@@ -1299,7 +1349,6 @@
     .gp-segmented,
     .gp-btn,
     .gp-btn-primary,
-    .gp-btn-success,
     .gp-btn-danger,
     .gp-field,
     .gp-separator,
@@ -1325,6 +1374,14 @@
   @media (prefers-contrast: more) {
     :root {
       --ring-focus: 0 0 0 3px rgb(var(--c-accent));
+      --field-focus-edge: rgb(var(--c-accent));
+    }
+    /* System accessibility wins (DESIGN_LANGUAGE rule 8): a user who asked
+       for more contrast gets the field's ring back, opaque. */
+    .gp-field:focus,
+    .gp-field:focus-within,
+    .gp-field-multi:focus {
+      box-shadow: var(--ring-focus);
     }
   }
 
@@ -1340,7 +1397,7 @@ input[type="range"] {
 }
 input[type="range"]::-webkit-slider-runnable-track {
   height: 6px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-border));
 }
 input[type="range"]::-webkit-slider-thumb {
@@ -1349,12 +1406,12 @@ input[type="range"]::-webkit-slider-thumb {
   width: 16px;
   height: 16px;
   margin-top: -5px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   border: 2px solid rgb(var(--c-surface));
   background-image: var(--brand-gradient);
   box-shadow: var(--shadow-glow);
   cursor: pointer;
-  transition: transform 120ms ease;
+  transition: transform var(--gp-dur-fast) var(--gp-ease-effect);
 }
 input[type="range"]:active::-webkit-slider-thumb {
   transform: scale(1.15);
@@ -1370,7 +1427,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 }
 ::-webkit-scrollbar-thumb {
   background: rgb(var(--c-border));
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   border: 3px solid transparent;
   background-clip: padding-box;
 }
@@ -1382,7 +1439,7 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 html.macos,
 html.macos body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-family: var(--gp-font-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif);
 }
 
 html.macos ::-webkit-scrollbar {
@@ -1428,15 +1485,21 @@ html.macos {
      these alphas lift that ground to roughly 3:1 against --c-text-muted, which
      fails AA. Chroma at the same luminance reads as more glass, not less. */
 
-  --mac-glass-fill: rgb(var(--c-surface) / 0.4);
+  /* `--gp-material` is the Settings → Appearance "material intensity" input
+     (0 = the alphas below, 1 = opaque). Only the input is ever written inline;
+     these OUTPUTS stay declared here, so the Reduce Transparency blocks that
+     redeclare them as opaque colours keep winning over a user setting. */
+  --mac-glass-fill: rgb(var(--c-surface) / calc(0.4 + 0.6 * var(--gp-material, 0)));
   /* The workspace plate. Denser than the chrome because dense text sits
      directly on it, thinner than opaque so the field carries under it. */
-  --mac-plate-fill: rgb(var(--c-bg) / 0.46);
+  --mac-plate-fill: rgb(var(--c-bg) / calc(0.46 + 0.54 * var(--gp-material, 0)));
   --mac-glass-edge: rgb(255 255 255 / 0.14);
   --mac-glass-sheen: rgb(255 255 255 / 0.05);
   --mac-glass-shade: rgb(0 0 0 / 0.22);
   --mac-glass-tint: rgb(var(--c-accent) / 0.07);
-  --mac-glass-blur-float: 34px;
+  /* `--gp-float-blur` is the Settings input; 0 also stamps
+     `html[data-float-blur="off"]`, because `blur(0)` is not `none`. */
+  --mac-glass-blur-float: var(--gp-float-blur, 34px);
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
   /* An inset area inside a panel -- a diff preview, a code block, an
@@ -1467,8 +1530,8 @@ html.macos.light {
   --mac-hue-c: 168 136 252;
   --mac-hue-d: 240 122 186;
   --mac-hue-gain: 0.5;
-  --mac-glass-fill: rgb(255 255 255 / 0.58);
-  --mac-plate-fill: rgb(255 255 255 / 0.6);
+  --mac-glass-fill: rgb(255 255 255 / calc(0.58 + 0.42 * var(--gp-material, 0)));
+  --mac-plate-fill: rgb(255 255 255 / calc(0.6 + 0.4 * var(--gp-material, 0)));
   --mac-glass-edge: rgb(var(--c-border) / 0.24);
   --mac-glass-sheen: rgb(255 255 255 / 0.7);
   --mac-glass-shade: rgb(38 46 76 / 0.07);
@@ -1569,6 +1632,13 @@ html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
     -webkit-backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
     backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
   }
+
+  /* Float blur 0 in Settings -> Appearance. `none`, not `blur(0)`: a var inside
+     `blur()` cannot produce `none`, and `blur(0)` still makes a backdrop root. */
+  html.macos[data-float-blur="off"] :is(.gp-menu, [class~="shadow-float"], [class~="shadow-pop"]) {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
 }
 
 /* One blur per dialog, not two.
@@ -1607,12 +1677,12 @@ html.macos .gp-scrim {
  * Depth does the work that a single global alpha cannot.
  */
 html.macos {
-  --mac-fill-bg: rgb(var(--c-bg) / 0.42);
-  --mac-fill-surface: rgb(var(--c-surface) / 0.5);
+  --mac-fill-bg: rgb(var(--c-bg) / calc(0.42 + 0.58 * var(--gp-material, 0)));
+  --mac-fill-surface: rgb(var(--c-surface) / calc(0.5 + 0.5 * var(--gp-material, 0)));
   /* Hover and selection have to survive being translucent: they are a
      DIFFERENCE against whatever they sit on, and thinning both sides equally
      erases the difference. This one stays dense on purpose. */
-  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.78);
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / calc(0.78 + 0.22 * var(--gp-material, 0)));
 
   /*
    * The graph canvas, which is the one surface CSS cannot make translucent on
@@ -1630,9 +1700,9 @@ html.macos {
 }
 
 html.macos.light {
-  --mac-fill-bg: rgb(var(--c-bg) / 0.52);
-  --mac-fill-surface: rgb(var(--c-surface) / 0.6);
-  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.82);
+  --mac-fill-bg: rgb(var(--c-bg) / calc(0.52 + 0.48 * var(--gp-material, 0)));
+  --mac-fill-surface: rgb(var(--c-surface) / calc(0.6 + 0.4 * var(--gp-material, 0)));
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / calc(0.82 + 0.18 * var(--gp-material, 0)));
 }
 
 html.macos :where([class~="bg-background"], .gp-field, .gp-field-multi, .gp-select) {
@@ -1722,7 +1792,7 @@ html.macos .gp-glass.gp-repo-tabs {
 html.macos .gp-welcome-card {
   padding: 32px;
   border: 1px solid var(--mac-glass-edge);
-  border-radius: 28px;
+  border-radius: var(--gp-r-xl);
 }
 
 /* The sidebar and the workspace are two rounded cards that fill the space
@@ -1758,6 +1828,54 @@ html.macos .gp-sidebar {
   height: auto;
   border: 1px solid var(--mac-glass-edge);
   border-radius: var(--gp-pane-radius);
+}
+
+/* The sidebar's tonal step from the workspace. Dark has one already: glass
+   fill from --c-surface (20 26 41 at .4) against the plate's --c-bg (11 14 23
+   at .46). Light filled both with white (.58 against .6), so the only thing
+   separating them was the pane outline. The light sidebar takes
+   --c-surface-hover at the plate's own alpha instead, a step of about 11
+   levels against white, the same strength as dark's. Reduced transparency
+   and the material slider keep winning: the slider term is the same one the
+   fill uses, and the opaque blocks below sit later in the cascade. */
+html.macos.light .gp-sidebar {
+  background-color: rgb(var(--c-surface-hover) / calc(0.6 + 0.4 * var(--gp-material, 0)));
+}
+
+/* The floating (overlay) light panel is the same fill over a white workspace,
+   and nothing behind it is a column of its own, so the tonal step alone did
+   not hold it off the plate. It takes a deeper wash of the border colour over
+   that fill and an edge that reads as a separator (3:1 against the workspace
+   it overlaps; harness/hidden-pane.html measures both). The wash is a
+   background-image and the edge a border-color, so the reduced-transparency
+   blocks below, which set `background` and `border-color` at this
+   specificity later in the cascade, still make the panel solid. Blur stays
+   on: the overlay is floating chrome. */
+html.light .gp-sidebar[data-sidebar-panel] {
+  background-image: linear-gradient(rgb(var(--c-border) / 0.1), rgb(var(--c-border) / 0.1));
+  border-color: var(--gp-edge-strong);
+}
+
+/* The sidebar's scroll cue. ScrollCue draws a 2rem chevron band at an edge
+   that still hides content, and the generic fade left half of a row showing
+   under the chevron. Inside the sidebar the content is fully clear across that
+   band and ramps in above it, so the chevron never sits on a row. At the end
+   of the list no token is set, so the last row is not faded at all. */
+.gp-sidebar {
+  --gp-sidebar-cue-band: 2rem;
+  --gp-sidebar-cue-ramp: 0.5rem;
+}
+
+.gp-sidebar [data-gp-fade="y-start"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+}
+
+.gp-sidebar [data-gp-fade="y-end"] {
+  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+}
+
+.gp-sidebar [data-gp-fade="y-both"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-sidebar-cue-band) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-sidebar-cue-band)));
 }
 
 html.macos :is(.gp-menu, .gp-card.shadow-float) {
@@ -1797,7 +1915,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   border-radius: inherit;
   background: linear-gradient(160deg, var(--mac-glass-sheen), transparent), rgb(var(--c-surface-hover));
   border: 1px solid var(--mac-glass-edge);
-  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), 0 2px 5px rgb(0 0 0 / 0.14);
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), var(--shadow-bubble-lift);
 }
 
 .gp-liquid-tabs .gp-seg-btn > span:not(.gp-liquid-selection) {
@@ -1814,9 +1932,9 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   min-width: 14px;
   height: 14px;
   padding: 0 3px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   color: white;
-  font-size: 9px;
+  @apply text-micro;
   font-weight: 600;
   line-height: 14px;
   text-align: center;
@@ -1840,12 +1958,11 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   width: 100%;
   align-items: center;
   gap: 8px;
-  border-radius: 9999px;
+  border-radius: var(--gp-r-full);
   padding: 5px 10px;
   text-align: left;
-  font-size: 12px;
   color: rgb(var(--c-text));
-  transition: background-color 120ms ease-out, color 120ms ease-out;
+  transition: background-color var(--gp-dur-fast) var(--gp-ease-effect), color var(--gp-dur-fast) var(--gp-ease-effect);
 }
 
 .gp-view-flyout-item:hover,
@@ -1864,13 +1981,13 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
    makes the setting authoritative without a specificity fight against the
    reduce rules below. See lib/motion/motionPreference.ts. */
 @media (prefers-reduced-motion: no-preference) {
-  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn) {
+  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn) {
     transition-property: color, background-color, border-color, transform;
     transition-duration: var(--gp-dur-fast);
     transition-timing-function: var(--gp-ease-effect);
   }
 
-  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn):active:not(:disabled) {
+  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active:not(:disabled) {
     transform: translate3d(0, 1px, 0) scale(0.97);
   }
 }
@@ -1995,6 +2112,25 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
   border-color: rgb(var(--c-accent));
 }
 
+/* The title row and the view bar under it are one band of chrome. Each is a
+   glass slab on its own, so where they met the upper one drew its bottom
+   shade and drop shadow and the lower one its top sheen: a seam across the
+   window. Joined, the pair keeps only the band's outer edges, and both drop
+   their diagonal sheen (two gradients each sized to its own row cannot meet
+   without a step). The fill is the same token on both, so nothing marks the
+   join. Placed after every glass and reduced-transparency rule so it wins in
+   all of them. */
+html.macos .gp-glass.gp-repo-tabs:has(+ .gp-glass.gp-repo-tabs) {
+  background-image: none;
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen);
+}
+html.macos .gp-glass.gp-repo-tabs + .gp-glass.gp-repo-tabs {
+  background-image: none;
+  box-shadow:
+    inset 0 -1px 0 var(--mac-glass-shade),
+    var(--shadow-card-drop);
+}
+
 .overflow-auto,
 .overflow-y-auto,
 .overflow-x-auto,
@@ -2014,6 +2150,20 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
 .gp-header-scroll::-webkit-scrollbar {
   display: none;
   height: 0;
+}
+
+/* Header lane I: the window inset (HEADER_SPEC section 4). The title bar
+   leaves 76px for the traffic lights. In full screen macOS hides them, and
+   windowState.ts stamps `html[data-fullscreen]`, so the inset collapses to a
+   12px gutter. Nothing clickable sits in that band: when the pointer touches
+   the top edge the system slides the menu bar and the lights over it. No
+   width transition: the collapse happens inside the system's own animation. */
+.gp-traffic-inset {
+  width: 76px;
+}
+
+html[data-fullscreen] .gp-traffic-inset {
+  width: 12px;
 }
 
 .gp-gpu {
@@ -2042,7 +2192,6 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
    and keeps the cue instead of removing it. */
 .gp-focus-flash {
   box-shadow: var(--ring-focus);
-  transition: box-shadow 200ms ease-out;
 }
 
 .gp-focus-flash:focus,
@@ -2058,7 +2207,7 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
   content-visibility: auto;
   /* Fallback only: BranchList sets `contain-intrinsic-size` inline per row
      KIND from src/lib/sidebar/metrics.ts, which is the single source of truth
-     — a two-line branch row is taller than the headers around it. This static
+     — a two- or three-line branch row is taller than the headers around it. This static
      value is the header height and covers non-JS edge paints. */
   contain-intrinsic-size: auto 30px;
 }
@@ -2083,20 +2232,20 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
 
 @media (prefers-reduced-motion: no-preference) {
   html:not([data-motion="reduced"]) .gp-view {
-    animation: gp-view-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation: gp-view-in var(--gp-dur-base) var(--gp-ease-effect) both;
   }
 
   html:not([data-motion="reduced"]) .gp-overlay {
-    animation: gp-overlay-in 140ms ease-out both;
+    animation: gp-overlay-in var(--gp-dur-fast) var(--gp-ease-effect) both;
   }
 
   html:not([data-motion="reduced"]) .gp-pop {
-    animation: gp-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation: gp-pop-in var(--gp-dur-fast) var(--gp-ease-effect) both;
   }
 
   html.macos:not([data-motion="reduced"]) .gp-view,
   html.macos:not([data-motion="reduced"]) .gp-pop {
-    animation-duration: 260ms;
+    animation-duration: var(--gp-dur-base);
     animation-timing-function: var(--mac-liquid-ease);
     /* Release the transform layer after entrance, so fixed descendants keep
        their viewport coordinates and idle surfaces do not retain textures. */
@@ -2118,28 +2267,28 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
 @media (prefers-reduced-motion: reduce) {
   /* Spinners keep their glyph (static, visible) so activity indication
      survives; only the rotation/pulse motion is removed. */
-  html :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
+  html :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion, .gp-indeterminate, .animate-pulse, .animate-spin) {
     animation: none !important;
   }
 
-  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
     transition: none !important;
   }
 
-  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn):active {
+  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active {
     transform: none;
   }
 }
 
-html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
+html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .gp-dock-motion, .gp-indeterminate, .animate-pulse, .animate-spin) {
   animation: none !important;
 }
 
-html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-slide-docked, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy) {
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["], .gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn, .gp-chip, .gp-row, .gp-menu-item, .gp-seg-btn, .gp-field, .gp-field-multi, .gp-check, .gp-view-flyout-item, .gp-focus-flash, .anchor, .gp-md-copy, .gp-scroll-cue-btn) {
   transition: none !important;
 }
 
-html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-success, .gp-btn-danger, .gp-icon-btn):active {
+html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active {
   transform: none;
 }
 
@@ -2174,11 +2323,69 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-success,
   }
 }
 
+/*
+ * The terminal dock's slide (DESIGN_LANGUAGE §8.5). One class, three phases
+ * through `data-phase`, so the reduced-motion lists name a single selector:
+ *
+ *   in          docked: the dock has just been shown; it settles up 8 px and
+ *               fades in once. The layout itself does not animate.
+ *   slide-in    overlay: it rises from the bottom edge of the column.
+ *   slide-out   either mode: it leaves in an exit, opacity and transform only.
+ *               The host holds the element for the exit, then hides it.
+ *
+ * transform and opacity only. `--gp-dock-exit-ms` is set by the host from the
+ * exit token (EXIT_MS.slow), so no duration literal lives in a component.
+ */
+@keyframes gp-dock-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes gp-dock-slide-in {
+  from {
+    transform: translate3d(0, 100%, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes gp-dock-slide-out {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, 24px, 0);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="in"] {
+    animation: gp-dock-in var(--gp-dur-base) var(--gp-ease-spatial) both;
+  }
+
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-in"] {
+    animation: gp-dock-slide-in var(--gp-dur-slow) var(--gp-ease-spatial) backwards;
+  }
+
+  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-out"] {
+    animation: gp-dock-slide-out var(--gp-dock-exit-ms, 70ms) var(--gp-ease-exit) both;
+  }
+}
+
 /* Theme-switch crossfade (View Transitions API). Runtimes without support
    flip instantly; that is the graceful path, not a degraded one. */
 ::view-transition-old(root),
 ::view-transition-new(root) {
-  animation-duration: 220ms;
+  animation-duration: var(--gp-dur-base);
   animation-timing-function: ease;
 }
 
@@ -2221,7 +2428,7 @@ html[data-motion="reduced"]::view-transition-new(root) {
   --md-caution: 251 113 133;
   --md-mark: 250 204 21;
   color: rgb(var(--c-text));
-  font-size: 13px;
+  @apply text-sm;
   line-height: 1.65;
   overflow-wrap: anywhere;
 }
@@ -2250,23 +2457,23 @@ html.light .gp-markdown {
   scroll-margin-top: 12px;
 }
 .gp-markdown h1 {
-  font-size: 1.75em;
+  font-size: var(--text-display);
   padding-bottom: 0.3em;
-  border-bottom: 1px solid rgb(var(--c-border) / 0.6);
+  border-bottom: 1px solid rgb(var(--c-border) / 0.65);
 }
 .gp-markdown h2 {
-  font-size: 1.4em;
+  font-size: var(--text-lg);
   padding-bottom: 0.25em;
-  border-bottom: 1px solid rgb(var(--c-border) / 0.4);
+  border-bottom: 1px solid rgb(var(--c-border) / 0.35);
 }
 .gp-markdown h3 {
-  font-size: 1.18em;
+  font-size: var(--text-base);
 }
 .gp-markdown h4 {
-  font-size: 1em;
+  font-size: inherit;
 }
 .gp-markdown :is(h5, h6) {
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .anchor {
@@ -2274,7 +2481,7 @@ html.light .gp-markdown {
   color: rgb(var(--c-text-muted));
   text-decoration: none;
   opacity: 0;
-  transition: opacity 120ms;
+  transition: opacity var(--gp-dur-fast) var(--gp-ease-effect);
 }
 .gp-markdown :is(h1, h2, h3, h4, h5, h6):hover .anchor,
 .gp-markdown .anchor:focus-visible {
@@ -2302,7 +2509,7 @@ html.light .gp-markdown {
 .gp-markdown mark {
   color: inherit;
   background: rgb(var(--md-mark) / 0.28);
-  border-radius: 3px;
+  border-radius: var(--gp-r-xs);
   padding: 0 0.15em;
 }
 .gp-markdown :is(ul, ol) {
@@ -2354,21 +2561,21 @@ html.light .gp-markdown {
   margin-bottom: 0;
 }
 .gp-markdown :is(code, pre, kbd, samp) {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 0.88em;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
+  font-size: var(--text-meta);
 }
 .gp-markdown :not(pre) > code {
   padding: 0.12em 0.38em;
-  border-radius: 5px;
+  border-radius: var(--gp-r-xs);
   background: rgb(var(--c-surface-hover));
-  border: 1px solid rgb(var(--c-border) / 0.45);
+  border: 1px solid rgb(var(--c-border) / 0.35);
 }
 .gp-markdown pre {
   overflow-x: auto;
   padding: 0.85em 1em;
-  border-radius: 8px;
+  border-radius: var(--gp-r-md);
   background: rgb(var(--c-surface-hover) / 0.7);
-  border: 1px solid rgb(var(--c-border) / 0.5);
+  border: 1px solid rgb(var(--c-border) / 0.65);
   line-height: 1.5;
   white-space: pre;
   overflow-wrap: normal;
@@ -2387,13 +2594,13 @@ html.light .gp-markdown {
   top: 6px;
   right: 6px;
   padding: 1px 8px;
-  border-radius: 999px;
-  border: 1px solid rgb(var(--c-border) / 0.7);
+  border-radius: var(--gp-r-full);
+  border: 1px solid rgb(var(--c-border) / 0.65);
   background: rgb(var(--c-surface));
   color: rgb(var(--c-text-muted));
-  font-size: 10px;
+  @apply text-micro;
   opacity: 0;
-  transition: opacity 120ms;
+  transition: opacity var(--gp-dur-fast) var(--gp-ease-effect);
 }
 .gp-markdown .gp-md-code:hover .gp-md-copy,
 .gp-markdown .gp-md-copy:focus-visible,
@@ -2402,7 +2609,7 @@ html.light .gp-markdown {
 }
 .gp-markdown .gp-md-copy[data-copied] {
   color: rgb(var(--md-tip));
-  border-color: rgb(var(--md-tip) / 0.5);
+  border-color: rgb(var(--md-tip) / 0.65);
 }
 .gp-markdown table {
   display: block;
@@ -2417,7 +2624,7 @@ html.light .gp-markdown {
    word; what does not fit scrolls inside the table. */
 .gp-markdown :is(th, td) {
   padding: 0.4em 0.8em;
-  border: 1px solid rgb(var(--c-border) / 0.6);
+  border: 1px solid rgb(var(--c-border) / 0.65);
   overflow-wrap: break-word;
 }
 .gp-markdown th {
@@ -2429,7 +2636,7 @@ html.light .gp-markdown {
 }
 .gp-markdown hr {
   border: 0;
-  border-top: 1px solid rgb(var(--c-border) / 0.6);
+  border-top: 1px solid rgb(var(--c-border) / 0.65);
   margin: 1.4em 0;
 }
 .gp-markdown img {
@@ -2444,9 +2651,9 @@ html.light .gp-markdown {
   min-height: 2.4em;
   padding: 0.3em 0.6em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   cursor: pointer;
 }
 .gp-markdown .gp-md-withheld-picture {
@@ -2454,7 +2661,7 @@ html.light .gp-markdown {
   min-width: 4em;
   min-height: 1.5em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
   cursor: pointer;
 }
@@ -2462,20 +2669,20 @@ html.light .gp-markdown {
   display: inline-block;
   padding: 0.1em 0.5em;
   border: 1px dashed rgb(var(--c-border));
-  border-radius: 5px;
+  border-radius: var(--gp-r-sm);
   color: rgb(var(--c-text-muted));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
 }
 .gp-markdown .tag {
   padding: 0.05em 0.45em;
-  border-radius: 999px;
+  border-radius: var(--gp-r-full);
   background: rgb(var(--c-accent) / 0.14);
   color: rgb(var(--c-accent));
-  font-size: 0.9em;
+  font-size: var(--text-meta);
 }
 .gp-markdown .math-source {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 0.9em;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .math-display {
@@ -2486,14 +2693,14 @@ html.light .gp-markdown {
   white-space: pre;
 }
 .gp-markdown sup {
-  font-size: 0.75em;
+  font-size: var(--text-micro);
   vertical-align: super;
   line-height: 0;
 }
 .gp-markdown .footnote-definition {
   display: flex;
   gap: 0.5em;
-  font-size: 0.9em;
+  font-size: var(--text-meta);
   color: rgb(var(--c-text-muted));
 }
 .gp-markdown .footnote-definition > p {
@@ -2503,7 +2710,7 @@ html.light .gp-markdown {
   --md-callout: var(--md-note);
   padding: 0.6em 0.9em;
   border-left: 3px solid rgb(var(--md-callout));
-  border-radius: 6px;
+  border-radius: var(--gp-r-md);
   background: rgb(var(--md-callout) / 0.08);
 }
 .gp-markdown .callout:is([data-callout-type="tip"], [data-callout-type="success"]) {
@@ -2547,7 +2754,7 @@ html.light .gp-markdown {
 }
 .gp-markdown.gp-markdown-compact :is(h1, h2, h3, h4, h5, h6) {
   margin: 0.8em 0 0.35em;
-  font-size: 1.05em;
+  font-size: inherit;
   border: 0;
   padding: 0;
 }
@@ -2561,11 +2768,11 @@ html.light .gp-markdown {
   gap: 0.75em;
   margin-bottom: 0.75em;
   padding: 0.4em 0.7em;
-  border: 1px solid rgb(var(--c-border) / 0.7);
-  border-radius: 6px;
+  border: 1px solid rgb(var(--c-border) / 0.65);
+  border-radius: var(--gp-r-md);
   background: rgb(var(--c-surface-hover) / 0.6);
   color: rgb(var(--c-text-muted));
-  font-size: 11px;
+  @apply text-meta;
 }
 .gp-md-notice-dismiss {
   flex: none;
@@ -2577,16 +2784,114 @@ html.light .gp-markdown {
   gap: 0.2em 0.9em;
   margin-bottom: 1.1em;
   padding: 0.55em 0.8em;
-  border: 1px solid rgb(var(--c-border) / 0.6);
-  border-radius: 6px;
-  font-size: 11px;
+  border: 1px solid rgb(var(--c-border) / 0.65);
+  border-radius: var(--gp-r-md);
+  @apply text-meta;
 }
 .gp-md-frontmatter dt {
   color: rgb(var(--c-text-muted));
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--gp-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace);
 }
 .gp-md-frontmatter dd {
   margin: 0;
   color: rgb(var(--c-text));
   overflow-wrap: anywhere;
 }
+
+/* Header lane I: the diffuse scroll edge's contrast and transparency opt-out.
+   Last in the file on purpose: contract tests find the first block of each
+   media query by prefix, and this one must not be it. */
+@media (prefers-contrast: more), (forced-colors: active), (prefers-reduced-transparency: reduce) {
+  .gp-scroll-diffuse {
+    display: none;
+  }
+}
+
+/* ===== STATUS POPOVER TOKENS (lane P) =====================================
+   The menu-bar popover floats over an arbitrary desktop, so its palette is
+   solved separately from the app theme: every foreground has to clear 4.5:1
+   (text) and 3:1 (non-text) against a pure black AND a pure white wallpaper at
+   the panel's own material alpha. src/lib/desktop/StatusPopover.contrast.test.ts
+   reads this block and fails a retune that loses that. RGB triplets, like every
+   other --c-* token, so `rgb(var(--c-pop-text) / .5)` works.
+
+   Light is the default and dark arrives with `html.dark` or, before the first
+   snapshot has stamped a theme class, `prefers-color-scheme: dark` - the same
+   order the component has always resolved.
+   `-solid` is the opaque palette (opaque material, Reduce Transparency);
+   `-glass` is the one tuned for the translucent panel. */
+:root {
+  --c-pop-base: 250 251 252;
+  --c-pop-card: 255 255 255;
+  --c-pop-soft: 240 242 245;
+  --c-pop-line: 229 232 237;
+  --c-pop-text: 32 36 44;
+  --c-pop-muted-solid: 99 108 121;
+  --c-pop-muted-glass: 66 76 91;
+  --c-pop-blue-solid: 37 99 235;
+  --c-pop-blue-glass: 23 76 176;
+  --c-pop-green-solid: 28 125 78;
+  --c-pop-green-glass: 24 91 57;
+  --c-pop-amber-solid: 151 86 0;
+  --c-pop-amber-glass: 114 66 6;
+  --c-pop-action: 37 99 235;
+  --c-pop-action-hover: 30 85 206;
+  --c-pop-on-action: 255 255 255;
+  --c-pop-hue-a: 120 152 255;
+  --c-pop-hue-b: 46 196 214;
+  --c-pop-hue-c: 168 136 252;
+  --c-pop-hue-d: 240 122 186;
+  --c-pop-white: 255 255 255;
+  --c-pop-shade: 38 46 76;
+  --c-pop-tint: 23 76 176;
+  --c-pop-shadow: 0 0 0;
+}
+html.dark {
+  --c-pop-base: 32 35 41;
+  --c-pop-card: 41 45 52;
+  --c-pop-soft: 43 48 56;
+  --c-pop-line: 56 61 70;
+  --c-pop-text: 240 242 245;
+  --c-pop-muted-solid: 161 169 182;
+  --c-pop-muted-glass: 213 220 233;
+  --c-pop-blue-solid: 120 164 255;
+  --c-pop-blue-glass: 206 222 255;
+  --c-pop-green-solid: 118 197 157;
+  --c-pop-green-glass: 165 238 203;
+  --c-pop-amber-solid: 241 187 112;
+  --c-pop-amber-glass: 255 229 200;
+  --c-pop-action: 50 106 222;
+  --c-pop-action-hover: 40 95 207;
+  --c-pop-hue-a: 52 78 200;
+  --c-pop-hue-b: 12 150 170;
+  --c-pop-hue-c: 110 66 210;
+  --c-pop-hue-d: 180 50 130;
+  --c-pop-shade: 0 0 0;
+  --c-pop-tint: 182 206 255;
+}
+@media (prefers-color-scheme: dark) {
+  html:not(.light) {
+    --c-pop-base: 32 35 41;
+    --c-pop-card: 41 45 52;
+    --c-pop-soft: 43 48 56;
+    --c-pop-line: 56 61 70;
+    --c-pop-text: 240 242 245;
+    --c-pop-muted-solid: 161 169 182;
+    --c-pop-muted-glass: 213 220 233;
+    --c-pop-blue-solid: 120 164 255;
+    --c-pop-blue-glass: 206 222 255;
+    --c-pop-green-solid: 118 197 157;
+    --c-pop-green-glass: 165 238 203;
+    --c-pop-amber-solid: 241 187 112;
+    --c-pop-amber-glass: 255 229 200;
+    --c-pop-action: 50 106 222;
+    --c-pop-action-hover: 40 95 207;
+    --c-pop-hue-a: 52 78 200;
+    --c-pop-hue-b: 12 150 170;
+    --c-pop-hue-c: 110 66 210;
+    --c-pop-hue-d: 180 50 130;
+    --c-pop-shade: 0 0 0;
+    --c-pop-tint: 182 206 255;
+  }
+}
+/* ===== END STATUS POPOVER TOKENS ===== */

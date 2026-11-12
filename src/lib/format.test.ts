@@ -98,7 +98,7 @@ describe("signatureLabel", () => {
     for (const signature of ["pgp", "ssh", "x509", "other"] as const) {
       for (const status of ["none", "cannot_check"] as const) {
         const label = signatureLabel(check(signature, status));
-        expect(label.text).toBe("Signed, could not verify");
+        expect(label.text).toBe("Signed, couldn't verify");
         expect(label.ok).toBe(false);
       }
     }

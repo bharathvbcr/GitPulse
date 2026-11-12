@@ -6,6 +6,7 @@ import {
   parseWindowState,
   readWindowState,
   shouldPersist,
+  stampFullscreen,
   writeWindowState,
   type MonitorArea,
   type WindowRect,
@@ -163,5 +164,31 @@ describe("writeWindowState", () => {
   it("is a no-op with no storage at all", () => {
     expect(() => writeWindowState(null, rect())).not.toThrow();
     expect(readWindowState(null)).toBeNull();
+  });
+});
+
+describe("stampFullscreen", () => {
+  const root = () => {
+    const attrs = new Set<string>();
+    return {
+      attrs,
+      toggleAttribute: (name: string, force?: boolean) => {
+        if (force) attrs.add(name);
+        else attrs.delete(name);
+        return attrs.has(name);
+      },
+    };
+  };
+
+  it("sets and clears data-fullscreen with the state it is given", () => {
+    const html = root();
+    stampFullscreen(true, html);
+    expect([...html.attrs]).toEqual(["data-fullscreen"]);
+    stampFullscreen(false, html);
+    expect(html.attrs.size).toBe(0);
+  });
+
+  it("does nothing without a document", () => {
+    expect(() => stampFullscreen(true, null)).not.toThrow();
   });
 });

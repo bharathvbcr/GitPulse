@@ -85,7 +85,7 @@ describe("verdict", () => {
     ).toBe("1 finding+");
     expect(
       verdict(report({ findings: rows, findings_total: 1, findings_unreadable: 2 })).detail,
-    ).toContain("2 findings could not be read and are not listed.");
+    ).toContain("2 findings couldn't be read and are not listed.");
     expect(verdict(report({ findings: rows, findings_total: 1, findings_truncated: true })).title).toBe(
       "1 finding+",
     );
@@ -101,7 +101,7 @@ describe("verdict", () => {
 
   it("names missing git status", () => {
     const v = verdict(report({ findings: [row({ location: "unknown" })], findings_total: 1, git_status_known: false }));
-    expect(v.detail).toContain("Git status could not be read");
+    expect(v.detail).toContain("Git status couldn't be read");
   });
 });
 
@@ -189,8 +189,8 @@ describe("scanFailureCopy", () => {
     expect(text).toBe(
       "kingfisher did not finish within 300s\nkingfisher: 2.7.0\nstdout_bytes_captured: 0",
     );
-    expect(scanFailureCopy(report({ ok: false, error: "kingfisher could not be started" }))).toBe(
-      "kingfisher could not be started",
+    expect(scanFailureCopy(report({ ok: false, error: "kingfisher couldn't be started" }))).toBe(
+      "kingfisher couldn't be started",
     );
     expect(scanFailureCopy(null)).toBe("The scanner did not complete.");
   });

@@ -23,26 +23,32 @@
    */
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { toastStore } from "../stores/toastStore";
-  import {
-    firstFailure,
-    isCleanSweep,
-    summarizeRun,
-    type BulkRunReport,
-  } from "../repos/workspaceOps";
+  import { summarizeRun, type BulkRunReport } from "../repos/workspaceOps";
   import { describeWorkspace, wipDestination } from "../repos/wipSummary";
   import { describeDestination } from "../views/viewRegistry";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { CloudDownload, Loader2, AlertTriangle, CircleCheck, X } from "@lucide/svelte";
+  import { markEnter, markExit } from "../ui/headerMotion";
+  import { CloudDownload, AlertTriangle, CircleCheck, X } from "@lucide/svelte";
 
   let running = $state<"fetch" | "pull" | null>(null);
   let progress = $state<{ done: number; total: number } | null>(null);
   let report = $state<BulkRunReport | null>(null);
+  /** The last sweep's one-line outcome. It names failures and skips, never just "done". */
+  let sweepLine = $state<string | null>(null);
   let detailsOpen = $state(false);
   /** Cooperative cancellation handed to the run. */
   let cancelToken = $state<{ aborted: boolean } | null>(null);
+
+  /** Ring geometry: a 14px viewBox and a 5px radius. The dash length is set per update, never animated. */
+  const RING_CIRCUMFERENCE = 2 * Math.PI * 5;
+  const ringDash = $derived(
+    progress && progress.total > 0
+      ? `${((progress.done / progress.total) * RING_CIRCUMFERENCE).toFixed(2)} ${RING_CIRCUMFERENCE.toFixed(2)}`
+      : `0 ${RING_CIRCUMFERENCE.toFixed(2)}`,
+  );
+  const runLabel = $derived(running === "pull" ? "Pulling repositories" : "Fetching repositories");
 
   const openCount = $derived($repoStore.openTabs.length);
   const visible = $derived(showsWorkspaceControls(openCount));
@@ -131,17 +137,11 @@
         },
       });
       report = result;
-      const verb = kind === "fetch" ? "Fetched" : "Pulled";
-      const line = summarizeRun(result, verb);
-      if (isCleanSweep(result)) {
-        toastStore.success(line);
-      } else {
-        // A partial sweep names one concrete cause; the rest are in the
-        // details panel rather than buried in a count.
-        const failure = firstFailure(result);
-        toastStore.warning(failure ? `${line} — ${failure.label}: ${failure.error}` : line);
-        detailsOpen = true;
-      }
+      // The result reads in the workspace status panel, not as a notification: a
+      // partial sweep keeps its failures and skips beside the repositories
+      // that own them, and a clean one says so in the same place.
+      sweepLine = summarizeRun(result, kind === "fetch" ? "Fetched" : "Pulled");
+      detailsOpen = true;
     } finally {
       running = null;
       progress = null;
@@ -151,149 +151,194 @@
 </script>
 
 {#if visible}
-  <div class="flex items-center gap-1">
-    <button
-      type="button"
-      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5"
-      disabled={running !== null}
-      onclick={() => void run("fetch")}
-      title="Fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
-    >
-      {#if running === "fetch"}
-        <Loader2 size={11} class="animate-spin" />
-      {:else}
-        <CloudDownload size={11} />
-      {/if}
-      <span>
-        {#if progress && running === "fetch"}
-          {progress.done}/{progress.total}
-        {:else}
-          Fetch all
+  <div class="flex shrink-0 items-center gap-1">
+    {#if running && progress}
+      <!-- While a sweep runs, the button becomes its own pill: a progress ring,
+           the count and Stop. -->
+      <div class="gp-chip shrink-0 gap-1.5 pr-1" data-tone="accent" role="group" aria-label={runLabel} in:markEnter out:markExit>
+        <svg
+          viewBox="0 0 14 14"
+          width="14"
+          height="14"
+          class="shrink-0"
+          role="progressbar"
+          aria-label={runLabel}
+          aria-valuemin="0"
+          aria-valuemax={progress.total}
+          aria-valuenow={progress.done}
+        >
+          <circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" stroke-opacity="0.25" stroke-width="2" />
+          <circle
+            cx="7"
+            cy="7"
+            r="5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-dasharray={ringDash}
+            transform="rotate(-90 7 7)"
+          />
+        </svg>
+        <span class="tabular-nums">{progress.done}/{progress.total}</span>
+        {#if cancelToken}
+          <button
+            type="button"
+            class="gp-btn"
+            data-variant="ghost"
+            data-size="sm"
+            onclick={() => {
+              if (cancelToken) cancelToken.aborted = true;
+            }}
+            title="Stop before the next repository. Repositories already fetched stay fetched."
+          >
+            Stop
+          </button>
         {/if}
-      </span>
-    </button>
-
-    {#if running && cancelToken}
+      </div>
+    {:else}
       <button
         type="button"
-        class="gp-btn py-1! px-2! text-[11px]!"
-        onclick={() => {
-          if (cancelToken) cancelToken.aborted = true;
-        }}
-        title="Stop before the next repository. Repositories already fetched stay fetched."
+        class="gp-btn"
+        data-size="sm"
+        onclick={() => void run("fetch")}
+        title="Fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
+        aria-label="Fetch all"
       >
-        Stop
+        <CloudDownload size={11} />
+        <span class="max-[1099px]:sr-only">Fetch all</span>
       </button>
     {/if}
+
+    <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">{sweepLine ?? ""}</span>
 
     <button
       type="button"
       data-workspace-wip-trigger
-      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5 {wip.allClear
-        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? 'border-accent/50! bg-surfaceHover! text-textPrimary!' : ''}`
-        : `border-amber-500/50! bg-amber-500/20! text-amber-700 hover:bg-amber-500/30! hover:border-amber-500/70! dark:text-amber-300 dark:bg-amber-500/25! dark:hover:bg-amber-500/35! ${detailsOpen ? 'border-amber-500/70! bg-amber-500/30! dark:bg-amber-500/40! ring-1 ring-amber-500/40' : ''}`}"
+      class="gp-chip min-h-6 shrink-0 cursor-pointer"
+      data-tone={wip.allClear ? "ok" : "warn"}
       onclick={() => (detailsOpen = !detailsOpen)}
       title={describeWorkspace(wip)}
+      aria-label={wip.allClear ? "All clean" : `${wip.repos.length} with work`}
       aria-haspopup="dialog"
       aria-expanded={detailsOpen}
     >
       {#if wip.allClear}
-        <CircleCheck size={11} class="text-emerald-600 dark:text-emerald-400" />
-        <span>All clean</span>
+        <CircleCheck size={11} />
+        <span class="max-[1099px]:sr-only">All clean</span>
       {:else}
-        <AlertTriangle size={11} class="shrink-0 text-amber-600 dark:text-amber-400" />
-        <span>{wip.repos.length} with work</span>
+        <AlertTriangle size={11} class="shrink-0" />
+        <span class="max-[1099px]:sr-only">{wip.repos.length} with work</span>
       {/if}
     </button>
 
     {#if detailsOpen}
       <div
         use:portal
-        use:popover={dismissal}
+        use:popover={dismissal} out:popoverExit
         data-workspace-wip
-        class="fixed right-3 top-20 w-80 gp-pop shadow-float rounded-xl p-3 text-[11px] bg-surface/95 border border-border/80"
+        class="fixed right-3 top-20 w-80 gp-menu gp-pop shadow-float text-meta"
         style="z-index: {LAYERS.MENU}"
         role="dialog"
         aria-label="Workspace status"
       >
-        <div class="mb-2 flex items-start gap-2">
-          <p class="min-w-0 flex-1 font-semibold text-textPrimary">{describeWorkspace(wip)}</p>
-          <!-- Closing is the one action this panel always offers, so it sits
-               where a window's close sits rather than below content that can
-               run long enough to scroll it out of reach. -->
-          <button
-            type="button"
-            class="shrink-0 inline-flex h-5 w-5 items-center justify-center rounded-full border border-rose-500/30 bg-rose-500/10 text-rose-700 transition-colors hover:bg-rose-500/20 dark:text-rose-300"
-            onclick={() => (detailsOpen = false)}
-            title="Close (Esc)"
-            aria-label="Close workspace status"
-          >
-            <X size={11} />
-          </button>
-        </div>
+        <div class="gp-scroll max-h-[70vh] overflow-y-auto p-2">
+          <div class="mb-2 flex items-start gap-2">
+            <!-- The sweep's outcome leads when there is one: it answers the click
+                 that just ran, and it names failures and skips. -->
+            <p class="min-w-0 flex-1 font-semibold text-textPrimary" data-sweep-summary={sweepLine ? "" : undefined}>
+              {sweepLine ?? describeWorkspace(wip)}
+            </p>
+            <!-- Closing is the one action this panel always offers, so it sits
+                 where a window's close sits rather than below content that can
+                 run long enough to scroll it out of reach. -->
+            <button
+              type="button"
+              class="gp-icon-btn shrink-0"
+              data-size="sm"
+              data-tone="danger"
+              onclick={() => (detailsOpen = false)}
+              title="Close (Esc)"
+              aria-label="Close workspace status"
+            >
+              <X size={11} />
+            </button>
+          </div>
 
-        {#if wip.repos.length > 0}
-          <ul class="mb-2 space-y-1">
-            {#each wip.repos as repo (repo.path)}
-              {@const to = destinationFor(repo.path)}
-              <li>
-                <!-- The row is the door to the repository it names: a list
-                     that says "alpha has 3 conflicts" and cannot take you to
-                     them is a notification, not a control. -->
-                <button
-                  type="button"
-                  class="w-full rounded-lg border border-border/50 px-2 py-1.5 text-left transition-colors hover:border-accent/60 hover:bg-surfaceHover"
-                  onclick={() => reveal(repo.path)}
-                  title="Open {repo.label} — {describeDestination(to.tab, to.section)}"
-                >
-                  <p class="truncate font-medium text-textPrimary">{repo.label}</p>
-                  <p class="truncate text-textMuted">
-                    {repo.reasons.map((reason) => reason.detail).join(" · ")}
-                  </p>
-                </button>
-                {#if repo.severity !== "uncommitted" && repo.reasons.some(reason => reason.kind === "uncommitted")}
-                  <button type="button" class="mt-1 text-amber-600 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {repo.label}"
-                    onclick={() => { void repoStore.previewUncommitted(repo.path); detailsOpen = false; }}>Preview uncommitted changes</button>
-                {/if}
-              </li>
-            {/each}
-          </ul>
-        {/if}
-
-        {#if report}
-          <!-- The last sweep's outcome, including what it did NOT do. -->
-          <p class="mb-1 font-semibold text-textPrimary">Last sweep</p>
-          <ul class="space-y-1">
-            {#each report.results.filter((r) => r.status !== "ok") as result (result.path)}
-              {@const to = destinationFor(result.path)}
-              <li>
-                <!-- Same rule as the list above: the repository a sweep could
-                     not finish is exactly the one the reader wants to open. -->
-                <button
-                  type="button"
-                  class="flex w-full items-start gap-1.5 rounded-lg px-1 py-0.5 text-left transition-colors hover:bg-surfaceHover"
-                  onclick={() => reveal(result.path)}
-                  title="Open {result.label} — {describeDestination(to.tab, to.section)}"
-                >
-                  <span
-                    class="mt-0.5 shrink-0 rounded-full px-1.5 text-[10px] {result.status === 'failed'
-                      ? 'bg-red-500/15 text-red-600 dark:text-red-400'
-                      : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}"
-                  >
-                    {result.status}
-                  </span>
-                  <span class="min-w-0">
-                    <span class="text-textPrimary">{result.label}</span>
-                    <span class="text-textMuted"> — {result.error ?? result.reason}</span>
-                  </span>
-                </button>
-              </li>
-            {/each}
-          </ul>
-          {#if report.results.every((r) => r.status === "ok")}
-            <p class="text-textMuted">Every repository succeeded.</p>
+          {#if sweepLine}
+            <p class="mb-2 text-textMuted">{describeWorkspace(wip)}</p>
           {/if}
-        {/if}
+
+          {#if wip.repos.length > 0}
+            <ul class="mb-2 space-y-1">
+              {#each wip.repos as repo (repo.path)}
+                {@const to = destinationFor(repo.path)}
+                <li>
+                  <!-- The row is the door to the repository it names: a list
+                       that says "alpha has 3 conflicts" and cannot take you to
+                       them is a notification, not a control. -->
+                  <button
+                    type="button"
+                    class="gp-menu-item"
+                    onclick={() => reveal(repo.path)}
+                    title="Open {repo.label} — {describeDestination(to.tab, to.section)}"
+                  >
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate font-medium text-textPrimary">{repo.label}</span>
+                      <span class="block truncate text-textMuted">
+                        {repo.reasons.map((reason) => reason.detail).join(" · ")}
+                      </span>
+                    </span>
+                  </button>
+                  {#if repo.severity !== "uncommitted" && repo.reasons.some(reason => reason.kind === "uncommitted")}
+                    <button
+                      type="button"
+                      class="gp-btn text-warn"
+                      data-variant="ghost"
+                      data-size="sm"
+                      title="Preview uncommitted files in {repo.label}"
+                      onclick={() => { void repoStore.previewUncommitted(repo.path); detailsOpen = false; }}
+                    >Preview uncommitted changes</button>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+
+          {#if report}
+            <!-- The last sweep's outcome, including what it did NOT do. -->
+            <p class="gp-label mb-1">Last sweep</p>
+            <ul class="space-y-1">
+              {#each report.results.filter((r) => r.status !== "ok") as result (result.path)}
+                {@const to = destinationFor(result.path)}
+                <li>
+                  <!-- Same rule as the list above: the repository a sweep could
+                       not finish is exactly the one the reader wants to open. -->
+                  <button
+                    type="button"
+                    class="gp-menu-item items-start gap-1.5"
+                    onclick={() => reveal(result.path)}
+                    title="Open {result.label} — {describeDestination(to.tab, to.section)}"
+                  >
+                    <span
+                      class="gp-chip mt-0.5 shrink-0"
+                      data-tone={result.status === 'failed' ? 'danger' : 'warn'}
+                    >
+                      {result.status}
+                    </span>
+                    <span class="min-w-0">
+                      <span class="text-textPrimary">{result.label}</span>
+                      <span class="text-textMuted"> — {result.error ?? result.reason}</span>
+                    </span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+            {#if report.results.every((r) => r.status === "ok")}
+              <p class="text-textMuted">Every repository succeeded.</p>
+            {/if}
+          {/if}
+        </div>
       </div>
     {/if}
   </div>

@@ -6,6 +6,7 @@ import {
 } from "../terminal/agentPromptText";
 import {
   isPromptLauncher,
+  TERMINAL_SESSION_CANCELED,
   terminalLaunchRequests,
   type PromptLauncher,
 } from "../terminal/launchRequests";
@@ -195,7 +196,7 @@ export async function launchAgentCommit(
     return { ok: false, error: AGENT_COMMIT_UNSUPPORTED_LAUNCHER };
   }
   if (signal?.aborted) {
-    return { ok: false, error: "Terminal launch cancelled" };
+    return { ok: false, error: TERMINAL_SESSION_CANCELED };
   }
 
   try {

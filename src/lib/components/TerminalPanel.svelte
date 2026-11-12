@@ -32,6 +32,8 @@
     Search,
     ChevronDown,
     Maximize2,
+    Pin,
+    PinOff,
     Minimize2,
     Columns2,
     Settings2,
@@ -90,7 +92,7 @@
   import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
@@ -101,6 +103,8 @@
     onClose,
     expanded = false,
     onToggleExpanded,
+    dockMode = "docked",
+    onToggleDockMode,
     onGoToSession,
     checkouts = [],
   }: {
@@ -110,6 +114,9 @@
     onClose?: () => void;
     expanded?: boolean;
     onToggleExpanded?: () => void;
+    /** Whether the dock floats over the view or takes its own row; the dock owns the choice. */
+    dockMode?: "docked" | "overlay";
+    onToggleDockMode?: () => void;
     /**
      * Brings a session from the cross-repository Sessions list on screen,
      * switching repository tabs when it lives in another one.
@@ -572,7 +579,7 @@
     try {
       await openTaskForRun(runId);
     } catch (cause) {
-      sessionError = `That session's task could not be opened: ${formatError(cause)}`;
+      sessionError = `That session's task couldn't be opened: ${formatError(cause)}`;
     }
   }
 
@@ -585,7 +592,7 @@
     const outcome = await onGoToSession(session);
     if (!outcome.ok) {
       sessionError = outcome.reason === "unavailable"
-        ? "That session could not be shown. It may have just exited; the Sessions list refreshes when it does."
+        ? "That session couldn't be shown. It may have just exited; the Sessions list refreshes when it does."
         : "That session is no longer running.";
     }
   }
@@ -1073,11 +1080,11 @@
 <!-- Justified: keyboard events bubble from the region's interactive controls; the region itself is not a focus stop. -->
 <div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Terminal" onkeydown={handlePanelKey}>
   <!-- Header Bar -->
-  <div class="px-3 py-1.5 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-2 items-center shrink-0">
+  <div class="px-3 py-1.5 bg-surface/60 flex flex-wrap gap-2 items-center shrink-0">
     <div class="flex flex-1 items-center gap-2 min-w-0">
       <Terminal size={14} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
-      <span class="text-textMuted font-mono truncate text-[10px]" title={repoPath ?? "No repository"}>
+      <span class="text-textMuted font-mono truncate text-micro" title={repoPath ?? "No repository"}>
         {repoPath?.split(/[\\/]/).pop() ?? "No repository"}
       </span>
     </div>
@@ -1087,7 +1094,7 @@
           type="button"
           aria-pressed={mode === "shell"}
           data-active={mode === "shell" ? "true" : "false"}
-          class="gp-seg-btn text-[11px]! py-0.5!"
+          class="gp-seg-btn text-meta!"
           onclick={() => (mode = "shell")}
           title="A real interactive shell in this repository"
         >
@@ -1097,7 +1104,7 @@
           type="button"
           aria-pressed={mode === "console"}
           data-active={mode === "console" ? "true" : "false"}
-          class="gp-seg-btn text-[11px]! py-0.5!"
+          class="gp-seg-btn text-meta!"
           onclick={() => (mode = "console")}
           title="Run single commands with capped output and per-run policy verdicts"
         >
@@ -1112,7 +1119,7 @@
         <button
           type="button"
           onclick={clearOutput}
-          class="gp-btn py-1!"
+          class="gp-btn" data-size="sm"
           title="Clear terminal output"
         >
           <Trash2 size={12} />
@@ -1122,7 +1129,7 @@
       <button
         bind:this={sessionListTrigger}
         type="button"
-        class="gp-icon-btn px-2! gap-1 text-[10px]! tabular-nums whitespace-nowrap"
+        class="gp-icon-btn px-2! gap-1 text-micro! tabular-nums whitespace-nowrap"
         aria-label="All terminal sessions"
         aria-expanded={sessionListOpen}
         aria-controls="terminal-session-list"
@@ -1135,6 +1142,11 @@
           {#if expanded}<Minimize2 size={13} />{:else}<Maximize2 size={13} />{/if}
         </button>
       {/if}
+      {#if onToggleDockMode}
+        <button type="button" class="gp-icon-btn" aria-label="Float terminal over the view" aria-pressed={dockMode === "overlay"} data-terminal-dock-mode-toggle title={dockMode === "overlay" ? "Dock the terminal under the view" : "Float the terminal over the view"} onclick={onToggleDockMode}>
+          {#if dockMode === "overlay"}<PinOff size={13} />{:else}<Pin size={13} />{/if}
+        </button>
+      {/if}
       {#if onClose}
         <button type="button" class="gp-icon-btn" aria-label="Hide the terminal dock" title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — sessions keep running" onclick={onClose}><ChevronDown size={14} /></button>
       {/if}
@@ -1145,7 +1157,7 @@
     <div
       bind:this={sessionListEl}
       id="terminal-session-list"
-      class="terminal-popover terminal-session-list px-3 py-2 border-b border-border/60 gp-section-edge bg-surface text-[11px]"
+      class="terminal-popover terminal-session-list px-3 py-2 bg-surface text-meta"
       role="listbox"
       aria-label="Sessions across repositories"
       aria-activedescendant={sessionListIndex >= 0 ? `terminal-session-option-${sessionListIndex}` : undefined}
@@ -1159,7 +1171,7 @@
         bind:value={sessionListQuery}
         maxlength="128"
         oninput={() => (sessionListHighlight = null)}
-        class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+        class="gp-field w-full mb-1.5"
       />
       {#if sessionListMessage}
         <p class="mb-1 text-textMuted" data-testid="session-list-notice">{sessionListMessage}</p>
@@ -1206,20 +1218,20 @@
                 </div>
               {/if}
               <span class="min-w-0 flex items-center gap-1.5">
-                {#if row.agent}<span class="shrink-0 rounded border border-accent/40 px-1 text-[10px] leading-4 text-accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
+                {#if row.agent}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
                 <span class="min-w-0 truncate">
                   <span class="font-medium text-textPrimary">{session.title?.trim() || session.label.trim() || "Shell"}</span>
                   {#if row.checkout}<span class="text-textMuted" aria-hidden="true"> · </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
                   <span class="text-textMuted"> · <span data-testid="session-status">{sessionStatusLabel(session.status)}</span></span>
                   <span class="sr-only">{session.status}</span>
-                  {#if session.taskRunId}<span class="text-textMuted"> · task attempt</span>{:else if session.continuesRunId}<span class="text-textMuted"> · resumed conversation</span>{/if}
+                  {#if session.taskRunId}<span class="text-textMuted"> · task run</span>{:else if session.continuesRunId}<span class="text-textMuted"> · resumed conversation</span>{/if}
                 </span>
               </span>
               <span class="session-path truncate font-mono text-textMuted" data-testid="session-path" title={where}>{where}</span>
               <span class="flex items-center gap-1 shrink-0">
                 <button
                   type="button"
-                  class="gp-btn py-0!"
+                  class="gp-btn" data-size="sm"
                   disabled={!session.reveal}
                   title={session.reveal
                     ? (row.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
@@ -1232,7 +1244,7 @@
                 {#if row.taskRunId}
                   <button
                     type="button"
-                    class="gp-btn py-0!"
+                    class="gp-btn" data-size="sm"
                     data-session-aux
                     data-testid="session-open-task"
                     title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
@@ -1244,7 +1256,7 @@
                 {/if}
                 <button
                   type="button"
-                  class="gp-btn py-0! ml-3 text-textMuted"
+                  class="gp-btn ml-3" data-variant="ghost" data-size="sm"
                   data-session-aux
                   onclick={(event) => {
                     event.stopPropagation();
@@ -1258,7 +1270,7 @@
     </div>
   {/if}
   {#if waitingForCapacity && mode === "shell"}
-    <div class="px-3 py-1.5 border-b border-border/60 text-[11px] text-amber-300 bg-amber-500/10" role="status" data-testid="terminal-waiting-for-capacity">
+    <div class="gp-notice" data-tone="warn" role="status" data-testid="terminal-waiting-for-capacity">
       {#if stripFull}
         {waitingForCapacity.title} is waiting to open here: this repository's terminal already holds {MAX_STRIP_TABS} tabs. Close ended ones and it opens.
       {:else}
@@ -1267,17 +1279,17 @@
     </div>
   {/if}
   {#if sessionError}
-    <div class="px-3 py-1.5 border-b border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-start gap-1.5" role="alert" data-testid="terminal-session-error">
+    <div class="gp-notice flex items-start gap-1.5" data-tone="danger" role="alert" data-testid="terminal-session-error">
       <AlertCircle size={13} class="shrink-0 mt-0.5" />
       <span class="flex-1" style="overflow-wrap:anywhere">{sessionError}</span>
-      <button type="button" class="text-xs hover:text-white" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
+      <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
   <!-- Tab strip + sessions. Rendered in BOTH modes and merely hidden in
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0 border-b border-border/60 gp-section-edge bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0 bg-surface/40"
       class:hidden={mode !== "shell"}
       data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
     >
@@ -1295,9 +1307,9 @@
       {#each tabState.tabs as tab (tab.id)}
         <div
           data-terminal-tab={tab.id}
-          class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-[11px] shrink-0 transition-colors {tab.id ===
+          class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-meta shrink-0 transition-colors {tab.id ===
           tabState.activeId
-            ? 'bg-surface border-accent/50 text-textPrimary'
+            ? 'bg-surface border-edgeStrong text-textPrimary'
             : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
         >
           <button
@@ -1312,11 +1324,12 @@
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
           >
-            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-rose-300"> · Error</span>{/if}
+            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{/if}
           </button>
           <button
             type="button"
-            class="p-0.5 rounded opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
+            class="gp-icon-btn opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:text-danger"
+            data-size="sm"
             onclick={() => void requestClose(tab.id)}
             aria-label={`Close ${tabLabel(tab)}`}
             title="Close this session ({shortcutTextLabel('⌃⇧W', $hostPlatform.os)}) — the process is terminated"
@@ -1329,7 +1342,7 @@
       <ScrollCue target={tabScroller} axis="x" />
       </div>
 
-      <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">
+      <div class="flex items-center gap-1 shrink-0 pl-2">
         <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label={splitIds ? "Close split view" : "Split terminal"} aria-pressed={Boolean(splitIds)} disabled={!activeId || (tabState.tabs.length < 2 && !canCreate)} onclick={toggleSplit}><Columns2 size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
@@ -1337,7 +1350,7 @@
           <button
             bind:this={launcherTriggerEl}
             type="button"
-            class="gp-btn py-0! px-1.5! text-[11px]! max-w-28 truncate"
+            class="gp-btn max-w-28 truncate" data-size="sm"
             aria-label="New session type"
             aria-haspopup="listbox"
             aria-expanded={launcherMenuOpen}
@@ -1354,7 +1367,7 @@
     </div>
 
     {#if sessionSearchOpen && mode === "shell"}
-      <div class="terminal-popover px-3 py-2 border-b border-border/60 gp-section-edge bg-surface" aria-label="Find terminal session">
+      <div class="terminal-popover px-3 py-2 bg-surface" aria-label="Find terminal session">
         <input
           bind:this={sessionSearchInput}
           type="search"
@@ -1363,7 +1376,7 @@
           bind:value={sessionQuery}
           maxlength="128"
           onkeydown={handleSessionSearchKey}
-          class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
+          class="gp-field w-full mb-1.5"
         />
         <div class="max-h-40 overflow-auto" role="listbox" aria-label="Matching terminals">
           {#each filteredTabs as tab, index (tab.id)}
@@ -1375,7 +1388,7 @@
               onclick={() => chooseSearchedTab(tab.id)}
             >
               <span class="flex-1 min-w-0 truncate">{tabLabel(tab)}</span>
-              <span class="shrink-0 text-[10px]">{launcherLabel(tab.launcher)}{#if tabStatuses[tab.id] === "exited"} · Ended{:else if tabStatuses[tab.id] === "error"} · Error{/if}{#if unread.has(tab.id)} · Unread{/if}</span>
+              <span class="shrink-0 text-micro">{launcherLabel(tab.launcher)}{#if tabStatuses[tab.id] === "exited"} · Ended{:else if tabStatuses[tab.id] === "error"} · Error{/if}{#if unread.has(tab.id)} · Unread{/if}</span>
             </button>
           {:else}
             <span class="text-textMuted">No terminals match.</span>
@@ -1388,9 +1401,9 @@
       <div
         id="terminal-launcher-menu"
         use:portal={"body"}
-        use:popover={launcherMenuDismissal}
+        use:popover={launcherMenuDismissal} out:popoverExit
         data-terminal-launcher-popup
-        class="fixed w-52 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-[11px] text-textPrimary"
+        class="fixed w-52 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-meta text-textPrimary"
         style="z-index: {LAYERS.MENU}"
         role="dialog"
         aria-label="New session type menu"
@@ -1404,7 +1417,7 @@
           placeholder="Search session types"
           bind:value={launcherQuery}
           maxlength="128"
-          class="w-full mb-1 bg-background border border-border rounded-lg px-2 py-1 text-[11px]"
+          class="gp-field w-full mb-1"
         />
         <div class="max-h-48 overflow-auto" role="listbox" aria-label="Session types">
           {#each filteredLaunchers as launcher, index (launcher.kind)}
@@ -1425,13 +1438,13 @@
     {/if}
 
     {#if tabOptions && mode === "shell" && activeId}
-      <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 border-b border-border/60 gp-section-edge bg-surface" onsubmit={saveTabName}>
-        <input aria-label="Terminal tab name" bind:value={renameValue} maxlength="64" placeholder="Use automatic title" class="min-w-0 w-36 bg-surface rounded px-2 py-1 border border-border text-xs" />
-        <button type="submit" class="gp-btn py-1!">Rename</button>
+      <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 bg-surface" onsubmit={saveTabName}>
+        <input aria-label="Terminal tab name" bind:value={renameValue} maxlength="64" placeholder="Use automatic title" class="gp-field min-w-0 w-36" />
+        <button type="submit" class="gp-btn" data-size="sm">Rename</button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={tabState.tabs.at(-1)?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, 1))}><ChevronRight size={13} /></button>
         {#if !activeIsBrowser}
-          <select aria-label="Terminal output actions" onchange={outputAction} class="bg-surface border border-border rounded px-1 py-1 text-xs">
+          <select aria-label="Terminal output actions" onchange={outputAction} class="gp-select">
             <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
           </select>
         {/if}
@@ -1446,11 +1459,11 @@
         <div class="h-full flex flex-col items-center justify-center gap-3 text-textMuted text-xs">
           <span>No sessions open.</span>
           <div class="flex items-center gap-2">
-            <button type="button" class="gp-btn py-1! text-[11px]!" onclick={() => newTab("shell")}>
+            <button type="button" class="gp-btn" data-size="sm" onclick={() => newTab("shell")}>
               <SquareTerminal size={12} /> New shell
             </button>
             {#if $hostPlatform.browser_sessions}
-              <button type="button" class="gp-btn py-1! text-[11px]!" data-terminal-new-browser onclick={() => newTab("browser")} title={capacityTitleFor("browser")}>
+              <button type="button" class="gp-btn" data-size="sm" data-terminal-new-browser onclick={() => newTab("browser")} title={capacityTitleFor("browser")}>
                 <Globe size={12} /> New browser
               </button>
             {/if}
@@ -1511,12 +1524,12 @@
     </div>
 
   {#if mode === "console"}
-  <div class="px-3 h-7 shrink-0 flex items-center gap-1.5 text-[10px] text-textMuted border-b border-border/60"><Shield size={11} />Direct & bounded · git commands MANVI-gated</div>
+  <div class="px-3 h-7 shrink-0 flex items-center gap-1.5 text-micro text-textMuted"><Shield size={11} />Direct & bounded · git commands Manvi-gated</div>
   <!-- Output Area -->
   <div
     bind:this={scrollContainer}
     onscroll={() => { if (scrollContainer) consoleFollowing = followsConsoleOutput(scrollContainer.scrollTop, scrollContainer.clientHeight, scrollContainer.scrollHeight); }}
-    class="flex-1 overflow-auto p-4 space-y-4 font-mono text-[11px] leading-relaxed"
+    class="flex-1 overflow-auto p-4 space-y-4 font-mono text-meta leading-relaxed"
   >
     {#if discardedExecutions > 0}<div role="status" class="text-textMuted">{discardedExecutions} older results removed · retains up to 100 results / 8 MiB.</div>{/if}
     {#if executions.length === 0}
@@ -1525,22 +1538,22 @@
           <Terminal size={28} />
         </div>
           <div>
-            <h3 class="font-semibold text-textPrimary text-sm">Direct Repository Terminal</h3>
+            <h3 class="font-semibold text-textPrimary text-sm">Direct repository terminal</h3>
             <p class="text-xs text-textMuted mt-1">
               Execute commands directly in your repository — no shell in between, so arguments stay
-              literal. Git commands are judged by the MANVI gate before they run; other tools run
+              literal. Git commands are judged by the Manvi gate before they run; other tools run
               with hard timeouts and capped output.
             </p>
           </div>
 
         <div class="w-full space-y-1.5 pt-2">
-          <div class="text-[10px] uppercase font-bold tracking-wider text-textMuted">Quick Commands</div>
+          <div class="gp-label">Quick commands</div>
           <div class="flex flex-wrap gap-1.5 justify-center font-mono text-xs">
             {#each QUICK_COMMANDS as qc}
               <button
                 type="button"
                 onclick={() => void execute(qc)}
-                class="px-2.5 py-1 rounded-full bg-surface border border-border/80 hover:border-accent/60 hover:text-textPrimary transition-all text-[11px]"
+                class="gp-btn font-mono" data-size="sm"
               >
                 {qc}
               </button>
@@ -1550,14 +1563,14 @@
       </div>
     {:else}
       {#each executions as entry (entry.id)}
-        <div class="rounded-xl border border-border/70 bg-surface/80 shadow-xs overflow-hidden font-mono">
+        <div class="rounded-xl border border-edgeSoft bg-surface/80 shadow-xs overflow-hidden font-mono">
           <!-- Command line header -->
-          <div class="px-3 py-1.5 bg-surface border-b border-border/50 gp-section-edge flex items-center justify-between gap-2 text-xs">
+          <div class="px-3 py-1.5 bg-surface flex items-center justify-between gap-2 text-xs">
             <div class="flex items-center gap-2 min-w-0">
-              <span class="text-accent font-bold">$</span>
+              <span class="text-accent font-semibold">$</span>
               <span class="font-semibold text-textPrimary truncate">{entry.command}</span>
             </div>
-            <div class="flex items-center gap-2 shrink-0 text-[10px]">
+            <div class="flex items-center gap-2 shrink-0 text-micro">
               {#if entry.running}
                 <span class="flex items-center gap-1 text-accent">
                   <LoaderCircle size={12} class="animate-spin" />
@@ -1571,45 +1584,49 @@
                 {#if entry.result.policy}
                   {@const p = entry.result.policy}
                   <span
-                    class="px-1.5 py-0.5 rounded-full border text-[9px] uppercase font-bold {p.status === 'allowed' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30' : p.status === 'blocked' ? 'bg-rose-500/10 text-rose-300 border-rose-500/30' : 'bg-amber-500/10 text-amber-300 border-amber-500/30'}"
+                    class="gp-chip"
+                    data-tone={p.status === 'allowed' ? 'ok' : p.status === 'blocked' ? 'danger' : 'warn'}
                     title={p.reason || p.detail}
                   >
-                    MANVI: {p.status}
+                    Manvi: {p.status}
                   </span>
                 {:else if !entry.result.gated}
                   <span
-                    class="px-1.5 py-0.5 rounded-full border border-border bg-surfaceHover text-textMuted text-[9px] uppercase font-bold"
-                    title="Non-git commands are not judged by the MANVI gate; they run bounded (timeout, capped output) instead."
+                    class="gp-chip"
+                    data-tone="neutral"
+                    title="Non-git commands are not judged by the Manvi gate; they run bounded (timeout, capped output) instead."
                   >
                     not gate-checked
                   </span>
                 {/if}
                 {#if entry.result.timed_out}
-                  <span class="px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/30 font-semibold">
+                  <span class="gp-chip" data-tone="warn">
                     timed out
                   </span>
                 {:else if entry.result.exit_code === 0}
-                  <span class="px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 font-semibold">
+                  <span class="gp-chip" data-tone="ok">
                     exit 0
                   </span>
                 {:else}
-                  <span class="px-1.5 py-0.5 rounded-full bg-rose-500/10 text-rose-300 border border-rose-500/30 font-semibold">
+                  <span class="gp-chip" data-tone="danger">
                     exit {entry.result.exit_code ?? "?"}
                   </span>
                 {/if}
               {:else if entry.error}
-                <span class="px-1.5 py-0.5 rounded-full bg-rose-500/10 text-rose-300 border border-rose-500/30 font-semibold">
+                <span class="gp-chip" data-tone="danger">
                   failed
                 </span>
               {/if}
               <button
                 type="button"
                 onclick={() => void copyOutput(entry)}
-                class="p-1 rounded hover:bg-surfaceHover text-textMuted hover:text-textPrimary"
+                class="gp-icon-btn"
+                data-size="sm"
+                aria-label="Copy command and output"
                 title="Copy command and output"
               >
                 {#if copiedId === entry.id}
-                  <Check size={12} class="text-emerald-400" />
+                  <Check size={12} class="text-ok" />
                 {:else}
                   <Clipboard size={12} />
                 {/if}
@@ -1618,7 +1635,7 @@
           </div>
 
           <!-- Output stream contents -->
-          <div class="p-3 bg-background/50 space-y-2 overflow-x-auto select-text whitespace-pre-wrap leading-relaxed text-[11px]">
+          <div class="p-3 bg-background/50 space-y-2 overflow-x-auto select-text whitespace-pre-wrap leading-relaxed text-meta">
             {#if entry.running}
               <div class="text-textMuted italic">Executing command…</div>
             {:else if entry.result}
@@ -1626,7 +1643,7 @@
                 <div class="text-textPrimary">{entry.result.stdout_tail}</div>
               {/if}
               {#if entry.result.stderr_tail}
-                <div class="text-rose-300/90">{entry.result.stderr_tail}</div>
+                <div class="text-danger">{entry.result.stderr_tail}</div>
               {/if}
               {#if !entry.result.stdout_tail && !entry.result.stderr_tail}
                 <div class="text-textMuted italic">(No output produced)</div>
@@ -1635,13 +1652,13 @@
                 <!-- The backend says WHY. It used to say "exceeded cap" for
                      every prefix, including a stream we simply never finished
                      reading — a cause the UI is in no position to assert. -->
-                <div class="text-amber-400 text-[10px] pt-1">
+                <div class="text-warn text-micro pt-1">
                   [Output is incomplete: {entry.result.truncation_reason ??
                     "reason unavailable"}]
                 </div>
               {/if}
             {:else if entry.error}
-              <div class="text-rose-400 flex items-start gap-1.5">
+              <div class="text-danger flex items-start gap-1.5">
                 <AlertCircle size={14} class="shrink-0 mt-0.5" />
                 <span>{entry.error}</span>
               </div>
@@ -1653,15 +1670,17 @@
   </div>
 
   <!-- Input Bar -->
-  <div class="p-3 border-t border-border gp-section-edge bg-surface shrink-0 space-y-2">
+  <div class="p-3 bg-surface shrink-0 space-y-2">
     {#if validationError}
-      <div class="px-3 py-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-center gap-1.5">
+      <div class="gp-notice mx-0! mt-0! flex items-center gap-1.5" data-tone="danger">
         <AlertCircle size={13} class="shrink-0" />
         <span class="flex-1">{validationError}</span>
         <button
           type="button"
           onclick={() => (validationError = null)}
-          class="text-xs hover:text-white"
+          class="gp-icon-btn"
+          data-size="sm"
+          aria-label="Dismiss"
         >
           ✕
         </button>
@@ -1669,8 +1688,8 @@
     {/if}
 
     <div class="flex items-center gap-2">
-      <div class="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border focus-within:border-accent/70 transition-colors font-mono">
-        <span class="text-accent font-bold select-none">$</span>
+      <div class="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border focus-within:border-(--field-focus-edge) transition-colors font-mono">
+        <span class="text-accent font-semibold select-none">$</span>
         <!-- A placeholder is not an accessible name: it is announced as a hint
              and vanishes the moment anything is typed, so this field read as
              unlabelled for the whole time it actually held a command. -->
@@ -1680,16 +1699,16 @@
           onkeydown={handleKeyDown}
           type="text"
           aria-label="Console command"
-          placeholder="Enter command (e.g. git status, npm test, cargo update)..."
+          placeholder="Enter command (e.g. git status, npm test, cargo update)…"
           disabled={running}
-          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden disabled:opacity-50"
+          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden disabled:opacity-50"
         />
       </div>
       <button
         type="button"
         onclick={() => void execute()}
         disabled={running || !commandInput.trim()}
-        class="gp-btn-primary px-4! py-2! shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+        class="gp-btn shrink-0 px-4!" data-variant="primary" data-size="md"
       >
         {#if running}
           <LoaderCircle size={14} class="animate-spin" />

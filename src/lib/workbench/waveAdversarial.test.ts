@@ -80,7 +80,7 @@ describe("merged-set re-verify is bounded", () => {
     w.deps.verify = async (id, signal, post) => { if (id === "a" && post?.head === "t2") throw new Error("sidecar down"); return verify(id, signal, post); };
     const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
     expect(done.state).toBe("halted");
-    expect(done.note).toMatch(/found "Task a" could not run \(sidecar down\)/);
+    expect(done.note).toMatch(/found "Task a" couldn't run \(sidecar down\)/);
   });
 });
 
@@ -127,7 +127,7 @@ describe("the gate outcome is durable before the wave can go on", () => {
     const record: WaveRecord = { v: 1, id: "w", repositoryId: "r", n: 2, batchesLeft: 0, batch: 1, state: "running", members: [old, landed], attempted: ["a", "b"], note: "", seq: 4 };
     const done = await (await resumeWave(record, w.deps)).finished;
     expect(done.state).toBe("halted");
-    expect(done.note).toMatch(/could not cover "Task a"/);
+    expect(done.note).toMatch(/couldn't cover "Task a"/);
     expect(phases(done)).toEqual({ a: "merged", b: "held" });
     expect(w.posts).toEqual([]);
   });
@@ -158,7 +158,7 @@ describe("persist failures and same-tick settles", () => {
     const done = await runner.finished;
     expect(calls).toBeGreaterThan(0);
     expect(done.state).toBe("failed");
-    expect(done.note).toMatch(/could not be kept|could not be saved/);
+    expect(done.note).toMatch(/couldn't be kept|couldn't be saved/);
     expect(done.members.map((m) => m.taskId)).toEqual(["a", "b"]);
     expect(w.merged).toEqual([]);
   });

@@ -9,7 +9,9 @@
   import { trapFocus } from "../ui/focusTrap";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import { fade, scale } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
 
   let { request, onClose }: { request: MergeRequest; onClose: () => void } = $props();
   let selectedRef = $state(untrack(() => request.sourceRef));
@@ -91,12 +93,16 @@
           : `Merged ${chosen.name} into ${request.targetBranch}`);
         onClose();
       } else {
-        error = outcome.error ?? "Merge failed. Review the repository and try again.";
+        const failure = describeFailure({ verb: "merge", object: chosen.name }, outcome.error ?? "");
+        error = outcome.error
+          ? `${failure.headline} ${failure.detail ?? outcome.error}`
+          : `${failure.headline} Review the repository and try again.`;
         // Git may have started a conflicted merge even though the command failed.
         await repoStore.refresh(request.repoPath);
       }
     } catch (err) {
-      error = formatError(err);
+      const failure = describeFailure({ verb: "merge", object: chosen.name }, err);
+      error = failure.detail ? `${failure.headline} ${failure.detail}` : failure.headline;
     } finally {
       busy = false;
     }
@@ -111,31 +117,38 @@
   aria-describedby="merge-branch-description"
   aria-busy={busy}
   tabindex="-1"
-  class="gp-scrim bg-black/40 flex items-center justify-center p-4"
+  in:fade|global={backdropFade()}
+  out:fade|global={backdropFadeOut()}
+  class="gp-scrim bg-black/40 flex items-center justify-center p-4 gp-gpu"
   style="z-index: {LAYERS.MODAL}"
   onclick={(event) => event.target === event.currentTarget && close()}
   onkeydown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); } }}
 >
-  <div use:trapFocus={{ autofocus: false }} class="gp-card w-full max-w-lg max-h-[90vh] rounded-2xl shadow-float flex flex-col overflow-hidden text-textPrimary text-xs">
+  <div
+    use:trapFocus={{ autofocus: false }}
+    in:scale|global={cardScale()}
+    out:scale|global={cardScaleOut()}
+    class="gp-card gp-gpu w-full max-w-lg max-h-[90vh] rounded-2xl shadow-float flex flex-col overflow-hidden text-textPrimary text-xs"
+  >
     <div class="p-5 pb-3 flex items-start justify-between gap-3">
       <div>
         <h2 id="merge-branch-title" class="flex items-center gap-2 text-base font-semibold"><GitMerge size={18} class="text-accent" /> Merge branches</h2>
         <p id="merge-branch-description" class="mt-1.5 text-textMuted">Choose a source branch to merge into your checked-out branch.</p>
       </div>
-      <button type="button" class="gp-icon-btn shrink-0" aria-label="Close merge dialog" disabled={busy} onclick={close}><X size={16} /></button>
+      <button type="button" class="gp-icon-btn shrink-0" data-size="md" aria-label="Close merge dialog" disabled={busy} onclick={close}><X size={16} /></button>
     </div>
 
-    <div class="mx-5 mb-4 p-3 rounded-xl bg-background border border-border/60 grid grid-cols-[1fr_auto_1fr] items-center gap-3 max-h-36 overflow-y-auto shrink-0">
+    <div class="mx-5 mb-4 p-3 rounded-xl bg-background grid grid-cols-[1fr_auto_1fr] items-center gap-3 max-h-36 overflow-y-auto shrink-0">
       <div class="min-w-0">
         <div class="flex items-center justify-between gap-1 mb-1">
-          <p class="text-[10px] uppercase tracking-wider text-textMuted">From</p>
-          {#if selectedRef}<button type="button" class="rounded p-0.5 text-textMuted hover:text-textPrimary" aria-label="Clear selected branch" title="Clear selected branch" disabled={busy} onclick={clearSelection}><X size={12} /></button>{/if}
+          <p class="gp-label">From</p>
+          {#if selectedRef}<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Clear selected branch" title="Clear selected branch" disabled={busy} onclick={clearSelection}><X size={12} /></button>{/if}
         </div>
         <p class="font-mono break-all {source ? 'text-textPrimary' : 'text-textMuted'}">{source?.name ?? (selectionMissing ? "Branch unavailable" : "Choose a branch")}</p>
-        {#if source}<p class="text-[10px] text-textMuted mt-1">{source.is_remote ? "Remote branch" : "Local branch"}</p>{/if}
+        {#if source}<p class="text-micro text-textMuted mt-1">{source.is_remote ? "Remote branch" : "Local branch"}</p>{/if}
       </div>
       <ArrowRight size={16} class="text-textMuted" />
-      <div class="min-w-0"><p class="text-[10px] uppercase tracking-wider text-textMuted mb-1">Into current</p><p class="font-mono text-accent break-all">{request.targetBranch ?? "No branch checked out"}</p></div>
+      <div class="min-w-0"><p class="gp-label mb-1">Into current</p><p class="font-mono text-accent break-all">{request.targetBranch ?? "No branch checked out"}</p></div>
     </div>
 
     <div class="px-5 pb-3">
@@ -143,22 +156,22 @@
       <div class="flex items-center gap-2 gp-field">
         <Search size={14} class="text-textMuted shrink-0" />
         <input id="merge-branch-search" bind:this={searchInput} bind:value={query} disabled={busy} placeholder="Search local and remote branches…" class="min-w-0 w-full bg-transparent outline-hidden" onkeydown={(event) => { if (event.key === "ArrowDown") navigateChoices(event); }} />
-        {#if query}<button type="button" aria-label="Clear merge search" disabled={busy} onclick={() => { query = ""; searchInput?.focus(); }}><X size={13} /></button>{/if}
+        {#if query}<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Clear merge search" disabled={busy} onclick={() => { query = ""; searchInput?.focus(); }}><X size={13} /></button>{/if}
       </div>
-      <div class="flex items-center gap-1.5 mt-3" role="group" aria-label="Branch origin">
+      <div class="gp-segmented mt-3" role="group" aria-label="Branch origin">
         {#each [{ id: "all", label: "All", count: candidates.length }, { id: "local", label: "Local", count: localCount }, { id: "remote", label: "Remote", count: remoteCount }] as tab (tab.id)}
-          <button type="button" aria-label="{tab.label} branches" aria-pressed={scope === tab.id} disabled={busy}
-            class="rounded-full px-2.5 py-1 text-[11px] border transition-colors {scope === tab.id ? 'bg-accent/10 border-accent/40 text-accent' : 'border-border/60 text-textMuted hover:bg-surfaceHover'}"
+          <button type="button" aria-label="{tab.label} branches" aria-pressed={scope === tab.id} data-active={scope === tab.id ? "true" : "false"} disabled={busy}
+            class="gp-seg-btn"
             onclick={() => { if (tab.id === "all" || tab.id === "local" || tab.id === "remote") scope = tab.id; }}>
             {tab.label} <span class="opacity-70 ml-0.5">{tab.count}</span>
           </button>
         {/each}
       </div>
-      <p class="mt-2 text-[10px] text-textMuted" role="status">{#if matches.length > MAX_VISIBLE}Showing {visible.length} of {matches.length} matches. Refine your search.{:else}{matches.length} {matches.length === 1 ? "branch" : "branches"} available{/if}</p>
+      <p class="mt-2 text-micro text-textMuted" role="status">{#if matches.length > MAX_VISIBLE}Showing {visible.length} of {matches.length} matches. Refine your search.{:else}{matches.length} {matches.length === 1 ? "branch" : "branches"} available{/if}</p>
       {#if selectionHidden}
-        <div class="mt-2 flex items-center justify-between gap-2 text-[11px] text-textMuted" role="status">
+        <div class="mt-2 flex items-center justify-between gap-2 text-meta text-textMuted" role="status">
           <span>Your selected source is outside these results.</span>
-          <button type="button" class="shrink-0 text-accent hover:underline" disabled={busy} onclick={() => void showSelected()}>Show selected</button>
+          <button type="button" class="gp-btn shrink-0" data-variant="ghost" data-size="sm" disabled={busy} onclick={() => void showSelected()}>Show selected</button>
         </div>
       {/if}
     </div>
@@ -170,34 +183,34 @@
           class="w-full flex items-center gap-2.5 text-left rounded-lg p-2.5 mb-0.5 focus-visible:outline-2 focus-visible:outline-accent {selected ? 'bg-accent/10 ring-1 ring-inset ring-accent/40' : 'hover:bg-surfaceHover'}"
           onclick={() => { selectedRef = mergeRef(branch); error = null; }} onkeydown={navigateChoices}>
           {#if branch.is_remote}<Cloud size={15} class="text-textMuted shrink-0" />{:else}<GitBranch size={15} class="text-textMuted shrink-0" />{/if}
-          <span class="flex-1 min-w-0"><span class="block font-mono break-all">{branch.name}</span><span class="block text-[10px] text-textMuted truncate mt-0.5">{branch.is_remote ? "Remote" : "Local"}{branch.last_summary ? ` · ${branch.last_summary}` : ""}</span></span>
+          <span class="flex-1 min-w-0"><span class="block font-mono break-all">{branch.name}</span><span class="block text-micro text-textMuted truncate mt-0.5">{branch.is_remote ? "Remote" : "Local"}{branch.last_summary ? ` · ${branch.last_summary}` : ""}</span></span>
           {#if selected}<Check size={16} class="text-accent shrink-0" />{/if}
         </button>
       {:else}
         <div class="px-2 py-5 text-center text-textMuted">
           <p>{query.trim() ? "No branches match your search." : scope === "all" ? "No other branches are available to merge." : `No ${scope} branches are available to merge.`}</p>
-          {#if query.trim() || scope !== "all"}<button type="button" class="text-accent mt-2 hover:underline" disabled={busy} onclick={() => { query = ""; scope = "all"; searchInput?.focus(); }}>Reset filters</button>{/if}
+          {#if query.trim() || scope !== "all"}<button type="button" class="gp-btn mt-2" data-variant="ghost" data-size="sm" disabled={busy} onclick={() => { query = ""; scope = "all"; searchInput?.focus(); }}>Reset filters</button>{/if}
         </div>
       {/each}
     </div>
 
     <div class="p-5 pt-3 space-y-3 overflow-y-auto">
-      <p id="merge-choice-help" class="text-[10px] text-textMuted">Use arrow keys to choose a branch. Tab moves to merge options.</p>
-      {#if selectionMissing}<p role="alert" class="text-amber-600 dark:text-amber-400">The selected branch is no longer available. Choose another branch.</p>{/if}
-      {#if blocked}<p role="status" class="flex items-start gap-2 text-amber-600 dark:text-amber-400"><AlertTriangle size={14} class="shrink-0 mt-0.5" />{blocked}</p>{/if}
-      {#if error}<p role="alert" class="text-rose-500 break-words whitespace-pre-wrap">{error}</p>{/if}
+      <p id="merge-choice-help" class="text-micro text-textMuted">Use arrow keys to choose a branch. Tab moves to merge options.</p>
+      {#if selectionMissing}<p role="alert" class="gp-notice" data-tone="warn">The selected branch is no longer available. Choose another branch.</p>{/if}
+      {#if blocked}<p role="status" class="gp-notice" data-tone="warn"><AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />{blocked}</p>{/if}
+      {#if error}<p role="alert" class="gp-notice break-words whitespace-pre-wrap" data-tone="danger">{error}</p>{/if}
       {#if $repoStore.statuses.length > 0 && !blocked && !error}<p class="text-textMuted">You have uncommitted changes. Git may require you to commit or stash them first.</p>{/if}
       <fieldset class="space-y-1.5" disabled={busy}>
-        <legend class="text-[10px] uppercase tracking-wider text-textMuted mb-1">Merge strategy</legend>
+        <legend class="gp-label mb-1">Merge strategy</legend>
         {#each MERGE_MODES as option (option.mode)}
-          <label class="flex items-start gap-2.5 cursor-pointer"><input type="radio" name="merge-mode" value={option.mode} bind:group={mode} class="accent-accent mt-0.5" /><span>{option.label}<span class="block text-[10px] text-textMuted mt-0.5">{option.detail}</span></span></label>
+          <label class="flex items-start gap-2.5 cursor-pointer"><input type="radio" name="merge-mode" value={option.mode} bind:group={mode} class="accent-accent mt-0.5" /><span>{option.label}<span class="block text-micro text-textMuted mt-0.5">{option.detail}</span></span></label>
         {/each}
       </fieldset>
       {#if busy}<HookRunNotice />{/if}
       <div class="flex items-center justify-end gap-2 pt-1">
         {#if conflicted && $repoStore.currentPath === request.repoPath}<button type="button" class="gp-btn" disabled={busy} onclick={() => { openConflicts(); close(); }}>Resolve conflicts</button>{/if}
         <button type="button" class="gp-btn" disabled={busy} onclick={close}>Cancel</button>
-        <button type="button" class="gp-btn gp-btn-primary" disabled={busy || !!blocked || !source} onclick={() => void submit()}>{busy ? "Merging…" : "Merge branch"}</button>
+        <button type="button" class="gp-btn" data-variant="primary" disabled={busy || !!blocked || !source} onclick={() => void submit()}>{busy ? "Merging…" : "Merge branch"}</button>
       </div>
     </div>
   </div>

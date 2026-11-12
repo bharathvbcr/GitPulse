@@ -131,20 +131,29 @@ describe("shape, space, density and edge tokens", () => {
     expect(themeBlock.get("--color-edgeStrong")).toBe("var(--gp-edge-strong)");
   });
 
-  it("adds the two type steps below text-xs and leaves text-sm, text-base and text-lg alone", () => {
-    const themeBlock = declarations(blockOf("@theme {"));
+  it("defines the six-step type scale: micro and meta are new, sm and base move from 14 and 16 to 13 and 15, xs stays 12px, all static so var(--text-*) always resolves", () => {
+    const themeBlock = declarations(blockOf("@theme static"));
     expect(themeBlock.get("--text-micro")).toBe("0.625rem");
     expect(themeBlock.get("--text-meta")).toBe("0.6875rem");
     expect(themeBlock.get("--text-micro--line-height")).toBe("1.3");
     expect(themeBlock.get("--text-meta--line-height")).toBe("1.4");
-    for (const redefined of ["--text-xs", "--text-sm", "--text-base", "--text-lg"]) {
-      expect(themeBlock.has(redefined), `${redefined} is a component change and lands with the type codemod`).toBe(false);
-    }
+    expect(themeBlock.get("--text-sm")).toBe("0.8125rem");
+    expect(themeBlock.get("--text-sm--line-height")).toBe("1.45");
+    expect(themeBlock.get("--text-base")).toBe("0.9375rem");
+    expect(themeBlock.get("--text-base--line-height")).toBe("1.3");
+    expect(themeBlock.get("--text-lg")).toBe("1.125rem");
+    expect(themeBlock.get("--text-lg--line-height")).toBe("1.25");
+    expect(themeBlock.get("--text-xs")).toBe("0.75rem");
+    expect(themeBlock.get("--text-xs--line-height")).toBe("calc(1 / 0.75)");
+    // design-lint rule 1 allows a literal fallback in `var(--text-*, <literal>)` because every
+    // step, display included, is defined here and so the fallback is never reached.
+    expect(themeBlock.get("--text-display")).toBe("1.5rem");
+    expect(themeBlock.get("--text-display--line-height")).toBe("1.1");
   });
 });
 
 describe("the vocabulary utilities", () => {
-  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-title", "gp-header-actions", "gp-row", "gp-label", "gp-select", "gp-slide-docked"])(
+  it.each(["gp-btn", "gp-chip", "gp-header", "gp-header-actions", "gp-row", "gp-label", "gp-select"])(
     "defines @utility %s",
     (name) => {
       expect(css).toMatch(new RegExp(`^@utility ${name} \\{`, "m"));
@@ -177,25 +186,29 @@ describe("the vocabulary utilities", () => {
     const select = blockOf("@utility gp-select {");
     expect(select).toMatch(/@apply [^;]*\brounded-full\b/);
     expect(select).not.toMatch(/\brounded-lg\b/);
-    expect(select).toMatch(/\bpy-1\b/);
+    // gp-field's metrics: no vertical padding and the same 24px floor, so an
+    // unmarked select and field stand exactly as tall as an unmarked button.
+    const field = blockOf("@utility gp-field {");
+    for (const block of [select, field, blockOf("@utility gp-btn {")]) {
+      expect(block).toMatch(/@apply [^;]*\bpy-0\b/);
+      expect(block).toMatch(/^\s*min-height: 24px;/m);
+    }
     expect(select).toMatch(/\bpl-3\b/);
   });
 
-  it("caps gp-slide-docked at the fast token, under the 200 ms the spec allows, and animates only size", () => {
-    const slide = blockOf("@utility gp-slide-docked {");
-    expect(slide).toContain("transition-property: width, height;");
-    expect(slide).toContain("transition-duration: var(--gp-dur-fast);");
-    expect(DURATION_MS.fast).toBeLessThanOrEqual(200);
-    // It is the single sanctioned layout transition: no other utility animates width or height.
-    const others = [...css.matchAll(/^@utility ([\w-]+) \{/gm)].map((match) => match[1]).filter((name) => name !== "gp-slide-docked");
-    for (const name of others) {
+  it("has no utility that animates layout: the docked slide is gone and every utility animates paint properties only", () => {
+    // The docked sidebar's width slide was the one sanctioned layout transition. It is
+    // transform and opacity now (Sidebar.svelte), so no utility may name a layout property.
+    expect(css).not.toMatch(/^@utility gp-slide-docked\b/m);
+    const all = [...css.matchAll(/^@utility ([\w-]+) \{/gm)].map((match) => match[1]);
+    for (const name of all) {
       expect(blockOf(`@utility ${name} {`), name).not.toMatch(/transition(?:-property)?:[^;]*\b(?:width|height|margin|padding|top|left|filter|box-shadow|backdrop-filter)\b/);
     }
   });
 
   it("zeroes every animated vocabulary class under reduced motion, in both lists", () => {
     // The pairing itself is pinned by motionPreference.test.ts; this names the classes this wave added.
-    for (const name of ["gp-btn", "gp-chip", "gp-row", "gp-slide-docked", "gp-btn-success"]) {
+    for (const name of ["gp-btn", "gp-chip", "gp-row"]) {
       expect(css, name).toMatch(new RegExp(`html :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
       expect(css, name).toMatch(new RegExp(`html\\[data-motion="reduced"\\] :is\\([^)]*\\.${name}\\b[^)]*\\) \\{\\s*transition: none !important;`));
     }
@@ -240,7 +253,7 @@ describe("LAYERS", () => {
 describe("nothing the sheet defined before the vocabulary was lost", () => {
   /** Every `@utility` at the Wave 1 base (overhaul/wave-1 = 13127387). */
   const BASE_UTILITIES = [
-    "gp-btn", "gp-btn-primary", "gp-btn-success", "gp-btn-danger", "gp-icon-btn", "gp-pill", "gp-card", "gp-scrim",
+    "gp-btn", "gp-btn-primary", "gp-btn-danger", "gp-icon-btn", "gp-pill", "gp-card", "gp-scrim",
     "gp-scroll-cue", "gp-scroll-cue-start", "gp-scroll-cue-end", "gp-scroll-cue-y", "gp-scroll-cue-top",
     "gp-scroll-cue-bottom", "gp-scroll-cue-btn", "gp-menu", "gp-menu-item", "gp-separator", "gp-menu-sep",
     "gp-section-edge", "gp-segmented", "gp-surface-header", "gp-surface-title", "gp-notice", "gp-notice-error",
@@ -252,19 +265,19 @@ describe("nothing the sheet defined before the vocabulary was lost", () => {
   });
 
   it("keeps the gp-btn-* aliases as standalone working utilities (Wave 2 empties them, not this wave)", () => {
-    for (const alias of ["gp-btn-primary", "gp-btn-success", "gp-btn-danger"]) {
+    for (const alias of ["gp-btn-primary", "gp-btn-danger"]) {
       const body = blockOf(`@utility ${alias} {`);
       expect(body, alias).toContain("rounded-full");
       expect(body, alias).toContain("background-image");
     }
   });
 
-  it("keeps the theme triplets, the light remap block and the status zoo the light theme still reads", () => {
+  it("keeps the theme triplets and no light-only status ramp and no class-attribute colour remap", () => {
     for (const name of ["bg", "surface", "surface-hover", "border", "accent", "text", "text-muted"]) {
       expect(css).toMatch(new RegExp(`--c-${name}:\\s*\\d+ \\d+ \\d+;`));
     }
-    expect((css.match(/--c-status-[a-z]+:/g) ?? []).length).toBe(15);
-    expect(css).toContain("html.light\n    :where(\n      [class~='text-amber-200']");
+    expect(css).not.toMatch(/--c-status-/);
+    expect(css).not.toMatch(/\[class~=["']text-/);
   });
 
   it("keeps the macOS material, forced-colors and view-transition blocks", () => {

@@ -171,7 +171,7 @@ export function explainAppleError(cause: unknown): string {
     if (typeof error.message === "string" && error.message.trim()) return error.message;
   }
   if (cause instanceof Error && cause.message) return cause.message;
-  return "Apple Intelligence could not finish.";
+  return "Apple Intelligence couldn't finish.";
 }
 
 export function appleErrorCode(cause: unknown): string {

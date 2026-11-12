@@ -5,6 +5,7 @@ import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 import { CONTEXT_READ_MS, KILL_HARD_MS } from "./inputQueue";
+import { TASK_TERMINAL_STARTING } from "./sessionMessages";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -147,7 +148,7 @@ describe("terminal lifecycle races", () => {
       const started = f.owner.start(); await flush();
       await vi.advanceTimersByTimeAsync(15000);
       expect(get(f.registry)).toHaveLength(1);
-      expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("still pending"));
+      expect(f.hooks.state).toHaveBeenLastCalledWith("error", TASK_TERMINAL_STARTING);
       pending.resolve({ id: "late", shell: "codex", cwd: "/repo" }); await started;
       expect(f.transport.kill).not.toHaveBeenCalled();
       expect(f.owner.isCurrent("late")).toBe(true);
@@ -166,7 +167,7 @@ describe("terminal lifecycle races", () => {
     f.exit();
     await f.owner.restart();
     expect(f.transport.spawn).toHaveBeenCalledTimes(2);
-    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("attempt ended"));
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("run ended"));
     f.owner.dispose(); await flush();
   });
   it("rejects a changed process identity during task reconnect without discarding its owner", async () => {
@@ -618,7 +619,7 @@ describe("a view that goes away without Close", () => {
     expect(f.transport.kill).not.toHaveBeenCalled();
     expect(adopted).toEqual([]);
     expect(get(registry)).toHaveLength(1);
-    expect(get(registry)[0].status).toContain("could not be detached");
+    expect(get(registry)[0].status).toContain("couldn't be detached");
     // Still stoppable from Sessions.
     await get(registry)[0].close();
     expect(f.transport.kill).toHaveBeenCalledWith("native-a");

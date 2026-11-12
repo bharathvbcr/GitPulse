@@ -155,7 +155,7 @@ export function repoWip(input: RepoWipInput): RepoWip {
     reasons.push({
       kind: "unknown",
       detail: input.loadFailed
-        ? "state could not be read"
+        ? "state couldn't be read"
         : !input.hydrated
           ? "not loaded yet"
           : "operation state unknown",
@@ -276,7 +276,7 @@ export function shouldWarnBeforeClosing(summary: WorkspaceWip): boolean {
  * null when the repository is a fine target.
  */
 export function bulkSkipReason(input: RepoWipInput): string | null {
-  if (input.loadFailed) return "Repository state could not be read.";
+  if (input.loadFailed) return "Repository state couldn't be read.";
   if (!input.hydrated) return "Repository has not finished loading.";
   if (input.operation.operation) {
     return `A ${input.operation.operation.kind === "Merge" ? "merge" : "git operation"} is in progress here.`;

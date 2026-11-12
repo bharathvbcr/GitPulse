@@ -160,36 +160,112 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
   return Boolean(status)&&Boolean(preview.querySelector('[aria-busy="true"]'));
  });
  await pending;await until(()=>text().includes("new two"),"rows after read");
+ // The loading skeleton leaves through an outro that ends on a later frame; wait it out (bounded by `until`) before asserting the mark is gone.
+ await until(()=>!preview.querySelector('[aria-busy="true"]'),"busy mark gone");
  check("and the rows arrive once it is read, with the busy mark gone",()=>!preview.querySelector('[aria-busy="true"]')&&text().includes("old forty"));
  delayMs=0;
  // --- identity and rows ---------------------------------------------------
  check("the pane is titled from the diff's own file",()=>text().includes("app.ts"));
  check("a changed line is drawn as the removed and the added text",()=>text().includes("old two")&&text().includes("new two"));
+ // --- find, in place ------------------------------------------------------
+ // Find used to open a second toolbar row under the first. The pill now
+ // widens into the field in the slot it sat in, and Escape folds it back.
+ {
+  const trigger=()=>preview.querySelector("[data-find-trigger]");
+  const field=()=>preview.querySelector("[data-find-field]");
+  check("the toolbar offers Find as one pill",()=>!!trigger()&&!field());
+  const slot=trigger().parentElement;const slotHeight=slot.getBoundingClientRect().height;
+  trigger().click();await until(()=>!!field(),"find field");await tick();
+  check("Find opens in place: the field takes the pill's slot in the same toolbar row, and the row does not grow",()=>{
+   const grew=slot.getBoundingClientRect().height-slotHeight;
+   if(field().parentElement===slot&&!trigger()&&Math.abs(grew)<=4&&document.activeElement===field().querySelector("input"))return true;
+   throw new Error(`same parent ${field().parentElement===slot}, trigger gone ${!trigger()}, row grew ${grew}px (from ${slotHeight}), focused ${document.activeElement?.tagName}.${document.activeElement?.getAttribute("aria-label")}`);
+  });
+  const input=field().querySelector("input");
+  input.value="two";input.dispatchEvent(new Event("input",{bubbles:true}));await until(()=>/of/.test(field().querySelector("[data-find-status]")?.textContent??""),"match count");
+  check("a query shows its match count inside the field",()=>/^1 of [1-9]/.test(field().querySelector("[data-find-status]").textContent.trim()));
+  // The global focus ring drew a box inside the pill while typing. Chromium
+  // treats this programmatic focus as :focus-visible, so the rule is
+  // exercised there; WebKit does not, and the shadows are checked anyway.
+  check("typing draws no focus ring: neither the focused input nor its pill has a box shadow",()=>{
+   const shadows=[getComputedStyle(input).boxShadow,getComputedStyle(field()).boxShadow];
+   if(document.activeElement===input&&shadows.every(s=>s==="none"||/^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s)))return true;
+   throw new Error(`focused ${document.activeElement===input}, focus-visible ${input.matches(":focus-visible")}, shadows ${JSON.stringify(shadows)}`);
+  });
+  input.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true}));await tick();
+  check("Enter steps to the next match",()=>/^2 of /.test(field().querySelector("[data-find-status]").textContent.trim()));
+  input.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));await until(()=>!field(),"find closed");
+  check("Escape folds it back to the Find pill",()=>!!trigger()&&!field());
+ }
+ // --- find through the view bar --------------------------------------------
+ // As History's Diff section the pane has no Find of its own: the view bar's
+ // one search field becomes this diff's find.
+ {
+  await unmount(view);preview.replaceChildren();
+  answer={text:twoHunks(),truncated:false};
+  await repoStore.openRepo(root);
+  repoStore.setActiveTab("history","diff");
+  const ScopedSearchHost=(await import("./ScopedSearchHost.svelte")).default;
+  view=mount(ScopedSearchHost,{target:preview,props:{scope:"history:diff",viewer:DiffViewer}});
+  await repoStore.selectFileDiff("src/other.ts",false);
+  await repoStore.selectFileDiff(FILE,false);
+  await until(()=>text().includes("new two"),"scoped diff drawn");
+  const bar=preview.querySelector("[data-scoped-bar]");
+  const pill=()=>bar.querySelector("[data-page-search]");
+  const input=()=>bar.querySelector("#gitpulse-page-search");
+  const status=()=>bar.querySelector("[data-find-status]")?.textContent.trim()??"";
+  await until(()=>pill()?.dataset.pageSearch==="find","the field becomes the diff's find");
+  check("as History's Diff section the pane draws no Find of its own, and the view bar's field is its find",()=>{
+   const own=preview.querySelectorAll("[data-find-trigger],[data-find-field]").length;
+   if(own===0&&pill().dataset.pageSearch==="find"&&input().placeholder==="Find in this diff…"&&!!bar.querySelector('[aria-label="Next match"]'))return true;
+   throw new Error(`own find controls ${own}, field ${pill()?.dataset.pageSearch}, placeholder ${input()?.placeholder}`);
+  });
+  input().focus();input().value="two";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>/ of /.test(status()),"match count in the field");
+  check("a query typed in the field reaches the diff: its match count shows in the field",()=>/^1 of [1-9]/.test(status()));
+  key(input(),{key:"Enter"});await tick();
+  check("Enter in the field steps the diff to its next match",()=>/^2 of /.test(status()));
+  key(input(),{key:"Enter",shiftKey:true});await tick();
+  check("Shift+Enter steps back",()=>/^1 of /.test(status()));
+  // A palette prefix is ordinary text here: a find for `#include` or `// TODO`
+  // must stay a find, with no palette results over the diff.
+  input().value="#two";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>status()==="no matches","literal prefixed query");
+  check("a query starting with a palette prefix stays the diff's find, searched literally",()=>pill().dataset.pageSearch==="find"&&input().value==="#two"&&status()==="no matches"&&!document.querySelector("[data-page-palette]"));
+  input().value="TWO";input().dispatchEvent(new Event("input",{bubbles:true}));
+  await until(()=>/ of /.test(status()),"case-insensitive match");
+  bar.querySelector('[title="Match case"]').click();
+  await until(()=>!/ of /.test(status()),"case-sensitive miss");
+  check("Aa in the field makes the diff's find case-sensitive: TWO no longer matches",()=>bar.querySelector('[title="Match case"]').getAttribute("aria-pressed")==="true"&&!/ of /.test(status()));
+  bar.querySelector('[title="Match case"]').click();await tick();
+  key(input(),{key:"Escape"});await tick();
+  check("Escape clears the diff's find and leaves the field, which stays its find",()=>input().value===""&&document.activeElement!==input()&&!bar.querySelector("[data-find-status]")&&pill().dataset.pageSearch==="find");
+ }
  // --- staging -------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
- check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Unstage Hunk").length===0);
- hunkButtons("Stage Hunk")[1].click();await until(()=>stagingCalls.length===1,"hunk stage");
+ check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Unstage hunk").length===0);
+ hunkButtons("Stage hunk")[1].click();await until(()=>stagingCalls.length===1,"hunk stage");
  check("Stage Hunk marks exactly that hunk's changed lines as the ones to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old forty,new forty");
  stagingCalls.length=0;
  await wait(400);
  await until(()=>lineBoxes().length>0,"line boxes");
  lineBoxes()[0].click();await tick();await wait();
- check("selecting a line shows the selection bar with only Stage Selected",()=>text().includes("1 line selected")&&buttons("Stage Selected").length===1&&buttons("Unstage Selected").length===0);
- buttons("Stage Selected")[0].click();await until(()=>stagingCalls.length===1,"selection stage");
+ check("selecting a line shows the selection bar with only Stage Selected",()=>text().includes("1 line selected")&&buttons("Stage selected").length===1&&buttons("Unstage selected").length===0);
+ buttons("Stage selected")[0].click();await until(()=>stagingCalls.length===1,"selection stage");
  check("Stage Selected marks only the selected line as the one to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old two");
  stagingCalls.length=0;
  await open({text:twoHunks(),truncated:false},{staged:true});
- check("a staged file offers Unstage Hunk and never Stage Hunk",()=>hunkButtons("Unstage Hunk").length===2&&hunkButtons("Stage Hunk").length===0);
+ check("a staged file offers Unstage Hunk and never Stage Hunk",()=>hunkButtons("Unstage hunk").length===2&&hunkButtons("Stage hunk").length===0);
  lineBoxes()[0].click();await tick();await wait();
- check("and its selection bar offers Unstage Selected only",()=>buttons("Unstage Selected").length===1&&buttons("Stage Selected").length===0);
+ check("and its selection bar offers Unstage Selected only",()=>buttons("Unstage selected").length===1&&buttons("Stage selected").length===0);
  // --- truncation ----------------------------------------------------------
  await open({text:twoHunks(),truncated:true,truncation_reason:"the fixture byte cap"});
  check("a backend-truncated diff says why, in the backend's words, and that staging is off",()=>text().includes("the fixture byte cap")&&/Staging is disabled/i.test(text()));
- check("and every Stage Hunk is disabled",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled));
- hunkButtons("Stage Hunk")[0].click();await wait(120);
+ check("and every Stage Hunk is disabled",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>b.disabled));
+ hunkButtons("Stage hunk")[0].click();await wait(120);
  check("a click on a disabled Stage Hunk stages nothing",()=>stagingCalls.length===0);
  lineBoxes()[0].click();await tick();await wait();
- check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage Selected").length===1&&buttons("Stage Selected")[0].disabled);
+ check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage selected").length===1&&buttons("Stage selected")[0].disabled);
  await open({text:twoHunks(),truncated:true});
  check("a truncation with no stated cause still discloses the prefix",()=>text().includes("is incomplete"));
  // --- copy patch ------------------------------------------------------------
@@ -216,20 +292,20 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  await open({text:twoHunks(),truncated:false});
  await until(()=>lineBoxes().length>0,"line boxes");
  lineBoxes()[0].click();await tick();await wait();
- check("with whitespace shown, a line can be selected and staged as before",()=>text().includes("1 line selected")&&!buttons("Stage Selected")[0].disabled);
+ check("with whitespace shown, a line can be selected and staged as before",()=>text().includes("1 line selected")&&!buttons("Stage selected")[0].disabled);
  wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===true,"whitespace on");await wait(400);
  check("turning Ignore whitespace on drops a selection made from the other view",()=>!text().includes("line selected"));
  const wsReason="Turn off Ignore whitespace to stage — this view hides whitespace-only changes";
- check("with it on, every Stage Hunk is disabled and says why",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled&&b.title===wsReason));
+ check("with it on, every Stage Hunk is disabled and says why",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>b.disabled&&b.title===wsReason));
  stagingCalls.length=0;
- hunkButtons("Stage Hunk")[0].click();await wait(150);
+ hunkButtons("Stage hunk")[0].click();await wait(150);
  check("a click on it stages nothing",()=>stagingCalls.length===0);
  check("and the line checkboxes are disabled with the same reason",()=>lineBoxes().length>0&&lineBoxes().every(b=>b.disabled&&b.title===wsReason));
  lineBoxes()[0].click();await tick();await wait();
- check("clicking one selects nothing, so no bar offers Stage Selected",()=>!text().includes("line selected")&&buttons("Stage Selected").length===0);
- check("Stage File is not touched by it",()=>buttons("Stage File").length===1&&!buttons("Stage File")[0].disabled);
+ check("clicking one selects nothing, so no bar offers Stage Selected",()=>!text().includes("line selected")&&buttons("Stage selected").length===0);
+ check("Stage File is not touched by it",()=>buttons("Stage file").length===1&&!buttons("Stage file")[0].disabled);
  wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===false,"whitespace off");await wait(400);
- check("turning it off gives hunk staging back",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>!b.disabled&&b.title===""));
+ check("turning it off gives hunk staging back",()=>hunkButtons("Stage hunk").length===2&&hunkButtons("Stage hunk").every(b=>!b.disabled&&b.title===""));
  lineBoxes()[0].click();await tick();await wait();
  check("and line selection",()=>text().includes("1 line selected"));
  // --- find ----------------------------------------------------------------
@@ -254,7 +330,7 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("Enter in the find box steps to the next match",()=>stepped.defaultPrevented&&/2 of 2/.test(text()));
  fire(findBox(),{key:"Enter",shiftKey:true});await tick();await wait();
  check("and Shift+Enter in it steps back",()=>/1 of 2/.test(text()));
- const onHunk=fire(hunkButtons("Stage Hunk")[0],{key:"Enter"});await tick();await wait();
+ const onHunk=fire(hunkButtons("Stage hunk")[0],{key:"Enter"});await tick();await wait();
  check("Enter on a focused Stage Hunk button with find open is the button's, not a search step",()=>!onHunk.defaultPrevented&&/1 of 2/.test(text()));
  const onClose=fire(preview.querySelector('button[aria-label="Close find"]'),{key:"Enter"});
  check("and so is Enter on Close find",()=>!onClose.defaultPrevented);
@@ -263,7 +339,7 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("Enter on a control outside the pane, such as a dialog's confirm button, is left alone",()=>!enterOutside.defaultPrevented&&/1 of 2/.test(text()));
  const escOutside=fire(outside,{key:"Escape"});await tick();await wait();
  check("Escape aimed at something outside the pane does not close find",()=>!escOutside.defaultPrevented&&Boolean(findBox()));
- const answered=hunkButtons("Stage Hunk")[0];
+ const answered=hunkButtons("Stage hunk")[0];
  const claim=event=>{if(event.key==="Escape")event.preventDefault();};
  answered.addEventListener("keydown",claim);
  fire(answered,{key:"Escape"});await tick();await wait();answered.removeEventListener("keydown",claim);
@@ -342,9 +418,9 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("a two-file diff is titled by its count, not by the file the reader last clicked",()=>titleButton().textContent.trim()==="2 files");
  check("and wears no single-language icon, because no one language describes it",()=>headerLogo()===null);
  check("each file's section header carries its own file's icon",()=>Boolean(preview.querySelector('[aria-label="Rust"]'))&&Boolean(preview.querySelector('[aria-label="JSON"]')));
- check("a Rust row is coloured as Rust even though the reader's selection is a .json",()=>/purple/.test(spanOf("fn")?.className??""));
+ check("a Rust row is coloured as Rust even though the reader's selection is a .json",()=>/text-syntax-keyword/.test(spanOf("fn")?.className??""));
  const jsonRow=[...preview.querySelectorAll(".gp-diff-text")].find(el=>el.textContent.includes('"b"'));
- check("and the .json row beneath it is not coloured with the Rust tokenizer",()=>Boolean(jsonRow)&&![...jsonRow.querySelectorAll("span")].some(el=>/purple/.test(el.className)));
+ check("and the .json row beneath it is not coloured with the Rust tokenizer",()=>Boolean(jsonRow)&&![...jsonRow.querySelectorAll("span")].some(el=>/text-syntax-keyword/.test(el.className)));
  // --- the gutter -----------------------------------------------------------
  const gutterCells=()=>[...preview.querySelectorAll(".gp-diff-text")].flatMap(code=>[...code.closest('[style*="height"]').querySelectorAll("span.tabular-nums")]).filter(el=>el.textContent.trim());
  await open({text:twoHunks(),truncated:false});
@@ -461,25 +537,25 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  blobs["gone.png"]={base64:"R09ORQ==",mime:"image/png",failNew:"gone from the working tree"};
  await repoStore.selectFileDiff("gone.png",false);await wait(500);
  check("an image whose current side cannot be read still shows the old picture, not 'No image'",()=>imgSrc("Before version of gone.png")==="data:image/png;base64,R09ORQ=="&&!text().includes("No image"));
- check("and the missing side is labelled with the reason it gave, not passed off as plain Deleted",()=>text().includes("No current version (deleted)")&&text().includes("could not be read: gone from the working tree"));
+ check("and the missing side is labelled with the reason it gave, not passed off as plain Deleted",()=>text().includes("No current version (deleted)")&&text().includes("couldn't be read: gone from the working tree"));
  blobs["new.png"]={base64:"TkVX",mime:"image/png",failOld:"no such path in HEAD"};
  await repoStore.selectFileDiff("new.png",false);await wait(500);
  check("an added image shows the new picture and says the previous version is absent",()=>imgSrc("After version of new.png")==="data:image/png;base64,TkVX"&&text().includes("No previous version (added)"));
  blobs["bad.png"]={failNew:"blob unreadable",failOld:"blob unreadable"};
  blobCalls.length=0;
  await repoStore.selectFileDiff("bad.png",false);await wait(500);
- check("an image neither side of which can be read says so and why, instead of 'Nothing to compare'",()=>text().includes("Could not read this image")&&text().includes("blob unreadable")&&!text().includes("No image"));
+ check("an image neither side of which can be read says so and why, instead of 'Nothing to compare'",()=>text().includes("Couldn't read this image")&&text().includes("blob unreadable")&&!text().includes("No image"));
  blobs["bad.png"]={base64:"RklYRUQ=",mime:"image/png"};
  blobCalls.length=0;
- buttons("Retry")[0].click();await wait(500);
- check("Retry reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Could not read this image"));
+ buttons("Try again")[0].click();await wait(500);
+ check("Try again reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Couldn't read this image"));
  // --- opening at the configured defaults -----------------------------------
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffWordWrap(true);interfaceStore.setDiffSyntaxHighlight(false);
  await open({text:twoHunks(),truncated:false});
- check("a pane opened under the saved preferences starts split, wrapped and uncoloured",()=>button("Split").getAttribute("aria-pressed")==="true"&&wrapToggle().getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ check("a pane opened under the saved preferences starts split, wrapped and uncoloured",()=>button("Split").getAttribute("aria-pressed")==="true"&&wrapToggle().getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax coloring"]').getAttribute("aria-pressed")==="false");
  button("Unified").click();await tick();await wait(100);
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffSyntaxHighlight(true);await tick();await wait(150);
- check("a preference changed under an open pane does not take the reader's toolbar choice away",()=>button("Unified").getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ check("a preference changed under an open pane does not take the reader's toolbar choice away",()=>button("Unified").getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax coloring"]').getAttribute("aria-pressed")==="false");
  interfaceStore.setDiffLayout("unified");interfaceStore.setDiffWordWrap(false);interfaceStore.setDiffSyntaxHighlight(true);
  await open({text:twoHunks(),truncated:false});
  // --- names ---------------------------------------------------------------

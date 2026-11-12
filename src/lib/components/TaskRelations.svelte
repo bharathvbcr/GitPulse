@@ -29,7 +29,6 @@
     MAX_TASK_LINKS,
     STATUS_LABELS,
     WorkbenchError,
-    explainError,
     getTask,
     listTasks,
     type ChecklistEntry,
@@ -47,6 +46,8 @@
   } from "../workbench/intake";
   import type { OpenTabRef } from "../workbench/openMembership";
   import { requestTaskOpen } from "../workbench/taskOpen";
+  import { describeFailure } from "../ui/copy/describeFailure";
+  import Checkbox from "./Checkbox.svelte";
 
   let {
     checklist = $bindable(),
@@ -85,6 +86,7 @@
     duplicate_of: "Duplicate of",
   };
 
+  const uid = $props.id();
   let entry = $state("");
   let kind = $state<LinkKind>("related");
   let query = $state("");
@@ -111,6 +113,12 @@
   let threadReplyText = $state<Record<string, string>>({});
   let askTargetAgent = $state<KickoffProvider>("claude");
   let askQuestionText = $state("");
+
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
 
   const done = $derived(checklist.filter((item) => item.done).length);
   const hasParent = $derived(links.some((link) => link.kind === "parent"));
@@ -231,7 +239,7 @@
         await refreshLinkedThreads(repositoryPath.trim(), task.id);
       }
     } catch (cause) {
-      collabError = explainError(cause);
+      collabError = failure("create", "the subtasks", cause);
     } finally {
       breakdownBusy = false;
     }
@@ -254,7 +262,7 @@
         await refreshLinkedThreads(repositoryPath.trim(), task.id);
       }
     } catch (cause) {
-      collabError = explainError(cause);
+      collabError = failure("split", "the acceptance criteria", cause);
     } finally {
       breakdownBusy = false;
     }
@@ -277,7 +285,7 @@
       });
       collabNotice = `Started ${provider} (${subtaskKickoffMode === "managed" ? "warm managed" : "worktree terminal"}) run ${run.id}.`;
     } catch (cause) {
-      collabError = explainError(cause);
+      collabError = failure("start", "the agent run", cause);
     } finally {
       breakdownBusy = false;
     }
@@ -300,7 +308,7 @@
       await refreshLinkedThreads(repositoryPath.trim(), taskId);
       collabNotice = `Replied on ${thread.thread_key}.`;
     } catch (cause) {
-      collabError = explainError(cause);
+      collabError = failure("send", "the reply", cause);
     } finally {
       breakdownBusy = false;
     }
@@ -324,7 +332,7 @@
       await refreshLinkedThreads(repositoryPath.trim(), task.id);
       collabNotice = `Posted handoff ask to ${askTargetAgent}.`;
     } catch (cause) {
-      collabError = explainError(cause);
+      collabError = failure("post", "the handoff ask", cause);
     } finally {
       breakdownBusy = false;
     }
@@ -364,7 +372,7 @@
       const page = await listTasks({ kind: "global" }, null, text, undefined, 8);
       results = page.items.filter((card) => card.id !== taskId);
     } catch (cause) {
-      error = explainError(cause);
+      error = failure("search", "tasks", cause);
     } finally {
       searching = false;
     }
@@ -396,7 +404,7 @@
 <section class="relations" aria-label="Checklist and linked tasks" data-testid="task-relations">
   <div class="block">
     <div class="head">
-      <span>Checklist</span>
+      <span class="gp-label">Checklist</span>
       {#if checklist.length}
         <span class="count" data-testid="task-checklist-count">{done} of {checklist.length} done</span>
       {/if}
@@ -405,18 +413,18 @@
       <ul data-testid="task-checklist">
         {#each checklist as item, index (index)}
           <li>
-            <label>
-              <input
-                type="checkbox"
-                checked={item.done}
-                {disabled}
-                onchange={(e) => toggle(index, e.currentTarget.checked)}
-              />
-              <span class:done={item.done}>{item.text}</span>
-            </label>
+            <Checkbox
+              id="task-checklist-{uid}-{index}"
+              ariaLabel={item.text}
+              checked={item.done}
+              {disabled}
+              onchange={(next) => toggle(index, next)}
+            />
+            <label class="item-text" for="task-checklist-{uid}-{index}" class:done={item.done}>{item.text}</label>
             <button
               type="button"
-              class="remove"
+              class="gp-icon-btn"
+              data-size="sm"
               {disabled}
               aria-label="Remove checklist item: {item.text}"
               onclick={() => removeEntry(index)}
@@ -455,7 +463,7 @@
 
   <div class="block">
     <div class="head">
-      <span>Linked tasks</span>
+      <span class="gp-label">Linked tasks</span>
       {#if links.length}<span class="count">{links.length}</span>{/if}
     </div>
     {#if links.length}
@@ -470,7 +478,8 @@
             </span>
             <button
               type="button"
-              class="remove"
+              class="gp-icon-btn"
+              data-size="sm"
               {disabled}
               aria-label="Remove link to {titles[entry_.item_id] ?? entry_.item_id}"
               onclick={() => unlink(index)}
@@ -517,14 +526,14 @@
       <ul class="results" data-testid="task-link-results">
         {#each results as card (card.id)}
           <li>
-            <button type="button" class="pick" {disabled} onclick={() => link(card)}>
+            <button type="button" class="gp-row pick" {disabled} onclick={() => link(card)}>
               {card.title}
             </button>
           </li>
         {/each}
       </ul>
     {/if}
-    {#if error}<p class="error" role="alert">{error}</p>{/if}
+    {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
   </div>
 
   <!-- Subtask Breakdown & Direct Multi-Agent Fan-Out (isolated from parent draft dirty tracking) -->
@@ -535,7 +544,7 @@
     onchange={(e) => e.stopPropagation()}
   >
     <div class="head">
-      <span class="head-with-icon"><Layers size={12} /> Break down into subtasks</span>
+      <span class="head-with-icon gp-label"><Layers size={12} /> Break down into subtasks</span>
       {#if childSubtasks.length > 0}
         <span class="count" data-testid="task-subtasks-rollup">
           {formatSubtaskProgress(childRollup)}
@@ -548,7 +557,7 @@
     {:else}
       {#if childSubtasks.length > 0}
         <div class="kickoff-mode-row">
-          <span class="kind">Subtask launch mode</span>
+          <span class="kind">Subtask run mode</span>
           <select
             class="gp-select compact-select"
             aria-label="Subtask kickoff mode"
@@ -563,10 +572,12 @@
           {#each childSubtasks as sub (sub.id)}
             <li class="subtask-card">
               <div class="subtask-row-top">
-                <span class="status-tag">{STATUS_LABELS[sub.status] ?? sub.status}</span>
+                <span class="gp-chip" data-tone="neutral">{STATUS_LABELS[sub.status] ?? sub.status}</span>
                 <button
                   type="button"
-                  class="subtask-open"
+                  class="gp-btn subtask-title"
+                  data-variant="ghost"
+                  data-size="inline"
                   onclick={() => requestTaskOpen(sub.id)}
                   title="Open subtask {sub.title}"
                 >
@@ -577,7 +588,8 @@
                 {#each KICKOFF_PROVIDERS as provider (provider.id)}
                   <button
                     type="button"
-                    class="gp-btn kickoff-pill"
+                    class="gp-btn"
+                    data-size="sm"
                     data-testid="subtask-kickoff-{provider.id}-{sub.id}"
                     disabled={disabled || breakdownBusy}
                     onclick={() => void handleKickOffSubtask(sub.id, provider.id)}
@@ -593,7 +605,7 @@
       {/if}
 
       <textarea
-        class="gp-field breakdown-area"
+        class="gp-field-multi breakdown-area"
         rows="2"
         data-testid="task-breakdown-input"
         aria-label="Break down into subtasks"
@@ -633,7 +645,7 @@
       onchange={(e) => e.stopPropagation()}
     >
       <div class="head">
-        <span class="head-with-icon"><MessageSquare size={12} /> Linked Inbox &amp; Agent Collaboration</span>
+        <span class="head-with-icon gp-label"><MessageSquare size={12} /> Linked inbox and agent collaboration</span>
         {#if linkedThreads.length > 0}
           <span class="count">{linkedThreads.length} {linkedThreads.length === 1 ? "thread" : "threads"}</span>
         {/if}
@@ -644,7 +656,7 @@
           {#each linkedThreads as thread (thread.thread_key)}
             <li class="linked-thread-item">
               <div class="subtask-row-top">
-                <span class="status-tag">{thread.status}</span>
+                <span class="gp-chip" data-tone="neutral">{thread.status}</span>
                 <span class="kind">{thread.from_agent}</span>
                 <span class="title">{parseAskSummary(thread.latest_msg.body)}</span>
               </div>
@@ -724,7 +736,7 @@
       {/if}
 
       {#if collabNotice}<p class="hint" role="status">{collabNotice}</p>{/if}
-      {#if collabError}<p class="error" role="alert">{collabError}</p>{/if}
+      {#if collabError}<div class="gp-notice" data-tone="danger" role="alert">{collabError}</div>{/if}
     </div>
   {/if}
 </section>
@@ -732,31 +744,24 @@
 <style>
   .relations{display:flex;flex-direction:column;gap:12px;margin-bottom:13px}
   .block{display:flex;flex-direction:column;gap:6px}
-  .collab-block{padding-top:8px;border-top:1px solid rgb(var(--c-border) / 0.45)}
+  .collab-block{padding-top:12px}
   .head{display:flex;align-items:baseline;justify-content:space-between;font-weight:500}
   .head-with-icon{display:inline-flex;align-items:center;gap:5px}
-  .count,.hint{font-weight:400;color:rgb(var(--c-text-muted));font-size:11px;margin:0}
+  .count,.hint{font-weight:400;color:rgb(var(--c-text-muted));font-size:var(--text-meta);margin:0}
   ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:180px;overflow-y:auto}
-  li{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;border:1px solid rgb(var(--c-border) / 0.5);font-size:11px}
+  li{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
   .subtask-card,.linked-thread-item{flex-direction:column;align-items:stretch;gap:6px;padding:6px 8px}
   .subtask-row-top{display:flex;align-items:center;gap:6px;min-width:0}
-  .status-tag{font-size:10px;padding:1px 6px;border-radius:999px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted));flex-shrink:0}
-  .subtask-open{background:transparent;border:0;cursor:pointer;color:inherit;text-align:left;font:inherit;flex:1;min-width:0;padding:0;overflow-wrap:anywhere}
-  .subtask-open:hover{text-decoration:underline}
+  .subtask-title{flex:1;min-width:0;color:inherit}
   .kickoff-mode-row,.kickoff-pills,.breakdown-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-  .compact-select{width:auto;font-size:11px;padding:4px 8px}
-  .kickoff-pill{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 7px}
-  .breakdown-area{font-size:11px;padding:6px 8px}
-  li label{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
-  li label span,.title{overflow-wrap:anywhere;flex:1;min-width:0}
+  .compact-select{width:auto}
+  .breakdown-area{font-size:var(--text-meta)}
+  .item-text,.title{overflow-wrap:anywhere;flex:1;min-width:0}
   .done{text-decoration:line-through;color:rgb(var(--c-text-muted))}
   .gone{color:rgb(var(--c-text-muted));font-style:italic}
   .kind{color:rgb(var(--c-text-muted));flex-shrink:0}
-  .remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;color:rgb(var(--c-text-muted));border-radius:4px}
-  .remove:hover{color:rgb(var(--c-text))}
   .add{display:flex;gap:6px;align-items:center}
-  .add input{flex:1;font-size:11px;padding:5px 8px}
-  .add button,.add select{flex-shrink:0;font-size:11px;padding:5px 10px}
-  .results .pick{background:transparent;border:0;cursor:pointer;color:inherit;text-align:left;width:100%;font:inherit}
-  .error{color:#dc6565;margin:0;font-size:11px}
+  .add input{flex:1}
+  .add button,.add select{flex-shrink:0}
+  .results .pick{cursor:pointer;text-align:left;width:100%}
 </style>

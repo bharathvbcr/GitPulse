@@ -96,7 +96,7 @@
 
 <div>
   <div class="flex items-center gap-2">
-    <label class="text-textPrimary text-[11px] flex-1 min-w-0" for={`gp-${testid}`}>
+    <label class="text-textPrimary text-meta flex-1 min-w-0" for={`gp-${testid}`}>
       {label}
     </label>
     <input
@@ -106,18 +106,18 @@
       min="1"
       {max}
       step="1"
-      class="gp-input text-[11px] py-0.5! w-16 text-right"
+      class="gp-field text-meta w-16 text-right" data-size="sm"
       data-testid={testid}
       disabled={busy}
       value={current}
       onchange={(event) => void choose(event.currentTarget)}
     />
   </div>
-  <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid={`${testid}-note`}>
+  <p class="text-textMuted text-micro leading-snug mt-1" data-testid={`${testid}-note`}>
     {@render children()}
   </p>
   {#if error}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
+    <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
       <span data-testid={`${testid}-error`}>{error}</span>
     </div>

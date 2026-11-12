@@ -1,0 +1,30 @@
+/* "Header button labels: Icons only" (Settings -> Layout).
+
+   The header shows words from 1100 px of its own width: the title row and the
+   view bar are `@container`s, and each label is `hidden @min-[1100px]:inline`.
+   Icons only holds the narrow rendering at every width. The label spans are
+   hidden, and the stand-ins the narrow rendering swaps in (the count badge on a
+   surface icon, the "?" for an unknown agent state) stay. The selectors read the
+   tier classes themselves, so moving a label to another tier moves this with it. */
+html[data-header-labels="icons"] .gp-repo-tabs [class*="@min-[1100px]:inline"] {
+  display: none;
+}
+
+html[data-header-labels="icons"] .gp-repo-tabs [class*="@min-[1100px]:hidden"] {
+  display: inline;
+}
+
+/* Workspace actions (Fetch all, the status chip) hide their words by viewport
+   width, not container width: `max-[1099px]:sr-only`. Same override, same
+   screen-reader-only styling, so the words stay in the accessibility tree. */
+html[data-header-labels="icons"] .gp-repo-tabs [class*="max-[1099px]:sr-only"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border-width: 0;
+}

@@ -40,7 +40,9 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { reportPanelError } from "../diagnostics/report";
   import { timestampFormat } from "../ui/timestampFormat";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
 
   /**
    * The stacked-branch page.
@@ -143,7 +145,7 @@
    */
   async function checkout(branch: string) {
     const outcome = await repoStore.checkoutBranch(branch);
-    reportFailure(outcome, `Could not check out ${branch}`);
+    reportFailure(outcome, `Couldn't check out ${branch}`);
   }
 
   async function restack(node: StackedBranchNode) {
@@ -290,12 +292,12 @@
       <h2 class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
         <Layers size={16} class="text-accent" />
         Stack
-        <span class="text-textMuted font-normal text-[11px]">
+        <span class="text-textMuted font-normal text-meta">
           which branch is built on which, and what an update would move
         </span>
       </h2>
       {#if stackBreadcrumb && stackBreadcrumb.breadcrumb_chain.length > 1}
-        <div class="mt-1.5 flex items-center gap-1.5 flex-wrap font-mono text-[11px] text-textMuted">
+        <div class="mt-1.5 flex items-center gap-1.5 flex-wrap font-mono text-meta text-textMuted">
           {#each stackBreadcrumb.breadcrumb_chain as segment, i (`${i}:${segment}`)}
             {#if i > 0}
               <span aria-hidden="true">›</span>
@@ -314,36 +316,36 @@
   </div>
 
   {#if restackProgress}
-    <div class="mb-3 max-w-3xl flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 p-2.5 text-[11px] text-textPrimary">
+    <div class="gp-notice mb-3! max-w-3xl items-center text-meta" data-tone="info" role="status">
       <RefreshCw size={13} class="animate-spin shrink-0 text-accent" />
       <span>Updating stack — {restackProgress}</span>
     </div>
   {/if}
 
   {#if restackError}
-    <div role="alert" class="mb-3 max-w-3xl p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300">{restackError}</div>
+    <div role="alert" class="gp-notice mb-3! max-w-3xl" data-tone="danger">{restackError}</div>
   {/if}
 
   {#if loadError}
-    <div role="alert" class="mb-3 max-w-3xl p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300 flex items-center justify-between gap-3">
-      <span class="min-w-0 truncate" title={loadError}>Failed to load stack: {loadError}</span>
-      <button onclick={() => loadStack()} disabled={isLoading || restackingKey !== null} class="gp-btn shrink-0 py-1! px-2.5! text-[11px]!">
+    <div role="alert" class="gp-notice mb-3! max-w-3xl items-center justify-between gap-3" data-tone="danger">
+      <span class="min-w-0 truncate" title={loadError}>{describeFailure({ verb: "load", object: "the stack" }, loadError).headline} {loadError}</span>
+      <button onclick={() => loadStack()} disabled={isLoading || restackingKey !== null} class="gp-btn shrink-0" data-size="sm">
         <RefreshCw size={12} class={isLoading ? "animate-spin" : ""} />
-        <span>Retry</span>
+        <span>Try again</span>
       </button>
     </div>
   {/if}
 
   {#if unresolvedNotice}
-    <div data-testid="stack-unresolved" class="mb-3 max-w-3xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300">
-      <CircleAlert size={14} class="shrink-0 mt-px" />
+    <div data-testid="stack-unresolved" class="gp-notice mb-3! max-w-3xl text-meta" data-tone="warn">
+      <CircleAlert size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
       <span>{unresolvedNotice}</span>
     </div>
   {/if}
 
   {#if behindRows.length > 0}
-    <div class="mb-3 max-w-3xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300">
-      <CircleAlert size={14} class="shrink-0 mt-px" />
+    <div class="gp-notice mb-3! max-w-3xl text-meta" data-tone="warn">
+      <CircleAlert size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
       <span>
         {behindRows.length} branch{behindRows.length === 1 ? "" : "es"} here {behindRows.length === 1
           ? "is"
@@ -366,8 +368,8 @@
               aria-busy={restackingKey === node.branch_name}
               data-branch={node.branch_name}
               data-depth={row.depth}
-              class="relative p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40 {isCurrent
-                ? 'border-accent/50 ring-1 ring-accent/30'
+              class="gp-card relative p-3 flex items-start justify-between gap-3 {isCurrent
+                ? 'ring-1 ring-accent/50'
                 : ''}"
             >
               <!-- The elbow into the parent's row above. Drawn on the card,
@@ -375,26 +377,27 @@
               {#if row.depth > 0}
                 <span
                   aria-hidden="true"
-                  class="absolute border-l border-b border-border/70 rounded-bl-md"
-                  style="left: -12px; top: -8px; bottom: 50%; width: 10px;"
+                  class="absolute rounded-bl-md"
+                  style="left: -12px; top: -8px; bottom: 50%; width: 10px; box-shadow: inset 1px -1px 0 0 var(--gp-edge);"
                 ></span>
               {/if}
               <div class="flex items-start gap-2.5 min-w-0">
                 <GitBranch size={15} class="mt-0.5 shrink-0 {isCurrent ? 'text-accent' : 'text-textMuted'}" />
                 <div class="min-w-0">
-                  <div class="font-medium text-textPrimary text-[13px] flex items-center gap-2 flex-wrap">
+                  <div class="font-medium text-textPrimary text-sm flex items-center gap-2 flex-wrap">
                     <span class="truncate">{node.branch_name}</span>
                     {#if isCurrent}
-                      <span class="text-[10px] bg-accent/20 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
+                      <span class="gp-chip font-mono" data-tone="accent">HEAD</span>
                     {/if}
                     {#if isRoot}
-                      <span class="text-[10px] bg-border/40 text-textMuted px-1.5 py-0.5 rounded-full font-mono">ROOT</span>
+                      <span class="gp-chip font-mono" data-tone="neutral">ROOT</span>
                     {/if}
                     <!-- A base that has moved is the reason to press the
                          button, so it is a chip and not a footnote. -->
                     {#if facts && facts.behindBase > 0}
                       <span
-                        class="text-[10px] px-1.5 py-0.5 rounded-full font-mono bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                        class="gp-chip font-mono"
+                        data-tone="warn"
                         title="{facts.behindBase} commit{facts.behindBase === 1 ? '' : 's'} on {facts.comparedTo ?? 'the base'} that this branch does not have"
                       >
                         {facts.behindBase} behind {facts.comparedTo ?? "base"}
@@ -405,20 +408,20 @@
                          branch looks like. -->
                     {#if facts?.upstream}
                       {#if facts.upstream.gone}
-                        <span class="text-[10px] px-1.5 py-0.5 rounded-full font-mono bg-rose-500/10 text-rose-700 dark:text-rose-300" title="{facts.upstream.name} no longer exists on the remote">
+                        <span class="gp-chip font-mono" data-tone="danger" title="{facts.upstream.name} no longer exists on the remote">
                           upstream gone
                         </span>
                       {:else if facts.upstream.ahead > 0 || facts.upstream.behind > 0}
-                        <span class="text-[10px] font-mono text-textMuted inline-flex items-center gap-0.5" title="Against {facts.upstream.name}">
+                        <span class="text-micro font-mono text-textMuted inline-flex items-center gap-0.5" title="Against {facts.upstream.name}">
                           {#if facts.upstream.ahead > 0}<ArrowUp size={10} />{facts.upstream.ahead}{/if}
                           {#if facts.upstream.behind > 0}<ArrowDown size={10} />{facts.upstream.behind}{/if}
                         </span>
                       {/if}
                     {:else if facts}
-                      <span class="text-[10px] font-mono text-textMuted" title="No tracking branch is configured">untracked</span>
+                      <span class="text-micro font-mono text-textMuted" title="No tracking branch is configured">untracked</span>
                     {/if}
                   </div>
-                  <div class="mt-0.5 text-textMuted text-[11px] font-mono flex flex-wrap items-center gap-x-2">
+                  <div class="mt-0.5 text-textMuted text-meta font-mono flex flex-wrap items-center gap-x-2">
                     <span>
                       {node.parent_branch_name
                         ? `on ${node.parent_branch_name} +${node.commit_count_ahead_of_parent}`
@@ -444,7 +447,8 @@
                   <button
                     onclick={() => restack(node)}
                     disabled={restackingKey !== null}
-                    class="gp-btn py-1! px-2.5! text-[11px]!"
+                    class="gp-btn"
+                    data-size="sm"
                     title="Rebase {node.branch_name} onto {node.parent_branch_name}{plan.length > 1
                       ? `, then the ${plan.length - 1} branch${plan.length === 2 ? '' : 'es'} stacked above it`
                       : ''}"
@@ -467,7 +471,8 @@
                   <button
                     onclick={() => void checkout(node.branch_name)}
                     disabled={restackingKey !== null}
-                    class="gp-btn py-1! px-2.5! text-[11px]!"
+                    class="gp-btn"
+                    data-size="sm"
                   >
                     Checkout
                   </button>
@@ -481,7 +486,7 @@
       <!-- Said on every populated stack, not only on the empty one: a reader
            looking at three branches has no way to tell that a fourth dropped
            out of the tree when its parent moved. -->
-      <p class="mt-3 flex items-start gap-1.5 text-[10px] leading-relaxed text-textMuted">
+      <p class="mt-3 flex items-start gap-1.5 text-micro leading-relaxed text-textMuted">
         <Info size={11} class="mt-px shrink-0" />
         <span>
           A branch appears here as a child only while it sits on its parent's current tip. Git records no
@@ -491,10 +496,7 @@
       </p>
     </div>
   {:else if isLoading}
-    <div class="space-y-3 max-w-3xl" aria-hidden="true">
-      <div class="p-3.5 bg-surface border border-border/70 rounded-2xl animate-pulse h-16"></div>
-      <div class="p-3.5 bg-surface border border-border/70 rounded-2xl animate-pulse h-16 w-11/12"></div>
-    </div>
+    <Skeleton variant="card" count={2} class="max-w-3xl" />
     <p class="sr-only">Loading stack hierarchy…</p>
   {:else if !loadError}
     <div class="flex-1 flex">
@@ -508,10 +510,10 @@
 
   {#if unplaced.length > 0}
     <div class="mt-4 max-w-3xl">
-      <h3 class="text-[11px] uppercase tracking-wider text-textMuted mb-1.5">
+      <h3 class="gp-label mb-1.5">
         On no stack ({unplaced.length})
       </h3>
-      <p class="text-[10px] text-textMuted mb-2">
+      <p class="text-micro text-textMuted mb-2">
         These local branches met no other branch's tip on their first-parent walk — they fork off
         {stackDefaultBranch ?? "the default branch"} directly, or below the history this scan loaded.
       </p>
@@ -519,7 +521,7 @@
         {#each unplaced as name, i (`${i}:${name}`)}
           <button
             type="button"
-            class="gp-pill text-[10px]! font-mono hover:text-accent"
+            class="gp-chip cursor-pointer font-mono hover:text-accent"
             disabled={restackingKey !== null}
             onclick={() => void checkout(name)}
             title="Checkout {name}"

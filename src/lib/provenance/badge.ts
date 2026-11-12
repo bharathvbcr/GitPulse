@@ -90,7 +90,7 @@ function sessionNote(f: ProvenanceFreshness): string {
       // (another Claude config directory, another tool) leaves no command row.
       return "; no ingested agent session's git command matches it (sessions GitPulse does not ingest are not seen)";
     default:
-      return `; which session made it could not be determined (${basis.replace(/_/g, " ")})`;
+      return `; which session made it couldn't be determined (${basis.replace(/_/g, " ")})`;
   }
 }
 
@@ -111,7 +111,7 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
       label: "unknown",
       detail:
         f.unmeasured_reason ||
-        "this commit's provenance notes could not be read, so nothing is known about it",
+        "this commit's provenance notes couldn't be read, so nothing is known about it",
     };
   }
 
@@ -151,7 +151,7 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
         tone: "warn",
         label: "verified · age unknown",
         detail:
-          `verified${verifiedBy(f)}, but how far the base has moved since could not be ` +
+          `verified${verifiedBy(f)}, but how far the base has moved since couldn't be ` +
           `measured: ${f.unmeasured_reason || "no reason was given"}`,
       };
     }

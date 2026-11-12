@@ -208,11 +208,11 @@
 <style>
   .send-to-agent{display:flex;flex-direction:column;gap:8px;flex-basis:100%;min-width:0}
   .open{align-self:flex-start}
-  .panel{display:flex;flex-direction:column;gap:8px;padding:12px;font-size:0.75rem}
+  .panel{display:flex;flex-direction:column;gap:8px;padding:12px;font-size:var(--text-xs)}
   .note{display:flex;flex-direction:column;gap:4px;color:rgb(var(--c-text-muted))}
   textarea{min-width:0;width:100%;font:inherit}
-  .caption{margin:0;color:rgb(var(--c-text-muted));font-size:0.6875rem}
-  .text{margin:0;padding:8px;border-radius:var(--gp-r-sm);background:var(--mac-fill-bg,rgb(var(--c-bg)));color:rgb(var(--c-text));font:0.6875rem ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
+  .caption{margin:0;color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
+  .text{margin:0;padding:8px;border-radius:var(--gp-r-sm);background:var(--mac-fill-bg,rgb(var(--c-bg)));color:rgb(var(--c-text));font:var(--text-meta) ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
   .route{display:flex;flex-direction:column;gap:2px;line-height:1.45;color:rgb(var(--c-text))}
   .route strong{font-weight:600}
   .route span{overflow-wrap:anywhere}

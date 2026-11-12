@@ -59,7 +59,7 @@
 
 {#if loading}
   <div
-    class="flex items-center gap-1.5 rounded-lg border border-border/50 bg-background/50 px-2.5 py-1.5 text-[11px] text-textMuted"
+    class="flex items-center gap-1.5 rounded-lg border border-edgeSoft bg-background/50 px-2.5 py-1.5 text-meta text-textMuted"
   >
     <Loader2 size={12} class="animate-spin" />
     <span>Measuring what this change reaches…</span>
@@ -67,8 +67,8 @@
 {:else if blast}
   <div
     class="overflow-hidden rounded-lg border bg-background/50 {degraded
-      ? 'border-amber-500/40'
-      : 'border-border/60'}"
+      ? 'border-warn'
+      : 'border-edge'}"
   >
     <!-- The summary row is the whole panel for most readers. -->
     <button
@@ -80,20 +80,20 @@
     >
       <span
         class="size-1.5 shrink-0 rounded-full {degraded
-          ? 'bg-amber-500'
+          ? 'bg-warn'
           : glance.confidence === 'exact'
-            ? 'bg-emerald-500'
+            ? 'bg-ok'
             : 'bg-accent/70'}"
         aria-hidden="true"
       ></span>
-      <span class="min-w-0 flex-1 truncate text-[11px] text-textPrimary">
+      <span class="min-w-0 flex-1 truncate text-meta text-textPrimary">
         {glance.headline}
       </span>
       {#if glance.qualified}
         <span
-          class="shrink-0 rounded-full border px-1.5 text-[9px] uppercase tracking-wide {degraded
-            ? 'border-amber-500/40 text-amber-600 dark:text-amber-400'
-            : 'border-border/70 text-textMuted'}"
+          class="shrink-0 rounded-full border px-1.5 text-micro {degraded
+            ? 'border-warn text-warn'
+            : 'border-edge text-textMuted'}"
         >
           {confidenceLabel(glance.confidence)}
         </span>
@@ -106,11 +106,11 @@
     </button>
 
     {#if open}
-      <div class="flex flex-col gap-2 border-t border-border/50 px-2.5 py-2">
+      <div class="flex flex-col gap-2 bg-surface/40 px-2.5 py-2">
         <div class="flex items-baseline justify-between gap-2">
-          <span class="text-[9px] font-bold uppercase tracking-wider text-textMuted">{title}</span>
+          <span class="gp-label">{title}</span>
           {#if blast.available}
-            <span class="font-mono text-[10px] tabular-nums text-textMuted">
+            <span class="font-mono text-micro tabular-nums text-textMuted">
               {blast.total_impacted.toLocaleString()} impacted
             </span>
           {/if}
@@ -120,7 +120,7 @@
           {#if blast.layers.length > 0}
             <ul class="flex flex-col gap-1">
               {#each blast.layers as layer (layer.depth)}
-                <li class="flex items-baseline gap-2 text-[10px]">
+                <li class="flex items-baseline gap-2 text-micro">
                   <span class="w-9 shrink-0 font-mono text-textMuted">hop {layer.depth}</span>
                   <span class="w-14 shrink-0 font-mono tabular-nums text-textSecondary">
                     {layer.node_count.toLocaleString()}
@@ -133,7 +133,7 @@
                       <span class="min-w-0 truncate" title={label.path ?? node}>
                         <span class="font-mono text-textSecondary">{label.symbol}</span>
                         {#if label.file}
-                          <span class="text-textMuted/70">{label.file}</span>
+                          <span class="text-faint">{label.file}</span>
                         {/if}
                       </span>
                     {/each}
@@ -155,14 +155,14 @@
               {/each}
             </ul>
           {:else}
-            <p class="text-[10px] text-textMuted">No inbound layers for these seeds.</p>
+            <p class="text-micro text-textMuted">No inbound layers for these seeds.</p>
           {/if}
         {/if}
 
         {#if glance.caveats.length > 0}
-          <ul class="flex flex-col gap-0.5 border-t border-border/40 pt-1.5">
+          <ul class="flex flex-col gap-0.5 pt-1.5">
             {#each glance.caveats as caveat (caveat)}
-              <li class="flex gap-1.5 text-[10px] {degraded ? 'text-amber-600 dark:text-amber-400' : 'text-textMuted'}">
+              <li class="flex gap-1.5 text-micro {degraded ? 'text-warn' : 'text-textMuted'}">
                 <span aria-hidden="true">·</span>
                 <span class="min-w-0">{caveat}</span>
               </li>
@@ -171,7 +171,7 @@
         {/if}
 
         {#if blast.unmatched_targets.length > 0}
-          <p class="text-[10px] text-textMuted" title={boundedJoin(blast.unmatched_targets, 12)}>
+          <p class="text-micro text-textMuted" title={boundedJoin(blast.unmatched_targets, 12)}>
             Not in the index: {blast.unmatched_targets.slice(0, 4).join(", ")}{blast
               .unmatched_targets.length > 4
               ? "…"
@@ -181,7 +181,7 @@
 
         {#if cancelledSeeds.length > 0}
           <p
-            class="text-[10px] text-amber-600 dark:text-amber-400"
+            class="text-micro text-warn"
             title={boundedJoin(cancelledSeeds.map((s) => s.seed), 12)}
           >
             {cancelledSeeds.length} file(s) cancelled before the walk finished — the hops above are a
@@ -191,7 +191,7 @@
 
         {#if refusedSeeds.length > 0}
           <p
-            class="text-[10px] text-textMuted"
+            class="text-micro text-textMuted"
             title={boundedJoin(refusedSeeds.map((s) => `${s.seed}: ${s.reason}`), 8)}
           >
             {refusedSeeds.length} file(s) refused layered impact
@@ -202,14 +202,14 @@
              who wants to know exactly what was missed can still find out. -->
         {#if glance.detail}
           {@const detailTitle = tooltipWalkIncomplete([blast.walk_incomplete, blast.reason])}
-          <details class="border-t border-border/40 pt-1.5">
+          <details class="pt-1.5">
             <summary
-              class="cursor-pointer text-[10px] text-textMuted hover:text-textPrimary"
+              class="cursor-pointer text-micro text-textMuted hover:text-textPrimary"
               title={detailTitle}
             >
               What the engine reported
             </summary>
-            <p class="mt-1 font-mono text-[10px] leading-relaxed text-textMuted">
+            <p class="mt-1 font-mono text-micro leading-relaxed text-textMuted">
               {glance.detail}
             </p>
           </details>

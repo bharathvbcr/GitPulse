@@ -740,7 +740,7 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 | **Reopen Closed Tab** | `⌘ ⇧ Y` | `Ctrl+Shift+Y` |
 | **Next Repository Tab** | `Ctrl Tab` | `Ctrl+Tab` |
 | **Previous Repository Tab** | `Ctrl ⇧ Tab` | `Ctrl+Shift+Tab` |
-| **Jump to Tab 1–9** | `Ctrl ⌥ 1–9` | `Ctrl+Alt+1–9` |
+| **Jump to Tab 1–9** (9 is the last) | `⌘ 1–9` | `Ctrl+1–9` |
 | **Open a stack's checkout switcher** (focused stack) | `↓` | `↓` |
 | **Unfold / fold a worktree stack** (focused stack) | `+` / `-` | `+` / `-` |
 | **Preferences / Settings…** | `⌘ ,` | `Ctrl+,` |
@@ -754,9 +754,9 @@ stop per checkout.
 | View | macOS | Windows / Linux |
 | --- | --- | --- |
 | **Work** | `F10` | `F10` |
-| **Code** | `⌘ 1` | `Ctrl+1` |
-| **History** | `⌘ 2` | `Ctrl+2` |
-| **Insights** | `⌘ 3` | `Ctrl+3` |
+| **Code** | `⌥ ⌘ 1` | `Ctrl+Shift+1` |
+| **History** | `⌥ ⌘ 2` | `Ctrl+Shift+2` |
+| **Insights** | `⌥ ⌘ 3` | `Ctrl+Shift+3` |
 | **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 

@@ -94,6 +94,8 @@ export interface NativeMenuHandlers {
   nextRepoTab: () => void;
   prevRepoTab: () => void;
   reopenRepoTab: () => void;
+  /** Digit 1–8 selects that repository tab; 9 selects the last one. */
+  jumpRepoTab: (digit: number) => void;
   openError: (message: string) => void;
   setDropActive?: (active: boolean) => void;
 }
@@ -255,6 +257,35 @@ export function dispatchNativeMenu(
       return true;
     case "reopen-repo-tab":
       handlers.reopenRepoTab();
+      return true;
+    // One case per digit, spelled out: `view-menu-contract` scans this file for
+    // `case "<id>":` to prove no native menu id is clickable without a handler.
+    case "repo-tab-1":
+      handlers.jumpRepoTab(1);
+      return true;
+    case "repo-tab-2":
+      handlers.jumpRepoTab(2);
+      return true;
+    case "repo-tab-3":
+      handlers.jumpRepoTab(3);
+      return true;
+    case "repo-tab-4":
+      handlers.jumpRepoTab(4);
+      return true;
+    case "repo-tab-5":
+      handlers.jumpRepoTab(5);
+      return true;
+    case "repo-tab-6":
+      handlers.jumpRepoTab(6);
+      return true;
+    case "repo-tab-7":
+      handlers.jumpRepoTab(7);
+      return true;
+    case "repo-tab-8":
+      handlers.jumpRepoTab(8);
+      return true;
+    case "repo-tab-9":
+      handlers.jumpRepoTab(9);
       return true;
     default: {
       // Match the complete destination against the live registry. Unknown or

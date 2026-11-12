@@ -28,7 +28,7 @@ describe("DevMap diagnostic export", () => {
     expect(text).toContain("store locked");
     expect(text).toContain("last failure");
     expect(text).toContain("older entries omitted");
-    expect(text).toContain("1 DevMap entries in 2 sampled backend entries");
+    expect(text).toContain("1 code map entries in 2 sampled backend entries");
     expect(text).not.toContain("unrelated");
     expect(invoke).toHaveBeenCalledWith("cmd_diagnostic_log_tail", { maxLines: 500 });
   });
@@ -73,7 +73,7 @@ describe("DevMap diagnostic export", () => {
     expect(text).not.toContain(secret);
     expect(text).toContain("section truncated");
     expect(text).toContain("final failure");
-    expect(text).toContain("No DevMap entries in this sampled tail");
+    expect(text).toContain("No code map entries in this sampled tail");
     expect(text.length).toBeLessThan(200_000);
   });
 

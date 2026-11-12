@@ -230,12 +230,12 @@ export function transcriptNotices(found: FoundTranscript): string[] {
   }
   if (found.gapMarkers > 0) {
     notices.push(
-      `${found.gapMarkers} stretch${found.gapMarkers === 1 ? "" : "es"} of output could not be saved fast enough and ${found.gapMarkers === 1 ? "is" : "are"} marked in the text.`,
+      `${found.gapMarkers} stretch${found.gapMarkers === 1 ? "" : "es"} of output couldn't be saved fast enough and ${found.gapMarkers === 1 ? "is" : "are"} marked in the text.`,
     );
   }
   if (found.unrecordedBytes > 0) {
     notices.push(
-      `${found.unrecordedBytes.toLocaleString("en-US")} more byte${found.unrecordedBytes === 1 ? " was" : "s were"} dropped because the host could not save output fast enough, and the text does not mark where.`,
+      `${found.unrecordedBytes.toLocaleString("en-US")} more byte${found.unrecordedBytes === 1 ? " was" : "s were"} dropped because the host couldn't save output fast enough, and the text does not mark where.`,
     );
   }
   if (found.recordingError) notices.push(`The saved output may be incomplete: ${found.recordingError}`);

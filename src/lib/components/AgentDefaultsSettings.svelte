@@ -87,14 +87,14 @@
 </script>
 
 <div data-setting="agent-defaults">
-  <div class="text-textMuted text-[10px] mb-1.5">Agent launch defaults</div>
-  <p class="text-textMuted text-[10px] leading-snug mb-2">
+  <div class="text-textMuted text-micro mb-1.5">Agent launch defaults</div>
+  <p class="text-textMuted text-micro leading-snug mb-2">
     How much a coding agent may do when you start it from a terminal tab. Applies to new
     sessions; a task handed to an agent keeps the permission mode chosen for that task.
   </p>
 
   {#if error}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mb-2">
+    <div class="flex items-start gap-1.5 text-warn text-micro mb-2">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
       <span data-testid="agent-defaults-error">{error}</span>
     </div>
@@ -103,12 +103,12 @@
   <div class="space-y-1.5">
     {#each view.launchers as launcher (launcher)}
       <div class="flex items-center gap-2">
-        <label class="text-textPrimary text-[11px] w-24 shrink-0" for="gp-agent-default-{launcher}">
+        <label class="text-textPrimary text-meta w-24 shrink-0" for="gp-agent-default-{launcher}">
           {launcherLabel(launcher)}
         </label>
         <select
           id="gp-agent-default-{launcher}"
-          class="gp-input text-[11px] py-0.5! flex-1 min-w-0"
+          class="gp-select text-meta flex-1 min-w-0" data-size="sm"
           data-testid="agent-default-{launcher}"
           disabled={busy}
           value={chosen(launcher)}
@@ -121,7 +121,7 @@
         </select>
       </div>
       {#if chosen(launcher) !== INHERIT}
-        <p class="text-textMuted text-[10px] leading-snug pl-26">
+        <p class="text-textMuted text-micro leading-snug pl-26">
           {PERMISSION_LABELS[chosen(launcher) as PermissionMode].detail}
         </p>
       {/if}
@@ -133,7 +133,7 @@
          as a warning about what was chosen: the reader chose it deliberately,
          and what they need is the reminder that it is still in force. -->
     <div
-      class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-2.5"
+      class="flex items-start gap-1.5 text-warn text-micro mt-2.5"
       data-testid="agent-defaults-bypass-note"
     >
       <AlertTriangle size={12} class="shrink-0 mt-px" />

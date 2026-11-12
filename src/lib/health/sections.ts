@@ -73,12 +73,12 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     id: "summary",
     label: "Summary",
     heading: "Summary",
-    summary: "The verdict for this scan, and what it could not establish.",
+    summary: "The verdict for this scan, and what it couldn't establish.",
   },
   {
     id: "plan",
     label: "Plan",
-    heading: "MANVI remediation plan",
+    heading: "Manvi remediation plan",
     summary: "The remediation plan generated for this report, and its steps.",
   },
   {
@@ -129,15 +129,15 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
   },
   {
     id: "code-graph",
-    label: "Code graph",
-    heading: "Code graph",
-    summary: "Whether this repository has an indexed code graph, and its size.",
+    label: "Code map",
+    heading: "Code map",
+    summary: "Whether this repository has an indexed code map, and its size.",
   },
   {
     id: "dead-code",
     label: "Dead code",
     heading: "Dead-code candidates",
-    summary: "Symbols the code graph found no reference to.",
+    summary: "Symbols the code map found no reference to.",
   },
   {
     id: "terminal-incidents",

@@ -115,12 +115,10 @@ describe("ciLocalVerdict", () => {
 
 describe("ciStepClass", () => {
   it("colors known statuses and mutes unknown ones", () => {
-    expect(ciStepClass("passed")).toContain("green");
-    expect(ciStepClass("failed")).toContain("red");
-    // Both shades: a bare `-400` is unreadable on the light theme's card.
-    expect(ciStepClass("passed")).toContain("dark:text-green-400");
-    expect(ciStepClass("failed")).toContain("dark:text-red-400");
-    expect(ciStepClass("passed")).not.toBe("text-green-400");
+    // Status roles, themed per scheme: a bare palette shade is unreadable on
+    // one of the two cards.
+    expect(ciStepClass("passed")).toBe("text-ok");
+    expect(ciStepClass("failed")).toBe("text-danger");
     expect(ciStepClass("skipped")).toContain("textMuted");
     expect(ciStepClass("whatever")).toContain("textMuted");
   });

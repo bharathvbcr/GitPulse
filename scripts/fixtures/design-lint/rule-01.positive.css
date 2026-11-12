@@ -1,0 +1,21 @@
+.gp-note {
+  font-size: 12px;
+}
+.gp-chip {
+  @apply text-[10px] font-medium;
+}
+@utility gp-big {
+  font-size: 15.5px;
+}
+.gp-rem {
+  font-size: 0.875rem;
+}
+.gp-em {
+  font-size: 1.18em;
+}
+.gp-keyword {
+  font-size: x-large;
+}
+.gp-shorthand {
+  font: 500 0.75rem/1.2 var(--font-sans);
+}

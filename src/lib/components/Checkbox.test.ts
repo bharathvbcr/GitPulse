@@ -76,6 +76,12 @@ describe("Checkbox", () => {
       expect(html).toContain('id="c-description"');
     });
 
+    it("puts testId on the native input as data-testid, and nothing when it is not passed", () => {
+      expect(boxTag(render(Checkbox, { props: { ariaLabel: "x", testId: "refine-all" } }).body)).toContain('data-testid="refine-all"');
+      expect(boxTag(render(Checkbox, { props: { label: "Sure", testId: "sure" } }).body)).toContain('data-testid="sure"');
+      expect(boxTag(render(Checkbox, { props: { ariaLabel: "x" } }).body)).not.toContain("data-testid");
+    });
+
     it("has no aria-describedby without a description", () => {
       expect(boxTag(render(Checkbox, { props: { label: "Sure" } }).body)).not.toContain("aria-describedby");
     });
@@ -102,7 +108,7 @@ describe("Checkbox", () => {
       expect(boxTag(render(Checkbox, { props: { ariaLabel: "x" } }).body)).not.toMatch(/\sdisabled(\s|=|>)/);
     });
 
-    it("shows focus through the global input:focus-visible ring and removes none of it", () => {
+    it("shows focus through the global checkbox focus-visible ring and removes none of it", () => {
       expect(source).not.toMatch(/outline-none|outline-hidden|focus:outline|focus-visible:/);
     });
 

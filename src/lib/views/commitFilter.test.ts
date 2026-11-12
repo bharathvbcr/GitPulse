@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { VIEW_TABS } from "../repos/persist";
 import {
-  FOCUS_COMMIT_SEARCH_EVENT,
+  COMMIT_FILTER_SECTION,
+  FOCUS_PAGE_SEARCH_EVENT,
+  FOCUS_SUSPECTS_SYMPTOM_EVENT,
+  fieldOwnsFindChord,
+  findChordTarget,
   isCommitSearchChord,
-  ownsCommitSearchChord,
   showsCommitFilter,
   tabForCommitSearch,
 } from "./commitFilter";
@@ -38,40 +41,54 @@ describe("commit-search chord", () => {
     expect(isCommitSearchChord({ key: "f" })).toBe(false);
   });
 
-  it("leaves Code to the in-file search, in all of its sections", () => {
-    // Blame and Map are sections of Code. Blame's lines are the Explorer's
-    // lines; Map has no commit list. ⌘F must not mean one thing on a file and
-    // something else one click later.
-    expect(ownsCommitSearchChord("code")).toBe(false);
-    expect(ownsCommitSearchChord("code", "explorer")).toBe(false);
-    expect(ownsCommitSearchChord("code", "blame")).toBe(false);
-    expect(ownsCommitSearchChord("code", "map")).toBe(false);
+  it("hands the chord to the view bar's field on every page of an open repository", () => {
+    // Code and History's diff used to catch ⌘F in their own toolbars, so the
+    // chord meant three things depending on the pane. The field is one control
+    // now and the page decides what it does, so ownership no longer asks which
+    // view or section is showing.
+    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: true, defaultPrevented: false })).toBe(true);
   });
 
-  it("leaves History's diff to its own find bar, and keeps the rest", () => {
-    // Graph (commits or HEAD moves) is a list, which the filter narrows. Diff
-    // is a file — or a commit's worth of files — and the chord belongs to the
-    // find bar inside it, for the same reason Code owns it.
-    expect(ownsCommitSearchChord("history", "diff")).toBe(false);
-    expect(ownsCommitSearchChord("history", "graph")).toBe(true);
-    expect(ownsCommitSearchChord("history")).toBe(true);
+  it("leaves the chord alone where the field is not on screen", () => {
+    // No repository: row 2 has no field. Fleet, Agents or Tasks: row 2 is
+    // inert under the surface's name, so focusing it would land on a hidden
+    // control.
+    expect(fieldOwnsFindChord({ hasRepository: false, onRepositorySurface: true, defaultPrevented: false })).toBe(false);
+    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: false, defaultPrevented: false })).toBe(false);
   });
 
-  it("takes the chord for every other view, whatever section is open", () => {
-    for (const tab of VIEW_TABS) {
-      if (tab === "code" || tab === "history") continue;
-      expect(ownsCommitSearchChord(tab), tab).toBe(true);
-      expect(ownsCommitSearchChord(tab, "diff"), tab).toBe(true);
-    }
+  it("leaves a chord another pane already took", () => {
+    // The terminal's own find marks ⌘F handled; the field must not steal it.
+    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: true, defaultPrevented: true })).toBe(false);
   });
 
-  it("switches Work (and any other non-filter view) onto History so the bar exists", () => {
-    // The failure this prevents: ⌘F on Work dispatched a focus event no
-    // listener heard, because FilterBar is unmounted there.
+  it("sends native Search Commits to History's graph, where the field filters commits", () => {
+    // ⌘F focuses the field wherever it is; the menu item asks for the commit
+    // filter by name, so it must land where the field is that filter.
     expect(tabForCommitSearch("work")).toBe("history");
     expect(tabForCommitSearch("insights")).toBe("history");
     expect(tabForCommitSearch("history")).toBe("history");
     expect(tabForCommitSearch("code")).toBe("history");
-    expect(FOCUS_COMMIT_SEARCH_EVENT).toBe("gitpulse:focus-filter");
+    expect(COMMIT_FILTER_SECTION).toBe("graph");
+    expect(FOCUS_PAGE_SEARCH_EVENT).toBe("gitpulse:focus-page-search");
+  });
+});
+
+describe("findChordTarget", () => {
+  it("sends ⌘F to the Suspects list's symptom on Graph's Suspects list", () => {
+    // The commit filter does not apply to a ranking (one answer, not a list
+    // text narrows), so the Suspects list asks its question in the context bar
+    // and ⌘F focuses that question's symptom, as it did before the field.
+    expect(findChordTarget({ tab: "history", section: "graph", historyList: "suspects" })).toBe("suspects-symptom");
+    expect(FOCUS_SUSPECTS_SYMPTOM_EVENT).toBe("gitpulse:focus-suspects-symptom");
+  });
+
+  it("sends it to the view bar's field everywhere else, Graph's other lists and Diff included", () => {
+    expect(findChordTarget({ tab: "history", section: "graph", historyList: "commits" })).toBe("page-search");
+    expect(findChordTarget({ tab: "history", section: "graph", historyList: "moves" })).toBe("page-search");
+    // The list is remembered while Diff is showing; Diff's field is the diff's find.
+    expect(findChordTarget({ tab: "history", section: "diff", historyList: "suspects" })).toBe("page-search");
+    expect(findChordTarget({ tab: "code", section: "explorer", historyList: "suspects" })).toBe("page-search");
+    expect(findChordTarget({ tab: "work", section: null, historyList: undefined })).toBe("page-search");
   });
 });

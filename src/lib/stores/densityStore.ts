@@ -1,48 +1,27 @@
-import { writable } from "svelte/store";
+import { derived, get } from "svelte/store";
 import type { DensityMode } from "../canvas/GraphRenderer";
+import { rowDensity, type Density } from "../ui/appearance/density";
+import { interfaceStore } from "./interfaceStore";
 
 export type { DensityMode } from "../canvas/GraphRenderer";
+export type { Density } from "../ui/appearance/density";
 
-const STORAGE_KEY = "gitpulse_density_mode";
-
-function readInitial(): DensityMode {
-  if (typeof window === "undefined") return "spacious";
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw === "spacious" || raw === "compact") return raw;
-  } catch {
-    /* ignore storage errors */
-  }
-  return "spacious";
-}
-
-function persist(mode: DensityMode) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, mode);
-  } catch {
-    /* ignore storage errors */
-  }
-}
-
-function createDensityStore() {
-  const initial = readInitial();
-  const { subscribe, set, update } = writable<DensityMode>(initial);
-
-  return {
-    subscribe,
-    setDensity: (mode: DensityMode) => {
-      persist(mode);
-      set(mode);
-    },
-    toggle: () => {
-      update((current) => {
-        const next: DensityMode = current === "spacious" ? "compact" : "spacious";
-        persist(next);
-        return next;
-      });
-    },
-  };
-}
-
-export const densityStore = createDensityStore();
+/**
+ * The row and graph density every fixed-row surface indexes its tables by.
+ *
+ * The preference itself is the global three-step `interfaceStore.density`
+ * (design language §7), which is also what `html[data-density]` is stamped
+ * from. This store is the two-valued view of it that the existing consumers
+ * read (`rowDensity`: comfortable and spacious draw the "spacious" tables,
+ * compact the "compact" ones), so none of them changed type. The old
+ * `gitpulse_density_mode` value is migrated by `interfaceStore` on first read.
+ */
+export const densityStore = {
+  subscribe: derived(interfaceStore, (prefs): DensityMode => rowDensity(prefs.density)).subscribe,
+  /** Sets the preference. The legacy two values stay valid. */
+  setDensity: (density: Density) => interfaceStore.setDensity(density),
+  /** Flips between compact and the default, as the old two-step toggle did. */
+  toggle: () => {
+    interfaceStore.setDensity(get(densityStore) === "compact" ? "comfortable" : "compact");
+  },
+};

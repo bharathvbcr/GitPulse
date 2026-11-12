@@ -111,6 +111,7 @@ let failConfiguration = false, blankConfiguration = false, loseEnhancement = fal
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
 const relinkCalls = [], repoCommandCalls = [];
 const missingCheckouts = new Set(), uncheckableCheckouts = new Set();
+let uncheckableProbes = 0;
 // What `repoStore.openRepo` asks the host for, answered the way an empty,
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
@@ -125,7 +126,7 @@ const fixtureRepoCommands = {
   // `uncheckableCheckouts` fails for a reason that says nothing about it.
   cmd_resolve_git_root: a => {
     if (missingCheckouts.has(a.path)) throw `Not a Git repository: ${a.path}`;
-    if (uncheckableCheckouts.has(a.path)) throw `Operation not permitted (os error 1): ${a.path}`;
+    if (uncheckableCheckouts.has(a.path)) { uncheckableProbes += 1; throw `Operation not permitted (os error 1): ${a.path}`; }
     return a.path;
   },
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
@@ -545,10 +546,15 @@ const settle = async (ms = 30) => {
   const prompt = pendingPrompt ? [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === pendingPrompt.options.title).at(-1) : null;
   if (prompt && pendingPrompt.options.title.startsWith("Delete")) { button(pendingPrompt.options.confirmLabel, prompt)?.click(); await new Promise(resolve => setTimeout(resolve, 0)); await tick(); }
   if (prompt && pendingPrompt.options.title.startsWith("Discard")) { confirmations++; [...prompt.querySelectorAll("button")].find(button => button.textContent.trim() === (confirmAnswer ? "Discard edits" : "Keep editing"))?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
-  if (prompt && pendingPrompt.options.title === "Reload saved task?") { button("Reload", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
+  if (prompt && pendingPrompt.options.title === "Refresh from saved task?") { button("Refresh", prompt)?.click(); await new Promise(resolve => setTimeout(resolve,0)); await tick(); }
 };
+// A popover leaves with a short exit now (`popoverExit`, 70 ms), so it is still
+// on screen for a moment after the close that dismissed it. A check that asks
+// "is it gone?" waits for the exit, bounded, and then asserts: it never skips
+// the assertion, and a popover that stays still fails it.
+const untilGone = async probe => { for (const end = Date.now() + 3000; probe() && Date.now() < end;) await settle(30); };
 const wait = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await settle(); } throw Error(`Timed out waiting for task UI [${describeForeground()}]`); };
-const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete", "Retry deletion":"Retry delete", "Copy for agent":"Copy task for an AI agent"};
+const aliases = {"Quick Enhance":"Quick Enhance…","Add task to Ready":"New task in Ready","Close workspace details":"Close workspace settings", "Refresh tasks":"Refresh", "List view":"List", "Board view":"Board", "Duplicate task…":"Duplicate…", "Delete task":"Delete",  "Copy for agent":"Copy task for an AI agent"};
 const button = (text, within = root) => [...within.querySelectorAll("button")].find(el => {
   const names = [text, aliases[text]].filter(Boolean);
   return names.includes(el.textContent.trim()) || names.includes(el.getAttribute("aria-label")) || names.includes(el.querySelector(":scope > span.flex-1")?.textContent.trim());
@@ -856,11 +862,11 @@ if (params.has("check")) {
       const tab = (el, shiftKey = false) => { if (!el) return; el.focus(); el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true })); };
       tab(focusables()[0]); await settle(60);
       const stayed = Boolean(repoPopup());
-      tab(focusables().at(-1)); await settle(60);
+      tab(focusables().at(-1)); await settle(60); await untilGone(repoPopup);
       check("Tab within the repository dropdown keeps it open; Tab off its last control closes it",
         stayed && !repoPopup() && Boolean(editor()));
       await openRepoPicker();
-      tab(focusables()[0], true); await settle(60);
+      tab(focusables()[0], true); await settle(60); await untilGone(repoPopup);
       check("Shift+Tab off the dropdown's first control closes it too", !repoPopup() && Boolean(editor()));
       await openRepoPicker();
     }
@@ -873,7 +879,7 @@ if (params.has("check")) {
     // The sheet also closes on Escape. One Escape must dismiss one thing.
     repoPopup()?.querySelector("input")?.focus();
     document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    await settle(80);
+    await settle(80); await untilGone(repoPopup);
     check("Escape in the repository dropdown closes the dropdown, not the task",
       !repoPopup() && Boolean(editor()) && document.activeElement === repoToggle());
     // The anchor scrolling away must not leave the popover behind it. Guarded
@@ -883,7 +889,7 @@ if (params.has("check")) {
     if (!editor()) { card("task-2").click(); await wait(editor); }
     await openRepoPicker();
     editor()?.querySelector(".sheet-body")?.dispatchEvent(new Event("scroll"));
-    await settle(80);
+    await settle(80); await untilGone(repoPopup);
     check("scrolling the sheet dismisses the repository dropdown instead of leaving it floating",
       Boolean(editor()) && !repoPopup() && repoToggle()?.getAttribute("aria-expanded") === "false");
     const paneTab = id => editor()?.querySelector(`[data-sheet-tab="${id}"]`);
@@ -919,7 +925,7 @@ if (params.has("check")) {
     check("the suggestion picker is on screen the moment the assist is, and is a real picker",
       Boolean(editor().querySelector(".manvi-assist")) && Boolean(historyPicker())
       && historyPicker() instanceof HTMLSelectElement && !editor().querySelector(".history-drawer"));
-    check("merged Manvi section has no model input", Boolean(editor().querySelector(".manvi-assist .change-link")) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
+    check("merged Manvi section has no model input", Boolean(editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')) && ![...editor().querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent.trim() === "Model"));
     editor().querySelector(".sheet-body").scrollTop = 900; await settle();
     const saveRect = button("Save task").getBoundingClientRect();
     check("save remains visible while the sheet scrolls", saveRect.top >= 0 && saveRect.bottom < innerHeight);
@@ -988,7 +994,7 @@ if (params.has("check")) {
         check("Choose folder remains fully readable in the add-repository menu",
           Boolean(choose) && uncropped(choose));
         menu?.querySelector('[role="menuitem"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-        await settle(80);
+        await settle(80); await untilGone(addRepoMenu);
         check("Escape in the add-repository menu restores focus to the plus",
           !addRepoMenu() && document.activeElement === addRepoTrigger());
         repos.push(...extras.slice(1));
@@ -1000,7 +1006,7 @@ if (params.has("check")) {
         check("a long registered list still fits the window and scrolls inside the menu",
           Boolean(tall) && fitsViewport(tall) && tall.scrollHeight > tall.clientHeight && getComputedStyle(tall).overflowY === "auto");
         document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-        await settle(80);
+        await settle(80); await untilGone(addRepoMenu);
         check("a pointer outside dismisses the add-repository menu", !addRepoMenu());
       } finally {
         if (addRepoMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60); }
@@ -1068,12 +1074,12 @@ if (params.has("check")) {
     await change(field("Acceptance criteria"), "  Result verified  \n\n  Recovery checked  ");
     await change(field("Status"), "review", "change");
     check("select changes are marked as unsaved", editor().querySelector("header small").textContent === "Unsaved");
-    loseSave = true; await click("Save task"); await wait(() => button("Retry save"));
+    loseSave = true; await click("Save task"); await wait(() => button("Try save again"));
     const pendingWrite = writes.at(-1);
-    check("uncertain saves lock the draft and expose an exact retry", field("Title").matches(":disabled") && !button("Retry save").disabled);
+    check("uncertain saves lock the draft and expose an exact retry", field("Title").matches(":disabled") && !button("Try save again").disabled);
     await click("Close task details");
     check("uncertain saves cannot be discarded before reconciliation", Boolean(editor()) && button("Close task details").disabled);
-    await click("Retry save"); await wait(() => button("Save task") && !field("Title").matches(":disabled"));
+    await click("Try save again"); await wait(() => button("Save task") && !field("Title").matches(":disabled"));
     check("retrying a lost save reuses the same mutation identity", writes.at(-1).request_id === pendingWrite.request_id && tasks.find(task => task.id === pendingWrite.id)?.revision === 1);
     check("acceptance criteria are normalized and retained after saving", field("Acceptance criteria").value === "Result verified\nRecovery checked");
     check("creation persists the selected task status", tasks.find(task => task.id === pendingWrite.id)?.status === "review");
@@ -1116,9 +1122,9 @@ if (params.has("check")) {
     corruptSave = true; await change(field("Description"), "Updated brief after protocol failure.");
     await click("Save task"); await settle(120);
     const malformedWrite = writes.at(-1);
-    check("malformed save replies retain the pending write", Boolean(button("Retry save")) && field("Title").matches(":disabled"));
-    if (button("Retry save")) {
-      await click("Retry save"); await wait(() => button("Save task") && !field("Title").matches(":disabled"));
+    check("malformed save replies retain the pending write", Boolean(button("Try save again")) && field("Title").matches(":disabled"));
+    if (button("Try save again")) {
+      await click("Try save again"); await wait(() => button("Save task") && !field("Title").matches(":disabled"));
       check("malformed save recovery reuses the committed receipt", writes.at(-1).request_id === malformedWrite.request_id && tasks.find(task => task.id === "task-1").revision === malformedWrite.expected_revision + 1);
     }
     confirmAnswer = true; await click("Close task details");
@@ -1149,7 +1155,7 @@ if (params.has("check")) {
     check("late search responses cannot replace newer results", Boolean(card("task-10")) && root.querySelectorAll('[data-task-card]').length === 1);
     failList = true; await change(search, "offline"); await settle(400);
     check("failed loads remain distinct from an empty task list", root.textContent.includes("Fixture task storage offline") && root.textContent.includes("Tasks unavailable") && !root.textContent.includes("No tasks match"));
-    failList = false; await click("Retry loading tasks"); await settle(300);
+    failList = false; await click("Try again"); await settle(300);
     check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
     await click("Clear task search"); await wait(() => card("task-1"));
 
@@ -1169,7 +1175,7 @@ if (params.has("check")) {
     check("a quoted phrase matches the phrase", JSON.stringify(shownIds()) === JSON.stringify(["task-3"]));
     await change(search, "label:usability,nothing"); await settle(400);
     check("a comma list is any of its values and shows as one removable chip", JSON.stringify(shownIds()) === JSON.stringify(["task-2"])
-      && root.querySelectorAll(".query-chip").length === 1 && Boolean(root.querySelector('[aria-label="Remove filter label:usability,nothing"]')));
+      && root.querySelectorAll(".query-term").length === 1 && Boolean(root.querySelector('[aria-label="Remove filter label:usability,nothing"]')));
     root.querySelector('[aria-label="Remove filter label:usability,nothing"]')?.click(); await settle(400);
     check("removing the chip removes the whole list", search.value === "" && Boolean(card("task-1")));
     await change(search, "repo:manvi -review"); await settle(400);
@@ -1257,7 +1263,7 @@ if (params.has("check")) {
       !card("task-3") && Boolean(card("task-2")) && Boolean(card("task-1"))
         && hiddenRepoNote().textContent.includes("1 task from Manvi is not on this board"));
     check("hiding never asks the store to filter", listQueries.slice(queriesBeforeHide).every(query => !query));
-    const hiddenToggle = () => root.querySelector('[data-testid="task-hidden-repositories"] .hidden-toggle');
+    const hiddenToggle = () => root.querySelector('[data-testid="task-hidden-toggle"]');
     const hiddenLabel = () => hiddenToggle()?.querySelector(".hidden-label");
     check("a hidden repository leaves the list for a collapsed Hidden group that still names it",
       !navRow("repo-1")
@@ -1267,7 +1273,7 @@ if (params.has("check")) {
     check("the Hidden group lists the repository with a way to show it again",
       navRow("repo-1")?.dataset.hidden === "true" && Boolean(navRow("repo-1").querySelector('[data-testid="repository-show"]')));
     {
-      const nameEl = navRow("repo-1")?.querySelector(".gp-seg-btn span");
+      const nameEl = navRow("repo-1")?.querySelector(".nav-scope span");
       const showEl = navRow("repo-1")?.querySelector('[data-testid="repository-show"]');
       const nameWidth = nameEl?.getBoundingClientRect().width ?? 0;
       const showWidth = showEl?.getBoundingClientRect().width ?? 0;
@@ -1323,7 +1329,8 @@ if (params.has("check")) {
     // still runs against a build whose navigator says nothing about members.
     await click("Global fixture"); await settle(400);
     check("the navigator says which workspaces are empty before one is opened",
-      workspaceTab("Fresh space").textContent.trim() === "Fresh space · Empty");
+      workspaceTab("Fresh space").querySelector(".nav-name")?.textContent.trim() === "Fresh space"
+      && workspaceTab("Fresh space").querySelector(".nav-meta")?.textContent.trim() === "Empty");
     workspaceTab("Fresh space").click(); await settle(400);
     check("an empty workspace still offers New task, and says what the sheet will ask for",
       button("New task").disabled === false
@@ -1396,11 +1403,11 @@ if (params.has("check")) {
     const confirmDelete = document.querySelector('[role="dialog"][aria-label="Delete tasks"]');
     if(confirmDelete) { button("Delete 1 task",confirmDelete).click(); await settle(); }
     check("a malformed deletion receipt is never reported as success", Boolean(editor()) || Boolean(document.querySelector('[role="dialog"][aria-label="Delete tasks"]')));
-    check("uncertain deletion has an explicit reconciliation retry", Boolean(button("Retry deletion",document)));
+    check("uncertain deletion has an explicit reconciliation retry", Boolean(button("Try delete again",document)));
     check("task surfaces participate in the shared liquid material", Boolean(root.querySelector('.workbench.bg-background')) && Boolean(root.querySelector('.task-editor.gp-glass')));
 
     const firstDelete = deleteWrites.at(-1);
-    button("Retry deletion",document).click(); await settle(120);
+    button("Try delete again",document).click(); await settle(120);
     check("malformed delete recovery uses the exact receipt and advances once", deleteWrites.at(-1).request_id === firstDelete.request_id && deleteWrites.length === 2);
     await settle(300);
     check("confirmed deletion removes the task and its open sheet", !card("task-10") && !editor());
@@ -1418,8 +1425,54 @@ if (params.has("check")) {
     check("task menus are clamped to the anchor, not left at the origin", Math.abs(rect.right - (innerWidth - 8)) <= 1 && Math.abs(rect.bottom - (innerHeight - 8)) <= 1);
     menu().dispatchEvent(new KeyboardEvent("keydown",{key:"End",bubbles:true,cancelable:true})); await settle();
     check("End selects the last task menu action", document.activeElement.textContent.includes("Delete"));
-    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle(); await untilGone(menu);
     check("Escape dismisses the portaled task menu", !menu());
+
+    // ---- Every popover the shared owner places leaves with one short exit ----
+    // They animated in (gp-pop) and vanished on close. The exit is a script
+    // animation Svelte plays while it still holds the node (a transition on
+    // the element, because an action's destroy has nothing left to animate):
+    // 70 ms or less, transform and opacity only, and the node is still on
+    // screen while it plays.
+    {
+      // Svelte starts a transition with a zero-length placeholder animation and
+      // creates the real one a frame later, so reading `getAnimations()` right
+      // after the close sees only the placeholder, and a read a frame later races
+      // the 70 ms on a loaded host. The probe records the node's own `animate`
+      // calls instead: what Svelte asked the browser to run, load-independent.
+      const probe = async (name, node, close) => {
+        const asked = [];
+        const animate = node.animate.bind(node);
+        node.animate = (keyframes, options) => {
+          asked.push({ keyframes: [...keyframes], duration: options?.duration ?? 0, connected: node.isConnected });
+          return animate(keyframes, options);
+        };
+        close(); await tick();
+        for (const end = Date.now() + 1500; !asked.some(call => call.duration > 0) && node.isConnected && Date.now() < end;) await settle(30);
+        const exit = asked.find(call => call.duration > 0);
+        const properties = exit ? [...new Set(exit.keyframes.flatMap(frame => Object.keys(frame)))] : [];
+        check(`${name}: closing plays an exit animation while the popover is still on screen (${asked.length} animate calls, connected ${exit?.connected})`, Boolean(exit) && exit.connected);
+        check(`${name}: the exit is 70 ms or less (${exit?.duration ?? "none"})`, Boolean(exit) && exit.duration <= 70);
+        check(`${name}: the exit animates transform and opacity and nothing else (${properties.join(", ") || "none"})`,
+          properties.length > 0 && properties.every(key => key === "transform" || key === "opacity"));
+        await untilGone(() => node.isConnected);
+        check(`${name}: the popover is gone once the exit has run`, !node.isConnected);
+      };
+      await openMenu("task-11");
+      await probe("the task menu", menu(), () => menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+      await settle(150);
+      const viewToggle = () => root.querySelector("[data-task-view-toggle]");
+      const viewsToggle = () => root.querySelector("[data-task-views-toggle]");
+      check("the View and Views controls are on the board for the exit probes", Boolean(viewToggle()) && Boolean(viewsToggle()));
+      if (viewToggle() && viewsToggle()) {
+        viewToggle().click(); await settle();
+        await probe("the View menu", document.querySelector('[data-testid="task-view-menu"]'), () => viewToggle().click());
+        await settle(150);
+        viewsToggle().click(); await settle();
+        await probe("the saved-views panel", document.querySelector('[data-testid="task-saved-views"]'), () => viewsToggle().click());
+        await settle(150);
+      }
+    }
     card("task-11").focus(); card("task-11").dispatchEvent(new KeyboardEvent("keydown",{key:"F10",shiftKey:true,bubbles:true,cancelable:true})); await settle();
     check("Shift F10 opens the focused task actions", Boolean(menu()));
     button("Move to…",menu()).click(); await settle(); button("Backlog",menu()).click(); await settle(150);
@@ -1446,20 +1499,20 @@ if (params.has("check")) {
       const deleteDialog = () => document.querySelector('[aria-label="Delete tasks"]');
       await click("Delete selected tasks"); dialog=deleteDialog();
       check("the deletion confirmation says how long Undo keeps the tasks", dialog?.textContent.includes("12 seconds"));
-      button("Delete 2 tasks",dialog).click(); await settle();
+      button("Delete 2 tasks",dialog).click(); await settle(); await wait(()=>!deleteDialog());
       check("a confirmed deletion leaves the board at once and writes nothing yet",
         !card("task-12") && !card("task-13") && deleteWrites.length===2 && !deleteDialog() && Boolean(undoStrip()?.textContent.includes("Deleted 2 tasks")));
       button("Undo", undoStrip()).click(); await settle();
       check("Undo inside the window brings the tasks back and never sent a deletion",
         Boolean(card("task-12")) && Boolean(card("task-13")) && deleteWrites.length===2 && !deleted.has("task-12") && !undoStrip());
       await selectCard("task-12"); await selectCard("task-13");
-      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle();
+      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle(); await wait(()=>!deleteDialog());
       card("task-14").dispatchEvent(new KeyboardEvent("keydown",{key:"z",metaKey:true,ctrlKey:true,bubbles:true,cancelable:true})); await settle();
       check("Command- or Control-Z undoes a pending deletion from the keyboard", Boolean(card("task-12")) && Boolean(card("task-13")) && deleteWrites.length===2);
       // Delete now sends it, with the same receipts and partial-failure report
       // every other task action has.
       await selectCard("task-12"); await selectCard("task-13");
-      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle();
+      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle(); await wait(()=>!deleteDialog());
       tasks.find(task=>task.id==="task-13").revision++; holdDelete=true;
       button("Delete now", undoStrip()).click(); await wait(()=>releaseDelete);
       check("a deletion being written can no longer be undone or sent twice",
@@ -1469,16 +1522,16 @@ if (params.has("check")) {
       check("mixed batch deletion preserves concurrent edits and reports partial failure", deleted.has("task-12") && !deleted.has("task-13") && dialog.textContent.includes("1 not changed"));
       await wait(()=>card("task-13"));
       check("the task that was not deleted is back on the board", Boolean(card("task-13")) && !card("task-12") && !undoStrip());
-      button("Done",dialog).click(); await settle(); if (root.querySelector(".selection")) await click("Clear task selection");
+      button("Done",dialog).click(); await settle(); await wait(()=>!deleteDialog()); if (root.querySelector(".selection")) await click("Clear task selection");
       // A lost reply leaves the same exact retry the dialog always offered.
-      await selectCard("task-13"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle();
-      loseDelete = true; button("Delete now", undoStrip()).click(); await wait(()=>button("Retry deletion", deleteDialog() ?? document));
+      await selectCard("task-13"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle(); await wait(()=>!deleteDialog());
+      loseDelete = true; button("Delete now", undoStrip()).click(); await wait(()=>button("Try again", deleteDialog() ?? document));
       const lostDelete = deleteWrites.at(-1);
       check("an uncertain deferred deletion opens the dialog with its exact retry, and it cannot be closed",
-        Boolean(button("Retry deletion", deleteDialog())) && button("Close task action", deleteDialog()).disabled);
-      button("Retry deletion", deleteDialog()).click(); await wait(()=>deleteDialog()?.textContent.includes("1 of 1 deleted"));
+        Boolean(button("Try again", deleteDialog())) && button("Close task action", deleteDialog()).disabled);
+      button("Try again", deleteDialog()).click(); await wait(()=>deleteDialog()?.textContent.includes("1 of 1 deleted"));
       check("the retry reuses the lost request and deletes once", deleteWrites.at(-1).request_id === lostDelete.request_id && deleted.has("task-13"));
-      button("Done", deleteDialog()).click(); await settle();
+      button("Done", deleteDialog()).click(); await settle(); await wait(()=>!deleteDialog());
       // And with nobody pressing anything, the window closes on its own. The
       // fixture compresses the clock for this one timer — the board's 12 s
       // window — so the run does not spend twelve real seconds waiting on it.
@@ -1486,7 +1539,7 @@ if (params.has("check")) {
         const realSetTimeout = window.setTimeout;
         window.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 12_000 ? 1_200 : ms, ...rest);
         try {
-          await selectCard("task-30"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle();
+          await selectCard("task-30"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle(); await wait(()=>!deleteDialog());
         } finally { window.setTimeout = realSetTimeout; }
         const writesBeforeWindow = deleteWrites.length;
         await settle(400);
@@ -1517,8 +1570,8 @@ if (params.has("check")) {
     await openMenu("task-2"); button("Quick Enhance",menu()).click(); await wait(()=>button("Close Quick Enhance",document)); await settle(100);
     check("Quick Enhance surfaces saved description and hidden task context", document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("GitPulse") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Manvi") && document.querySelector('[aria-labelledby="quick-enhance-title"]').textContent.includes("Bharath"));
     button("Open full editor",document).click(); await wait(editor); await wait(()=>!document.querySelector('[aria-labelledby="quick-enhance-title"]')); await settle();
-    check("Manvi configuration failure has an explicit retry", Boolean(button("Retry Manvi configuration")));
-    failConfiguration=false; await click("Retry Manvi configuration");
+    check("Manvi configuration failure has an explicit retry", Boolean(button("Try again", editor().querySelector(".manvi-assist"))));
+    failConfiguration=false; button("Try again", editor().querySelector(".manvi-assist")).click(); await settle();
     await wait(() => { const el = enhanceButton(); return Boolean(el) && !el.matches(":disabled"); });
     await click("Improve with Manvi"); await wait(()=>[...proposals.values()].some(p=>p.state==="running"));
     check("Improve with Manvi prevents duplicate generations while work is live", enhanceButton().matches(":disabled"));
@@ -1541,9 +1594,9 @@ if (params.has("check")) {
     if(button("Accept selected fields")) await click("Accept selected fields");
     else if(button("Use this title")) await click("Use this title");
     else await click("Use both");
-    await wait(()=>button("Retry pending action"));
+    await wait(()=>button("Try again", editor().querySelector(".manvi-assist")));
     check("uncertain enhancement acceptance blocks editor close", button("Close task details").disabled);
-    await click("Retry pending action"); await wait(()=>button("Undo accepted fields") || tasks.find(task=>task.id==="task-2").title==="A focused task brief");
+    button("Try again", editor().querySelector(".manvi-assist")).click(); await settle(); await wait(()=>button("Undo accepted fields") || tasks.find(task=>task.id==="task-2").title==="A focused task brief");
     if(button("Undo accepted fields")) {
       check("Quick Enhance acceptance retries once and preserves unselected content", tasks.find(task=>task.id==="task-2").revision===originalTask.revision+1 && tasks.find(task=>task.id==="task-2").description===originalTask.description && enhancementWrites.filter(w=>w.method==="enhancements.accept").at(-1).request_id===enhancementWrites.filter(w=>w.method==="enhancements.accept")[0].request_id);
       await click("Undo accepted fields"); await settle(100);
@@ -1717,9 +1770,9 @@ if (params.has("check")) {
       && editor().textContent.includes("before accepting a suggestion"));
     await change(field("Description"),quickProposal.source.description);
     // Reload the saved revision so this acceptance starts from clean state.
-    await click("Reload saved"); await settle(100);
+    await click("Refresh saved"); await settle(100);
     loseEnhancement=true; acceptButton().click(); await settle();
-    const retryInline=button("Retry pending action");
+    const retryInline=button("Try again", editor().querySelector(".manvi-assist"));
     check("a lost acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
     {
       // While that acceptance is unresolved, save and leave are refused, and each refusal names the wait.
@@ -1732,7 +1785,7 @@ if (params.has("check")) {
       check("Escape then keeps the sheet open and says to wait for it",
         Boolean(editor()) && notes().includes("Wait for Manvi to finish before leaving this task."));
     }
-    if(retryInline) await click("Retry pending action");
+    if(retryInline) { retryInline.click(); await settle(); }
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
     await click("Close task details");
@@ -1746,9 +1799,9 @@ if (params.has("check")) {
     check("save bar is not an opaque slab", saveBar.parentElement === editor() && footerAlpha < 1);
     confirmAnswer=true; await click("Close task details");
     failConfiguration=true; await click("New task"); await wait(()=>editor().textContent.includes("Manvi temporarily unavailable"));
-    check("inline configuration failure exposes a working retry", Boolean(button("Retry Manvi configuration")) && !button("Retry Manvi configuration").matches(":disabled"));
-    failConfiguration=false; blankConfiguration=true; await click("Retry Manvi configuration");
-    check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector(".manvi-assist .change-link")) && enhanceButton().matches(":disabled"));
+    check("inline configuration failure exposes a working retry", Boolean(button("Try again", editor().querySelector(".manvi-assist"))) && !button("Try again", editor().querySelector(".manvi-assist")).matches(":disabled"));
+    failConfiguration=false; blankConfiguration=true; button("Try again", editor().querySelector(".manvi-assist")).click(); await settle();
+    check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')) && enhanceButton().matches(":disabled"));
     blankConfiguration=false;
     await harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "replacement-fixture" });
     await settle(150);
@@ -1765,7 +1818,7 @@ if (params.has("check")) {
     // is the LiquiTask shape: one line, parsed as you type, Enter commits.
     const quickAdd = () => root.querySelector('[data-testid="task-quick-add"] input');
     const quickPreview = () => root.querySelector('[data-testid="task-quick-add-preview"]');
-    const chips = () => [...(quickPreview()?.querySelectorAll(".chip") ?? [])].map(el => el.textContent.trim());
+    const chips = () => [...(quickPreview()?.querySelectorAll(".gp-chip") ?? [])].map(el => el.textContent.trim());
     const enter = (el, extra = {}) => { el.dispatchEvent(new KeyboardEvent("keydown", {key:"Enter", bubbles:true, cancelable:true, ...extra})); };
     quickAdd().focus();
     await change(quickAdd(), "Ship the release notes !high #docs #release @ada ~feature :: with the changelog");
@@ -1893,7 +1946,7 @@ if (params.has("check")) {
 
     // ---- Board customization, and what it costs --------------------------
     const viewToggle = () => root.querySelector("[data-task-view-toggle]");
-    const viewMenu = () => root.querySelector('[data-testid="task-view-menu"]');
+    const viewMenu = () => document.querySelector('[data-testid="task-view-menu"]');
     const columnToggle = status => viewMenu().querySelector(`[data-task-column-toggle="${status}"]`);
     const hiddenNote = () => root.querySelector('[data-testid="task-hidden-columns"]');
     const columnEl = status => root.querySelector(`[data-task-column="${status}"]`);
@@ -1937,7 +1990,7 @@ if (params.has("check")) {
       viewMenu().querySelector('[data-task-order-option="priority"]')?.getAttribute("aria-checked") === "true");
     // The keyboard and drag checks below move cards within a column.
     viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle();
-    viewToggle().click(); await settle();
+    viewToggle().click(); await settle(); await untilGone(viewMenu);
     check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
 
     // ---- The archive, and what it is willing to claim --------------------
@@ -2382,7 +2435,7 @@ if (params.has("check")) {
       await openMenu("task-27"); issueRow().click(); await wait(() => Boolean(issuePrompt()));
       button("Create issue", issuePrompt()).click(); await settle(300);
       check(`a creation that hit its deadline is reported as unknown, with the title to look for (${boardAlert().slice(0, 200)})`,
-        boardAlert().includes("Could not confirm whether “Ready task 18” was filed")
+        boardAlert().includes("Couldn't confirm whether “Ready task 18” was filed")
         && boardAlert().includes("Check GitHub for an issue titled “Ready task 18”") && !boardAlert().includes("Not created"));
       issueFailure = "";
 
@@ -2431,10 +2484,10 @@ if (params.has("check")) {
     // `shortcutTextLabel` spells ⌘ as "Ctrl+", so the comparison was false for
     // a ready gate and the check inverted on the Linux runner while passing on
     // every Mac it was written on.
-    const launchHint = `${shortcutTextLabel("⌘↩", get(hostPlatform).os)} to launch`;
+    const launchHint = `${shortcutTextLabel("⌘↩", get(hostPlatform).os)} to run`;
     check("the handoff names the one thing left to do rather than a dead button",
-      button("Launch in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== launchHint));
-    sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+      button("Run in Codex", sheet()).disabled === (sheet().querySelector(".gate").textContent.trim() !== launchHint));
+    sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle(); await wait(() => !sheet());
     check("Escape closes the handoff without preparing a run", !sheet() && preparedRuns.length === 0);
     // A launch that succeeds closes the sheet from inside the form's launch:
     // `onLaunched` nulls the board's handoff while `launch()` is still on the
@@ -2491,7 +2544,7 @@ if (params.has("check")) {
     await change(overrideField("Model"), "opus", "change");
     await change(overrideField("Effort"), "high", "change");
     const preparedBefore = preparedRuns.length;
-    const launchClaude = [...sheet().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Launch in"));
+    const launchClaude = [...sheet().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Run in"));
     launchClaude?.click(); await wait(() => preparedRuns.length > preparedBefore); await settle(100);
     check("the launch sends only the fields typed, as this attempt's model_choice",
       JSON.stringify(preparedRuns.at(-1).model_choice) === JSON.stringify({ model: "opus", effort: "high" }) && preparedRuns.at(-1).provider === "claude");
@@ -2758,7 +2811,7 @@ if (params.has("check")) {
         check("setting off: a hooked ask still counts, alone and beside a bell",
           asking("task-3") === "1" && asking("task-2") === "1" && working("task-2") === "2");
         check("setting off: the chip's title agrees with its count",
-          !/need/.test(chip("task-1").title) && /1 needs you/.test(chip("task-2").title) && /2 agents working/.test(chip("task-2").title));
+          !/need/.test(chip("task-1").querySelector(".agents-mark").title) && /1 needs you/.test(chip("task-2").querySelector(".agents-mark").title) && /2 agents working/.test(chip("task-2").querySelector(".agents-mark").title));
 
         check("setting back on: the bell chip asks again at once, before any board poll",
           await flipped([true], () => asking("task-1") === "1" && asking("task-2") === "2" && asking("task-3") === "1"));
@@ -2922,8 +2975,8 @@ if (params.has("check")) {
       loseRelink = true; pickFolderResult = "/moved-again/GitPulse";
       relinkButton().click(); await wait(() => relinkPrompt()); button("Relink", relinkPrompt()).click();
       await wait(() => root.querySelector('[data-testid="repository-relink-uncertain"]'));
-      check("an uncertain relink says so and offers a retry", Boolean(button("Retry relink")));
-      button("Retry relink").click();
+      check("an uncertain relink says so and offers a retry", Boolean(button("Try again", root.querySelector('[data-testid="repository-relink-uncertain"]'))));
+      button("Try again", root.querySelector('[data-testid="repository-relink-uncertain"]')).click();
       await wait(() => !root.querySelector('[data-testid="repository-relink-uncertain"]'));
       check("the retry reuses the request and relinks once", relinkCalls.length === 3 && relinkCalls[1].requestId === relinkCalls[2].requestId
         && repos.find(repo => repo.id === "repo-0").revision === 3);
@@ -3070,6 +3123,13 @@ if (params.has("check")) {
       check("a checkout that could not be checked says so instead of passing or failing",
         row("repo-0").textContent.includes("Not checked") && !chip("task-1")
         && (root.querySelector('[data-testid="checkout-unchecked"]')?.textContent ?? "").includes("Operation not permitted"));
+      // Rescan on that notice bumps `checkoutToken`, which reruns the checkout read.
+      const probesBefore = uncheckableProbes;
+      const rescan = [...root.querySelectorAll('[data-testid="checkout-unchecked"] button')].find(b => b.textContent.trim() === "Rescan");
+      check("the unchecked-checkout notice is a gp-notice, tone unknown, with a Rescan action", root.querySelector('[data-testid="checkout-unchecked"]')?.dataset.tone === "unknown" && Boolean(rescan));
+      rescan?.click();
+      await wait(() => uncheckableProbes > probesBefore);
+      check("Rescan reruns the checkout read, and a check that still cannot run stays unknown", uncheckableProbes > probesBefore && Boolean(root.querySelector('[data-testid="checkout-unchecked"]')));
       uncheckableCheckouts.clear();
       guardStep = "checkouts: relink";
       pickFolderResult = "/relocated/Manvi";
@@ -3347,6 +3407,33 @@ if (params.has("check")) {
       interfaceStore.flush();
       check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
       await closeViews();
+      {
+        // The panel opens leftwards from a trigger near the pane's edge. Placed by CSS inside the paint-contained pane it
+        // was cut off at the pane edge (left edge x=109 at 1200 px), so the owner places it against the window instead.
+        // The app frame stands in for the window at 1200 and 900 px: the panel must lie whole inside it, and outside the pane.
+        const frame = document.getElementById("app");
+        const fit = [];
+        try {
+          for (const width of [1200, 900]) {
+            frame.style.width = `${width}px`; await settle(350);
+            await closeViews(); await openViews();
+            const panel = viewsPanel(), box = panel.getBoundingClientRect(), edge = frame.getBoundingClientRect();
+            fit.push(`${width}: ${Math.round(box.left)}..${Math.round(box.right)} in ${Math.round(edge.left)}..${Math.round(edge.right)}`);
+            check(`the saved-views panel lies whole inside a ${width} px window and is not inside the clipping pane (${fit.at(-1)})`,
+              box.width > 0 && box.height > 0 && box.left >= edge.left - 1 && box.right <= edge.right + 1 && box.left >= 0 && box.top >= 0
+              && box.right <= innerWidth && box.bottom <= innerHeight && !panel.closest(".gp-pane"));
+            const toggleBox = viewsToggle().getBoundingClientRect();
+            check(`and it opens under its trigger, not over it, at ${width} px`, box.top >= toggleBox.bottom - 1 || box.bottom <= toggleBox.top + 1);
+            // The View menu beside it is placed the same way and has the same failure.
+            await closeViews(); await openView();
+            const menuBox = viewMenu().getBoundingClientRect();
+            check(`the View menu lies whole inside a ${width} px window and is not inside the clipping pane (${Math.round(menuBox.left)}..${Math.round(menuBox.right)})`,
+              menuBox.width > 0 && menuBox.left >= edge.left - 1 && menuBox.right <= edge.right + 1 && menuBox.left >= 0 && menuBox.top >= 0
+              && menuBox.right <= innerWidth && menuBox.bottom <= innerHeight && !viewMenu().closest(".gp-pane"));
+            await closeView();
+          }
+        } finally { frame.style.width = ""; await settle(350); await closeViews(); }
+      }
       await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();
       button("List").click(); await settle(150);
       await click("Clear filters");
@@ -3614,12 +3701,12 @@ if (params.has("check")) {
       guardStep = "claims: membership retry";
       failWorkspaceGet = true;
       workspaceTab("Developer tools").click(); await wait(() => root.querySelector(".banner.error"));
-      check("a failed workspace membership read is reported with a Retry", /membership offline/.test(root.querySelector(".banner.error").textContent) && Boolean(button("Retry", root.querySelector(".banner.error"))));
+      check("a failed workspace membership read is reported with Try again", /membership offline/.test(root.querySelector(".banner.error").textContent) && Boolean(button("Try again", root.querySelector(".banner.error"))));
       failWorkspaceGet = false;
       const getsBeforeRetry = workspaceGets;
-      button("Retry", root.querySelector(".banner.error")).click();
+      button("Try again", root.querySelector(".banner.error")).click();
       await wait(() => !root.querySelector(".banner.error"));
-      check("Retry reads the workspace membership again, not just the board", workspaceGets > getsBeforeRetry);
+      check("Try again reads the workspace membership again, not just the board", workspaceGets > getsBeforeRetry);
       button("All", scopes).click(); await settle(400);
     } catch (error) { check(`the board claim checks ran to the end (${error.message} at ${guardStep})`, false); }
 
@@ -3702,7 +3789,7 @@ if (params.has("check")) {
         const fromLabel = labels[subject().priority] ?? "Normal";
         await toAll();
         organizeCalls.length = 0; organizeMode = "ok";
-        check("Organise asks nothing until it is pressed", organizeCalls.length === 0 && !panel() && toggle().getAttribute("aria-pressed") === "false");
+        check("Organize asks nothing until it is pressed", organizeCalls.length === 0 && !panel() && toggle().getAttribute("aria-pressed") === "false");
         toggle().click(); await wait(() => idle() && row());
         check("pressing it asks once and shows the change, its reason, and that nothing is written yet",
           organizeCalls.length === 1 && !("repository_id" in organizeCalls[0])
@@ -3733,7 +3820,7 @@ if (params.has("check")) {
         tasks = tasks.map(task => task.id === "task-3" ? snapshot : task);
         await click("Refresh");
         await wait(() => boardRefresh() && boardRefresh().disabled === false && card("task-3"));
-      } catch (error) { check(`the Organise checks ran to the end (${error.message} at ${step})`, false); }
+      } catch (error) { check(`the Organize checks ran to the end (${error.message} at ${step})`, false); }
       finally {
         organizeMode = "ok";
         const panel = root.querySelector('[data-testid="task-organize"]');
@@ -3832,7 +3919,7 @@ if (params.has("check")) {
 
       try {
         step = "scope labels";
-        const navButtons = [...scopesNav().querySelectorAll("button.gp-seg-btn")];
+        const navButtons = [...scopesNav().querySelectorAll("button.nav-scope")];
         const label = btn => btn.querySelector(":scope > span:not(.gp-liquid-selection)");
         check("every scope button keeps its name in a label span, with no loose text beside it",
           navButtons.length >= 3 && navButtons.every(btn => label(btn)?.textContent.trim() && [...btn.childNodes].filter(node => node.nodeType === 3).every(node => !node.textContent.trim())));
@@ -3842,6 +3929,65 @@ if (params.has("check")) {
             Boolean(picked?.querySelector(".gp-liquid-selection")) && getComputedStyle(label(picked)).position === "relative");
         }
       } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
+
+      // The navigator is a docked rail (a tonal step, no outline, no glass), moves by keyboard,
+      // and gives the board its width back — collapsed or narrow — as an overlay opened from the toolbar.
+      const appBox = document.getElementById("app");
+      try {
+        step = "navigator rail";
+        const nav = scopesNav();
+        const style = getComputedStyle(nav);
+        check("the docked navigator is a rail: no outline, no corner radius, no glass",
+          style.borderTopWidth === "0px" && style.borderTopLeftRadius === "0px" && !nav.classList.contains("gp-glass"));
+        const toggle = () => root.querySelector('[data-testid="task-nav-toggle"]');
+        const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
+        const press = (el, key, init = {}) => el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));
+        const rows = () => [...scopesNav().querySelectorAll(".nav-scope")];
+        rows()[0].focus(); press(document.activeElement, "ArrowDown");
+        check("ArrowDown moves focus to the next scope row", document.activeElement === rows()[1]);
+        press(document.activeElement, "End");
+        check("End jumps to the last scope row", document.activeElement === rows().at(-1));
+        press(document.activeElement, "ArrowDown");
+        check("ArrowDown stays on the last row", document.activeElement === rows().at(-1));
+        press(document.activeElement, "Home");
+        check("Home jumps to the first scope row", document.activeElement === rows()[0]);
+        const firstSpace = scopesNav().querySelector("[data-workspace-row] > .nav-scope");
+        firstSpace.focus(); press(firstSpace, "ArrowUp", { altKey: true }); await settle(100);
+        check("Alt+ArrowUp on the first workspace is the reorder shortcut, not row navigation: focus stays put", document.activeElement === firstSpace);
+
+        step = "navigator collapse";
+        check("the toolbar offers to hide the navigator while it is docked", toggle()?.getAttribute("aria-label") === "Hide task scopes" && toggle().getAttribute("aria-expanded") === "true");
+        toggle().click(); await wait(() => !scopesNav());
+        check("hiding it removes the rail and remembers the choice", !scopesNav() && get(interfaceStore).taskNavigatorCollapsed === true && toggle().getAttribute("aria-label") === "Show task scopes");
+        toggle().click(); await wait(() => scopesNav());
+        check("Show opens the navigator as a floating overlay over the board", scopesNav().classList.contains("gp-glass") && scopesNav().classList.contains("is-overlay") && toggle().getAttribute("aria-expanded") === "true");
+        press(document.activeElement ?? document.body, "Escape"); await wait(() => !scopesNav());
+        check("Escape closes the overlay and returns focus to the toggle", !scopesNav() && (await settled(() => document.activeElement === toggle())));
+        toggle().click(); await wait(() => scopesNav());
+        document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await wait(() => !scopesNav());
+        check("a pointer press outside the overlay closes it", !scopesNav());
+        toggle().click(); await wait(() => scopesNav());
+        button("Dock the task scopes beside the board", scopesNav()).click(); await wait(() => scopesNav() && !scopesNav().classList.contains("is-overlay"));
+        check("Dock puts the navigator back beside the board and forgets the collapse", !scopesNav().classList.contains("gp-glass") && get(interfaceStore).taskNavigatorCollapsed === false);
+
+        step = "narrow board";
+        appBox.style.width = "700px"; await wait(() => !scopesNav());
+        const board = root.querySelector('[data-testid="task-board"]');
+        check("a board too narrow for a rail and three columns hides the rail", !scopesNav() && toggle()?.getAttribute("aria-label") === "Show task scopes" && board.getBoundingClientRect().width <= 700);
+        toggle().click(); await wait(() => scopesNav());
+        const overlayRows = [...scopesNav().querySelectorAll(".nav-scope")];
+        check("the overlay starts under the toolbar, so the toggle stays reachable",
+          scopesNav().getBoundingClientRect().top >= root.querySelector(".board-main header").getBoundingClientRect().bottom - 1
+          && !button("Dock the task scopes beside the board", scopesNav()));
+        overlayRows.find(row => row.textContent.trim().startsWith("Fresh space")).click();
+        await wait(() => !scopesNav());
+        check("choosing a scope in the overlay closes it and returns focus to the toggle", !scopesNav() && (await settled(() => document.activeElement === toggle())));
+        toggle().click(); await wait(() => scopesNav());
+        button("All", scopesNav()).click(); await wait(() => !scopesNav());
+        appBox.style.width = ""; await wait(() => scopesNav());
+        check("widening the window docks the rail again", Boolean(scopesNav()) && !scopesNav().classList.contains("is-overlay"));
+      } catch (error) { check(`the navigator rail checks ran to the end (${error.message} at ${step})`, false); }
+      finally { appBox.style.width = ""; interfaceStore.setTaskNavigatorCollapsed(false); await settle(200); }
 
       try {
         step = "sheet controls";
@@ -3911,7 +4057,7 @@ if (params.has("check")) {
       const applyBefore = applyCalls().length;
       rq("task-refine-apply").click(); await settle(100);
       check("a click on a disabled Apply writes nothing and the typed title is still there", applyCalls().length === applyBefore && field("Title").value === "Typed but not saved");
-      await click("Reload saved"); await wait(() => !rq("task-refine-apply").disabled);
+      await click("Refresh saved"); await wait(() => !rq("task-refine-apply").disabled);
       check("once the edits are discarded Apply is available again", !rq("task-refine-apply").disabled);
 
       // -- More than 25 related tasks: the review accumulates, so 'anyway' succeeds.
@@ -3936,7 +4082,7 @@ if (params.has("check")) {
       failGetTaskId = "task-1";
       rq("task-refine-apply").click(); await wait(() => rq("task-refine-message"));
       failGetTaskId = "";
-      check("an apply whose re-read fails is reported as applied, not as an error", /^Applied/.test(rq("task-refine-message").textContent) && /could not be re-read/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
+      check("an apply whose re-read fails is reported as applied, not as an error", /^Applied/.test(rq("task-refine-message").textContent) && /Couldn't re-read the task/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
       check("that apply wrote exactly once", applyCalls().length === callsBefore + sentSizes.length + 1);
       await closeSheet();
 

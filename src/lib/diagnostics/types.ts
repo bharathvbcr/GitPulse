@@ -21,7 +21,7 @@ export interface PersistedLog {
  * whoever reads the report — and only one of them means nothing went wrong.
  */
 export function unreadablePersistedLog(reason: string): PersistedLog {
-  return { path: "", lines: [], degraded: `could not be read: ${reason}` };
+  return { path: "", lines: [], degraded: `couldn't be read: ${reason}` };
 }
 
 /**

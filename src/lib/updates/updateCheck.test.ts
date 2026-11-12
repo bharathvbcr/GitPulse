@@ -81,7 +81,7 @@ describe("describeUpdateCheck", () => {
       result({ updateAvailable: false, latestVersion: "0.0.3" }),
     );
     expect(current.kind).toBe("current");
-    expect(current.message).not.toContain("Could not");
+    expect(current.message).not.toContain("Couldn't");
   });
 
   it("names both versions when an update exists", () => {

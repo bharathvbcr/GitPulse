@@ -43,6 +43,7 @@ pub mod logging;
 pub mod lru_map;
 pub mod markdown;
 pub mod mcp;
+pub mod native_rendering;
 pub mod ndjson;
 pub mod ops;
 pub mod output;
@@ -386,6 +387,7 @@ pub fn run() {
             workbench::cmd_workbench_launch_terminal,
             workbench::cmd_inbox_decompose_task,
             host_platform::cmd_host_platform,
+            native_rendering::cmd_native_rendering_apply,
             browser::commands::cmd_browser_open,
             browser::commands::cmd_browser_set_bounds,
             browser::commands::cmd_browser_set_visible,

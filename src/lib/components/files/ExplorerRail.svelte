@@ -40,7 +40,7 @@
   </div>
   {#if searchMounted}
     <div
-      class="flex-1 min-h-0 flex flex-col border-r border-border/70 bg-surface/50"
+      class="flex-1 min-h-0 flex flex-col bg-surface/50"
       class:hidden={rail !== "search"}
     >
       <!-- A hit opens the way a click in the tree does (preview, and on a

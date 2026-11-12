@@ -9,7 +9,6 @@
   import {
     automaticUpdates,
     enhancementConfiguration,
-    explainError,
     ACTIVE_ENHANCEMENT_STATES,
     getEnhancement,
     latestEnhancement,
@@ -50,6 +49,8 @@
   import { openManviFocus } from "../ui/openManviFocus";
   import { askConfirm } from "../stores/modalStore";
   import SettingToggle from "./SettingToggle.svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import { describeFailure } from "../ui/copy/describeFailure";
 
   let {
     task,
@@ -241,7 +242,7 @@
    * act on, so the review prints this instead of only greying out.
    */
   const acceptBlock = $derived(
-    dirty ? "Save or reload your edits before accepting a suggestion."
+    dirty ? "Save or discard your edits before accepting a suggestion."
       : stale ? "This suggestion is for an older task revision. Ask again to apply it."
       : "",
   );
@@ -295,6 +296,12 @@
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
   const expiredLive = $derived(Boolean(proposal && liveEnhancement(proposal, now) && now >= proposal.expires_at));
+
+  /** "Couldn't <verb> <object>. <Reason>." for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
 
   function toggleField(field: EnhancementField, on: boolean) {
     if (acting || disabled || lockedFields.includes(field)) return;
@@ -415,7 +422,7 @@
       configuration = config;
       configurationError = null;
     } catch (cause) {
-      if (!disposed && selectionKey === JSON.stringify(liveSelection)) configurationError = explainError(cause);
+      if (!disposed && selectionKey === JSON.stringify(liveSelection)) configurationError = failure("read", "the Manvi configuration", cause);
     } finally {
       if (!disposed) configPending = false;
     }
@@ -451,7 +458,7 @@
       // Follow the newest active attempt until the reader picks one: an older
       // review on screen must not hide a run that started since.
       if (wanted && (!proposal || (!readerPicked && proposal.id !== wanted && !liveEnhancement(proposal)))) await choose(wanted);
-    } catch (cause) { if (!disposed) error = explainError(cause); }
+    } catch (cause) { if (!disposed) error = failure("read", "the suggestions", cause); }
     finally { if (!disposed) historyLoading = false; }
   }
 
@@ -476,7 +483,7 @@
       error = "";
     } catch (cause) {
       if (disposed || ticket !== selecting) return;
-      error = explainError(cause);
+      error = failure("open", "the suggestion", cause);
     } finally {
       // Snap back to the revision actually on screen. A picker still naming an
       // entry it failed to load is the same lie as a review that never
@@ -498,7 +505,7 @@
       proposal = next;
       if (task) void history();
     } catch (cause) {
-      if (!disposed && ticket === epoch) error = `Status refresh failed: ${explainError(cause)}`;
+      if (!disposed && ticket === epoch) error = failure("refresh", "the suggestion status", cause);
     } finally { polling = false; }
   }
 
@@ -530,7 +537,7 @@
       if (result.task) onApplied(result.task);
       note = "Enhancement action confirmed.";
       if (task) await history();
-    } catch (cause) { if (!disposed) error = explainError(cause); }
+    } catch (cause) { if (!disposed) error = failure("confirm", "the action", cause); }
     finally { if (!disposed) { needsReconcile = action.pending !== null; busy = false; } }
   }
 
@@ -559,12 +566,12 @@
       const saved = quick ? task : await prepareTask();
       if (disposed) return;
       if (!saved) {
-        if (!error) error = gate ?? `Could not save a draft for ${engineName}.`;
+        if (!error) error = gate ?? `Couldn't save a draft for ${engineName}.`;
         return;
       }
       if (engine !== "apple") {
         if (!configuration) {
-          error = configurationError ?? "Manvi configuration has not been loaded.";
+          error = configurationError ?? "Couldn't read the Manvi configuration.";
           return;
         }
         if (!liveSelection) {
@@ -603,7 +610,7 @@
         : `${engineName} is drafting title and description.`;
       await history();
     } catch (cause) {
-      if (!disposed) error = explainError(cause);
+      if (!disposed) error = failure("draft", "the suggestion", cause);
     } finally {
       if (!disposed) { needsReconcile = action.pending !== null; busy = false; }
     }
@@ -649,7 +656,7 @@
         note = method === "enhancements.revise" ? "Suggestion saved. The task has not changed." : labels[proposal.state];
       }
       await history();
-    } catch (cause) { if (!disposed) { error = explainError(cause); needsReconcile = action.pending !== null; } }
+    } catch (cause) { if (!disposed) { error = failure(method === "enhancements.accept" ? "apply" : method === "enhancements.undo" ? "undo" : "update", "the suggestion", cause); needsReconcile = action.pending !== null; } }
     finally { if (!disposed) busy = false; }
   }
 
@@ -664,8 +671,8 @@
     }
     if (method === "enhancements.recover") {
       if (!await askConfirm({
-        title: "Release this expired attempt?",
-        message: "Its provider outcome is unknown. Starting again may create another model call.",
+        title: "Release this expired run?",
+        message: "Its provider outcome is unknown. Starting again may make another model call.",
         confirmLabel: "Release",
         cancelLabel: "Keep waiting",
         destructive: true,
@@ -696,7 +703,7 @@
     <label class="notes-label">
       <span class="sr-only">{compose ? "What do you need?" : "Improve this task"}</span>
       <textarea
-        class="gp-field"
+        class="gp-field-multi"
         value={notes}
         maxlength="65536"
         rows="4"
@@ -735,13 +742,15 @@
       {#if confirmedModel}
         <p class="meta">Using {confirmedModel}</p>
       {:else}
-        <p class="warn">Pick a local model in Local model servers</p>
+        <p class="warn text-warn">Pick a local model in Local model servers</p>
       {/if}
-      <button type="button" class="change-link" title={manviFocusHint("model")} onclick={() => openManviFocus("model")}>Change</button>
+      <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" data-testid="manvi-change-model" title={manviFocusHint("model")} onclick={() => openManviFocus("model")}>Change</button>
     </div>
     {#if configurationError}
-      <p class="warn">{configurationError}</p>
-      <button type="button" class="gp-btn" disabled={configPending || acting || disabled} onclick={() => void loadConfig()}>Retry Manvi configuration</button>
+      <div class="gp-notice" data-tone="unknown" role="status">
+        <span class="min-w-0 flex-1">{configurationError}</span>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={configPending || acting || disabled} onclick={() => void loadConfig()}>Try again</button>
+      </div>
     {/if}
   {/if}
   {#if appleOffered && requestedEngine === "apple" && !appleReady(apple)}
@@ -762,16 +771,16 @@
   {#if !manviGate.ok && (manviReady || engine === "apple") && !gate}<p class="warn">{manviGate.reason}</p>{/if}
   {#if engine === "apple" && !appleAsk.ok && !gate && appleReady(apple)}<p class="warn">{appleAsk.reason}</p>{/if}
 
-  <button type="button" class="gp-btn-primary ask" disabled={askDisabled} title={gate ?? (engine === "apple" ? appleAsk.reason : fieldReason)} onclick={() => void generate()}>
+  <button type="button" class="gp-btn ask" data-variant="primary" data-size="md" disabled={askDisabled} title={gate ?? (engine === "apple" ? appleAsk.reason : fieldReason)} onclick={() => void generate()}>
     <Sparkles size={12} />
     {askLabel}
   </button>
   {#if askDisabled && !notes.trim() && !title.trim() && !task && !quick}
     <p class="meta">Type a few sentences, then draft. Or fill a title to improve an existing one.</p>
   {/if}
-  {#if needsReconcile}<p class="warn" role="status">The result is uncertain. Retry the same action before editing or closing.</p><button type="button" class="gp-btn" disabled={busy || disabled} onclick={() => void retry()}>Retry pending action</button>{/if}
-  {#if ready && (dirty || stale)}<p class="warn">{dirty ? "Save or reload your edits before accepting a suggestion." : "This suggestion is for an older task revision. Request a fresh suggestion."}</p>{/if}
-  {#if error}<p role="alert" class="error">{error}</p>{/if}
+  {#if needsReconcile}<div class="gp-notice" data-tone="unknown" role="status"><span class="min-w-0 flex-1">Couldn't confirm the result. Try again with the same action before editing or closing.</span><button type="button" class="gp-btn shrink-0" data-size="sm" disabled={busy || disabled} onclick={() => void retry()}>Try again</button></div>{/if}
+  {#if ready && (dirty || stale)}<p class="warn">{dirty ? "Save or discard your edits before accepting a suggestion." : "This suggestion is for an older task revision. Request a fresh suggestion."}</p>{/if}
+  {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
   {#if proposal && liveEnhancement(proposal, now)}
     <p class="meta" role="status">
@@ -780,9 +789,9 @@
     </p>
   {/if}
   {#if proposal?.state === "failed" || proposal?.state === "cancelled" || proposal?.failure}
-    <p class="error" role="alert">{failureAdvice?.guidance ?? proposal?.failure}</p>
+    <div class="gp-notice" data-tone="danger" role="alert">{failureAdvice?.guidance ?? proposal?.failure}</div>
     {#if /expired/i.test(proposal?.failure ?? "") || proposal?.state === "failed"}
-      <button type="button" class="gp-btn" disabled={acting || disabled} onclick={clearExpired}>Start again</button>
+      <button type="button" class="gp-btn" data-size="sm" disabled={acting || disabled} onclick={clearExpired}>Start again</button>
     {/if}
   {/if}
   {#if proposal?.rationale && ready}<p class="meta">{proposal.rationale}</p>{/if}
@@ -816,7 +825,7 @@
           onchange={(event) => void pick(event.currentTarget.value)}
         >
           {#if historyLoading && !entries.length}
-            <option value="">Loading suggestions…</option>
+            <option value="">Reading suggestions…</option>
           {:else if !entries.length}
             <option value="">No suggestions yet</option>
           {/if}
@@ -832,8 +841,8 @@
       {#if cursor}<button type="button" class="gp-btn" disabled={historyLoading || controlsLocked} onclick={() => history(true)}>Load more</button>{/if}
     </div>
     <p id="assist-history-count-{uid}" class="meta">
-      {#if selectPending}Loading suggestion…
-      {:else if !entries.length}{historyLoading ? "Loading suggestions…" : "No suggestions for this task yet."}
+      {#if selectPending}Reading the suggestion…
+      {:else if !entries.length}{historyLoading ? "Reading suggestions…" : "No suggestions for this task yet."}
       {:else}Showing {entries.length} of {total}{/if}
     </p>
 
@@ -855,7 +864,7 @@
           {#if proposal.state === "ready" || proposal.state === "accepted" || proposal.state === "undone"}
             {#each proposal.fields as field}
               <div class="field-review">
-                <label class="check" class:advanced-hidden={quick && !chooseFields}>
+                <div class="check" class:advanced-hidden={quick && !chooseFields} oninput={(event) => event.stopPropagation()} onchange={(event) => event.stopPropagation()}>
                   <!-- Both `input` and `change` are stopped, because a checkbox
                        click fires both and the sheet marks the task dirty from
                        either one anywhere inside its form. Which fields a
@@ -863,21 +872,20 @@
                        to bubble, ticking this box marked the draft unsaved, and
                        the unsaved-edits guard then refused the very acceptance
                        the box was selecting. -->
-                  <input class="gp-field" type="checkbox" checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} oninput={(event) => event.stopPropagation()} onchange={(event) => { event.stopPropagation(); toggleSelected(field, event.currentTarget.checked); }} />
-                  {field === "title" ? "Title" : "Description"}
-                </label>
+                  <Checkbox label={field === "title" ? "Title" : "Description"} checked={proposal.state === "ready" ? selected.includes(field) : proposal.accepted_fields.includes(field)} disabled={disabled || controlsLocked || proposal.state !== "ready" || lockedFields.includes(field)} onchange={(next) => toggleSelected(field, next)} />
+                </div>
                 {#if quick && !chooseFields}<h4>{field === "title" ? "Title" : "Description"}</h4>{/if}
                 <details open={!quick}><summary>Original task</summary><pre>{proposal.source[field]}</pre></details>
                 {#if proposal.edited_fields.includes(field)}<small>Original suggestion</small><pre>{proposal.original_proposed?.[field]}</pre>{/if}
                 <small>{proposal.edited_fields.includes(field) ? "Edited suggestion" : "Suggestion"}</small>
                 <pre class="suggestion">{proposal.proposed[field]}</pre>
-                {#if editing}<label>Revised {field}<textarea class="gp-field" bind:value={revisionDraft[field]} rows={field === "title" ? 2 : 5} maxlength={field === "title" ? 300 : 65536} disabled={acting || lockedFields.includes(field)}></textarea></label>{/if}
+                {#if editing}<label oninput={(event) => event.stopPropagation()} onchange={(event) => event.stopPropagation()}>Revised {field}<textarea class="gp-field-multi" bind:value={revisionDraft[field]} rows={field === "title" ? 2 : 5} maxlength={field === "title" ? 300 : 65536} disabled={acting || lockedFields.includes(field)}></textarea></label>{/if}
               </div>
             {/each}
           {/if}
           <div class="actions">
             {#if editing}
-              <button class="gp-btn-primary" type="button" disabled={acting || !revisionDirty || (proposal.fields.includes("title") && !revisionDraft.title?.trim())} onclick={() => void saveSuggestion()}>Save suggestion edits</button>
+              <button class="gp-btn" data-variant="primary" data-size="md" type="button" disabled={acting || !revisionDirty || (proposal.fields.includes("title") && !revisionDraft.title?.trim())} onclick={() => void saveSuggestion()}>Save suggestion edits</button>
               <button type="button" class="gp-btn" disabled={acting} onclick={() => { editing = false; revisionDraft = {}; }}>Discard suggestion edits</button>
             {/if}
             {#if proposal.state === "ready"}
@@ -890,7 +898,7 @@
                    but the sheet also disabled on `acting`, which is transient
                    and has no sentence to show, so that stays with
                    `controlsLocked` where it belongs. -->
-              <button class="gp-btn-primary" type="button" disabled={Boolean(acceptBlock) || disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
+              <button class="gp-btn" data-variant="primary" data-size="md" type="button" disabled={Boolean(acceptBlock) || disabled || controlsLocked || !selected.length} onclick={() => act("enhancements.accept")}>{quick ? "Apply enhancement" : "Accept selected fields"}</button>
               {#if quick}<button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => { chooseFields = !chooseFields; }}>{chooseFields ? "Hide field choices" : "Choose fields"}</button>{/if}
               <button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={editSuggestion}>Edit suggestion</button>
             {/if}
@@ -900,7 +908,7 @@
               <button type="button" class="gp-btn" disabled={disabled || controlsLocked} onclick={() => act("enhancements.dismiss")}>{proposal.state === "running" ? "Cancel" : "Dismiss"}</button>
             {/if}
             {#if ["running", "cancel_requested"].includes(proposal.state) && now >= proposal.expires_at}
-              <button type="button" class="gp-btn" disabled={disabled || acting} onclick={() => act("enhancements.recover")}>Resolve uncertain attempt</button>
+              <button type="button" class="gp-btn" disabled={disabled || acting} onclick={() => act("enhancements.recover")}>Resolve uncertain run</button>
             {/if}
           </div>
         </article>
@@ -909,38 +917,34 @@
 </section>
 
 <style>
-  .manvi-assist{margin:0 0 16px;padding:12px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
+  .manvi-assist{margin:0 0 16px;padding:12px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-lg)}
   .manvi-assist.quick{margin-top:8px;padding-top:8px;border:0;border-radius:0;padding-left:0;padding-right:0}
   .assist-head{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px}
-  .assist-title{margin:0;font-size:12px;font-weight:650}
-  .assist-hint,.meta{margin:4px 0 0;font-size:11px;color:rgb(var(--c-text-muted));line-height:1.45}
+  .assist-title{margin:0;font-size:var(--text-xs);font-weight:600}
+  .assist-hint,.meta{margin:4px 0 0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));line-height:1.45}
   .notes-label{display:block;margin:8px 0}
-  textarea,pre{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
-  textarea{resize:vertical}
+  pre{width:100%;padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
+  textarea{resize:vertical;width:100%;min-width:0}
   .field-picks{margin:0 0 8px}
   .engine-picks{margin:0 0 8px}
-  .engine-badge{margin-left:5px;font-size:9px;opacity:.75}
+  .engine-badge{margin-left:5px;font-size:var(--text-micro);opacity:.75}
   .ask{margin-top:8px}
-  label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:12px}
-  input,textarea{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}
+  label{display:flex;flex-direction:column;gap:6px;margin:12px 0 8px;font-size:var(--text-xs)}
   .actions,.history-row,.model-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .model-row{justify-content:space-between;margin:4px 0 8px}
-  .change-link{background:none;border:0;color:rgb(var(--c-accent));font-size:11px;padding:0;cursor:pointer;text-decoration:underline}
   .locks{margin:4px 0 8px}
-  .error{color:#dc6565}
-  .warn{color:#d4a017;font-size:11px;margin:4px 0}
-  .history-row{margin-top:12px;border-top:1px solid rgb(var(--c-border) / 0.55);padding-top:10px}
+  .manvi-assist :global(.gp-notice){margin:8px 0 0;display:flex;align-items:center;gap:8px}
+  .warn{font-size:var(--text-meta);margin:4px 0}
+  .history-row{margin-top:12px;padding-top:10px}
   /* The picker takes the row's slack so a long label ellipsises rather than
      pushing Refresh and Load more onto their own line. */
   .history-label{flex:1;min-width:8rem;margin:0}
   .history-label select{width:100%}
   .field-review{margin:12px 0}
-  .check{flex-direction:row;align-items:center;gap:7px}
-  .check input{width:auto}
+  .check{margin:0}
   .advanced-hidden{display:none}
-  h3{font-size:13px;margin:14px 0 4px}
-  h4{font-size:12px;margin:10px 0 6px}
-  pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;font:12px/1.5 inherit;margin:4px 0 8px}
+  h3{font-size:var(--text-sm);font-weight:600;margin:14px 0 4px}
+  h4{font-size:var(--text-xs);font-weight:600;margin:10px 0 6px}
+  pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:170px;overflow:auto;font:var(--text-xs)/1.5 inherit;margin:4px 0 8px}
   .suggestion{border-left:3px solid rgb(var(--c-accent))}
-  .actions button{padding:6px 9px;border:1px solid rgb(var(--c-border));border-radius:6px}
 </style>

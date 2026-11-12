@@ -31,7 +31,7 @@
     const next = await readAttemptReview(run.id);
     // Counted with the review so "Uncommitted files" is offered for what is there; a count that fails is unknown, not zero.
     const count = await attemptDirtyFiles(run).catch((cause: unknown) => {
-      diagnostics.warn("attempt-review", `Uncommitted files of ${run.cwd} could not be counted: ${formatDiagnosticFailure(cause)}`);
+      diagnostics.warn("attempt-review", `Uncommitted files of ${run.cwd} couldn't be counted: ${formatDiagnosticFailure(cause)}`);
       return null;
     });
     if (!disposed) dirty = count;
@@ -86,7 +86,7 @@
         <span data-testid="attempt-no-commits">This run has not committed anything.</span>
       {/if}
       {#if dirty === null || dirty > 0}
-        <button class="gp-btn" type="button" onclick={viewUncommitted} disabled={busy} data-testid="attempt-view-uncommitted" title={dirty === null ? "The uncommitted files could not be counted." : "Opens the files this run left uncommitted. The review does not cover them."}>Uncommitted files{dirty === null ? "" : ` (${dirty})`}</button>
+        <button class="gp-btn" type="button" onclick={viewUncommitted} disabled={busy} data-testid="attempt-view-uncommitted" title={dirty === null ? "The uncommitted files couldn't be counted." : "Opens the files this run left uncommitted. The review does not cover them."}>Uncommitted files{dirty === null ? "" : ` (${dirty})`}</button>
       {/if}
     </div>
     {#each notices as notice}<div class="gp-notice" data-tone="warn" role="alert" data-testid="attempt-diff-notice">{notice}</div>{/each}

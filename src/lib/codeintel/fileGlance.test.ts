@@ -64,7 +64,7 @@ describe("fileGlance says what was found, not what the struct holds", () => {
   });
 
   it("names an unparseable file", () => {
-    expect(glanceOf({ parse_status: "Fallback" })).toBe("could not be parsed (fallback)");
+    expect(glanceOf({ parse_status: "Fallback" })).toBe("couldn't be parsed (fallback)");
   });
 
   it("names a missing delta", () => {

@@ -5,6 +5,7 @@ import {
   TerminalTimeoutError, createTerminalInput, sessionIsGone, terminalDeadline, type DeadlineClock,
 } from "./inputQueue";
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
+import { TASK_TERMINAL_STARTING } from "./sessionMessages";
 import type { LauncherKind } from "./tabs";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
@@ -224,7 +225,7 @@ export function createSessionLifecycle(options: {
     try {
       kept = await terminalDeadline(transport.detach(target), CONTROL_QUICK_MS, "Detaching terminal", { clock: options.clock, pauseWhileHidden: true });
     } catch (error) {
-      if (id === target) slot?.update(`Still running; its view closed but it could not be detached. ${String(error)}`);
+      if (id === target) slot?.update(`Still running; its view closed but it couldn't be detached. ${String(error)}`);
       throw error;
     }
     // Not kept: it had already ended, and its exit (still subscribed) releases.
@@ -278,7 +279,7 @@ export function createSessionLifecycle(options: {
       watchdog = setTimeout(() => {
         timedOut = !options.singleAttempt;
         state("error", options.singleAttempt
-          ? "Task terminal launch is still pending. Reconnect waits for this same attempt."
+          ? TASK_TERMINAL_STARTING
           : "Starting terminal timed out; awaiting native cleanup");
       }, 15000);
       const spawned = await transport.spawn();
@@ -361,7 +362,7 @@ export function createSessionLifecycle(options: {
     if (starting) return starting;
     if (disposed || (id && !reconnect)) return Promise.resolve();
     if (options.singleAttempt && attemptEnded) {
-      state("error", "This attempt ended. Launch a new attempt from the task details.");
+      state("error", "This run ended. Start another run from the task details.");
       return Promise.resolve();
     }
     starting = launch(reconnect).finally(() => { starting = null; });

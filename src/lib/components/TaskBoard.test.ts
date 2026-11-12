@@ -53,6 +53,20 @@ describe("TaskBoard source contracts", () => {
     expect(source).not.toContain("<VirtualList");
   });
 
+  it("keeps its controls on the shared owners instead of scoped widget classes", () => {
+    expect(source).toContain('import Checkbox from "./Checkbox.svelte"');
+    for (const dialect of ["archive-toggle", "hint-action", "chip-remove", "class=\"tab-close\"", "agents-chip", "gp-pill", "gp-btn-primary", "gp-btn-danger", 'class="link"']) {
+      expect(source, `${dialect} is a retired dialect`).not.toContain(dialect);
+    }
+    expect(source).toContain('data-testid="card-agents"');
+    expect(source).toContain('data-testid="task-hidden-toggle"');
+  });
+
+  it("words its failures through describeFailure and none through the retired verbs", () => {
+    expect(source).toContain("describeFailure({ verb, object }");
+    expect(source).not.toMatch(/>\s*(Retry|Organise)[^<]*</);
+  });
+
   it("asks through the in-app dialog, never the native confirm", () => {
     expect(source).not.toContain("window.confirm");
   });

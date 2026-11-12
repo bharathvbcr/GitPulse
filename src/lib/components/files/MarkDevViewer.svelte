@@ -163,7 +163,7 @@
 
   async function handleCopySource() {
     if (!(await copyText(rawContent))) {
-      repoStore.setError("Could not copy to clipboard");
+      repoStore.setError("Couldn't copy to clipboard");
       return;
     }
     copiedSource = true;
@@ -208,7 +208,7 @@
 {#snippet page()}
   {#if renderError}
     <div class="gp-md-notice" role="status">
-      <span>Could not render this note: {renderError}. The Raw view shows its source.</span>
+      <span>Couldn't render this note. {renderError} The Raw view shows its source.</span>
     </div>
   {/if}
   {#if rendered.omittedBytes > 0}
@@ -232,27 +232,29 @@
 
 <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
   <!-- MarkDev Integrated Header Toolbar -->
-  <div class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/80 select-none" data-tip-place="above">
+  <div class="relative shrink-0 bg-surface/80 select-none" data-tip-place="above">
     <div bind:this={markdevBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
     <!-- Left: MarkDev Brand & Outline Toggle -->
     <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-border/70 shadow-xs">
+      <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-edge shadow-xs">
         <MarkDevLogo size={15} />
-        <span class="font-bold text-textPrimary tracking-tight text-[11px]">MarkDev</span>
-        <span class="text-[9px] font-mono uppercase px-1 py-0.2 rounded bg-accent/20 text-accent font-semibold">.MD</span>
+        <span class="font-semibold text-textPrimary text-meta">MarkDev</span>
+        <span class="gp-chip font-mono" data-tone="accent" data-kind="count">.MD</span>
       </div>
 
       {#if outline.length > 0}
         <button
           type="button"
           onclick={() => (showOutline = !showOutline)}
-          title="{showOutline ? 'Hide' : 'Show'} Table of Contents"
-          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] {showOutline ? 'border-accent/60 bg-accent/15 text-accent font-semibold' : ''}"
+          aria-pressed={showOutline}
+          title="{showOutline ? 'Hide' : 'Show'} table of contents"
+          class="gp-btn text-meta {showOutline ? 'border-accent/65 bg-accent/15 text-accent font-semibold' : ''}"
+          data-size="sm"
         >
           <ListTree size={12} />
           <span>Outline</span>
-          <span class="text-[10px] opacity-60 font-mono">({outline.length})</span>
+          <span class="text-micro text-faint font-mono">({outline.length})</span>
         </button>
       {/if}
     </div>
@@ -265,7 +267,7 @@
         aria-pressed={viewMode === "rendered"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "rendered"}
-        title="Rendered View: Formatted Markdown with rich blocks"
+        title="Rendered view: formatted Markdown with rich blocks"
       >
         <Eye size={12} />
         <span>Rendered</span>
@@ -277,7 +279,7 @@
         aria-pressed={viewMode === "split"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "split"}
-        title="Split View: Raw source code and live preview side-by-side"
+        title="Split view: raw source and live preview side by side"
       >
         <Columns size={12} />
         <span>Split</span>
@@ -289,7 +291,7 @@
         aria-pressed={viewMode === "raw"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "raw"}
-        title="Raw View: Source code editor with line numbers and find"
+        title="Raw view: source editor with line numbers and find"
       >
         <Code size={12} />
         <span>Raw</span>
@@ -299,15 +301,17 @@
     <!-- Right: Stats Pill & Open in MarkDev / Actions -->
     <div class="flex items-center gap-1.5 shrink-0">
       <!-- Reading Stats Pill -->
-      <div class="hidden md:flex items-center gap-2 px-2.5 py-0.5 rounded-full bg-surface border border-border/60 text-[10px] font-mono text-textMuted select-none">
-        <span class="flex items-center gap-1">
-          <BookOpen size={10} class="text-accent" />
-          <span>{stats.wordCount} words</span>
-        </span>
-        <span class="text-textMuted/40">•</span>
-        <span class="flex items-center gap-1">
-          <Clock size={10} class="text-amber-400" />
-          <span>~{stats.readingTimeMinutes} min</span>
+      <div class="hidden md:block select-none">
+        <span class="gp-chip gap-2 font-mono" data-tone="neutral">
+          <span class="flex items-center gap-1">
+            <BookOpen size={10} class="text-accent" />
+            <span>{stats.wordCount} words</span>
+          </span>
+          <span class="text-faint">•</span>
+          <span class="flex items-center gap-1">
+            <Clock size={10} class="text-warn" />
+            <span>~{stats.readingTimeMinutes} min</span>
+          </span>
         </span>
       </div>
 
@@ -315,8 +319,11 @@
         <button
           type="button"
           onclick={() => (wordWrap = !wordWrap)}
-          class="gp-icon-btn p-1.5! {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
-          title="Toggle Word Wrap"
+          aria-pressed={wordWrap}
+          aria-label="Toggle word wrap"
+          class="gp-icon-btn {wordWrap ? 'text-accent bg-accent/15' : ''}"
+          data-size="sm"
+          title="Toggle word wrap"
         >
           <WrapText size={12} />
         </button>
@@ -325,12 +332,13 @@
       <button
         type="button"
         onclick={handleCopySource}
-        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px]"
-        title="Copy raw markdown text"
+        class="gp-btn text-meta"
+        data-size="sm"
+        title="Copy raw Markdown text"
       >
         {#if copiedSource}
-          <Check size={11} class="text-emerald-400" />
-          <span class="text-emerald-400 font-semibold">Copied</span>
+          <Check size={11} class="text-ok" />
+          <span class="text-ok font-semibold">Copied</span>
         {:else}
           <Copy size={11} />
           <span>Copy</span>
@@ -340,7 +348,9 @@
       <button
         type="button"
         onclick={openInMarkDev}
-        class="gp-btn-primary py-0.5! px-2.5! flex items-center gap-1 text-[11px]"
+        class="gp-btn text-meta"
+        data-variant="primary"
+        data-size="sm"
         title="Open in MarkDev desktop application or default editor"
       >
         <ExternalLink size={11} />
@@ -356,10 +366,10 @@
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
     <!-- Outline / TOC Drawer -->
     {#if showOutline && outline.length > 0}
-      <div class="w-56 shrink-0 h-full border-r border-border/70 bg-surface/50 p-3 overflow-y-auto gp-scroll select-none">
-        <div class="text-[10px] font-mono uppercase tracking-wider text-textMuted mb-2 flex items-center gap-1.5 font-bold">
+      <div class="w-56 shrink-0 h-full bg-surface/50 p-3 overflow-y-auto gp-scroll select-none">
+        <div class="gp-label mb-2 flex items-center gap-1.5">
           <Sparkles size={11} class="text-accent" />
-          <span>Document Outline</span>
+          <span>Document outline</span>
         </div>
         <div class="space-y-1">
           {#each outline as h}
@@ -370,7 +380,7 @@
               style="padding-left: {(h.level - 1) * 12 + 6}px;"
               title={h.title}
             >
-              <span class="text-[10px] font-mono text-accent/70 mr-1">{"#".repeat(h.level)}</span>
+              <span class="text-micro font-mono text-accent mr-1">{"#".repeat(h.level)}</span>
               <span>{h.title}</span>
             </button>
           {/each}
@@ -385,16 +395,16 @@
         bind:this={previewContainerEl}
         class="flex-1 min-h-0 min-w-0 p-8 overflow-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
       >
-        <div class="gp-card p-8 border-border/60 max-w-4xl mx-auto shadow-card">
+        <div class="gp-card p-8 max-w-4xl mx-auto shadow-card">
           {@render page()}
           {#if backlinks.length > 0}
-            <div class="mt-8 pt-4 border-t border-border/60">
-              <div class="text-[10px] font-mono uppercase tracking-wider text-textMuted mb-2 font-bold">
+            <div class="mt-10">
+              <div class="gp-label mb-2">
                 Backlinks ({backlinks.length})
               </div>
               <ul class="space-y-1.5">
                 {#each keyedList(backlinks, (link) => JSON.stringify([link.path, link.line, link.offset])) as { item: link, key: renderKey } (renderKey)}
-                  <li class="text-[11px]">
+                  <li class="text-meta">
                     <span class="font-mono text-accent">{link.path}</span>
                     <span class="text-textMuted"> — {link.context}</span>
                   </li>
@@ -422,7 +432,7 @@
       </div>
     {:else if viewMode === "split"}
       <!-- Side-by-Side Split View -->
-      <div class="flex-1 flex min-h-0 h-full divide-x divide-border/70">
+      <div class="flex-1 flex min-h-0 h-full gap-2">
         <!-- Left: Raw Editor Pane -->
         <div class="flex-1 min-w-0 h-full">
           <CodeViewer
@@ -444,7 +454,7 @@
           bind:this={previewContainerEl}
           class="flex-1 min-w-0 h-full p-6 overflow-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
         >
-          <div class="gp-card p-6 border-border/60 max-w-2xl mx-auto shadow-card">
+          <div class="gp-card p-6 max-w-2xl mx-auto shadow-card">
             {@render page()}
           </div>
         </div>

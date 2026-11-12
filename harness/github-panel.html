@@ -375,11 +375,10 @@
           check("waiting and requested runs are coloured as in flight, like in_progress", () =>
             !!waiting && !!requested && !!inProgress && inkOf(waiting) === inkOf(inProgress) && inkOf(requested) === inkOf(inProgress) &&
             inkOf(waiting) !== inkOf(success) && inkOf(waiting) !== inkOf(failure));
-          const darkInk = [inkOf(success), inkOf(failure), inkOf(waiting)];
           document.documentElement.classList.remove("dark");
           await wait(20);
-          check("every verdict has its own light-theme shade", () =>
-            inkOf(success) !== darkInk[0] && inkOf(failure) !== darkInk[1] && inkOf(waiting) !== darkInk[2]);
+          check("every verdict wears a status role, which the theme resolves, not a fixed shade", () =>
+            success.classList.contains("text-ok") && failure.classList.contains("text-danger") && waiting.classList.contains("text-warn"));
           document.documentElement.classList.add("dark");
           runExpander().click();
           await settle();
@@ -634,6 +633,25 @@
           await settle();
           check("a newer full context supersedes the poll's snapshot", () => runTitles()[0] === "run 1");
 
+          // ---- the timeline's Rescan is the panel's own refresh -------------------------------
+          // A context that carries rows and a run-listing error makes the timeline say it
+          // could not check. Its Rescan must be the same full read the header Refresh makes.
+          const buttons = () => $$("button", stage);
+          contexts[A].runs_error = "gh: partial run listing";
+          button("Refresh").click();
+          await until(() => !!buttons().find((b) => b.textContent.trim() === "Rescan"));
+          const rescanButton = buttons().find((b) => b.textContent.trim() === "Rescan");
+          check("a run listing that could not be checked offers Rescan on the timeline", () => Boolean(rescanButton));
+          contexts[A].runs_error = null;
+          const contextsBeforeRescan = count("cmd_github_context");
+          rescanButton.click();
+          await until(() => count("cmd_github_context") > contextsBeforeRescan);
+          await settle();
+          check("Rescan makes exactly one full context read, not a new fetch path", () =>
+            count("cmd_github_context") === contextsBeforeRescan + 1);
+          check("and a Rescan that answers clears the could-not-check notice", () =>
+            !buttons().find((b) => b.textContent.trim() === "Rescan") && runTitles()[0] === "run 1");
+
           // ---- a merge's confirmation outlives the row it came from -------------------------
           const detailOf = (n) => $(`[data-pr-detail="${n}"]`, stage);
           buttonLabelled("Show details for pull request #4").click();
@@ -670,9 +688,9 @@
           const stamp = () => text().match(/fetched [^·]*?ago|fetched just now/)?.[0] ?? "";
           contextMode = "throw";
           button("Refresh").click();
-          await until(() => text().includes("Refresh failed:"));
+          await until(() => text().includes("Couldn't refresh the remote."));
           check("a refresh that throws keeps the listings and says what failed and how old they are", () =>
-            text().includes("PR 1") && text().includes("PR 2") && text().includes("Refresh failed: gh: network is unreachable — showing data fetched"));
+            text().includes("PR 1") && text().includes("PR 2") && text().includes("Couldn't refresh the remote. gh: network is unreachable — showing data fetched"));
           check("it did not replace the pane with the bare error", () => !!section("Open pull requests") && prCards() === 3);
           check("and Refresh is clickable again, as the retry", () => !button("Refresh").disabled);
           contextMode = "error";
@@ -680,18 +698,18 @@
           await until(() => text().includes("API rate limit exceeded"));
           await settle();
           check("a refresh that gh answers with an error keeps the listings too", () =>
-            text().includes("Refresh failed: gh: API rate limit exceeded") && prCards() === 3);
+            text().includes("Couldn't refresh the remote. gh: API rate limit exceeded") && prCards() === 3);
           contextMode = "ok";
           button("Refresh").click();
-          await until(() => !text().includes("Refresh failed:"));
-          check("a refresh that works clears the failure", () => prCards() === 3 && !text().includes("Refresh failed:"));
+          await until(() => !text().includes("Couldn't refresh the remote."));
+          check("a refresh that works clears the failure", () => prCards() === 3 && !text().includes("Couldn't refresh the remote."));
           // No last-known data: the error is all there is, and Refresh is the way out of it.
           contextMode = "throw";
           await repoStore.openRepo(D);
           await until(() => text().includes("acme/delta") || text().includes("network is unreachable"));
           await settle();
           check("with nothing fetched before, a failed read is the error card, not a stale listing", () =>
-            text().includes("gh: network is unreachable") && !text().includes("PR 31") && !text().includes("Refresh failed:"));
+            text().includes("gh: network is unreachable") && !text().includes("PR 31") && !text().includes("Couldn't refresh the remote."));
           contextMode = "ok";
           button("Refresh").click();
           await until(() => text().includes("PR 31"));

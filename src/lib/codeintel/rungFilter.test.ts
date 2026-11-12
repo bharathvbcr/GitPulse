@@ -23,8 +23,8 @@ describe("rungFilter", () => {
       speculative: 9,
       filtered_out: 7,
     });
-    expect(line).toContain("filtered out by min_rung");
+    expect(line).toContain("hidden by the confidence filter");
     expect(line).toContain("2 deterministic");
-    expect(line).toContain("7 filtered out");
+    expect(line).toContain("7 hidden by the confidence filter");
   });
 });

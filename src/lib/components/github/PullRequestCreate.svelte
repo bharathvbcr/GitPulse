@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "../Checkbox.svelte";
   /**
    * Opens a pull request from the current branch with `gh pr create`.
    *
@@ -6,7 +7,7 @@
    * branch must already be on GitHub, and when it is not, gh's refusal is
    * what the reader sees. Sending goes through `confirmAndRunPrAction`.
    */
-  import { formatError } from "../../ui/formatError";
+  import { describeFailure } from "../../ui/copy/describeFailure";
   import { verdictLabel } from "../../stores/harnessStore";
   import { confirmAndRunPrAction } from "../../github/prActions";
 
@@ -51,7 +52,8 @@
       if (!result) return;
       onCreated(`${result.output || "Pull request opened."}${result.policy ? ` — ${verdictLabel(result.policy)}` : ""}`);
     } catch (err) {
-      error = formatError(err);
+      const copy = describeFailure({ verb: "open", object: "the pull request" }, err);
+      error = copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
     } finally {
       busy = false;
     }
@@ -60,21 +62,21 @@
 
 <form
   data-pr-create
-  class="mb-3 p-3 rounded-xl border border-border/60 bg-background/60 text-xs space-y-2"
+  class="mb-3 p-3 rounded-xl border border-edge bg-background/60 text-xs space-y-2"
   onsubmit={(event) => { event.preventDefault(); void submit(); }}
 >
   {#if !headBranch}
-    <div class="text-amber-600 dark:text-amber-400">HEAD is detached. Check out a branch to open a pull request from it.</div>
+    <div class="text-warn">HEAD is detached. Check out a branch to open a pull request from it.</div>
   {:else}
-    <div class="text-[11px] text-textMuted font-mono">{headBranch} → <input class="gp-field inline-block w-40 py-0.5! text-[11px]!" aria-label="Base branch" bind:value={base} disabled={busy} /></div>
+    <div class="text-meta text-textMuted font-mono">{headBranch} → <input class="gp-field inline-block w-40 text-meta!" data-size="sm" aria-label="Base branch" bind:value={base} disabled={busy} /></div>
     <input class="gp-field w-full" placeholder="Title" aria-label="Pull request title" bind:value={title} disabled={busy} />
-    <textarea class="gp-field w-full min-h-20 font-sans" placeholder="Description" aria-label="Pull request description" bind:value={body} disabled={busy}></textarea>
+    <textarea class="gp-field-multi w-full min-h-20 font-sans" placeholder="Description" aria-label="Pull request description" bind:value={body} disabled={busy}></textarea>
     <div class="flex items-center gap-3">
-      <label class="flex items-center gap-1.5 text-[11px] text-textMuted"><input type="checkbox" bind:checked={draft} disabled={busy} /> draft</label>
+      <label class="flex items-center gap-1.5 text-meta text-textMuted"><Checkbox ariaLabel="Draft" checked={draft} disabled={busy} onchange={(next) => (draft = next)} /> draft</label>
       <span class="flex-1"></span>
-      <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={onCancel} disabled={busy}>Cancel</button>
-      <button type="submit" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={!ready || busy}>Open pull request…</button>
+      <button type="button" class="gp-btn" data-size="sm" onclick={onCancel} disabled={busy}>Cancel</button>
+      <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={!ready || busy}>Open pull request…</button>
     </div>
   {/if}
-  {#if error}<div class="text-rose-400" role="alert">{error}</div>{/if}
+  {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
 </form>

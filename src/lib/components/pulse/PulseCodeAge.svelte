@@ -120,7 +120,7 @@
       <div>
         <span class="gp-label">Repository code half-life</span>
         <div class="flex items-baseline gap-2 mt-1">
-          <span class="text-3xl font-semibold text-textPrimary">{knowledge.half_life_days}</span>
+          <span class="text-display font-semibold text-textPrimary">{knowledge.half_life_days}</span>
           <span class="text-sm text-textMuted font-medium">days</span>
         </div>
         <p class="text-meta text-textMuted mt-0.5">

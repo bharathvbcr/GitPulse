@@ -21,6 +21,7 @@
   import type { AgentDefaults } from "../terminal/agentDefaults";
   import { readTerminalBackend, type TerminalBackendStatus } from "../terminal/quitChoice";
   import { formatError } from "../ui/formatError";
+  import SettingToggle from "./SettingToggle.svelte";
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -60,8 +61,7 @@
   });
 
   /** Off is stored as absence, like every other default. */
-  async function choose(input: HTMLInputElement) {
-    const next = input.checked;
+  async function choose(next: boolean) {
     if (next === chosen) return;
     const rest: AgentDefaults = { ...view.defaults };
     delete rest.keep_terminals_running;
@@ -74,7 +74,6 @@
       readBackend();
     } catch (err) {
       error = formatError(err);
-      input.checked = chosen;
     } finally {
       busy = false;
     }
@@ -85,20 +84,13 @@
 </script>
 
 <div>
-  <div class="flex items-center gap-2">
-    <label class="text-textPrimary text-[11px] flex-1 min-w-0" for="gp-keep-terminals">
-      Keep terminals running when GitPulse quits
-    </label>
-    <input
-      id="gp-keep-terminals"
-      type="checkbox"
-      data-testid="keep-terminals"
-      disabled={busy}
-      checked={chosen}
-      onchange={(event) => void choose(event.currentTarget)}
-    />
-  </div>
-  <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid="keep-terminals-note">
+  <SettingToggle
+    label="Keep terminals running when GitPulse quits"
+    disabled={busy}
+    checked={chosen}
+    onchange={(next) => void choose(next)}
+  />
+  <p class="text-textMuted text-micro leading-snug mt-1" data-testid="keep-terminals-note">
     Terminals and the agents in them run in a process of their own, so quitting GitPulse — or GitPulse crashing — does not end
     them. The next launch lists them, shows what they printed meanwhile, and records any that finished. Quitting asks whether to
     stop them or leave them running. Managed agent runs (Codex and Claude driven by Manvi) are kept the same way when the
@@ -109,26 +101,26 @@
   </p>
   {#if backend?.managed}
     <p
-      class="text-[10px] leading-snug mt-1 {backend.managed.requested && !backend.managed.hosted ? 'text-amber-600 dark:text-amber-400' : 'text-textMuted'}"
+      class="text-micro leading-snug mt-1 {backend.managed.requested && !backend.managed.hosted ? 'text-warn' : 'text-textMuted'}"
       data-testid="keep-managed-status"
     >
       {backend.managed.detail}
     </p>
   {/if}
   {#if backendError}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
+    <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
-      <span data-testid="keep-terminals-backend-error">Could not read which process holds the terminals: {backendError}</span>
+      <span data-testid="keep-terminals-backend-error">Couldn't read which process holds the terminals. {backendError}</span>
     </div>
   {/if}
   {#each backend?.trouble ?? [] as trouble (trouble)}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
+    <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
       <span data-testid="keep-terminals-trouble">{trouble}</span>
     </div>
   {/each}
   {#if error}
-    <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
+    <div class="flex items-start gap-1.5 text-warn text-micro mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />
       <span data-testid="keep-terminals-error">{error}</span>
     </div>

@@ -11,10 +11,10 @@ describe("AgentsView", () => {
   it("does not call an unread task board an empty workspace", () => {
     const html = render(AgentsView).body;
     expect(html).toContain('data-testid="agents-view"');
-    expect(html).toContain("Task attempts have not been read yet");
+    expect(html).toContain("Task runs have not been read yet");
     expect(html).toContain("Still reading");
     expect(html).not.toContain("No agent sessions");
-    expect(html).not.toContain("could not be read");
+    expect(html).not.toContain("couldn't be read");
   });
 
   it("keeps gaps on the page when the attention column is hidden", () => {
@@ -22,7 +22,7 @@ describe("AgentsView", () => {
     const table = source.indexOf("<table");
     expect(gaps).toBeGreaterThan(-1);
     expect(table).toBeGreaterThan(gaps);
-    expect(source).toContain("Sessions could not be read");
+    expect(source).toContain("Sessions couldn't be read");
     expect(source).toContain("Still reading");
   });
 
@@ -57,7 +57,9 @@ describe("AgentsView", () => {
   });
 
   it("takes directories from the sweep the tab chip also reads, and does not invent one", () => {
-    expect(source).toContain("$agentDirectories.get(record.sessionId)");
+    // The mapping lives in agents/repoAttention.ts (`planeTerminals`), which
+    // the header shares; it leaves an unread directory null (repoAttention.test.ts).
+    expect(source).toContain("planeTerminals($terminalSessions, $sessionActivity, $agentDirectories)");
     expect(source).not.toContain("cwd: null");
     // The sweep (cwd.ts, createAgentDirectorySweep) owns when to read, and
     // re-reads only when the set of sessions changes (cwd.test.ts). A second

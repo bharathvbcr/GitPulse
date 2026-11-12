@@ -48,7 +48,16 @@ describe("DiffViewer source contracts", () => {
     // Enter that is not in the find box belongs to a control unless it is on the diff body.
     expect(handler).not.toMatch(/searchOpen && !typing && event\.key === "Enter"/);
     expect(handler).toContain("!onControl");
-    expect(source).toContain("onkeydown={onSearchKeydown}");
+    // The find box owns its Enter and Escape: the shared in-place field
+    // handles them on its own input and marks them handled, so the window
+    // rule above (which returns on defaultPrevented) never sees them.
+    expect(source).toContain("<FindField");
+    const field = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "FindField.svelte"), "utf8");
+    const keys = field.slice(field.indexOf("function onkeydown"), field.indexOf("</script>"));
+    expect(keys).toContain('event.key === "Enter"');
+    expect(keys).toContain('event.key === "Escape"');
+    expect((keys.match(/event\.preventDefault\(\)/g) ?? []).length).toBe(2);
+    expect(field).toMatch(/<input[\s\S]*?\{onkeydown\}/);
   });
 
   it("says a copied patch is partial when the backend cut the diff", () => {
@@ -67,6 +76,19 @@ describe("DiffViewer source contracts", () => {
     // The functions refuse too, so no path but the buttons can send a -w patch.
     expect(source).toContain("if (stagingBlocked || !$repoStore.selectedFilePath) return;");
     expect(source).toContain("if (whitespaceView || !lineSelectable(index)) return;");
+  });
+
+  it("words a failed read through describeFailure and offers Try again, not a spinner or a raw message", () => {
+    // A read that failed is "couldn't determine" (the unknown tone), never a
+    // blank pane or a pass. The headline is the shared template; the backend's
+    // text is only the detail.
+    expect(source).toContain('describeFailure({ verb: "read", object: "this diff" }, diffError)');
+    expect(source).toContain('data-tone="unknown" role="alert"');
+    expect(source).not.toContain("Could not read this diff");
+    expect(source).not.toContain("animate-spin");
+    expect(source.split(">Try again</button>").length - 1).toBe(2); // the diff read and the file list
+    // The commit-history entry from d27e808e stays on the toolbar.
+    expect(source).toContain("data-diff-history-toggle");
   });
 
   it("compiles", () => {

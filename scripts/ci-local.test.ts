@@ -135,6 +135,17 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(gate?.local).toBeUndefined();
   });
 
+  it("gates the design rules in strict mode, through a package.json script that exists", () => {
+    const gate = GATES.find((g) => g.id === "design-lint");
+    expect(gate).toBeDefined();
+    expect(commandLine(gate!)).toBe("bun run design:gate");
+    const scripts = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).scripts as Record<string, string>;
+    expect(scripts["design:gate"]).toBe("node scripts/design-lint.mjs --strict");
+    // A failing design gate fails the run, like any other gate.
+    const outcomes = runGates(GATES, { run: (g) => ({ ok: g.id !== "design-lint", detail: "", ms: 0 }), platform: "darwin", log: () => {} });
+    expect(outcomes.filter((o) => o.status === "failed").map((o) => o.gate.id)).toEqual(["design-lint"]);
+  });
+
   it("passes the flags that stop one failing test binary hiding the rest", () => {
     // ci.yml spells out why: without --no-fail-fast cargo stops at the first
     // failing test binary, so the rest never run and the job reports one

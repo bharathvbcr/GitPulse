@@ -8,7 +8,7 @@
 import type { CodeintelRung, CodeintelRungHistogram } from "./types";
 
 export const RUNG_OPTIONS: Array<{ value: CodeintelRung | "all"; label: string }> = [
-  { value: "all", label: "All rungs" },
+  { value: "all", label: "All confidence levels" },
   { value: "speculative", label: "Speculative+" },
   { value: "high", label: "High+" },
   { value: "deterministic", label: "Deterministic only" },
@@ -33,7 +33,7 @@ export function rungHistogramLine(
     `${hist.speculative} speculative`,
   ];
   if (hist.filtered_out > 0) {
-    parts.push(`${hist.filtered_out} filtered out by min_rung`);
+    parts.push(`${hist.filtered_out} hidden by the confidence filter`);
   }
   return `What you did not necessarily see: ${parts.join(" · ")}`;
 }

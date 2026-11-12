@@ -53,9 +53,9 @@ function normalizeBrokenCallers(
   const rec = asRecord(raw);
   if (!rec) {
     return {
-      source_freshness: unverifiedSourceFreshness("broken_callers missing from preview report"),
+      source_freshness: unverifiedSourceFreshness("The list of broken callers is missing from the preview report"),
       available: false,
-      reason: "broken_callers missing from preview report",
+      reason: "The list of broken callers is missing from the preview report",
       items: [],
       total: 0,
       shown: 0,

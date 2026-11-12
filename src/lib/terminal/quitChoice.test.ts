@@ -59,7 +59,7 @@ describe("decideQuitTerminals", () => {
     const ask = vi.fn<Ask>(async () => "alternate");
     const decision = await decideQuitTerminals({ ask, invoke: invoker(host, new Error("host gone")), onError });
     expect(decision).toEqual({ backend: "host", terminals: "stop" });
-    expect(ask.mock.calls[0][0].message).toContain("could not list them");
+    expect(ask.mock.calls[0][0].message).toContain("couldn't list them");
     expect(onError).toHaveBeenCalledWith("the terminal host's sessions", expect.any(Error));
   });
 
@@ -132,7 +132,7 @@ describe("decideQuitManagedRuns", () => {
   it("asks, as a floor, when the list was cut short, even with none counted", async () => {
     const ask = vi.fn<AskStop>(async () => false);
     expect(await decideQuitManagedRuns({ ask, listRuns: async () => ({ complete: false, runs: [] }) })).toEqual({ cancelled: true });
-    expect(ask.mock.calls[0][0].message).toContain("could not be read in full");
+    expect(ask.mock.calls[0][0].message).toContain("couldn't be read in full");
     ask.mockClear();
     await decideQuitManagedRuns({ ask, listRuns: async () => ({ complete: false, runs: [managedRun("a")] }) });
     expect(ask.mock.calls[0][0].message).toContain("at least 1 managed run will be stopped");
@@ -143,7 +143,7 @@ describe("decideQuitManagedRuns", () => {
     const ask = vi.fn<AskStop>(async () => true);
     const failure = new Error("workbench gone");
     expect(await decideQuitManagedRuns({ ask, listRuns: async () => { throw failure; }, onError })).toEqual({ cancelled: false, stopping: null, managed: "stop" });
-    expect(ask.mock.calls[0][0].message).toContain("could not list them");
+    expect(ask.mock.calls[0][0].message).toContain("couldn't list them");
     expect(onError).toHaveBeenCalledWith("the managed runs", failure);
   });
 
@@ -164,11 +164,11 @@ describe("decideQuitManagedRuns", () => {
     const askYes = vi.fn<AskStop>(async () => true);
     await decideQuitManagedRuns({ ask: askYes, listRuns: async () => ({ complete: false, workingComplete: true, runs: [managedRun("a")] }) });
     expect(askYes.mock.calls[0][0].message).toContain("1 managed run will be stopped");
-    expect(askYes.mock.calls[0][0].message).not.toContain("could not be read in full");
+    expect(askYes.mock.calls[0][0].message).not.toContain("couldn't be read in full");
     // A working state that overflowed still does.
     const askFloor = vi.fn<AskStop>(async () => false);
     await decideQuitManagedRuns({ ask: askFloor, listRuns: async () => ({ complete: false, workingComplete: false, runs: [] }) });
-    expect(askFloor.mock.calls[0][0].message).toContain("could not be read in full");
+    expect(askFloor.mock.calls[0][0].message).toContain("couldn't be read in full");
   });
 });
 
@@ -205,7 +205,7 @@ describe("decideQuitManagedRuns with a hosted Manvi", () => {
     const unreadable = vi.fn<Ask>(async () => "confirm");
     const decision = await decideQuitManagedRuns({ ask: vi.fn(), askHosted: unreadable, hosted, listRuns: async () => { throw new Error("gone"); } });
     expect(decision).toEqual({ cancelled: false, stopping: 0, managed: "leave" });
-    expect(unreadable.mock.calls[0][0].message).toContain("could not list them");
+    expect(unreadable.mock.calls[0][0].message).toContain("couldn't list them");
     expect(unreadable.mock.calls[0][0].title).toBe("Leave the Managed Runs Working?");
   });
 

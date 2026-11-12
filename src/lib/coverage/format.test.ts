@@ -10,8 +10,8 @@ describe("coverage format helpers", () => {
 
   it("classifies line hits for the blame gutter", () => {
     expect(coverageHitClass(undefined)).toBe("");
-    expect(coverageHitClass(3)).toBe("bg-emerald-500/15");
-    expect(coverageHitClass(0)).toBe("bg-red-500/20");
+    expect(coverageHitClass(3)).toBe("bg-ok/15");
+    expect(coverageHitClass(0)).toBe("bg-danger/20");
   });
 
   it("formats finite percentages and treats NaN as zero", () => {

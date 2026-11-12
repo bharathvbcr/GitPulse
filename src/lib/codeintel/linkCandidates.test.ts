@@ -30,7 +30,7 @@ describe("linkCandidatesHonesty", () => {
         repos_considered: 2,
         coverage_gaps: [],
       }),
-    ).toBe("Showing 1 of 4 candidates across 2 repo(s).");
+    ).toBe("Showing 1 of 4 candidates across 2 repositories.");
   });
 
   it("never reads an empty list as none when something could not be read", () => {
@@ -40,7 +40,7 @@ describe("linkCandidatesHonesty", () => {
       repos_considered: 2,
       coverage_gaps: [{ repo: "b", reason: "store would not open" }],
     });
-    expect(text).toContain("could not be read");
+    expect(text).toContain("couldn't be read");
     expect(text).toContain("b: store would not open");
     expect(text).toContain("incomplete");
   });

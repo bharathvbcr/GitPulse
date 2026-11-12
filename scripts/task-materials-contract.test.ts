@@ -4,7 +4,7 @@ import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
 import TaskBoard from "../src/lib/components/TaskBoard.svelte";
 
-const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskManviAssist", "TaskAgentPanel", "TaskHandoffForm", "TaskHandoffSheet", "AgentDecisions", "NativeNotificationSettings", "NativeNotificationBridge"];
+const panels = ["TaskEditor", "WorkspaceEditor", "AutomaticEnhancements", "AttentionInbox", "TaskManviAssist", "TaskAgentPanel", "TaskHandoffForm", "TaskHandoffSheet", "AgentDecisions", "NativeNotificationSettings", "NativeNotificationBridgeView"];
 const read = (name: string) => readFileSync(new URL(`../src/lib/components/${name}.svelte`, import.meta.url), "utf8");
 
 describe("Tasks material coverage", () => {
@@ -36,7 +36,7 @@ describe("Tasks material coverage", () => {
   });
 
   it("opens native notification review on the shared glass card, not an opaque plate", () => {
-    const source = read("NativeNotificationBridge");
+    const source = read("NativeNotificationBridgeView");
     expect(source).toContain('class="native-activation gp-card gp-glass shadow-float"');
     expect(source).toContain('class="activation-error gp-card shadow-float"');
     expect(source).toContain('class="gp-btn"');

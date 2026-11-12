@@ -76,6 +76,10 @@ const Panel = (await import("../src/lib/components/files/FileTreePanel.svelte"))
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
 const until = async (test, label) => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Timed out: " + label); };
+// Waits, bounded, without throwing: a popover now leaves with a 70 ms exit
+// (popoverExit), so "is it gone?" is asked after the exit, and a menu that
+// never leaves still reaches its check as a failure rather than a crash.
+const settle = async (test, ms = 2000) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await wait(); };
 const host = document.getElementById("host");
 const tree = () => host.querySelector('[role="tree"]');
 const items = () => [...host.querySelectorAll('[role="treeitem"]')];
@@ -168,26 +172,28 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await press(menu(), "ArrowDown");
   check("ArrowDown moves to the next action", () => document.activeElement === menuItems()[1]);
   await press(menu(), "Escape");
+  await settle(() => !menu());
   check("Escape closes it and puts focus back on the tree", () => !menu() && (document.activeElement === tree() || tree().contains(document.activeElement)));
   await press(tree(), "F10", { shiftKey: true });
   check("Shift+F10 opens it too", () => Boolean(menu()));
   await press(menu(), "Escape");
+  await settle(() => !menu());
 
   // --- delete asks first, and says what cannot be undone -------------------
   await press(tree(), "Home");
   await press(tree(), "ArrowDown");
   check("the untracked file is selected", () => activeName().includes("guide.md"));
   await press(tree(), "ContextMenu");
-  const deleteItem = [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete File/.test(el.textContent));
+  const deleteItem = [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete file/.test(el.textContent));
   deleteItem.click(); await until(() => get(promptState), "delete confirmation");
   const asked = get(promptState).options;
-  check("Delete File asks first, as a destructive confirmation that names the path and that git holds no copy",
-    () => asked.title === "Delete File" && asked.destructive === true && asked.message.includes("docs/guide.md") && /cannot be undone/.test(asked.message));
+  check("Delete file asks first, as a destructive confirmation that names the path and that git holds no copy",
+    () => asked.title === "Delete file" && asked.destructive === true && asked.message.includes("docs/guide.md") && /cannot be undone/.test(asked.message));
   check("and nothing has been deleted while it waits", () => deletes.length === 0);
   completePrompt(false); await wait(150);
   check("cancelling deletes nothing", () => deletes.length === 0);
   await press(tree(), "ContextMenu");
-  [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete File/.test(el.textContent)).click();
+  [...menu().querySelectorAll("button,[role='menuitem']")].find(el => /Delete file/.test(el.textContent)).click();
   await until(() => get(promptState), "second confirmation"); completePrompt(true);
   await until(() => deletes.length === 1, "delete sent");
   check("confirming deletes that path, once", () => deletes[0].path === "docs/guide.md" && deletes[0].repoPath === root);
@@ -203,30 +209,30 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   const menuItem = label => [...menu().querySelectorAll('[role="menuitem"]')].find(el => el.textContent.trim() === label);
   const closeMenu = async () => { if (menu()) await press(menu(), "Escape"); };
   await openMenuFor("README.md");
-  check("a staged file is offered Unstage Changes, and neither Stage File nor Discard", () => menuLabels().includes("Unstage Changes") && !menuLabels().includes("Stage File") && !menuLabels().includes("Discard Changes…"));
-  menuItem("Unstage Changes").click();
+  check("a staged file is offered Unstage changes, and neither Stage file nor Discard", () => menuLabels().includes("Unstage changes") && !menuLabels().includes("Stage file") && !menuLabels().includes("Discard changes…"));
+  menuItem("Unstage changes").click();
   await until(() => indexCalls.length === 1, "unstage sent");
-  check("and Unstage Changes unstages that file", () => indexCalls[0].cmd === "cmd_unstage_file" && indexCalls[0].filePath === "README.md" && indexCalls[0].repoPath === root);
+  check("and Unstage changes unstages that file", () => indexCalls[0].cmd === "cmd_unstage_file" && indexCalls[0].filePath === "README.md" && indexCalls[0].repoPath === root);
   await openMenuFor("src/app.ts");
-  check("an unstaged file is offered Stage File and Discard, and not Unstage Changes", () => menuLabels().includes("Stage File") && menuLabels().includes("Discard Changes…") && !menuLabels().includes("Unstage Changes"));
-  menuItem("Stage File").click();
+  check("an unstaged file is offered Stage file and Discard, and not Unstage changes", () => menuLabels().includes("Stage file") && menuLabels().includes("Discard changes…") && !menuLabels().includes("Unstage changes"));
+  menuItem("Stage file").click();
   await until(() => indexCalls.length === 2, "stage sent");
-  check("and Stage File stages that file", () => indexCalls[1].cmd === "cmd_stage_file" && indexCalls[1].filePath === "src/app.ts");
+  check("and Stage file stages that file", () => indexCalls[1].cmd === "cmd_stage_file" && indexCalls[1].filePath === "src/app.ts");
   await openMenuFor("src/lib/a.ts");
-  check("a file changed on both sides of the index is offered both actions", () => menuLabels().includes("Unstage Changes") && menuLabels().includes("Stage File"));
+  check("a file changed on both sides of the index is offered both actions", () => menuLabels().includes("Unstage changes") && menuLabels().includes("Stage file"));
   await closeMenu();
 
   // --- discard asks first ---------------------------------------------------
   await openMenuFor("src/app.ts");
-  menuItem("Discard Changes…").click();
+  menuItem("Discard changes…").click();
   await until(() => get(promptState), "discard confirmation");
   const discardAsk = get(promptState).options;
-  check("Discard Changes asks first, naming the file and that it cannot be undone", () => discardAsk.title === "Discard Changes" && discardAsk.message.includes("src/app.ts") && /cannot be undone/.test(discardAsk.message));
+  check("Discard changes asks first, naming the file and that it cannot be undone", () => discardAsk.title === "Discard changes" && discardAsk.message.includes("src/app.ts") && /cannot be undone/.test(discardAsk.message));
   check("and nothing is discarded while it waits", () => discards.length === 0);
   completePrompt(false); await wait(150);
   check("cancelling discards nothing", () => discards.length === 0);
   await openMenuFor("src/app.ts");
-  menuItem("Discard Changes…").click();
+  menuItem("Discard changes…").click();
   await until(() => get(promptState), "second discard confirmation"); completePrompt(true);
   await until(() => discards.length === 1, "discard sent");
   check("confirming discards that file, once", () => discards[0].filePath === "src/app.ts" && discards[0].repoPath === root);
@@ -234,7 +240,7 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   // --- creating files and folders ------------------------------------------
   host.querySelector('[aria-label="New file in repository root"]').click();
   await until(() => get(promptState), "new file prompt");
-  check("New File asks for a name in the repository root", () => get(promptState).options.title === "New File" && get(promptState).options.message === "Create file in repository root");
+  check("New file asks for a name in the repository root", () => get(promptState).options.title === "New file" && get(promptState).options.message === "Create file in repository root");
   completePrompt("   "); await wait(150);
   check("a blank name creates nothing", () => writes.length === 0);
   host.querySelector('[aria-label="New file in repository root"]').click();
@@ -246,17 +252,17 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await press(tree(), "Home");
   await closeMenu();
   host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
-  menuItem("New Folder in folder…").click();
+  menuItem("New folder in folder…").click();
   await until(() => get(promptState), "new folder prompt");
-  check("New Folder from a folder's menu asks for a folder inside it", () => get(promptState).options.title === "New Folder" && get(promptState).options.message === "Create folder in docs/");
+  check("New folder from a folder's menu asks for a folder inside it", () => get(promptState).options.title === "New folder" && get(promptState).options.message === "Create folder in docs/");
   completePrompt("assets");
   await until(() => writes.length === 2, "folder written");
   check("and creates it by writing a .gitkeep inside it", () => writes[1].filePath === "docs/assets/.gitkeep");
   host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
-  menuItem("New File in folder…").click();
+  menuItem("New file in folder…").click();
   await until(() => get(promptState), "new file in folder prompt"); completePrompt("intro.md");
   await until(() => writes.length === 3, "file in folder written");
-  check("New File from a folder's menu creates the file inside that folder", () => writes[2].filePath === "docs/intro.md");
+  check("New file from a folder's menu creates the file inside that folder", () => writes[2].filePath === "docs/intro.md");
 
   // --- an existing name is refused and nothing is written ------------------------
   const created = writes.length;
@@ -277,26 +283,26 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
 
   // --- rename and move --------------------------------------------------------
   await openMenuFor("src/lib/b.ts");
-  menuItem("Rename or Move…").click();
+  menuItem("Rename or move…").click();
   await until(() => get(promptState), "move prompt");
   const moveAsk = get(promptState).options;
-  check("Rename or Move starts from the file's current path", () => moveAsk.title === "Rename or Move File" && moveAsk.initialValue === "src/lib/b.ts");
+  check("Rename or move starts from the file's current path", () => moveAsk.title === "Rename or move file" && moveAsk.initialValue === "src/lib/b.ts");
   completePrompt("src/lib/b.ts"); await wait(150);
   check("answering with the same path moves nothing", () => moves.length === 0);
   await openMenuFor("src/lib/b.ts");
-  menuItem("Rename or Move…").click();
+  menuItem("Rename or move…").click();
   await until(() => get(promptState), "move prompt again"); completePrompt("src/core/b.ts");
   await until(() => moves.length === 1, "move sent"); await wait(200);
   check("a new path moves the file there and the open file follows it", () => moves[0].from === "src/lib/b.ts" && moves[0].to === "src/core/b.ts" && get(repoStore).selectedFilePath === "src/core/b.ts");
   await reveal("docs/guide.md");
   host.querySelector('[aria-label="Actions for docs"]').click(); await tick(); await wait(120);
-  menuItem("Rename or Move Folder…").click();
+  menuItem("Rename or move folder…").click();
   await until(() => get(promptState), "folder move prompt"); completePrompt("guides/");
   await until(() => moves.length === 2, "folder move sent"); await wait(200);
   check("moving a folder drops a trailing slash and the open file inside it follows", () => moves[1].from === "docs" && moves[1].to === "guides" && get(repoStore).selectedFilePath === "guides/guide.md");
   moveFails = true;
   await openMenuFor("src/app.ts");
-  menuItem("Rename or Move…").click();
+  menuItem("Rename or move…").click();
   await until(() => get(promptState), "refused move prompt"); completePrompt("src/main.ts");
   await until(() => moves.length === 3, "refused move sent"); await wait(200);
   check("a move the backend refuses says why and leaves the open file where it was", () => get(repoStore).error?.includes("refused by fixture") && get(repoStore).selectedFilePath === "src/app.ts");
@@ -315,12 +321,12 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   const deletesBefore = deletes.length, movesBefore = moves.length, writesBefore = writes.length;
   holding = new Set(["cmd_delete_path", "cmd_move_path", "cmd_create_file"]);
   await openMenuFor("README.md");
-  menuItem("Delete File…").click();
+  menuItem("Delete file…").click();
   await until(() => get(promptState), "wrapped delete confirmation"); completePrompt(true);
   await until(() => deletes.length === deletesBefore + 1, "wrapped delete sent");
   check("a pending delete is counted by the quit guard", () => busy() === 1);
   await openMenuFor("src/lib/a.ts");
-  menuItem("Rename or Move…").click();
+  menuItem("Rename or move…").click();
   await until(() => get(promptState), "wrapped move prompt"); completePrompt("src/lib/z.ts");
   await wait(250);
   check("a move asked for behind it is counted too, and waits its turn instead of running beside it", () => busy() === 2 && moves.length === movesBefore);
@@ -342,7 +348,7 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   const otherRepo = "/fixture/Other";
   const deletesAtSwitch = deletes.length;
   await openMenuFor("docs/guide.md");
-  menuItem("Delete File…").click();
+  menuItem("Delete file…").click();
   await until(() => get(promptState), "delete confirmation before a switch");
   await repoStore.openRepo(otherRepo);
   await wait(200);
@@ -357,9 +363,9 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await reveal("src/lib/a.ts");
   const churnOf = path => [...rowFor(path).querySelectorAll("span.font-mono")].filter(el => /^~?[+-]\d+$/.test(el.textContent.trim()));
   const warned = churnOf("src/lib/b.ts"), verified = churnOf("src/lib/a.ts");
-  check("a line count the backend flagged reads as a floor: a tilde, in amber", () => warned.length === 2 && warned[0].textContent.trim() === "~+5" && warned.every(el => /amber/.test(el.className)));
+  check("a line count the backend flagged reads as a floor: a tilde, in the warn tone", () => warned.length === 2 && warned[0].textContent.trim() === "~+5" && warned.every(el => /text-warn/.test(el.className)));
   check("and its tooltip gives the backend's reason", () => /may understate/.test(warned[0].title) && warned[0].title.includes("numstat record unreadable"));
-  check("a verified count has no tilde and keeps the add/delete colours", () => verified.length === 2 && verified[0].textContent.trim() === "+3" && /emerald/.test(verified[0].className) && /rose/.test(verified[1].className) && !verified[0].title);
+  check("a verified count has no tilde and keeps the add/delete colours", () => verified.length === 2 && verified[0].textContent.trim() === "+3" && /text-ok/.test(verified[0].className) && /text-danger/.test(verified[1].className) && !verified[0].title);
 
   // --- long names scroll instead of being painted through ---------------------
   const longName = "src/verdict.schema.with-a-name-much-longer-than-the-rail-can-hold.json";
@@ -369,7 +375,7 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await reveal(longName);
   const longRow = rowFor(longName);
   const nameEl = [...longRow.querySelectorAll("span")].find(el => el.textContent.includes("much-longer"));
-  const badge = [...longRow.querySelectorAll("span")].find(el => /font-bold/.test(el.className) && el.textContent.trim().length <= 2 && el !== nameEl);
+  const badge = [...longRow.querySelectorAll("span")].find(el => /font-semibold/.test(el.className) && el.textContent.trim().length <= 2 && el !== nameEl);
   const scroller = (() => { let node = longRow.parentElement; while (node && node !== host) { if (["auto", "scroll"].includes(getComputedStyle(node).overflowX)) return node; node = node.parentElement; } return null; })();
   check("a long name is drawn whole, on one line", () => nameEl.scrollWidth <= nameEl.clientWidth + 1 && nameEl.getBoundingClientRect().height < 30 && nameEl.textContent.trim() === longName.split("/").pop());
   check("its status mark sits after the name, inside the row, instead of over the name or clipped off its end", () => Boolean(badge) && badge.getBoundingClientRect().left >= nameEl.getBoundingClientRect().right - 1 && badge.getBoundingClientRect().right <= longRow.getBoundingClientRect().right + 1 && longRow.scrollWidth <= longRow.clientWidth + 1);
@@ -413,12 +419,12 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   await repoStore.refresh(root);
   await until(staleBanner, "the stale-listing banner");
   check("a failed re-list keeps the last rows on screen", () => items().length >= rowsBefore && Boolean(rowFor("README.md")));
-  check("and a banner says they are the last successful listing", () => staleBanner().getAttribute("role") === "status" && staleBanner().textContent.includes("Could not refresh the file list. Showing the last successful listing."));
+  check("and a banner says they are the last successful listing", () => staleBanner().getAttribute("role") === "status" && staleBanner().textContent.includes("Couldn't refresh the file list. Showing the last successful listing."));
   check("with the reason as a second line", () => staleBanner().textContent.includes("listing refused by fixture"));
   listFails = false;
-  [...staleBanner().querySelectorAll("button")].find(el => el.textContent.trim() === "Retry").click();
+  [...staleBanner().querySelectorAll("button")].find(el => el.textContent.trim() === "Try again").click();
   await until(() => staleBanner() === null, "the banner goes after a good retry");
-  check("Retry re-lists and clears the banner", () => staleBanner() === null && Boolean(rowFor("README.md")));
+  check("Try again re-lists and clears the banner", () => staleBanner() === null && Boolean(rowFor("README.md")));
 
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);

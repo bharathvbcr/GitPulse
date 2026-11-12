@@ -69,6 +69,32 @@ describe("createAgentPlaneStore", () => {
     expect(get(store).scanning).toBe(false);
   });
 
+  it("dates the probes by when their sweep finished, and keeps that date while the next one runs", async () => {
+    let clock = 1000;
+    const reads: ReturnType<typeof deferred<InsightsSnapshot>>[] = [];
+    const store = createAgentPlaneStore({
+      snapshot: () => {
+        const next = deferred<InsightsSnapshot>();
+        reads.push(next);
+        return next.promise;
+      },
+      now: () => clock,
+      paths: { caseInsensitive: false },
+    });
+    expect(get(store).readAt).toBeNull();
+    const first = store.refresh([{ path: "/repo", label: "Repo" }]);
+    clock = 1500;
+    reads[0].resolve(snap);
+    await first;
+    expect(get(store).readAt).toBe(1500);
+    const second = store.refresh([{ path: "/repo", label: "Repo" }]);
+    clock = 9000;
+    expect(get(store).readAt).toBe(1500);
+    reads[1].resolve(snap);
+    await second;
+    expect(get(store).readAt).toBe(9000);
+  });
+
   it("records one repository's failure and still reads the others", async () => {
     const store = createAgentPlaneStore({
       snapshot: async (path) => {

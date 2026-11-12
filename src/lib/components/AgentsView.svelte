@@ -37,6 +37,7 @@
   import { openTaskForRun, requestTaskOpen } from "../workbench/taskOpen";
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentDirectories } from "../agents/cwd";
+  import { planeTerminals } from "../agents/repoAttention";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
   import { isMacOS } from "../platform";
   import { gapGroupTitle, gapsBlockReading, groupGaps, type GapNote } from "../agents/gapGroups";
@@ -81,24 +82,9 @@
   let activeView = $state<"plane" | "inbox">("plane");
   const activeRepoPath = $derived($agentsRepositoryScope || $repoStore.currentPath || "");
 
-  const terminals = $derived($terminalSessions.map((record) => {
-    const activity = record.sessionId ? $sessionActivity.get(record.sessionId) : undefined;
-    return {
-      key: record.key,
-      repoPath: record.repoPath,
-      label: record.label,
-      title: activity?.title || record.title || record.label,
-      status: record.status,
-      sessionId: record.sessionId ?? "",
-      taskRunId: record.taskRunId ?? "",
-      continuesRunId: record.continuesRunId ?? "",
-      // Unknown stays unknown. The registry has no directory, and a failed
-      // context read must not be filled in with the repository root. The tab
-      // chip counts from this same sweep (`agentDirectories`).
-      cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
-      attention: activity?.attention?.kind ?? null,
-    };
-  }));
+  // The one mapping the header shares (`repoAttention.ts`): unknown stays
+  // unknown there, and the tab chip counts from this same sweep.
+  const terminals = $derived(planeTerminals($terminalSessions, $sessionActivity, $agentDirectories));
 
   const repoPaths = $derived(repositoryPaths($registered, $repoStore.openTabs, pathOpts));
 
@@ -474,7 +460,7 @@
         class="gp-notice mx-3! mt-2! shrink-0 flex-col! gap-0! p-0!"
         data-tone="unknown"
         data-testid="agents-gaps"
-        aria-label="What the plane could not read"
+        aria-label="What the plane couldn't read"
       >
         <div class="flex items-center gap-2 px-3 pt-2 pb-1">
           <CircleAlert size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
@@ -515,7 +501,7 @@
         {:else if plane.rows.length > 0}
           <EmptyState compact icon={Bot} title="Nothing matches this filter" hint="The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid." />
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
-          <div class="gp-notice" data-tone="unknown" role="status">Sessions could not be read. The notes above are the reason, not an empty workspace.</div>
+          <div class="gp-notice" data-tone="unknown" role="status">Sessions couldn't be read. The notes above are the reason, not an empty workspace.</div>
         {:else if plane.gaps.length > 0 || scanning}
           <div class="gp-notice" data-tone="unknown" role="status">Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.</div>
         {:else}
@@ -570,7 +556,7 @@
                   {#if entry.expandable}
                     <button
                       type="button"
-                      class="gp-icon-btn h-4! w-4! mt-0.5 shrink-0"
+                      class="gp-icon-btn mt-0.5 shrink-0" data-size="sm"
                       tabindex="-1"
                       aria-label="{entry.expanded ? 'Collapse' : 'Expand'} {row.session}"
                       title={entry.expanded ? "Collapse" : "Expand"}

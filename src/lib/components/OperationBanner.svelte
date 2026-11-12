@@ -15,6 +15,7 @@
 
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import {
@@ -75,7 +76,8 @@
     try {
       const outcome = await run(action);
       if (!outcome.ok) {
-        failure = outcome.error ?? "The operation could not be completed.";
+        const copy = describeFailure({ verb: "finish", object: "the operation" }, outcome.error);
+        failure = copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
         toastStore.error(failure);
       }
     } finally {
@@ -92,16 +94,17 @@
     clean repository, so the unknown state is stated outright.
   -->
   <div
-    class="gp-card flex items-start gap-2.5 rounded-xl border-amber-500/40 bg-amber-500/5 px-3.5 py-2.5"
+    class="gp-notice px-3.5 py-2.5"
+    data-tone="unknown"
     role="status"
   >
-    <HelpCircle size={15} class="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
+    <HelpCircle size={15} class="mt-0.5 shrink-0 text-unknown" />
     <div class="min-w-0">
       <p class="text-xs font-semibold text-textPrimary">
         Repository state unknown
       </p>
-      <p class="mt-0.5 text-[11px] leading-relaxed text-textMuted">
-        GitPulse could not check whether a merge, rebase or cherry-pick is in
+      <p class="mt-0.5 text-meta leading-relaxed text-textMuted">
+        GitPulse couldn't check whether a merge, rebase or cherry-pick is in
         progress here. Run <code class="rounded bg-surfaceHover px-1">git status</code>
         in the Terminal view before making changes.
       </p>
@@ -109,7 +112,7 @@
   </div>
 {:else if operation}
   <div
-    class="gp-card gp-pop rounded-xl border-accent/40 bg-accent/6 px-3.5 py-3"
+    class="gp-card gp-pop rounded-xl bg-accent/6 px-3.5 py-3"
     role="status"
     aria-live="polite"
   >
@@ -119,12 +122,12 @@
         <p class="text-xs font-semibold text-textPrimary">
           {headline(operation)}
         </p>
-        <p class="mt-0.5 text-[11px] leading-relaxed text-textMuted">
+        <p class="mt-0.5 text-meta leading-relaxed text-textMuted">
           {nextStep(operation)}
         </p>
 
         {#if operation.incoming_ref}
-          <p class="mt-1 truncate text-[11px] text-textMuted">
+          <p class="mt-1 truncate text-meta text-textMuted">
             Applying <span class="font-mono text-textPrimary">{operation.incoming_ref}</span>
           </p>
         {/if}
@@ -137,7 +140,7 @@
           -->
           <ul class="mt-1.5 space-y-0.5">
             {#each keyedList(operation.warnings, (warning) => warning) as { item: warning, key: renderKey } (renderKey)}
-              <li class="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+              <li class="flex items-start gap-1.5 text-meta text-warn">
                 <AlertTriangle size={11} class="mt-0.5 shrink-0" />
                 <span class="min-w-0 wrap-break-word">{warning}</span>
               </li>
@@ -146,7 +149,7 @@
         {/if}
 
         {#if failure}
-          <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">{failure}</p>
+          <p class="mt-1.5 text-meta leading-relaxed text-danger">{failure}</p>
         {/if}
 
         <div class="mt-2.5 flex flex-wrap items-center gap-1.5">
@@ -159,11 +162,9 @@
               disabled={busy !== null}
               title={actionConsequence(operation.kind, action)}
               aria-label={armedLabel(label, isArmed)}
-              class="{action === 'continue'
-                ? 'gp-btn-primary'
-                : 'gp-btn'} py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5 {isArmed
-                ? 'border-red-500/60! text-red-600! dark:text-red-400!'
-                : ''}"
+              class="gp-btn"
+              data-size="sm"
+              data-variant={action === 'continue' ? 'primary' : isArmed ? 'danger' : undefined}
             >
               {#if busy === action}
                 <Loader2 size={11} class="animate-spin" />
@@ -176,7 +177,8 @@
             <button
               type="button"
               onclick={() => (armed = null)}
-              class="gp-btn py-1! px-2.5! text-[11px]!"
+              class="gp-btn"
+              data-size="sm"
             >
               Cancel
             </button>
@@ -184,7 +186,7 @@
         </div>
 
         {#if armed}
-          <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
+          <p class="mt-1.5 text-meta leading-relaxed text-danger">
             {actionConsequence(operation.kind, armed)}
           </p>
         {/if}

@@ -6,6 +6,7 @@ import { readGitHubContext } from "../ipc/githubContext";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
+import { notePullRequests } from "../github/pullRequestReads";
 import type { GrantView } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
 import { loadWorktreeTasks } from "../tasks/bindings";
@@ -207,7 +208,7 @@ export async function loadWork(
       const why = probeFailureDetail ? ` (${probeFailureDetail})` : "";
       sources.worktrees = noteFailure(
         sources.worktrees,
-        `could not read parked operations for ${probeFailures} worktree${probeFailures === 1 ? "" : "s"}${why}`,
+        `couldn't read parked operations for ${probeFailures} worktree${probeFailures === 1 ? "" : "s"}${why}`,
       );
     }
     input.operations = operations;
@@ -228,6 +229,8 @@ export async function loadWork(
       github.v.runs_truncated ? "workflow run list truncated" : ""].filter(Boolean);
     sources.github = details.length ? failed(details.join("; ")) : { ...READ };
     input.pullRequests = github.v.pull_requests;
+    // Row 2's glance shows the branch's pull request from this read.
+    notePullRequests(repoPath, github.v);
     input.runs = github.v.workflow_runs;
   }
 
@@ -275,7 +278,7 @@ export async function loadWork(
       const why = bindingFailureDetail ? ` (${bindingFailureDetail})` : "";
       sources.worktrees = noteFailure(
         sources.worktrees,
-        `could not read task binding for ${bindingFailures} worktree${bindingFailures === 1 ? "" : "s"}${why}`,
+        `couldn't read task binding for ${bindingFailures} worktree${bindingFailures === 1 ? "" : "s"}${why}`,
       );
     }
     if (input.worktrees.length > looked.length) {
@@ -301,7 +304,7 @@ export async function loadWork(
         if (title) titles[taskId] = title;
       }
     } catch (e) {
-      sources.tasks = noteFailure(sources.tasks, `task titles could not be read (${formatError(e)}); using task IDs`);
+      sources.tasks = noteFailure(sources.tasks, `task titles couldn't be read (${formatError(e)}); using task IDs`);
     }
     input.titles = titles;
   }

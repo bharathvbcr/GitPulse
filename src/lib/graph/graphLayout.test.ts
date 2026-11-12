@@ -177,8 +177,8 @@ describe("lanes past the canvas ceiling", () => {
   it("words the cut in lanes, and says nothing when nothing is cut", () => {
     expect(graphClipNotice(0, 30)).toBeNull();
     expect(graphClipNotice(Number.NaN, 30)).toBeNull();
-    expect(graphClipNotice(600, 30)).toContain("20 branch lanes extend past the 4,096 px");
-    expect(graphClipNotice(10, 30)).toContain("1 branch lane extends");
-    expect(graphClipNotice(600, 0)).toContain("Some branch lanes extend");
+    expect(graphClipNotice(600, 30)).toContain("20 branch columns extend past the 4,096 px");
+    expect(graphClipNotice(10, 30)).toContain("1 branch column extends");
+    expect(graphClipNotice(600, 0)).toContain("Some branch columns extend");
   });
 });

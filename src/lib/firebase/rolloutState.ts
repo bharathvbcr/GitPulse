@@ -53,7 +53,7 @@ const LABELS: Record<string, string> = {
   paused: "Paused",
   succeeded: "Live",
   failed: "Failed",
-  cancelled: "Cancelled",
+  cancelled: "Canceled",
   skipped: "Skipped",
 };
 
@@ -69,16 +69,17 @@ export function rolloutStateLabel(state: RolloutState): string {
 }
 
 /**
- * Colour for a state, with both shades on every verdict.
+ * Colour for a state, as a status role.
  *
- * A bare `-400` is tuned for the dark theme and sits near 2:1 against the light
- * theme's near-white card — on exactly the labels a reader opened this panel to
- * check.
+ * The roles carry their own light and dark values, tuned against each theme's
+ * card, so no verdict needs a hand-picked shade pair: a bare `-400` sat near
+ * 2:1 against the light theme's near-white card, on exactly the labels a reader
+ * opened this panel to check.
  */
 export function rolloutStateClass(state: RolloutState): string {
-  if (isLive(state)) return "text-green-700 dark:text-green-400";
-  if (isFailed(state)) return "text-red-700 dark:text-red-400";
-  if (isInFlight(state)) return "text-amber-700 dark:text-amber-400";
+  if (isLive(state)) return "text-ok";
+  if (isFailed(state)) return "text-danger";
+  if (isInFlight(state)) return "text-warn";
   // Unspecified, skipped and unrecognised: no verdict to colour.
   return "text-textMuted";
 }

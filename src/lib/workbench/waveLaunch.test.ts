@@ -175,7 +175,7 @@ describe("a wave end to end against a fake sidecar", () => {
     const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, verdict: (id) => { if (id === "b") throw new Error("sidecar down"); return passed(); } });
     const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
     expect(phases(done)).toEqual({ a: "merged", b: "held", c: "merged" });
-    expect(done.members[1]!.detail).toMatch(/could not run: sidecar down/);
+    expect(done.members[1]!.detail).toMatch(/couldn't run: sidecar down/);
   });
 
   // This used to assert that c merged after b conflicted. A conflicting merge
@@ -207,7 +207,7 @@ describe("a wave end to end against a fake sidecar", () => {
   });
 
   it("treats a parked squash like a conflict: reported as parked in main, and nothing merges after it", async () => {
-    const parked: MergeTeardownError = { code: "squash_parked", message: "The squashed changes are staged but could not be committed", };
+    const parked: MergeTeardownError = { code: "squash_parked", message: "The squashed changes are staged but couldn't be committed", };
     const w = world({ scopes: { a: ["a"], b: ["b"] }, mergeFailure: (id) => (id === "a" ? parked : null) });
     const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
     expect(done.state).toBe("halted");
@@ -270,7 +270,7 @@ describe("a wave end to end against a fake sidecar", () => {
   });
 
   it("counts a merge whose cleanup is pending as merged, and still re-verifies it", async () => {
-    const said = "Merged 1 commit from gitpulse/a into main; cleanup pending: the worktree could not be removed after 3 attempts.";
+    const said = "Merged 1 commit from gitpulse/a into main; cleanup pending: the worktree couldn't be removed after 3 attempts.";
     const w = world({ candidates: [[task("a")]], mergeSaid: () => said });
     const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
     expect(phases(done)).toEqual({ a: "merged" });
@@ -282,7 +282,7 @@ describe("a wave end to end against a fake sidecar", () => {
     for (const [main, why] of [
       [{ dirty: 3, operation: null }, /3 uncommitted files/],
       [{ dirty: 0, operation: "squash merge" }, /squash merge is in progress/],
-      [{ dirty: null, operation: null }, /could not be counted/],
+      [{ dirty: null, operation: null }, /couldn't be counted/],
     ] as [MainState, RegExp][]) {
       const w = world({ main: () => main });
       const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
@@ -294,7 +294,7 @@ describe("a wave end to end against a fake sidecar", () => {
     unreadable.deps.mainState = async () => { throw new Error("git is busy"); };
     const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, unreadable.deps)).finished;
     expect(done.state).toBe("refused");
-    expect(done.note).toMatch(/could not be read \(git is busy\)/);
+    expect(done.note).toMatch(/couldn't be read \(git is busy\)/);
     expect(unreadable.launched).toEqual([]);
   });
 
@@ -305,7 +305,7 @@ describe("a wave end to end against a fake sidecar", () => {
     const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
     expect(w.merged).toEqual([]);
     expect(phases(done)).toEqual({ a: "held", b: "held" });
-    expect(done.members[0]!.detail).toMatch(/Not merged: the main checkout has 2 uncommitted files/);
+    expect(done.members[0]!.detail).toMatch(/Not merged: the main worktree has 2 uncommitted files/);
     expect(w.mainReads()).toBeGreaterThan(1);
   });
 
@@ -625,7 +625,7 @@ describe("adversarial: merge halting and main state", () => {
     const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
     expect(w.merged).toEqual([]);
     expect(done.members[0]!.phase).toBe("held");
-    expect(done.members[0]!.detail).toMatch(/could not be read \(ipc down\)/);
+    expect(done.members[0]!.detail).toMatch(/couldn't be read \(ipc down\)/);
   });
 
   it("adv: a mainState that rejects at launch refuses the wave with nothing launched", async () => {

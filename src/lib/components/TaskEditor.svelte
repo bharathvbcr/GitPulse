@@ -28,6 +28,8 @@
   import { handleTablistKeydown, focusTabAt, panelId, tabId, tabProps } from "../dom/tablist";
   import { crossfade } from "svelte/transition";
   import { isMacOS } from "../platform";
+  import { LAYERS } from "../ui/layers";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { liquidSelection } from "../ui/transitions";
 
   // Same material as every other section strip in the app: the selected pane
@@ -241,7 +243,7 @@
   export async function canLeave(): Promise<boolean> {
     if (saving || adding || reloading || confirming) return false;
     if (enhancementWorking) { shortcutBlocked = `Wait for ${assistName} to finish before leaving this task.`; return false; }
-    if (pending || pendingDelete) { error = "Retry the pending action before closing this task."; return false; }
+    if (pending || pendingDelete) { error = "Try the pending action again before closing this task."; return false; }
     const edited = dirty || Boolean(notes.trim());
     if (!edited && !suggestionEditing) return true;
     confirming = true;
@@ -342,13 +344,13 @@
       error = "Wait for the current task action to finish.";
       throw new Error(error);
     }
-    if (!applyExtractedNotes()) throw new Error(error || "Could not use these notes.");
+    if (!applyExtractedNotes()) throw new Error(error || "Couldn't use these notes.");
     const blocked = canAskManvi(draft, notes);
     if (blocked) { error = blocked; throw new Error(blocked); }
     if (!current || dirty || pending) {
       const saved = await save(true);
       if (disposed) return null;
-      if (!saved) throw new Error(error || `Could not save a draft for ${assistName}.`);
+      if (!saved) throw new Error(error || `Couldn't save a draft for ${assistName}.`);
       return saved;
     }
     return current;
@@ -420,7 +422,7 @@
     reloading = true;
     confirming = true;
     try {
-      if (!await askConfirm({title: "Reload saved task?", message: "Replace your unsaved edits with the latest saved revision?", confirmLabel: "Reload", cancelLabel: "Keep editing"}) || disposed) return;
+      if (!await askConfirm({title: "Refresh from saved task?", message: "Replace your unsaved edits with the latest saved revision?", confirmLabel: "Refresh", cancelLabel: "Keep editing"}) || disposed) return;
       const latest = await bounded(getTask(id));
       if (disposed) return;
       if (latest.id !== id) throw new WorkbenchError("protocol_error", "Loaded task does not match this editor.");
@@ -502,7 +504,7 @@
   }} />
 
 <aside bind:this={sheet} class="task-editor gp-glass bg-surface" aria-label={current ? "Task details" : "New task"} data-task-revision={current?.revision ?? ""}>
-  <header class="gp-glass shadow-float">
+  <header class="gp-glass shadow-float" style="z-index: {LAYERS.STICKY}">
     <div>
       <h2>{current ? "Task details" : "New task"}</h2>
       <small>{dirty ? "Unsaved" : current ? `Revision ${current.revision}` : "Describe the work, then save."}</small>
@@ -529,7 +531,7 @@
         {@const badge = editorTabBadge(entry.id, { working: workingCount })}
         <button
           type="button"
-          class="gp-seg-btn text-[11px]! py-1!"
+          class="gp-seg-btn text-meta!"
           role={props.role}
           id={props.id}
           aria-selected={props["aria-selected"]}
@@ -558,7 +560,7 @@
     </div>
     <p class="tab-hint">{editorTabHint(tab, saved)}</p>
   {/if}
-  <div class="sheet-body">
+  <div class="sheet-body" use:scrollEdgeFade>
   <form id="task-editor-form-{id}" novalidate
     onsubmit={(e) => { e.preventDefault(); void save(); }}
     oninput={() => { dirty = true; }}
@@ -591,7 +593,7 @@
                 {#if section.id === "assist" && assistChrome.collapsible}
                   <button
                     type="button"
-                    class="gp-btn assist-toggle"
+                    class="gp-btn shrink-0" data-size="sm"
                     data-testid="task-assist-toggle"
                     aria-expanded={assistChrome.open}
                     aria-controls="task-assist-body-{id}"
@@ -601,7 +603,7 @@
                 {#if section.id === "logs" && logsChrome.collapsible}
                   <button
                     type="button"
-                    class="gp-btn logs-toggle"
+                    class="gp-btn shrink-0" data-size="sm"
                     data-testid="task-logs-toggle"
                     aria-expanded={logsChrome.open}
                     aria-controls="task-logs-body-{id}"
@@ -675,14 +677,14 @@
                     <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
                   </label>
                   <label class:flash={flash.includes("description")}>Description
-                    <textarea class="gp-field" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+                    <textarea class="gp-field-multi" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
                   </label>
                   <div class="subtasks-section">
                     <div class="subtasks-head">
                       <label for="task-criteria-{id}">Subtasks and acceptance criteria{#if criteriaList.length > 0} <span class="criteria-count">({criteriaList.length})</span>{/if}</label>
                       <button
                         type="button"
-                        class="gp-btn extract-subtasks-btn"
+                        class="gp-btn shrink-0" data-size="sm"
                         data-testid="task-extract-subtasks"
                         disabled={enhancementBusy || (!draft.description.trim() && !notes.trim())}
                         onclick={extractSubtasksAction}
@@ -715,6 +717,7 @@
                     <div class="subtask-add-row" data-testid="task-subtask-add-row">
                       <input
                         class="gp-field subtask-add-input"
+                        data-size="sm"
                         data-testid="task-subtask-add-input"
                         bind:value={newSubtask}
                         disabled={enhancementBusy}
@@ -724,7 +727,7 @@
                       />
                       <button
                         type="button"
-                        class="gp-btn subtask-add-btn"
+                        class="gp-btn shrink-0" data-size="sm"
                         data-testid="task-subtask-add-button"
                         disabled={enhancementBusy || !newSubtask.trim()}
                         onclick={addSubtaskItem}
@@ -736,7 +739,7 @@
                       <span class="sr-only">Acceptance criteria</span>
                       <textarea
                         id="task-criteria-{id}"
-                        class="gp-field criteria-textarea"
+                        class="gp-field-multi criteria-textarea"
                         data-testid="task-criteria"
                         bind:value={criteria}
                         rows="3"
@@ -753,7 +756,7 @@
                     <button type="button" class="gp-btn" onclick={() => void copyLogs()} disabled={!hasLogs || copying || saving} aria-label="Copy raw logs">Copy logs</button>
                   </div>
                   <fieldset disabled={enhancementBusy}>
-                    <label>Raw logs<textarea class="gp-field logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
+                    <label>Raw logs<textarea class="gp-field-multi logs-field" data-testid="task-logs" value={draft.logs ?? ""} rows="8" spellcheck="false" wrap="off" placeholder="Paste rustc, pytest, or terminal output. ANSI codes are stripped; the text is kept." oninput={(event) => setLogs(event.currentTarget.value)} onpaste={onLogsPaste}></textarea></label>
                   </fieldset>
                   {#if logNotice}<p class="meta" role="status">{logNotice}</p>{/if}
                 </div>
@@ -831,8 +834,8 @@
     </fieldset>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
     {#if shortcutBlocked}<p role="status" class="meta">{shortcutBlocked}</p>{/if}
-    {#if pending}<p role="status">Save result uncertain. Retry the same write before editing further.</p>{/if}
-    {#if pendingDelete}<p role="status">Delete result uncertain. Retry the same delete before editing further.</p>{/if}
+    {#if pending}<p role="status">Couldn't confirm the save. Try the same write again before editing further.</p>{/if}
+    {#if pendingDelete}<p role="status">Couldn't confirm the deletion. Try the same delete again before editing further.</p>{/if}
   </form>
   {#if current}
     <div class="pane" hidden={tab !== "agent"} id={panelId(group, "agent")} role="tabpanel" aria-labelledby={tabId(group, "agent")}>
@@ -850,10 +853,10 @@
   {/if}
   </div>
   <footer>
-    <button class="gp-btn-primary" disabled={saving || adding || enhancementBusy || pendingDelete !== null || !draft.repository_ids.length || (!pending && ((!draft.title.trim() && !notes.trim()) || !draft.kind.trim()))} form="task-editor-form-{id}" type="submit">{saving && !pendingDelete ? "Saving…" : pending ? "Retry save" : "Save task"}</button>
+    <button class="gp-btn" data-variant="primary" disabled={saving || adding || enhancementBusy || pendingDelete !== null || !draft.repository_ids.length || (!pending && ((!draft.title.trim() && !notes.trim()) || !draft.kind.trim()))} form="task-editor-form-{id}" type="submit">{saving && !pendingDelete ? "Saving…" : pending ? "Try save again" : "Save task"}</button>
     {#if current}
-      <button type="button" class="gp-btn" onclick={reload} disabled={saving || enhancementBusy || pendingDelete !== null}>Reload saved</button>
-      <button type="button" class="gp-btn-danger" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>{pendingDelete ? "Retry delete" : "Delete"}</button>
+      <button type="button" class="gp-btn" onclick={reload} disabled={saving || enhancementBusy || pendingDelete !== null}>Refresh saved</button>
+      <button type="button" class="gp-btn" data-variant="danger" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>{pendingDelete ? "Try delete again" : "Delete"}</button>
     {/if}
     {#if note}<p role="status" class="footer-note">{note}</p>{/if}
   </footer>
@@ -865,61 +868,65 @@
      every pane on screen at once. The explicit rule below is the guard. */
   .pane[hidden]{display:none}
   .sheet-tabs{flex-shrink:0;margin:0 18px 8px;width:calc(100% - 36px)}
-  .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:11px;color:rgb(var(--c-text-muted))}
-  .tab-badge{margin-left:5px;padding:0 4px;border-radius:999px;font-size:9px;line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
-  .tab-badge[data-asking]{background:rgb(210 153 34 / 0.22);color:#d29922;font-weight:650}
-  .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:999px;background:rgb(var(--c-accent));display:inline-block}
-  .flash :is(input,textarea){animation:gp-task-flash 1.1s ease-out}
+  .tab-hint{flex-shrink:0;margin:0 18px 10px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .tab-badge{margin-left:5px;padding:0 4px;border-radius:var(--gp-r-full);font-size:var(--text-micro);line-height:14px;background:rgb(var(--c-surface-hover) / 0.8);color:rgb(var(--c-text-muted))}
+  .tab-badge[data-asking]{background:rgb(var(--c-warn) / 0.2);color:rgb(var(--c-warn));font-weight:600}
+  .tab-dot{margin-left:4px;width:5px;height:5px;border-radius:var(--gp-r-full);background:rgb(var(--c-accent));display:inline-block}
+  .flash :is(input,textarea){animation:gp-task-flash var(--gp-dur-emphasis) ease-out 2}
   @keyframes gp-task-flash{from{border-color:rgb(var(--c-accent));box-shadow:0 0 0 3px rgb(var(--c-accent) / 0.18)}to{border-color:rgb(var(--c-border));box-shadow:none}}
   @media (prefers-reduced-motion: reduce){.flash :is(input,textarea){animation:none}}
   /* `--gp-task-sheet-w` (app.css) is the one owner of this width: the strip
      of open-task tabs above the sheet reads the same token, and these used to
      be two literals that could drift apart. */
-  .task-editor{width:var(--gp-task-sheet-w);flex-shrink:0;min-width:0;min-height:0;border-left:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
+  .task-editor{width:var(--gp-task-sheet-w);flex-shrink:0;min-width:0;min-height:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-lg);margin:0 8px 8px 0;overflow:hidden;padding:0;color:rgb(var(--c-text));display:flex;flex-direction:column}
   /* The columns respond to the sheet, not the window: this is a dock whose
      width the reader's window only partly decides. `container-type` also
      makes this a containing block for fixed descendants, which is why the
      repository popover is portaled to the body. */
-  .sheet-body{flex:1;min-height:0;overflow:auto;padding:0 18px 18px;container-type:inline-size}
+  .sheet-body{flex:1;min-height:0;overflow:auto;scroll-padding-block:2rem;padding:0 18px 18px;container-type:inline-size}
   /* One column at every width. The two-column grid this replaces only applied
      past 520px, so which layout a reader got depended on how far they had
      dragged the dock's splitter. */
   .steps{display:flex;flex-direction:column;gap:20px}
   .step{min-width:0}
   .step-head{display:flex;align-items:center;gap:7px;margin:0 0 8px}
-  .step-head h3{margin:0;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
-  .step-n{flex-shrink:0;width:16px;height:16px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.34)}
+  .step-head h3{margin:0;font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
+  .step-n{flex-shrink:0;width:16px;height:16px;border-radius:var(--gp-r-full);display:inline-flex;align-items:center;justify-content:center;font-size:var(--text-micro);font-weight:600;line-height:1;color:rgb(var(--c-accent));background:rgb(var(--c-accent) / 0.14);border:1px solid rgb(var(--c-accent) / 0.35)}
   .step-rule{flex:1;height:1px;background:linear-gradient(to right,rgb(var(--c-border) / 0.55),transparent)}
-  .assist-status{font-size:10px;font-weight:500;color:rgb(var(--c-text-muted));letter-spacing:.01em}
-  .assist-toggle,.logs-toggle{flex-shrink:0;font-size:10px;padding:2px 8px;letter-spacing:.02em}
+  .assist-status{font-size:var(--text-micro);font-weight:500;color:rgb(var(--c-text-muted))}
+  
   /* Same guard as `.pane[hidden]`: a later `display` on this body would
      silently beat Tailwind's zero-specificity `[hidden]` and leave the
      folded assist on screen. */
   [data-testid="task-assist-body"][hidden],[data-testid="task-logs-body"][hidden]{display:none}
   .logs-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin:0 0 8px}
   .logs-head p{margin:0;flex:1}
-  .logs-field{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;white-space:pre;overflow:auto}
+  .logs-field{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:var(--text-meta);white-space:pre;overflow:auto}
   /* The last field in a section carries the section's own bottom gap, not a
      second one of its own. */
   .step fieldset > :last-child{margin-bottom:0}
   .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0}
-  .field-label{color:rgb(var(--c-text-muted));font-size:11px}
+  .field-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
   .owner-field{margin-bottom:0;gap:0}
-  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;z-index:1;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:16px;font-weight:650;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:11px}form{font-size:12px;min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:inherit;min-width:0}textarea{resize:vertical}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px;border-top:1px solid rgb(var(--c-border) / 0.45)}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
-  .error{color:#dc6565}p{font-size:12px;margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
+  header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:var(--text-base);font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:var(--text-xs);min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;min-width:0}textarea{resize:vertical}
+  /* Only a control that carries no field primitive is drawn here. This rule used
+     to restyle every input, so its scoped selector outranked gp-field and
+     gp-select and squared the editor's one-line pills into 8px rectangles. */
+  :where(input,textarea,select):not(.gp-field):not(.gp-field-multi):not(.gp-select){padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6);color:inherit}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
+  .error{color:rgb(var(--c-danger))}p{font-size:var(--text-xs);margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
   .subtasks-section{display:flex;flex-direction:column;gap:8px;margin-bottom:13px}
   .subtasks-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
   .subtasks-head label{margin-bottom:0;font-weight:500}
-  .criteria-count{font-size:11px;font-weight:400;color:rgb(var(--c-text-muted))}
-  .extract-subtasks-btn{flex-shrink:0;font-size:10px;padding:2px 8px;letter-spacing:.02em}
+  .criteria-count{font-size:var(--text-meta);font-weight:400;color:rgb(var(--c-text-muted))}
+  
   .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
-  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;background:rgb(var(--c-bg) / 0.4);border:1px solid rgb(var(--c-border) / 0.5);font-size:11px}
-  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:14px;line-height:1}
+  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
+  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:var(--text-sm);line-height:1}
   .subtask-text{flex:1;min-width:0;word-break:break-word}
-  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:4px}
+  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs)}
   .subtask-remove:hover{color:rgb(var(--c-text))}
   .subtask-add-row{display:flex;gap:6px;align-items:center}
-  .subtask-add-input{flex:1;font-size:11px;padding:5px 8px}
-  .subtask-add-btn{flex-shrink:0;font-size:11px;padding:5px 10px}
+  .subtask-add-input{flex:1;font-size:var(--text-meta)}
+  
   .criteria-raw-label{margin-bottom:0}
 </style>

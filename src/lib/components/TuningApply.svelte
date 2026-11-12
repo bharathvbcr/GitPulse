@@ -8,6 +8,7 @@
    * for the flow.
    */
   import { onDestroy } from "svelte";
+  import Checkbox from "./Checkbox.svelte";
   import { invoke } from "../ipc/invoke";
   import type { TuningAdvice, TuningChange, TuningScope } from "../storage/types";
   import {
@@ -66,24 +67,22 @@
 
 {#if current.phase !== "idle" || offered || warnings.length > 0}
   <div
-    class="rounded-2xl border border-border/70 bg-surface p-3 space-y-2"
+    class="rounded-2xl border border-edge bg-surface p-3 space-y-2"
     data-testid="tuning-apply"
     data-phase={current.phase}
   >
     {#if current.phase === "idle" || current.phase === "previewing"}
-      <div class="text-[11px] font-semibold text-textSecondary">Repository tuning</div>
+      <div class="gp-label">Repository tuning</div>
       {#each warnings as warning}
-        <p class="text-[11px] text-amber-300" data-testid="tuning-warning">{warning}</p>
+        <p class="text-meta text-warn" data-testid="tuning-warning">{warning}</p>
       {/each}
       {#if offered}
         <ul class="space-y-1">
           {#each advice?.offers ?? [] as offer (offer.change)}
-            <li class="flex items-start gap-2 text-[11px]" data-testid="tuning-offer">
-              <input
-                type="checkbox"
-                class="mt-0.5"
+            <li class="flex items-start gap-2 text-meta" data-testid="tuning-offer">
+              <Checkbox
+                ariaLabel={offer.title}
                 checked={!unticked.includes(offer.change)}
-                aria-label={offer.title}
                 onchange={() => toggle(offer.change)}
               />
               <span>
@@ -95,7 +94,8 @@
         </ul>
         <button
           type="button"
-          class="rounded-md border border-border px-2 py-1 text-[11px] text-textPrimary hover:bg-surfaceHover disabled:opacity-50"
+          class="gp-btn"
+          data-size="sm"
           data-testid="tuning-apply-open"
           disabled={current.phase === "previewing" || selected.length === 0}
           onclick={() => void flow.open(selected)}
@@ -104,7 +104,7 @@
         </button>
       {/if}
     {:else if current.phase === "confirming"}
-      <p class="text-[11px] text-textMuted">
+      <p class="text-meta text-textMuted">
         These commands run in this repository. Nothing else is written, and each can be undone
         with the command shown under it. Stops after {current.plan.timeout_secs} s.
       </p>
@@ -112,15 +112,15 @@
         {#each current.plan.steps as step (step.change)}
           <li class="space-y-1" data-testid="tuning-step" data-skipped={step.skipped !== null}>
             {#if step.skipped !== null}
-              <p class="text-[11px] text-textSecondary" data-testid="tuning-step-skipped">
+              <p class="text-meta text-textSecondary" data-testid="tuning-step-skipped">
                 Skipped: {step.skipped}.
               </p>
             {:else}
               <code
-                class="block select-all font-mono text-[11px] text-textPrimary"
+                class="block select-all font-mono text-meta text-textPrimary"
                 data-testid="tuning-step-argv">{step.argv.join(" ")}</code
               >
-              <ul class="text-[11px] text-textMuted">
+              <ul class="text-meta text-textMuted">
                 {#each step.writes as write}
                   <li data-testid="tuning-step-write">
                     Writes {write.what} to {SCOPE_LABEL[write.scope]}.
@@ -128,17 +128,17 @@
                 {/each}
               </ul>
               {#each step.notes as note}
-                <p class="text-[11px] text-amber-300" data-testid="tuning-step-note">{note}</p>
+                <p class="text-meta text-warn" data-testid="tuning-step-note">{note}</p>
               {/each}
-              <p class="text-[11px] text-textMuted">Undo:</p>
+              <p class="text-meta text-textMuted">Undo:</p>
               {#each step.undo as undo}
                 <code
-                  class="block select-all font-mono text-[11px] text-textPrimary"
+                  class="block select-all font-mono text-meta text-textPrimary"
                   data-testid="tuning-step-undo">{undo.join(" ")}</code
                 >
               {/each}
               {#if step.undo_note}
-                <p class="text-[11px] text-textMuted" data-testid="tuning-step-undo-note">
+                <p class="text-meta text-textMuted" data-testid="tuning-step-undo-note">
                   {step.undo_note}
                 </p>
               {/if}
@@ -149,7 +149,9 @@
       <div class="flex gap-2">
         <button
           type="button"
-          class="rounded-md bg-accent px-2 py-1 text-[11px] font-semibold text-white"
+          class="gp-btn"
+          data-variant="primary"
+          data-size="sm"
           data-testid="tuning-apply-confirm"
           onclick={() => void flow.confirm()}
         >
@@ -157,7 +159,8 @@
         </button>
         <button
           type="button"
-          class="rounded-md border border-border px-2 py-1 text-[11px] text-textSecondary"
+          class="gp-btn"
+          data-size="sm"
           data-testid="tuning-apply-cancel"
           onclick={() => void flow.cancel()}
         >
@@ -165,12 +168,13 @@
         </button>
       </div>
     {:else if current.phase === "running"}
-      <p class="text-[11px] text-textMuted" role="status">
+      <p class="text-meta text-textMuted" role="status">
         {current.cancelling ? "Stopping…" : "Applying…"}
       </p>
       <button
         type="button"
-        class="rounded-md border border-border px-2 py-1 text-[11px] text-textSecondary disabled:opacity-50"
+        class="gp-btn"
+        data-size="sm"
         data-testid="tuning-apply-stop"
         disabled={current.cancelling}
         onclick={() => void flow.cancel()}
@@ -178,11 +182,11 @@
         Stop
       </button>
     {:else if current.phase === "done"}
-      <p class="text-[11px] text-textSecondary" role="status" data-testid="tuning-apply-result">
+      <p class="text-meta text-textSecondary" role="status" data-testid="tuning-apply-result">
         {#if current.outcome.cancelled}Stopped.{:else if current.outcome.joined}Joined an apply
           already running here.{:else}Finished in {current.outcome.elapsed_ms} ms.{/if}
       </p>
-      <ul class="text-[11px] text-textMuted">
+      <ul class="text-meta text-textMuted">
         {#each current.outcome.results as result}
           <li data-testid="tuning-result" data-status={result.status}>
             {result.status.replace("_", " ")}: {result.argv.length > 0 ? result.argv.join(" ") : result.change}{result.detail ? ` (${result.detail})` : ""}
@@ -191,18 +195,20 @@
       </ul>
       <button
         type="button"
-        class="rounded-md border border-border px-2 py-1 text-[11px] text-textSecondary"
+        class="gp-btn"
+        data-size="sm"
         onclick={() => flow.dismiss()}
       >
         Dismiss
       </button>
     {:else}
-      <p class="text-[11px] text-amber-300" role="alert" data-testid="tuning-apply-error">
+      <p class="text-meta text-danger" role="alert" data-testid="tuning-apply-error">
         {current.message}
       </p>
       <button
         type="button"
-        class="rounded-md border border-border px-2 py-1 text-[11px] text-textSecondary"
+        class="gp-btn"
+        data-size="sm"
         onclick={() => flow.dismiss()}
       >
         Dismiss

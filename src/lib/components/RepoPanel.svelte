@@ -18,6 +18,9 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
+  import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import {
     Cloud,
     Package,
@@ -63,7 +66,6 @@
     isStaleStackError,
     stashActionConsequence,
     stashActionLabel,
-    stashEmptyMessage,
     stashSubtitle,
     stashTitle,
     stashEntryKey,
@@ -279,7 +281,7 @@
     try {
       const outcome = await action();
       if (!outcome.ok) {
-        const message = outcome.error ?? "The action could not be completed.";
+        const message = outcome.error ?? "The action couldn't be completed.";
         toastStore.error(
           isStaleStackError(outcome.cause)
             ? "The stash list changed — refreshed. Try again."
@@ -389,39 +391,40 @@
         <div class="flex items-center gap-2 min-w-0">
           <Cloud size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Remotes</h2>
-          <span class="truncate text-[11px] {remotesError ? 'text-red-600 dark:text-red-400' : 'text-textMuted'}">
-            {remotesError ? "Could not read remotes" : remotesLoaded ? describeRemotes(remotes) : "Loading…"}
+          <span class="truncate text-meta {remotesError ? 'text-danger' : 'text-textMuted'}">
+            {remotesError ? "Couldn't read remotes" : remotesLoaded ? describeRemotes(remotes) : null}{#if !remotesError && !remotesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <button
           type="button"
-          class="gp-btn py-1! px-2! text-[11px]!"
+          class="gp-icon-btn"
+          data-size="sm"
           onclick={() => void load()}
           disabled={busy !== null}
-          title="Reload remotes and submodules"
+          title="Refresh remotes and submodules"
+          aria-label="Refresh remotes and submodules"
         >
           <RefreshCw size={11} />
         </button>
       </header>
 
-      <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-border/60 p-2.5 text-[11px] text-textSecondary">
+      <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-edge p-2.5 text-meta text-textSecondary">
         <label class="inline-flex items-center gap-1.5">
           Pull by
-          <select class="gp-input py-0.5!" bind:value={pullStrategy} disabled={busy !== null}>
+          <select class="gp-select" data-size="sm" bind:value={pullStrategy} disabled={busy !== null}>
             <option value="config">{pullRebaseConfig ? `pull.rebase (${pullRebaseConfig})` : "git's default (merge)"}</option>
             <option value="merge">Merging (--no-rebase)</option>
             <option value="rebase">Rebasing local commits (--rebase)</option>
           </select>
         </label>
-        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy !== null || !$repoStore.currentBranch} onclick={() => void pull()}>
+        <button type="button" class="gp-btn" data-size="sm" disabled={busy !== null || !$repoStore.currentBranch} onclick={() => void pull()}>
           {#if busy === "pull"}<Loader2 size={11} class="animate-spin" />{:else}<Download size={11} />{/if} Pull
         </button>
         <span class="flex-1"></span>
-        <label class="inline-flex items-center gap-1.5" title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
-          <input type="checkbox" checked={autoFetchOn} onchange={(event) => setAutoFetch(event.currentTarget.checked, autoFetchMinutes)} />
-          Auto-fetch every
-        </label>
-        <select class="gp-input py-0.5!" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
+        <span title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
+          <Checkbox label="Auto-fetch every" checked={autoFetchOn} onchange={(next) => setAutoFetch(next, autoFetchMinutes)} />
+        </span>
+        <select class="gp-select" data-size="sm" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
           onchange={(event) => setAutoFetch(true, Number(event.currentTarget.value))}>
           {#each [5, 10, 15, 30, 60, 120, 240].filter((m) => m >= MIN_AUTO_FETCH_MINUTES && m <= MAX_AUTO_FETCH_MINUTES) as minutes (minutes)}
             <option value={minutes}>{minutes} min</option>
@@ -430,45 +433,45 @@
       </div>
 
       {#if remotesTruncated}
-        <p class="mb-2 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+        <p class="mb-2 flex items-start gap-1.5 text-meta text-warn">
           <AlertTriangle size={11} class="mt-0.5 shrink-0" />
           <span>Showing {remotes.length} remotes. More exist in .git/config and are not listed.</span>
         </p>
       {/if}
       {#if remotesError}
-        <p class="text-[11px] text-red-600 dark:text-red-400">{remotesError}</p>
+        <p class="text-meta text-danger">{remotesError}</p>
       {:else if remotes.length === 0}
-        <p class="text-[11px] text-textMuted">
-          {remotesLoaded
-            ? "Nothing to fetch from or push to. Add a remote to sync this repository."
-            : "Reading .git/config…"}
-        </p>
+        {#if remotesLoaded}
+          <EmptyState icon={Cloud} title="Nothing to fetch from or push to" hint="Add a remote to sync this repository." compact />
+        {:else}
+          <Skeleton variant="rect" height="8rem" />
+        {/if}
       {:else}
         <ul class="space-y-2">
           {#each remotes as remote (remote.name)}
             {@const pruneKey = `remote-prune-${remote.name}`}
             {@const removeKey = `remote-remove-${remote.name}`}
             {@const setKey = `remote-seturl-${remote.name}`}
-            <li class="rounded-xl border border-border/50 px-3 py-2">
+            <li class="rounded-xl border border-edgeSoft px-3 py-2">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="font-mono font-semibold text-textPrimary">{remote.name}</span>
                 {#if remote.is_default}
-                  <span class="rounded-full bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">default</span>
+                  <span class="gp-chip" data-tone="accent">default</span>
                 {/if}
-                <span class="text-[11px] text-textMuted">
+                <span class="text-meta text-textMuted">
                   {remote.tracking_branches} tracked branch{remote.tracking_branches === 1 ? "" : "es"}
                 </span>
               </div>
-              <p class="mt-1 truncate font-mono text-[11px] text-textMuted">
+              <p class="mt-1 truncate font-mono text-meta text-textMuted">
                 {remote.fetch_url ?? "no fetch URL"}
                 {#if remoteHost(remote.fetch_url)}
-                  <span class="text-textMuted/70"> · {remoteHost(remote.fetch_url)}</span>
+                  <span class="text-faint"> · {remoteHost(remote.fetch_url)}</span>
                 {/if}
               </p>
               {#if hasSplitUrls(remote)}
                 <!-- Either a deliberate fork workflow or work going to the
                      wrong repository; both are invisible if collapsed. -->
-                <p class="mt-1 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                <p class="mt-1 flex items-start gap-1.5 text-meta text-warn">
                   <AlertTriangle size={11} class="mt-0.5 shrink-0" />
                   <span class="min-w-0 break-all">
                     Pushes go elsewhere: <span class="font-mono">{remote.push_url}</span>
@@ -476,7 +479,7 @@
                 </p>
               {/if}
               {#if remote.has_credentials}
-                <p class="mt-1 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                <p class="mt-1 flex items-start gap-1.5 text-meta text-warn">
                   <ShieldAlert size={11} class="mt-0.5 shrink-0" />
                   <span>This URL embeds a password or token. It is hidden here and kept when you apply the URL shown, but it is stored in plain text in .git/config.</span>
                 </p>
@@ -484,7 +487,7 @@
               <div class="mt-2 flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
-                  class="gp-btn py-1! px-2.5! text-[11px]!"
+                  class="gp-btn" data-size="sm"
                   disabled={busy !== null}
                   onclick={() => {
                     editingRemote = remote.name;
@@ -499,7 +502,7 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn py-1! px-2.5! text-[11px]!"
+                  class="gp-btn" data-size="sm"
                   disabled={busy !== null}
                   onclick={() => {
                     renamingRemote = remote.name;
@@ -513,9 +516,9 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === pruneKey
-                    ? 'border-red-500/60! text-red-600! dark:text-red-400!'
-                    : ''}"
+                  class="gp-btn"
+                  data-size="sm"
+                  data-variant={armed?.key === pruneKey ? "danger" : undefined}
                   disabled={busy !== null}
                   onclick={() => activateRemote({ kind: "prune", name: remote.name })}
                 >
@@ -523,9 +526,9 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === removeKey
-                    ? 'border-red-500/60! text-red-600! dark:text-red-400!'
-                    : ''}"
+                  class="gp-btn"
+                  data-size="sm"
+                  data-variant={armed?.key === removeKey ? "danger" : undefined}
                   disabled={busy !== null}
                   onclick={() => activateRemote({ kind: "remove", name: remote.name })}
                 >
@@ -533,7 +536,7 @@
                   {armed?.key === removeKey ? "Confirm remove" : "Remove"}
                 </button>
                 {#if armed?.kind === "remote" && (armed.key === pruneKey || armed.key === removeKey || armed.key === setKey)}
-                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn" data-size="sm" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
@@ -547,18 +550,21 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
+                    class="gp-field min-w-0 flex-1 font-mono text-meta!"
                     bind:value={editUrl}
                     aria-label="New URL for {remote.name}"
                     placeholder="https://github.com/owner/repo.git"
                   />
                   {#if remote.has_credentials}
-                    <label class="flex w-full items-center gap-1.5 text-[11px] text-textMuted">
-                      <input type="checkbox" bind:checked={editDropCredentials} />
-                      Remove the saved password or token (otherwise it is kept)
-                    </label>
+                    <div class="w-full">
+                      <Checkbox
+                        label="Remove the saved password or token (otherwise it is kept)"
+                        checked={editDropCredentials}
+                        onchange={(next) => (editDropCredentials = next)}
+                      />
+                    </div>
                   {/if}
-                  <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]!" disabled={busy !== null}>
+                  <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={busy !== null}>
                     {armed?.key === setKey ? "Confirm URL" : "Apply URL"}
                   </button>
                 </form>
@@ -572,25 +578,25 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
+                    class="gp-field min-w-0 flex-1 font-mono text-meta!"
                     bind:value={renameTo}
                     aria-label="New name for {remote.name}"
                     placeholder="upstream"
                   />
-                  <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]!" disabled={busy !== null}>
+                  <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={busy !== null}>
                     Apply name
                   </button>
                 </form>
                 {#if renameError}
-                  <p class="mt-1 text-[11px] text-red-600 dark:text-red-400">{renameError}</p>
+                  <p class="mt-1 text-meta text-danger">{renameError}</p>
                 {:else if renameTo.trim() && renameTo.trim() !== remote.name}
-                  <p class="mt-1 text-[11px] leading-relaxed text-textMuted">
+                  <p class="mt-1 text-meta leading-relaxed text-textMuted">
                     {remoteChangeConsequence({ kind: "rename", name: remote.name, new_name: renameTo.trim() })}
                   </p>
                 {/if}
               {/if}
               {#if armed?.kind === "remote" && armed.change.name === remote.name}
-                <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
+                <p class="mt-1.5 text-meta leading-relaxed text-danger">
                   {remoteChangeConsequence(armed.change)}
                 </p>
               {/if}
@@ -608,25 +614,25 @@
       >
         <div class="flex flex-wrap items-center gap-1.5">
           <input
-            class="gp-input w-28 font-mono text-[11px]!"
+            class="gp-field w-28 font-mono text-meta!"
             bind:value={addName}
             aria-label="Remote name"
             placeholder="origin"
           />
           <input
-            class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
+            class="gp-field min-w-0 flex-1 font-mono text-meta!"
             bind:value={addUrl}
             aria-label="Remote URL"
             placeholder="https://github.com/owner/repo.git"
           />
-          <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]! inline-flex items-center gap-1" disabled={busy !== null}>
+          <button type="submit" class="gp-btn" data-variant="primary" data-size="sm" disabled={busy !== null}>
             {#if busy === "remote-add"}<Loader2 size={11} class="animate-spin" />{/if}
             <Plus size={11} />
             Add remote
           </button>
         </div>
         {#if addError}
-          <p class="text-[11px] text-red-600 dark:text-red-400">{addError}</p>
+          <p class="text-meta text-danger">{addError}</p>
         {/if}
       </form>
     </section>
@@ -637,15 +643,15 @@
         <div class="flex items-center gap-2 min-w-0">
           <Package size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Submodules</h2>
-          <span class="truncate text-[11px] {submodulesError ? 'text-red-600 dark:text-red-400' : 'text-textMuted'}">
-            {submodulesError ? "Could not read submodules" : submodulesLoaded ? describeSubmodules(submodules) : "Loading…"}
+          <span class="truncate text-meta {submodulesError ? 'text-danger' : 'text-textMuted'}">
+            {submodulesError ? "Couldn't read submodules" : submodulesLoaded ? describeSubmodules(submodules) : null}{#if !submodulesError && !submodulesLoaded}<div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>{/if}
           </span>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
           {#if syncable.length > 0}
             <button
               type="button"
-              class="gp-btn py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5"
+              class="gp-btn" data-size="sm"
               disabled={busy !== null}
               onclick={() =>
                 activateSubmodule({ kind: "sync", path: null, recursive: true })}
@@ -657,7 +663,7 @@
           {#if initializable.length > 0}
             <button
               type="button"
-              class="gp-btn-primary py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5"
+              class="gp-btn" data-variant="primary" data-size="sm"
               disabled={busy !== null}
               onclick={() =>
                 activateSubmodule({ kind: "update", path: null, recursive: true })}
@@ -670,51 +676,49 @@
       </header>
 
       {#if submodulesTruncated}
-        <p class="mb-2 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+        <p class="mb-2 flex items-start gap-1.5 text-meta text-warn">
           <AlertTriangle size={11} class="mt-0.5 shrink-0" />
           <span>Showing {submodules.length} submodules. More exist and are not listed.</span>
         </p>
       {/if}
       {#if submodulesError}
-        <p class="text-[11px] text-red-600 dark:text-red-400">{submodulesError}</p>
+        <p class="text-meta text-danger">{submodulesError}</p>
       {:else if submodules.length === 0}
-        <p class="text-[11px] text-textMuted">
-          {submodulesLoaded ? "Nothing is embedded in this repository." : "Reading .gitmodules…"}
-        </p>
+        {#if submodulesLoaded}
+          <p class="text-meta text-textMuted">Nothing is embedded in this repository.</p>
+        {:else}
+          <Skeleton variant="text" width="40%" height="0.875rem" />
+        {/if}
       {:else}
         <ul class="space-y-2">
           {#each submodules as sub (sub.path)}
-            <li class="rounded-xl border border-border/50 px-3 py-2">
+            <li class="rounded-xl border border-edgeSoft px-3 py-2">
               <div class="flex flex-wrap items-center gap-2">
                 <span class="font-mono text-textPrimary">{sub.path}</span>
-                <span
-                  class="rounded-full px-1.5 py-0.5 text-[10px] {needsAttention(sub)
-                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-                    : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'}"
-                >
+                <span class="gp-chip" data-tone={needsAttention(sub) ? "warn" : "ok"}>
                   {submoduleStateLabel(sub.state)}
                 </span>
                 {#if sub.orphaned}
-                  <span class="rounded-full bg-red-500/15 px-1.5 py-0.5 text-[10px] text-red-600 dark:text-red-400">
+                  <span class="gp-chip" data-tone="danger">
                     not in .gitmodules
                   </span>
                 {/if}
               </div>
               {#if needsAttention(sub)}
-                <p class="mt-1 text-[11px] leading-relaxed text-textMuted">
+                <p class="mt-1 text-meta leading-relaxed text-textMuted">
                   {submoduleStateExplanation(sub.state)}
                 </p>
               {/if}
               {#if blockedInitializeReason(sub)}
                 <!-- Saying why the button is absent is the only way the user
                      learns the real problem is a missing .gitmodules entry. -->
-                <p class="mt-1 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
+                <p class="mt-1 text-meta leading-relaxed text-danger">
                   {blockedInitializeReason(sub)}
                 </p>
               {:else if canInitialize(sub)}
                 <button
                   type="button"
-                  class="gp-btn mt-1.5! py-1! px-2.5! text-[11px]!"
+                  class="gp-btn mt-1.5" data-size="sm"
                   disabled={busy !== null}
                   onclick={() =>
                     activateSubmodule({ kind: "update", path: sub.path, recursive: true })}
@@ -726,7 +730,7 @@
                 {#if canSync(sub)}
                   <button
                     type="button"
-                    class="gp-btn py-1! px-2.5! text-[11px]!"
+                    class="gp-btn" data-size="sm"
                     disabled={busy !== null}
                     onclick={() =>
                       activateSubmodule({ kind: "sync", path: sub.path, recursive: false })}
@@ -738,9 +742,9 @@
                   {@const deinitKey = `submodule-deinit-${sub.path}`}
                   <button
                     type="button"
-                    class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === deinitKey
-                      ? 'border-red-500/60! text-red-600! dark:text-red-400!'
-                      : ''}"
+                    class="gp-btn"
+                    data-size="sm"
+                    data-variant={armed?.key === deinitKey ? "danger" : undefined}
                     disabled={busy !== null}
                     onclick={() =>
                       activateSubmodule({ kind: "deinit", path: sub.path, force: false })}
@@ -749,13 +753,13 @@
                   </button>
                 {/if}
                 {#if armed?.kind === "submodule" && armed.change.kind === "deinit" && armed.change.path === sub.path}
-                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn" data-size="sm" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
               </div>
               {#if armed?.kind === "submodule" && armed.change.kind === "deinit" && armed.change.path === sub.path}
-                <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
+                <p class="mt-1.5 text-meta leading-relaxed text-danger">
                   {submoduleChangeConsequence(armed.change)}
                 </p>
               {/if}
@@ -770,64 +774,71 @@
       <header class="mb-3 flex items-center gap-2">
         <Archive size={15} class="shrink-0 text-accent" />
         <h2 class="font-semibold text-textPrimary">Stash</h2>
-        <span class="text-[11px] text-textMuted">
+        <span class="text-meta text-textMuted">
           {stashEntries.length} entr{stashEntries.length === 1 ? "y" : "ies"}
         </span>
       </header>
 
       <form class="mb-3 space-y-2" onsubmit={(event) => { event.preventDefault(); void saveStash(); }}>
-        <label class="block text-[11px] text-textSecondary">
+        <label class="block text-meta text-textSecondary">
           Stash message
-          <input class="gp-input mt-1 w-full" bind:value={stashMessage} maxlength={4096} placeholder="What are you setting aside?" disabled={busy !== null} />
+          <input class="gp-field mt-1 w-full" bind:value={stashMessage} maxlength={4096} placeholder="What are you setting aside?" disabled={busy !== null} />
         </label>
-        <div class="flex flex-wrap gap-3 text-[11px] text-textSecondary">
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={includeUntracked} disabled={busy !== null} />Include untracked files</label>
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={keepIndex} disabled={busy !== null} />Keep staged changes</label>
-          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={stashSelectedOnly} disabled={busy !== null || changedPaths.length === 0} />Only selected files</label>
+        <div class="flex flex-wrap gap-3 text-meta text-textSecondary">
+          <Checkbox label="Include untracked files" checked={includeUntracked} disabled={busy !== null} onchange={(next) => (includeUntracked = next)} />
+          <Checkbox label="Keep staged changes" checked={keepIndex} disabled={busy !== null} onchange={(next) => (keepIndex = next)} />
+          <Checkbox label="Only selected files" checked={stashSelectedOnly} disabled={busy !== null || changedPaths.length === 0} onchange={(next) => (stashSelectedOnly = next)} />
         </div>
         {#if stashSelectedOnly}
           {#if changedPaths.length > STASH_PICKER_LIMIT}
-            <p class="text-[11px] text-amber-600 dark:text-amber-400">{changedPaths.length} changed files is too many to pick from here. Stash the whole working tree instead.</p>
+            <p class="text-meta text-warn">{changedPaths.length} changed files is too many to pick from here. Stash the whole working tree instead.</p>
           {:else}
-            <fieldset class="max-h-40 overflow-y-auto rounded-lg border border-border/60 p-2 space-y-0.5" disabled={busy !== null} aria-label="Files to stash">
+            <fieldset class="max-h-40 overflow-y-auto rounded-lg border border-edge p-2 space-y-0.5" disabled={busy !== null} aria-label="Files to stash">
               {#each changedPaths as path (path)}
-                <label class="flex items-center gap-1.5 text-[11px] font-mono"><input type="checkbox" value={path} bind:group={stashPaths} /><span class="truncate">{path}</span></label>
+                <label class="flex items-center gap-1.5 text-meta font-mono">
+                  <Checkbox
+                    ariaLabel={path}
+                    checked={stashPaths.includes(path)}
+                    onchange={(next) => (stashPaths = next ? [...stashPaths, path] : stashPaths.filter((p) => p !== path))}
+                  />
+                  <span class="truncate">{path}</span>
+                </label>
               {/each}
             </fieldset>
-            <p class="text-[11px] text-textMuted">{stashPaths.length} of {changedPaths.length} selected</p>
+            <p class="text-meta text-textMuted">{stashPaths.length} of {changedPaths.length} selected</p>
           {/if}
         {/if}
-        <p class="text-[11px] text-textMuted">{keepIndex ? "Staged changes remain ready to commit. " : ""}Ignored files stay in the working tree.</p>
+        <p class="text-meta text-textMuted">{keepIndex ? "Staged changes remain ready to commit. " : ""}Ignored files stay in the working tree.</p>
         <button type="submit" class="gp-btn" disabled={busy !== null || !$repoStore.statuses.length || $repoStore.isBare}>Save stash</button>
       </form>
       {#if $repoStore.stashTruncated}
-        <p class="mb-2 text-[11px] text-amber-600 dark:text-amber-400">Showing {stashEntries.length} entries from a limited stash list. Older or incomplete entries are not shown.</p>
+        <p class="mb-2 text-meta text-warn">Showing {stashEntries.length} entries from a limited stash list. Older or incomplete entries are not shown.</p>
       {/if}
       {#if stashFailed}
         <!-- An unreadable stack must not render as an empty one: a forgotten
              stash is work that exists nowhere else. -->
-        <p class="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+        <p class="flex items-start gap-1.5 text-meta text-warn">
           <AlertTriangle size={11} class="mt-0.5 shrink-0" />
-          <span>The stash list could not be read, so this may not be complete.</span>
+          <span>The stash list couldn't be read, so this may not be complete.</span>
         </p>
       {:else if stashEntries.length === 0}
-        <p class="text-[11px] text-textMuted">{stashEmptyMessage(true)}</p>
+        <EmptyState icon={Archive} title="No stashed changes" compact />
       {:else}
         <ul class="space-y-2">
           {#each stashEntries as entry (stashEntryKey(entry))}
-            <li class="rounded-xl border border-border/50 px-3 py-2">
+            <li class="rounded-xl border border-edgeSoft px-3 py-2">
               <p class="truncate font-medium text-textPrimary">{stashTitle(entry)}</p>
-              <p class="mt-0.5 font-mono text-[11px] text-textMuted">{stashSubtitle(entry)}</p>
+              <p class="mt-0.5 font-mono text-meta text-textMuted">{stashSubtitle(entry)}</p>
               <div class="mt-2 flex flex-wrap items-center gap-1.5">
-                <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" aria-expanded={previewKey === stashEntryKey(entry)} onclick={() => void previewStash(entry)}>{previewKey === stashEntryKey(entry) ? "Close preview" : "Preview"}</button>
+                <button type="button" class="gp-btn" data-size="sm" aria-expanded={previewKey === stashEntryKey(entry)} onclick={() => void previewStash(entry)}>{previewKey === stashEntryKey(entry) ? "Close preview" : "Preview"}</button>
                 {#each STASH_ACTIONS as action (action)}
                   {@const key = `stash-${action}-${stashEntryKey(entry)}`}
                   {@const isArmed = armed?.kind === "stash" && armed.key === key}
                   <button
                     type="button"
-                    class="{action === 'apply' ? 'gp-btn-primary' : 'gp-btn'} py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5 {isArmed
-                      ? 'border-red-500/60! text-red-600! dark:text-red-400!'
-                      : ''}"
+                    class="gp-btn"
+                    data-size="sm"
+                    data-variant={isArmed ? "danger" : action === "apply" ? "primary" : undefined}
                     disabled={busy !== null}
                     title={stashActionConsequence(action)}
                     onclick={() =>
@@ -840,23 +851,23 @@
                   </button>
                 {/each}
                 {#if armed?.kind === "stash" && armed.entryKey === stashEntryKey(entry)}
-                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn" data-size="sm" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
               </div>
               {#if armed?.kind === "stash" && armed.entryKey === stashEntryKey(entry)}
-                <p class="mt-1.5 text-[11px] leading-relaxed text-red-600 dark:text-red-400">
+                <p class="mt-1.5 text-meta leading-relaxed text-danger">
                   {stashActionConsequence(armed.action)}
                 </p>
               {/if}
               {#if previewKey === stashEntryKey(entry)}
                 <div class="mt-3" aria-label="Stash preview">
-                  {#if previewError}<p role="alert" class="text-[11px] text-red-600 dark:text-red-400">{previewError}</p>
+                  {#if previewError}<p role="alert" class="text-meta text-danger">{previewError}</p>
                   {:else if preview}
-                    {#if preview.truncated}<p class="mb-2 text-[11px] text-amber-600 dark:text-amber-400">Preview is incomplete. {preview.truncation_reason ?? "The diff exceeds the display limit."}</p>{/if}
-                    <div class="h-80 overflow-hidden rounded-lg border border-border/50"><CodeViewer filePath={`stash-${entry.index}.diff`} content={preview.text} readOnly /></div>
-                  {:else}<p role="status" class="text-[11px] text-textMuted">Loading stash preview…</p>{/if}
+                    {#if preview.truncated}<p class="mb-2 text-meta text-warn">Preview is incomplete. {preview.truncation_reason ?? "The diff exceeds the display limit."}</p>{/if}
+                    <div class="h-80 overflow-hidden rounded-lg border border-edgeSoft"><CodeViewer filePath={`stash-${entry.index}.diff`} content={preview.text} readOnly /></div>
+                  {:else}<Skeleton variant="rect" height="20rem" />{/if}
                 </div>
               {/if}
             </li>

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { Archive, ArrowLeft, Bot, Calendar, Check, CircleDot, Clipboard, Copy, Hash, Minus, Plus, Sparkles, SquareCheck, SquarePen, Tag, Trash2, User } from "@lucide/svelte";
   import { portal } from "../dom/portal";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { cycleFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { menuPageItems, submenuTitle, typeAheadIndex, type TaskMenuIcon, type TaskMenuItem, type TaskMenuSubmenu } from "../workbench/taskMenu";
@@ -175,7 +175,7 @@
 <div
   bind:this={menuEl}
   use:portal={"body"}
-  use:popover={dismissal}
+  use:popover={dismissal} out:popoverExit
   data-task-menu
   class="gp-menu gp-pop fixed min-w-56 max-w-[min(18rem,calc(100vw-1rem))] max-h-[min(32rem,calc(100vh-1rem))] overflow-y-auto text-xs text-textPrimary py-1"
   style="z-index: {LAYERS.MENU}"
@@ -191,7 +191,7 @@
     </button>
     <div class="gp-menu-sep" role="separator"></div>
   {:else}
-    <div class="px-2.5 py-1 text-[10px] text-textMuted">{label}</div>
+    <div class="px-2.5 py-1 text-micro text-textMuted">{label}</div>
   {/if}
   {#each shown as item (item.id)}
     {#if item.separatorBefore && page === "root"}<div class="gp-menu-sep" role="separator"></div>{/if}
@@ -199,7 +199,7 @@
       type="button"
       role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"}
       data-menu-id={item.id}
-      class="gp-menu-item {item.danger ? 'text-rose-400' : ''}"
+      class="gp-menu-item {item.danger ? 'text-danger' : ''}"
       aria-disabled={item.disabled}
       aria-checked={item.checked === undefined ? undefined : item.checked === "mixed" ? "mixed" : item.checked}
       aria-haspopup={item.action.kind === "submenu" ? "menu" : undefined}
@@ -212,7 +212,7 @@
         </span>
       {:else if item.icon}{@render menuIcon(item.icon, item.danger)}{/if}
       <span class="flex-1 min-w-0 truncate">{item.label}</span>
-      {#if item.hint}<span class="text-[10px] text-textMuted shrink-0">{item.hint}</span>{/if}
+      {#if item.hint}<span class="text-micro text-textMuted shrink-0">{item.hint}</span>{/if}
       {#if item.action.kind === "submenu"}<span class="text-textMuted shrink-0" aria-hidden="true">›</span>{/if}
     </button>
   {/each}
@@ -238,7 +238,7 @@
   <!-- The same glyph the board header's Archive toggle carries, so the row
        and the panel it files into read as one thing. -->
   {:else if name === "archive"}<Archive size={13} />
-  {:else if name === "delete"}<Trash2 size={13} class={danger ? "text-rose-400" : ""} />
+  {:else if name === "delete"}<Trash2 size={13} class={danger ? "text-danger" : ""} />
   {/if}
 {/snippet}
 

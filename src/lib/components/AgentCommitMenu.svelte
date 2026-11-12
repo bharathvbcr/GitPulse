@@ -23,7 +23,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
-  import { popover, restoreFocusTo, type DismissReason, type PopoverOptions } from "../ui/popover";
+  import { popover, restoreFocusTo, type DismissReason, type PopoverOptions, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { describeFailure } from "../ui/copy/describeFailure";
   import SettingSegment from "./SettingSegment.svelte";
@@ -41,10 +41,22 @@
 
   let {
     compact = false,
+    iconOnly = false,
+    segment = false,
     align = "left",
     direction = "down",
   }: {
     compact?: boolean;
+    /**
+     * Icon-only trailing segment of a split button. The parent draws the pill
+     * and the divider; this trigger only opens the dialog.
+     */
+    segment?: boolean;
+    /**
+     * Icon only, for the 44 px rail: the label moves to `aria-label` and the
+     * tooltip, so nothing can spill past the column. Applies to `compact`.
+     */
+    iconOnly?: boolean;
     /** Which trigger edge the panel lines up with. */
     align?: "left" | "right";
     /** Preferred side; the panel flips when that side cannot hold it. */
@@ -327,8 +339,27 @@
   }
 </script>
 
-<div class="relative inline-flex items-center" data-agent-commit-menu={uid}>
-  {#if compact}
+<div
+  class="relative inline-flex {segment ? 'items-stretch self-stretch' : 'items-center'}"
+  data-agent-commit-menu={uid}
+>
+  {#if segment}
+    <button
+      bind:this={triggerEl}
+      type="button"
+      onclick={toggle}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      aria-controls={open ? panelId : undefined}
+      aria-label="Ask agent"
+      disabled={Boolean(disabledReason)}
+      title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
+      class="gp-btn h-full rounded-none px-2.5 shadow-none"
+      data-variant="primary"
+    >
+      <Sparkles size={12} class="shrink-0" />
+    </button>
+  {:else if compact}
     <button
       bind:this={triggerEl}
       type="button"
@@ -338,11 +369,12 @@
       aria-controls={open ? panelId : undefined}
       disabled={Boolean(disabledReason)}
       title={disabledReason ?? "Ask Antigravity or Claude to quickly commit these changes"}
-      class="gp-btn text-textMuted hover:text-accent"
+      aria-label={iconOnly ? "Ask agent" : undefined}
+      class={iconOnly ? "gp-icon-btn hover:text-accent" : "gp-btn text-textMuted hover:text-accent"}
       data-size="sm"
     >
-      <Sparkles size={11} class="text-accent shrink-0" />
-      <span class="font-sans">Ask agent</span>
+      <Sparkles size={iconOnly ? 14 : 11} class="text-accent shrink-0" />
+      {#if !iconOnly}<span class="font-sans">Ask agent</span>{/if}
     </button>
   {:else}
     <button
@@ -369,7 +401,7 @@
        after it has left the clipping pane, not while it is still inside it. -->
   <div
     use:portal={"body"}
-    use:popover={dismissal}
+    use:popover={dismissal} out:popoverExit
     id={panelId}
     data-agent-commit-panel={uid}
     class="fixed gp-menu gp-pop gp-scroll p-3 w-80 max-w-[calc(100vw-16px)] max-h-[calc(100vh-16px)] overflow-y-auto overscroll-contain flex flex-col gap-2.5 font-sans"

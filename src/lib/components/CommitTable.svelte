@@ -73,7 +73,9 @@
    */
   const COMMIT_OVERSCAN = 8;
   import { LAYERS } from "../ui/layers";
+  import { GitCommit, Loader } from "@lucide/svelte";
   import CommitRow from "./CommitRow.svelte";
+  import EmptyState from "./EmptyState.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import GraphClipNotice from "./GraphClipNotice.svelte";
@@ -893,22 +895,26 @@
        acceptable answer for it. -->
   {#if $graphStore.isLoading}
     <div
-      class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden"
+      class="absolute top-0 inset-x-0 h-0.5 overflow-hidden"
+      style="z-index: {LAYERS.STICKY};"
       role="status"
       aria-label="Loading commits"
     >
-      <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
+      <div class="h-full w-1/3 bg-accent gp-indeterminate"></div>
     </div>
   {/if}
   {#if $graphStore.error && !$graphStore.isLoading}
     <div
-      class="absolute top-1 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg bg-surface border border-rose-500/40 text-[11px] text-rose-300 shadow-lg flex flex-col gap-0.5 max-w-[90%]"
+      class="gp-notice absolute top-1 left-1/2 max-w-[90%] -translate-x-1/2 flex-col gap-0.5 text-meta shadow-pop"
+      data-tone="danger"
+      style="z-index: {LAYERS.STICKY};"
       role="alert"
     >
-      <div class="flex items-center gap-2 min-w-0">
-        <span class="truncate" title={$graphStore.error}>{$graphStore.error}</span>
+      <div class="flex w-full min-w-0 items-center gap-2">
+        <span class="truncate" title={$graphStore.error}>Couldn't load commits. {$graphStore.error}</span>
         <button
-          class="shrink-0 underline hover:text-white"
+          class="gp-btn shrink-0"
+          data-size="sm"
           onclick={() => {
             const path = $repoStore.currentPath;
             if (!path) return;
@@ -923,7 +929,7 @@
             );
           }}
         >
-          Retry
+          Try again
         </button>
       </div>
       {#if previousFilterShown}
@@ -935,7 +941,7 @@
   {/if}
 
   <div
-    class="relative z-10 flex min-w-0 shrink-0 flex-col self-stretch border-r border-border/40 bg-background"
+    class="relative isolate flex min-w-0 shrink-0 flex-col self-stretch bg-background"
     style={graphViewportBoxStyle(graphViewportWidth)}
   >
     <div
@@ -966,7 +972,7 @@
     bind:this={container}
     onscroll={handleScroll}
     aria-busy={$graphStore.isLoading}
-    class="flex-1 overflow-y-auto overflow-x-hidden relative gp-scroll"
+    class="flex-1 overflow-y-auto overflow-x-hidden relative gp-scroll pl-2"
   >
     <div style="height: {totalCommits * rowHeight}px; width: 100%; position: relative;">
       <div
@@ -991,26 +997,29 @@
       </div>
     </div>
     {#if totalCommits === 0 && !$graphStore.isLoading && !$graphStore.error}
-      <div class="absolute inset-0 flex items-center justify-center text-textMuted text-xs pointer-events-none">
+      <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
         {#if $filterStore.searchQuery.trim() === "" && !$filterStore.selectedBranch}
-          This repository has no commits yet.
+          <EmptyState icon={GitCommit} title="No commits yet" hint="This repository has no commits. Make one and it shows up here." compact />
         {:else}
-          No commits match the current filters.
+          <EmptyState icon={GitCommit} title="No commits match the filters" hint="Clear the search or the branch filter to see the full history." compact />
         {/if}
       </div>
     {/if}
     {#if $graphStore.hasMore}
-      <button
-        onclick={loadMore}
-        disabled={isLoadingMore || nextLoadLimit($graphStore.maxCommits) === null}
-        class="block mx-auto my-2 px-3 py-1.5 rounded-lg border border-border bg-surface text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors disabled:opacity-50"
-      >
-        {#if isLoadingMore}
-          <span class="inline-block animate-spin mr-1.5">◌</span>Loading older history…
-        {:else}
-          {loadMoreLabel}
-        {/if}
-      </button>
+      <div class="flex justify-center py-2">
+        <button
+          onclick={loadMore}
+          disabled={isLoadingMore || nextLoadLimit($graphStore.maxCommits) === null}
+          class="gp-btn"
+          data-size="sm"
+        >
+          {#if isLoadingMore}
+            <Loader size={12} class="animate-spin" />Loading older history…
+          {:else}
+            {loadMoreLabel}
+          {/if}
+        </button>
+      </div>
     {/if}
   </div>
 

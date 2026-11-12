@@ -29,7 +29,7 @@ import {
 export const SWIMLANES = ["none", "status", "owner", "label"] as const;
 export type Swimlane = (typeof SWIMLANES)[number];
 export const SWIMLANE_LABELS: Record<Swimlane, string> = {
-  none: "No lanes",
+  none: "No grouping",
   status: "Status",
   owner: "Owner",
   label: "Label",
@@ -272,7 +272,7 @@ export function saveView(
     return { ok: false, reason: `A board keeps at most ${MAX_VIEWS_PER_BOARD} saved views. Delete one first.` };
   }
   const view: SavedTaskView = { id: existing?.id ?? newId().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64), name: clean, ...sanitizeSnapshot(snapshot) };
-  if (!view.id) return { ok: false, reason: "Could not name the view." };
+  if (!view.id) return { ok: false, reason: "Couldn't name the view." };
   const views = existing ? prefs.views.map((entry) => entry.id === existing.id ? view : entry) : [...prefs.views, view];
   return { ok: true, boards: withBoard(boards, key, { ...prefs, views }), view, replaced: Boolean(existing) };
 }

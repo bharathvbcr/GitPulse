@@ -1,0 +1,4 @@
+.gp-glow {
+  background-image: linear-gradient(135deg, #34d399, #059669);
+  box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
+}

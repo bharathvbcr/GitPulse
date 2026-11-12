@@ -6,7 +6,8 @@
    * The filter does not apply here: the ranking is one answer whose scores
    * are comparable only within it, so narrowing it by text would hand the
    * reader a list whose order means something it does not. ⌘F, which focuses
-   * the filter on the other lists, focuses the symptom field instead.
+   * the view bar's search field (the commit filter) on the other lists,
+   * focuses the symptom field instead (findChordTarget in views/commitFilter).
    */
   import { tick } from "svelte";
   import { Loader2, Search } from "@lucide/svelte";
@@ -18,7 +19,7 @@
     MAX_SUSPECT_CONE_DEPTH,
     MAX_SYMPTOM_LENGTH,
   } from "../codeintel/suspectsQuery";
-  import { FOCUS_COMMIT_SEARCH_EVENT } from "../views/commitFilter";
+  import { FOCUS_SUSPECTS_SYMPTOM_EVENT } from "../views/commitFilter";
 
   let symptomInput = $state<HTMLInputElement | null>(null);
 
@@ -31,8 +32,8 @@
   }
 
   $effect(() => {
-    window.addEventListener(FOCUS_COMMIT_SEARCH_EVENT, focusSymptom);
-    return () => window.removeEventListener(FOCUS_COMMIT_SEARCH_EVENT, focusSymptom);
+    window.addEventListener(FOCUS_SUSPECTS_SYMPTOM_EVENT, focusSymptom);
+    return () => window.removeEventListener(FOCUS_SUSPECTS_SYMPTOM_EVENT, focusSymptom);
   });
 
   // "Find suspects since this commit" with no symptom yet asks for this field,

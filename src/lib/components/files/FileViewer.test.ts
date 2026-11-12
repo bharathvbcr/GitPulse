@@ -274,7 +274,7 @@ describe("FileViewer", () => {
 
   it("surfaces clipboard failure when copying the active path", () => {
     expect(source).toContain("if (!(await copyText(activeTabPath)))");
-    expect(source).toContain('repoStore.setError("Could not copy path to clipboard")');
+    expect(source).toContain(`repoStore.setError("Couldn't copy path to clipboard")`);
   });
 
   it("renders LanguageLogo for open editor tabs", () => {

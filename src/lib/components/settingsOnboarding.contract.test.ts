@@ -107,7 +107,9 @@ describe("No native window.confirm in Settings panels (SO-12)", () => {
 
   it("Reset Tips says it worked and forgets when Settings closes", () => {
     const settings = read("SettingsModal.svelte");
-    expect(settings).toContain("onclick={resetTips}");
+    // The button now lives in AppearanceSettings and is wired to resetTips by SettingsModal.
+    expect(read("AppearanceSettings.svelte")).toContain("onclick={onResetTips}");
+    expect(settings).toContain("onResetTips={resetTips}");
     expect(settings).toContain('tipsStatus = "Tips restored"');
     expect(settings).toMatch(/if \(!isOpen\) tipsStatus = ""/);
   });

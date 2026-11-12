@@ -7,6 +7,7 @@
     summarizeVelocity,
   } from "../github/prVelocity";
   import type { WorkflowsReport, GitHubContext } from "../github/types";
+  import { notePullRequests } from "../github/pullRequestReads";
 
 
 
@@ -97,6 +98,7 @@
     type PrFacet,
   } from "../github/remoteFilter";
   import { formatError } from "../ui/formatError";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -436,6 +438,9 @@
     loading = true;
     try {
       const next = await readGitHubContext<GitHubContext>(repo, { force });
+      // Row 2's glance reads the branch's pull request from here; a failed
+      // read is not recorded (pullRequestReads.ts).
+      notePullRequests(repo, next);
       if (!guard.isLive()) return;
       // gh reports a rate limit or an outage as a context carrying `error`. On
       // a panel already showing a good read, that is a failed refresh, not the
@@ -483,6 +488,9 @@
     quietRefreshing = true;
     try {
       const next = await readGitHubContext<GitHubContext>(repo, { force: false });
+      // The glance's pull-request read is per repository, so it is recorded
+      // even when the screen has moved on; a failed read is not recorded.
+      notePullRequests(repo, next);
       if ($repoStore.currentPath !== repo || loading) return;
       if (next.error) {
         backgroundError = `Couldn't refresh GitHub in the background. ${next.error}`;
@@ -503,9 +511,15 @@
     }
   }
 
+  /** "Couldn't <verb> <object>. <Reason>" for an error line. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, cause);
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+
   /** A failed refresh over data already on screen: keep the data, say what failed and how old it is. */
   function reportRefreshFailure(message: string) {
-    actionError = `Refresh failed: ${message} — showing ${fetchedAgo ? `data fetched ${fetchedAgo}` : "the last data read"}`;
+    actionError = `${failure("refresh", "the remote", message)} — showing ${fetchedAgo ? `data fetched ${fetchedAgo}` : "the last data read"}`;
   }
 
   async function loadWorkflowsFor(repo: string) {
@@ -660,17 +674,17 @@
     });
   });
 
-  // Both shades on every verdict. A single `-400` is tuned for the dark theme
-  // and sits at roughly 2:1 against the light theme's near-white card — on
-  // exactly the labels a reader opened this page to check.
+  // Status roles on every verdict: they are defined per theme, so the label
+  // keeps its contrast on the light theme's near-white card as well as the
+  // dark one — on exactly the labels a reader opened this page to check.
   function ciClass(status: string): string {
     const s = status.toLowerCase();
-    if (s === "success" || s === "completed") return "text-green-700 dark:text-green-400";
-    if (s === "failure" || s === "cancelled" || s === "timed_out") return "text-red-700 dark:text-red-400";
+    if (s === "success" || s === "completed") return "text-ok";
+    if (s === "failure" || s === "cancelled" || s === "timed_out") return "text-danger";
     // `waiting`/`requested` sit behind deployment protections/approvals —
     // in flight, never a verdict.
     if (s === "pending" || s === "in_progress" || s === "queued" || s === "waiting" || s === "requested")
-      return "text-amber-700 dark:text-amber-400";
+      return "text-warn";
     return "text-textMuted";
   }
 
@@ -721,7 +735,7 @@
       if ($repoStore.currentPath !== repo) return;
       actionNotice = withVerdict(describePrWorktree(result.output), result.policy);
     } catch (err: unknown) {
-      if ($repoStore.currentPath === repo) actionError = formatError(err);
+      if ($repoStore.currentPath === repo) actionError = failure("open", "the pull request in a worktree", err);
     } finally {
       openingWorktree.delete(number);
     }
@@ -739,14 +753,14 @@
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
       // Post-mutation reload keeps the visible filter context: a bare
-      // loadGraph(repo) reset the graph to query=""/HEAD while FilterBar
+      // loadGraph(repo) reset the graph to query=""/HEAD while the search field
       // still showed the selection. The backend applies every query term,
       // so the reload answers exactly what the scheduler keys on.
       await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);
       actionNotice = withVerdict(result.output || `Checked out pull request #${number} in place.`, result.policy);
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) {
-        repoStore.setError(formatError(err));
+        repoStore.setError(failure("check out", `pull request #${number}`, err));
       }
     } finally {
       // Clear only this id unconditionally: this component remounts per repo
@@ -781,7 +795,7 @@
       await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);
       actionNotice = message;
     } catch (err: unknown) {
-      if ($repoStore.currentPath === repo) repoStore.setError(formatError(err));
+      if ($repoStore.currentPath === repo) repoStore.setError(failure("refresh", "the checkout", err));
     }
   }
 
@@ -811,7 +825,7 @@
       );
       await Promise.all([loadFor(repo), loadWorkflowsFor(repo)]);
     } catch (err: unknown) {
-      actionError = formatError(err);
+      actionError = failure("dispatch", workflow.name || "the workflow", err);
     } finally {
       triggering = false;
     }
@@ -832,7 +846,7 @@
       actionNotice = actionMessage(result, `Re-running “${run.title || run.name}”.`);
       await loadFor(repo);
     } catch (err: unknown) {
-      actionError = formatError(err);
+      actionError = failure("re-run", "the workflow run", err);
     } finally {
       busyRunAction = null;
     }
@@ -856,7 +870,7 @@
       );
       await loadFor(repo);
     } catch (err: unknown) {
-      actionError = formatError(err);
+      actionError = failure("cancel", "the workflow run", err);
     } finally {
       busyRunAction = null;
     }
@@ -880,7 +894,7 @@
       ciReport = report;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      ciError = formatError(err);
+      ciError = failure("start", "CI:local", err);
     } finally {
       if (guard.isLive()) ciRunning = false;
     }
@@ -911,7 +925,7 @@
       <!-- How old what is on screen is. A listing carrying no timestamp reads
            as current however long it has been sitting there. -->
       {#if fetchedAgo}
-        <p class="mt-1 text-[10px] text-textMuted font-mono">fetched {fetchedAgo}</p>
+        <p class="mt-1 text-micro text-textMuted font-mono">fetched {fetchedAgo}</p>
       {/if}
       {#if backgroundError}
         <p class="mt-1 text-meta text-warn" role="status">{backgroundError}</p>
@@ -961,15 +975,13 @@
        the top of the page that pushed every listing down and could not be put
        away; it is a card the reader folds up or dismisses when done with it. -->
   {#if ciRunning}
-    <div class="mb-3 p-3 rounded-xl border border-border/70 bg-surface text-textMuted text-xs max-w-xl">
+    <div class="mb-3 p-3 rounded-xl border border-edge bg-surface text-textMuted text-xs max-w-xl">
       Running this repository's CI pipeline locally (type-check, tests, build, fmt, clippy, cargo test)…
     </div>
   {:else if ciError}
-    <div class="mb-3 p-3 rounded-xl border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300 text-xs max-w-xl">
-      CI:local could not start: {ciError}
-    </div>
+    <div class="gp-notice mb-3! max-w-xl" data-tone="danger" role="alert">{ciError}</div>
   {:else if ciReport}
-    <div class="mb-3 rounded-xl border border-border/70 bg-surface max-w-4xl">
+    <div class="mb-3 rounded-xl border border-edge bg-surface max-w-4xl">
       <div class="flex items-center justify-between gap-3 px-3 pt-3 {ciReportOpen ? 'pb-1' : 'pb-1'}">
         <button
           type="button"
@@ -979,10 +991,10 @@
           title={ciReportOpen ? "Hide the steps" : "Show the steps"}
         >
           <ChevronRight size={13} class="shrink-0 text-textMuted transition-transform {ciReportOpen ? 'rotate-90' : ''}" />
-          <span class="font-medium {ciReport.failed > 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'}">
+          <span class="font-medium {ciReport.failed > 0 ? 'text-danger' : 'text-ok'}">
             CI:local {ciLocalVerdict(ciReport)}
           </span>
-          <span class="text-[11px] text-textMuted font-mono">
+          <span class="text-meta text-textMuted font-mono">
             {(ciReport.total_duration_ms / 1000).toFixed(1)}s total
           </span>
         </button>
@@ -998,8 +1010,8 @@
       </div>
       {#if ciReport.test_scope?.reason}
         <p
-          class="mx-3 mb-1 text-[11px] font-mono leading-snug {ciReport.test_scope.fail_closed
-            ? 'text-amber-700 dark:text-amber-300'
+          class="mx-3 mb-1 text-meta font-mono leading-snug {ciReport.test_scope.fail_closed
+            ? 'text-warn'
             : 'text-textMuted'}"
           title={ciReport.test_scope.reason}
         >
@@ -1021,12 +1033,12 @@
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="{ciStepClass(step.status)} shrink-0 w-14">{step.status}</span>
                   <span class="truncate text-textPrimary">{step.name}</span>
-                  <span class="truncate font-mono text-[10px] text-textMuted hidden md:inline">{step.command}</span>
+                  <span class="truncate font-mono text-micro text-textMuted hidden md:inline">{step.command}</span>
                 </span>
-                <span class="shrink-0 text-[11px] text-textMuted font-mono">{(step.duration_ms / 1000).toFixed(1)}s</span>
+                <span class="shrink-0 text-meta text-textMuted font-mono">{(step.duration_ms / 1000).toFixed(1)}s</span>
               </summary>
               {#if step.detail || step.command}
-                <pre class="mt-1 mb-1 ml-16 whitespace-pre-wrap break-all rounded bg-background p-2 text-[10px] leading-relaxed text-textMuted overflow-x-auto">{step.detail || ""}</pre>
+                <pre class="mt-1 mb-1 ml-16 whitespace-pre-wrap break-all rounded bg-background p-2 text-micro leading-relaxed text-textMuted overflow-x-auto">{step.detail || ""}</pre>
               {/if}
             </details>
           {/each}
@@ -1037,9 +1049,9 @@
            recorded and a run nobody looked at leave the same empty space.
            Outside the fold, because a reader who has put the steps away still
            needs to know which of the two they have. -->
-      <div class="mt-2 mx-3 mb-3 pt-2 border-t border-border/50 text-[11px] font-mono">
+      <div class="mt-3 mx-3 mb-3 text-meta font-mono">
         {#if ciReport.recorded_commit}
-          <span class="text-emerald-600 dark:text-emerald-400" title="Written to refs/notes/gitpulse/verification">
+          <span class="text-ok" title="Written to refs/notes/gitpulse/verification">
             recorded on {ciReport.recorded_commit.slice(0, 8)}
           </span>
         {:else}
@@ -1050,7 +1062,7 @@
         {#if ciReport.signal_error}
           <!-- The task of an agent attempt was not told. Stated apart from the
                note above: the two are separate records and either can fail. -->
-          <div class="mt-1 text-amber-700 dark:text-amber-300" role="status" data-testid="ci-signal-error">
+          <div class="mt-1 text-warn" role="status" data-testid="ci-signal-error">
             {ciReport.signal_error}
           </div>
         {/if}
@@ -1070,13 +1082,17 @@
       </div>
     </div>
   {:else if ctx?.error}
-    <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs max-w-xl">
-      {ctx.error}
-      {#if ctx.html_url}
-        <div class="mt-2">
-          <button class="text-accent underline" onclick={() => ctx && openExternal(ctx.html_url)}>{ctx.html_url}</button>
-        </div>
-      {/if}
+    <div class="gp-notice max-w-xl" data-tone="unknown" role="status">
+      <div class="min-w-0 flex-1">
+        <div>Couldn't read the remote.</div>
+        <div>{ctx.error}</div>
+        {#if ctx.html_url}
+          <div class="mt-2">
+            <button class="text-accent underline" onclick={() => ctx && openExternal(ctx.html_url)}>{ctx.html_url}</button>
+          </div>
+        {/if}
+      </div>
+      <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={loadAll} disabled={loading || workflowsLoading}>Try again</button>
     </div>
   {:else if ctx}
     <!-- The snippet below runs after the branch is left behind in the type
@@ -1084,9 +1100,8 @@
     {@const c = ctx}
     {#if actionNotice || actionError}
       <div
-        class="mb-4 p-3 rounded-xl border text-xs max-w-3xl {actionError
-          ? 'border-red-500/30 bg-red-500/10 text-red-300'
-          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'}"
+        class="gp-notice mb-4! max-w-3xl flex-col! gap-0!"
+        data-tone={actionError ? "danger" : "ok"}
       >
         <!-- Both when both are true: a merge that went through and a reload that
              then failed are two facts, and the error must not hide the first. -->
@@ -1095,7 +1110,7 @@
       </div>
     {/if}
     {#if (ctx.warnings?.length ?? 0) > 0}
-      <div class="mb-4 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs max-w-3xl space-y-1">
+      <div class="gp-notice mb-4! max-w-3xl flex-col! gap-1!" data-tone="warn">
         {#each ctx.warnings as warning}
           <div>{warning}</div>
         {/each}
@@ -1112,16 +1127,17 @@
       <div class="xl:col-span-2 space-y-5 min-w-0">
         <section>
           <div class="flex items-center justify-between gap-3 mb-2">
-            <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Open pull requests</h3>
+            <h3 class="gp-label">Open pull requests</h3>
             <div class="flex items-center gap-2">
               {#if prFilterOn}
-                <span class="text-[11px] text-textMuted font-mono">
+                <span class="text-meta text-textMuted font-mono">
                   {visiblePrs.length} of {ctx.pull_requests.length}
                 </span>
               {/if}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! text-[11px]! flex items-center gap-1"
+                class="gp-btn flex items-center gap-1"
+                data-size="sm"
                 aria-expanded={creatingPr}
                 onclick={() => (creatingPr = !creatingPr)}
               ><Plus size={12} /> New pull request</button>
@@ -1138,7 +1154,7 @@
             />
           {/if}
           {#if ctx.prs_error && ctx.pull_requests.length === 0}
-            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+            <div class="gp-notice" data-tone="unknown" role="status">
               Pull request listing unavailable: {ctx.prs_error}
             </div>
           {:else if ctx.pull_requests.length === 0 && !ctx.prs_truncated}
@@ -1149,7 +1165,7 @@
             <!-- Median rather than mean: one PR left open for a year should not
                  become the headline number for the queue. Drafts are excluded
                  because they are not waiting on anyone. -->
-            <div class="mb-2 text-[11px] text-textMuted font-mono flex flex-wrap gap-x-3">
+            <div class="mb-2 text-meta text-textMuted font-mono flex flex-wrap gap-x-3">
               <span title="Median time the {velocity.considered} non-draft open pull requests have been open">
                 median open {formatAge(velocity.medianOpenHours)}
               </span>
@@ -1173,7 +1189,7 @@
                     data-active={prFacet === candidate ? "true" : "false"}
                     disabled={candidate !== "all" && prCounts[candidate] === 0}
                     onclick={() => (prFacet = candidate)}
-                    class="gp-seg-btn text-[11px]! py-0.5! disabled:opacity-40 disabled:cursor-default"
+                    class="gp-seg-btn disabled:opacity-40 disabled:cursor-default"
                   >
                     {#if macos && prFacet === candidate}
                       <span
@@ -1183,7 +1199,7 @@
                         out:sendSelection={{ key: "pr-facet" }}
                       ></span>
                     {/if}
-                    <span>{PR_FACET_LABELS[candidate]}<span class="ml-1 font-mono text-[10px] opacity-70">{prCounts[candidate]}</span></span>
+                    <span>{PR_FACET_LABELS[candidate]}<span class="ml-1 font-mono text-micro opacity-70">{prCounts[candidate]}</span></span>
                   </button>
                 {/each}
               </div>
@@ -1198,7 +1214,7 @@
                 />
               </label>
               {#if prFilterOn}
-                <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={clearPrFilter}>
+                <button type="button" class="gp-btn" data-size="sm" onclick={clearPrFilter}>
                   Clear
                 </button>
               {/if}
@@ -1217,7 +1233,7 @@
             {:else}
               <div class="space-y-2">
                 {#each visiblePrs as pr (pr.number)}
-                  <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                  <div class="gp-card p-3.5 transition-colors hover:border-accent/35">
                   <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0">
                       <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
@@ -1225,21 +1241,21 @@
                         <span class="truncate">#{pr.number} {pr.title}</span>
                         <FreshnessBadge freshness={prHeadFreshness($freshnessStore.byRevision, pr)} />
                         {#if pr.is_draft}
-                          <span class="gp-pill">draft</span>
+                          <span class="gp-chip" data-tone="neutral">draft</span>
                         {/if}
                       </div>
-                      <div class="mt-1 text-[11px] text-textMuted font-mono">
+                      <div class="mt-1 text-meta text-textMuted font-mono">
                         {pr.head_ref} → {pr.base_ref}
                         <span class="{ciClass(pr.ci_status)} ml-2">CI {pr.ci_status}</span>
                         <span class="ml-2" title="Open for {formatAge(openHours(pr, velocityNow))}">
                           open {formatAge(openHours(pr, velocityNow))}
                         </span>
                         {#if hoursToFirstReview(pr) !== null}
-                          <span class="ml-2 text-emerald-600 dark:text-emerald-400" title="First review came {formatAge(hoursToFirstReview(pr))} after opening">
+                          <span class="ml-2 text-ok" title="First review came {formatAge(hoursToFirstReview(pr))} after opening">
                             reviewed +{formatAge(hoursToFirstReview(pr))}
                           </span>
                         {:else if !pr.is_draft}
-                          <span class="ml-2 text-amber-600 dark:text-amber-400" title="No review submitted yet">awaiting review</span>
+                          <span class="ml-2 text-warn" title="No review submitted yet">awaiting review</span>
                         {/if}
                       </div>
                     </div>
@@ -1302,19 +1318,19 @@
               </div>
             {/if}
             {#if ctx.prs_truncated}
-              <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {ctx.pull_requests.length} pull requests; more open PRs exist. This is not complete coverage.</div>
+              <div class="mt-2 text-warn text-meta">Showing {ctx.pull_requests.length} pull requests; more open PRs exist. This is not complete coverage.</div>
             {/if}
           {/if}
         </section>
 
         <section>
           <div class="flex items-center justify-between gap-3 mb-2">
-            <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Open issues</h3>
+            <h3 class="gp-label">Open issues</h3>
             {#if ctx.issues.length > 3}
               <label class="relative w-48">
                 <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
                 <input
-                  class="gp-field w-full pl-7! py-0.5!"
+                  class="gp-field w-full pl-7!" data-size="sm"
                   type="search"
                   placeholder="Filter issues"
                   aria-label="Filter issues"
@@ -1326,7 +1342,7 @@
           <IssueTaskActions issues={ctx.issues} onReported={() => void loadAll()}>
             {#snippet children(rowAction)}
           {#if c.issues_error}
-            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+            <div class="gp-notice" data-tone="unknown" role="status">
               Issue listing unavailable: {c.issues_error}
             </div>
           {:else if c.issues.length === 0 && !c.issues_truncated}
@@ -1344,13 +1360,13 @@
           {:else}
             <div class="grid gap-2 md:grid-cols-2">
               {#each visibleIssues as issue (issue.number)}
-                <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                <div class="gp-card p-3.5 flex items-start justify-between gap-3 transition-colors hover:border-accent/35">
                   <div class="min-w-0">
                     <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                       <CircleDot size={14} class="text-accent shrink-0" />
                       <span class="truncate">#{issue.number} {issue.title}</span>
                     </div>
-                    <div class="mt-1 text-[11px] text-textMuted font-mono">
+                    <div class="mt-1 text-meta text-textMuted font-mono">
                       {issue.author || "unknown author"}
                       {#if relativeAge(issue.updated_at, clockTick)}
                         · updated {relativeAge(issue.updated_at, clockTick)}
@@ -1377,7 +1393,7 @@
             </div>
           {/if}
           {#if c.issues_truncated}
-            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {c.issues.length} issues; more open issues exist. This is not complete coverage.</div>
+            <div class="mt-2 text-warn text-meta">Showing {c.issues.length} issues; more open issues exist. This is not complete coverage.</div>
           {/if}
             {/snippet}
           </IssueTaskActions>
@@ -1388,17 +1404,14 @@
            shipped. Workflows and their runs used to sit a grid row apart. -->
       <div class="space-y-5 min-w-0">
         <section>
-          <h3 class="text-[11px] uppercase tracking-wider text-textMuted mb-2">Workflows</h3>
+          <h3 class="gp-label mb-2">Workflows</h3>
           {#if workflows?.error}
-            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+            <div class="gp-notice" data-tone="unknown" role="status">
               Workflow listing unavailable: {workflows.error}
             </div>
           {:else if !workflows}
             {#if workflowsLoading}
-              <div class="flex items-center gap-1.5 text-textMuted text-[11px]">
-                <LoaderCircle size={12} class="animate-spin" />
-                Loading workflows…
-              </div>
+              <Skeleton variant="text" count={2} height="2.5rem" />
             {:else}
               <EmptyState icon={Workflow} title="No Actions workflows" compact />
             {/if}
@@ -1419,16 +1432,16 @@
                      path stays on screen at every density because it is the
                      dispatch selector and the only thing that tells two
                      workflows with the same `name:` apart. -->
-                <div class="{compactWfRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-border/70 shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                <div class="{compactWfRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-edge shadow-card flex items-start justify-between gap-3 transition-colors hover:border-accent/35">
                   <div class="min-w-0">
-                    <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap {compactWfRows ? 'text-[13px] leading-tight' : ''}">
+                    <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap {compactWfRows ? 'text-sm leading-tight' : ''}">
                       <Workflow size={14} class="text-accent shrink-0" />
                       <span class="truncate">{wf.name}</span>
-                      <span class="gp-pill {isWorkflowDispatchable(wf.state) ? 'border-emerald-500/30! bg-emerald-500/10! text-emerald-600! dark:text-emerald-400!' : ''}">
+                      <span class="gp-chip" data-tone={isWorkflowDispatchable(wf.state) ? "ok" : "neutral"}>
                         {workflowStateLabel(wf.state)}
                       </span>
                     </div>
-                    <div class="{compactWfRows ? 'mt-0 leading-tight' : 'mt-1'} text-[11px] text-textMuted font-mono truncate">{wf.path}</div>
+                    <div class="{compactWfRows ? 'mt-0 leading-tight' : 'mt-1'} text-meta text-textMuted font-mono truncate">{wf.path}</div>
                   </div>
                   <button
                     type="button"
@@ -1453,7 +1466,7 @@
                    separate fact, and the notice below still states it. -->
               <button
                 type="button"
-                class="mt-2 w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+                class="gp-btn mt-2 w-full" data-variant="ghost" data-size="sm"
                 aria-expanded={workflowsExpanded}
                 onclick={() => (workflowsExpanded = !workflowsExpanded)}
               >
@@ -1461,7 +1474,7 @@
               </button>
             {/if}
             {#if workflows.truncated}
-              <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {workflows.workflows.length} workflows; more exist.</div>
+              <div class="mt-2 text-warn text-meta">Showing {workflows.workflows.length} workflows; more exist.</div>
             {/if}
           {/if}
         </section>
@@ -1483,11 +1496,12 @@
 
         <section>
           <div class="flex items-center justify-between gap-2 mb-2">
-            <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Workflow runs</h3>
+            <h3 class="gp-label">Workflow runs</h3>
             {#if $repoStore.currentBranch && runs.length > 0}
               <button
                 type="button"
-                class="gp-pill hover:text-accent {runsThisBranch ? 'border-accent/50! bg-accent/10! text-accent!' : ''}"
+                class="gp-chip cursor-pointer"
+                data-tone={runsThisBranch ? "accent" : "neutral"}
                 aria-pressed={runsThisBranch}
                 onclick={() => (runsThisBranch = !runsThisBranch)}
                 title="Only runs whose head branch is {$repoStore.currentBranch}"
@@ -1501,15 +1515,17 @@
                  never auto-cleared: a notice that disappears on the next poll
                  is one nobody standing up from their desk will ever see. -->
             <div
-              class="mb-2 p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-xs flex items-start justify-between gap-2"
+              class="gp-notice mb-2! justify-between"
+              data-tone="danger"
               role="status"
             >
-              <span class="text-rose-700 dark:text-rose-300 min-w-0 wrap-break-word">
+              <span class="min-w-0 wrap-break-word">
                 Failed while watching: {failureNotice}
               </span>
               <button
                 type="button"
-                class="gp-pill shrink-0"
+                class="gp-btn shrink-0"
+                data-size="sm"
                 onclick={() => (failureNotice = null)}
               >
                 Dismiss
@@ -1539,11 +1555,12 @@
                 error={runsError}
                 sampleNoun="runs"
                 live={liveState}
+                onRescan={() => void loadAll()}
               />
             </div>
           {/if}
           {#if ctx.runs_error && runs.length === 0}
-            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+            <div class="gp-notice" data-tone="unknown" role="status">
               Run listing unavailable: {ctx.runs_error}
             </div>
           {:else if runs.length === 0}
@@ -1559,13 +1576,13 @@
           {:else}
             <div class={compactRunRows ? "space-y-1" : "space-y-2"}>
               {#each previewedRuns as run (run.id)}
-                <div class="{compactRunRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-border/70 shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                <div class="{compactRunRows ? 'px-2.5 py-1.5 rounded-xl' : 'p-3 rounded-2xl'} bg-surface border border-edge shadow-card flex items-start justify-between gap-3 transition-colors hover:border-accent/35">
                   <div class="min-w-0">
-                    <div class="flex items-center gap-2 text-textPrimary font-medium {compactRunRows ? 'text-[13px] leading-tight' : ''}">
+                    <div class="flex items-center gap-2 text-textPrimary font-medium {compactRunRows ? 'text-sm leading-tight' : ''}">
                       <Play size={14} class="text-accent shrink-0" />
                       <span class="truncate">{run.title || run.name}</span>
                     </div>
-                    <div class="{compactRunRows ? 'mt-0 leading-tight' : 'mt-1'} text-[11px] text-textMuted font-mono">
+                    <div class="{compactRunRows ? 'mt-0 leading-tight' : 'mt-1'} text-meta text-textMuted font-mono">
                       {run.name}
                       {#if run.head_branch}
                         · {run.head_branch}
@@ -1582,9 +1599,9 @@
                         type="button"
                         onclick={() => void cancelRun(run)}
                         disabled={busyRunAction !== null || triggering}
-                        class="gp-icon-btn hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed"
-                        title={busyRunAction === `cancel:${run.id}` ? "Cancelling…" : "Cancel run"}
-                        aria-label={busyRunAction === `cancel:${run.id}` ? `Cancelling run ${run.title || run.name}` : `Cancel run ${run.title || run.name}`}
+                        class="gp-icon-btn" data-tone="danger"
+                        title={busyRunAction === `cancel:${run.id}` ? "Canceling…" : "Cancel run"}
+                        aria-label={busyRunAction === `cancel:${run.id}` ? `Canceling run ${run.title || run.name}` : `Cancel run ${run.title || run.name}`}
                       >
                         <Square size={13} />
                       </button>
@@ -1620,7 +1637,7 @@
                    notice below still states it. -->
               <button
                 type="button"
-                class="mt-2 w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+                class="gp-btn mt-2 w-full" data-variant="ghost" data-size="sm"
                 aria-expanded={runsExpanded}
                 onclick={() => (runsExpanded = !runsExpanded)}
               >
@@ -1629,22 +1646,23 @@
             {/if}
           {/if}
           {#if runsTruncated}
-            <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing the {runs.length} most recent runs; older runs exist.</div>
+            <div class="mt-2 text-warn text-meta">Showing the {runs.length} most recent runs; older runs exist.</div>
           {/if}
         </section>
 
         <section>
           <div class="flex items-center justify-between gap-2 mb-2">
             <div class="flex items-center gap-2">
-              <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Releases</h3>
+              <h3 class="gp-label">Releases</h3>
               {#if (ctx.releases?.length ?? 0) > 0}
-                <span class="gp-pill">{ctx.releases.length}</span>
+                <span class="gp-chip" data-kind="count" data-tone="neutral">{ctx.releases.length}</span>
               {/if}
             </div>
             {#if (ctx.releases?.length ?? 0) > 0}
               <button
                 type="button"
-                class="gp-pill hover:text-accent {latestReleaseOnly ? 'border-accent/50! bg-accent/10! text-accent!' : ''}"
+                class="gp-chip cursor-pointer"
+                data-tone={latestReleaseOnly ? "accent" : "neutral"}
                 aria-pressed={latestReleaseOnly}
                 onclick={() => (latestReleaseOnly = !latestReleaseOnly)}
                 title="Only releases marked latest"
@@ -1654,7 +1672,7 @@
             {/if}
           </div>
           {#if ctx.releases_error}
-            <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs">
+            <div class="gp-notice" data-tone="unknown" role="status">
               Release listing unavailable: {ctx.releases_error}
             </div>
           {:else if !ctx.releases || ctx.releases.length === 0}
@@ -1670,7 +1688,7 @@
           {:else}
             <div class="space-y-2">
               {#each visibleReleases as release, i (`${release.tag_name || release.name || "release"}#${i}`)}
-                <div class="p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                <div class="gp-card p-3 flex items-start justify-between gap-3 transition-colors hover:border-accent/35">
                   <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                       <Tag size={14} class="text-accent shrink-0" />
@@ -1681,17 +1699,17 @@
                         <span class="truncate">{release.name}</span>
                       {/if}
                       {#if release.is_latest}
-                        <span class="gp-pill border-emerald-500/30! bg-emerald-500/10! text-emerald-600! dark:text-emerald-400!">latest</span>
+                        <span class="gp-chip" data-tone="ok">latest</span>
                       {/if}
                       {#if release.is_prerelease}
-                        <span class="gp-pill border-amber-500/30! bg-amber-500/10! text-amber-600! dark:text-amber-400!">pre-release</span>
+                        <span class="gp-chip" data-tone="warn">pre-release</span>
                       {/if}
                       {#if release.is_draft}
-                        <span class="gp-pill">draft</span>
+                        <span class="gp-chip" data-tone="neutral">draft</span>
                       {/if}
                     </div>
                     {#if release.published_at || release.created_at}
-                      <div class="mt-1 text-[11px] text-textMuted">
+                      <div class="mt-1 text-meta text-textMuted">
                         {formatReleaseDate(release.published_at || release.created_at)}
                       </div>
                     {/if}
@@ -1711,7 +1729,7 @@
               {/each}
             </div>
             {#if ctx.releases_truncated}
-              <div class="mt-2 text-amber-600 dark:text-amber-400 text-[11px]">Showing {ctx.releases.length} releases; more releases exist.</div>
+              <div class="mt-2 text-warn text-meta">Showing {ctx.releases.length} releases; more releases exist.</div>
             {/if}
           {/if}
           <ReleasePublish

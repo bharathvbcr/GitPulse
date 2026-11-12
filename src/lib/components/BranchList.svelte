@@ -12,7 +12,8 @@
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
-  import MergeBranchDialog from "./MergeBranchDialog.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  import { loadMergeBranchDialog } from "./lazyLoaders";
   import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
@@ -34,8 +35,10 @@
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { LAYERS } from "../ui/layers";
   import BranchHealthDot from "./BranchHealthDot.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import EmptyState from "./EmptyState.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
   import {
@@ -47,11 +50,16 @@
     totalRowHeight,
     windowFromOffsets,
   } from "../sidebar/rowWindow";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
   import { repoScope } from "../repos/repoScope.svelte";
-  import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
+  import {
+    branchRowHeight,
+    branchRowLines,
+    sidebarRowHeight,
+    BRANCH_OVERSCAN,
+  } from "../sidebar/metrics";
   import { formatTimestamp, timestampTitle } from "../ui/timestampStyle";
   import { plural } from "../format";
   import { densityStore } from "../stores/densityStore";
@@ -100,15 +108,21 @@
   let rowLayout = $derived($interfaceStore.branchRowLayout);
   /** Section headers, folder headers and tag rows: always one line. */
   let HEADER_HEIGHT = $derived(branchRowHeight($densityStore));
-  /** Branch rows: two lines unless the reader asked for the dense list. */
+  /** Branch rows: three lines unless the reader asked for a denser list. */
   let BRANCH_HEIGHT = $derived(sidebarRowHeight("branch", $densityStore, rowLayout));
-  let twoLine = $derived(rowLayout === "two-line");
+  /** The same answer `sidebarRowHeight` reads, so markup and height agree. */
+  let rowLines = $derived(branchRowLines(rowLayout));
+  let multiLine = $derived(rowLines > 1);
   // Spacious mode breathes: slightly larger gaps between the chrome bands.
   // Compact stays genuinely tight. Class literals are spelled out in full so
   // Tailwind's scanner sees every variant.
   let gapBand = $derived($densityStore === "compact" ? "mb-1" : "mb-1.5");
   let gapChips = $derived($densityStore === "compact" ? "mb-1.5" : "mb-2");
-  let scrollerAir = $derived($densityStore === "compact" ? "" : "pb-1");
+  // The list's bottom padding clears the last row off the edge once the fade
+  // is gone at the end of the list.
+  let scrollerAir = $derived($densityStore === "compact" ? "pb-1" : "pb-2");
+  /** The chevron band and fade ramp at a scroll edge (`--gp-sidebar-cue-band` + `-ramp` in app.css, 2rem + 0.5rem). */
+  const CUE_CLEAR_PX = 40;
 
   let activeTab = $state<BranchFilterTab>("all");
   let pinnedNames = $state<Set<string>>(new Set());
@@ -141,7 +155,7 @@
   let filteredSections = $derived(filterBranchSections(groupedSections, debouncedQuery, activeTab));
   let allRows = $derived(flattenRows(filteredSections, isCollapsed));
 
-  // Virtual windowing over rows of DIFFERENT heights: a two-line branch row
+  // Virtual windowing over rows of DIFFERENT heights: a multi-line branch row
   // is taller than the headers around it, so `index * one height` is no
   // longer where row `index` starts. rowOffsets is the prefix-sum array every
   // position question is answered from — it rebuilds O(n) on the same
@@ -434,7 +448,11 @@
     // Reads the same offsets the window does, so a list of mixed row heights
     // reveals the row the reader actually selected. null means "already fully
     // visible" — distinct from "scroll to 0", which is why it is not a number.
-    const top = scrollOffsetToReveal(rowOffsets, index, scrollTop, viewportHeight);
+    // The scroller's own position, not the `scrollTop` state: that state only
+    // follows `scroll` events, which a busy frame delivers late, so a second
+    // arrow key pressed before the first scroll's event landed was measured
+    // against a stale offset and left its row clipped at the edge.
+    const top = scrollOffsetToReveal(rowOffsets, index, containerEl.scrollTop, containerEl.clientHeight, CUE_CLEAR_PX);
     if (top !== null) containerEl.scrollTo({ top });
   }
 
@@ -555,7 +573,7 @@
   async function copyText(value: string) {
     closeMenu({ restoreFocus: true });
     if (!(await copyToClipboard(value))) {
-      repoStore.setError("Could not copy to clipboard");
+      repoStore.setError("Couldn't copy to clipboard");
     } else {
       toastStore.success(`Copied ${value}`);
     }
@@ -588,7 +606,7 @@
     const trimmed = name?.trim();
     if (!trimmed) return;
     const outcome = await repoStore.createTag(trimmed, at?.commitId, undefined, target);
-    reportFailure(outcome, "Could not create the tag");
+    reportFailure(outcome, "Couldn't create the tag");
   }
 
   async function runDeleteTag(tag: TagInfo) {
@@ -601,7 +619,7 @@
     });
     if (!ok) return;
     const outcome = await repoStore.deleteTag(tag.name, target);
-    reportFailure(outcome, "Could not delete the tag");
+    reportFailure(outcome, "Couldn't delete the tag");
   }
 
   async function runRename(branch: BranchInfo) {
@@ -616,7 +634,7 @@
     const trimmed = next?.trim();
     if (!trimmed || trimmed === branch.name) return;
     const outcome = await repoStore.renameBranch(branch.name, trimmed, target);
-    reportFailure(outcome, "Could not rename the branch");
+    reportFailure(outcome, "Couldn't rename the branch");
   }
 
   async function runDelete(branch: BranchInfo) {
@@ -644,7 +662,7 @@
     }
     const decision = escalateDeleteDecision(outcome.error ?? "", branch);
     if (!decision.canRetryForce || !decision.message) {
-      reportFailure(outcome, "Could not delete the branch");
+      reportFailure(outcome, "Couldn't delete the branch");
       return;
     }
     const forceOk = await askConfirm({
@@ -654,7 +672,7 @@
     });
     if (!forceOk) return;
     const forceOutcome = await repoStore.deleteBranch(branch.name, true, target);
-    if (!reportFailure(forceOutcome, "Could not force-delete the branch")) return;
+    if (!reportFailure(forceOutcome, "Couldn't force-delete the branch")) return;
     offerBranchUndo(`Force deleted branch "${branchName}"`, tips, target);
   }
 
@@ -774,7 +792,7 @@
     <span class="truncate inline-flex items-center gap-0">
       {#each highlightMatches(text, q) as chunk, i (`${i}:${chunk.matched}:${chunk.text}`)}
         {#if chunk.matched}
-          <mark class="bg-accent/30 text-accent font-semibold rounded-[2px] px-0.5 leading-none">{chunk.text}</mark>
+          <mark class="bg-accent/30 text-accent font-semibold rounded-(--gp-r-xs) px-0.5 leading-none">{chunk.text}</mark>
         {:else}
           <span>{chunk.text}</span>
         {/if}
@@ -791,23 +809,23 @@
   {#if withGlyph}{@render branchGlyph(branch)}{/if}
   {@render highlightedLabel(leaf, debouncedQuery)}
   {#if branch.is_default}
-    <span class="text-[9px] px-1 py-0 rounded-full bg-surface border border-border/80 text-textMuted font-mono shrink-0">default</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="neutral">default</span>
   {/if}
   {#if branch.is_gone}
-    <span class="text-[9px] px-1 py-0 rounded-full bg-rose-500/15 text-rose-400 font-mono shrink-0">gone</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="danger">gone</span>
   {/if}
-  <!-- The two-line row prints the actual commit age on line two and tints it
-       when stale, so a separate "stale" chip would say the same thing twice
-       and less precisely — and it would say it in the one place that costs
-       the branch name its width. The one-line row has no age to tint, so it
+  <!-- The multi-line rows print the actual commit age and tint it when
+       stale, so a separate "stale" chip would say the same thing twice and
+       less precisely — and it would say it in the one place that costs the
+       branch name its width. The one-line row has no age to tint, so it
        keeps the chip. -->
   {#if showStale && isStaleBranch(branch.last_commit_timestamp)}
-    <span class="text-[9px] px-1 py-0 rounded-full bg-surface text-textMuted font-mono shrink-0">stale</span>
+    <span class="gp-chip font-mono shrink-0" data-size="inline" data-tone="neutral">stale</span>
   {/if}
 {/snippet}
 
-<!-- Every measured number for one branch, in one owner, so the one-line and
-     two-line rows cannot drift into showing different facts. Each item stays
+<!-- Every measured number for one branch, in one owner, so the one-, two- and
+     three-line rows cannot drift into showing different facts. Each item stays
      shrink-0: these are the values the reader came for, and a half-rendered
      "+33" is worse than a name that had to give up a character. -->
 {#snippet branchNumbers(branch: BranchInfo, statsMissing: boolean)}
@@ -815,13 +833,13 @@
     <span class="inline-block w-6 h-1 rounded-full bg-border/70 animate-pulse shrink-0" aria-hidden="true"></span>
   {:else if statsFailed && statsMissing}
     <!-- Stats fetch failed outright: a dimmed static marker instead of zeros pretending "no churn". -->
-    <span class="inline-block w-6 h-1 rounded-full bg-rose-500/20 opacity-60 shrink-0" title="Churn unavailable (stats failed)" aria-hidden="true"></span>
+    <span class="inline-block w-6 h-1 rounded-full bg-danger/20 opacity-60 shrink-0" title="Churn unavailable (stats failed)" aria-hidden="true"></span>
   {/if}
   {#if branch.additions > 0 || branch.deletions > 0}
     <ChurnBar additions={branch.additions} deletions={branch.deletions} />
   {/if}
   {#if branch.is_current && (workAdd > 0 || workDel > 0)}
-    <span class="text-[9px] text-textMuted font-mono shrink-0" title="Uncommitted working tree">wt</span>
+    <span class="text-micro text-textMuted font-mono shrink-0" title="Uncommitted working tree">wt</span>
     <ChurnBar additions={workAdd} deletions={workDel} />
   {/if}
   <!-- Only ever a measured positive count. A zero here would be
@@ -829,21 +847,21 @@
        are the honest answer to. -->
   {#if branch.files_changed > 0}
     <span
-      class="shrink-0 inline-flex items-center gap-0.5 text-[10px] font-mono text-textMuted/90"
+      class="shrink-0 inline-flex items-center gap-0.5 text-micro font-mono text-textMuted"
       title="{plural(branch.files_changed, 'file')} changed vs {branch.compared_to || 'base'}"
       >
       <FileDiff size={9} aria-hidden="true" />{branch.files_changed}
     </span>
   {/if}
   {#if branch.ahead_count > 0}
-    <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
+    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-size="inline" data-tone="ok" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
   {/if}
   {#if branch.behind_count > 0}
-    <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25 shrink-0" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
+    <span class="gp-chip font-mono font-semibold shrink-0" data-kind="count" data-size="inline" data-tone="warn" title="{branch.behind_count} behind upstream">↓{branch.behind_count}</span>
   {/if}
   {#if branch.commits_ahead_of_base > 0 && !branch.is_current}
     <span
-      class="text-[10px] font-mono text-textMuted shrink-0"
+      class="text-micro font-mono text-textMuted shrink-0"
       title="{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}{branch.commits_behind_base > 0
         ? `, ${branch.commits_behind_base} behind`
         : ''}"
@@ -855,9 +873,11 @@
 <!--
   Who touched the branch and when — the two facts the sidebar already held on
   every row and showed on none of them, because the one-line layout had no
-  room left. Deliberately the LAST items on line two and the only shrinkable
-  ones, so a branch with a wide set of counts loses the author's surname
-  rather than a number.
+  room left. The age comes first and the author after it, and the author is
+  the only shrinkable item: whatever line this snippet lands on, a narrow
+  sidebar costs the author's surname before it costs the age. On the
+  three-line row it has line three to itself, so it is rarely asked to; on the
+  two-line row it trails the numbers and gives way to them.
 
   The age carries staleness itself: `isStaleBranch`'s verdict as a tint on the
   exact figure it was computed from, instead of a chip beside it.
@@ -866,27 +886,29 @@
   {@const stale = isStaleBranch(branch.last_commit_timestamp)}
   {@const age = formatTimestamp(branch.last_commit_timestamp, $interfaceStore.timestampStyle)}
   {@const author = branch.last_author?.trim() ?? ""}
-  <!-- The separator lives INSIDE the author span, at its end. The author is
-       the only shrinkable thing on the line, so on a busy row it clips to
-       nothing — and a separator owned by the age would survive that and read
-       as "· 3d ago", a dot joining the time to nothing. Clipped together,
-       the line degrades "Alex · 3d ago" → "Ale… 3d ago" → "3d ago". -->
+  <!-- The separator lives INSIDE the author span, at its start. The author
+       is the only shrinkable item, and it follows the age, so the separator
+       must belong to it: owned by the age it would survive the author's
+       removal and read as "3d ago ·", a dot joining the time to nothing.
+       Owned by the author it is clipped with it, and the ellipsis marks
+       whatever was cut: the line degrades "3d ago · Alex" → "3d ago · Al…"
+       → "3d ago" as the width goes. Having no age, the author starts bare. -->
   {#if age}
     <span
-      class="shrink-0 text-[10px] font-mono {stale ? 'text-amber-500/90' : 'text-textMuted/80'}"
+      class="shrink-0 text-micro font-mono {stale ? 'text-warn' : 'text-textMuted'}"
       title="Last commit {timestampTitle(branch.last_commit_timestamp, $interfaceStore.timestampStyle)}{stale
         ? ' — stale'
         : ''}">{age}</span
     >
   {/if}
   {#if author}
-    <span class="truncate text-[10px] text-textMuted/70" title="Last commit by {author}"
+    <span class="truncate text-micro text-textMuted" title="Last commit by {author}"
       >{age ? "· " : ""}{author}</span
     >
   {/if}
 {/snippet}
 
-<!-- Per-row buttons. Hover/focus revealed in the two-line row, where they sit
+<!-- Per-row buttons. Hover/focus revealed in the multi-line rows, where they sit
      in a right-edge rail over reserved space, so they never take width from
      the name and never shift the layout when they appear. -->
 {#snippet branchActions(branch: BranchInfo, reveal: boolean)}
@@ -926,7 +948,7 @@
     !branch.is_current &&
     !branch.is_default}
   <div
-    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {twoLine
+    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {multiLine
       ? 'rounded-2xl'
       : 'rounded-full pr-1'} {branch.is_current
       ? 'bg-accent/15 text-accent font-semibold ring-1 ring-accent/40'
@@ -943,9 +965,9 @@
       onclick={(e) => togglePin(branch.name, e)}
       title={isPinned ? "Unpin branch" : "Pin branch to top"}
       aria-label={isPinned ? "Unpin branch" : "Pin branch to top"}
-      class="p-0.5 rounded-full text-textMuted hover:text-amber-400 transition-opacity shrink-0 {isPinned ? 'text-amber-400 opacity-100' : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60'}"
+      class="p-0.5 rounded-full text-textMuted hover:text-warn transition-opacity shrink-0 {isPinned ? 'text-warn opacity-100' : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60'}"
     >
-      <Star size={11} class={isPinned ? "fill-amber-400" : ""} />
+      <Star size={11} class={isPinned ? "fill-warn" : ""} />
     </button>
     <button
       type="button"
@@ -960,13 +982,20 @@
       }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
       title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
-      class={twoLine
-        ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"
-        : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
+      class={rowLines === 3
+        ? "flex-1 min-w-0 flex items-start gap-1.5 text-left pr-1"
+        : rowLines === 2
+          ? "flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"
+          : "flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"}
     >
-      {#if twoLine}
+      {#if multiLine}
+        <!-- The glyph sits level with the name. Beside two lines it centres
+             on the pair; beside three, centred would float it level with
+             line two, so the three-line button top-aligns it instead. -->
         {@render branchGlyph(branch)}
-        <span class="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
+        <span
+          class="flex-1 min-w-0 flex flex-col justify-center {rowLines === 3 ? 'gap-1' : 'gap-0.5'}"
+        >
           <!-- Line one is the name's alone. Nothing after it can outgrow a
                chip, so the name truncates at the width of the sidebar rather
                than at whatever a row of buttons and counters left over.
@@ -978,7 +1007,9 @@
           </span>
           <!-- Line two, flush left under the name, in descending order of
                what a reader would miss: churn, divergence, files, then the
-               attribution. An `ml-auto` here would right-align the tail,
+               freshness badge. On the two-line row the attribution follows
+               on this same line; on the three-line row it has line three.
+               An `ml-auto` here would right-align the tail,
                which on the common branch — no churn, no divergence — leaves
                it floating alone across an empty row. It runs the full width
                of the row: the action rail is on line one, so nothing here
@@ -992,22 +1023,35 @@
                the author's ellipsis — the normal way this line gives up
                width — ends before the fade and stays crisp. -->
           <span
-            class="w-full flex items-center gap-1 min-w-0 leading-none overflow-hidden pr-2.5"
-            style="mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent);"
+            class="w-full flex items-center gap-1 min-w-0 min-h-lh text-micro overflow-hidden pr-2.5"
+            style="mask-image: linear-gradient(to right, black calc(100% - 10px), transparent); -webkit-mask-image: linear-gradient(to right, black calc(100% - 10px), transparent);"
           >
             {@render branchNumbers(branch, statsMissing)}
             <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
-            {@render branchAge(branch)}
+            {#if rowLines === 2}
+              {@render branchAge(branch)}
+            {/if}
           </span>
+          {#if rowLines === 3}
+            <!-- Line three: the last commit's age, then its author. It has the
+                 whole row, so the only thing that can give is the author's
+                 ellipsis. `min-h-lh` on a `text-micro` line keeps one line
+                 of height when a branch has nothing to show there (no
+                 churn on line two, no commit time on line three), so the
+                 stack is the same height on every row. -->
+            <span class="w-full flex items-center gap-1 min-w-0 min-h-lh text-micro overflow-hidden pr-2.5">
+              {@render branchAge(branch)}
+            </span>
+          {/if}
         </span>
       {:else}
         {@render branchIdentity(branch, leaf, true, true)}
       {/if}
     </button>
-    {#if twoLine}
+    {#if multiLine}
       <!-- Level with line one and clear of line two: 16px buttons (the copy
            button drops to the menu button's p-0.5 here) centred on the name,
-           y 5–21, above line two's top at ~21.5. At rest the status dots sit
+           y 5–21, above line two's top at ~21.5 (~24.5 on three lines). At rest the status dots sit
            at the row's right edge; on hover or focus they fade and the actions
            take their place, so neither ever pushes the name. -->
       <div class="absolute right-1 top-[5px] h-4 flex items-center">
@@ -1057,7 +1101,7 @@
            not: a release tag sitting on main needs no chip, and a tag that
            could not be compared must not imply it was. -->
       <span
-        class="ml-auto shrink-0 text-[10px] font-mono text-textMuted"
+        class="ml-auto shrink-0 text-micro font-mono text-textMuted"
         title="{row.tag.commits_ahead_of_base} commits not in {row.tag.compared_to}"
         >+{row.tag.commits_ahead_of_base}</span
       >
@@ -1071,7 +1115,7 @@
     type="button"
     onclick={() => toggle(row.folderId, "local")}
     aria-expanded={!closed}
-    class="gp-cv-row w-full flex items-center gap-1.5 text-[11px] font-semibold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
+    class="gp-cv-row gp-label w-full flex items-center gap-1.5 hover:text-textPrimary transition-colors select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
     style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px; padding-left: {8 + row.depth * 12}px"
   >
     {#if closed}
@@ -1080,7 +1124,7 @@
       <ChevronDown size={12} class="shrink-0" />
     {/if}
     {@render highlightedLabel(row.folder.label, debouncedQuery)}
-    <span class="text-textMuted/70 font-normal text-[10px]">({countFolder(row.folder)})</span>
+    <span class="text-faint font-normal text-micro">({countFolder(row.folder)})</span>
   </button>
 {/snippet}
 
@@ -1090,7 +1134,7 @@
     type="button"
     onclick={() => toggle(row.sectionId, row.section.kind)}
     aria-expanded={!closed}
-    class="w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
+    class="gp-label w-full flex items-center gap-1 px-2 py-1 hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
     style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px;"
   >
     {#if closed}
@@ -1099,7 +1143,7 @@
       <ChevronDown size={11} class="shrink-0" />
     {/if}
     {#if row.section.kind === "pinned"}
-      <Star size={11} class="text-amber-400 fill-amber-400 shrink-0" />
+      <Star size={11} class="text-warn fill-warn shrink-0" />
     {:else if row.section.kind === "remote"}
       <Cloud size={11} class="shrink-0" />
     {:else if row.section.kind === "tags"}
@@ -1108,7 +1152,7 @@
       <GitBranch size={11} class="shrink-0" />
     {/if}
     <span class="truncate">{row.section.label}</span>
-    <span class="font-normal text-textMuted/70">({row.section.branchCount})</span>
+    <span class="font-normal text-faint">({row.section.branchCount})</span>
   </button>
 {/snippet}
 
@@ -1131,7 +1175,7 @@
   onkeydown={handleKeydown}
 >
   <!-- Header Bar -->
-  <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 {gapBand}">
+  <div class="gp-label flex items-center justify-between px-2 {gapBand}">
     <span>Branches ({$repoStore.branches.length})</span>
     <div class="flex items-center gap-0.5">
       <button
@@ -1148,7 +1192,7 @@
         onclick={expandAll}
         title="Expand all folders"
         aria-label="Expand all folders"
-        class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
+        class="px-1 py-0.5 text-micro rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
       >
         +All
       </button>
@@ -1157,7 +1201,7 @@
         onclick={collapseAll}
         title="Collapse all folders"
         aria-label="Collapse all folders"
-        class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
+        class="px-1 py-0.5 text-micro rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
       >
         -All
       </button>
@@ -1184,7 +1228,7 @@
         onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:branch-cleanup"))}
         title="Clean stale branches (Deadbranch)"
         aria-label="Clean stale branches"
-        class="p-1 rounded-full hover:bg-surfaceHover hover:text-emerald-400 text-textMuted transition-colors"
+        class="p-1 rounded-full hover:bg-surfaceHover hover:text-ok text-textMuted transition-colors"
       >
         <Sparkles size={12} />
       </button>
@@ -1192,19 +1236,19 @@
   </div>
 
   <div class="px-1 {gapBand}">
-    <button type="button" class="gp-btn w-full justify-center gap-1.5" aria-label="Merge branches" disabled={!$repoStore.currentPath} onclick={() => runMerge()}>
+    <button type="button" class="gp-btn w-full justify-center gap-1.5" data-size="sm" aria-label="Merge branches" disabled={!$repoStore.currentPath} onclick={() => runMerge()}>
       <GitMerge size={13} /> Merge…
     </button>
   </div>
 
   {#if $repoStore.tagsFailed}
     <!-- An unreadable tag list must not render as "no tags". -->
-    <p class="px-2 {gapBand} flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+    <p class="px-2 {gapBand} flex items-start gap-1.5 text-meta text-unknown">
       <AlertTriangle size={11} class="mt-0.5 shrink-0" />
-      <span>The tag list could not be read, so this may not be complete.</span>
+      <span>The tag list couldn't be read, so this may not be complete.</span>
     </p>
   {:else if $repoStore.tagsTruncated}
-    <p class="px-2 {gapBand} flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+    <p class="px-2 {gapBand} flex items-start gap-1.5 text-meta text-warn">
       <AlertTriangle size={11} class="mt-0.5 shrink-0" />
       <span>Showing the newest {$repoStore.tags.length} tags. Older tags exist and are not listed.</span>
     </p>
@@ -1212,14 +1256,14 @@
 
   <!-- Search Box -->
   <div class="px-1 {gapBand}">
-    <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-2 py-1.5 focus-within:border-accent/60 focus-within:shadow-(--ring-focus) transition-all duration-150">
+    <div class="gp-field flex items-center gap-1 px-2! focus-within:border-(--field-focus-edge)">
       <Search size={11} class="text-textMuted shrink-0" />
       <input
         type="text"
         bind:value={query}
         oninput={(e) => applyFilter(e.currentTarget.value)}
         placeholder="Filter branches…"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
+        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-faint focus:outline-hidden"
       />
       {#if query}
         <button
@@ -1237,25 +1281,31 @@
 
   <!-- Quick Filter Chips -->
   <div class="relative min-w-0">
-  <div bind:this={chipScroller} class="chip-strip flex items-center gap-1 px-1 {gapChips} overflow-x-auto text-[10px]">
+  <div bind:this={chipScroller} class="chip-strip flex items-center gap-1 px-1 {gapChips} overflow-x-auto">
     <button
       type="button"
       onclick={() => (activeTab = "all")}
-      class="px-2 py-1 rounded-full border transition-all shrink-0 {activeTab === 'all' ? 'bg-accent/15 border-accent/40 text-accent font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+      aria-pressed={activeTab === "all"}
+      data-tone={activeTab === "all" ? "accent" : "neutral"}
+      class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary {activeTab === 'all' ? 'font-semibold' : ''}"
     >
       All
     </button>
     <button
       type="button"
       onclick={() => (activeTab = "local")}
-      class="px-2 py-1 rounded-full border transition-all shrink-0 {activeTab === 'local' ? 'bg-accent/15 border-accent/40 text-accent font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+      aria-pressed={activeTab === "local"}
+      data-tone={activeTab === "local" ? "accent" : "neutral"}
+      class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary {activeTab === 'local' ? 'font-semibold' : ''}"
     >
       Local ({localCount})
     </button>
     <button
       type="button"
       onclick={() => (activeTab = "remote")}
-      class="px-2 py-1 rounded-full border transition-all shrink-0 {activeTab === 'remote' ? 'bg-accent/15 border-accent/40 text-accent font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+      aria-pressed={activeTab === "remote"}
+      data-tone={activeTab === "remote" ? "accent" : "neutral"}
+      class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary {activeTab === 'remote' ? 'font-semibold' : ''}"
     >
       Remote ({remoteCount})
     </button>
@@ -1263,23 +1313,29 @@
       <button
         type="button"
         onclick={() => (activeTab = "pinned")}
-        class="px-2 py-1 rounded-full border transition-all shrink-0 flex items-center gap-0.5 {activeTab === 'pinned' ? 'bg-amber-500/15 border-amber-500/40 text-amber-400 font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+        aria-pressed={activeTab === "pinned"}
+        data-tone={activeTab === "pinned" ? "warn" : "neutral"}
+        class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary gap-0.5 {activeTab === 'pinned' ? 'font-semibold' : ''}"
       >
-        <Star size={9} class="fill-amber-400 text-amber-400" />
+        <Star size={9} class="fill-warn text-warn" />
         {pinnedCount}
       </button>
     {/if}
     <button
       type="button"
       onclick={() => (activeTab = "active")}
-      class="px-2 py-1 rounded-full border transition-all shrink-0 {activeTab === 'active' ? 'bg-accent/15 border-accent/40 text-accent font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+      aria-pressed={activeTab === "active"}
+      data-tone={activeTab === "active" ? "accent" : "neutral"}
+      class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary {activeTab === 'active' ? 'font-semibold' : ''}"
     >
       Active ({activeCount})
     </button>
     <button
       type="button"
       onclick={() => (activeTab = "stale")}
-      class="px-2 py-1 rounded-full border transition-all shrink-0 {activeTab === 'stale' ? 'bg-accent/15 border-accent/40 text-accent font-semibold' : 'bg-surface border-border/60 text-textMuted hover:text-textPrimary'}"
+      aria-pressed={activeTab === "stale"}
+      data-tone={activeTab === "stale" ? "accent" : "neutral"}
+      class="gp-chip shrink-0 cursor-pointer hover:text-textPrimary {activeTab === 'stale' ? 'font-semibold' : ''}"
     >
       Stale ({staleCount})
     </button>
@@ -1299,7 +1355,8 @@
       <input
         bind:value={createName}
         placeholder="feat/name"
-        class="flex-1 min-w-0 bg-background border border-border/80 rounded-full px-2.5 py-1 text-[11px] text-textPrimary focus:outline-hidden focus:border-accent/60 font-mono transition-colors"
+        aria-label="New branch name"
+        class="gp-field flex-1 min-w-0 text-meta! font-mono"
       />
       <button
         type="button"
@@ -1311,7 +1368,7 @@
       >
         <Sparkles size={12} class={suggesting ? "animate-pulse text-accent" : ""} />
       </button>
-      <button type="submit" class="gp-btn-primary px-2! py-0.5! text-[10px]!">Create</button>
+      <button type="submit" class="gp-btn" data-variant="primary" data-size="sm">Create</button>
     </form>
   {/if}
 
@@ -1324,9 +1381,7 @@
     class="h-full overflow-y-auto min-h-0 relative select-none will-change-scroll {scrollerAir}"
   >
     {#if allRows.length === 0}
-      <div class="px-3 py-6 text-center text-[11px] text-textMuted/70">
-        {query ? `No branches match "${query}"` : "No branches found"}
-      </div>
+      <EmptyState compact icon={GitBranch} title={query ? `No branches match "${query}"` : "No branches found"} />
     {:else}
       <!-- Total Virtual Spacer -->
       <div style="height: {totalHeight}px; position: relative; width: 100%;">
@@ -1356,7 +1411,11 @@
 </div>
 
 {#if mergeRequest}
-  <MergeBranchDialog request={mergeRequest} onClose={() => { mergeRequest = null; }} />
+  <LazyMount
+    load={loadMergeBranchDialog}
+    name="The merge dialog"
+    props={{ request: mergeRequest, onClose: () => { mergeRequest = null; } }}
+  />
 {/if}
 
 {#if menu}
@@ -1367,8 +1426,9 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    use:popover={dismissal}
-    class="fixed z-50 min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
+    use:popover={dismissal} out:popoverExit
+    class="fixed min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
+    style="z-index: {LAYERS.MENU};"
     role="menu"
     aria-orientation="vertical"
     tabindex="-1"
@@ -1378,7 +1438,7 @@
     {#if menu.branch}
       {@const b = liveBranch(menu.branch)}
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = b.name; closeMenu(); togglePin(name); }}>
-        <Star size={12} class={pinnedNames.has(b.name) ? "fill-amber-400 text-amber-400" : ""} />
+        <Star size={12} class={pinnedNames.has(b.name) ? "fill-warn text-warn" : ""} />
         {pinnedNames.has(b.name) ? "Unpin branch" : "Pin branch"}
       </button>
       {#if !b.is_current}
@@ -1409,7 +1469,7 @@
           <Download size={12} /> Pull
         </button>
         {#if !b.is_current}
-          <button role="menuitem" class="w-full px-3 py-1.5 text-left hover:bg-surfaceHover flex items-center gap-2 text-rose-400" onclick={() => void runDelete(b)}>
+          <button role="menuitem" class="gp-menu-item text-danger" onclick={() => void runDelete(b)}>
             <Trash2 size={12} /> Delete…
           </button>
         {/if}
@@ -1439,7 +1499,7 @@
       </button>
       <button
         role="menuitem"
-        class="w-full px-3 py-1.5 text-left hover:bg-surfaceHover flex items-center gap-2 text-rose-400"
+        class="gp-menu-item text-danger"
         onclick={() => void runDeleteTag(t)}
       >
         <Trash2 size={12} /> Delete…

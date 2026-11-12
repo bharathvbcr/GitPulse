@@ -1,10 +1,11 @@
 <script lang="ts">
   import { createFrameScheduler } from "../motion/frameScheduler";
-  import { crossfade } from "svelte/transition";
-  import { liquidSelection } from "../ui/transitions";
-  import { onMount, untrack } from "svelte";
+  import { crossfade, fly } from "svelte/transition";
+  import { backdropFade, backdropFadeOut, liquidSelection } from "../ui/transitions";
+  import { createResizeObservation } from "../dom/observeResize";
+  import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -15,7 +16,7 @@
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover, restoreFocusTo } from "../ui/popover";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { MAX_COLUMN_PAGES, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
   import { createLiveLoader } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
@@ -98,6 +99,8 @@
   import TaskQuickAdd from "./TaskQuickAdd.svelte";
   import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import { describeFailure, unknownState } from "../ui/copy/describeFailure";
 
   let { repositoryPath = null, active = true, acceptsOpenRequests = false }: {
     repositoryPath?: string | null;
@@ -106,6 +109,11 @@
     acceptsOpenRequests?: boolean;
   } = $props();
   const macos = isMacOS();
+  /** "Couldn't <verb> <object>. <Reason>." for an error line; the reason is the store's own wording. */
+  function failure(verb: string, object: string, cause: unknown): string {
+    const copy = describeFailure({ verb, object }, explainError(cause));
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
   const [sendScope, receiveScope] = crossfade(liquidSelection());
   let scope = $state<Scope>({ kind: "global" });
   let repositories = $state<Repository[]>([]), workspaces = $state<WorkspaceCard[]>([]);
@@ -363,6 +371,97 @@
     },
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
+  /**
+   * The scope navigator is a rail beside the board only while the board is wide
+   * enough for it AND the reader has not collapsed it. The rail is 188px and a
+   * column is at least 196px, so below this width the board kept a column and a
+   * half behind a horizontal scroller, with the third column cut off at the
+   * window's edge. Collapsed or narrow, the same navigator opens from the
+   * toolbar as an overlay over the board instead.
+   */
+  const RAIL_MIN_BOARD_PX = 860;
+  /** 0 until the board has been measured; a hidden pane measures 0 and keeps the last real width. */
+  let boardWidth = $state(0);
+  const railNarrow = $derived(boardWidth > 0 && boardWidth < RAIL_MIN_BOARD_PX);
+  const railPinnedAway = $derived($interfaceStore.taskNavigatorCollapsed);
+  const railDocked = $derived(!railNarrow && !railPinnedAway);
+  let railOpen = $state(false);
+  /** Where the overlay starts: under the toolbar, measured when it opens. */
+  let railTop = $state(0);
+  let railToggleEl: HTMLButtonElement | undefined = $state();
+  let railEl: HTMLElement | undefined = $state();
+  $effect(() => {
+    const el = boardEl;
+    if (!el) return;
+    const read = () => { if (el.clientWidth > 0) boardWidth = el.clientWidth; };
+    read();
+    const observation = createResizeObservation(read);
+    observation.observe(el);
+    return () => observation.disconnect();
+  });
+  $effect(() => { if (railDocked) railOpen = false; });
+  function closeRail(options?: { restoreFocus?: boolean }) {
+    if (!railOpen) return;
+    railOpen = false;
+    if (options?.restoreFocus) restoreFocusTo(railToggleEl);
+  }
+  function toggleRail() {
+    if (railDocked) { interfaceStore.setTaskNavigatorCollapsed(true); return; }
+    if (railOpen) { closeRail({ restoreFocus: true }); return; }
+    // Below the toolbar, so the toggle that opened it stays in reach to close it.
+    const header = boardEl?.querySelector("header");
+    railTop = header && boardEl ? Math.max(0, Math.round(header.getBoundingClientRect().bottom - boardEl.getBoundingClientRect().top)) : 0;
+    railOpen = true;
+    void tick().then(() => (railEl?.querySelector<HTMLElement>('.nav-scope[aria-pressed="true"]') ?? railEl?.querySelector<HTMLElement>(".nav-scope"))?.focus());
+  }
+  /** Back beside the board, for a reader who collapsed the rail on a wide window. */
+  function dockRail() {
+    interfaceStore.setTaskNavigatorCollapsed(false);
+    railOpen = false;
+    restoreFocusTo(railToggleEl);
+  }
+  /** Picking a scope from the overlay is the end of that visit: the board is what they came for. */
+  function chooseScope(next: Scope) {
+    scope = next;
+    closeRail({ restoreFocus: true });
+  }
+  const railDismissal = $derived({
+    dismiss: {
+      inside: "[data-task-rail], [data-nav-toggle], [data-add-repo-popup]",
+      pointer: "pointerdown" as const,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      // Escape belongs to the add-repository menu while it is open; it closes
+      // itself, and the rail stays for the next one.
+      if (reason === "escape" && addMenu) return;
+      closeRail({ restoreFocus: reason === "escape" });
+    },
+  });
+  /**
+   * Up and Down move between scope rows, Home and End jump to the ends. Focus
+   * only: Enter or Space picks, as on any list of buttons. Alt+Up and Alt+Down
+   * are the workspace reorder (handled on the row, which has already prevented
+   * default by the time this runs) and are never claimed here.
+   */
+  function onRailKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!keys.includes(event.key) || !railEl) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const rows = [...railEl.querySelectorAll<HTMLElement>(".nav-scope")];
+    if (rows.length === 0) return;
+    const fromSearch = target.matches('[data-testid="task-nav-search"]');
+    const index = rows.indexOf(target);
+    if (index < 0 && !(fromSearch && event.key === "ArrowDown")) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? rows.length - 1
+      : event.key === "ArrowDown" ? Math.min(rows.length - 1, index + 1)
+      : Math.max(0, index - 1);
+    rows[next]?.focus();
+  }
   const loadedCards = $derived(allLoadedCards(displayColumns));
   /** Titles of the cards loaded, so a subtask can name its parent when the parent is on the board. */
   const loadedTitles = $derived(new Map(loadedCards.map((card) => [card.id, card.title])));
@@ -500,7 +599,7 @@
   }
   function laneAria(group: TaskLane): string {
     const by = swimlane === "label" ? "first label" : swimlane;
-    return `${group.label} — ${plural(group.cards.length, "task")}, lane by ${by}`;
+    return `${group.label} — ${plural(group.cards.length, "task")}, grouped by ${by}`;
   }
   /** Put a saved view back: the layout preferences, then this board's filters. */
   function applyView(view: SavedTaskView) {
@@ -692,7 +791,7 @@
     } catch (cause) {
       // A background read that failed says so, and the next one that
       // succeeds clears what it said; neither touches the reader's own error.
-      if (generation === revision && !disposed && !(quiet && error && !refreshError)) { error = explainError(cause); refreshError = quiet; }
+      if (generation === revision && !disposed && !(quiet && error && !refreshError)) { error = failure("load", "tasks", cause); refreshError = quiet; }
       return false;
     }
     finally { if (!quiet && generation === revision && !disposed) loading = false; }
@@ -769,7 +868,7 @@
     // Retry beside a failed membership read reloaded everything except the
     // thing that failed.
     membershipToken++;
-    try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
+    try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
     if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
   /**
@@ -787,11 +886,11 @@
       void boardAgents.refresh();
       if (loading || moving) { background.schedule(); return; }
       membershipToken++;
-      try { await catalog(); } catch (cause) { if (!disposed) catalogError = explainError(cause); }
+      try { await catalog(); } catch (cause) { if (!disposed) catalogError = failure("refresh", "repositories and workspaces", cause); }
       if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
       await loadUnread();
     },
-    onError: (cause) => { if (!disposed) liveNotice = `Live updates failed: ${explainError(cause)}. Use Refresh.`; },
+    onError: (cause) => { if (!disposed) liveNotice = `${failure("keep", "live updates running", cause)} Use Refresh.`; },
   });
   function scheduleRefresh() { background.schedule(); }
   async function initialize(path: string | null = repositoryPath) {
@@ -803,7 +902,7 @@
       scope = repo ? { kind: "repository", id: repo.id } : { kind: "global" };
       await catalog();
       if (!disposed && ticket === initializationRevision) initialized = true;
-    } catch (cause) { if (!disposed && ticket === initializationRevision) { catalogError = explainError(cause); loading = false; } }
+    } catch (cause) { if (!disposed && ticket === initializationRevision) { catalogError = failure("load", "tasks", cause); loading = false; } }
   }
   $effect(() => { const path = repositoryPath; untrack(() => { void initialize(path); }); });
   // The back link from a terminal session (see `taskOpen.ts`). Waits for the
@@ -859,7 +958,7 @@
   onMount(() => {
     const listeners = createListenerTracker();
     const changed = () => { scheduleRefresh(); };
-    listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Live updates unavailable: ${message}. Use Refresh.`; } }));
+    listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Couldn't watch for live updates. ${message} Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
       boardAgents.wake();
@@ -906,9 +1005,14 @@
   const statedFailure = $derived(catalogError || error);
   /** A read note's cause, or a pointer to the notice above when it says the same thing. */
   function noteCause(reason: string): string {
-    return reason === statedFailure ? "the same failure as above" : reason;
+    return reason === statedFailure ? "The same failure as above." : reason;
   }
-  const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error || uncheckedCheckouts.length));
+  /** A read-note line: "Couldn't read <object>. <What the board does instead>. <Reason>." */
+  function readNote(object: string, reason: string, consequence: string): string {
+    const copy = describeFailure({ verb: "read", object }, noteCause(reason));
+    return [copy.headline, consequence, copy.detail].filter(Boolean).join(" ");
+  }
+  const hasReadNotes = $derived(Boolean(verdictError || lineageError || $boardAgents.error));
   $effect(() => {
     checkoutToken;
     void checkoutKey;
@@ -934,7 +1038,7 @@
     void getWorkspace(id).then((full) => {
       if (disposed || scope.kind !== "workspace" || scope.id !== id) return;
       workspaceMemberIds = full.repository_ids;
-    }).catch((cause) => { if (!disposed) catalogError = explainError(cause); });
+    }).catch((cause) => { if (!disposed) catalogError = failure("read", "this workspace's repositories", cause); });
   });
   $effect(() => {
     if (!addMenu || !addMenuEl) return;
@@ -973,7 +1077,7 @@
       await catalog();
       announce = addedAnnouncement(added.map((repo) => repo.name));
       toastStore.success(announce);
-    } catch (cause) { catalogError = explainError(cause); }
+    } catch (cause) { catalogError = failure("add", "repositories", cause); }
     finally { adding = false; }
   }
   /**
@@ -993,7 +1097,7 @@
       await catalog();
       announce = addedAnnouncement(ids.map((id) => repositories.find((repo) => repo.id === id)?.name ?? id));
       toastStore.success(announce);
-    } catch (cause) { catalogError = explainError(cause); }
+    } catch (cause) { catalogError = failure("add", "repositories", cause); }
     finally { adding = false; }
   }
   /**
@@ -1034,7 +1138,7 @@
       const path = await invoke<string | null>("cmd_pick_folder");
       if (!path) return;
       await addPaths([path]);
-    } catch (cause) { catalogError = explainError(cause); }
+    } catch (cause) { catalogError = failure("add", "the folder", cause); }
   }
   function toggleAddMenu() {
     if (adding) return;
@@ -1062,12 +1166,12 @@
   async function moreRepositories() {
     if (!repositoryCursor) return;
     try { const next = await listRepositories(repositoryCursor); repositories = [...repositories, ...next.items.filter((r) => !repositories.some((old) => old.id === r.id))]; repositoryCursor = next.next_cursor; repositoryTotal = next.total; }
-    catch (cause) { catalogError = explainError(cause); }
+    catch (cause) { catalogError = failure("load", "more repositories", cause); }
   }
   async function moreWorkspaces() {
     if (!workspaceCursor) return;
     try { const next = await listWorkspaces(workspaceCursor); workspaces = [...workspaces, ...next.items.filter((r) => !workspaces.some((old) => old.id === r.id))]; workspaceCursor = next.next_cursor; workspaceTotal = next.total; }
-    catch (cause) { catalogError = explainError(cause); }
+    catch (cause) { catalogError = failure("load", "more workspaces", cause); }
   }
   /**
    * Whether the open task, and the Quick Enhance sheet if one is up, may be
@@ -1118,7 +1222,7 @@
       taskTabs = updateTaskTab(taskTabs, id, { title: full.title, status: full.status, draft: false });
     } catch (cause) {
       if (!disposed && ticket === openingRevision) {
-        error = explainError(cause);
+        error = failure("open", "the task", cause);
         taskTabs = closeTaskTab(taskTabs, id);
       }
     } finally { if (!disposed && ticket === openingRevision) opening = false; }
@@ -1165,9 +1269,9 @@
     try {
       const result = await applyMove(writes);
       if (disposed) return;
-      try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
+      try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
       if (result.failed.length) {
-        catalogError = `${name} did not finish moving: ${result.failed.length} of ${writes.length} ${writes.length === 1 ? "workspace" : "workspaces"} could not be updated. ${result.failed[0]?.error ?? ""}`;
+        catalogError = `${name} did not finish moving: ${result.failed.length} of ${writes.length} ${writes.length === 1 ? "workspace" : "workspaces"} couldn't be updated. ${result.failed[0]?.error ?? ""}`;
       } else {
         announce = `${name} moved ${delta < 0 ? "up" : "down"}`;
       }
@@ -1184,15 +1288,15 @@
     importingGroups = true;
     try {
       for (let page = 0; workspaceCursor && page < 50; page++) await moreWorkspaces();
-      if (workspaceCursor) { catalogError = "Not every workspace could be read, so the import could not tell which tab groups already have one."; return; }
+      if (workspaceCursor) { catalogError = "Not every workspace could be read, so the import couldn't tell which tab groups already have one."; return; }
       const report = await importTabGroups(importableGroups, workspaces);
       if (disposed) return;
-      try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
+      try { await catalog(); } catch (cause) { catalogError = failure("refresh", "repositories and workspaces", cause); }
       announce = importSummary(report);
       if (report.created.length) toastStore.success(announce);
       if (report.failed.length) catalogError = `${announce} ${report.failed.map((entry) => `${entry.name}: ${entry.error}`).join(" ")}`;
       else if (!report.created.length) toastStore.info(announce);
-    } catch (cause) { if (!disposed) catalogError = explainError(cause); }
+    } catch (cause) { if (!disposed) catalogError = failure("import", "tab groups", cause); }
     finally { if (!disposed) importingGroups = false; }
   }
   async function newWorkspace() {
@@ -1207,7 +1311,7 @@
       const full = await bounded(getWorkspace(id));
       if (disposed || ticket !== openingRevision) return;
       session = null; taskTabs = emptyTaskTabs(); enhanceId = null; workspaceEditor = { value: full };
-    } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
+    } catch (cause) { if (!disposed && ticket === openingRevision) error = failure("open", "workspace settings", cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
   /** Ask Manvi which open tasks to start next. The newest ask wins; a stale answer never replaces it. */
@@ -1224,7 +1328,7 @@
       suggestion = answer;
     } catch (cause) {
       if (disposed || ticket !== suggestTicket) return;
-      suggestion = null; suggestError = explainError(cause);
+      suggestion = null; suggestError = failure("ask", "Manvi for suggestions", cause);
     } finally { if (!disposed && ticket === suggestTicket) suggestLoading = false; }
   }
   function toggleSuggest() {
@@ -1244,7 +1348,7 @@
       organizeEpoch++;
     } catch (cause) {
       if (disposed || ticket !== organizeTicket) return;
-      organization = null; organizeError = explainError(cause);
+      organization = null; organizeError = failure("ask", "Manvi to organize tasks", cause);
     } finally { if (!disposed && ticket === organizeTicket) organizeLoading = false; }
   }
   function toggleOrganize() {
@@ -1306,7 +1410,7 @@
       organizeOutcomes = outcomes;
       organizeApplying = false;
       if (applied > 0 && !disposed) {
-        try { await refresh(); } catch (cause) { if (!organizeError) organizeError = explainError(cause); }
+        try { await refresh(); } catch (cause) { if (!organizeError) organizeError = failure("refresh", "the board", cause); }
       }
     }
   }
@@ -1324,7 +1428,7 @@
       workspaceEditor = null; enhanceId = null;
       taskTabs = openTaskTab(taskTabs, { id: full.id, title: full.title, status: full.status, draft: false });
       session = { tabId: full.id, pane: full.id, value: full };
-    } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
+    } catch (cause) { if (!disposed && ticket === openingRevision) error = failure("open", "the task", cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
   function openLoaded(task: Task) {
@@ -1353,7 +1457,7 @@
     try {
       if (all) await readAllCandidates(set, current.word, read, show);
       else show(await nextCandidates(set, current.word, read));
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
     finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
   }
   /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
@@ -1368,7 +1472,7 @@
    */
   async function loadColumnRest(status: TaskStatus): Promise<boolean> {
     if (!tailUnknown(status)) return true;
-    const refusal = `${STATUS_LABELS[status]} has more tasks than are loaded, so the card was not moved to its end. ${searching ? "Load more tasks, or clear the search," : "Retry,"} then move it again.`;
+    const refusal = `${STATUS_LABELS[status]} has more tasks than are loaded, so the card was not moved to its end. ${searching ? "Load more tasks, or clear the search," : "Try again,"} then move it again.`;
     const page = columns[status];
     if (searching || !page || loadedKey !== boardKey) { error = refusal; return false; }
     const generation = revision, key = boardKey;
@@ -1379,7 +1483,7 @@
       if (!all) { error = refusal; return false; }
       columns = { ...columns, [status]: all };
       return true;
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); return false; }
+    } catch (cause) { if (generation === revision && !disposed) error = failure("load", "the column", cause); return false; }
     finally { if (generation === revision && !disposed) loading = false; }
   }
   async function pageColumn(status: TaskStatus, cursor?: string) {
@@ -1392,7 +1496,7 @@
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
       loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
   /** Cards loaded across every column: what Load all budgets against `MAX_CANDIDATES`, since each one is drawn. */
@@ -1421,7 +1525,7 @@
         },
       });
       if (!stale()) loadCardReads(Object.values(columns).flatMap((one) => one?.items.map((card) => card.id) ?? []), generation);
-    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    } catch (cause) { if (generation === revision && !disposed) error = failure("load", "all tasks", cause); }
     finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
   }
   /**
@@ -1851,7 +1955,7 @@
       // The board went away mid-window; the deletion still went out, so say
       // what did not, where it can still be read.
       const missed = rows.length - done.length;
-      if (missed) toastStore.error(`${plural(missed, "task")} could not be deleted. Open Tasks to retry.`);
+      if (missed) toastStore.error(`Couldn't delete ${plural(missed, "task")}. Open Tasks to try again.`);
       return;
     }
     deletesRunning--;
@@ -1954,7 +2058,7 @@
       }
       return true;
     } catch (cause) {
-      if (!disposed) error = explainError(cause);
+      if (!disposed) error = failure("create", "the task", cause);
       return false;
     } finally { if (!disposed) quickAdding = false; }
   }
@@ -2151,7 +2255,7 @@
       if (summary.ok) { announce = summary.message; toastStore.success(summary.message, open); }
       else { error = summary.message; announce = summary.message; if (linked.length || urls.length) toastStore.warning("Some issues were filed; see the board for what was not.", open); }
     } catch (cause) {
-      if (!disposed) error = explainError(cause);
+      if (!disposed) error = failure("file", "issues", cause);
     } finally {
       filingIssue = false;
       issueProgress = null;
@@ -2179,7 +2283,7 @@
       adoptLinked(linked.task);
       void loadBoard();
     } catch (cause) {
-      if (!disposed) error = explainError(cause);
+      if (!disposed) error = failure("link", "the issue", cause);
     } finally {
       filingIssue = false;
     }
@@ -2210,7 +2314,7 @@
               const title = duplicateTitle(full.title);
               taskTabs = openTaskTab(taskTabs, { id: draftId, title, status: full.status, draft: true });
               session = { tabId: draftId, pane: draftId, value: null, status: full.status, seed: { ...copy, title, position: Date.now() } };
-            }).catch((cause) => { if (!disposed) error = explainError(cause); })
+            }).catch((cause) => { if (!disposed) error = failure("duplicate", "the task", cause); })
               .finally(() => { opening = false; });
           });
         }
@@ -2226,7 +2330,7 @@
           try {
             const brief = await getTaskBrief(cards[0].id, cards[0].revision);
             await copyValues(brief.markdown, `Copied saved revision ${cards[0].revision}`);
-          } catch (cause) { error = explainError(cause); }
+          } catch (cause) { error = failure("copy", "the brief", cause); }
         }
         break;
       case "copyAgent":
@@ -2240,7 +2344,7 @@
         break;
       case "due": {
         const due = dueFromChoice(item.action.choice);
-        if (item.action.choice !== "clear" && due === null) { error = "Could not resolve that due date."; break; }
+        if (item.action.choice !== "clear" && due === null) { error = "Couldn't resolve that due date."; break; }
         void patchCards(cards, { due_at: due });
         break;
       }
@@ -2304,7 +2408,7 @@
     <!-- The store's count for the column, not its loaded page: a column
          showing thirty of forty is over a limit of thirty-five. -->
     <span data-testid="task-column-count" title={searching ? `${columnCount(status)} matching in ${STATUS_LABELS[status]}` : limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status] && !(provisional && !searching) ? columnCount(status) : "—"}{#if limit && !searching}<span class="limit">/{limit}</span>{/if}</span>
-    {#if wip === "over"}<span class="over-badge" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
+    {#if wip === "over"}<span class="gp-chip over-badge" data-kind="label" data-tone="danger" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
     <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
   </span>
 {/snippet}
@@ -2336,10 +2440,10 @@
     <div class="card-meta">
       {#if face.pip !== null}<span class="pip" data-priority={face.pip} role="img" aria-label={`${priorityLabel(face.pip)} priority`} title={`${priorityLabel(face.pip)} priority`}></span>{/if}
       <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
-      {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
+      {#if openCardIds.has(card.id)}<span class="gp-chip open-mark" data-kind="label" data-tone="accent">Open</span>{/if}
     </div>
-    {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
-    {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
+    {#if agents}<span class="agents-host" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined}><span class="gp-chip agents-mark" data-kind="label" data-tone={agents.asking ? "warn" : agents.tone === "error" ? "danger" : "neutral"} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span></span>{/if}
+    {#if flag}<span class="gp-chip checkout-note" data-kind="label" data-tone="warn" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
     {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {@render lineageMarks(card)}
     {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
@@ -2347,10 +2451,10 @@
       <div class="card-extra">
         {#if chrome.kind && cardFields.has("type")}<span class="muted">{chrome.kind}</span>{/if}
         {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
-        {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+        {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="gp-chip due" data-kind="label" data-tone={chrome.due === "overdue" ? "danger" : "warn"} data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
       </div>
     {/if}
-    {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+    {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span class="gp-chip" data-kind="label" data-tone="neutral">{label}</span>{/each}{#if chrome.extraLabels}<span class="gp-chip" data-kind="label" data-tone="neutral">+{chrome.extraLabels}</span>{/if}</div>{/if}
     {@render matchHint(card)}
   </button>
 {/snippet}
@@ -2378,14 +2482,14 @@
   >
     <span class="status">{STATUS_LABELS[card.status]}</span>
     <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
-    {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
-    {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
+    {#if agents}<span class="agents-host" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined}><span class="gp-chip agents-mark" data-kind="label" data-tone={agents.asking ? "warn" : agents.tone === "error" ? "danger" : "neutral"} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span></span>{/if}
+    {#if flag}<span class="gp-chip checkout-note" data-kind="label" data-tone="warn" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
     {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {@render lineageMarks(card)}
-    {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
+    {#if openCardIds.has(card.id)}<span class="gp-chip open-mark" data-kind="label" data-tone="accent">Open</span>{/if}
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
-    {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+    {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="gp-chip due" data-kind="label" data-tone={chrome.due === "overdue" ? "danger" : "warn"} data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
     {@render matchHint(card)}
   </button>
 {/snippet}
@@ -2428,110 +2532,151 @@
 {/snippet}
 {#snippet repositoryRow(repo: Repository, hidden: boolean)}
   {@const health = checkouts.get(repo.id)}
-  <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
-  {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
-  </button>{#if hidden}<button type="button" class="icon gp-icon-btn" data-testid="repository-show" aria-label={`Show ${repo.name}'s tasks on the board`} title={`Show ${repo.name}'s tasks on the All and workspace boards again`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><Eye size={12} /></button>{:else}<span class="row-action"><button type="button" class="icon gp-icon-btn" data-testid="repository-hide" aria-label={`Hide ${repo.name}'s tasks from the board`} title={`Hide ${repo.name}'s tasks from the All and workspace boards — its own board still shows them`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><EyeOff size={12} /></button></span>{/if}{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+  {@const selected = scope.kind === "repository" && scope.id === repo.id}
+  <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}>
+    <button type="button" class="gp-row nav-scope" class:selected aria-pressed={selected} data-active={selected} onclick={() => chooseScope({ kind: "repository", id: repo.id })} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
+      {@render scopeSelection(selected)}<span class="nav-name">{repo.name}</span>{#if health?.state === "missing"}<span class="nav-meta checkout-mark" data-testid="repository-checkout-missing"><AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="nav-meta" data-testid="repository-remote-only">Remote only</span>{:else if health?.state === "unknown"}<span class="nav-meta" data-testid="repository-checkout-unknown">Not checked</span>{/if}
+    </button>
+    <span class="nav-trail">
+      {#if hidden}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-persist data-testid="repository-show" aria-label={`Show ${repo.name}'s tasks on the board`} title={`Show ${repo.name}'s tasks on the All and workspace boards again`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><Eye size={12} /></button>
+      {:else}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-testid="repository-hide" aria-label={`Hide ${repo.name}'s tasks from the board`} title={`Hide ${repo.name}'s tasks from the All and workspace boards — its own board still shows them`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><EyeOff size={12} /></button>
+      {/if}
+      {#if health?.state === "remote"}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" data-persist aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>
+      {:else}
+        <button type="button" class="trail-item gp-icon-btn" data-size="sm" class:urgent={health?.state === "missing"} data-persist={health?.state === "missing" || undefined} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>
+      {/if}
+    </span>
+  </div>
 {/snippet}
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
+{#snippet scopeRail(overlay: boolean)}
+  <!-- Justified: the keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
+    {#if overlay && !railNarrow}
+      <div class="nav-heading gp-label nav-dock">Task scopes<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dock the task scopes beside the board" title="Dock the task scopes beside the board" onclick={dockRail}><PanelLeft size={12} /></button></div>
+    {/if}
+    <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
+    <div class="nav-heading gp-label">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="gp-icon-btn" data-size="sm" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="gp-icon-btn" data-size="sm" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
+    <div class="nav-row"><button type="button" class="gp-row nav-scope" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => chooseScope({ kind: "global" })}>{@render scopeSelection(scope.kind === "global")}<span class="nav-name">All</span></button></div>
+    {#each orderedWorkspaces as group, index (group.id)}
+      {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
+      {#if navShowsWorkspace(group)}
+        {@const selected = scope.kind === "workspace" && scope.id === group.id}
+        {@const meta = [group.repository_count === 0 ? "Empty" : "", group.archived ? "Archived" : ""].filter(Boolean).join(" · ")}
+        <div class="nav-row" data-workspace-row={group.id}>
+          <button type="button" class="gp-row nav-scope" aria-pressed={selected} data-active={selected} class:selected aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => chooseScope({ kind: "workspace", id: group.id })} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(selected)}<span class="nav-name">{group.icon} {group.name}</span>{#if meta}<span class="nav-meta">{meta}</span>{/if}</button>
+          <span class="nav-trail">
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={12} /></button>
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={12} /></button>
+            <button type="button" class="trail-item gp-icon-btn" data-size="sm" aria-label={`Edit ${group.name}`} title={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}><Ellipsis size={12} /></button>
+          </span>
+        </div>
+      {/if}
+    {/each}
+    {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
+    {#if workspaceCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
+    {#if workspaces.some((group) => group.archived)}
+      <!-- "workspaces", not just "archived": this page also has an Archive
+           that holds completed tasks, and two unqualified uses of the word
+           on one screen read as one feature with a broken control. -->
+      <div class="archive-pick"><Checkbox label="Show archived workspaces" checked={showArchived} onchange={(next) => interfaceStore.setTaskShowArchivedWorkspaces(next)} /></div>
+    {/if}
+    <!-- In a workspace scope this control has a second effect: whatever it
+         adds also joins the workspace. It says so rather than leaving the
+         membership write to be discovered. -->
+    <div class="nav-heading gp-label" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="gp-icon-btn" data-size="sm" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
+    {#if addMenu}
+      <div
+        bind:this={addMenuEl}
+        use:portal={"body"}
+        use:popover={addMenuDismissal} out:popoverExit
+        id="task-add-repo-menu"
+        data-add-repo-popup
+        data-testid="task-add-repo-menu"
+        class="add-menu gp-menu gp-pop fixed"
+        role="menu"
+        aria-label={addRepoLabel}
+        tabindex="-1"
+        style="z-index: {LAYERS.MENU}"
+        onkeydown={onAddMenuKey}
+      >
+        {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
+        {#each menuTabs as tab (tab.path)}
+          <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
+            <span class="add-name">{tab.label}</span>
+            <span class="add-path">{tab.path}</span>
+          </button>
+        {/each}
+        {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
+        {#if attachable.length}
+          <div class="add-menu-label">Registered</div>
+          {#each attachable as repo (repo.id)}
+            <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
+              <span class="add-name">{repo.name}</span>
+            </button>
+          {/each}
+          {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
+        {/if}
+        <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
+      </div>
+    {/if}
+    {#each repositories as repo (repo.id)}
+      {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
+    {/each}
+    <!-- Hidden repositories keep their rows: their own boards still open
+         from here, and Show is one click away. Collapsed unless the reader
+         opened it, is on one of their boards, or is searching the navigator. -->
+    {#if hiddenRepositories.length}
+      {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
+      <div class="nav-heading gp-label" data-testid="task-hidden-repositories">
+        <button type="button" class="gp-btn nav-disclosure" data-variant="ghost" data-size="inline" data-testid="task-hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
+        <button type="button" class="gp-icon-btn" data-size="sm" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
+      </div>
+      {#if expanded}
+        <div id="task-hidden-repository-rows">
+          {#each repositories as repo (repo.id)}
+            {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
+          {/each}
+          {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
+        </div>
+      {/if}
+    {/if}
+    {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
+    {#if repositoryCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
+  </nav>
+{/snippet}
 <svelte:window onkeydown={onBoardKeydown} onpointermove={onCardPointerMove} onpointerup={onCardPointerUp} onpointercancel={onCardPointerCancel} onlostpointercapture={onCardPointerCancel} onblur={cancelDrag} />
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
-    <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
-      <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find workspace or repo" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
-      <div class="nav-heading">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="icon gp-icon-btn" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
-      <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
-      {#each orderedWorkspaces as group, index (group.id)}
-        {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
-        {#if navShowsWorkspace(group)}
-        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
-        {/if}
-      {/each}
-      {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
-      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
-      {#if workspaces.some((group) => group.archived)}
-        <!-- "workspaces", not just "archived": this page also has an Archive
-             that holds completed tasks, and two unqualified uses of the word
-             on one screen read as one feature with a broken control. -->
-        <label class="archive-toggle"><input type="checkbox" checked={showArchived} onchange={(e) => interfaceStore.setTaskShowArchivedWorkspaces(e.currentTarget.checked)} />Show archived workspaces</label>
-      {/if}
-      <!-- In a workspace scope this control has a second effect: whatever it
-           adds also joins the workspace. It says so rather than leaving the
-           membership write to be discovered. -->
-      <div class="nav-heading" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="icon gp-icon-btn" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
-      {#if addMenu}
-        <div
-          bind:this={addMenuEl}
-          use:portal={"body"}
-          use:popover={addMenuDismissal}
-          id="task-add-repo-menu"
-          data-add-repo-popup
-          data-testid="task-add-repo-menu"
-          class="add-menu gp-menu gp-pop fixed"
-          role="menu"
-          aria-label={addRepoLabel}
-          tabindex="-1"
-          style="z-index: {LAYERS.MENU}"
-          onkeydown={onAddMenuKey}
-        >
-          {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
-          {#each menuTabs as tab (tab.path)}
-            <button type="button" class="add-item gp-menu-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
-              <span class="add-name">{tab.label}</span>
-              <span class="add-path">{tab.path}</span>
-            </button>
-          {/each}
-          {#if menuTabs.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
-          {#if attachable.length}
-            <div class="add-menu-label">Registered</div>
-            {#each attachable as repo (repo.id)}
-              <button type="button" class="add-item gp-menu-item" role="menuitem" title={repo.identity_key} onclick={() => void addRegistered([repo.id])}>
-                <span class="add-name">{repo.name}</span>
-              </button>
-            {/each}
-            {#if attachable.length > 1}<button type="button" class="gp-menu-item" role="menuitem" onclick={() => void addRegistered(attachable.map((repo) => repo.id))}>Add all registered</button>{/if}
-          {/if}
-          <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
-        </div>
-      {/if}
-      {#each repositories as repo (repo.id)}
-        {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
-      {/each}
-      <!-- Hidden repositories keep their rows: their own boards still open
-           from here, and Show is one click away. Collapsed unless the reader
-           opened it, is on one of their boards, or is searching the navigator. -->
-      {#if hiddenRepositories.length}
-        {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
-        <div class="nav-heading" data-testid="task-hidden-repositories">
-          <button type="button" class="hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
-          <button type="button" class="icon gp-icon-btn" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
-        </div>
-        {#if expanded}
-          <div id="task-hidden-repository-rows">
-            {#each repositories as repo (repo.id)}
-              {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
-            {/each}
-            {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
-          </div>
-        {/if}
-      {/if}
-      {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
-      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
-    </nav>
+    {#if railDocked}
+      {@render scopeRail(false)}
+    {:else if railOpen}
+      <div class="rail-overlay" style="z-index: {LAYERS.SCROLL_CUE}; top: {railTop}px" use:popover={railDismissal} in:fly={{ x: -16, opacity: 0, ...backdropFade() }} out:fly={{ x: -16, opacity: 0, ...backdropFadeOut() }}>
+        {@render scopeRail(true)}
+      </div>
+    {/if}
   {/if}
   <main class="board-main">
     <header class="gp-glass gp-surface-header">
       <div class="heading">
+        {#if !repositoryPath}
+          <button bind:this={railToggleEl} type="button" class="gp-icon-btn" data-nav-toggle data-testid="task-nav-toggle" aria-expanded={railDocked || railOpen} aria-controls="task-scope-rail" aria-label={railDocked ? "Hide task scopes" : "Show task scopes"} title={railDocked ? "Hide task scopes" : "Show task scopes"} onclick={toggleRail}><PanelLeft size={13} /></button>
+        {/if}
         <h1 class="gp-surface-title">{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
-        {#if inProgressCount > 0}<span class="gp-pill">{inProgressCount} in progress</span>{/if}
+        {#if inProgressCount > 0}<span class="gp-chip" data-kind="label" data-tone="accent">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
              the boards for every task and for its workspaces. -->
-        {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
+        {#if repositoryPath}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
-        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repo:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
-        <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repo:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
+        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
+        <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repository:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
           <!-- inline-flex: an icon is a block-level svg, so without it the
@@ -2543,27 +2688,27 @@
         {#if initialized}
           <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
             <Inbox size={13} />
-            {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
+            {#if !unreadError && unread > 0}<span class="gp-chip" data-kind="count" data-tone="accent">{unread}</span>{/if}
           </button>
           <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title="Archive — tasks filed away from this board, and deleted tasks to restore" onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
-            {#if archivedCount > 0}<span class="gp-pill">{archivedCount}</span>{/if}
+            {#if archivedCount > 0}<span class="gp-chip" data-kind="count" data-tone="neutral">{archivedCount}</span>{/if}
           </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
         <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
-        <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}>Organise</button>
+        <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}>Organize</button>
         <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
         <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
-        <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
+        <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
         <!-- A disabled New task always says why, and a caveat says what the
              sheet will ask for. This used to render only for a profile with no
              repositories at all, so an empty workspace left the button dead
              and silent. -->
         {#if creation.blocked ?? creation.caveat}
           {#if creation.blocked && emptyAddLabel}
-            <button type="button" class="hint-action" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
+            <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
           {:else}
             <span class="hint" data-testid="task-create-hint">{creation.blocked ?? creation.caveat}</span>
           {/if}
@@ -2652,13 +2797,13 @@
         <div class="quick-filters" role="group" aria-label="Quick filters">
           {#each QUICK_FILTERS as quick (quick.filter)}
             {@const on = queryHas(parsedQuery, quick.filter)}
-            <button type="button" class="gp-btn quick" aria-pressed={on} data-active={on} title={on ? `Remove ${quick.filter}` : `Add ${quick.filter} to the search`} onclick={() => { search = toggleQueryTerm(search, quick.filter); }}>{quick.label}</button>
+            <button type="button" class="gp-btn quick" data-size="sm" aria-pressed={on} data-active={on} title={on ? `Remove ${quick.filter}` : `Add ${quick.filter} to the search`} onclick={() => { search = toggleQueryTerm(search, quick.filter); }}>{quick.label}</button>
           {/each}
         </div>
         {#if parsedQuery.terms.length}
           <ul class="query-chips" aria-label="Search filters">
             {#each queryChips(parsedQuery) as term (`${term.start}:${term.raw}`)}
-              <li class="gp-pill query-chip" class:negated={term.negated}><span>{term.raw}</span><button type="button" class="chip-remove" aria-label={`Remove filter ${term.raw}`} onclick={() => { search = removeQueryTerm(search, term); }}><X size={10} /></button></li>
+              <li class="gp-chip query-term" data-kind="removable" class:negated={term.negated}><span>{term.raw}</span><button type="button" class="gp-icon-btn" data-size="sm" aria-label={`Remove filter ${term.raw}`} onclick={() => { search = removeQueryTerm(search, term); }}><X size={10} /></button></li>
             {/each}
           </ul>
         {/if}
@@ -2669,11 +2814,11 @@
           <span class="query-coverage" role="status" data-testid="task-query-coverage">{searchReport}</span>
         {/if}
         {#if moreCandidates}
-          <button type="button" class="gp-btn quick" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
           {#if loadingAll === "search"}
-            <button type="button" class="gp-btn quick" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
+            <button type="button" class="gp-btn quick" data-size="sm" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
           {:else}
-            <button type="button" class="gp-btn quick" disabled={loading} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
+            <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
           {/if}
         {/if}
         {#if searching && parsedQuery.words}
@@ -2692,7 +2837,7 @@
             <div><dt>words</dt><dd>Every word must match: titles, labels, type, owner and repository (word forms, related words, close spellings), and descriptions through the store</dd></div>
             <div><dt>login OR signin</dt><dd>Either word</dd></div>
             <div><dt>"sign in"</dt><dd>That phrase in the title or a label</dd></div>
-            {#each QUERY_HELP as row (row.example)}<div><dt><button type="button" class="link" title="Add to the search" onclick={() => { search = toggleQueryTerm(search, row.example); }}>{row.example}</button></dt><dd>{row.meaning}</dd></div>{/each}
+            {#each QUERY_HELP as row (row.example)}<div><dt><button type="button" class="gp-btn" data-variant="ghost" data-size="sm" title="Add to the search" onclick={() => { search = toggleQueryTerm(search, row.example); }}>{row.example}</button></dt><dd>{row.meaning}</dd></div>{/each}
           </dl>
         {/if}
       </div>
@@ -2725,11 +2870,11 @@
         <EyeOff size={11} />
         {hiddenRepositoryReport.line}
         {#if moreCandidates && !filtering}
-          <button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
-          {#if loadingAll === "search"}<button type="button" class="link" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
-          {:else}<button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
+          <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          {#if loadingAll === "search"}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
+          {:else}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
         {/if}
-        <button type="button" class="link" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>
+        <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>
       </p>
     {/if}
     {#if hiddenWork}
@@ -2738,7 +2883,7 @@
       <p class="hidden-note" role="status" data-testid="task-hidden-columns">
         <EyeOff size={11} />
         {hiddenWork.summary} hidden from this board.
-        <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
+        <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
       </p>
     {/if}
     {#if pendingDelete || undoOffer}
@@ -2749,7 +2894,7 @@
         {#if pendingDelete}
           <span>{deletesRunning > 0 && pendingDelete.running ? `Deleting ${plural(pendingDelete.cards.length, "task")}…` : `${describeTaskAction({kind:"delete"}, pendingDelete.cards.length)}. Nothing is written until ${DEFERRED_DELETE_MS / 1000} seconds pass.`}</span>
           <button type="button" class="gp-btn" aria-keyshortcuts="Meta+Z Control+Z" disabled={deletesRunning > 0 && pendingDelete.running} onclick={() => cancelPendingDelete()}><Undo2 size={12} /> Undo</button>
-          <button type="button" class="gp-btn-danger" disabled={deletesRunning > 0 && pendingDelete.running} onclick={() => void commitPendingDelete()}><Trash2 size={12} /> Delete now</button>
+          <button type="button" class="gp-btn" data-variant="danger" disabled={deletesRunning > 0 && pendingDelete.running} onclick={() => void commitPendingDelete()}><Trash2 size={12} /> Delete now</button>
         {:else if undoOffer}
           <span>{undoOffer.label}</span>
           <button type="button" class="gp-btn" aria-keyshortcuts="Meta+Z Control+Z" disabled={busy} onclick={() => void undoLast()}><Undo2 size={12} /> Undo</button>
@@ -2801,11 +2946,11 @@
           title={selectionMerge.ok ? "Merge — fold these into one task and delete the rest" : selectionMerge.reason}
           onclick={() => { if (selectionMerge.ok) mergeDialog = { cards: [...selectedCards], repositoryId: selectionMerge.repositoryId }; }}
         ><Merge size={12} /> Merge…</button>
-        <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
+        <button type="button" class="gp-btn" data-variant="danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
     {/if}
-    {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Retry task update</button></div>{/if}
+    {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button type="button" class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Try again</button></div>{/if}
     {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
     {#if showArchive}
       <TaskArchive
@@ -2820,8 +2965,8 @@
         repository={(id) => repositoryById.get(id)}
       />
     {/if}
-    {#if relinkPending}<div class="banner error gp-notice gp-notice-error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
-    {#if catalogError}<div class="banner error gp-notice gp-notice-error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
+    {#if relinkPending}<div class="banner error gp-notice gp-notice-error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Try again</button></div>{/if}
+    {#if catalogError}<div class="banner error gp-notice gp-notice-error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Try again</button></div>{/if}
     {#if issueProgress}<div class="banner gp-notice" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
     {#if liveNotice}<div class="banner gp-notice" role="status" data-testid="task-live-unavailable">{liveNotice}</div>{/if}
     {#if error}<div class="banner error gp-notice gp-notice-error" role="alert">{error}</div>{/if}
@@ -2832,13 +2977,20 @@
       <ul class="read-notes gp-notice gp-notice-warn" aria-label="Board details not read" data-testid="board-read-notes">
         <!-- Cards carry no agent marks while this stands: an old reading would
              claim agents nobody checked. -->
-        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>Verification verdicts could not be read, so cards show none: {noteCause(verdictError)}</span></li>{/if}
-        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>Subtask progress could not be read, so cards show none: {noteCause(lineageError)}</span></li>{/if}
-        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>Agents working on these tasks could not be read: {noteCause($boardAgents.error)}</span></li>{/if}
-        <!-- A check that could not run is said, not shown as a healthy checkout:
-             those rows and cards carry no mark either way. -->
-        {#if uncheckedCheckouts.length}<li class="agents-unread" role="status" data-testid="checkout-unchecked"><CircleAlert size={12} aria-hidden="true" /><span>{plural(uncheckedCheckouts.length, "checkout")} could not be checked, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</span></li>{/if}
+        {#if verdictError}<li class="agents-unread" role="status" data-testid="board-verdicts-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("verification verdicts", verdictError, "Cards show none.")}</span></li>{/if}
+        {#if lineageError}<li class="agents-unread" role="status" data-testid="board-lineage-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("subtask progress", lineageError, "Cards show none.")}</span></li>{/if}
+        {#if $boardAgents.error}<li class="agents-unread" role="status" data-testid="board-agents-error"><CircleAlert size={12} aria-hidden="true" /><span>{readNote("which agents are working on these tasks", $boardAgents.error, "")}</span></li>{/if}
       </ul>
+    {/if}
+    <!-- A check that could not run is said, not shown as a healthy checkout:
+         those rows and cards carry no mark either way. -->
+    {#if uncheckedCheckouts.length}
+      {@const unknown = unknownState(plural(uncheckedCheckouts.length, "checkout"), `Whether ${uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. ${uncheckedCheckouts[0].detail}`)}
+      <div class="gp-notice" data-tone="unknown" role="status" data-testid="checkout-unchecked">
+        <CircleAlert size={12} aria-hidden="true" />
+        <span class="min-w-0 flex-1">{unknown.title}. {unknown.reason}</span>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => { checkoutToken += 1; }}>{unknown.actionLabel}</button>
+      </div>
     {/if}
     <!-- Its own banner, not part of `error`: a board reload clears `error`,
          and the issue would still exist with nothing on screen to link it. -->
@@ -2847,7 +2999,7 @@
     {#if !initialized && loading}
       <div class="pad"><Skeleton variant="card" count={4} /></div>
     {:else if initialized && error && loadedKey !== boardKey}
-      <EmptyState icon={Inbox} title="Tasks unavailable" hint="Retry to load this scope." action={{label:"Retry loading tasks",onClick:()=>void loadBoard(),variant:"secondary"}} />
+      <EmptyState icon={Inbox} title="Tasks unavailable" hint="Try again to load this scope." action={{label:"Try again",onClick:()=>void loadBoard(),variant:"secondary"}} />
     {:else if initialized && !loading && listCards.length === 0 && !filtering && (hiddenRepositoryReport?.tasks ?? 0) > 0}
       <!-- Not "No tasks yet": there are tasks, the reader hid where they live. -->
       <EmptyState icon={EyeOff} title="Every loaded task is in a hidden repository" hint={hiddenRepositoryReport?.line ?? ""} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Show hidden repositories", onClick: () => interfaceStore.showAllTaskRepositories(), variant: "secondary" }} />
@@ -2958,7 +3110,7 @@
          preview drawn in it trailed the pointer by the pane's own origin.
          Drawn at the card's size and held where it was grabbed. -->
     {@const grab = press?.grab ?? { dx: 0, dy: 0, width: 0, height: 0 }}
-    <div use:portal={"body"} class="ghost gp-glass bg-surface shadow-float" style="width: {grab.width}px; height: {grab.height}px; transform: translate3d({drag.x - grab.dx}px, {drag.y - grab.dy}px, 0)" data-testid="task-drag-ghost">{drag.card.title}</div>
+    <div use:portal={"body"} class="ghost gp-glass bg-surface shadow-float" style="z-index: {LAYERS.SCROLL_CUE}; width: {grab.width}px; height: {grab.height}px; transform: translate3d({drag.x - grab.dx}px, {drag.y - grab.dy}px, 0)" data-testid="task-drag-ghost">{drag.card.title}</div>
   {/if}
   {#if menu}
     <TaskContextMenu
@@ -3046,7 +3198,7 @@
               </div>
               <button
                 type="button"
-                class="tab-close"
+                class="gp-icon-btn" data-size="sm" data-tone="danger"
                 tabindex="-1"
                 data-testid="task-tab-close"
                 aria-label={`Close ${taskTabLabel(tab)}`}
@@ -3086,163 +3238,160 @@
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));overflow:hidden}
   .workbench.is-dragging{cursor:grabbing;user-select:none}
-  /* A rounded card that fills the board's left edge, top to bottom, with no
-     gutter: its corners meet the pane's own rounded corners, the same rule
-     as the app sidebar beside it. */
-  .navigator{width:188px;flex-shrink:0;margin:0;border:1px solid rgb(var(--c-border) / 0.65);border-radius:14px;padding:10px 8px;overflow:auto}
-  .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;background:transparent}
-  .navigator button:hover{background:rgb(var(--c-surface-hover) / 0.7)}
-  .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
-  .navigator.gp-liquid-tabs{padding:10px 8px}
-  .navigator.gp-liquid-tabs button.selected{background:transparent}
-  .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
-  .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
-  /* Icon buttons have to beat `.navigator button { width: 100% }`. Show, on a
-     hidden repository, is not the row's last child, so a bare `.icon` rule
-     lost and the button took the row — the name collapsed to nothing. */
-  .nav-heading > button,.nav-row>button:last-child,.navigator button.icon{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+  /* A docked rail, not a floating card. In flow beside the board it separates
+     from it by one tonal step and its own padding: no outline, no radius (the
+     pane's rounded corner clips it where it meets the plate), no glass. Glass
+     is for the overlay below, because only that one floats over the board. */
+  /* `gp-glass` paints only on macOS and its rule is more specific than this
+     fill, so the overlay is glass there and the same solid surface elsewhere. */
+  .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
+  .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
+  .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
+  .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;position:relative;text-align:left;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
+  .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
+  .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
+  .navigator.nav-liquid .nav-scope.selected{background:transparent}
+  .navigator .nav-scope:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-2px}
+  .navigator .nav-scope > :not(:global(.gp-liquid-selection)){position:relative}
+  .navigator .nav-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .navigator .nav-meta{flex-shrink:0;font-size:var(--text-meta);color:rgb(var(--c-text-muted));white-space:nowrap}
+  .navigator .nav-meta.checkout-mark{color:rgb(var(--c-warn))}
+  /* Every trailing control on a row is one 24px gp-icon-btn, revealed together
+     on hover or focus-within. `data-persist` keeps the ones that carry state
+     or the row's main action (a hidden repository's Show, a checkout that
+     needs relinking); touch has no hover, so it shows them all. */
+  .navigator .nav-row{display:flex;align-items:center;min-width:0}
+  .navigator .nav-trail{display:inline-flex;flex-shrink:0}
+  .navigator .trail-item{display:none;flex-shrink:0}
+  .navigator .nav-row:hover .trail-item,.navigator .nav-row:focus-within .trail-item,.navigator .trail-item[data-persist]{display:inline-flex}
+  @media (hover:none){.navigator .trail-item{display:inline-flex}}
+  .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 0 4px 8px;min-height:24px}
+  .nav-heading > button,.heading-actions>button{flex-shrink:0}
+  .heading-actions{display:inline-flex}
+  .navigator .nav-more{display:block;width:100%;text-align:left}
+  .navigator .nav-disclosure{gap:2px;width:auto;min-width:0;flex:1;overflow:hidden;font:inherit;color:inherit}
+  .navigator .nav-disclosure :global(svg){flex-shrink:0}
   /* Portaled: `fixed` + the popover owner set left/top. Width and height are
      viewport-capped so a long path or a long registered list cannot grow the
      panel off the window the way the old 260px-in-188px absolute menu did.
      `gp-menu`'s overflow:hidden is overridden so the list can scroll. */
   .add-menu{width:min(20rem,calc(100vw - 16px));max-width:calc(100vw - 16px);max-height:min(20rem,calc(100vh - 16px));overflow:hidden auto;box-sizing:border-box}
-  .add-menu-label{padding:4px 8px;font-size:10px;color:rgb(var(--c-text-muted))}
+  .add-menu-label{padding:4px 8px;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .add-menu button{width:100%;height:auto;min-width:0;padding:6px 8px;white-space:normal;overflow:visible;text-align:left}
   .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0}
   .add-name,.add-path{display:block;min-width:0;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
-  .add-path{font-size:10px;color:rgb(var(--c-text-muted))}
-  .hint-action{border:0;background:transparent;padding:0;color:rgb(var(--c-accent));font-size:11px}
-  .nav-row{display:flex;align-items:center}
-  .nav-row .reorder{display:none;flex-shrink:0}
-  .nav-row:hover .reorder,.nav-row:focus-within .reorder{display:inline-flex}
-  .reorder>button{width:18px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-  .heading-actions{display:inline-flex;gap:2px}
-  .heading-actions>button{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
-  .nav-row>button:first-child{min-width:0;flex:1}
-  .nav-row .row-action{display:none;flex-shrink:0}
-  .nav-row:hover .row-action,.nav-row:focus-within .row-action{display:inline-flex}
-  .navigator .hidden-toggle{display:inline-flex;align-items:center;justify-content:flex-start;gap:2px;width:auto;min-width:0;flex:1;padding:0;overflow:hidden;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit}
-  .navigator .hidden-toggle :global(svg){flex-shrink:0}
+  .add-path{font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .archive-toggle{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .archive-pick{padding:0 8px}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
   /* The header's box and the title's type are the shared gp-surface-header
      and gp-surface-title (app.css), so Tasks and Agents read as one chrome. */
   h1{display:flex;align-items:baseline;gap:8px}
-  h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
+  h1 span{font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
   .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
-  .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:12px}
-  .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
-  .undo-strip>span{flex:1;min-width:0;font-size:12px}
-  button,input,select{font-size:12px}
+  .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs)}
+  .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:var(--gp-r-md)}
+  .undo-strip>span{flex:1;min-width:0;font-size:var(--text-xs)}
+  button,input,select{font-size:var(--text-xs)}
   button:disabled{opacity:.5}
-  .hint{font-size:11px;color:rgb(var(--c-text-muted))}
+  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .match-hint{display:block;margin-top:4px;font-size:10px;line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .match-hint{display:block;margin-top:4px;font-size:var(--text-micro);line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
-  .nav-search input{flex:1;min-width:0;font-size:11px}
-  .nav-empty{margin:2px 6px 6px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .nav-search input{flex:1;min-width:0;font-size:var(--text-meta)}
+  .nav-empty{margin:2px 6px 6px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .query-bar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:0 14px 8px}
   .quick-filters{display:flex;flex-wrap:wrap;gap:4px}
-  .quick{font-size:11px;padding:2px 8px}
-  .quick[data-active="true"]{background:rgb(var(--c-accent) / .18);border-color:rgb(var(--c-accent) / .55)}
+  .quick[data-active="true"]{background:rgb(var(--c-accent) / .18);border-color:rgb(var(--c-accent) / .65)}
   .query-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
-  .query-chip{display:inline-flex;align-items:center;gap:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
-  .query-chip.negated span{text-decoration:line-through}
-  .chip-remove{display:inline-flex;border:0;background:none;padding:0;color:inherit;cursor:pointer}
-  .query-coverage{font-size:11px;color:rgb(var(--c-text-muted))}
-  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
-  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:11px}
+  .query-term{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .query-term.negated span{text-decoration:line-through}
+  .query-coverage{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:var(--text-meta);color:rgb(var(--c-warn))}
+  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:var(--text-meta)}
   .query-help div{display:flex;gap:8px}
   .query-help dt{min-width:130px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   .query-help dd{margin:0;color:rgb(var(--c-text-muted))}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
-  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
+  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:var(--gp-r-xl);border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}
   /* Over its work-in-progress limit: the column says so in its border and its head, and still accepts work. */
-  .column.over-limit,.column-head.over-limit{border-color:#d15a64}
+  .column.over-limit,.column-head.over-limit{border-color:rgb(var(--c-danger))}
   .limit{color:rgb(var(--c-text-muted))}
-  .over-badge{font-size:9px;font-weight:650;letter-spacing:.03em;text-transform:uppercase;padding:1px 5px;border-radius:4px;color:#d15a64;background:rgb(209 90 100 / .14)}
   /* Lanes: one head row for the columns, then a row of cells per lane. */
   .columns.laned{flex-direction:column;align-items:stretch;gap:10px}
   .lane-head,.lane-cells{display:grid;gap:8px}
-  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
+  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-lg)}
   .lane{flex-shrink:0;display:flex;flex-direction:column;gap:6px}
-  .lane-title{margin:0;font-size:11px;font-weight:650;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
+  .lane-title{margin:0;font-size:var(--text-meta);font-weight:600;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
   .lane-title span{font-weight:400;color:rgb(var(--c-text-muted))}
   .lane-cell{width:auto;min-width:0;flex:none}
   .lane-cell .cards{min-height:48px;overflow:visible}
   .list-lane{display:flex;flex-direction:column;margin-bottom:10px}
   .list-lane .lane-title{padding:4px 2px 6px}
-  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);padding:8px 10px;}
+  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:var(--text-xs);padding:8px 10px}
   .column-meta{display:flex;align-items:center;gap:4px;color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
-  .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:10px}
+  .card{border:1px solid rgb(var(--c-border) / 0.65);border-radius:var(--gp-r-md)}
   .card,.row{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;cursor:grab;touch-action:none;user-select:none}
   .row{cursor:pointer;display:grid;grid-template-columns:7rem minmax(0,1fr) auto auto auto;gap:8px;align-items:center}
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}
-  .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.45)}
+  .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.35)}
   .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
-  .open-mark{font-size:9px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-accent));flex-shrink:0;margin-top:2px}
-  /* Agents working on the card's task; amber when one needs the reader, as in the task's Agents pane. */
-  .agents-chip{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;flex-shrink:0;font-size:10px;font-weight:600;line-height:1;padding:2px 5px;border-radius:999px;color:rgb(var(--c-text-muted));background:rgb(var(--c-text-muted) / .12);font-variant-numeric:tabular-nums;white-space:nowrap}
-  .agents-chip[data-asking]{color:#d29922;background:rgb(210 153 34 / .16)}
-  .agents-chip[data-tone="error"]{color:#dc6565;background:rgb(220 101 101 / .16)}
-  .card .agents-chip{margin-top:4px}
+  .open-mark{flex-shrink:0;margin-top:2px}
+  /* Agents working on the card's task; warn when one needs the reader, as in the task's Agents pane.
+     The host carries the hooks (testid, data-tone, data-asking) and draws nothing; the chip inside is the mark. */
+  .agents-host{display:contents}
+  .agents-mark{align-self:flex-start;flex-shrink:0;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .card .agents-mark{margin-top:4px}
   /* A task whose primary repository has no checkout here: said on the card, before a launch finds out. */
-  .checkout-flag{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;flex-shrink:0;font-size:10px;font-weight:600;line-height:1;padding:2px 5px;border-radius:999px;color:#d29922;background:rgb(210 153 34 / .16);white-space:nowrap}
-  .card .checkout-flag{margin-top:4px}
-  .card-lineage{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;max-width:100%;font-size:10px;line-height:1.2;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .checkout-note{align-self:flex-start;flex-shrink:0;white-space:nowrap}
+  .card .checkout-note{margin-top:4px}
+  .card-lineage{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;max-width:100%;font-size:var(--text-micro);line-height:1.2;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card .card-lineage{display:flex;margin-top:4px}
-  .checkout-mark{color:#d29922;font-size:10px}
-  .navigator .gp-icon-btn.urgent{color:#d29922}
+  .checkout-mark{color:rgb(var(--c-warn));font-size:var(--text-micro)}
+  .navigator .gp-icon-btn.urgent{color:rgb(var(--c-warn))}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
   /* Same token the sheet below uses (app.css): the strip and the sheet are
      one column and must not be able to disagree about its width. */
-  .task-tabs{position:relative;width:var(--gp-task-sheet-w);flex-shrink:0;border-left:1px solid rgb(var(--c-border) / 0.65);border-bottom:1px solid rgb(var(--c-border) / 0.65)}
+  .task-tabs{position:relative;width:var(--gp-task-sheet-w);flex-shrink:0}
   .task-tab-strip{display:flex;align-items:stretch;gap:4px;min-width:0;overflow-x:auto;padding:6px 8px}
-  .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:8px;border:1px solid transparent;padding:0 2px 0 8px}
-  .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.45);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}
+  .task-tab-shell{display:flex;align-items:center;gap:2px;flex-shrink:0;max-width:190px;border-radius:var(--gp-r-full);border:1px solid transparent;padding:0 2px 0 8px}
+  .task-tab-shell.is-active{border-color:rgb(var(--c-accent) / 0.35);background:color-mix(in srgb,rgb(var(--c-accent)) 12%,transparent)}
   .task-tab-shell.is-draft [role="tab"]{font-style:italic}
-  .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:11px}
+  .task-tab-shell [role="tab"]{display:flex;align-items:center;gap:6px;min-width:0;flex:1;padding:5px 0;cursor:pointer;font-size:var(--text-meta)}
+  .task-tab-shell .gp-icon-btn{flex-shrink:0}
   .tab-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-  .tab-pip{width:6px;height:6px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
-  .tab-close{width:18px;height:18px;padding:0;border:0;background:transparent;color:rgb(var(--c-text-muted));display:inline-flex;align-items:center;justify-content:center;border-radius:5px;flex-shrink:0}
-  .tab-close:hover{color:#e11d48;background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover)))}
+  .tab-pip{width:6px;height:6px;border-radius:var(--gp-r-full);flex-shrink:0;background:rgb(var(--c-accent))}
   .task-panel{flex:1;min-height:0;display:flex}
   .task-panel :global(.task-editor){flex:1}
-  .card h3,.row-title{font-size:12px;line-height:1.4;font-weight:550;margin:0;overflow-wrap:anywhere;min-width:0}
+  .card h3,.row-title{font-size:var(--text-xs);line-height:1.4;font-weight:500;margin:0;overflow-wrap:anywhere;min-width:0}
   .card-meta{display:flex;align-items:flex-start;gap:6px}
-  .pip{width:7px;height:7px;margin-top:4px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
-  .pip[data-priority="0"]{background:#d15a64}
-  .insert{height:2px;margin:2px 4px;border-radius:2px;background:rgb(var(--c-accent))}
-  .card-repos,.muted,.status{font-size:10px;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pip{width:7px;height:7px;margin-top:4px;border-radius:var(--gp-r-full);flex-shrink:0;background:rgb(var(--c-accent))}
+  .pip[data-priority="0"]{background:rgb(var(--c-danger))}
+  .insert{height:2px;margin:2px 4px;border-radius: calc(var(--gp-r-xs) / 2);background:rgb(var(--c-accent))}
+  .card-repos,.muted,.status{font-size:var(--text-micro);color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card-repos{margin-top:4px}
   .card-extra{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
-  .due{font-size:9px;padding:1px 5px;border-radius:4px;background:rgb(245 158 11 / 0.15);color:rgb(180 83 9)}
-  .due[data-due="overdue"]{background:rgb(244 63 94 / 0.15);color:#e11d48}
-  .labels{display:flex;gap:4px;margin-top:6px;font-size:9px;flex-wrap:wrap}
-  .labels span{padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent);color:rgb(var(--c-text-muted))}
+  .labels{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
   .paging{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:6px}
-  .paging-count{font-size:10px;color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
-  .paging-note{flex-basis:100%;margin:0;font-size:10px;color:rgb(var(--c-text-muted))}
-  .column-empty{margin:10px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .paging-count{font-size:var(--text-micro);color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
+  .paging-note{flex-basis:100%;margin:0;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
+  .column-empty{margin:10px 8px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}
   /* The card skin is gp-notice (app.css); this is only the row inside it. */
   .banner{display:flex;align-items:center;justify-content:space-between;gap:10px}
   .read-notes{list-style:none;display:flex;flex-direction:column;gap:4px;color:rgb(var(--c-text-muted))}
-  .read-notes li{display:flex;align-items:flex-start;gap:8px;font-size:11px;line-height:1.45}
-  .read-notes li :global(svg){flex-shrink:0;margin-top:2px;color:#f59e0b}
-  .error{color:#d15a64}
-  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:12px;font-weight:550;overflow:hidden;overflow-wrap:anywhere}
+  .read-notes li{display:flex;align-items:flex-start;gap:8px;font-size:var(--text-meta);line-height:1.45}
+  .read-notes li :global(svg){flex-shrink:0;margin-top:2px;color:rgb(var(--c-warn))}
+  .error{color:rgb(var(--c-danger))}
+  .ghost{position:fixed;top:0;left:0;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:var(--text-xs);font-weight:500;overflow:hidden;overflow-wrap:anywhere}
   .pad{padding:16px}
   .quick-add-row{padding:8px 14px 0}
-  .quick-add-row.dimmed{opacity:.45;pointer-events:none;transition:opacity .15s ease}
-  .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:11px;color:rgb(var(--c-text-muted))}
-  .link{border:0;background:transparent;padding:0;font-size:11px;color:rgb(var(--c-accent))}
-  .link:hover{text-decoration:underline}
+  .quick-add-row.dimmed{opacity:.45;pointer-events:none}
+  .hidden-note{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0;padding:6px 14px;font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   /* Compact trades the card's breathing room for roughly a third more cards
      on screen. Only padding and gaps change: nothing is dropped, so the same
      card reads the same way at either density. */

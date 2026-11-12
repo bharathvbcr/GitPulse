@@ -260,7 +260,7 @@ export function formatHealthReport(
     const missing = github?.available ? (github.partial_tiers ?? []).map(safeText) : [];
     if (missing.length > 0) {
       out.push(
-        `NOTE: GitHub ${label} could not read the ${missing.join(", ")} severity; its alerts below are incomplete, not all-clear.`,
+        `NOTE: GitHub ${label} couldn't read the ${missing.join(", ")} severity; its alerts below are incomplete, not all-clear.`,
       );
     }
   }
@@ -269,7 +269,7 @@ export function formatHealthReport(
   const incompleteWalk = deadCode?.available ? deadCode.walk_incomplete?.trim() : null;
   if (deadCode && !deadCode.available) {
     out.push(
-      `Dead-code check could not run${deadCode.reason ? `: ${safeText(deadCode.reason)}` : ""}. That is not the same as finding no unreferenced symbols.`,
+      `Dead-code check couldn't run${deadCode.reason ? `: ${safeText(deadCode.reason)}` : ""}. That is not the same as finding no unreferenced symbols.`,
     );
   } else if (deadCode?.available && deadItems.length === 0 && deadCode.truncated) {
     out.push(

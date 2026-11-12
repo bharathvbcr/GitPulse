@@ -199,7 +199,7 @@ describe("transcriptNotices", () => {
 
   it("names the bytes dropped but not yet marked, in the singular too", () => {
     expect(transcriptNotices({ ...base, unrecordedBytes: 1 })).toEqual([
-      "1 more byte was dropped because the host could not save output fast enough, and the text does not mark where.",
+      "1 more byte was dropped because the host couldn't save output fast enough, and the text does not mark where.",
     ]);
   });
 

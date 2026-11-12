@@ -427,7 +427,7 @@ export function buildCoverageIssueDraft(
     indentBlock(snapshot || "No coverage data was available."),
   ];
   if (analysis) {
-    sections.push("", "## MANVI analysis", "", indentBlock(analysis));
+    sections.push("", "## Manvi analysis", "", indentBlock(analysis));
   }
   sections.push(
     "",
@@ -647,7 +647,7 @@ export function coverageFailureHint(
       return `pytest never ran a test: importing a collected module called sys.exit(), which aborts the whole session.${where} That file matches pytest's default collection patterns (test_*.py, *_test.py) but is a runnable script, not a test module. Rename it, guard its body with \`if __name__ == "__main__":\`, or exclude it (\`--ignore=<path>\`, or \`norecursedirs\`/\`python_files\` in pytest.ini).`;
     }
     case "build_failed":
-      return "The project failed to build, so no test ran and no coverage could be recorded. This is a build error in the repository (see the first error line), not a problem with the coverage command.";
+      return "The code failed to build, so no test ran and no coverage could be recorded. This is a build error in the repository (see the first error line), not a problem with the coverage command.";
     case "tests_failed": {
       const runner = cause.generatorRan
         ? "The coverage generator ran; tests failed."

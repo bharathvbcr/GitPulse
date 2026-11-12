@@ -33,7 +33,10 @@ describe("TaskRepositoryPicker", () => {
     // Same reasoning as `gp-select` in app.css: keep the platform widget and
     // replace only its painting. A listbox option also cannot carry a second,
     // independent choice, which is exactly what the primary radio is.
-    expect(source).toContain('type="checkbox"');
+    // The checkbox is the shared `Checkbox`, which draws a native
+    // `<input type="checkbox">` itself; the radio stays a native radio here.
+    expect(source).toContain('<Checkbox ariaLabel={row.name}');
+    expect(source).not.toContain('type="checkbox"');
     expect(source).toContain('type="radio"');
     expect(source).not.toContain('role="listbox"');
     expect(source).not.toContain('role="option"');

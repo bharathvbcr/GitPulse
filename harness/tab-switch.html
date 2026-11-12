@@ -86,7 +86,11 @@
       };
 
       // ---- the fixture backend ------------------------------------------------
+      let spawnedShells = 0;
       const calls = [];
+      // Readable from outside the page, so a screenshot run can say which host
+      // commands a surface asked for.
+      window.__gpCalls = calls;
       // A held answer: `hold(cmd, repoPath)` makes the next such call wait until
       // `release()`. Calls are matched by command and by the repository asked.
       const holds = new Map();
@@ -103,6 +107,23 @@
         ],
         truncated: false, scanned_files: 520, candidate_files: 520,
       });
+      const glanceFacts = { on: false, fetchedAt: 0, agentsOk: true };
+      const glanceStash = [0, 1].map((index) => ({
+        index, selector: `stash@{${index}}`, oid: `abcd${index}`, subject: `WIP ${index}`, message: `WIP ${index}`, branch: "main", timestamp: 1_700_000_000,
+      }));
+      let ledgerStatusOf = null;
+      const glanceSnapshot = (repoPath) => ({
+        repo_path: repoPath, branch: "main", branch_ok: true, deadline_expired: false, duration_ms: 1,
+        worktrees: { ok: true, error: "", count: 1, scanned: 1, dirty: 0, dirty_unknown: 0, blocked: 0, blocked_unknown: 0, truncated: false, items: [] },
+        agents: { ok: glanceFacts.agentsOk, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
+        changes: { ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0, additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false },
+        collisions: {
+          ok: true, error: "", overlapping_files: 2, worktrees_involved: 2, scanned_worktrees: 2, unscanned_worktrees: 0, failed_worktrees: 0,
+          truncated: false, items: [], shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
+        },
+        ledger: ledgerStatusOf({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
+        codeintel: { available: false, db_path: "" },
+      });
       const fixtures = {
         cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
         cmd_list_branches: (a) => DATA[a.repoPath]?.branches ?? [],
@@ -110,12 +131,14 @@
         cmd_get_status: (a) => DATA[a.repoPath]?.statuses ?? [],
         cmd_list_tags: () => ({ tags: [], truncated: false }),
         cmd_repo_operation: () => null,
-        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        // The glance checks turn these on (glanceFacts) for their own block; every
+        // other check sees the empty stash and unrecorded fetch it always did.
+        cmd_stash_list: () => (glanceFacts.on ? { entries: glanceStash, truncated: false } : { entries: [], truncated: false }),
         cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
         cmd_watch_repo: (a) => a.repoPath,
         cmd_unwatch_repo: () => null,
         cmd_set_recent_menu: () => null,
-        cmd_last_fetch_at: () => null,
+        cmd_last_fetch_at: () => (glanceFacts.on ? glanceFacts.fetchedAt : null),
         cmd_note_tab_activated: () => null,
         // Wire shape of `CommitGraphPayload` (src/lib/stores/graphStore.ts). The
         // old `nodes`/`edges` shape made History show a raw "reading 'map'"
@@ -133,6 +156,43 @@
         cmd_get_language_stats: () => langStats(),
         cmd_apple_intelligence_status: () => ({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "Not in this build." }),
         cmd_commit: () => null,
+        // The glance's fetch chip; answered as cmd_commit is.
+        cmd_fetch: () => null,
+        // The wire shape of `AiStatus` (src/lib/stores/harnessStore.ts). Answered
+        // with nothing, the store read `ai.harness` off null and the header badge
+        // showed "Cannot read properties of null (reading 'harness')": a fixture
+        // fault, since the host always answers with this object.
+        cmd_ai_status: () => ({
+          harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
+          endpoints: [], selected: null, model_info: null, model_detail: "", ready: false, detail: "No local model in this fixture.",
+        }),
+        // Settings -> Agents reads these two as objects (`view.settings.*`,
+        // `fresh.settings.*`); answered with nothing the panel crashed with
+        // "reading 'settings'" and took the dialog with it.
+        cmd_lappi_settings: () => ({
+          settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
+          collect_forced_off: false, socket: null, store: null, transport_supported: false,
+        }),
+        cmd_host_load_settings: () => ({ enabled: true, govern_launches: false }),
+        // The store's own defaults in the wire shape, so this answer cannot drift from them.
+        cmd_agent_defaults: async () => {
+          const { DEFAULT_AGENT_DEFAULTS_VIEW: view } = await import("../src/lib/stores/agentDefaultsStore.ts");
+          return {
+            defaults: view.defaults, modes: [...view.modes], launchers: [...view.launchers],
+            model_fields: view.modelFields, effort_levels: [...view.effortLevels], model_listing: {},
+          };
+        },
+        cmd_devmap_integration_survey: () => [],
+        cmd_session_alerts: () => ({
+          settings: { enabled: true, sound: false, shell_bell: false, configure_agents: true, hook_bridge: true, quiet_start: null, quiet_end: null },
+          status: {
+            running: false, delivered: 0, suppressed_disabled: 0, suppressed_not_agent: 0, suppressed_attended: 0, suppressed_quiet: 0,
+            coalesced: 0, resolved: 0, deferred: 0, displaced: 0, rate_limited: 0, dropped_queue: 0, dropped_scan: 0, failed: 0,
+            bridge_rejected: 0, stale: 0, hook_replies_missed: 0, hook_reply_missed_last: null, hook_drop_record_error: null,
+            bridge_listening: false, bridge_path: null, last_error: null,
+          },
+          bridge_supported: false,
+        }),
         cmd_ai_generate_commit_message: (a) => ({
           text: `generated for ${a.repoPath}`, model: "fixture-model", context_source: "staged diff", prompt_tokens: 0, elapsed_ms: 1,
           budget: { planned_by_harness: true }, warnings: [],
@@ -159,27 +219,72 @@
         cmd_github_context: () => ({
           available: false, error: "", runs_error: "", warnings: [], pull_requests: [], workflow_runs: [], issues: [], releases: [],
         }),
+        // The glance's pull request chip opens Work's Remote section, whose
+        // panels ask for these when they mount (shapes from github-panel.html).
+        cmd_github_workflows: () => ({ available: false, cli_present: true, workflows: [], truncated: false, error: null }),
+        cmd_github_runs: () => ({ available: false, checked: false, cli_present: true, owner: "", repo: "", runs: [], truncated: false, error: null, went_red: [] }),
+        cmd_firebase_status: () => ({
+          configured: false, firebaserc_error: null, firebasejson_error: null, cli: { present: false, reason: "not installed" },
+          projects: [], projects_truncated: false, default_alias: null, has_apphosting_config: false,
+        }),
         cmd_grants_view: () => ({ available: false, error: "", grants: [] }),
         cmd_terminal_sessions: () => [],
+        // Opening the dock spawns a shell and reads `.id` off the reply. Answered
+        // with nothing, the dock showed "TypeError: Cannot read properties of null
+        // (reading 'id')": a fixture fault, as the host replies `{ id, cwd, shell }`.
+        cmd_terminal_spawn: async (a) => {
+          const { adoptOutput } = await import("./tauriMocks.ts");
+          const id = `fixture-shell-${++spawnedShells}`;
+          adoptOutput(id, a);
+          return { id, cwd: a.repoPath, shell: "/bin/zsh" };
+        },
         cmd_terminal_backend: () => ({ backend: "in-process", trouble: [] }),
         cmd_ledger_tail: () => [],
         cmd_get_file_content: () => "export {};\n",
+        // The search checks visit Code, whose explorer lists the repository's
+        // files when it mounts (FileTreePanel); its changed files stand in.
+        // Row 2 asks the shared agents sweep for the repository on screen when
+        // it mounts (once); the answer here is none, so the pill says why. The
+        // glance checks answer with a snapshot whose collision scan found overlap.
+        cmd_insights_snapshot: (a) => (glanceFacts.on ? glanceSnapshot(a.repoPath) : null),
+        cmd_list_repo_files: (a) => (DATA[a.repoPath]?.statuses ?? []).map((entry) => entry.path),
+        cmd_workbench_request: (a) => workbenchFixture(a),
       };
+      // The workbench answers with a JSON string, and `page()` in
+      // src/lib/workbench/client.ts rejects anything that is not an
+      // `{ ok: true, items, shown, total, has_more, next_cursor }` page. The
+      // notification bridge reads `notifications.native.pending` when the
+      // window mounts, so answering it with nothing put an "invalid response"
+      // card on screen: an empty page is the real shape of "none pending".
+      const emptyWorkbenchPage = () => JSON.stringify({ ok: true, items: [], shown: 0, total: 0, has_more: false, next_cursor: null });
+      // Every `*.list` the Tasks surface reads is a page in the same shape
+      // (`page()` in src/lib/workbench/client.ts). `repositories.list` and
+      // `workspaces.list` were answered with nothing, so the surface showed
+      // "Couldn't load tasks. Task storage returned an invalid response."
+      const EMPTY_PAGE_METHODS = new Set([
+        "notifications.native.pending", "runs.list", "repositories.list", "workspaces.list", "items.list", "events.list",
+      ]);
+      const workbenchFixture = (a) => (EMPTY_PAGE_METHODS.has(a.method) ? emptyWorkbenchPage() : null);
       // Answered with nothing, on purpose: the window's background services
       // (menus, alerts, tool discovery, the ledger, GitHub alerts) that a tab
       // switch neither starts nor waits for. Listed rather than defaulted so a
       // command this page has not met is still reported as unexpected.
       const QUIET = new Set([
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
-        "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
-        "cmd_workbench_request", "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
-        "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
+        "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_external_tools_status",
+        "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
+        // What an open dock asks after its shell spawns (a screenshot opens it).
+        "cmd_terminal_context", "cmd_terminal_resize", "cmd_session_alerts_visible",
+        "cmd_catch_up","cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
+        // The header checks open the Fleet surface (row 2 inert under it), which
+        // asks for its snapshot; the answer is not what they look at.
+        "cmd_fleet_snapshot",
       ]);
       // The code-graph service is not installed in this fixture, which is what
       // a refused call means to its callers.
       const REFUSED = new Set(["cmd_devmap_preview_many", "cmd_codeintel_impact_layered_many"]);
       const handler = async (cmd, args) => {
-        calls.push({ cmd, repo: args?.repoPath ?? null, at: performance.now() });
+        calls.push({ cmd, repo: args?.repoPath ?? null, method: args?.method ?? null, at: performance.now() });
         const gate = holds.get(`${cmd}|${args?.repoPath}`);
         if (gate) await gate;
         if (cmd.startsWith("plugin:")) return 1;
@@ -195,6 +300,10 @@
       holdForeground();
       const { mockIPCWithEvents } = await import("./tauriMocks.ts");
       mockIPCWithEvents(handler);
+      // getCurrentWindow() reads the window label from the host-provided metadata, which
+      // the IPC mock does not install; without it the shell's native-drag subscription
+      // throws after the menu listeners, so a file drop could never be exercised here.
+      window.__TAURI_INTERNALS__.metadata = { currentWindow: { label: "main" }, currentWebview: { windowLabel: "main", label: "main" } };
 
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");
@@ -280,6 +389,8 @@
         $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
       };
       let diagnostics = "";
+      // What the glance showed at each width, carried into the diagnostics line.
+      let glanceWidths = "";
 
       // A run that hangs is reported, not timed out: the runner hands back only
       // the verdict, so a hang would otherwise say nothing about where.
@@ -335,6 +446,125 @@
           const firstContent = panelContent();
           hardCheck("the view panel has content to compare", () => !!firstContent);
 
+          // `?shot=<words>` is for taking screenshots of the header, not a
+          // check: it puts the real app in the named state and stops, so a
+          // headless browser can capture it. Words: `light`, `fleet`,
+          // `agents`, `tasks`, `fullscreen` (stamps `html[data-fullscreen]`, as
+          // windowState.ts does on macOS). Combine with `?fill` for a viewport-
+          // sized window.
+          const shot = params.get("shot");
+          if (shot !== null) {
+            const words = shot.split(/[\s,+]+/);
+            // The first-run walkthrough and the fixture's task-storage toast
+            // are not part of the header: put both away for the picture.
+            (await import("../src/lib/tools/productTour.ts")).productTour.closeForSession();
+            (await import("../src/lib/stores/toastStore.ts")).toastStore.clear();
+            // The first-run command-palette hint goes through its own dismiss
+            // (the store the × button calls), and the shot waits for its exit.
+            interfaceStore.dismissCoachMark("coach-palette");
+            await sleepUntil(() => !$('[role="tooltip"][aria-label="Command Palette"]'), 3000);
+            if (words.includes("light")) document.documentElement.classList.replace("dark", "light");
+            if (words.includes("fullscreen")) document.documentElement.setAttribute("data-fullscreen", "");
+            // `tabs` opens four more repositories (the fixture answers any path
+            // with an empty repository) so the strip reads as a working window.
+            if (words.includes("tabs")) {
+              for (const name of ["gamma", "delta-service", "epsilon", "zeta-docs"]) await repoStore.openRepo(`/code/tabs/${name}`, { activate: false });
+            }
+            // `shortcuts` opens the shortcuts sheet through the status bar's own button.
+            if (words.includes("shortcuts")) {
+              $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+              await sleepUntil(() => !!$('[role="dialog"]'), 3000);
+            }
+            // `shortcuts-end` scrolls the open sheet to its last row, to see that the
+            // end of the list is not cut off.
+            if (words.includes("shortcuts-end")) {
+              $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+              await sleepUntil(() => !!$('[role="dialog"]'), 3000);
+              await wait(400);
+              const scroller = $$("*", $('[role="dialog"]')).find((el) => el.scrollHeight > el.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(el).overflowY));
+              if (scroller) scroller.scrollTop = scroller.scrollHeight;
+            }
+            // The panels' own modes: `rail` collapses the docked sidebar to its rail,
+            // `floating` opens it as an overlay panel, `dock` opens the terminal dock.
+            if (words.includes("rail")) (await import("../src/lib/sidebar/layoutStore.ts")).layoutStore.toggleCollapsed();
+            if (words.includes("floating")) (await import("../src/lib/ui/panelMode.ts")).panelModes.set("sidebar", "overlay");
+            if (words.includes("dock")) { repoStore.setTerminalOpen(true); await sleepUntil(() => $("[data-terminal-dock]") !== null, 5000); }
+            // `popover-exit` opens the language popover, closes it, and stops its
+            // exit half way, so the picture is of a popover that is leaving.
+            if (words.includes("popover-exit")) {
+              langTrigger()?.click();
+              await sleepUntil(() => !!$("[data-language-panel]"), 3000);
+              await wait(300);
+              const leaving = $("[data-language-panel]");
+              if (leaving) {
+                const asked = [];
+                const animate = leaving.animate.bind(leaving);
+                leaving.animate = (keyframes, options) => { const a = animate(keyframes, options); asked.push(a); return a; };
+                langTrigger()?.click();
+                await sleepUntil(() => asked.some((a) => (a.effect?.getComputedTiming().duration ?? 0) > 0), 3000);
+                const exit = asked.find((a) => (a.effect?.getComputedTiming().duration ?? 0) > 0);
+                if (exit) { exit.pause(); exit.currentTime = (exit.effect.getComputedTiming().duration ?? 0) / 2; }
+                document.documentElement.dataset.gpShotLeaving = exit ? `paused at ${exit.currentTime} of ${exit.effect.getComputedTiming().duration} ms` : "no exit animation found";
+              } else document.documentElement.dataset.gpShotLeaving = "no popover found";
+              $("#result").textContent = `shot ready: ${shot}`;
+              document.documentElement.dataset.gpShot = "ready";
+              return;
+            }
+            // `settings` opens Settings (`settings-layout` on its Layout panel);
+            // `icons` sets Header button labels to Icons only first.
+            if (words.includes("icons")) interfaceStore.setHeaderLabels("icons");
+            if (words.some((w) => w.startsWith("settings"))) {
+              window.dispatchEvent(new CustomEvent("gitpulse:settings"));
+              await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
+              // `settings-<panel>` (layout, views, agents, ...) opens that panel.
+              const panelWord = words.find((w) => w.startsWith("settings-"))?.slice(9);
+              // Look inside the dialog only: the header's own surface tabs are
+              // `[role="tab"]` too (Fleet, Agents, Tasks...) and come first in the
+              // page, so `settings-agents` used to click the Agents *surface* and
+              // leave Settings on its first panel behind it.
+              const dialog = $('[role="dialog"][aria-labelledby="settings-modal-title"]');
+              if (panelWord) $$('[role="tab"]', dialog).find((t) => text(t).toLowerCase() === panelWord)?.click();
+            }
+            for (const surface of ["fleet", "agents", "tasks"]) {
+              if (words.includes(surface)) interfaceStore.setGlobalSurface(surface);
+            }
+            await settle();
+            // Let the list and sheet entrances finish before the picture.
+            await wait(900);
+            // ...then until every finite animation and transition on the page has
+            // finished (an endless pulse never will, so it is not waited for),
+            // bounded so a stuck one cannot hang the capture, and two frames so
+            // the last one is painted.
+            const finite = () => document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity);
+            // A headless page whose clock is virtual (`--virtual-time-budget`) can go
+            // without a frame for the whole wait: a transition that has been created
+            // but not yet started keeps `pending = true` with no start time, and
+            // `playState` says "running" for it forever. Count the frames the wait
+            // really gets, so that case is told apart from an animation that is
+            // simply long.
+            let frames = 0;
+            const onFrame = () => { frames++; requestAnimationFrame(onFrame); };
+            requestAnimationFrame(onFrame);
+            const timelineStart = Number(document.timeline.currentTime ?? 0);
+            const animationsDone = await sleepUntil(() => finite().every((a) => a.playState === "finished" || a.playState === "idle"), 6000);
+            // A 6 s wait on a page that is being drawn sees hundreds of frames; one
+            // that saw fewer than one a second is not being drawn, and its
+            // animations cannot advance however long it waits. Put what is left at
+            // its end state, which is what the picture is of, and say so.
+            let forced = 0;
+            if (!animationsDone && frames < 6) {
+              for (const a of finite()) if (a.playState === "running") { a.finish(); forced++; }
+            }
+            await raf(); await raf();
+            const stillRunning = finite().filter((a) => a.playState === "running");
+            document.documentElement.dataset.gpShotFrames = String(frames);
+            document.documentElement.dataset.gpShotForced = String(forced);
+            document.documentElement.dataset.gpShotAnimations = stillRunning.length === 0 ? "settled" : `pending (timeline moved ${Math.round(Number(document.timeline.currentTime ?? 0) - timelineStart)}ms, ${frames} frames) ${stillRunning.length}:${[...new Set(stillRunning.map((a) => `${a.animationName ?? a.transitionProperty ?? "script"}@${Math.round(Number(a.currentTime ?? 0))}/${Math.round(Number(a.effect?.getComputedTiming().endTime ?? 0))}<${(a.effect?.target?.className?.toString?.() ?? a.effect?.target?.nodeName ?? "").slice(0, 40)}>`))].slice(0, 6).join(",")}`;
+            $("#result").textContent = `shot ready: ${shot}`;
+            document.documentElement.dataset.gpShot = "ready";
+            return;
+          }
+
           // ---- 1. mount counts: the shell survives A -> B -> A -> B -------------
           const applePerSwitch = [];
           const ipcPerSwitch = [];
@@ -363,25 +593,41 @@
           // ---- 2. nothing of the repository being left stays behind -------------
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
-          const scroller = bodyScroller();
+          // A switch settles after a fixed number of ticks, which a loaded host can
+          // beat: the sidebar's controls may not have mounted yet, and a bare
+          // `bodyScroller().scrollTop = 300` then threw "Cannot set properties of
+          // null" outside any check, so the run died with no row naming the step.
+          // `need` waits (bounded) for the element and records the wait as a check,
+          // so a control that never comes is a named failure, not a crash.
+          const need = async (label, find, ms = 15000) => {
+            await sleepUntil(() => !!find(), ms);
+            let found = null;
+            hardCheck(`${label} is on screen`, () => (found = find()));
+            return found;
+          };
+          // The scroller must also be tall enough to scroll: its rows arrive with
+          // the repository's data.
+          const scrollable = () => { const el = bodyScroller(); return !!el && el.scrollHeight - el.clientHeight > 150; };
+          await sleepUntil(scrollable, 15000);
+          const scroller = await need("alpha's sidebar body", bodyScroller);
           scroller.scrollTop = 300;
-          await wait(40);
+          await sleepUntil(() => scroller.scrollTop > 100, 2000);
           hardCheck("alpha's sidebar body can be scrolled", () => scroller.scrollTop > 100);
-          type(fileFilter(), "src/alpha");
-          type(branchFilter(), "feat");
+          type(await need("the file filter", fileFilter), "src/alpha");
+          type(await need("the branch filter", branchFilter), "feat");
           chip("Local")?.click();
-          $('button[aria-label="Create branch"]').click();
+          (await need("the create-branch button", () => $('button[aria-label="Create branch"]'))).click();
           await settle();
-          type(createInput(), "feat/half-typed");
-          worktreeAdd().click();
+          type(await need("the new-branch name input", createInput), "feat/half-typed");
+          (await need("the create-worktree button", worktreeAdd)).click();
           await settle();
-          type(worktreePath(), "/tmp/alpha-new-worktree");
-          includeUnstaged().click();
+          type(await need("the worktree path input", worktreePath), "/tmp/alpha-new-worktree");
+          (await need("the include-unstaged checkbox", includeUnstaged)).click();
           repoStore.commitDraft.set("alpha draft");
-          agentTrigger().click();
+          (await need("the agent commit menu trigger", agentTrigger)).click();
           await settle();
-          type(agentNote(), "note about alpha");
-          langTrigger().click();
+          type(await need("the agent note input", agentNote), "note about alpha");
+          (await need("the language trigger", langTrigger)).click();
           await settle();
           const row = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
           row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
@@ -400,8 +646,11 @@
             text(sidebar()).includes("beta.md") && !text(sidebar()).includes("alpha"));
           check("branches: filter text is cleared", () => branchFilter().value === "");
           check("branches: the Local chip is no longer selected, All is", () =>
-            chip("All").className.includes("bg-accent/15") && !chip("Local").className.includes("bg-accent/15"));
+            chip("All").getAttribute("aria-pressed") === "true" && chip("Local").getAttribute("aria-pressed") === "false");
           check("branches: the half-typed new branch and its form are gone", () => !createInput());
+          // Menus and panels leave with a 70 ms exit (popoverExit), so alpha's three are
+          // gone a moment after the switch closes them, not in the same frame.
+          await sleepUntil(() => !contextMenu() && !agentPanel() && !langPanel(), 3000);
           check("branches: the context menu opened on alpha's branch is gone", () => !contextMenu());
           check("branches: lists beta's branches and none of alpha's", () =>
             text(branchList()).includes("beta-only") && !text(branchList()).includes("alpha-only"));
@@ -449,6 +698,8 @@
           await settle();
           $$('[role="menuitem"]').find((el) => text(el).includes("Merge into current"))?.click();
           await settle();
+          // The merge dialog is its own chunk: wait on the dialog itself, bounded.
+          await sleepUntil(() => !!$("#merge-branch-title"));
           check("branches (alpha): the merge dialog is open", () => !!$("#merge-branch-title"));
           await switchTo(BETA);
           check("branches: the merge dialog aimed at alpha says the repository changed and cannot merge", () => {
@@ -457,10 +708,99 @@
             return !!$("#merge-branch-title") && text(document.body).includes("The repository changed") && merge?.disabled === true && !!box;
           });
           $('button[aria-label="Close merge dialog"]')?.click();
-          await settle();
+          await sleepUntil(() => !$("#merge-branch-title"));
           check("…and closes from its own button", () => !$("#merge-branch-title"));
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
+          // The view-tab guide tooltip draws its schematic from a lazily loaded chunk.
+          const guideTab = $("[data-tip-guide]");
+          guideTab?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          const GUIDE_ART = '[role="tooltip"] [data-view-guide-art]';
+          await sleepUntil(() => !!$(GUIDE_ART), 5000);
+          check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$(GUIDE_ART) && $$(`${GUIDE_ART} *`).length > 3);
+          guideTab?.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
+
+          // The shortcuts sheet exists to say what each chord does, so a
+          // description that is clipped (one line, ellipsis) defeats it. At the
+          // regression viewport every description must be drawn in full: its
+          // box is not scrolled, and its text lies inside its own box.
+          $$("button").find((b) => /\bShortcuts$/.test(text(b)))?.click();
+          await sleepUntil(() => $$("[data-shortcut-description]").length > 20, 3000);
+          const descriptions = $$("[data-shortcut-description]");
+          const clippedDescriptions = descriptions.filter((el) => {
+            const box = el.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const drawn = range.getBoundingClientRect();
+            return el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight + 1
+              || drawn.right > box.right + 0.5 || drawn.bottom > box.bottom + 0.5;
+          }).map((el) => text(el).slice(0, 48));
+          check(`the shortcuts sheet draws every description in full at ${window.innerWidth}px${clippedDescriptions.length ? ` (clipped: ${clippedDescriptions.join(" | ")})` : ""}`, () =>
+            window.innerWidth >= 1280 && descriptions.length > 20 && clippedDescriptions.length === 0);
+          // A dialog body is a scroller with a hard clip. Scrolled to its end, the
+          // last row has to be whole, and while more is hidden below, the body
+          // fades its own edge (data-gp-fade) instead of slicing a row in half.
+          const scrollEnd = async (dialog) => {
+            const body = dialog && $("[data-dialog-body]", dialog);
+            if (!body) return { found: false };
+            body.scrollTop = 0; await settle();
+            const fadeAtTop = body.dataset.gpFade ?? "";
+            body.scrollTop = body.scrollHeight; await settle(); await wait(120);
+            const box = body.getBoundingClientRect();
+            const rows = [...body.querySelectorAll("*")].filter((el) => el.getClientRects().length && el.children.length === 0 && !el.closest("[hidden]"));
+            const last = rows.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
+            const lastBox = last?.getBoundingClientRect();
+            return {
+              found: true, overflows: body.scrollHeight > body.clientHeight + 1, fadeAtTop, fadeAtEnd: body.dataset.gpFade ?? "",
+              atEnd: Math.abs(body.scrollTop + body.clientHeight - body.scrollHeight) <= 1,
+              lastInside: !!lastBox && lastBox.bottom <= box.bottom + 0.5 && lastBox.top >= box.top - 0.5,
+              last: text(last).slice(0, 40),
+            };
+          };
+          const shortcutsEnd = await scrollEnd($('[role="dialog"][aria-label="Keyboard Shortcuts"]'));
+          check(`the shortcuts sheet scrolls to a whole last row, and fades the edge that still hides rows (${JSON.stringify(shortcutsEnd)})`, () =>
+            shortcutsEnd.found && shortcutsEnd.overflows && shortcutsEnd.atEnd && shortcutsEnd.lastInside
+            && shortcutsEnd.fadeAtTop === "y-end" && !shortcutsEnd.fadeAtEnd.includes("end"));
+          $$("button").find((b) => text(b) === "Done")?.click();
+          await sleepUntil(() => !$('[role="dialog"]'), 3000);
+
+          // Settings is a lazy chunk with its own scroller. Its panels differ in
+          // length, so the check runs on the longest one it can reach here.
+          window.dispatchEvent(new CustomEvent("gitpulse:settings"));
+          await sleepUntil(() => !!$('[role="dialog"][aria-labelledby="settings-modal-title"]'), 8000);
+          await wait(300);
+          const settingsEnds = [];
+          for (const tab of ["Appearance", "Layout", "Commit graph"]) {
+            $$('[role="tab"]').find((t) => text(t) === tab)?.click();
+            await settle();
+            settingsEnds.push({ tab, ...(await scrollEnd($('[role="dialog"][aria-labelledby="settings-modal-title"]'))) });
+          }
+          check(`Settings scrolls each panel to a whole last control, with no mask once nothing is hidden below (${JSON.stringify(settingsEnds)})`, () =>
+            settingsEnds.every((end) => end.found && (!end.overflows || (end.atEnd && end.lastInside && !end.fadeAtEnd.includes("end"))))
+            && settingsEnds.some((end) => end.overflows && end.fadeAtTop === "y-end"));
+
+          // Header button labels: Icons only holds the narrow rendering at every
+          // width. This window is wider than the 1100 px tier, so Automatic shows
+          // the Open label and Icons only hides it, along with every other label
+          // the header tiers.
+          const headerLabels = () => $$('.gp-repo-tabs [class*="@min-[1100px]:inline"]').filter((el) => text(el));
+          const shown = (els) => els.filter((el) => getComputedStyle(el).display !== "none").length;
+          const openLabel = () => $('[data-testid="open-repo-tab"] span');
+          check("header labels: Automatic shows the Open label at this width", () => window.innerWidth >= 1280 && text(openLabel()) === "Open" && getComputedStyle(openLabel()).display !== "none" && shown(headerLabels()) > 0);
+          const settingsTab = () => $$('[role="tab"]').find((t) => text(t) === "Layout");
+          settingsTab()?.click(); await settle();
+          $('[data-setting="header-labels"] button[title^="Keep header buttons"]')?.click();
+          await settle();
+          check("header labels: Icons only hides every header label and stamps the document", () =>
+            document.documentElement.getAttribute("data-header-labels") === "icons" && getComputedStyle(openLabel()).display === "none" && headerLabels().length > 0 && shown(headerLabels()) === 0);
+          check("header labels: the buttons keep their accessible names without the words", () => $('[data-testid="open-repo-tab"]')?.getAttribute("aria-label") === "Open repository");
+          $('[data-setting="header-labels"] button[title^="Show words"]')?.click();
+          await settle();
+          check("header labels: Automatic gives the words back", () =>
+            !document.documentElement.hasAttribute("data-header-labels") && getComputedStyle(openLabel()).display !== "none" && shown(headerLabels()) > 0);
+          $$("button").find((b) => text(b) === "Done")?.click();
+          await sleepUntil(() => !$('[role="dialog"]'), 3000);
 
           // ---- 4. an answer in flight for the repository left does not land -----
           const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
@@ -515,7 +855,7 @@
             check("switcher: the open panel names a section tab that exists", () =>
               !!panel && !!document.getElementById(panel.getAttribute("aria-labelledby")));
             check("switcher: a view with per-view content keeps its row, labelled", () =>
-              !!$('[role="group"][aria-label="Commit filter"]'));
+              !!$('[role="group"][aria-label="Graph list"]'));
             const heights = $$("[data-view-group]").map((g) => g.getBoundingClientRect().height);
             check("switcher: the expanded group is as tall as the collapsed ones", () =>
               heights.length >= 4 && Math.max(...heights) - Math.min(...heights) < 1);
@@ -537,11 +877,17 @@
             check("switcher: the flyout marks the section the view would reopen on", () =>
               fly?.querySelector('[data-remembered="true"]')?.dataset.section === "overview");
             group("work").dispatchEvent(new PointerEvent("pointerleave", { pointerType: "mouse" }));
-            await sleepUntil(() => !flyout(), 1000);
+            // The flyout closes on a timer (220 ms grace). A window the OS does not
+            // show as key can clamp timers to about a second, so the bound is the
+            // time to fail, not the grace: the condition is still "closed", and a
+            // flyout that never closes still fails after the bound.
+            await sleepUntil(() => !flyout(), 5000);
             check("switcher: leaving the pill closes the flyout after its grace", () => !flyout());
             group("code").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "touch" }));
-            await wait(300);
-            check("switcher: a touch has no hover, so it opens no flyout", () => !flyout());
+            // Watch the whole 300 ms for a flyout to appear, not only the last
+            // instant, so one that opens and is gone again would still be caught.
+            const touchOpened = await sleepUntil(() => !!flyout(), 300);
+            check("switcher: a touch has no hover, so it opens no flyout", () => !touchOpened && !flyout());
             group("history").dispatchEvent(new PointerEvent("pointerenter", { pointerType: "mouse" }));
             await wait(300);
             check("switcher: the active view opens no flyout; its sections are already out", () => !flyout());
@@ -557,8 +903,495 @@
             check("switcher: ArrowUp from a section returns to its view", () => document.activeElement === viewButton("history"));
           }
 
+          // ---- the two header rows (HEADER_SPEC sections 2, 3, 4, 7) ----------
+          // Row 1 (header) is the title bar: surfaces and repositories in one
+          // Workspace tablist. Row 2 (nav "Views") is the view bar. They never
+          // merge, the Terminal pill lives in row 2, and a global surface
+          // leaves row 2 mounted at the same height with its controls inert.
+          {
+            const row1 = $("header");
+            const row2 = $('nav[aria-label="Views"]');
+            const workspace = $$('[role="tablist"][aria-label="Workspace"]');
+            check("header: exactly one Workspace tablist, in row 1, holding the surfaces and the repository tabs", () =>
+              workspace.length === 1 && row1.contains(workspace[0]) && !row2.contains(workspace[0]) &&
+              $$('[data-surface-tab]', workspace[0]).length === 3 && $$('[role="tab"][data-tab-id]', workspace[0]).length >= 2);
+            check("header: the Views landmark holds the switcher, the Terminal pill and Refresh, and row 1 holds none of them", () =>
+              !!row2 && row2.contains($("[data-view-group]")) && !!$('[data-testid="terminal-pill"]', row2) &&
+              !!$('[data-testid="viewbar-refresh"]', row2) && !$("[data-view-group]", row1) && !$('[data-testid="terminal-pill"]', row1));
+            check("header: the Terminal pill left the status bar", () => !$('[data-testid="terminal-pill"]', statusBar()));
+            check("header: the rows never merge, row 1 above row 2", () =>
+              row1.getBoundingClientRect().bottom <= row2.getBoundingClientRect().top + 0.5 &&
+              row1.getBoundingClientRect().height >= 40 && row2.getBoundingClientRect().height >= 32);
+            check("header: nothing changes shape at 1280, the label tier: Open is a pill and the section labels show", () =>
+              /^Open$/.test(text($('[data-testid="open-repo-tab"]'))) &&
+              $$('[data-section-label]', row2).every((el) => getComputedStyle(el).display !== "none"));
+            const row2Box = row2.getBoundingClientRect();
+            const controls = () => $("[data-viewbar-controls]", row2);
+            check("header: on the repository surface row 2's controls are live", () => !controls().inert);
+            const insightsReads = calls.filter((call) => call.cmd === "cmd_insights_snapshot");
+            const agentsPill = $('[data-testid="viewbar-agents"]', row2);
+            // A repository no read covered asks the shared sweep once, and a sweep
+            // reads every open repository, so a repository opened after the first
+            // read costs one more sweep (alpha twice here), never a poll.
+            check("header: mounting row 2 asked the shared agents sweep for the repository, a bounded number of times, and an unreadable answer is named, not a bare question mark", () =>
+              insightsReads.some((call) => call.repo === ALPHA) && insightsReads.length <= 4 &&
+              !!agentsPill && agentsPill.dataset.agentsState === "unknown" &&
+              /The agents read (failed|has not covered)/.test(agentsPill.getAttribute("title") ?? ""));
+            interfaceStore.setGlobalSurface("fleet");
+            await settle();
+            // The controls fade out over the 70ms exit before they are hidden.
+            for (let i = 0; i < 40 && getComputedStyle(controls()).visibility !== "hidden"; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+            const underBox = row2.getBoundingClientRect();
+            check("header: under Fleet row 2 stays mounted at the same height, its controls inert and hidden, the surface named", () =>
+              row2.isConnected && Math.abs(underBox.height - row2Box.height) < 0.5 && Math.abs(underBox.top - row2Box.top) < 0.5 &&
+              controls().inert === true && getComputedStyle(controls()).visibility === "hidden" &&
+              text($('[data-viewbar-surface="fleet"]', row2)) === "Fleet");
+            check("header: the Workspace tablist has one selected tab, Fleet, and Fleet is the one roving stop", () => {
+              const tabs = $$('[role="tab"]', workspace[0]);
+              return tabs.filter((el) => el.getAttribute("aria-selected") === "true").map((el) => el.dataset.surfaceTab).join() === "fleet" &&
+                tabs.filter((el) => el.tabIndex === 0).length === 1 && $('[data-surface-tab="fleet"]').tabIndex === 0;
+            });
+            interfaceStore.setGlobalSurface("repository");
+            await settle();
+            // The surface name fades out (70ms) rather than vanishing.
+            for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+            check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
+              !controls().inert && !$("[data-viewbar-surface]", row2));
+            // Rows 1 and 2 are one band of glass. Each used to draw its own edges, so
+            // where they met row 1's bottom shade and drop shadow sat on row 2's top
+            // sheen: a line across the window. The page stamps html.macos, where the
+            // glass is drawn, so this cannot pass by not applying.
+            check("header: rows 1 and 2 join with no seam: row 1 keeps only its top sheen, row 2 has no top sheen, neither a diagonal gradient", () => {
+              const layers = (el) => getComputedStyle(el).boxShadow.split(/,(?![^(]*\))/).map((s) => s.trim());
+              const top = layers(row1), below = layers(row2);
+              return document.documentElement.classList.contains("macos") &&
+                top.length === 1 && /0px 1px 0px 0px inset/.test(top[0]) &&
+                !below.some((s) => /0px 1px 0px 0px inset/.test(s)) && below.some((s) => /0px -1px 0px 0px inset/.test(s)) &&
+                getComputedStyle(row1).backgroundImage === "none" && getComputedStyle(row2).backgroundImage === "none";
+            });
+            // Row 2's search is one field for every page (search/pageSearch.svelte.ts):
+            // History's graph filters commits through it, its Diff section finds in
+            // the diff, and a page with nothing of its own searches the repository
+            // through the palette, whose results drop down under the field.
+            const { reportViewBarWidth, FOLD_MIN_WIDTH } = await import("../src/lib/ui/headerSlots.ts");
+            const { filterStore } = await import("../src/lib/stores/filterStore.ts");
+            const viewBefore = get(repoStore).activeTab;
+            const field = () => $("[data-page-search]", row2);
+            const fieldInput = () => $("#gitpulse-page-search", row2);
+            const typeInField = async (value) => {
+              fieldInput().value = value;
+              fieldInput().dispatchEvent(new Event("input", { bubbles: true }));
+              await settle();
+            };
+            const keyInField = async (key) => {
+              fieldInput().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+              await settle();
+            };
+            check("search: row 2 holds one search field and it fits: no overflow at this width, the field at least 160px", () => {
+              const width = field()?.getBoundingClientRect().width ?? -1;
+              if ($$("[data-page-search]").length === 1 && width >= 160 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`fields ${$$("[data-page-search]").length}, field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
+            });
+            // The field's 160px floor has to come out of free width, not out of the
+            // view switcher: at the default 1280px window and at 1400px, every view's
+            // switcher shows in full beside it (the switcher scrolls rather than
+            // overflowing the row, so the row's own width cannot show a squeeze).
+            {
+              const switcherScroller = $("[data-viewbar-controls] .gp-header-scroll", row2);
+              const squeezed = [];
+              const measured = [];
+              for (const width of [1400, 1280]) {
+                row2.style.maxWidth = width + "px";
+                // Insights is left out: its reports have no fixtures on this page.
+                for (const view of ["work", "code", "history"]) {
+                  repoStore.setActiveTab(view);
+                  await settle();
+                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}`;
+                  measured.push(row);
+                  if (switcherScroller.scrollWidth > switcherScroller.clientWidth + 1) squeezed.push(row);
+                }
+              }
+              row2.style.maxWidth = "";
+              repoStore.setActiveTab(viewBefore);
+              await settle();
+              check("search: at 1400 and 1280px every view's switcher shows in full beside the field, with the Agents pill and the uncommitted chip in the row", () => {
+                const chips = !!$('[data-testid="viewbar-agents"]', row2) && !!$('[data-testid="viewbar-uncommitted"]', row2);
+                if (!squeezed.length && chips) return true;
+                throw new Error(`agents+uncommitted present ${chips}; squeezed: ${squeezed.join("; ") || "none"}; all: ${measured.join("; ")}`);
+              });
+            }
+            // 900px is the window's minimum (tauri.conf.json). Row 2 spans the window,
+            // so a 900px row is the narrowest it gets: the switcher scrolls, the field
+            // keeps its floor, and nothing spills out of the row.
+            row2.style.maxWidth = "900px";
+            await settle();
+            check("search: at the 900px minimum window row 2 still fits, the field keeps its 96px floor and the switcher scrolls instead", () => {
+              const width = field()?.getBoundingClientRect().width ?? -1;
+              if (width >= 95.5 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`field ${width}px, row 2 ${row2.clientWidth}px / ${row2.scrollWidth}px content`);
+            });
+            row2.style.maxWidth = "";
+            await settle();
+            repoStore.setActiveTab("history", "graph");
+            await sleepUntil(() => field()?.dataset.pageSearch === "filter", 5000);
+            check("search: on History's graph the field is the commit filter", () =>
+              field()?.dataset.pageSearch === "filter" && /^Filter commits/.test(fieldInput().placeholder));
+            // From 1600px the view's own row folds into row 2's slot: History's list
+            // segment lands there, before the field. The shell is sized by the
+            // viewport, so the page sends the fold signal the bar's ResizeObserver sends.
+            reportViewBarWidth(FOLD_MIN_WIDTH);
+            await sleepUntil(() => !!$('[data-viewbar-context] [aria-label="Graph list"]', row2), 5000);
+            await settle();
+            check("search: folded, History's list segment sits in row 2's slot, before the one field", () => {
+              const segment = $('[data-viewbar-context] [aria-label="Graph list"]', row2);
+              return !!segment && $$("[data-page-search]").length === 1 &&
+                segment.getBoundingClientRect().right <= field().getBoundingClientRect().left + 0.5;
+            });
+            // With the switcher hidden the row has free width; the claim is where it
+            // goes: to the field, with the drag zone at its floor share.
+            const dragZone = $("[data-viewbar-controls] > [data-tauri-drag-region]:not([data-viewbar-context])", row2);
+            const switcher = $("[data-viewbar-controls] > .relative", row2);
+            switcher.style.display = "none";
+            await settle();
+            check("search: with free width the field takes it (over 400px, more than twice the drag zone) and the zone keeps its 48px floor", () => {
+              const searchWidth = field()?.getBoundingClientRect().width ?? -1;
+              const zoneWidth = dragZone?.getBoundingClientRect().width ?? -1;
+              if (searchWidth > 400 && searchWidth > 2 * zoneWidth && zoneWidth >= 48 && row2.scrollWidth <= row2.clientWidth + 1) return true;
+              throw new Error(`search ${searchWidth}px, drag zone ${zoneWidth}px, row 2 ${row2.clientWidth}px wide / ${row2.scrollWidth}px content`);
+            });
+            switcher.style.display = "";
+            reportViewBarWidth(row2.getBoundingClientRect().width);
+            await settle();
+            // Typing must not paint it: no accent edge or ring on the pill, and no
+            // global focus ring on the input inside it.
+            const pillEdge = getComputedStyle(field()).borderTopColor;
+            fieldInput().focus();
+            // A palette prefix is ordinary text where the page has a search: `#123`
+            // filters commits for an issue reference instead of opening the palette.
+            await typeInField("#123");
+            check("search: on the graph a query starting with a palette prefix is the commit filter, literally", () =>
+              field().dataset.pageSearch === "filter" && get(filterStore).searchQuery === "#123" && !$("[data-page-palette]"));
+            await typeInField("fix");
+            check("search: typing in it draws no ring or accent edge on the input or its pill", () => {
+              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
+              const shadows = [getComputedStyle(fieldInput()).boxShadow, getComputedStyle(field()).boxShadow];
+              const edge = getComputedStyle(field()).borderTopColor;
+              if (document.activeElement === fieldInput() && shadows.every(noShadow) && edge === pillEdge) return true;
+              throw new Error(`focused ${document.activeElement === fieldInput()}, shadows ${JSON.stringify(shadows)}, edge ${pillEdge} -> ${edge}`);
+            });
+            check("search: what is typed on the graph is the commit filter", () => get(filterStore).searchQuery === "fix");
+            fieldInput().blur();
+            await settle();
+            check("search: the filter stays applied, and shown, after the field loses focus", () =>
+              fieldInput().value === "fix" && get(filterStore).searchQuery === "fix");
+            repoStore.setActiveTab("history", "diff");
+            await sleepUntil(() => field()?.dataset.pageSearch === "find", 5000);
+            check("search: on History's Diff section the field is the diff's find, empty, with the applied commit filter shown in it", () =>
+              field()?.dataset.pageSearch === "find" && fieldInput().value === "" && /Commits: “fix”/.test(text(field())));
+            [...field().querySelectorAll("button")].find((el) => /Commits:/.test(text(el)))?.click();
+            await settle();
+            check("search: that chip clears the commit filter from the Diff section", () =>
+              get(filterStore).searchQuery === "" && !/Commits:/.test(text(field())));
+            // Work has no search of its own (its conflict count is not a list to filter).
+            repoStore.setActiveTab("work");
+            await sleepUntil(() => field()?.dataset.pageSearch === "palette", 5000);
+            check("search: on a page with nothing of its own the field searches the repository", () =>
+              /^Search this repository/.test(fieldInput().placeholder));
+            fieldInput().focus();
+            await typeInField(">");
+            await sleepUntil(() => $$('#page-palette-listbox [role="option"]').length > 0, 10000);
+            check("search: typed with a palette prefix, the palette's results drop down under the field as the listbox it controls", () => {
+              const card = $("[data-page-palette]");
+              const options = $$('#page-palette-listbox [role="option"]');
+              const fieldBox = field().getBoundingClientRect();
+              const cardBox = card?.getBoundingClientRect();
+              if (card && options.length > 0 && fieldInput().getAttribute("aria-expanded") === "true" &&
+                fieldInput().getAttribute("aria-controls") === "page-palette-listbox" &&
+                cardBox.top >= fieldBox.bottom - 1 && !$('[role="dialog"] #command-palette-listbox')) return true;
+              throw new Error(`card ${!!card}, options ${options.length}, expanded ${fieldInput().getAttribute("aria-expanded")}, card top ${cardBox?.top} under field bottom ${fieldBox.bottom}`);
+            });
+            await keyInField("ArrowDown");
+            check("search: the arrow keys move the highlighted result, announced through the field", () => {
+              const id = fieldInput().getAttribute("aria-activedescendant");
+              return !!id && document.getElementById(id)?.getAttribute("role") === "option" && document.activeElement === fieldInput();
+            });
+            await keyInField("Escape");
+            await sleepUntil(() => !$("[data-page-palette]"), 3000);
+            check("search: Escape closes the results, empties the field and leaves it", () =>
+              !$("[data-page-palette]") && fieldInput().value === "" && document.activeElement !== fieldInput());
+
+            // ---- the glance: four facts from reads already made -------------------
+            // A stash, a fetch over a day old, a pull request a panel read for this
+            // branch, and a collision scan that found overlap, all turned on here
+            // and off again at the end, so no other check sees them.
+            {
+              ledgerStatusOf = (await import("../src/lib/ledger/types.ts")).ledgerStatus;
+              const { notePullRequests } = await import("../src/lib/github/pullRequestReads.ts");
+              const { agentPlaneStore, sweepTargets } = await import("../src/lib/agents/store.ts");
+              const glancePath = get(repoStore).currentPath;
+              const glanceBranch = get(repoStore).currentBranch;
+              const glanceContext = (prs) => ({
+                available: true, owner: "o", repo: "r", workflow_runs: [], releases: [], cli_present: true, host: "github.com",
+                html_url: "", pull_requests: prs, issues: [], issues_truncated: false,
+              });
+              glanceFacts.on = true;
+              // 26.5h: clear of the hour boundary the minute clock could round across.
+              glanceFacts.fetchedAt = Date.now() - 26.5 * 3_600_000;
+              notePullRequests(glancePath, glanceContext([{
+                number: 31, title: "Cache the graph", state: "OPEN", head_ref: glanceBranch, base_ref: "main", url: "https://example.test/pr/31",
+                is_draft: false, ci_status: "failure", created_at: "", updated_at: "", review_decision: "", first_review_at: "",
+              }]));
+              await repoStore.refresh();
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+              await sleepUntil(() => $$("[data-glance]", row2).length === 4, 5000);
+              await settle();
+              const glanceChip = (name) => $(`[data-glance="${name}"]`, row2);
+              check("glance: the overlap, the branch's pull request, the last fetch and the stash sit in row 2 in that order, after the drag zone and before the Terminal pill", () => {
+                const order = $$("[data-glance], [data-testid='terminal-pill']", row2).map((el) => el.dataset.glance ?? "terminal");
+                const spacer = $("[data-viewbar-controls] > [data-tauri-drag-region]:not([data-viewbar-context]):not([data-glance-strip])", row2);
+                const first = glanceChip("overlap");
+                if (order.join(",") === "overlap,pull-request,fetch,stash,terminal" && !!spacer && !!first &&
+                  (spacer.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING)) return true;
+                throw new Error(`order ${order.join(",")}, glance path ${glancePath}, branch ${glanceBranch}`);
+              });
+              check("glance: each chip says its fact, in its tone (overlap warns, failing checks are danger, a day-old fetch warns)", () => {
+                const facts = {
+                  overlap: [text(glanceChip("overlap")), glanceChip("overlap")?.dataset.tone, glanceChip("overlap")?.getAttribute("aria-label")],
+                  pr: [text(glanceChip("pull-request")), glanceChip("pull-request")?.dataset.tone, glanceChip("pull-request")?.getAttribute("aria-label")],
+                  stash: [text(glanceChip("stash")), glanceChip("stash")?.getAttribute("title")],
+                  fetch: [text(glanceChip("fetch")), glanceChip("fetch")?.dataset.tone, glanceChip("fetch")?.getAttribute("aria-label")],
+                };
+                if (/^2/.test(facts.overlap[0]) && facts.overlap[1] === "warn" && /2 files changed in more than one worktree/.test(facts.overlap[2]) &&
+                  facts.pr[0] === "#31" && facts.pr[1] === "danger" && /checks failing/.test(facts.pr[2]) &&
+                  /^2/.test(facts.stash[0]) && facts.stash[1] === "2 stash entries" &&
+                  facts.fetch[0] === "26h" && facts.fetch[1] === "warn" && facts.fetch[2] === "Last fetched 1d ago. Fetch now") return true;
+                throw new Error(JSON.stringify(facts));
+              });
+              // The chips come out of free width, never out of the switcher: at
+              // 1400 and 1280px every view's switcher still shows in full. A chip
+              // that does not fit is hidden whole and inert, the last first, so
+              // what shows is always a prefix of the priority order.
+              const GLANCE_ORDER = ["overlap", "pull-request", "fetch", "stash"];
+              const glanceShown = () => {
+                const strip = $("[data-glance-strip]", row2);
+                const box = strip.getBoundingClientRect();
+                const shown = [];
+                const torn = [];
+                for (const chip of $$("[data-glance]", strip)) {
+                  const at = chip.getBoundingClientRect();
+                  const hidden = chip.hasAttribute("data-glance-hidden");
+                  const inside = at.top >= box.top - 0.5 && at.bottom <= box.bottom + 0.5 && at.left >= box.left - 0.5 && at.right <= box.right + 0.5;
+                  if (hidden ? !(chip.inert && getComputedStyle(chip).visibility === "hidden") : !inside) torn.push(chip.dataset.glance);
+                  if (!hidden) shown.push(chip.dataset.glance);
+                }
+                return { shown, torn };
+              };
+              const glanceScroller = $("[data-viewbar-controls] .gp-header-scroll", row2);
+              const glanceSqueezed = [];
+              const glanceMeasured = [];
+              // Measured twice: with no Agents pill (the sweep read no agents) and
+              // with it up (the agents facet could not be read, so the pill says
+              // so), since the pill shares the row and a repository with agents
+              // has it.
+              for (const agentsOk of [true, false]) {
+                glanceFacts.agentsOk = agentsOk;
+                await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+                await settle();
+                for (const width of [1400, 1280]) {
+                  row2.style.maxWidth = width + "px";
+                  for (const view of ["work", "code", "history"]) {
+                    repoStore.setActiveTab(view);
+                    await settle();
+                    const pill = !!$('[data-testid="viewbar-agents"]', row2);
+                    const { shown, torn } = glanceShown();
+                    const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
+                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
+                    glanceMeasured.push(row);
+                    // With no pill, Code and History leave room for every chip at 1400px.
+                    const roomy = agentsOk && width === 1400 && view !== "work";
+                    if (glanceScroller.scrollWidth > glanceScroller.clientWidth + 1 || row2.scrollWidth > row2.clientWidth + 1 ||
+                      torn.length || !prefix || (roomy && shown.length !== 4) || pill === agentsOk) glanceSqueezed.push(row);
+                  }
+                }
+              }
+              glanceFacts.agentsOk = true;
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+              row2.style.maxWidth = "";
+              await settle();
+              check("glance: with four chips to show, with and without the Agents pill, at 1400 and 1280px every view's switcher shows in full, row 2 does not overflow, and a chip that does not fit is hidden whole, inert, the last first", () => {
+                if (!glanceSqueezed.length) return true;
+                throw new Error(`squeezed: ${glanceSqueezed.join("; ")}; all: ${glanceMeasured.join("; ")}`);
+              });
+              glanceWidths = glanceMeasured.join("; ");
+              // Each chip's click, in the live row. The page is put back after:
+              // Work's section and the Agents scope these clicks change are read by
+              // the checks below.
+              const workSectionBefore = get(repoStore).viewSections.work;
+              const { agentsRepositoryScope, setAgentsRepositoryScope } = await import("../src/lib/agents/scope.ts");
+              const agentsScopeBefore = get(agentsRepositoryScope);
+              repoStore.setActiveTab("history", "graph");
+              await settle();
+              glanceChip("pull-request")?.click();
+              await settle();
+              check("glance: the pull request chip opens Work's Remote section", () =>
+                get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "remote");
+              repoStore.setActiveTab("history", "graph");
+              await settle();
+              glanceChip("overlap")?.click();
+              await settle();
+              check("glance: the overlap chip opens Agents, narrowed to this repository", () =>
+                get(interfaceStore).globalSurface === "agents" && get(agentsRepositoryScope) === glancePath);
+              interfaceStore.setGlobalSurface("repository");
+              await settle();
+              const fetchesBefore = calls.filter((call) => call.cmd === "cmd_fetch").length;
+              glanceChip("fetch")?.click();
+              await sleepUntil(() => calls.filter((call) => call.cmd === "cmd_fetch").length > fetchesBefore, 3000);
+              await settle();
+              check("glance: the fetch chip fetches this repository", () =>
+                calls.filter((call) => call.cmd === "cmd_fetch").slice(fetchesBefore).some((call) => call.repo === glancePath));
+              setAgentsRepositoryScope(agentsScopeBefore);
+              if (workSectionBefore) repoStore.setActiveTab("work", workSectionBefore);
+              await settle();
+              // Off again: the stash and fetch go with their facts, the overlap with
+              // the scan, and a later read with no pull request for the branch takes
+              // that chip away.
+              glanceFacts.on = false;
+              notePullRequests(glancePath, glanceContext([]));
+              await repoStore.refresh();
+              await agentPlaneStore.refresh(sweepTargets(get(repoStore).openTabs));
+              await sleepUntil(() => $$("[data-glance]", row2).length === 0, 5000);
+              check("glance: with nothing to say, no chip is drawn (never a zero)", () => $$("[data-glance]", row2).length === 0);
+            }
+
+            // ---- a text field's focus: an edge, not a halo ------------------------
+            // Owner, 2026-11-11: "make the focus ring less annoying". A focused
+            // field (the sidebar's file filter, a gp-field) and a field-shaped box
+            // around one (the branch filter) lean their edge toward the accent and
+            // draw no ring; a button reached by keyboard keeps its ring.
+            {
+              const probe = document.createElement("span");
+              probe.style.cssText = "position:absolute;border:1px solid var(--field-focus-edge)";
+              document.body.append(probe);
+              const focusEdge = getComputedStyle(probe).borderTopColor;
+              probe.remove();
+              const noShadow = (s) => s === "none" || /^(rgba\(0, 0, 0, 0\) 0px 0px 0px 0px(, )?)+$/.test(s);
+              const seen = [];
+              for (const [name, input, box] of [
+                ["file filter", fileFilter(), fileFilter()],
+                ["branch filter", branchFilter(), branchFilter()?.closest(".gp-field")],
+              ]) {
+                input?.focus();
+                // The edge eases in (the field's border-color transition).
+                await sleepUntil(() => !!box && getComputedStyle(box).borderTopColor === focusEdge, 1000);
+                const style = box ? getComputedStyle(box) : null;
+                seen.push({ name, focused: document.activeElement === input, edge: style?.borderTopColor, shadow: style?.boxShadow });
+                input?.blur();
+              }
+              check("focus: a focused text field leans its edge toward the accent (--field-focus-edge) and draws no halo", () => {
+                if (focusEdge && !/rgba?\(0, 0, 0, 0\)/.test(focusEdge) &&
+                  seen.every((s) => s.focused && s.edge === focusEdge && noShadow(s.shadow ?? ""))) return true;
+                throw new Error(`focus edge ${focusEdge}; ${JSON.stringify(seen)}`);
+              });
+            }
+            repoStore.setActiveTab(viewBefore);
+            await settle();
+            // The Tasks surface, mounted in the real App on this page's fixture. A
+            // list the fixture answered in the wrong shape made it say "Couldn't
+            // load tasks. Task storage returned an invalid response." in every
+            // shot=tasks picture, so the surface is checked here, not only looked at.
+            interfaceStore.setGlobalSurface("tasks");
+            await sleepUntil(() => /Workspaces/.test(text(document.body)) || /Couldn't load tasks/.test(text(document.body)), 15000);
+            await settle();
+            check("tasks: the surface renders its board with no load-error card", () => {
+              const body = text(document.body);
+              if (/Workspaces/.test(body) && !/Couldn't load tasks|invalid response/.test(body)) return true;
+              const card = body.match(/Couldn't load tasks[^.]*\.[^.]*\./)?.[0];
+              throw new Error(card ?? `no board after 15 s; surface ${get(interfaceStore).globalSurface}; on screen: ${body.slice(0, 300)}`);
+            });
+            interfaceStore.setGlobalSurface("repository");
+            await settle();
+            // Full screen is stamped on <html>; the inset collapses with it.
+            const inset = $(".gp-traffic-inset");
+            if (inset) {
+              const windowed = inset.getBoundingClientRect().width;
+              document.documentElement.setAttribute("data-fullscreen", "");
+              await settle();
+              const full = inset.getBoundingClientRect().width;
+              document.documentElement.removeAttribute("data-fullscreen");
+              await settle();
+              check("header: html[data-fullscreen] collapses the 76px traffic-light inset to a 12px gutter and back", () =>
+                Math.round(windowed) === 76 && Math.round(full) === 12 && Math.round(inset.getBoundingClientRect().width) === 76);
+            }
+          }
+
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);
+
+          // ---- an idle window is quiet, in both themes -----------------------------
+          // Nothing is moving, so nothing should be created: a transition made
+          // again and again on an idle page is a reactive loop, a style written
+          // every frame, or a class toggling back and forth, and it costs GPU and
+          // CPU for nothing. Count what a 3 s idle window makes after the theme
+          // flip's own crossfade and the entrances have finished.
+          const { themeStore } = await import("../src/lib/stores/themeStore.ts");
+          const finiteAnims = () => document.getAnimations().filter((a) => a.effect?.getComputedTiming().iterations !== Infinity);
+          const whereIs = (el) => `${el?.nodeName?.toLowerCase?.() ?? "?"}.${(el?.className?.toString?.() ?? "").slice(0, 40)}${el?.dataset?.testid ? `#${el.dataset.testid}` : ""}`;
+          // The most attribute writes an idle 3 s may make. The measured count on
+          // this page is 0 in both themes; the slack is for a timer that stamps
+          // an attribute on a slow host, not for a loop, which makes hundreds.
+          const idleNotes = [];
+          const IDLE_ATTRIBUTE_BOUND = 12;
+          const watchIdle = async (ms) => {
+            const known = new WeakSet(finiteAnims());
+            const created = [];
+            const attributes = {};
+            let attributeCount = 0;
+            const onRun = (event) => created.push(`${event.type}:${event.animationName ?? event.propertyName}<${whereIs(event.target)}>`);
+            document.addEventListener("transitionrun", onRun, true);
+            document.addEventListener("animationstart", onRun, true);
+            const observer = new MutationObserver((records) => {
+              for (const record of records) {
+                if (record.type !== "attributes") continue;
+                attributeCount++;
+                const key = `${whereIs(record.target)}[${record.attributeName}]`;
+                attributes[key] = (attributes[key] ?? 0) + 1;
+              }
+            });
+            observer.observe(document.documentElement, { attributes: true, subtree: true });
+            const end = performance.now() + ms;
+            while (performance.now() < end) {
+              for (const a of finiteAnims()) {
+                if (known.has(a)) continue;
+                known.add(a);
+                created.push(`animation:${a.animationName ?? a.transitionProperty ?? "script"}<${whereIs(a.effect?.target)}>`);
+              }
+              await wait(25);
+            }
+            observer.disconnect();
+            document.removeEventListener("transitionrun", onRun, true);
+            document.removeEventListener("animationstart", onRun, true);
+            const top = Object.entries(attributes).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, n]) => `${k}x${n}`).join(", ");
+            return { created, attributeCount, top };
+          };
+          for (const theme of ["dark", "light"]) {
+            themeStore.setTheme(theme);
+            await settle();
+            await wait(900);
+            await sleepUntil(() => finiteAnims().every((a) => a.playState === "finished" || a.playState === "idle"), 4000);
+            const idle = await watchIdle(3000);
+            check(`idle (${theme}): 3 s of nothing happening creates no transition or animation`, () => {
+              if (document.documentElement.classList.contains(theme) && idle.created.length === 0) return true;
+              throw new Error(`theme class ${document.documentElement.className}; created ${idle.created.length}: ${idle.created.slice(0, 6).join(" | ")}`);
+            });
+            check(`idle (${theme}): 3 s of nothing happening writes at most ${IDLE_ATTRIBUTE_BOUND} attributes`, () => {
+              if (idle.attributeCount <= IDLE_ATTRIBUTE_BOUND) return true;
+              throw new Error(`${idle.attributeCount} attribute writes; most often ${idle.top}`);
+            });
+            idleNotes.push(`idle ${theme}: ${idle.created.length} created, ${idle.attributeCount} attribute writes`);
+          }
+          themeStore.setPreference("system");
+          try { localStorage.removeItem("gitpulse_theme_preference"); } catch { /* the page then starts from the system theme, as it did */ }
+          await settle();
 
           // ---- a crashed sidebar recovers on the next switch --------------------
           // The sidebar used to be rebuilt per repository, which cleared a crash
@@ -603,7 +1436,7 @@
             const sorted = [...series].sort((a, b) => a - b);
             return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
           };
-          diagnostics = `${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          diagnostics = `${idleNotes.join("; ")}; ${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}${glanceWidths ? `; glance: ${glanceWidths}` : ""}`;
           // ---- the graph keeps rows for a bounded number of repositories ---------
           // The real App, its real graph scheduler and the real graph store, with
           // a backend that answers the commit graph. After 8 repositories have
@@ -616,15 +1449,30 @@
           fixtures.cmd_delete_branch = () => "";
           await switchTo(ALPHA);
           await sleepUntil(() => text(branchList()).includes("alpha-only"));
-          // Jump-to-tab is a webview shortcut (Ctrl+Alt+digit), so a real
-          // keypress reaches RepoTabBar's window listener here.
+          // Jump-to-tab is Cmd+digit on macOS and Ctrl+digit elsewhere. Under
+          // Tauri the native menu owns it; this page has no Tauri, so a real
+          // keypress reaches RepoTabBar's window listener here. The modifier is
+          // the host's own, as `classifyShortcut` reads it.
+          const { isMacOS } = await import("../src/lib/platform.ts");
           const betaDigit = get(repoStore).openTabs.findIndex((t) => t.path === BETA) + 1;
-          const jumpToBeta = () => window.dispatchEvent(new KeyboardEvent("keydown", {
-            key: String(betaDigit), code: `Digit${betaDigit}`, ctrlKey: true, altKey: true, bubbles: true, cancelable: true,
-          }));
+          // This page mocks Tauri, where the webview stands down for the chord
+          // because the native menu owns it, so the browser path is exercised
+          // with the marker hidden for the synchronous dispatch.
+          const jumpToBeta = () => {
+            const held = window.__TAURI_INTERNALS__;
+            const had = "__TAURI_INTERNALS__" in window;
+            delete window.__TAURI_INTERNALS__;
+            try {
+              window.dispatchEvent(new KeyboardEvent("keydown", {
+                key: String(betaDigit), code: `Digit${betaDigit}`, metaKey: isMacOS(), ctrlKey: !isMacOS(), bubbles: true, cancelable: true,
+              }));
+            } finally {
+              if (had) window.__TAURI_INTERNALS__ = held;
+            }
+          };
           jumpToBeta();
           await sleepUntil(() => activePath() === BETA);
-          check("prompt: control: Ctrl+Alt+digit with no prompt open jumps to that tab", () => activePath() === BETA);
+          check("prompt: control: Cmd/Ctrl+digit with no prompt open jumps to that tab", () => activePath() === BETA);
           await switchTo(ALPHA);
           await sleepUntil(() => text(branchList()).includes("alpha-only"));
           const deleteRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
@@ -636,7 +1484,7 @@
           jumpToBeta();
           await settle();
           await settle();
-          check("prompt: a Ctrl+Alt+digit jump-to-tab keypress while it is open is ignored", () => activePath() === ALPHA && promptTitle() === "Delete branch");
+          check("prompt: a Cmd/Ctrl+digit jump-to-tab keypress while it is open is ignored", () => activePath() === ALPHA && promptTitle() === "Delete branch");
           // The tab-changing shortcuts are refused while a prompt is open (unit
           // and source tests: this page mocks Tauri without its window API, so the
           // native menu is not subscribed here). Activation by an open event or a
@@ -660,7 +1508,7 @@
           // listing; with none recorded it asks nothing and the Git-action
           // question below is the first prompt.
           const runsPage = (items) => JSON.stringify({ ok: true, items, shown: items.length, total: items.length, has_more: false, next_cursor: null });
-          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage([]) : null);
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage([]) : workbenchFixture(a));
           const releasePull = hold("cmd_pull", ALPHA);
           const sweep = repoStore.runAcrossOpenRepos("pull", { only: [ALPHA] });
           await sleepUntil(() => calls.some((c) => c.cmd === "cmd_pull" && c.repo === ALPHA));
@@ -684,7 +1532,7 @@
             created_at: 100, expires_at: 400, session_id: "session", exit_code: null, reason: "", outcome_uncertain: false,
             provider_state: "running", provider_thread_id: "thread", provider_turn_id: "turn",
           };
-          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage(JSON.parse(a.input).state === "running" ? [managedRun] : []) : null);
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage(JSON.parse(a.input).state === "running" ? [managedRun] : []) : workbenchFixture(a));
           const exitCalls = [];
           // A stop is recorded and then refused, so the page returns to a quit it
           // can be asked again (an accepted exit leaves the request pending for
@@ -731,7 +1579,7 @@
           check("quit: leaving the run running reaches the exit as managed: leave, with no terminals choice", () =>
             exitCalls.length === 1 && JSON.stringify(exitCalls[0]) === JSON.stringify({ managed: "leave" }));
           delete fixtures.cmd_exit_app;
-          delete fixtures.cmd_workbench_request;
+          fixtures.cmd_workbench_request = (a) => workbenchFixture(a);
           delete fixtures.cmd_exit_request_answer;
           fixtures.cmd_terminal_backend = () => ({ backend: "in-process", trouble: [] });
 
@@ -785,6 +1633,53 @@
           delete fixtures.cmd_get_commit_details;
           delete fixtures.cmd_verify_commit_signature;
           check("the graph and commit-details commands had fixtures throughout", () => unexpected.length === 0);
+
+          // ---- 7. dropping a folder on the window opens it -----------------------
+          // The native drag events (tauri://drag-*) are what the shell listens
+          // to; the window's own event routing is what the mock reproduces. An
+          // in-app drag carries no paths and must not raise the veil.
+          const DROPPED = "/code/tabs/dropped-folder";
+          fixtures.cmd_resolve_git_root = (a) => a.path;
+          const dropVeil = () => $('[data-testid="drop-overlay"]');
+          const emitDrag = (type, paths) => emit(`tauri://drag-${type}`, { paths, position: { type: "Physical", x: 40, y: 40 } });
+          await emitDrag("enter", []);
+          await wait(250);
+          check("drop: an in-app drag (no file paths) does not show the veil", () => dropVeil() === null);
+          await emitDrag("leave", []);
+          await emitDrag("enter", [DROPPED]);
+          await sleepUntil(() => dropVeil() !== null, 3000);
+          check("drop: a folder dragged over the window shows the veil", () => dropVeil() !== null && /Drop a Git repository to open/.test(text(dropVeil())));
+          check("drop: the veil takes no pointer events, so the drop reaches the window", () => dropVeil() !== null && getComputedStyle(dropVeil()).pointerEvents === "none");
+          check("drop: nothing has opened before the drop", () => !tabFor(DROPPED));
+          await emitDrag("drop", [DROPPED]);
+          await sleepUntil(() => !!tabFor(DROPPED), 5000);
+          check("drop: dropping the folder opens it as a repository tab", () => !!tabFor(DROPPED));
+          await sleepUntil(() => dropVeil() === null, 3000);
+          check("drop: the veil is gone once the folder is dropped", () => dropVeil() === null);
+          delete fixtures.cmd_resolve_git_root;
+
+          // ---- 8. closing the docked terminal leaves with a short exit ----------
+          // Docked is the default mode and used to close with no animation at
+          // all. The exit must be a real animation on transform and opacity only,
+          // 70 ms or less, running while the row is still there; only after it
+          // does the dock hide.
+          await switchTo(ALPHA);
+          repoStore.setTerminalOpen(true);
+          await sleepUntil(() => $("[data-terminal-dock]") !== null, 5000);
+          await settle();
+          const dock = () => $("[data-terminal-dock]");
+          check("dock exit: the dock is open and docked (the default mode)", () => !!dock() && dock().dataset.dockMode === "docked" && !dock().classList.contains("hidden"));
+          repoStore.setTerminalOpen(false);
+          await tick();
+          const exitAnims = () => (dock()?.getAnimations() ?? []).filter((a) => a.animationName === "gp-dock-slide-out");
+          const exiting = exitAnims();
+          const animatedProps = exiting.flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k).filter((p) => !["offset", "easing", "composite", "computedOffset"].includes(p))));
+          check("dock exit: closing in docked mode starts the exit animation", () => exiting.length === 1 && dock().dataset.phase === "slide-out");
+          check("dock exit: it is 70 ms or less", () => exiting.length === 1 && exiting[0].effect.getComputedTiming().duration <= 70);
+          check("dock exit: it animates transform and opacity and nothing else", () => animatedProps.length > 0 && animatedProps.every((p) => p === "transform" || p === "opacity"));
+          check("dock exit: the row is still there while it runs", () => !dock().classList.contains("hidden"));
+          await sleepUntil(() => dock().classList.contains("hidden"), 2000);
+          check("dock exit: after the exit the dock is hidden, not unmounted", () => !!dock() && dock().classList.contains("hidden"));
           report_();
         } catch (error) {
           stopped(error);

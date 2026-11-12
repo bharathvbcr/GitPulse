@@ -83,6 +83,15 @@ export interface GraphTheme {
 
 export type DensityMode = "spacious" | "compact";
 
+/**
+ * `DensityMode` is the two-valued KEY of the row and graph tables below, which
+ * many surfaces index. The user-facing preference has three steps (`Density`:
+ * compact, comfortable, spacious, design language §7) and maps onto this key
+ * with `rowDensity` (ui/appearance/density.ts): comfortable and spacious draw
+ * the "spacious" tables, compact the "compact" ones.
+ */
+export type { Density } from "../ui/appearance/density";
+
 export const DENSITY_CONFIGS: Record<DensityMode, GraphRenderConfig> = {
   spacious: {
     rowHeight: 36,

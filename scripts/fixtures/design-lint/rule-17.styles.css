@@ -1,0 +1,15 @@
+@utility gp-card {
+  @apply rounded-xl;
+}
+@utility gp-btn {
+  @apply px-2;
+}
+.gp-menu .gp-menu-item {
+  color: inherit;
+}
+.gp-row:not(.gp-ghost) {
+  opacity: 1;
+}
+@utility gp-dead {
+  @apply p-1;
+}

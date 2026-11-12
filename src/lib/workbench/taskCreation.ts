@@ -67,7 +67,7 @@ export function taskCreation(scope: Scope, context: CreationContext): TaskCreati
   // the dead end — a disabled button with nothing on screen saying why.
   const name = context.workspaceName?.trim();
   const caveat = context.workspaceMembers === null
-    ? "This workspace's repositories could not be read. Choose one in the task."
+    ? "This workspace's repositories couldn't be read. Choose one in the task."
     : `${name ? `${name} has` : "This workspace has"} no repositories yet. Choose one in the task.`;
   return { allowed: true, blocked: null, caveat, seed };
 }

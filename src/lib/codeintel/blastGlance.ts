@@ -75,7 +75,7 @@ export function blastGlance(blast: ComposedBlastRadius | null | undefined): Blas
   if (!blast.available) {
     const cause = firstClause(blast.reason);
     return {
-      headline: "Impact could not be measured — this is not the same as no impact.",
+      headline: "Impact couldn't be measured — this is not the same as no impact.",
       impacted: null,
       hops,
       confidence: "unavailable",
@@ -99,7 +99,7 @@ export function blastGlance(blast: ComposedBlastRadius | null | undefined): Blas
 
   const refused = blast.unavailable_seeds.length - blast.cancelled_seeds;
   if (refused > 0) {
-    caveats.push(`${refused} ${plural(refused, "file")} could not be walked`);
+    caveats.push(`${refused} ${plural(refused, "file")} couldn't be walked`);
   }
 
   if (blast.unmatched_targets.length > 0) {
@@ -181,7 +181,7 @@ function headlineFor(confidence: BlastConfidence, total: number, hops: number): 
     case "approximate":
       return `Reaches roughly ${n} ${thing}${reach}.`;
     case "unavailable":
-      return "Impact could not be measured — this is not the same as no impact.";
+      return "Impact couldn't be measured — this is not the same as no impact.";
     case "exact":
       return `Reaches ${n} ${thing}${reach}.`;
   }

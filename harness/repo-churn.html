@@ -27,6 +27,9 @@
       import { mockIPCWithEvents } from "./tauriMocks";
 
       const params = new URLSearchParams(location.search);
+      // `?shot=failure&theme=light` stops on the failed CommitDetails read, for looking at it.
+      // The theme store resets the class while the app loads, so it is held.
+      if (params.get("theme") === "light") setInterval(() => { document.documentElement.classList.remove("dark"); document.documentElement.classList.add("light"); }, 200);
       const { results, check, stopped } = createChecks();
       const crashes = [];
       const unexpected = [];
@@ -310,7 +313,7 @@
         await show(CodeStackViewer);
         await until(banner);
         check(`CodeStackViewer: unresolved branches render a banner with the count (saw ${banner()?.textContent.trim() ?? "none"})`,
-          () => /3 branches could not be placed/.test(banner()?.textContent ?? "") && /budget/.test(banner()?.textContent ?? ""));
+          () => /3 branches couldn't be placed/.test(banner()?.textContent ?? "") && /budget/.test(banner()?.textContent ?? ""));
         // Mounted: a refresh of the repository loads the stack again.
         const mountedLoads = count("cmd_get_stack_hierarchy");
         await repoStore.refresh();
@@ -370,6 +373,32 @@
         await repoStore.selectCommitDiff(selectedId);
         await settle(5);
         await quietUnderChurn("CommitDetails", CommitDetails, ["cmd_provenance_freshness"]);
+
+        // ---- CommitDetails: a read that fails says what failed, then why.
+        // A second commit whose details and diff reads are refused; the first
+        // keeps answering, so the failure belongs to the commit it hit.
+        const failId = "f".repeat(40);
+        const commitRow = (id) => ({ id, parent_ids: [], summary: "refused", author_name: "ada", author_email: "ada@example.com",
+          timestamp: 1, lane: 0, color_index: 0, active_lanes: [0], active_lane_colors: [0], connections: [], is_merge: false, is_root: true });
+        const detailsFixture = fixtures.cmd_get_commit_details, diffFixture = fixtures.cmd_get_commit_diff;
+        fixtures.cmd_get_commit_details = (a) => { if (a.commitId === failId) throw "Operation not permitted"; return detailsFixture(a); };
+        fixtures.cmd_get_commit_diff = (a) => { if (a.commitId === failId) throw "Operation not permitted"; return diffFixture(a); };
+        const failedGraph = fixtures.cmd_get_commit_graph;
+        fixtures.cmd_get_commit_graph = () => ({ head_id: selectedId, refs: [], has_more: false, rows: [commitRow(selectedId), commitRow(failId)] });
+        await graphStore.loadGraph(REPO);
+        fixtures.cmd_get_commit_graph = failedGraph;
+        await show(CommitDetails);
+        await graphStore.selectCommit(commitRow(failId), REPO);
+        await repoStore.selectCommitDiff(failId);
+        await until(() => app.textContent.includes("Couldn't load commit details."));
+        check(`CommitDetails: a failed details read reads "Couldn't load commit details." with its reason (page says: ${app.textContent.replace(/\s+/g, " ").slice(0, 160)})`,
+          () => app.textContent.includes("Couldn't load commit details. Operation not permitted"));
+        check("CommitDetails: a failed diff read reads \"Couldn't read this diff.\" with its reason",
+          () => app.textContent.includes("Couldn't read this diff. Operation not permitted"));
+        check("CommitDetails: each failure offers Try again", () => buttons().filter((b) => b.textContent.trim() === "Try again").length === 2);
+        if (params.get("shot") === "failure") { window.__failureShot = true; return; }
+        fixtures.cmd_get_commit_details = detailsFixture;
+        fixtures.cmd_get_commit_diff = diffFixture;
 
         // ---- DiffViewer and CommitComposer: impact walks per selection.
         await repoStore.selectFileDiff("README.md", true);
@@ -449,9 +478,13 @@
         const collisionFixture = fixtures.cmd_collision_risk;
         fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
         await show(WorkView);
-        await until(() => app.textContent.includes("Could not check overlapping files"));
-        check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
-          () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
+        await until(() => app.textContent.includes("Couldn't check overlapping files"));
+        // The `until` above only waits; it asserts nothing and returns on a
+        // timeout. The headline is therefore asserted here, in the check, or a
+        // regression to "Could not check…" would pass on the other two phrases.
+        check("WorkView: a failed collision scan says it couldn't check, never that there is no overlap",
+          () => app.textContent.includes("Couldn't check overlapping files")
+            && app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
         fixtures.cmd_collision_risk = collisionFixture;
 
         check(`no crash (${crashes.join(" | ") || "none"})`, () => crashes.length === 0);
@@ -463,7 +496,7 @@
       } catch (error) {
         stopped(error);
       }
-      if (component) unmount(component);
+      if (component && !window.__failureShot) unmount(component);
       const result = { results, passed: results.filter((r) => r.pass).length, total: results.length,
         crashes: crashes.slice(0, 10), unexpected: [...new Set(unexpected)] };
       document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify(result)));

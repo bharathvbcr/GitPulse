@@ -191,7 +191,7 @@
     <CalendarDays size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
     <span class="due-label">{label}</span>
     {#if relative.text}
-      <span class="gp-pill due-relative" class:overdue={relative.state === "overdue"} data-testid="task-due-relative">{relative.text}</span>
+      <span class="gp-chip due-relative" data-tone={relative.state === "overdue" ? "danger" : "neutral"} class:overdue={relative.state === "overdue"} data-testid="task-due-relative">{relative.text}</span>
     {/if}
     <ChevronDown size={11} class="shrink-0 text-textMuted" aria-hidden="true" />
   </button>
@@ -225,7 +225,7 @@
         }}
       />
       {#if readingLabel}
-        <button type="button" class="reading" data-testid="task-due-reading" onclick={commitPhrase}>{readingLabel}</button>
+        <button type="button" class="gp-btn reading" data-variant="ghost" data-size="sm" data-testid="task-due-reading" onclick={commitPhrase}>{readingLabel}</button>
       {/if}
     </div>
 
@@ -257,19 +257,19 @@
     <div class="cal-time">
       <Clock size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
       <input
-        class="time"
+        class="gp-field time"
         type="time"
         value={time}
         aria-label="Time"
         data-testid="task-due-time"
         oninput={(event) => pickTime(event.currentTarget.value)}
       />
-      <button type="button" class="gp-btn" disabled={value === null} data-testid="task-due-clear" onclick={clear}>Clear</button>
+      <button type="button" class="gp-btn" data-size="sm" disabled={value === null} data-testid="task-due-clear" onclick={clear}>Clear</button>
     </div>
 
     <div class="cal-quick">
       {#each DUE_SHORTCUTS as shortcut (shortcut.id)}
-        <button type="button" class="mini" onclick={() => pickWord(shortcut.word)}>{shortcut.label}</button>
+        <button type="button" class="gp-btn" data-size="sm" onclick={() => pickWord(shortcut.word)}>{shortcut.label}</button>
       {/each}
     </div>
   </div>
@@ -277,43 +277,38 @@
 
 <style>
   .due{position:relative;min-width:0}
-  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px;border:1px solid rgb(var(--c-border));border-radius:7px;background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:12px;cursor:pointer;min-width:0}
-  .due-trigger:hover:not(:disabled){border-color:rgb(var(--c-accent) / 0.5)}
+  .due-trigger{display:flex;align-items:center;gap:7px;width:100%;text-align:left;padding:8px 12px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-full);background:rgb(var(--c-bg) / 0.6);color:rgb(var(--c-text-muted));font:inherit;font-size:var(--text-xs);cursor:pointer;min-width:0}
+  .due-trigger:hover:not(:disabled){border-color:rgb(var(--c-accent))}
   .due-trigger:disabled{opacity:.5;cursor:not-allowed}
   /* Muted until there is a deadline, so "No due date" reads as the absence it
      is rather than as a value someone chose. */
   .due-trigger.set{color:rgb(var(--c-text))}
   .due-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .due-relative{flex-shrink:0}
-  .due-relative.overdue{color:rgb(var(--c-status-rose, 244 63 94));border-color:rgb(225 29 72 / 0.5);background:rgb(225 29 72 / 0.14)}
-  :global(.dark) .due-relative.overdue{color:rgb(253 164 175)}
 
-  .due-popup{position:fixed;width:min(286px,92vw);padding:10px;font-size:12px;color:rgb(var(--c-text))}
-  .phrase-row{display:flex;align-items:center;gap:6px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-bg) / 0.6);padding:5px 8px;margin-bottom:9px}
-  .phrase{flex:1;min-width:0;border:0;background:none;color:inherit;font:inherit;font-size:12px;outline:none}
+  .due-popup{position:fixed;width:min(286px,92vw);padding:10px;font-size:var(--text-xs);color:rgb(var(--c-text))}
+  .phrase-row{display:flex;align-items:center;gap:6px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.6);padding:5px 8px;margin-bottom:9px}
+  .phrase{flex:1;min-width:0;border:0;background:none;color:inherit;font:inherit;font-size:var(--text-xs);outline:none}
   .phrase::placeholder{color:rgb(var(--c-text-muted) / 0.7)}
   /* The reading is a button, not a label: seeing what was understood and
      accepting it are the same gesture. */
-  .reading{flex-shrink:0;border:0;background:none;padding:0;font:inherit;font-size:10px;color:rgb(var(--c-accent));cursor:pointer;white-space:nowrap}
-  .reading:hover{text-decoration:underline}
+  .reading{flex-shrink:0;font-size:var(--text-micro);color:rgb(var(--c-accent));white-space:nowrap}
 
   .cal-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px}
-  .cal-title{font-size:12px;font-weight:600}
+  .cal-title{font-size:var(--text-xs);font-weight:600}
   .cal-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
-  .dow{text-align:center;font-size:9px;color:rgb(var(--c-text-muted));padding-bottom:3px;letter-spacing:.04em}
-  .day{border:1px solid transparent;background:none;border-radius:8px;padding:6px 0;font:inherit;font-size:11px;color:rgb(var(--c-text));cursor:pointer}
+  .dow{text-align:center;font-size:var(--text-micro);color:rgb(var(--c-text-muted));padding-bottom:3px}
+  .day{border:1px solid transparent;background:none;border-radius:var(--gp-r-sm);padding:6px 0;font:inherit;font-size:var(--text-meta);color:rgb(var(--c-text));cursor:pointer}
   /* Slash-alpha, not a flat token: an alpha-less fill is a slab that paints
      over the window material rather than reading as a recess in it. */
   .day:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .day[data-outside="true"]{color:rgb(var(--c-text-muted) / 0.55)}
   /* Outline is "you are here", fill is "this is chosen". Drawing today filled
      as well made the old grid ambiguous on the day a task was due. */
-  .day[data-today="true"]{border-color:rgb(var(--c-border));font-weight:650}
-  .day[data-selected="true"]{background:rgb(var(--c-accent));color:rgb(var(--c-bg));font-weight:700;border-color:rgb(var(--c-accent))}
+  .day[data-today="true"]{border-color:rgb(var(--c-border));font-weight:600}
+  .day[data-selected="true"]{background:rgb(var(--c-accent));color:rgb(var(--c-on-accent));font-weight:600;border-color:rgb(var(--c-accent))}
 
-  .cal-time{display:flex;align-items:center;gap:6px;border-top:1px solid rgb(var(--c-border) / 0.45);margin-top:8px;padding-top:8px}
-  .time{flex:1;min-width:0;padding:5px 8px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-bg) / 0.6);color:inherit;font:inherit;font-size:12px}
+  .cal-time{display:flex;align-items:center;gap:6px;margin-top:10px}
+  .time{flex:1;min-width:0}
   .cal-quick{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
-  .mini{border-radius:999px;border:1px solid rgb(var(--c-border) / 0.7);background:rgb(var(--c-surface-hover) / 0.55);padding:3px 9px;font:inherit;font-size:10px;color:rgb(var(--c-text-muted));cursor:pointer}
-  .mini:hover{color:rgb(var(--c-text));border-color:rgb(var(--c-accent) / 0.45)}
 </style>

@@ -1663,7 +1663,7 @@
           <div data-coverage-family={view.family} class="flex flex-wrap items-center gap-x-1.5 gap-y-1 min-w-0 max-w-full" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
             <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
             <span class="text-textPrimary/80 shrink-0">{view.status.languages.join(", ") || view.label}</span>
-            <span class="text-textMuted/60 shrink-0">no report</span>
+            <span class="text-faint shrink-0">no report</span>
             {#if view.toolDetail}
               <span class="text-warn truncate min-w-0 max-w-[32rem]" title={view.toolDetail}>{view.toolDetail}</span>
             {/if}
@@ -1682,7 +1682,7 @@
         {/each}
         {#if foundViews.length > 0}
           <span
-            class="shrink-0 text-textMuted/70"
+            class="shrink-0 text-faint"
             title={foundViews.map((view) => `${view.status.languages.join(", ")} (${view.family}): ${view.status.expected_paths.join(", ")}`).join("\n")}
           >{foundViews.length} other {foundViews.length === 1 ? "report" : "reports"} found</span>
         {/if}
@@ -1759,7 +1759,7 @@
                      classifier the copied diagnostics use. -->
                 <span
                   data-coverage-run-summary
-                  class="text-textMuted/70 truncate"
+                  class="text-faint truncate"
                   title={(status.status === "failed" ? coverageFailureHint(status.label, status.detail) : null) ?? status.summary ?? briefDetail(status.detail)}
                 >{status.summary || briefDetail(status.detail)}</span>
               {/if}
@@ -1932,7 +1932,7 @@
           {#each report.artifacts as artifact, i (`${i}:${artifact.path}`)}
             <div class="truncate" title={artifact.skip_reason || artifact.format}>
               {artifact.path}
-              <span class="text-textMuted/70">({artifact.format})</span>
+              <span class="text-faint">({artifact.format})</span>
               {#if artifact.skipped}
                 <span class="text-warn"> skipped</span>
               {/if}
@@ -2104,12 +2104,12 @@
           icon={FileCode}
           title={!contentError && hitMap.size === 0 ? "Not in any coverage report" : "No source available"}
           hint={contentError
-            ? `The source for this path could not be loaded: ${contentError}`
+            ? `The source for this path couldn't be loaded: ${contentError}`
             : hitMap.size === 0
               ? scanTruncated
                 ? "The scan was capped, so this file's absence may be incomplete rather than a real zero."
                 : "This file was not instrumented by the coverage artifacts found in the repository."
-              : "The source for this path could not be loaded."}
+              : "The source for this path couldn't be loaded."}
         />
       {:else}
         <EmptyState

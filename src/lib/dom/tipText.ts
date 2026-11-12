@@ -20,6 +20,17 @@ export interface TooltipPointerTarget extends TipHost {
   closest(selectors: string): unknown;
 }
 
+/**
+ * Whether the control already has its own popup open (`aria-expanded="true"`).
+ * A tooltip on such a control sits on top of the menu or popover it opened,
+ * which is placed against the same anchor: the terminal pill opens its menu on
+ * pointer-enter, and 350 ms later its "Toggle the terminal dock" tip landed on
+ * the menu. The popup is the more specific answer, so the tip stays away.
+ */
+export function anchorOwnsOpenPopup(el: Pick<TipHost, "getAttribute">): boolean {
+  return el.getAttribute("aria-expanded") === "true";
+}
+
 function declaresAccessibleName(el: TipHost): boolean {
   const label = el.getAttribute("aria-label");
   if (label !== null && label.trim().length > 0) return true;

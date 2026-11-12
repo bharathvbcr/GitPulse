@@ -90,6 +90,10 @@
   {#if result?.items.length === 0}<p class="empty">None</p>{/if}
   {#if items.length > 0}
     <div class="pile" class:open={pile.peeks === 0} data-testid="notification-pile">
+      <!-- Lips come first in the document so the cards, positioned later, paint over them without a z-index. -->
+      {#each lips as depth (depth)}
+        <div class="peek gp-card" style:--depth={depth} aria-hidden="true"></div>
+      {/each}
       {#each shown as item (item.id)}
         {#if "unreadable" in item}
           <!-- A kind this version does not know. Said plainly as a row of its own: dropping it would hide that
@@ -115,9 +119,6 @@
           </article>
         {/if}
       {/each}
-      {#each lips as depth (depth)}
-        <div class="peek gp-card" style:--depth={depth} aria-hidden="true"></div>
-      {/each}
     </div>
   {/if}
   {#if label}<button type="button" class="gp-btn" aria-expanded={expanded} onclick={() => { expanded = !expanded; }}>{label}</button>{/if}
@@ -125,25 +126,23 @@
 </section>
 
 <style>
-  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:12px;font-size:12px;color:rgb(var(--c-text))}
+  .inbox{max-height:40vh;overflow:auto;flex-shrink:0;margin:8px 14px;padding:12px;border:1px solid rgb(var(--c-border));border-radius:var(--gp-r-lg);font-size:var(--text-xs);color:rgb(var(--c-text))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
   /* Lips tuck under the card by its padding only, so the title never sits on another card. */
   .pile{position:relative;display:flex;flex-direction:column;gap:8px;margin-top:8px}
   .pile.open{max-height:280px;overflow:auto}
   .pile:not(.open){padding-bottom:16px}
-  article{position:relative;z-index:1;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
+  article{position:relative;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
   article.unreadable{border-style:dashed}
   article.unread{box-shadow:var(--shadow-card),inset 3px 0 0 rgb(var(--c-accent))}
-  .peek{position:absolute;z-index:0;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
+  .peek{position:absolute;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
   .pile + button{margin-top:8px}
   .summary{display:flex;flex-direction:column;gap:2px;min-width:0}
-  .summary strong{font-weight:550}
+  .summary strong{font-weight:500}
   .summary span{color:rgb(var(--c-text-muted))}
   details{margin:8px 0}
   summary{cursor:pointer;color:rgb(var(--c-text-muted))}
-  button,select{font:inherit;color:inherit;background:transparent;border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}
-  button{cursor:pointer}button:disabled{opacity:.45;cursor:default}
-  [role=alert]{color:#ef9a9a}
+  [role=alert]{color:rgb(var(--c-danger))}
   .empty{padding:8px 0}
 </style>

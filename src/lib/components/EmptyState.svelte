@@ -5,11 +5,19 @@
    * "nothing here yet" renders through this so the quiet screens speak the same
    * language as the busy ones.
    */
+  import { Loader2 } from "@lucide/svelte";
+
   export interface EmptyStateAction {
     label: string;
     onClick: () => void;
     icon?: any;
     variant?: "primary" | "secondary";
+    /** The action cannot run now. Pair it with `title` so the reason is readable. */
+    disabled?: boolean;
+    /** The reason (disabled) or the plain description (enabled), as a tooltip. */
+    title?: string;
+    /** The action is running. Marks the button `aria-busy`, swaps its icon for a spinner and keeps it from firing twice. */
+    busy?: boolean;
   }
 
   let {
@@ -41,7 +49,7 @@
     </div>
     <p class="font-semibold text-textPrimary text-xs">{title}</p>
     {#if hint}
-      <p class="mt-1.5 text-[11px] leading-relaxed text-textMuted">{hint}</p>
+      <p class="mt-1.5 text-meta leading-relaxed text-textMuted">{hint}</p>
     {/if}
 
     {#if action}
@@ -49,9 +57,14 @@
         <button
           type="button"
           onclick={action.onClick}
+          disabled={action.disabled || action.busy}
+          title={action.title}
+          aria-busy={action.busy ? "true" : undefined}
           class="{action.variant === 'secondary' ? 'gp-btn' : 'gp-btn-primary'} py-1.5! px-3.5! text-xs! inline-flex items-center gap-1.5"
         >
-          {#if ActionIcon}
+          {#if action.busy}
+            <Loader2 size={13} class="animate-spin" aria-hidden="true" />
+          {:else if ActionIcon}
             <ActionIcon size={13} />
           {/if}
           <span>{action.label}</span>

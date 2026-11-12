@@ -13,7 +13,7 @@ describe("ft-038e6ba5 wiring", () => {
   });
 
   it("a failed notification read can be dismissed and clears on the next good read", () => {
-    const bridge = read("NativeNotificationBridge.svelte");
+    const bridge = read("NativeNotificationBridgeView.svelte");
     expect(bridge).toContain('onclick={() => { error = ""; }}>Dismiss');
     expect(bridge).toMatch(/pendingNotificationActivation\(\);\s*if \(disposed\) return;[^]*?error = "";\s*if \(!activation\) return;/);
   });

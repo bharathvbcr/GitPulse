@@ -234,7 +234,7 @@ export async function cancelInstall() {
   try {
     await cancelExternalToolInstall();
   } catch (e) {
-    actionError.set(`Could not cancel the install: ${formatError(e)}`);
+    actionError.set(`Couldn't cancel the install. ${formatError(e)}`);
   }
 }
 
@@ -264,7 +264,7 @@ export async function dismissFirstRun() {
 export async function markOnboardingComplete() {
   const current = get(config)?.config ?? (await refreshToolConfig())?.config;
   if (!current) {
-    throw new Error("Tool configuration is not loaded yet, so setup completion could not be recorded.");
+    throw new Error("Tool configuration is not loaded yet, so setup completion couldn't be recorded.");
   }
   const next = await saveToolConfig({
     ...current,
@@ -308,7 +308,7 @@ export async function runVerify(tool: ExternalTool) {
   try {
     verify.set(await verifyTool(tool));
   } catch (e) {
-    actionError.set(`Verify could not run: ${formatError(e)}`);
+    actionError.set(`Verify couldn't run: ${formatError(e)}`);
   } finally {
     verifying.set(false);
   }

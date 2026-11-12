@@ -18,7 +18,7 @@ export const HOST_LABEL: Record<string, string> = {
 
 export const KIND_LABEL: Record<IntegrationKind, string> = {
   guide: "Agent guide",
-  project_mcp: "Project MCP",
+  project_mcp: "Repository MCP",
   global_mcp: "Global MCP",
   hook: "Hook config",
   skill: "Skill",
@@ -104,7 +104,7 @@ function files(count: number): string {
 
 /** The one-line state of a host row. */
 export function planSummary(plan: IntegrationPlan): string {
-  if (!plan.available) return plan.reason ?? "could not be checked";
+  if (!plan.available) return plan.reason ?? "couldn't be checked";
   if (totalChanges(plan) === 0) return "Already registered and current.";
   const head = `${files(plan.repo_changes)} in this repository`;
   return plan.outside_changes > 0

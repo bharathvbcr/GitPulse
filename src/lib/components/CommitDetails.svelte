@@ -34,12 +34,13 @@
     hopsLabel,
   } from "../codeintel/suspectsQuery";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash, signatureLabel } from "../format";
   import { summarizeCommitFiles } from "../diff/commitFilesNotice";
-  import { formatError } from "../ui/formatError";
+  import { describeFailure, type FailureCopy } from "../ui/copy/describeFailure";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
   import { filterStore } from "../stores/filterStore";
@@ -115,6 +116,16 @@
       ($repoStore.selectedDiff === null && !$repoStore.selectedDiffError),
   );
   let diffError = $derived($repoStore.selectedDiffError);
+  /** Headline, then the reason, as one line. A space written between block tags is trimmed, so it is joined here. */
+  function failureLine(copy: FailureCopy): string {
+    return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
+  }
+  let detailsFailure = $derived(
+    detailsStatus === "error" ? describeFailure({ verb: "load", object: "commit details" }, detailsError) : null,
+  );
+  let diffFailure = $derived(
+    diffError ? describeFailure({ verb: "read", object: "this diff" }, diffError) : null,
+  );
 
   /**
    * "Find suspects since this commit": the commit on screen becomes the last
@@ -169,7 +180,7 @@
   let explanation = $state<AiGeneration | null>(null);
   let explanationFor = $state<string | null>(null);
   let isExplaining = $state(false);
-  let explainError = $state<string | null>(null);
+  let explainFailure = $state<FailureCopy | null>(null);
 
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let explainGuard: AsyncGuard | null = null;
@@ -188,7 +199,7 @@
 
   async function copySha(id: string) {
     if (!(await copyText(id))) {
-      toastStore.error("Could not copy the commit SHA");
+      toastStore.error("Couldn't copy the commit SHA.");
       return;
     }
     copiedSha = true;
@@ -199,7 +210,7 @@
 
   async function copyMessage(msg: string) {
     if (!(await copyText(msg))) {
-      toastStore.error("Could not copy the commit message");
+      toastStore.error("Couldn't copy the commit message.");
       return;
     }
     copiedMessage = true;
@@ -216,7 +227,7 @@
     const guard = createAsyncGuard();
     explainGuard = guard;
     isExplaining = true;
-    explainError = null;
+    explainFailure = null;
     explanation = null;
     try {
       const result = await harnessStore.explainCommit(path, id);
@@ -227,7 +238,7 @@
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       if (currentCommitId !== id || $repoStore.currentPath !== path) return;
-      explainError = formatError(err);
+      explainFailure = describeFailure({ verb: "explain", object: "this commit" }, err);
     } finally {
       if (guard.isLive()) isExplaining = false;
     }
@@ -246,7 +257,7 @@
       isExplaining = false;
       // The error belongs to the commit it failed on; left set it reads as
       // "this commit failed" under every commit clicked afterwards.
-      explainError = null;
+      explainFailure = null;
     });
   });
 
@@ -309,8 +320,8 @@
 
 {#if selectedCommit}
   {@const sig = signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)}
-  <div class="h-64 border-t border-border/60 gp-section-edge bg-surface flex flex-col font-sans select-none overflow-hidden">
-    <div class="px-4 py-2.5 border-b border-border/60 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
+  <div class="h-64 bg-background flex flex-col font-sans select-none overflow-hidden">
+    <div class="gp-header justify-between">
       <div class="flex items-center gap-3 min-w-0">
         <GitCommit size={16} class="text-accent shrink-0" />
         <button
@@ -322,9 +333,9 @@
         >
           <span>{shortHash(selectedCommit.id, 8)}</span>
           {#if copiedSha}
-            <Check size={11} class="text-emerald-500" />
+            <Check size={11} class="text-ok" />
           {:else}
-            <Copy size={10} class="text-textMuted/60 opacity-0 group-hover/sha:opacity-100 group-focus-within/sha:opacity-100 transition-opacity" />
+            <Copy size={10} class="text-textMuted opacity-0 group-hover/sha:opacity-100 group-focus-within/sha:opacity-100 transition-opacity" />
           {/if}
         </button>
 
@@ -337,7 +348,8 @@
                  the filter is the likelier one: those say "loaded". -->
             {@const filtered = Boolean(suspect) || filterActive}
             <span
-              class="shrink-0 rounded px-1.5 py-0.5 text-[10px] bg-amber-500/10 text-amber-600 dark:text-amber-300"
+              class="gp-chip shrink-0"
+              data-tone="warn"
               title={filtered
                 ? "The loaded graph does not draw this commit: the commit filter or the page size leaves it out. It stays selected because it was chosen from HEAD's moves or Suspects."
                 : "The loaded graph does not draw this commit. It was selected from HEAD's moves (the reflog); a reset or amend may have left it reachable only from there, or the page size leaves it out."}
@@ -349,22 +361,23 @@
           <button
             type="button"
             onclick={() => copyMessage(headerSummary)}
-            class="opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 focus-visible:opacity-100 text-textMuted hover:text-textPrimary transition-opacity p-0.5"
+            class="gp-icon-btn opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 focus-visible:opacity-100 transition-opacity"
+            data-size="sm"
             title="Copy commit message"
             aria-label="Copy commit message"
           >
             {#if copiedMessage}
-              <Check size={11} class="text-emerald-500" />
+              <Check size={11} class="text-ok" />
             {:else}
               <Copy size={11} />
             {/if}
           </button>
         </div>
       </div>
-      <div class="flex items-center gap-4 text-[11px] text-textMuted shrink-0">
+      <div class="flex items-center gap-4 text-meta text-textMuted shrink-0">
         <span class="flex items-center gap-1.5 select-text"><User size={13} /> {headerAuthor || "—"}</span>
         <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || (offGraph ? "—" : formatDate(selectedCommit.timestamp))}</span>
-        <span class="flex items-center gap-1 {sig.ok ? 'text-green-400' : 'text-textMuted'}">
+        <span class="flex items-center gap-1 {sig.ok ? 'text-ok' : 'text-textMuted'}">
           {#if sig.ok}
             <ShieldCheck size={13} />
           {:else}
@@ -425,19 +438,21 @@
       </div>
     {/if}
 
-    <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
+    <div class="flex-1 grid grid-cols-3 min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">
-        <div class="text-[10px] font-semibold uppercase text-textMuted px-2 py-1">
-          Changed Files ({details ? filesSummary.count : "--"})
+        <div class="gp-label px-2 py-1">
+          Changed files ({details ? filesSummary.count : "--"})
           {#if details}
-            <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}{filesSummary.partial ? "+" : ""}</span>
-            <span class="normal-case font-mono text-red-400">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
+            <span class="font-mono text-ok ml-1">+{details.total_additions}{filesSummary.partial ? "+" : ""}</span>
+            <span class="font-mono text-danger">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
           {/if}
         </div>
-        {#if detailsStatus === "error"}
-          <div class="px-2 py-1 flex items-center gap-2 text-[11px] text-amber-500" role="alert">
-            <span class="min-w-0 break-words">Could not load commit details: {detailsError}</span>
-            <button type="button" class="gp-btn text-xs py-1 px-2.5 shrink-0" onclick={retryDetails}>Retry</button>
+        {#if detailsFailure}
+          <div class="px-2 py-1">
+            <div class="gp-notice" data-tone="danger" role="alert">
+              <span class="min-w-0 flex-1 break-words text-meta">{failureLine(detailsFailure)}</span>
+              <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDetails}>Try again</button>
+            </div>
           </div>
         {/if}
         {#if details?.body}
@@ -446,7 +461,7 @@
           </div>
         {/if}
         {#if details && details.co_authors.length > 0}
-          <div class="px-2 py-1 text-[11px] text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
+          <div class="px-2 py-1 text-meta text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
         {/if}
 
         <!-- Local explanation of the commit. Nothing leaves the machine: the
@@ -458,31 +473,32 @@
             title={aiReady
               ? "Explain this commit with the local model"
               : ($harnessStore.ai?.detail ?? "No local model server is running")}
-            class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors py-1!"
+            class="gp-btn"
+            data-size="sm"
           >
             {#if isExplaining}
               <Loader size={12} class="animate-spin" />
               <span>Reading the diff…</span>
             {:else}
-              <Sparkles size={12} />
+              <Sparkles size={12} class="text-accent" />
               <span>Explain this commit</span>
             {/if}
           </button>
 
-          {#if explainError}
-            <div class="mt-1.5 text-[11px] text-rose-400">{explainError}</div>
+          {#if explainFailure}
+            <div class="mt-1.5 text-meta text-danger">{failureLine(explainFailure)}</div>
           {/if}
 
           {#if explanation && explanationFor === currentCommitId}
-            <div class="mt-2 rounded-xl border border-border/70 bg-background/60 p-3 space-y-1.5 shadow-card">
-              <div class="text-[11px] text-textPrimary whitespace-pre-wrap leading-relaxed">
+            <div class="mt-2 rounded-xl bg-surface p-3 space-y-1.5">
+              <div class="text-meta text-textPrimary whitespace-pre-wrap">
                 {explanation.text}
               </div>
-              <div class="text-[10px] text-textMuted">
+              <div class="text-micro text-textMuted">
                 <span class="font-mono">{explanation.model}</span> · {explanation.context_source}
               </div>
               {#each explanation.warnings as warning}
-                <div class="text-[10px] text-amber-400 flex items-start gap-1">
+                <div class="text-micro text-warn flex items-start gap-1">
                   <AlertTriangle size={11} class="mt-px shrink-0" />
                   <span>{warning}</span>
                 </div>
@@ -492,7 +508,7 @@
         </div>
         {#if filesSummary.note}
           <div
-            class="px-2 pb-1 text-[10px] {filesSummary.partial ? 'text-amber-400' : 'text-textMuted'}"
+            class="px-2 pb-1 text-micro {filesSummary.partial ? 'text-warn' : 'text-textMuted'}"
             data-testid="commit-files-note"
           >
             {filesSummary.note}
@@ -501,33 +517,34 @@
         {#each fileList as f (f.path)}
           {@const parts = formatPathParts(f.path)}
           <button
-            class="w-full px-2 py-1.5 rounded-full hover:bg-surfaceHover flex items-center justify-between text-xs text-left transition-colors"
+            class="gp-row w-full justify-between text-left text-xs"
             onclick={() => {
               if (currentCommitId) repoStore.selectCommitFileDiff(currentCommitId, f.path);
             }}
           >
             <div class="flex items-center gap-2 truncate">
               <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
-              <span class="truncate font-mono text-[11px]">
+              <span class="truncate font-mono text-meta">
                 {#if parts.dir}
-                  <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                  <span class="text-textMuted text-micro">{parts.dir}</span>
                 {/if}
                 <span class="text-textPrimary font-medium">{parts.name}</span>
               </span>
             </div>
-            <div class="flex items-center gap-1.5 text-[10px] font-mono shrink-0">
+            <div class="flex items-center gap-1.5 text-micro font-mono shrink-0">
               {#if f.additions > 0}
-                <span class="text-green-400 flex items-center"><Plus size={10} />{f.additions}</span>
+                <span class="text-ok flex items-center"><Plus size={10} />{f.additions}</span>
               {/if}
               {#if f.deletions > 0}
-                <span class="text-red-400 flex items-center"><Minus size={10} />{f.deletions}</span>
+                <span class="text-danger flex items-center"><Minus size={10} />{f.deletions}</span>
               {/if}
             </div>
           </button>
         {/each}
         {#if hiddenFileCount > 0}
           <button
-            class="w-full px-2 py-1.5 rounded-xl border border-dashed border-border/80 text-[11px] text-textMuted hover:text-textPrimary hover:border-accent/50 transition-colors"
+            class="gp-btn w-full justify-center"
+            data-size="sm"
             onclick={() => (fileListLimit = details!.changed_files.length)}
           >
             Show {hiddenFileCount.toLocaleString()} more changed file{hiddenFileCount === 1 ? "" : "s"}
@@ -535,28 +552,27 @@
         {/if}
       </div>
 
-      <div class="col-span-2 p-3 font-mono text-xs overflow-auto bg-background/50 flex flex-col">
+      <div class="col-span-2 p-3 font-mono text-xs overflow-auto bg-surface flex flex-col">
         {#if diffLoading}
-          <div
-            class="flex flex-1 items-center justify-center gap-2 text-[11px] text-textMuted font-sans"
-            role="status"
-          >
-            <Loader size={14} class="animate-spin" />
-            <span>Reading the diff…</span>
+          <div class="flex-1" aria-label="Reading the diff…">
+            <Skeleton variant="code-lines" count={8} />
           </div>
-        {:else if diffError}
-          <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center font-sans" role="alert">
-            <span class="text-[11px] text-amber-500">Could not read this diff: {diffError}</span>
-            <button type="button" class="gp-btn text-xs py-1 px-2.5" onclick={retryDiff}>Retry</button>
+        {:else if diffFailure}
+          <div class="flex flex-1 items-center justify-center px-4 font-sans">
+            <div class="gp-notice" data-tone="danger" role="alert">
+              <span class="min-w-0 flex-1 break-words text-meta">{failureLine(diffFailure)}</span>
+              <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDiff}>Try again</button>
+            </div>
           </div>
         {:else if previewLines.length > 0}
-          <pre class="whitespace-pre text-textPrimary text-[11px] leading-relaxed select-text">{previewLines.join("\n")}</pre>
+          <pre class="whitespace-pre text-textPrimary text-meta select-text">{previewLines.join("\n")}</pre>
           {#if previewTruncated}
             <button
-              class="mt-2 self-start px-2.5 py-1 rounded-full border border-border/80 text-[11px] font-sans text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors"
+              class="gp-btn mt-2 self-start font-sans"
+              data-size="sm"
               onclick={() => repoStore.setActiveTab("history", "diff")}
             >
-              Preview capped at {PREVIEW_LINE_CAP.toLocaleString()} lines — open the full diff view
+              Preview capped at {PREVIEW_LINE_CAP.toLocaleString()} lines. Open the full diff
             </button>
           {/if}
         {:else if currentCommitId !== null}

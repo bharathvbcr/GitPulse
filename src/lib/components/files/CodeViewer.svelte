@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { hostPlatform } from "../../stores/platformStore";
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { repoStore } from "../../stores/repoStore";
@@ -23,9 +23,6 @@
   import { askConfirm } from "../../stores/modalStore";
   import { createAsyncGuard } from "../../async/guard";
   import {
-    Search,
-    ChevronUp,
-    ChevronDown,
     WrapText,
     Copy,
     Check,
@@ -33,9 +30,12 @@
     Save,
     RotateCcw,
     Hash,
+    Loader2,
   } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
+  import FindField from "../FindField.svelte";
+  import { pageSearchScope, registerPageSearch } from "../../search/pageSearch.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
@@ -73,7 +73,6 @@
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
   let actionBar: HTMLDivElement | undefined = $state();
-  let searchBar: HTMLDivElement | undefined = $state();
   let goToBar: HTMLDivElement | undefined = $state();
   let statusBar: HTMLDivElement | undefined = $state();
   const OVERSCAN = 20;
@@ -98,6 +97,12 @@
 
   // In-file search state
   let isSearchOpen = $state(false);
+  /**
+   * Mounted as the Code view's file pane, the view bar's search field is
+   * this file's find: the viewer registers as its provider and draws no Find
+   * of its own. Mounted anywhere else (a stash preview) it keeps its own.
+   */
+  const searchScope = pageSearchScope();
   let searchQuery = $state("");
   let isCaseSensitive = $state(false);
   let isRegex = $state(false);
@@ -236,6 +241,30 @@
     scrollToMatch(next);
   }
 
+  // A file opened as a page's own pane finds through the view bar's field;
+  // anywhere else (a stash preview) the toolbar Find above stays. Registered
+  // once on mount, as in DiffViewer: the scope is fixed for the viewer's life.
+  onMount(() => {
+    if (!searchScope) return;
+    return registerPageSearch(searchScope, {
+      kind: "find",
+      label: "Find in file",
+      placeholder: "Find in file…",
+      query: () => searchQuery,
+      setQuery: (next) => (searchQuery = next),
+      caseSensitive: () => isCaseSensitive,
+      setCaseSensitive: (next) => (isCaseSensitive = next),
+      regex: () => isRegex,
+      setRegex: (next) => (isRegex = next),
+      status: () => ({
+        text: matchLabel(searchResult, currentMatchIdx),
+        invalid: searchResult.invalid,
+        hasMatches: matchCount > 0,
+      }),
+      step: (delta) => (delta === 1 ? nextMatch() : prevMatch()),
+    });
+  });
+
   function scrollToMatch(idx: number) {
     const match = searchMatches[idx];
     if (!match) return;
@@ -341,7 +370,7 @@
   async function handleCopy() {
     const textToCopy = isEditing ? editDraft : content;
     if (!(await copyText(textToCopy))) {
-      repoStore.setError("Could not copy file content to clipboard");
+      repoStore.setError("Couldn't copy file content to clipboard");
       return;
     }
     copied = true;
@@ -349,7 +378,8 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    // As the page's pane, ⌘F is the view bar field's (App routes it there).
+    if (!searchScope && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
       isSearchOpen = true;
       setTimeout(() => searchInputEl?.focus(), 50);
@@ -372,7 +402,7 @@
         goToLineOpen = false;
         return;
       }
-      if (isSearchOpen) {
+      if (isSearchOpen && !searchScope) {
         isSearchOpen = false;
         searchQuery = "";
         return;
@@ -464,7 +494,7 @@
   role="textbox"
   aria-multiline="true"
   aria-readonly={isEditing ? "false" : "true"}
-  aria-label="Code Viewer"
+  aria-label="Code viewer"
 >
   <!--
     Editor chrome. The two clusters used to share one justify-between row and
@@ -473,55 +503,64 @@
     open above the bar so they do not cover the file.
   -->
   <div
-    class="relative shrink-0 border-b border-border/70 gp-section-edge bg-surface/80 select-none"
+    class="relative shrink-0 gp-section-edge bg-surface/80 select-none"
     data-tip-place="above"
   >
     <div bind:this={actionBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
     <div class="flex items-center gap-2 shrink-0">
-      <span class="text-[11px] font-mono text-textMuted">{rawLines.length}{linesTruncated ? "+" : ""} lines</span>
-      <span class="text-textMuted/40">•</span>
-      <span class="text-[11px] font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
-      <span class="text-textMuted/40">•</span>
-      <span class="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">{language}</span>
+      <span class="text-meta font-mono text-textMuted">{rawLines.length}{linesTruncated ? "+" : ""} lines</span>
+      <span class="text-faint">•</span>
+      <span class="text-meta font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
+      <span class="text-faint">•</span>
+      <span class="text-micro font-mono uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">{language}</span>
       {#if eolLabel}
-        <span class="text-textMuted/40">•</span>
+        <span class="text-faint">•</span>
         <span
-          class="text-[11px] font-mono {eol === 'mixed' ? 'text-amber-400 font-semibold' : 'text-textMuted'}"
+          class="text-meta font-mono {eol === 'mixed' ? 'text-warn font-semibold' : 'text-textMuted'}"
           title={eol === "mixed" ? editBlockedReason : `Line endings: ${eolLabel}, kept on save`}
           data-testid="code-eol"
         >{eolLabel}</span>
       {/if}
       {#if invalidUtf8Bytes > 0}
         <span
-          class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400"
+          class="text-micro font-semibold px-1.5 py-0.5 rounded bg-warn/15 text-warn"
           role="status"
           title={editBlockedReason}
           data-testid="code-lossy"
         >Not UTF-8 · {invalidUtf8Bytes} byte{invalidUtf8Bytes === 1 ? "" : "s"} shown as {"\u{FFFD}"}</span>
       {/if}
       {#if hasUnsavedChanges}
-        <span class="text-[10px] font-semibold text-amber-400" role="status">Unsaved</span>
+        <span class="text-micro font-semibold text-warn" role="status">Unsaved</span>
+      {/if}
+
+      {#if !searchScope}
+      <div class="ml-2 flex min-w-0 items-center">
+        <FindField
+          bind:open={isSearchOpen}
+          bind:query={searchQuery}
+          bind:caseSensitive={isCaseSensitive}
+          bind:regex={isRegex}
+          bind:input={searchInputEl}
+          label="Find in file"
+          placeholder="Find in file…"
+          shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+          status={matchLabel(searchResult, currentMatchIdx)}
+          invalid={searchResult.invalid}
+          hasMatches={matchCount > 0}
+          onstep={(delta) => (delta === 1 ? nextMatch() : prevMatch())}
+        />
+      </div>
       {/if}
 
       <button
         type="button"
-        onclick={() => (isSearchOpen = !isSearchOpen)}
-        class="gp-btn py-0.5! px-2! ml-2 flex items-center gap-1 text-[11px] {isSearchOpen ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
-      >
-        <Search size={11} />
-        <span>Find</span>
-        <span class="gp-keycap text-[9px]!">{shortcutTextLabel("⌘F", $hostPlatform.os)}</span>
-      </button>
-
-      <button
-        type="button"
         onclick={() => (goToLineOpen = true)}
-        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px]"
+        class="gp-btn px-2! flex items-center gap-1 text-meta" data-size="sm"
       >
         <Hash size={11} />
         <span>Go to Line</span>
-        <span class="gp-keycap text-[9px]!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
+        <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
       </button>
     </div>
 
@@ -529,7 +568,7 @@
       <button
         type="button"
         onclick={() => (wordWrap = !wordWrap)}
-        class="gp-icon-btn p-1.5! {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
         title="Word wrap (edit mode)"
       >
         <WrapText size={13} />
@@ -538,25 +577,25 @@
       <button
         type="button"
         onclick={() => (showWhitespace = !showWhitespace)}
-        class="gp-icon-btn p-1.5! {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
-        title="Toggle Whitespace Indicators"
+        class="gp-icon-btn {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        title="Show whitespace"
       >
-        <span class="font-mono text-[11px] font-bold">·_</span>
+        <span class="font-mono text-meta font-semibold">·_</span>
       </button>
 
       <!-- Zoom Controls -->
-      <div class="flex items-center rounded-full border border-border/70 bg-surface px-1.5 py-0.5 gap-1">
+      <div class="flex items-center rounded-full border border-edge bg-surface px-1.5 py-0.5 gap-1">
         <button
           type="button"
           onclick={() => (zoomPercent = Math.max(CODE_ZOOM_MIN, zoomPercent - 10))}
-          class="text-textMuted hover:text-textPrimary text-[10px] px-1"
+          class="text-textMuted hover:text-textPrimary text-micro px-1"
           title="Zoom out"
         >−</button>
-        <span class="text-[10px] font-mono text-textMuted min-w-8 text-center">{zoomPercent}%</span>
+        <span class="text-micro font-mono text-textMuted min-w-8 text-center">{zoomPercent}%</span>
         <button
           type="button"
           onclick={() => (zoomPercent = Math.min(CODE_ZOOM_MAX, zoomPercent + 10))}
-          class="text-textMuted hover:text-textPrimary text-[10px] px-1"
+          class="text-textMuted hover:text-textPrimary text-micro px-1"
           title="Zoom in"
         >+</button>
       </div>
@@ -570,7 +609,7 @@
           onclick={startEdit}
           disabled={editBlockedReason !== null}
           title={editBlockedReason ?? undefined}
-          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px]"
+          class="gp-btn px-2.5! flex items-center gap-1 text-meta" data-size="sm"
         >
           <Edit3 size={12} class="text-accent" />
           <span>Edit</span>
@@ -579,7 +618,7 @@
         <button
           type="button"
           onclick={cancelEdit}
-          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px] text-textMuted"
+          class="gp-btn px-2.5! flex items-center gap-1 text-meta text-textMuted" data-size="sm"
         >
           <RotateCcw size={12} />
           <span>Cancel</span>
@@ -588,10 +627,10 @@
           type="button"
           onclick={saveChanges}
           disabled={isSaving || !hasUnsavedChanges}
-          class="gp-btn-primary py-1! px-3! flex items-center gap-1 text-[11px]"
+          class="gp-btn-primary px-3! flex items-center gap-1 text-meta" data-size="sm"
         >
           {#if isSaving}
-            <span class="animate-spin text-xs">⏳</span>
+            <Loader2 size={12} class="animate-spin" />
           {:else}
             <Save size={12} />
           {/if}
@@ -602,12 +641,12 @@
       <button
         type="button"
         onclick={handleCopy}
-        class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px]"
+        class="gp-btn px-2.5! flex items-center gap-1 text-meta" data-size="sm"
         title="Copy whole file content"
       >
         {#if copied}
-          <Check size={12} class="text-emerald-400" />
-          <span class="text-emerald-400 font-semibold">Copied</span>
+          <Check size={12} class="text-ok" />
+          <span class="text-ok font-semibold">Copied</span>
         {:else}
           <Copy size={12} class="text-textMuted" />
           <span>Copy</span>
@@ -619,88 +658,8 @@
     <ScrollCue target={actionBar} axis="x" />
   </div>
 
-  <!-- Search Bar -->
-  {#if isSearchOpen}
-    <div class="relative shrink-0 border-b border-border/80 gp-section-edge bg-surface select-none" data-tip-place="above">
-      <div bind:this={searchBar} class="gp-header-scroll">
-        <div class="flex items-center justify-between gap-3 px-3 py-2 min-w-max w-full">
-      <div class="flex items-center gap-2 shrink-0 min-w-48 max-w-md flex-1">
-        <div class="flex items-center gap-1.5 bg-background border border-border rounded-full px-2.5 py-1 flex-1 focus-within:border-accent/70">
-          <Search size={12} class="text-textMuted shrink-0" />
-          <input
-            bind:this={searchInputEl}
-            type="text"
-            bind:value={searchQuery}
-            onkeydown={(e) => {
-              if (e.key === "Enter") {
-                if (e.shiftKey) prevMatch();
-                else nextMatch();
-              }
-            }}
-            placeholder="Find in file..."
-            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
-          />
-          {#if searchQuery}
-            <span class="text-[10px] font-mono text-textMuted shrink-0">
-              {matchLabel(searchResult, currentMatchIdx)}
-            </span>
-          {/if}
-        </div>
-
-        <div class="flex items-center gap-1">
-          <button
-            type="button"
-            onclick={() => (isCaseSensitive = !isCaseSensitive)}
-            class="px-2 py-0.5 text-[10px] font-mono rounded border transition-colors {isCaseSensitive
-              ? 'bg-accent/20 border-accent/40 text-accent font-bold'
-              : 'border-border/60 text-textMuted hover:text-textPrimary'}"
-            title="Match Case"
-          >Aa</button>
-          <button
-            type="button"
-            onclick={() => (isRegex = !isRegex)}
-            class="px-2 py-0.5 text-[10px] font-mono rounded border transition-colors {isRegex
-              ? 'bg-accent/20 border-accent/40 text-accent font-bold'
-              : 'border-border/60 text-textMuted hover:text-textPrimary'}"
-            title="Use Regular Expression"
-          >.*</button>
-        </div>
-      </div>
-
-      <div class="flex items-center gap-1">
-        <button
-          type="button"
-          onclick={prevMatch}
-          disabled={matchCount === 0}
-          class="gp-btn py-1! px-2! flex items-center gap-1"
-          title="Previous match (Shift+Enter)"
-        >
-          <ChevronUp size={12} />
-        </button>
-        <button
-          type="button"
-          onclick={nextMatch}
-          disabled={matchCount === 0}
-          class="gp-btn py-1! px-2! flex items-center gap-1"
-          title="Next match (Enter)"
-        >
-          <ChevronDown size={12} />
-        </button>
-        <button
-          type="button"
-          onclick={() => { isSearchOpen = false; searchQuery = ""; }}
-          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
-          aria-label="Close find"
-        >✕</button>
-      </div>
-        </div>
-      </div>
-      <ScrollCue target={searchBar} axis="x" />
-    </div>
-  {/if}
-
   {#if goToLineOpen}
-    <div class="relative shrink-0 border-b border-border/70 bg-surface select-none">
+    <div class="relative shrink-0 bg-surface select-none">
       <div bind:this={goToBar} class="gp-header-scroll">
         <div class="flex items-center gap-2 px-3 py-2 min-w-max">
       <span class="text-xs text-textMuted shrink-0">Go to line (1–{rawLines.length}):</span>
@@ -716,8 +675,8 @@
         placeholder="Line number"
         class="gp-field w-24!"
       />
-      <button type="button" class="gp-btn-primary py-1! px-3! shrink-0" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn py-1! px-2! shrink-0" onclick={() => (goToLineOpen = false)}>Cancel</button>
+      <button type="button" class="gp-btn-primary px-3! shrink-0" data-size="sm" onclick={handleGoToLine}>Go</button>
+      <button type="button" class="gp-btn px-2! shrink-0" data-size="sm" onclick={() => (goToLineOpen = false)}>Cancel</button>
         </div>
       </div>
       <ScrollCue target={goToBar} axis="x" />
@@ -727,7 +686,7 @@
   <!-- Main Code Surface -->
   <div class="flex-1 min-h-0 relative overflow-hidden bg-background flex flex-col">
     {#if linesTruncated && !isEditing}
-      <div class="shrink-0 px-3 py-1.5 text-[11px] text-amber-300 bg-amber-500/10 border-b border-amber-500/30">
+      <div class="shrink-0 px-3 py-1.5 text-meta text-warn bg-warn/10">
         Showing the first {MAX_RENDER_LINES.toLocaleString()} lines. Open the file externally to view the rest.
       </div>
     {/if}
@@ -776,7 +735,7 @@
                 <button
                   type="button"
                   onclick={(e) => handleLineClick(lineNum, e)}
-                  class="w-12 shrink-0 self-stretch text-right pr-3 pl-1 select-none text-[11px] font-mono text-textMuted/60 hover:text-textPrimary transition-colors cursor-pointer"
+                  class="w-12 shrink-0 self-stretch text-right pr-3 pl-1 select-none text-meta font-mono text-faint hover:text-textPrimary transition-colors cursor-pointer"
                 >
                   {lineNum}
                 </button>
@@ -805,7 +764,7 @@
   </div>
 
   <!-- Bottom Status Bar -->
-  <div class="relative shrink-0 border-t border-border/70 gp-section-edge bg-surface/90 text-[10px] font-mono text-textMuted select-none">
+  <div class="relative shrink-0 gp-section-edge bg-surface/90 text-micro font-mono text-textMuted select-none">
     <div bind:this={statusBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-3 px-3 py-1 min-w-max w-full">
     <div class="flex items-center gap-3 shrink-0">
@@ -815,7 +774,7 @@
       <span>•</span>
       <span>UTF-8</span>
       {#if saveSuccess}
-        <span class="text-emerald-400 font-bold flex items-center gap-1">✓ Saved</span>
+        <span class="text-ok font-semibold flex items-center gap-1">✓ Saved</span>
       {/if}
     </div>
     <div class="flex items-center gap-3 shrink-0">

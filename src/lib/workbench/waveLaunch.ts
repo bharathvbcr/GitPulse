@@ -107,12 +107,12 @@ export interface MainState { dirty: number | null; operation: string | null }
 /** Why the main checkout is not free to launch from or merge into, or "" when it is. A state that could not be read is not free. */
 function mainBlocker(state: MainState | null | undefined): string {
   // Free only on a reading that says so: a whole-number zero count and no operation. Anything else, a malformed reading included, is not free.
-  if (!state || typeof state !== "object") return "the main checkout could not be read";
-  if (typeof state.operation === "string" && state.operation) return `a ${state.operation} is in progress in the main checkout`;
+  if (!state || typeof state !== "object") return "the main worktree couldn't be read";
+  if (typeof state.operation === "string" && state.operation) return `a ${state.operation} is in progress in the main worktree`;
   const { dirty } = state;
-  if (typeof dirty === "number" && Number.isInteger(dirty) && dirty > 0) return `the main checkout has ${dirty} uncommitted file${dirty === 1 ? "" : "s"}`;
-  if (!(typeof dirty === "number" && Number.isInteger(dirty) && dirty === 0)) return "the main checkout's uncommitted changes could not be counted";
-  if (state.operation !== null) return "the main checkout's operation state could not be read";
+  if (typeof dirty === "number" && Number.isInteger(dirty) && dirty > 0) return `the main worktree has ${dirty} uncommitted file${dirty === 1 ? "" : "s"}`;
+  if (!(typeof dirty === "number" && Number.isInteger(dirty) && dirty === 0)) return "the main worktree's uncommitted changes couldn't be counted";
+  if (state.operation !== null) return "the main worktree's operation state couldn't be read";
   return "";
 }
 
@@ -326,7 +326,7 @@ export function resumeWave(record: WaveRecord, deps: WaveDeps): Promise<WaveRunn
 
 /** Why a verdict for the merged checkout is not a pass, or null when it is one for exactly `tip`. */
 function gateFault(verdict: VerdictRead | null, why: string, tip: string): string | null {
-  if (!verdict) return `could not run (${why})`;
+  if (!verdict) return `couldn't run (${why})`;
   if (verdict.state !== "passed") return `was ${verdict.state.replace("_", " ")}`;
   if (verdict.stale || !verdict.head || verdict.head !== tip) return "was not a verdict for the merged checkout's tip";
   return null;
@@ -368,7 +368,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     // this wave's to build on: the next batch's merges would land over it.
     let blocker: string;
     try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
-    catch (cause) { blocker = `the main checkout could not be read (${message(cause)})`; }
+    catch (cause) { blocker = `the main worktree couldn't be read (${message(cause)})`; }
     if (blocker) {
       await save({ state: "refused", note: `Nothing was launched: ${blocker}.` });
       return false;
@@ -450,7 +450,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       head = m.cwd ? await deps.headOf(m.cwd, abort.signal) : "";
     } catch (cause) {
       if (cancelled) return;
-      await update(m.taskId, { phase: "held", detail: `Verification could not run: ${message(cause)}` }); return; }
+      await update(m.taskId, { phase: "held", detail: `Verification couldn't run: ${message(cause)}` }); return; }
     if (verdict.state !== "passed") { await update(m.taskId, { phase: "held", detail: `Verification ${verdict.state.replace("_", " ")}; this is not a pass, so it is left for review.` }); return; }
     if (verdict.stale || !verdict.head || !head || verdict.head !== head) {
       await update(m.taskId, { phase: "held", detail: "The passing verdict is not for the commit the worktree is at, so it is left for review." });
@@ -479,20 +479,20 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     // Every exit below is ONE write that carries the gate outcome with the member's move out of
     // `verifying_merge`, so no record ever holds a terminal member without it, or a halt without its member.
     if (cancelled) {
-      await settle(held("The wave was stopped before the merge was re-verified; check the main checkout."), "cancelled", "Stopped by the person; no further task was launched or merged.");
+      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", "Stopped by the person; no further task was launched or merged.");
       return;
     }
     const tip = landed.mergeAfter, base = landed.mergeBefore;
     if (!tip || !base) {
       // Fail closed: without where the merge landed there is no range to judge, and nothing may read as verified.
-      await settle(held("Where the merge landed was not recorded, so it was not re-verified; check the main checkout."), "halted", `Re-verification after merging "${landed.title}" could not run (where the merge landed was not recorded); no further merge was made.`);
+      await settle(held("Where the merge landed was not recorded, so it was not re-verified; check the main worktree."), "halted", `Re-verification after merging "${landed.title}" couldn't run (where the merge landed was not recorded); no further merge was made.`);
       return;
     }
     const merged = record.members.filter((m) => m.phase === "merged" || m.phase === "verifying_merge");
     const unjudged = merged.filter((m) => !m.mergeBefore);
     if (unjudged.length > 0) {
       // A member merged by a record from before the gate has no pre-merge tip to judge it over; it is never counted as judged.
-      await settle(held("An earlier member of this batch has no recorded pre-merge tip, so the merged set was not re-verified; check the main checkout."), "halted", `Re-verification after merging "${landed.title}" could not cover ${unjudged.map((m) => `"${m.title}"`).join(", ")} (merged by a record that kept no pre-merge tip); no further merge was made.`);
+      await settle(held("An earlier member of this batch has no recorded pre-merge tip, so the merged set was not re-verified; check the main worktree."), "halted", `Re-verification after merging "${landed.title}" couldn't cover ${unjudged.map((m) => `"${m.title}"`).join(", ")} (merged by a record that kept no pre-merge tip); no further merge was made.`);
       return;
     }
     const judged = merged.flatMap((m) => (m.mergeBefore ? [{ m, base: m.mergeBefore }] : []));
@@ -501,7 +501,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       catch (cause) { return { m, verdict: null, why: message(cause) }; }
     }));
     if (cancelled) {
-      await settle(held("The wave was stopped before the merge was re-verified; check the main checkout."), "cancelled", "Stopped by the person; no further task was launched or merged.");
+      await settle(held("The wave was stopped before the merge was re-verified; check the main worktree."), "cancelled", "Stopped by the person; no further task was launched or merged.");
       return;
     }
     const faults = results.flatMap((r) => { const fault = gateFault(r.verdict, r.why, tip); return fault ? [{ m: r.m, fault }] : []; });
@@ -522,7 +522,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     if (!next || !next.cwd || !next.head) return false;
     let blocker: string;
     try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
-    catch (cause) { if (cancelled) return true; blocker = `the main checkout could not be read (${message(cause)})`; }
+    catch (cause) { if (cancelled) return true; blocker = `the main worktree couldn't be read (${message(cause)})`; }
     if (blocker) {
       await update(next.taskId, { phase: "held", detail: `Not merged: ${blocker}.` });
       return true;
@@ -567,7 +567,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       if (fresh && !(await launchBatch())) return record;
       if (interrupted) {
         await save({ members: record.members.map((m) => (m.phase === "ready" ? { ...m, phase: "held" as MemberPhase, detail: `not merged: the merge of ${interrupted.title} was interrupted and its outcome is unknown, pending` } : m)) });
-        await stopTerminal("halted", `The merge of "${interrupted.title}" was interrupted by a restart; check the main checkout and the branch before merging anything else. Nothing was launched or merged.`);
+        await stopTerminal("halted", `The merge of "${interrupted.title}" was interrupted by a restart; check the main worktree and the branch before merging anything else. Nothing was launched or merged.`);
       }
       while (record.state === "running") {
         if (fatal.raised) throw fatal.cause;
@@ -597,7 +597,7 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         try { await stopTerminal("cancelled", "Stopped by the person; no further task was launched or merged."); } catch { /* the record below still says what happened */ }
       }
       if (record.state === "running") {
-        try { await save({ state: "failed", note: `The wave stopped because its state could not be kept or read: ${message(cause)}` }); } catch { record = { ...record, state: "failed", note: `The wave stopped and its state could not be saved: ${message(cause)}` }; }
+        try { await save({ state: "failed", note: `The wave stopped because its state couldn't be kept or read: ${message(cause)}` }); } catch { record = { ...record, state: "failed", note: `The wave stopped and its state couldn't be saved: ${message(cause)}` }; }
       }
     }
     // Whatever the wave ended on, no verification of it is left waiting out its deadline.

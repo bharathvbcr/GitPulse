@@ -33,8 +33,35 @@
  *   over one key.
  */
 
+import type { TransitionConfig } from "svelte/transition";
 import { clampMenuPosition } from "../branches/menuPosition";
 import { shouldDismissOverlay } from "./dismiss";
+import { headerTransition } from "./headerMotion";
+
+/**
+ * The one exit every popover this module places leaves with, as a Svelte
+ * `out:` transition: `out:popoverExit` on the element that carries
+ * `use:popover`.
+ *
+ * It has to be a transition and not part of the action. An action's `destroy`
+ * runs as the node goes, so it has nothing left to animate; only an `out:`
+ * directive makes Svelte keep the node until the animation ends.
+ * `popover.exit.contract.test.ts` fails a `use:popover` element that lacks it
+ * (the three that own a different exit are listed there).
+ *
+ * It is `EXIT_MS.fast` (70 ms, the cap every exit shares) on transform and
+ * opacity only, over the exit curve, so a close never re-lays-out the page
+ * behind it. Reduced motion (the system preference or the in-app setting)
+ * makes the duration 0 and Svelte skips the outro, so the popover just goes.
+ * The frames are the header's own popup frames, so the repository strip's
+ * overflow menu and hover card and every other popover leave the same way.
+ *
+ * Svelte calls a transition as `(node, params, { direction })` and the exit
+ * takes none of them, so the signature is the optional-argument form the
+ * header's transitions use.
+ */
+export const popoverExit = (_node?: Element, _params?: unknown, _options?: unknown): TransitionConfig =>
+  headerTransition("popup", false);
 
 /** Why the popover was asked to close. Call sites that treat every reason
  *  alike can ignore it; those that restore focus only for Escape cannot. */

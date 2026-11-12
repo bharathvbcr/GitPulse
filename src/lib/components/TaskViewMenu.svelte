@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The Tasks board's "View" popover: density, card order, lanes, which
+   * The Tasks board's "View" popover: density, card order, grouping, which
    * columns are on screen and which chips a card carries.
    *
    * Follows the Fleet grid's Columns menu deliberately — same `gp-menu` shell,
@@ -9,7 +9,8 @@
    */
   import { Settings2, Square, SquareCheck } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { popover } from "../ui/popover";
+  import { portal } from "../dom/portal";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
@@ -27,7 +28,7 @@
   const laneIgnored = $derived(lane !== "none" && effectiveSwimlane($interfaceStore.taskLayout, lane) === "none");
 
   let open = $state(false);
-  let root: HTMLDivElement | undefined = $state();
+  let toggleEl: HTMLButtonElement | undefined = $state();
 
   const hidden = $derived(new Set($interfaceStore.taskHiddenColumns));
   const fields = $derived(new Set($interfaceStore.taskCardFields));
@@ -44,30 +45,36 @@
   );
 
   /**
-   * Dismissal only, from the shared popover owner: this panel is placed by
-   * CSS, `absolute` under its own trigger inside a `relative` wrapper, so it
-   * has no anchor to clamp and the owner leaves its position alone.
+   * Placed and dismissed by the shared popover owner: portaled to the body
+   * (the board's `.gp-pane` is paint-contained and would clip an `absolute`
+   * panel at its edge), anchored under its trigger, right-aligned, and
+   * clamped to the window. The panel grows and shrinks with the columns and
+   * chips it lists, so a count of what is shown re-places it.
    *
    * Escape bubbles rather than capturing — nothing behind the board menu also
    * closes on Escape, so there is nothing to stop propagation from.
    */
-  const dismissal = {
-    dismiss: { inside: "[data-task-view-menu]", escape: "bubble" as const },
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: toggleEl, gap: 4, align: "end" as const },
+    inset: 8,
+    revision: `${hidden.size}|${fields.size}|${lane}|${order}`,
+    dismiss: { inside: "[data-task-view-menu]", escape: "bubble" as const, resize: true },
     onDismiss: (reason: string) => {
       open = false;
       // Only Escape hands focus back. A pointer dismissal means the reader is
       // already somewhere else, and pulling focus to the trigger would take
       // them off whatever they just clicked.
-      if (reason === "escape") root?.querySelector<HTMLButtonElement>("[data-task-view-toggle]")?.focus();
+      if (reason === "escape") restoreFocusTo(toggleEl);
     },
-  };
+  });
 </script>
 
-<div class="relative" bind:this={root} data-task-view-menu>
+<div class="relative" data-task-view-menu>
   <button
     type="button"
     class="gp-btn"
     data-task-view-toggle
+    bind:this={toggleEl}
     aria-expanded={open}
     aria-haspopup="true"
     {disabled}
@@ -80,8 +87,10 @@
   </button>
   {#if open}
     <div
-      use:popover={dismissal}
-      class="view-panel absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
+      use:portal={"body"}
+      use:popover={dismissal} out:popoverExit
+      data-task-view-menu
+      class="view-panel fixed gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
       style="z-index: {LAYERS.MENU}"
       role="group"
       aria-label="Board view"
@@ -97,7 +106,7 @@
         {@render mark(compact)}<span class="flex-1 text-textPrimary">Compact cards</span>
       </button>
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-order-label">Order</p>
+      <p class="gp-label px-1.5 pt-2 pb-1" id="task-order-label">Order</p>
       <div role="radiogroup" aria-labelledby="task-order-label" class="flex flex-col gap-0.5">
         {#each TASK_ORDERS as option (option)}
           <button
@@ -115,7 +124,7 @@
       </div>
       {#if order === "priority"}<p class="note" data-testid="task-order-note">The List layout puts the most urgent rows first across every status. A search ranked by relevance keeps its own order. Priority first is priority, then due date. Suggest next also weighs severity, blockers, age, and verification.</p>{/if}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-lanes-label">Lanes</p>
+      <p class="gp-label px-1.5 pt-2 pb-1" id="task-lanes-label">Group by</p>
       <div role="radiogroup" aria-labelledby="task-lanes-label" class="flex flex-col gap-0.5">
         {#each SWIMLANES as option (option)}
           <button
@@ -130,10 +139,10 @@
           </button>
         {/each}
       </div>
-      {#if laneIgnored}<p class="note" data-testid="task-lanes-note">The board's columns are already statuses, so status lanes group the List layout only.</p>{/if}
-      {#if lane !== "none" && !laneIgnored}<p class="note">Dragging a card into another lane changes its status only.</p>{/if}
+      {#if laneIgnored}<p class="note" data-testid="task-lanes-note">The board's columns are already statuses, so grouping by status applies to the List layout only.</p>{/if}
+      {#if lane !== "none" && !laneIgnored}<p class="note">Dragging a card into another group changes its status only.</p>{/if}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Columns</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Columns</p>
       {#each STATUSES as status (status)}
         {@const hideable = canHideStatus($interfaceStore.taskHiddenColumns, status)}
         <button
@@ -150,13 +159,14 @@
         </button>
       {/each}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Work-in-progress limits</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Work-in-progress limits</p>
       <p class="note">For {boardName} only. A column over its limit is marked; nothing is refused.</p>
       {#each STATUSES as status (status)}
         <label class="limit">
           <span class="flex-1 text-textPrimary">{STATUS_LABELS[status]}</span>
           <input
             class="gp-field"
+            data-size="sm"
             type="number"
             inputmode="numeric"
             min="1"
@@ -177,7 +187,7 @@
         </label>
       {/each}
 
-      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Card shows</p>
+      <p class="gp-label px-1.5 pt-2 pb-1">Card shows</p>
       {#each TASK_CARD_FIELDS as field (field)}
         <button
           type="button"
@@ -191,14 +201,13 @@
         </button>
       {/each}
 
-      <div class="border-t border-border/60 mt-1 pt-1">
-        <button
-          type="button"
-          class="reset"
-          disabled={!customized}
-          onclick={() => interfaceStore.resetTaskView()}
-        >Reset board view</button>
-      </div>
+      <div class="gp-menu-sep" role="separator"></div>
+      <button
+        type="button"
+        class="reset"
+        disabled={!customized}
+        onclick={() => interfaceStore.resetTaskView()}
+      >Reset board view</button>
     </div>
   {/if}
 </div>
@@ -208,17 +217,17 @@
 {/snippet}
 
 <style>
-  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;width:100%}
+  .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);text-align:left;width:100%}
   .row:hover{background:rgb(var(--c-surface-hover) / 0.7)}
-  .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent) / 0.6);outline-offset:-1px}
-  .reset{width:100%;padding:4px 6px;border-radius:5px;font-size:11px;text-align:left;color:rgb(var(--c-text-muted))}
+  .row:focus-visible,.reset:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
+  .reset{width:100%;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);text-align:left;color:rgb(var(--c-text-muted))}
   .reset:hover:not(:disabled){color:rgb(var(--c-text));background:rgb(var(--c-surface-hover) / 0.7)}
   .reset:disabled{opacity:.5}
   .row:disabled{opacity:.55;cursor:default}
   /* Lanes and limits made the panel taller than a short window; it scrolls rather than run off it. */
   .view-panel{max-height:min(70vh,36rem);overflow:hidden auto}
-  .note{margin:0;padding:0 6px 4px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted))}
-  .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:11px}
-  .limit input{width:4.5rem;padding:2px 6px;font-size:11px}
+  .note{margin:0;padding:0 6px 4px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted))}
+  .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:var(--text-meta)}
+  .limit input{width:4.5rem;font-size:var(--text-meta)}
   .row:disabled:hover{background:transparent}
 </style>

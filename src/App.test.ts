@@ -209,32 +209,45 @@ describe("App overlay wiring", () => {
   it("no longer strips the commit-search bar across every view", () => {
     // It used to be a full-width row App stacked above the sidebar whenever
     // `showsCommitFilter` said so — one of four horizontal bands before any
-    // content. The bar lives inside History's section bar now, which is the
-    // only view it filters, so App must not mount it at all.
+    // content. The search is the view bar's field now, so App must not mount
+    // a bar of its own at all.
     expect(source).not.toContain("<FilterBar");
+    expect(source).not.toContain("<PageSearch");
     expect(source).not.toContain("showsCommitFilter");
   });
 
-  it("switches to Graph before focusing commit search when the bar is unmounted", () => {
+  it("lands native Search Commits on History's graph before focusing the field", () => {
+    // The field filters commits only on Graph; elsewhere it finds or runs the
+    // palette. Switching the view alone left History's Diff section showing,
+    // where the menu item focused a find instead of the commit filter.
     const fn = source.slice(
       source.indexOf("async function focusCommitSearch"),
       source.indexOf("onMount(() => {"),
     );
     expect(fn).toContain("tabForCommitSearch");
-    expect(fn).toContain("repoStore.setActiveTab(target)");
-    expect(fn).toContain("FOCUS_COMMIT_SEARCH_EVENT");
+    expect(fn).toContain("repoStore.setActiveTab(target, COMMIT_FILTER_SECTION)");
+    expect(fn).toContain("focusPageSearch()");
     expect(source).toContain("focusFilter: () => void focusCommitSearch()");
   });
 
-  it("asks the chord owner about the section, not only about the view", () => {
-    // History's Diff section reads a file's lines and owns ⌘F for finding
-    // inside them; its Graph section (commits or HEAD moves) is a list and
-    // hands the chord to the filter that narrows it. Passing only the view made
-    // ⌘F focus the commit filter over an open diff.
-    expect(source).toContain(
-      "ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))",
-    );
-    expect(source).toContain('import { activeSectionFor } from "./lib/views/viewRegistry"');
+  it("sends ⌘F to the field on every page, never by view or section", () => {
+    // History's Diff and Code used to keep the chord for toolbar find bars of
+    // their own. Those panes find through the field now, so ⌘F switches
+    // nothing: it focuses the field, and the page decides what the field does.
+    const handler = source.slice(source.indexOf("isCommitSearchChord(e) &&"));
+    const branch = handler.slice(0, handler.indexOf("return;"));
+    expect(branch).toContain("fieldOwnsFindChord({");
+    expect(branch).toContain('onRepositorySurface: $interfaceStore.globalSurface === "repository"');
+    expect(branch).toContain("defaultPrevented: e.defaultPrevented");
+    expect(branch).toContain("focusPageSearch();");
+    expect(branch).not.toContain("focusCommitSearch");
+  });
+
+  it("opens Clone and Rebase for the palette the view bar runs inline", () => {
+    // The field's palette is mounted outside App, so its Clone and Rebase
+    // commands cannot call App's openers directly.
+    expect(source).toContain('window.addEventListener("gitpulse:clone", openCloneDialog)');
+    expect(source).toContain('window.addEventListener("gitpulse:rebase", openRebaseDialog)');
   });
 
   it("keeps PromptModal and DiagnosticsModal in separate crash boundaries", () => {
@@ -456,22 +469,71 @@ describe("App display preferences", () => {
   });
 });
 
+const viewBarSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "lib", "components", "ViewBar.svelte"),
+  "utf8",
+);
+
+describe("the two header rows", () => {
+  it("puts the title bar above the view bar, and the repository tabs inside the title bar", () => {
+    const header = source.indexOf("<header");
+    const headerEnd = source.indexOf("</header>");
+    const tabs = source.indexOf("<RepoTabBar");
+    const viewBar = source.indexOf("<ViewBar");
+    expect(header).toBeGreaterThan(-1);
+    expect(tabs).toBeGreaterThan(header);
+    expect(tabs).toBeLessThan(headerEnd);
+    // Row 2 follows row 1 and sits under the same crash boundary.
+    expect(viewBar).toBeGreaterThan(headerEnd);
+    expect(source.indexOf("</svelte:boundary>", viewBar)).toBeGreaterThan(viewBar);
+    expect(source.slice(source.indexOf("<svelte:boundary"), header)).toContain('paneCrashes.report("header"');
+  });
+
+  it("drops the wordmark: the title bar carries the logo mark and no control after it but the tabs", () => {
+    const row = source.slice(source.indexOf("<header"), source.indexOf("</header>"));
+    expect(row).toContain("<Logo size={19}");
+    expect(row).not.toContain(">GitPulse<");
+    // The old inline Refresh moved to the view bar.
+    expect(row).not.toContain("Refresh Status");
+    expect(row).not.toContain("RefreshCw");
+  });
+
+  it("orders the host-wide chips Manvi then Diagnostics, last, so the badge sits at the corner", () => {
+    const row = source.slice(source.indexOf('class="gp-titlebar-actions'), source.indexOf("</header>"));
+    expect(row.indexOf("<HarnessBadge")).toBeGreaterThan(-1);
+    expect(row.indexOf("<HarnessBadge")).toBeLessThan(row.indexOf('aria-label="Open Diagnostics"'));
+  });
+
+  it("makes each row its own container and gives both the dense glass fill", () => {
+    expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 200)).toContain("@container");
+    expect(source.slice(source.indexOf("<header"), source.indexOf("<header") + 300)).toContain("gp-repo-tabs");
+    expect(viewBarSource).toContain("@container gp-glass gp-repo-tabs");
+    expect(viewBarSource).toMatch(/<nav[^>]*\bdata-viewbar\b/s);
+  });
+
+  it("stamps the traffic-light inset a class the full-screen rule can collapse", () => {
+    expect(source).toContain('class="gp-traffic-inset h-full shrink-0"');
+    expect(source).not.toContain("w-[76px]");
+  });
+});
+
 /**
- * The title-bar row is `min-w-full w-max`, so everything in it counts toward
- * the scroller's width. A drag spacer with a minimum width, or padding after
- * the last control, made the row wider than the header by that much while
- * every control was in view: the overflow cue then sat on the right edge over
- * empty space (at ~912-940px wide), and its chevron scrolled into nothing.
+ * The view switcher's row is `min-w-full w-max`, so everything in it counts
+ * toward the scroller's width. A drag spacer with a minimum width, or padding
+ * after the last control, made the row wider than the scroller by that much
+ * while every control was in view: the overflow cue then sat on the right edge
+ * over empty space (at ~912-940px wide), and its chevron scrolled into
+ * nothing. The view bar keeps the spacer OUTSIDE the scroller for that reason.
  */
 describe("title-bar overflow", () => {
-  const start = source.indexOf("bind:this={headerScroller}");
-  const end = source.indexOf("<ScrollCue target={headerScroller}", start);
-  const region = source.slice(start, end);
+  const start = viewBarSource.indexOf("bind:this={scroller}");
+  const end = viewBarSource.indexOf("<ScrollCue target={scroller}", start);
+  const region = viewBarSource.slice(start, end);
 
   it("is measured from the controls, not from empty space", () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    const row = /<div class="([^"]*min-w-full w-max[^"]*)"([^>]*)>/.exec(region);
+    const row = /<div class="([^"]*min-w-full[^"]*w-max[^"]*|[^"]*w-max[^"]*min-w-full[^"]*)"([^>]*)>/.exec(region);
     expect(row).not.toBeNull();
     // No padding after the last control...
     expect(row![1]).not.toMatch(/(^|\s)(px|pr|pe)-/);

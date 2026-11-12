@@ -42,6 +42,19 @@
     <Checkbox ariaLabel="Disabled box" disabled onchange={() => (disabledTicks += 1)} />
   </div>
   <div data-testid="checkbox-state" data-ticked={ticked} data-tick-changes={tickChanges} data-confirmed={confirmed} data-mixed={mixed} data-disabled-ticks={disabledTicks}></div>
+  <!-- One of each sized control, unmarked and at both declared sizes, for the
+       height checks. The icon is an inline 14px box, the size every icon
+       button in the app draws. -->
+  <div data-testid="sizes" class="flex items-start gap-2">
+    {#each ["", "sm", "md"] as size (size)}
+      <button type="button" class="gp-btn" data-size={size || undefined} data-control="btn" data-sized={size}>Label</button>
+      <button type="button" class="gp-icon-btn" data-size={size || undefined} data-control="icon-btn" data-sized={size} aria-label="Icon {size}"><svg width="14" height="14" aria-hidden="true"></svg></button>
+    {/each}
+    {#each ["", "sm"] as size (size)}
+      <input class="gp-field" data-size={size || undefined} data-control="field" data-sized={size} aria-label="Field {size}" />
+      <select class="gp-select" data-size={size || undefined} data-control="select" data-sized={size} aria-label="Select {size}"><option>One</option></select>
+    {/each}
+  </div>
   <div data-testid="slider">
     <Slider label="Level" min={0} max={100} step={5} bind:value={level} format={(n) => `${n}%`} oninput={() => (inputs += 1)} />
   </div>

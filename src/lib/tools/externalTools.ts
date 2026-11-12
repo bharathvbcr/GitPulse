@@ -276,11 +276,11 @@ export function classifyMapFailure(input: {
 export function mapFailureMessage(mode: MapFailureMode, fallback?: string | null): string {
   switch (mode) {
     case "no_cli":
-      return "devmap CLI is not installed — run Setup to install it.";
+      return "The code map tool is not installed — run Setup to install it.";
     case "no_sqlite_store":
-      return "No codeintel sqlite store yet — click Build to index this repository.";
+      return "No code map yet — click Build to index this repository.";
     case "no_json_artifact":
-      return "No repo_map.json artifact yet — click Build to generate the navigator map.";
+      return "No code map overview yet — click Build to generate it.";
     default:
       // The fallback is the build's own stderr — a process's output, with no
       // length anyone controls. Every other branch here is a fixed sentence;

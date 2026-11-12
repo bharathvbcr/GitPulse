@@ -10,3 +10,5 @@
 </p>
 <p>{busy ? "Retry attempt" : "Done"}</p>
 <button title={open ? "Open repo" : "Close"}>x</button>
+<p>The log could not be read</p>
+<p title="Could not save">x</p>

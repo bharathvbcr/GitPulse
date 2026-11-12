@@ -1,0 +1,46 @@
+{
+  "comment": "The design-lint gate's exemptions, read by `node scripts/design-lint.mjs --strict` (the `design:gate` step of `bun run ci:local`). Every violation outside this file fails the gate. `allow` is permanent and reported on every run as `allowed`; `deferred` is temporary and held to the baseline ratchet only. The gate also fails on an entry that matches no violation, so an exemption cannot outlive what it excused.",
+  "allow": [
+    {
+      "rule": 4,
+      "file": "src/lib/components/Logo.svelte",
+      "reason": "Brand art: the GitPulse mark's gradient stops are the logo's own colors. No design token maps to them, and tokenizing them would make the mark change with the theme."
+    },
+    {
+      "rule": 4,
+      "file": "src/lib/components/files/MarkDevLogo.svelte",
+      "reason": "Brand art: the MarkDev mark's gradient stops belong to another product's identity. No design token maps to them, and they must not follow the theme."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/components/FirebasePanel.svelte",
+      "term": "project",
+      "reason": "Vendor term: a Firebase project and a Google Cloud project are the vendor's own objects, not repositories. Backends live on a project and the App Hosting API is enabled on one, so the copy must say project. Only the bare uses remain here; the qualified ones (Firebase project, project alias, project ID) pass by shape."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/workbench/taskCompose.ts",
+      "term": "snake_case identifier",
+      "reason": "Agent prompt, not interface copy: the text is read by a model, which must be given the exact MCP tool and argument names (gitpulse_complete_task, repo_path). A person never reads it."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/secrets/agentPrompt.ts",
+      "term": "project",
+      "reason": "Agent prompt, not interface copy: the text is read by a model working in a checkout, where the project's own secret store is the project's, not a GitPulse repository. A person never reads it."
+    },
+    {
+      "rule": 14,
+      "file": "src/lib/components/BrowserSession.svelte",
+      "term": "Reload",
+      "reason": "The embedded browser's own verb: its toolbar mirrors a browser's back, forward and reload controls, and reload re-fetches the page from the network, which is not what Refresh (re-read local state) means."
+    },
+    {
+      "rule": 12,
+      "file": "src/lib/components/HarnessBadge.svelte",
+      "term": "<select>",
+      "reason": "An invisible native <select> (opacity 0, inset 0) sits over a gp-select face that draws the chosen model with its own icon. The native element keeps keyboard, screen-reader role and the platform popup; the painting is the gp-select span beside it."
+    }
+  ],
+  "deferred": []
+}

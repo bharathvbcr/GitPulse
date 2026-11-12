@@ -60,8 +60,8 @@
   });
 </script>
 
-<div class="space-y-1 text-[11px]" data-testid="lappi-settings">
-  <div class="text-textMuted text-[10px] mb-1.5">Lappi</div>
+<div class="space-y-1 text-meta" data-testid="lappi-settings">
+  <div class="text-textMuted text-micro mb-1.5">Lappi</div>
   <SettingToggle
     label="Ask Lappi on ambiguous commit types"
     description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket. This is separate from AI commit-message generation, which has its own consent. Its answer can only pre-select the type in the draft you edit."
@@ -87,7 +87,7 @@
     </p>
   {/if}
   {#if error}
-    <p class="text-amber-600 dark:text-amber-400" role="alert">{error}</p>
-    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
+    <p class="text-warn" role="alert">{error}</p>
+    <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Try again</button>
   {/if}
 </div>

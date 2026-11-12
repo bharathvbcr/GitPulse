@@ -4,6 +4,7 @@ import { mount } from "svelte";
 import { applyPlatformClass, isTauri } from "./lib/platform";
 import { installBrowseRequests } from "./lib/browser/browseRequests";
 import { loadHostPlatform } from "./lib/stores/platformStore";
+import { installNativeRendering } from "./lib/desktop/nativeRendering";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
 import { installResponsivenessDiagnostics } from "./lib/diagnostics/responsiveness";
 import { installNavigationDiagnostics } from "./lib/diagnostics/navigation";
@@ -28,6 +29,16 @@ configureReadCancellation(CANCELLABLE_READ_COMMANDS, cancelRead);
 // it off here rather than on first subscribe keeps a gated control from popping
 // into the settings page a moment after it opens.
 void loadHostPlatform();
+
+// The two opt-in macOS rendering switches (Liquid Glass, 120 Hz). Both are off
+// by default, and with both off nothing is sent: the window already has its
+// standard material and WebKit its default pacing. Once a switch is on, its
+// stored value is sent after the host profile arrives, and any refusal is
+// written to Diagnostics with its reason.
+if (isTauri()) {
+  const stopNativeRendering = installNativeRendering();
+  import.meta.hot?.dispose(stopNativeRendering);
+}
 
 // Capture every failure channel (uncaught errors, unhandled rejections,
 // console.error/warn) into the diagnostics ring buffer; the originals still

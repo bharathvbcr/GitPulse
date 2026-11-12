@@ -68,6 +68,7 @@
     cardScaleOut,
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "../ipc/invoke";
@@ -154,7 +155,7 @@
 
   /** What to say about the attribution daemon, or null when there is nothing to say. */
   function daemonNoticeFor(status: DaemonStatus): string | null {
-    if (status.error) return `The attribution daemon could not be checked: ${redactDiagnosticText(String(status.error))}`;
+    if (status.error) return `The attribution daemon couldn't be checked: ${redactDiagnosticText(String(status.error))}`;
     if (!status.running || !status.mismatch) return null;
     return `A gitpulsed from another version (${redactDiagnosticText(String(status.version ?? "unknown"))}, this app is ${redactDiagnosticText(String(status.app_version))}) is running${status.pid ? ` as pid ${status.pid}` : ""}. Restart it so it writes with this version's rules.`;
   }
@@ -261,7 +262,7 @@
         report,
         "",
         "Backend memory log — unavailable",
-        `  ! could not be read: ${memoryReadError}`,
+        `  ! couldn't be read: ${memoryReadError}`,
       ].join("\n");
     }
     report = withPersistedLogSection(
@@ -302,7 +303,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-xl max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between gap-3">
+      <div class="p-4 gp-section-edge flex items-center justify-between gap-3">
         <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0">
           <Activity size={16} class="text-accent" />
           <span>Diagnostics</span>
@@ -319,135 +320,135 @@
             >
               <span>{option.label}</span>
               {#if option.value === "error" && errorCount > 0}
-                <span class="ml-1 px-1 rounded-full bg-rose-500/20 text-rose-400 text-[10px] font-semibold">{errorCount}</span>
+                <span class="ml-1 px-1 rounded-full bg-danger/20 text-danger text-micro font-semibold">{errorCount}</span>
               {:else if option.value === "warning" && warningCount > 0}
-                <span class="ml-1 px-1 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-semibold">{warningCount}</span>
+                <span class="ml-1 px-1 rounded-full bg-warn/20 text-warn text-micro font-semibold">{warningCount}</span>
               {/if}
             </button>
           {/each}
         </div>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-y-auto p-2 space-y-2">
+      <div class="min-h-0 flex-1 overflow-y-auto p-2 space-y-2 scroll-py-8" data-dialog-body use:scrollEdgeFade>
         <section
           aria-label="Backend diagnostics"
-          class="rounded-xl border border-border/70 bg-background px-3 py-2 space-y-2"
+          class="rounded-xl border border-edge bg-background px-3 py-2 space-y-2"
         >
           <div class="flex items-center gap-2">
             <span
               class="h-2 w-2 rounded-full shrink-0 {backendStatus === 'healthy'
-                ? 'bg-emerald-400'
+                ? 'bg-ok'
                 : backendStatus === 'degraded' || backendStatus === 'empty'
-                  ? 'bg-amber-400'
+                  ? 'bg-warn'
                   : backendStatus === 'unavailable'
-                    ? 'bg-rose-400'
+                    ? 'bg-danger'
                     : 'bg-textMuted'}"
             ></span>
             <span class="font-medium text-textPrimary" role="status" aria-live="polite">{backendStatusLabel(backendStatus)}</span>
             {#if backendStatus === "degraded" || backendStatus === "unavailable"}
               <button
                 type="button"
-                class="gp-btn py-0.5! px-2! ml-auto"
+                class="gp-btn px-2! ml-auto" data-size="sm"
                 onclick={() => void beginBackendLoad()}
-              >Retry</button>
+              >Try again</button>
             {/if}
           </div>
 
-          <div class="border-t border-border/50 pt-2 space-y-1">
+          <div class="pt-2 space-y-1">
             <div class="flex items-center gap-2" role="status" aria-live="polite">
               <span>{diagnosticPersistenceLabel($diagnosticHealth)}</span>
               {#if $diagnosticHealth.persistence === "memory-only"}
-                <button type="button" class="gp-btn py-0.5! px-2! ml-auto" onclick={() => diagnostics.retryPersistence()}>Retry saving</button>
+                <button type="button" class="gp-btn px-2! ml-auto" data-size="sm" onclick={() => diagnostics.retryPersistence()}>Try saving again</button>
               {/if}
             </div>
             {#if $diagnosticHealth.persistenceError}
-              <p class="text-[11px] text-amber-300 wrap-break-word">{$diagnosticHealth.persistenceError}</p>
+              <p class="text-meta text-warn wrap-break-word">{$diagnosticHealth.persistenceError}</p>
             {/if}
             {#if $diagnosticHealth.restorationError}
-              <p class="text-[11px] text-amber-300 wrap-break-word">Saved history incomplete: {$diagnosticHealth.restorationError}</p>
+              <p class="text-meta text-warn wrap-break-word">Saved history incomplete: {$diagnosticHealth.restorationError}</p>
             {/if}
             {#if $diagnosticHealth.suppressedRuntimeEvents > 0}
-              <p class="text-[11px] text-textMuted">{$diagnosticHealth.suppressedRuntimeEvents} runtime notifications suppressed this session.</p>
+              <p class="text-meta text-textMuted">{$diagnosticHealth.suppressedRuntimeEvents} runtime notifications suppressed this session.</p>
             {/if}
           </div>
 
           {#if memoryReadError}
-            <p class="text-[11px] text-amber-300 wrap-break-word">Current-session log could not be read: {memoryReadError}</p>
+            <p class="text-meta text-warn wrap-break-word">Current-session log couldn't be read: {memoryReadError}</p>
           {/if}
           {#if daemonNotice}
-            <p class="text-[11px] text-amber-300 wrap-break-word">{daemonNotice}</p>
+            <p class="text-meta text-warn wrap-break-word">{daemonNotice}</p>
           {/if}
           {#each degradedSubsystems as degraded (degraded.subsystem)}
-            <p class="text-[11px] text-amber-300 wrap-break-word">
+            <p class="text-meta text-warn wrap-break-word">
               {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and {degraded.stopped ? "has stopped; restart GitPulse to bring it back" : "is retrying"}: {degraded.reason}
             </p>
           {/each}
           {#if persistedLog?.degraded}
-            <p class="text-[11px] text-amber-300 wrap-break-word">Durable log is incomplete: {persistedLog.degraded}</p>
+            <p class="text-meta text-warn wrap-break-word">Durable log is incomplete: {persistedLog.degraded}</p>
           {/if}
           {#if persistedLog?.path}
-            <p class="text-[10px] text-textMuted font-mono break-all">Durable log: {persistedLog.path}</p>
+            <p class="text-micro text-textMuted font-mono break-all">Durable log: {persistedLog.path}</p>
           {/if}
 
           {#if backendLines.length > 0}
             <details open={$diagnostics.length === 0}>
-              <summary class="cursor-pointer text-[11px] text-textMuted">Current session ({backendLines.length} lines)</summary>
-              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed text-textPrimary select-text">{backendLines.join("\n")}</pre>
+              <summary class="cursor-pointer text-meta text-textMuted">Current session ({backendLines.length} lines)</summary>
+              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-micro leading-relaxed text-textPrimary select-text">{backendLines.join("\n")}</pre>
             </details>
           {/if}
           {#if persistedLog && persistedLog.lines.length > 0}
             <details open={$diagnostics.length === 0}>
-              <summary class="cursor-pointer text-[11px] text-textMuted">Durable history ({persistedLog.lines.length} lines)</summary>
-              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed text-textPrimary select-text">{persistedLog.lines.join("\n")}</pre>
+              <summary class="cursor-pointer text-meta text-textMuted">Durable history ({persistedLog.lines.length} lines)</summary>
+              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-micro leading-relaxed text-textPrimary select-text">{persistedLog.lines.join("\n")}</pre>
             </details>
           {/if}
         </section>
 
-        <div class="px-1 pt-1 text-[10px] font-semibold uppercase tracking-wider text-textMuted">
+        <div class="px-1 pt-1 gp-label">
           Frontend diagnostics
         </div>
         {#each visibleEntries as entry (entry.id)}
           <div
             class="rounded-xl border px-3 py-2 {entry.severity === 'error'
-              ? 'border-rose-500/25 bg-rose-500/5'
-              : 'border-amber-500/25 bg-amber-500/5'}"
+              ? 'border-danger/35 bg-danger/5'
+              : 'border-warn/35 bg-warn/5'}"
           >
             <div class="flex items-center gap-2 mb-1">
               {#if entry.severity === "error"}
-                <CircleAlert size={12} class="text-rose-400 shrink-0" />
+                <CircleAlert size={12} class="text-danger shrink-0" />
               {:else}
-                <TriangleAlert size={12} class="text-amber-400 shrink-0" />
+                <TriangleAlert size={12} class="text-warn shrink-0" />
               {/if}
               <span
-                class="text-[10px] font-semibold uppercase tracking-wider {entry.severity === 'error'
-                  ? 'text-rose-400'
-                  : 'text-amber-400'}"
+                class="text-micro font-semibold {entry.severity === 'error'
+                  ? 'text-danger'
+                  : 'text-warn'}"
               >{entry.severity}</span>
-              <span class="px-1.5 py-px rounded-md bg-surfaceHover text-[10px] text-textMuted font-mono">{entry.source}</span>
+              <span class="px-1.5 py-px rounded-sm bg-surfaceHover text-micro text-textMuted font-mono">{entry.source}</span>
               <!-- Only entries that did not come from the running build are
                    marked, so the badge means something when it appears: the
                    ring is persisted, so a log can outlive the build that
                    wrote it and describe a bug that is already fixed. -->
               {#if staleBuildNote(entry.version, APP_VERSION)}
                 <span
-                  class="px-1.5 py-px rounded-md bg-amber-500/15 text-[10px] text-amber-400/90 font-mono shrink-0"
+                  class="px-1.5 py-px rounded-sm bg-warn/15 text-micro text-warn/90 font-mono shrink-0"
                   title="Recorded by {entry.version ?? 'an earlier build'}; this app is running {APP_VERSION}."
                 >{entry.version ?? "older build"}</span>
               {/if}
-              <span class="text-[10px] text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticTime(entry.at)}</span>
+              <span class="text-micro text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticTime(entry.at)}</span>
               <!-- Repeats are grouped by fingerprint, so occurrences can
                    differ in per-run detail. Saying so keeps the counter from
                    reading as N verbatim copies of the text below it. -->
               {#if entry.count > 1}
                 <span
-                  class="px-1.5 py-px rounded-full bg-surfaceHover text-[10px] font-semibold text-textPrimary shrink-0"
+                  class="px-1.5 py-px rounded-full bg-surfaceHover text-micro font-semibold text-textPrimary shrink-0"
                   title={entry.varied
                     ? `${entry.count} occurrences; they were not identical — the most recent is shown.`
                     : `${entry.count} identical occurrences.`}
                 >×{entry.count}{entry.varied ? " differing" : ""}</span>
               {/if}
             </div>
-            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-[11px] leading-relaxed text-textPrimary m-0">{entry.message}</pre>
+            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0">{entry.message}</pre>
           </div>
         {:else}
           <div class="py-10 text-center text-textMuted flex flex-col items-center gap-3" role="status">
@@ -455,7 +456,7 @@
               <span>{hiddenNotice}</span>
               <button
                 type="button"
-                class="gp-btn py-1! px-2.5! text-[11px]!"
+                class="gp-btn px-2.5! text-meta!" data-size="sm"
                 onclick={() => (filter = "all")}
               >
                 Show all
@@ -467,25 +468,25 @@
         {/each}
       </div>
 
-      <div class="p-3 border-t border-border/60 gp-section-edge bg-surfaceHover/30 shrink-0 space-y-2">
-        <p class="text-[10px] leading-relaxed text-textMuted">
+      <div class="p-3 gp-section-edge bg-surfaceHover/30 shrink-0 space-y-2">
+        <p class="text-micro leading-relaxed text-textMuted">
           Review local paths and command output before sharing. Copy only places the report on your
           clipboard; it does not upload or delete any logs.
         </p>
         <div class="flex justify-between gap-2">
           <button type="button" class="gp-btn" onclick={copyReport} disabled={copying}>
             {#if copied}
-              <Check size={13} class="text-emerald-400" />
+              <Check size={13} class="text-ok" />
               <span>Copied</span>
             {:else if copyFailed}
-              <TriangleAlert size={13} class="text-rose-400" />
-              <span class="text-rose-400">Copy failed</span>
+              <TriangleAlert size={13} class="text-danger" />
+              <span class="text-danger">Copy failed</span>
             {:else if copying}
               <Activity size={13} class="animate-spin" />
               <span>Preparing…</span>
             {:else}
               <ClipboardCopy size={13} />
-              <span>Copy Report</span>
+              <span>Copy report</span>
             {/if}
           </button>
           <div class="flex gap-2">

@@ -15,6 +15,7 @@
    */
   import { onDestroy, untrack } from "svelte";
   import { ScanSearch, X } from "@lucide/svelte";
+  import { LAYERS } from "../ui/layers";
   import { explainError } from "../workbench/client";
   import { PRIORITY_LABELS } from "../workbench/taskPriority";
   import {
@@ -147,23 +148,23 @@
 <svelte:window onkeydown={(event) => { if (open && event.key === "Escape") open = false; }} />
 
 {#if repositoryPath}
-  <button type="button" class="gp-btn dock-trigger" data-testid="proposals-open" aria-expanded={open} onclick={() => { open = !open; }}>
-    <ScanSearch size={14} aria-hidden="true" /> Proposals{#if view && view.new_count > 0} <span class="count">{view.new_count}</span>{/if}
+  <button type="button" class="gp-btn dock-trigger" style="z-index: {LAYERS.SCROLL_CUE}" data-testid="proposals-open" aria-expanded={open} onclick={() => { open = !open; }}>
+    <ScanSearch size={14} aria-hidden="true" /> Proposals{#if view && view.new_count > 0} <span class="gp-chip" data-kind="count" data-tone="accent">{view.new_count}</span>{/if}
   </button>
 {/if}
 
 {#if open}
-  <aside class="drawer bg-surface shadow-float" aria-label="Gap scan proposals" data-testid="proposals-drawer">
+  <aside class="drawer bg-surface shadow-float" aria-label="Gap scan proposals" style="z-index: {LAYERS.DROP_OVERLAY}" data-testid="proposals-drawer">
     <header>
       <h2>Gap scan</h2>
       <span class="actions">
         {#if running}
           <button type="button" class="gp-btn" data-testid="proposals-stop" onclick={stop}>Stop</button>
         {/if}
-        <button type="button" class="gp-btn primary" data-testid="proposals-scan" disabled={starting || running} onclick={start}>
-          {view ? "Scan again" : "Scan repository"}
+        <button type="button" class="gp-btn" data-variant="primary" data-testid="proposals-scan" disabled={starting || running} onclick={start}>
+          {view ? "Rescan" : "Scan repository"}
         </button>
-        <button type="button" class="icon" aria-label="Close proposals" onclick={() => { open = false; }}><X size={14} aria-hidden="true" /></button>
+        <button type="button" class="gp-icon-btn" data-size="md" aria-label="Close proposals" onclick={() => { open = false; }}><X size={14} aria-hidden="true" /></button>
       </span>
     </header>
 
@@ -200,9 +201,9 @@
           {@const mine = drafts[proposal.fingerprint]}
           <li class="proposal" class:dismissed={dismissed.has(proposal.fingerprint)} data-testid="proposal-{proposal.fingerprint}">
             <div class="head">
-              <span class="chip">{categoryLabel(proposal.category)}</span>
-              {#if proposal.status === "attached"}<span class="chip on-board">On the board</span>
-              {:else if proposal.status === "known"}<span class="chip">Seen in an earlier scan</span>{/if}
+              <span class="gp-chip" data-kind="label">{categoryLabel(proposal.category)}</span>
+              {#if proposal.status === "attached"}<span class="gp-chip" data-kind="label" data-tone="accent">On the board</span>
+              {:else if proposal.status === "known"}<span class="gp-chip" data-kind="label">Seen in an earlier scan</span>{/if}
             </div>
             <p class="title">{proposal.title}</p>
             {#if proposal.status === "attached"}
@@ -235,20 +236,20 @@
             {#if mine}
               <div class="editor" data-testid="proposal-editor">
                 <label>Title <input class="gp-field" data-testid="proposal-edit-title" bind:value={mine.title} maxlength="300" /></label>
-                <label>Description <textarea class="gp-field" rows="5" bind:value={mine.description}></textarea></label>
+                <label>Description <textarea class="gp-field-multi" rows="5" bind:value={mine.description}></textarea></label>
                 <label>Priority
-                  <select class="gp-field" bind:value={mine.priority}>
+                  <select class="gp-select" bind:value={mine.priority}>
                     {#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}
                   </select>
                 </label>
                 <span class="actions">
-                  <button type="button" class="gp-btn primary" data-testid="proposal-file-edited" disabled={busy.has(proposal.fingerprint) || !mine.title.trim()} onclick={() => file(proposal, mine)}>File edited task</button>
+                  <button type="button" class="gp-btn" data-variant="primary" data-testid="proposal-file-edited" disabled={busy.has(proposal.fingerprint) || !mine.title.trim()} onclick={() => file(proposal, mine)}>File edited task</button>
                   <button type="button" class="gp-btn" onclick={() => { delete drafts[proposal.fingerprint]; }}>Cancel</button>
                 </span>
               </div>
             {:else if proposal.status !== "attached" && !done}
               <span class="actions">
-                <button type="button" class="gp-btn primary" data-testid="proposal-accept" disabled={busy.has(proposal.fingerprint)} onclick={() => file(proposal, draftOf(proposal))}>Accept</button>
+                <button type="button" class="gp-btn" data-variant="primary" data-testid="proposal-accept" disabled={busy.has(proposal.fingerprint)} onclick={() => file(proposal, draftOf(proposal))}>Accept</button>
                 <button type="button" class="gp-btn" data-testid="proposal-edit" onclick={() => edit(proposal)}>Edit</button>
                 {#if !dismissed.has(proposal.fingerprint)}
                   <button type="button" class="gp-btn" data-testid="proposal-dismiss" onclick={() => dismiss(proposal)}>Dismiss</button>
@@ -260,7 +261,7 @@
       </ul>
 
       {#if hiddenCount > 0}
-        <button type="button" class="gp-btn link" data-testid="proposals-show-dismissed" onclick={() => { showDismissed = !showDismissed; }}>
+        <button type="button" class="gp-btn self-start" data-variant="ghost" data-testid="proposals-show-dismissed" onclick={() => { showDismissed = !showDismissed; }}>
           {showDismissed ? "Hide" : "Show"} {hiddenCount} dismissed
         </button>
       {/if}
@@ -271,32 +272,27 @@
 {/if}
 
 <style>
-  .dock-trigger{position:absolute;right:14px;bottom:14px;z-index:20;display:inline-flex;align-items:center;gap:6px}
-  .count{min-width:16px;padding:0 5px;border-radius:8px;background:rgb(var(--c-accent));color:rgb(var(--c-bg));font-size:10px;text-align:center}
-  .drawer{position:absolute;top:0;right:0;bottom:0;z-index:30;width:min(30rem,100%);box-sizing:border-box;padding:12px 14px;overflow:auto;border-left:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px;color:rgb(var(--c-text));background-color:rgb(var(--c-surface) / 0.94)}
+  .dock-trigger{position:absolute;right:14px;bottom:14px;display:inline-flex;align-items:center;gap:6px}
+  .drawer{position:absolute;top:0;right:0;bottom:0;width:min(30rem,100%);box-sizing:border-box;padding:12px 14px;overflow:auto;border-left:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px;color:rgb(var(--c-text));background-color:rgb(var(--c-surface) / 0.94)}
   header{display:flex;align-items:center;justify-content:space-between;gap:8px}
-  h2{margin:0;font-size:14px;font-weight:650}
+  h2{margin:0;font-size:var(--text-sm);font-weight:600}
   .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-  .icon{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent}
-  .lede,.state,.empty{margin:0;font-size:12px;color:rgb(var(--c-text-muted))}
-  .error{margin:0;font-size:12px;color:rgb(var(--c-status-red))}
-  .coverage{padding:8px 10px;border-radius:10px;font-size:12px;border:1px solid rgb(var(--c-border) / 0.65)}
+  .lede,.state,.empty{margin:0;font-size:var(--text-xs);color:rgb(var(--c-text-muted))}
+  .error{margin:0;font-size:var(--text-xs);color:rgb(var(--c-danger))}
+  .coverage{padding:8px 10px;border-radius: var(--gp-r-md);font-size:var(--text-xs);border:1px solid rgb(var(--c-border) / 0.65)}
   .coverage ul{margin:4px 0 0;padding-left:16px}
   .list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
-  .proposal{padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:12px}
+  .proposal{padding:10px;border-radius: var(--gp-r-lg);border:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:6px;font-size:var(--text-xs)}
   .proposal.dismissed{opacity:.6}
   .head{display:flex;gap:6px;flex-wrap:wrap}
-  .chip{padding:1px 7px;border-radius:8px;font-size:10px;background:rgb(var(--c-surface-hover) / 0.7)}
-  .chip.on-board{background:color-mix(in srgb,rgb(var(--c-accent)) 18%,transparent)}
   .title{margin:0;font-weight:600;overflow-wrap:anywhere}
   .evidence{margin:0;padding-left:16px;color:rgb(var(--c-text-muted))}
   .source{font-weight:600}
-  pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
+  pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--text-meta)}
   .editor{display:flex;flex-direction:column;gap:6px}
-  .editor label{display:flex;flex-direction:column;gap:2px;font-size:11px}
+  .editor label{display:flex;flex-direction:column;gap:2px;font-size:var(--text-meta)}
   .filed{margin:0;color:rgb(var(--c-accent))}
-  .related{padding:8px;border-radius:8px;border:1px solid rgb(var(--c-border) / 0.65)}
+  .related{padding:8px;border-radius: var(--gp-r-sm);border:1px solid rgb(var(--c-border) / 0.65)}
   .related p,.related ul{margin:0 0 4px}
   .attached{margin:0;color:rgb(var(--c-text-muted))}
-  .link{align-self:flex-start}
 </style>

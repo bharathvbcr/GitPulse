@@ -73,7 +73,7 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     check(`${mode}: cards do not stack filters`, [...document.querySelectorAll("[data-task-card]")].every(node => blur(node) === "none"));
 
     if (document.querySelector(".navigator")) {
-      const scopes = [...document.querySelectorAll<HTMLButtonElement>(".navigator .gp-seg-btn")];
+      const scopes = [...document.querySelectorAll<HTMLButtonElement>(".navigator .nav-scope")];
       for (const scope of [...scopes, ...scopes].reverse()) {
         scope.click();
         await new Promise(resolve => requestAnimationFrame(resolve));
@@ -127,9 +127,9 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     check(`${mode}: a saved task draws its title without the compose surface`,
       (document.querySelector('input[name="task-title"]')?.getClientRects().length ?? 0) > 0);
     (document.querySelector('[data-testid="task-assist-toggle"]') as HTMLElement).click();
-    await wait(() => (document.querySelector(".manvi-assist .change-link")?.getClientRects().length ?? 0) > 0);
+    await wait(() => (document.querySelector('.manvi-assist [data-testid="manvi-change-model"]')?.getClientRects().length ?? 0) > 0);
     check(`${mode}: merged Manvi section has Change link and no Model input`,
-      Boolean(document.querySelector(".manvi-assist .change-link"))
+      Boolean(document.querySelector('.manvi-assist [data-testid="manvi-change-model"]'))
       && ![...document.querySelectorAll(".manvi-assist label")].some(label => label.firstChild?.textContent?.trim() === "Model"));
     material(`${mode} Manvi assist`, ".manvi-assist .gp-field:not(.draft),.manvi-assist textarea");
     click('[data-sheet-tab="agent"]');
@@ -153,7 +153,7 @@ export async function checkTaskMaterials(errors: string[]): Promise<{ name: stri
     await wait(() => document.querySelectorAll(".automation .settings input").length === 2);
     floating(`${mode} automatic settings`, ".automation .settings");
     material(`${mode} automatic settings`, ".automation .settings");
-    click(".automation .settings .check:nth-child(2) input");
+    click(".automation .settings fieldset > label:nth-of-type(2) input");
     await wait(() => document.querySelectorAll(".automation .pair input").length === 2);
     material(`${mode} automatic fields`, ".automation .pair input");
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));

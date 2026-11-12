@@ -329,8 +329,9 @@ describe("annotated but unregistered commands", () => {
     // callers have all gone is stopped);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
-    // agree.
-    expect(found.size).toBe(313);
+    // agree. 314 with cmd_native_rendering_apply (Liquid Glass and the 120 Hz
+    // switch), counted on top of cmd_cancel_read when the overhaul merged.
+    expect(found.size).toBe(314);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

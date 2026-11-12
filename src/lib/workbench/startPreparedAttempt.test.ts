@@ -100,15 +100,15 @@ describe("startPreparedAttempt", () => {
     await startPreparedAttempt(run("a"), {}, h.deps);
     consumeTaskTerminal("a");
     noteAttempt("a", "failed", "Claude Code 1.0.3 is too old for --setting-sources.");
-    expect(h.toasts.at(-1)).toMatchObject({ kind: "error", message: "Claude Code did not start: Claude Code 1.0.3 is too old for --setting-sources." });
+    expect(h.toasts.at(-1)).toMatchObject({ kind: "error", message: "Couldn't start Claude Code. Claude Code 1.0.3 is too old for --setting-sources." });
     expect(get(attemptNotices).get("a")).toMatchObject({ phase: "failed", tone: "error" });
   });
 
   it("records a refused open as a failure with its reason, not 'queued'", async () => {
     const h = harness(queuedStart("failed"));
     const result = await startPreparedAttempt(run("a"), {}, h.deps);
-    expect(result).toMatchObject({ ok: false, error: "Could not open a: Too many open repositories (max 24)." });
-    expect(get(attemptNotices).get("a")).toMatchObject({ phase: "failed", text: "Could not open a: Too many open repositories (max 24)." });
+    expect(result).toMatchObject({ ok: false, error: "Couldn't open a. Too many open repositories (max 24)." });
+    expect(get(attemptNotices).get("a")).toMatchObject({ phase: "failed", text: "Couldn't open a. Too many open repositories (max 24)." });
     expect(hasTaskTerminalRequest("a")).toBe(false);
     expect(h.toasts.at(-1)?.kind).toBe("error");
   });
@@ -196,7 +196,7 @@ describe("startPreparedAttempt", () => {
     const failed = await startPreparedAttempt(run("n", { kind: "managed" }), {}, h.deps);
     expect(failed.ok).toBe(false);
     expect(get(attemptNotices).get("n")).toMatchObject({ phase: "failed" });
-    expect(get(attemptNotices).get("n")?.text).toMatch(/Manvi is not installed.*Start or recover managed launch/);
+    expect(get(attemptNotices).get("n")?.text).toMatch(/^Couldn't start managed .*\. Manvi is not installed.*Start or recover managed run retries this same run\.$/);
   });
 });
 

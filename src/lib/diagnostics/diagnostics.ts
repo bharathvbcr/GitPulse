@@ -1074,7 +1074,7 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
     repairIds || sanitized.length !== parsed.length || entries.length !== sanitized.length || sanitizedChanged
     || coalescedChanged;
   const invalid = parsed.length - sanitized.length;
-  return { entries, nextId, rewritten, restorationError: invalid > 0 ? `${invalid} invalid saved diagnostic entries could not be restored.` : null };
+  return { entries, nextId, rewritten, restorationError: invalid > 0 ? `${invalid} invalid saved diagnostic entries couldn't be restored.` : null };
 }
 
 /**

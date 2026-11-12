@@ -13,10 +13,15 @@ import {
 import {
   BRANCH_OVERSCAN,
   BRANCH_ROW_HEIGHT,
+  BRANCH_ROW_HEIGHT_THREE_LINE,
   BRANCH_ROW_HEIGHT_TWO_LINE,
   BRANCH_ROW_LAYOUTS,
+  DEFAULT_BRANCH_ROW_LAYOUT,
+  branchRowLines,
   isBranchRowLayout,
   sidebarRowHeight,
+  type BranchRowLayout,
+  type SidebarDensity,
   type SidebarRowKind,
 } from "./metrics";
 
@@ -218,6 +223,33 @@ describe("scrollOffsetToReveal", () => {
     }
   });
 
+  it("keeps the row an inset inside each edge, for a scroller whose edges are covered", () => {
+    const viewport = 160;
+    for (let index = 0; index < rowCount(offsets); index++) {
+      for (const anchor of [0, 17, 60, 140, 222, 400]) {
+        const next = scrollOffsetToReveal(offsets, index, anchor, viewport, 30) ?? anchor;
+        // A row at the very top has nothing above to clear, so its inset is 0.
+        expect(rowTop(offsets, index) - next).toBeGreaterThanOrEqual(Math.min(30, rowTop(offsets, index)));
+        expect(next + viewport - rowBottom(offsets, index)).toBeGreaterThanOrEqual(30);
+      }
+    }
+  });
+
+  it("never asks for a scroll to row 0 when the list is already at the top", () => {
+    expect(scrollOffsetToReveal(offsets, 0, 0, 160, 30)).toBeNull();
+    expect(scrollOffsetToReveal(offsets, 1, 0, 160, 30)).toBeNull();
+  });
+
+  it("caps the inset at a quarter of the viewport, so a short list is still navigable", () => {
+    // 60 px viewport: the inset is 15, not 40. Row 1 spans 30–74.
+    expect(scrollOffsetToReveal(offsets, 1, 0, 60, 40)).toBe(74 - 60 + 15);
+  });
+
+  it("treats a negative or non-finite inset as flush", () => {
+    expect(scrollOffsetToReveal(offsets, 4, 0, 100, -5)).toBe(92);
+    expect(scrollOffsetToReveal(offsets, 4, 0, 100, Number.NaN)).toBe(92);
+  });
+
   it("returns null rather than a number for an out-of-range row or geometry", () => {
     expect(scrollOffsetToReveal(offsets, -1, 0, 100)).toBeNull();
     expect(scrollOffsetToReveal(offsets, 99, 0, 100)).toBeNull();
@@ -249,26 +281,60 @@ describe("scrollOffsetToCenter", () => {
 });
 
 describe("sidebarRowHeight", () => {
-  it("only grows branch rows, and only under the two-line layout", () => {
+  it("only grows branch rows, and only under the multi-line layouts", () => {
     const header = BRANCH_ROW_HEIGHT.spacious;
     expect(sidebarRowHeight("branch", "spacious", "two-line")).toBe(
       BRANCH_ROW_HEIGHT_TWO_LINE.spacious,
     );
+    expect(sidebarRowHeight("branch", "spacious", "three-line")).toBe(
+      BRANCH_ROW_HEIGHT_THREE_LINE.spacious,
+    );
     expect(sidebarRowHeight("branch", "spacious", "one-line")).toBe(header);
     for (const kind of ["section-header", "folder-header", "tag"] as const) {
-      expect(sidebarRowHeight(kind, "spacious", "two-line")).toBe(header);
-      expect(sidebarRowHeight(kind, "spacious", "one-line")).toBe(header);
+      for (const layout of BRANCH_ROW_LAYOUTS) {
+        expect(sidebarRowHeight(kind, "spacious", layout)).toBe(header);
+        expect(sidebarRowHeight(kind, "compact", layout)).toBe(BRANCH_ROW_HEIGHT.compact);
+      }
     }
   });
 
-  it("keeps two lines taller than one in both densities", () => {
+  it("answers the measured three-line heights per density", () => {
+    // 47px of content (three 13px lines and two 4px gaps) plus 15px spacious
+    // and 9px compact. Pinned as numbers: the harness measures the content,
+    // and this is the half that fails if the constants move without it.
+    expect(sidebarRowHeight("branch", "spacious", "three-line")).toBe(62);
+    expect(sidebarRowHeight("branch", "compact", "three-line")).toBe(56);
+    expect(sidebarRowHeight("branch", "spacious", "two-line")).toBe(40);
+    expect(sidebarRowHeight("branch", "compact", "two-line")).toBe(34);
+  });
+
+  it("keeps each extra line taller than the last in both densities", () => {
     for (const density of ["spacious", "compact"] as const) {
-      expect(sidebarRowHeight("branch", density, "two-line")).toBeGreaterThan(
-        sidebarRowHeight("branch", density, "one-line"),
+      const one = sidebarRowHeight("branch", density, "one-line");
+      const two = sidebarRowHeight("branch", density, "two-line");
+      const three = sidebarRowHeight("branch", density, "three-line");
+      expect(two).toBeGreaterThan(one);
+      expect(three).toBeGreaterThan(two);
+    }
+    // Compact must stay genuinely tighter than spacious in every layout.
+    expect(BRANCH_ROW_HEIGHT_TWO_LINE.compact).toBeLessThan(BRANCH_ROW_HEIGHT_TWO_LINE.spacious);
+    expect(BRANCH_ROW_HEIGHT_THREE_LINE.compact).toBeLessThan(BRANCH_ROW_HEIGHT_THREE_LINE.spacious);
+  });
+
+  it("gives three lines at least the per-line room of two", () => {
+    for (const density of ["spacious", "compact"] as const) {
+      expect(BRANCH_ROW_HEIGHT_THREE_LINE[density] / 3).toBeGreaterThanOrEqual(
+        BRANCH_ROW_HEIGHT_TWO_LINE[density] / 2,
       );
     }
-    // Compact must stay genuinely tighter than spacious in the new layout too.
-    expect(BRANCH_ROW_HEIGHT_TWO_LINE.compact).toBeLessThan(BRANCH_ROW_HEIGHT_TWO_LINE.spacious);
+  });
+
+  it("leaves room for three lines of real text", () => {
+    // Three 13px lines and two 4px gaps is the 47px the harness measures. A
+    // height that cannot hold it clips the row.
+    for (const density of ["spacious", "compact"] as const) {
+      expect(BRANCH_ROW_HEIGHT_THREE_LINE[density]).toBeGreaterThanOrEqual(47);
+    }
   });
 
   it("leaves room for two lines of real text", () => {
@@ -288,10 +354,36 @@ describe("sidebarRowHeight", () => {
       sidebarRowHeight("branch", undefined as unknown as "spacious", "two-line"),
     ).toBe(BRANCH_ROW_HEIGHT_TWO_LINE.spacious);
     // An unknown layout is not "one-line": it must not silently shrink rows
-    // whose markup is still two lines tall.
-    expect(sidebarRowHeight("branch", "spacious", "nonsense" as "two-line")).toBe(
-      BRANCH_ROW_HEIGHT_TWO_LINE.spacious,
+    // whose markup is still several lines tall. It is the default's three.
+    expect(sidebarRowHeight("branch", "spacious", "nonsense" as BranchRowLayout)).toBe(
+      BRANCH_ROW_HEIGHT_THREE_LINE.spacious,
     );
+    expect(sidebarRowHeight("branch", "compact", "nonsense" as BranchRowLayout)).toBe(
+      BRANCH_ROW_HEIGHT_THREE_LINE.compact,
+    );
+    expect(
+      sidebarRowHeight("branch", "nonsense" as SidebarDensity, "three-line"),
+    ).toBe(BRANCH_ROW_HEIGHT_THREE_LINE.spacious);
+  });
+});
+
+describe("branchRowLines", () => {
+  it("counts the lines each layout draws", () => {
+    expect(branchRowLines("one-line")).toBe(1);
+    expect(branchRowLines("two-line")).toBe(2);
+    expect(branchRowLines("three-line")).toBe(3);
+  });
+
+  it("reads an unknown layout as the default's three lines", () => {
+    expect(branchRowLines("nonsense" as BranchRowLayout)).toBe(3);
+    expect(branchRowLines(undefined as unknown as BranchRowLayout)).toBe(3);
+  });
+
+  it("agrees with sidebarRowHeight about which layouts are taller than a header", () => {
+    for (const layout of BRANCH_ROW_LAYOUTS) {
+      const grows = sidebarRowHeight("branch", "spacious", layout) > BRANCH_ROW_HEIGHT.spacious;
+      expect(grows).toBe(branchRowLines(layout) > 1);
+    }
   });
 });
 
@@ -300,12 +392,90 @@ describe("isBranchRowLayout", () => {
     for (const layout of BRANCH_ROW_LAYOUTS) {
       expect(isBranchRowLayout(layout)).toBe(true);
     }
-    for (const bad of ["", "two", "TWO-LINE", null, undefined, 0, {}, ["two-line"]]) {
+    expect(isBranchRowLayout("three-line")).toBe(true);
+    for (const bad of [
+      "",
+      "two",
+      "three",
+      "TWO-LINE",
+      "THREE-LINE",
+      "four-line",
+      null,
+      undefined,
+      0,
+      3,
+      {},
+      ["two-line"],
+      ["three-line"],
+    ]) {
       expect(isBranchRowLayout(bad)).toBe(false);
     }
   });
 
-  it("defaults to the layout that keeps names readable", () => {
-    expect(BRANCH_ROW_LAYOUTS[0]).toBe("two-line");
+  it("lists the layouts roomiest first, with three lines the default", () => {
+    expect([...BRANCH_ROW_LAYOUTS]).toEqual(["three-line", "two-line", "one-line"]);
+    expect(DEFAULT_BRANCH_ROW_LAYOUT).toBe("three-line");
+    expect(BRANCH_ROW_LAYOUTS[0]).toBe(DEFAULT_BRANCH_ROW_LAYOUT);
+  });
+});
+
+describe("window math over mixed three-line rows", () => {
+  // The sidebar's real shape under the default layout: a 30px header, then
+  // branches at 62px, with a folder header and a tag in between.
+  const kinds: SidebarRowKind[] = [
+    "section-header",
+    "branch",
+    "branch",
+    "folder-header",
+    "branch",
+    "branch",
+    "branch",
+    "section-header",
+    "tag",
+  ];
+  const heights = kinds.map((kind) => sidebarRowHeight(kind, "spacious", "three-line"));
+  const offsets = buildRowOffsets(heights);
+  // tops: 0 30 92 154 184 246 308 370 400, total 430
+
+  it("places each row by the sum of the real heights above it", () => {
+    expect(heights).toEqual([30, 62, 62, 30, 62, 62, 62, 30, 30]);
+    expect([...offsets]).toEqual([0, 30, 92, 154, 184, 246, 308, 370, 400, 430]);
+    expect(totalRowHeight(offsets)).toBe(430);
+  });
+
+  it("is not what two-line heights would say about the same list", () => {
+    const twoLine = buildRowOffsets(
+      kinds.map((kind) => sidebarRowHeight(kind, "spacious", "two-line")),
+    );
+    expect(totalRowHeight(offsets)).toBeGreaterThan(totalRowHeight(twoLine));
+    expect(rowTop(offsets, 5)).not.toBe(rowTop(twoLine, 5));
+  });
+
+  it("windows the rows that touch the viewport", () => {
+    // Viewport [100, 260) touches row 2 (92–154), 3 (154–184), 4 (184–246) and 5 (246–308).
+    expect(windowFromOffsets(100, 160, offsets, 0)).toEqual({ start: 2, end: 6 });
+  });
+
+  it("reveals a three-line row by its real edges", () => {
+    // Row 5 spans 246–308; a 120px viewport at 0 needs top 188 to show it.
+    expect(scrollOffsetToReveal(offsets, 5, 0, 120)).toBe(188);
+    // Row 1 spans 30–92 and is already inside [0, 120).
+    expect(scrollOffsetToReveal(offsets, 1, 0, 120)).toBeNull();
+  });
+
+  it("lands every row fully in view for every anchor", () => {
+    const viewport = 140;
+    for (let index = 0; index < rowCount(offsets); index++) {
+      for (const anchor of [0, 33, 90, 200, 290, 400]) {
+        const next = scrollOffsetToReveal(offsets, index, anchor, viewport) ?? anchor;
+        expect(rowTop(offsets, index)).toBeGreaterThanOrEqual(next);
+        expect(rowBottom(offsets, index)).toBeLessThanOrEqual(next + viewport);
+      }
+    }
+  });
+
+  it("parks a located row a third of the way down, from its own top", () => {
+    // Row 4 starts at 184; a 90px viewport puts it 30px down, so scrollTop 154.
+    expect(scrollOffsetToCenter(offsets, 4, 90)).toBe(154);
   });
 });

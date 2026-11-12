@@ -1,4 +1,5 @@
 import type { MutationOutcome } from "../repos/storeTypes";
+import { failureLine } from "../ui/copy/describeFailure";
 import { toastStore } from "./toastStore";
 
 /**
@@ -11,11 +12,11 @@ import { toastStore } from "./toastStore";
  * toast rather than doubled.
  *
  * Returns whether the mutation succeeded, so a caller reads
- * `if (!reportFailure(outcome, "Could not …")) return;` before its own success
- * message.
+ * `if (!reportFailure(outcome, "Couldn't …")) return;` before its own success
+ * message. The toast reads `Couldn't <verb> <object>. <Reason>.`
  */
 export function reportFailure(outcome: MutationOutcome, what: string): boolean {
   if (outcome.ok) return true;
-  if (!outcome.surfaced) toastStore.error(`${what}: ${outcome.error ?? "it did not complete."}`);
+  if (!outcome.surfaced) toastStore.error(failureLine(what, outcome.error));
   return false;
 }

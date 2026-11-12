@@ -1143,7 +1143,7 @@ export function verdictLabel(verdict: PolicyVerdict): string {
 export function verdictDetail(verdict: PolicyVerdict): string {
   switch (verdict.status) {
     case "allowed":
-      return "The MANVI gate ran and no rule fired.";
+      return "The Manvi gate ran and no rule fired.";
     case "demoted":
       return verdict.demoted || verdict.reason;
     case "granted":
@@ -1153,9 +1153,9 @@ export function verdictDetail(verdict: PolicyVerdict): string {
         ? `${verdict.rule} waived by ${verdict.granted_by} (${verdict.grant_id}).`
         : `${verdict.rule} waived by grant ${verdict.grant_id}.`;
     case "widened":
-      return `Authorised by scope the agent added to its own task: ${verdict.widened}.`;
+      return `Authorized by scope the agent added to its own task: ${verdict.widened}.`;
     case "degraded":
-      return `Allowed, but these checks could not run: ${verdict.degraded.join(", ")}.`;
+      return `Allowed, but these checks couldn't run: ${verdict.degraded.join(", ")}.`;
     case "warned":
       return verdict.reason;
     case "blocked":

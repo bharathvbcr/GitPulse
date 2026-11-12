@@ -1,12 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { REGISTERED_VIEWS, sectionsFor } from "./viewRegistry";
+import { classifyShortcut } from "../ui/webviewShortcuts";
 import {
+  repoTabChordModifiers,
   SECTION_KEY_CODES,
   sectionForChord,
   sectionShortcutRows,
   VIEW_DIGIT_ORDER,
   viewAccelerator,
+  viewChordModifiers,
   viewShortcutRows,
 } from "./viewShortcuts";
 
@@ -35,21 +38,101 @@ describe("the digit table matches the native menu", () => {
    * that bound three — so the table is asserted against the Rust source rather
    * than trusted.
    */
-  it("binds the same views, in the same order, as VIEW_TAB_BINDINGS", () => {
-    const table = menuRs.slice(
-      menuRs.indexOf("const VIEW_TAB_BINDINGS"),
-      menuRs.indexOf("];", menuRs.indexOf("const VIEW_TAB_BINDINGS")),
-    );
-    const bound = [...table.matchAll(/actions::TAB_(\w+),\s*"[^"]+",\s*"CmdOrCtrl\+(\d)"/g)].map(
-      ([, name, digit]) => ({ view: name.toLowerCase(), digit: Number(digit) }),
-    );
-    expect(bound.map((b) => b.view)).toEqual([...VIEW_DIGIT_ORDER]);
-    expect(bound.map((b) => b.digit)).toEqual(bound.map((_, i) => i + 1));
+  /** One table of `menu.rs`, as (view, modifiers, digit) rows. */
+  function menuTable(name: string) {
+    const start = menuRs.indexOf(`const ${name}:`);
+    const table = menuRs.slice(start, menuRs.indexOf("];", start));
+    return [...table.matchAll(/actions::(\w+),\s*"[^"]+",\s*"([^"]+)"/g)].map(([, id, accel]) => {
+      const tokens = accel.split("+");
+      const digit = Number(tokens.pop());
+      return { id, digit, modifiers: tokens };
+    });
+  }
+
+  /** menu.rs spells CmdOrCtrl; resolve it for the host the table is for. */
+  const resolveModifier = (token: string, os: "macos" | "windows") => {
+    switch (token.toLowerCase()) {
+      case "cmdorctrl":
+        return os === "macos" ? "meta" : "ctrl";
+      case "cmd":
+        return "meta";
+      case "ctrl":
+        return "ctrl";
+      case "alt":
+        return "alt";
+      case "shift":
+        return "shift";
+      default:
+        throw new Error(`unknown modifier ${token}`);
+    }
+  };
+
+  it("binds the same views, in the same order, as the native view tables", () => {
+    for (const [table, os] of [
+      ["VIEW_TAB_BINDINGS_MACOS", "macos"],
+      ["VIEW_TAB_BINDINGS_OTHER", "windows"],
+    ] as const) {
+      const bound = menuTable(table);
+      expect(bound.map((b) => b.id.replace("TAB_", "").toLowerCase()), table).toEqual([
+        ...VIEW_DIGIT_ORDER,
+      ]);
+      expect(bound.map((b) => b.digit), table).toEqual(bound.map((_, i) => i + 1));
+      // The chord's modifiers are the structured table's, not a second copy.
+      for (const row of bound) {
+        expect(
+          row.modifiers.map((token) => resolveModifier(token, os)).sort(),
+          `${table} ${row.id}`,
+        ).toEqual([...viewChordModifiers(os)].sort());
+      }
+    }
+  });
+
+  it("binds the repository-tab digits to the command key alone, the same on every host", () => {
+    const bound = menuTable("REPO_TAB_BINDINGS");
+    expect(bound.map((b) => b.digit)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    for (const os of ["macos", "windows"] as const) {
+      for (const row of bound) {
+        expect(row.modifiers.map((token) => resolveModifier(token, os))).toEqual([
+          ...repoTabChordModifiers(os),
+        ]);
+      }
+    }
   });
 
   it("gives Work the accelerator the menu actually assigns it", () => {
     expect(menuRs).toContain('actions::TAB_WORK, "Work", Some("F10")');
     expect(viewAccelerator("work")).toBe("F10");
+  });
+
+  it("prints the chord each host actually binds, never a mechanical translation", () => {
+    expect(viewAccelerator("code", "macos")).toBe("⌥⌘1");
+    expect(viewAccelerator("history", "macos")).toBe("⌥⌘2");
+    expect(viewAccelerator("insights", "macos")).toBe("⌥⌘3");
+    for (const os of ["windows", "linux"] as const) {
+      expect(viewAccelerator("code", os)).toBe("Ctrl+Shift+1");
+      expect(viewAccelerator("insights", os)).toBe("Ctrl+Shift+3");
+    }
+    // The cheat-sheet chips follow the same table: modifiers, then the digit.
+    expect(viewShortcutRows("macos").find((row) => row.description === "Open Code")?.keys).toEqual([
+      "⌥",
+      "⌘",
+      "1",
+    ]);
+    expect(viewShortcutRows("windows").find((row) => row.description === "Open Code")?.keys).toEqual([
+      "⌃",
+      "⇧",
+      "1",
+    ]);
+  });
+
+  it("keeps every view chord off the screenshot shortcuts and off AltGr", () => {
+    const view = (os: "macos" | "windows" | "linux") => new Set(viewChordModifiers(os));
+    // macOS ⌘⇧3/4/5 are the system screenshot shortcuts.
+    expect(view("macos")).not.toEqual(new Set(["meta", "shift"]));
+    // Ctrl+Alt is AltGr on many Windows and Linux layouts.
+    for (const os of ["windows", "linux"] as const) {
+      expect(view(os).has("ctrl") && view(os).has("alt")).toBe(false);
+    }
   });
 
   it("has an accelerator for every registered view", () => {
@@ -64,7 +147,7 @@ describe("the cheat sheet is derived, not restated", () => {
     // Scoped to the shortcut DATA: the surrounding comment quotes the old
     // string on purpose, to say what went wrong.
     const table = sheet.slice(
-      sheet.indexOf("const SHORTCUT_CATEGORIES"),
+      sheet.indexOf("function shortcutCategories"),
       sheet.indexOf("</script>"),
     );
     const descriptions = [...table.matchAll(/description: "([^"]+)"/g)].map(([, d]) => d);
@@ -75,7 +158,7 @@ describe("the cheat sheet is derived, not restated", () => {
   });
 
   it("renders the derived rows rather than a hand-written list", () => {
-    expect(sheet).toContain("...viewShortcutRows()");
+    expect(sheet).toContain("...viewShortcutRows(os)");
     expect(sheet).toContain("...sectionShortcutRows()");
   });
 
@@ -123,10 +206,47 @@ describe("sectionForChord", () => {
     );
   });
 
-  it("ignores Ctrl+Alt+digit, which already switches repository tabs", () => {
+  it("ignores every digit chord another feature owns", () => {
     // One keystroke with two owners is the defect that put Fleet on the
-    // context-menu key; it must not be reintroduced here.
+    // context-menu key; it must not be reintroduced here. ⌘/Ctrl+digit select
+    // repository tabs (with Alt added they would still be someone else's), and
+    // ⌥⌘digit and Ctrl+Shift+digit select views.
     expect(sectionForChord("history", chord("Digit1", { ctrl: true }))).toBeNull();
+    expect(sectionForChord("history", chord("Digit1", { meta: true }))).toBeNull();
+    expect(sectionForChord("history", chord("Digit1", { ctrl: true, shift: true, alt: false }))).toBeNull();
+  });
+
+  it("is disjoint from the repository-tab chord and from the view chord on every host", () => {
+    const hosts = ["macos", "windows", "linux"] as const;
+    for (const os of hosts) {
+      const asChord = (modifiers: readonly string[], code: string) => ({
+        alt: modifiers.includes("alt"),
+        ctrl: modifiers.includes("ctrl"),
+        meta: modifiers.includes("meta"),
+        shift: modifiers.includes("shift"),
+        code,
+      });
+      const repo = repoTabChordModifiers(os);
+      const views = viewChordModifiers(os);
+      // Different modifier sets, so no keystroke can be both.
+      expect([...repo].sort()).not.toEqual([...views].sort());
+      for (const code of SECTION_KEY_CODES) {
+        // Neither is a section chord (⌥ alone)…
+        expect(sectionForChord("history", asChord(repo, code)), `${os} repo ${code}`).toBeNull();
+        expect(sectionForChord("history", asChord(views, code)), `${os} view ${code}`).toBeNull();
+        // …and neither is a repository-tab jump when typed as the other.
+        const event = (modifiers: readonly string[]) => ({
+          key: code.replace("Digit", ""),
+          code,
+          ctrlKey: modifiers.includes("ctrl"),
+          altKey: modifiers.includes("alt"),
+          metaKey: modifiers.includes("meta"),
+          shiftKey: modifiers.includes("shift"),
+        });
+        expect(classifyShortcut(event(repo), os === "macos")).toBe("jumpToTab");
+        expect(classifyShortcut(event(views), os === "macos"), `${os} view ${code}`).not.toBe("jumpToTab");
+      }
+    }
   });
 
   it("ignores the chord without Alt, and with Meta or Shift added", () => {

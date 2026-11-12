@@ -38,6 +38,8 @@
   import { paneDetails } from "../diagnostics/paneCrash";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { describeFailure } from "../ui/copy/describeFailure";
 
   /** Tallest timeline column, in px. The strip is chrome, not a chart pane. */
   const AXIS_HEIGHT = 30;
@@ -395,7 +397,7 @@
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between gap-3 font-sans shrink-0">
+  <div class="px-4 py-2 bg-surface/60 flex items-center justify-between gap-3 font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <FileCode size={16} class="text-accent" />
       <!-- The file, named rather than typed. Blame is Explorer's other lens
@@ -422,7 +424,8 @@
       {#if atRevision}
         <span
           data-blame-revision
-          class="shrink-0 flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-sans text-[10px] text-textPrimary"
+          class="gp-chip shrink-0 font-sans"
+          data-tone="accent"
           title="Blaming {atRevision.path} as it stood at {atRevision.revision}, the parent of {shortHash(atRevision.from)}"
         >
           at {shortHash(atRevision.revision)}{atRevision.path !== filePath ? ` · ${atRevision.path}` : ""}
@@ -430,7 +433,9 @@
         <button
           type="button"
           onclick={stepBack}
-          class="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md font-sans text-[11px] text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          class="gp-btn shrink-0 font-sans"
+          data-variant="ghost"
+          data-size="sm"
           title={revisionTrail.length > 1 ? "Undo the last step back" : "Back to the working tree"}
         >
           <Undo2 size={11} /> Back
@@ -439,7 +444,9 @@
           <button
             type="button"
             onclick={returnToWorkingTree}
-            class="shrink-0 px-1.5 py-0.5 rounded-md font-sans text-[11px] text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+            class="gp-btn shrink-0 font-sans"
+            data-variant="ghost"
+            data-size="sm"
           >
             Working tree
           </button>
@@ -450,7 +457,7 @@
     <!-- min-w-0, not shrink-0: the summary is the longest string in this row,
          and a rigid one would push the path it sits beside down to nothing on
          a narrow pane. Both sides give, and both truncate. -->
-    <div class="flex items-center gap-3 text-[11px] text-textMuted min-w-0">
+    <div class="flex items-center gap-3 text-meta text-textMuted min-w-0">
       {#if blameLines.length > 0}
         <span class="tabular-nums truncate" title="Across the whole file, not just the selected period">
           {summary}
@@ -458,10 +465,10 @@
       {/if}
       {#if coverageFailed && blameLines.length > 0}
         <span
-          class="flex items-center gap-1 text-amber-400/80"
-          title="Coverage data could not be loaded; hit badges are unavailable."
+          class="flex items-center gap-1 text-warn"
+          title="Coverage data couldn't be loaded; hit badges are unavailable."
         >
-          <span class="w-2 h-2 rounded-full bg-amber-400/70"></span> Coverage unavailable
+          <span class="w-2 h-2 rounded-full bg-warn"></span> Coverage unavailable
         </span>
       {/if}
     </div>
@@ -477,7 +484,7 @@
     named chips rather than being quietly left out of the denominator.
   -->
   {#if blameLines.length > 0 && !errorMsg}
-    <div class="px-4 py-2 border-b border-border/60 bg-surface/30 font-sans shrink-0 flex flex-col gap-1.5">
+    <div class="px-4 py-2 bg-surface/30 font-sans shrink-0 flex flex-col gap-1.5">
       <div class="flex items-end gap-3">
         {#if timeline.periods.length > 0}
           <div class="flex-1 min-w-0 flex flex-col gap-1">
@@ -489,7 +496,7 @@
               quantity is read off a height and not off an opacity.
             -->
             <div
-              class="flex items-stretch gap-px rounded-[3px] overflow-hidden ring-1 ring-border/50"
+              class="flex items-stretch gap-px rounded-sm overflow-hidden ring-1 ring-border/50"
               style:height={`${AXIS_HEIGHT}px`}
               role="group"
               aria-label="Code age timeline: share of the file by when each line last changed"
@@ -522,7 +529,7 @@
                 </button>
               {/each}
             </div>
-            <div class="flex items-center justify-between text-[10px] text-textMuted/80 tabular-nums">
+            <div class="flex items-center justify-between text-micro text-faint tabular-nums">
               <span class="truncate">{axisStartLabel}</span>
               <span class="truncate shrink-0 px-2">
                 {formatShare(timeline.peakPercent)} peak · {granularityLabel(timeline.granularity)}
@@ -531,7 +538,7 @@
             </div>
           </div>
         {:else}
-          <p class="flex-1 min-w-0 text-[11px] text-textMuted leading-tight">
+          <p class="flex-1 min-w-0 text-meta text-textMuted leading-tight">
             No dated lines to place on a timeline.
           </p>
         {/if}
@@ -545,7 +552,7 @@
           three months" becomes a glance and a click. Both these and the chips
           come from the one age scale, and both partition the same file.
         -->
-        <div class="shrink-0 flex flex-col items-end gap-1.5 text-[10px] text-textMuted">
+        <div class="shrink-0 flex flex-col items-end gap-1.5 text-micro text-textMuted">
           <div class="flex items-center gap-1" role="group" aria-label="Filter by code age">
             {#each timeline.bands as share (share.band.id)}
               <button
@@ -555,16 +562,17 @@
                 aria-label="{share.band.label}: {formatShare(share.percent)} of the file, {plural(share.lines, 'line')}"
                 title="{formatShare(share.percent)} of the file is {share.band.label}{share.lines > 0 ? ' — click to show only those lines' : ''}"
                 onclick={() => selectBand(share)}
-                class="flex items-center gap-1 px-1.5 py-0.5 rounded-md border transition-colors tabular-nums
+                class="gp-chip cursor-pointer tabular-nums
                        {isSelected({ kind: 'band', id: share.band.id })
-                         ? 'border-accent/60 bg-accent/15 text-textPrimary'
+                         ? ''
                          : share.lines > 0
-                           ? 'border-transparent hover:bg-surfaceHover'
-                           : 'border-transparent opacity-45'}"
+                           ? 'hover:bg-surfaceHover'
+                           : 'opacity-45'}"
+                data-tone={isSelected({ kind: "band", id: share.band.id }) ? "accent" : undefined}
               >
                 <span class="w-2.5 h-2.5 rounded-full shrink-0" style:background-color={bandColor(share.band, "fill")}></span>
                 <span>{share.band.label}</span>
-                <span class="text-textMuted/70">{formatShare(share.percent)}</span>
+                <span class="text-faint">{formatShare(share.percent)}</span>
               </button>
             {/each}
           </div>
@@ -576,10 +584,9 @@
                   aria-pressed={isSelected({ kind: "bucket", key: extra.key })}
                   title={extra.explanation}
                   onclick={() => toggle({ kind: "bucket", key: extra.key })}
-                  class="px-1.5 py-0.5 rounded-full border transition-colors tabular-nums
-                         {isSelected({ kind: 'bucket', key: extra.key })
-                           ? 'border-accent/60 bg-accent/15 text-textPrimary'
-                           : 'border-border/60 hover:bg-surfaceHover'}"
+                  class="gp-chip cursor-pointer tabular-nums
+                         {isSelected({ kind: 'bucket', key: extra.key }) ? '' : 'hover:bg-surfaceHover'}"
+                  data-tone={isSelected({ kind: "bucket", key: extra.key }) ? "accent" : undefined}
                 >
                   {extra.label} {formatShare(extra.percent)}
                 </button>
@@ -590,14 +597,16 @@
       </div>
 
       {#if activeLabel !== null}
-        <div class="flex items-center gap-2 text-[11px] text-textMuted">
+        <div class="flex items-center gap-2 text-meta text-textMuted">
           <span class="tabular-nums">
             Showing {plural(visibleLines.length, "line")} of {timeline.totalLines} — {activeLabel}
           </span>
           <button
             type="button"
             onclick={() => { selection = null; listScroll = 0; }}
-            class="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+            class="gp-btn"
+            data-variant="ghost"
+            data-size="sm"
           >
             <X size={11} /> Clear
           </button>
@@ -611,14 +620,18 @@
     <!-- Blame Lines -->
     <div class="flex-1 min-w-0 flex flex-col">
       {#if isLoading && blameLines.length === 0}
-        <div class="h-full flex items-center justify-center text-textMuted font-sans text-xs">
-          Loading blame for {filePath}...
+        <div class="h-full p-3 overflow-hidden">
+          <!-- No hold: this branch names the file being loaded, and a held
+               outro would keep the previous file's name on screen after a
+               selection change or clear. -->
+          <Skeleton variant="code-lines" count={16} />
+          <span class="sr-only">Loading blame for {filePath}…</span>
         </div>
       {:else if errorMsg}
-        <div class="h-full flex flex-col items-center justify-center gap-3 text-rose-400 font-sans text-xs p-4 text-center">
-          <span class="max-w-md">{errorMsg}</span>
-          <button type="button" onclick={retryBlame} class="gp-btn py-1! px-3! text-[11px]">
-            Retry
+        <div class="h-full flex flex-col items-center justify-center gap-3 text-danger font-sans text-xs p-4 text-center">
+          <span class="max-w-md"><span class="font-medium">{describeFailure({ verb: "load", object: "blame" }, errorMsg).headline}</span> {errorMsg}</span>
+          <button type="button" onclick={retryBlame} class="gp-btn" data-size="sm">
+            Try again
           </button>
         </div>
       {:else if blameLines.length > 0}
@@ -665,23 +678,22 @@
                 data-blame-line={line.line_no}
                 data-blame-grouped={grouped ? "true" : undefined}
                 data-blame-block={inHoveredCommit ? "true" : undefined}
-                class="flex items-center w-full rounded-r-md pr-1 border-l-2 {inHoveredCommit
-                  ? 'border-accent/70'
-                  : 'border-transparent'}"
+                class="flex items-center w-full rounded-r-md pl-0.5 pr-1"
                 style:height={`${ROW}px`}
+                style:box-shadow={inHoveredCommit ? "inset 2px 0 0 rgb(var(--c-accent) / 0.7)" : undefined}
                 style:background-color={blameRowTint(line, timeline.nowMs)}
                 onmouseenter={() => (hoverCommit = line.commit_id)}
                 onmouseleave={() => (hoverCommit = null)}
               >
                 {#if uncommitted}
                   <span
-                    class="w-16 px-2 text-[10px] font-mono text-textMuted/50 italic text-left shrink-0 truncate"
+                    class="w-16 px-2 text-micro font-mono text-faint italic text-left shrink-0 truncate"
                     title="Not committed yet"
                   >{grouped ? "" : "uncommitted"}</span>
                 {:else}
                   <button
                     type="button"
-                    class="w-16 px-2 text-[10px] text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0 transition-opacity
+                    class="w-16 px-2 text-micro text-accent font-mono select-none cursor-pointer hover:underline text-left shrink-0 transition-opacity
                            {grouped ? 'opacity-0 hover:opacity-100 focus-visible:opacity-100' : ''}"
                     title="{shortHash(line.commit_id)} — {line.author_name}, {$timestampFormat.title(line.timestamp)}"
                     onclick={() => {
@@ -693,7 +705,7 @@
                   <button
                     type="button"
                     data-blame-parent
-                    class="w-4 shrink-0 flex items-center justify-center text-textMuted/60 hover:text-accent focus-visible:text-accent"
+                    class="w-4 shrink-0 flex items-center justify-center text-faint hover:text-accent focus-visible:text-accent"
                     title="Blame the parent of {shortHash(line.commit_id)} ({shortHash(line.previous_commit)}{line.previous_path && line.previous_path !== (atRevision?.path ?? filePath) ? `, ${line.previous_path}` : ''})"
                     aria-label="Blame the parent of commit {shortHash(line.commit_id)}"
                     onclick={() => stepToParent(line)}
@@ -701,12 +713,12 @@
                 {:else}
                   <span class="w-4 shrink-0"></span>
                 {/if}
-                <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{grouped ? "" : line.author_name}</span>
+                <span class="w-24 px-2 text-micro text-textMuted truncate font-sans shrink-0">{grouped ? "" : line.author_name}</span>
                 <span
-                  class="w-[74px] px-1.5 text-[10px] text-textMuted/70 truncate font-sans shrink-0 tabular-nums"
+                  class="w-[74px] px-1.5 text-micro text-faint truncate font-sans shrink-0 tabular-nums"
                   title={$timestampFormat.title(line.timestamp) || undefined}
                 >{grouped ? "" : $timestampFormat.text(line.timestamp)}</span>
-                <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
+                <span class="w-8 px-2 text-right text-faint text-micro select-none shrink-0">{line.line_no}</span>
                 <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
                 <span class="gp-diff-text px-3 whitespace-pre text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
               </div>
@@ -734,7 +746,7 @@
           data-blame-rail
           bind:clientHeight={railHeight}
           class="group/rail relative h-full w-3 shrink-0 cursor-pointer select-none overflow-hidden
-                 border-l border-border/70 bg-surface/90 transition-[width] duration-150 hover:w-4"
+                 bg-surface/90 hover:w-4"
           title="Code age map — click or drag to navigate"
           role="presentation"
           onpointerdown={(e) => {
@@ -748,7 +760,7 @@
           {#if scrollBand}
             <div
               data-blame-rail-band
-              class="pointer-events-none absolute inset-x-0 rounded-sm border border-accent/40 bg-accent/10"
+              class="pointer-events-none absolute inset-x-0 rounded-sm bg-accent/10 ring-1 ring-inset ring-accent/40"
               style:top={`${scrollBand.topPct}%`}
               style:height={`${scrollBand.heightPct}%`}
             ></div>

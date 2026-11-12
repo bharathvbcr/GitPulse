@@ -356,13 +356,13 @@ describe("DiffHistoryGraph", () => {
     expect(body).toContain(">base<");
   });
 
-  it("says where the loaded history ends, and offers Retry when older history failed", () => {
+  it("says where the loaded history ends, and offers Try again when older history failed", () => {
     expect(render(DiffHistoryGraph, { props: historyProps() }).body).toContain("Start of the loaded history");
     const failed = render(DiffHistoryGraph, {
       props: historyProps({ hasMore: true, loadError: "git exploded" }),
     }).body;
-    expect(failed).toContain("Could not load older history: git exploded");
-    expect(failed).toContain("Retry");
+    expect(failed).toContain("Couldn't load older history. git exploded");
+    expect(failed).toContain("Try again");
   });
 
   it("is one listbox the keyboard can drive", () => {

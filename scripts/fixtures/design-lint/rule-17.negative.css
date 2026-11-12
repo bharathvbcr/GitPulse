@@ -1,0 +1,24 @@
+@utility gp-card {
+  @apply rounded-xl;
+}
+.gp-menu .gp-menu-item {
+  color: inherit;
+}
+.gp-tone-ok {
+  color: green;
+}
+.gp-state-open {
+  opacity: 1;
+}
+@utility gp-composed {
+  @apply p-1;
+}
+.consumer {
+  @apply gp-composed;
+}
+.gp-bare {
+  margin: 0;
+}
+.gp-boot-only {
+  margin: 0;
+}

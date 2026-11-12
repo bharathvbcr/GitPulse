@@ -12,7 +12,7 @@ export function formatStorageAgentPrompt(repoPath: string): string {
     "",
     "GitPulse Health did not attach a storage scan. No sizes were measured for this prompt; an empty list here is not evidence that nothing can be reclaimed.",
     "",
-    "1. Confirm the checkout below and read AGENTS.md / CLAUDE.md. Measure first with read-only size and listing commands, inside this checkout only. Report logical and on-disk size where they differ, and name any directory you could not read; an incomplete measurement is not a small one.",
+    "1. Confirm the checkout below and read AGENTS.md / CLAUDE.md. Measure first with read-only size and listing commands, inside this checkout only. Report logical and on-disk size where they differ, and name any directory you couldn't read; an incomplete measurement is not a small one.",
     "2. For each large path, identify its producer (build tool, package manager, test runner or agent) and check whether Git tracks it, whether an ignore rule covers it, and whether it is a nested repository or a symlink that points outside the checkout.",
     "3. Propose reductions that use each producer's own documented retention or garbage-collection mechanism, with the expected rebuild or re-download cost. Ask before removing anything, and remove nothing yourself in this session.",
     "4. Do not delete source files, uncommitted work, environments or host-wide caches. Leave secrets, dependencies, models, datasets, agent state and Git history untouched, and do not change global cache or build-target configuration.",

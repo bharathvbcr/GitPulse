@@ -145,12 +145,12 @@
 </details>
 
 <style>
-  .activity{margin-top:8px;font-size:0.6875rem}
+  .activity{margin-top:8px;font-size:var(--text-meta)}
   summary{cursor:pointer;font-weight:600;color:rgb(var(--c-text))}
   summary:focus-visible{outline:2px solid rgb(var(--c-accent)/.65);outline-offset:2px}
   .spent{font-weight:500;color:rgb(var(--c-text-muted))}
-  .meta{color:rgb(var(--c-text-muted));font-size:0.6875rem;margin:6px 0 0}
-  .bar{display:flex;height:8px;margin-top:8px;border-radius:4px;overflow:hidden;background:rgb(var(--c-text-muted)/.12)}
+  .meta{color:rgb(var(--c-text-muted));font-size:var(--text-meta);margin:6px 0 0}
+  .bar{display:flex;height:8px;margin-top:8px;border-radius:var(--gp-r-xs);overflow:hidden;background:rgb(var(--c-text-muted)/.12)}
   .bar span,.swatch{background:rgb(var(--c-text-muted)/.5)}
   .bar [data-state="working"],li[data-state="working"] .swatch{background:rgb(var(--c-ok))}
   .bar [data-state="waiting_tool"],li[data-state="waiting_tool"] .swatch{background:rgb(var(--c-accent))}
@@ -159,16 +159,16 @@
   .bar [data-state="unknown"],li[data-state="unknown"] .swatch{background:repeating-linear-gradient(45deg,rgb(var(--c-text-muted)/.25) 0 3px,transparent 3px 6px)}
   .legend{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:4px 12px;color:rgb(var(--c-text-muted))}
   .legend li{display:flex;align-items:center;gap:5px}
-  .swatch{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .swatch{width:8px;height:8px;border-radius: calc(var(--gp-r-xs) / 2);display:inline-block}
   .items{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}
   .items li{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:baseline;gap:2px 8px;min-width:0}
-  .kind{font-size:0.625rem;color:rgb(var(--c-text-muted))}
+  .kind{font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-  .sub{font-size:0.625rem;color:rgb(var(--c-text-muted))}
-  .outcome{font-size:0.6875rem;color:rgb(var(--c-text-muted))}
+  .sub{font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
+  .outcome{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
   li[data-outcome="failed"] .outcome,li[data-outcome="failed"] .label{color:rgb(var(--c-danger))}
   .took{font-variant-numeric:tabular-nums;color:rgb(var(--c-text-muted));text-align:right}
-  .track{grid-column:2 / -1;height:2px;background:rgb(var(--c-text-muted)/.12);border-radius:1px;overflow:hidden}
+  .track{grid-column:2 / -1;height:2px;background:rgb(var(--c-text-muted)/.12);border-radius: calc(var(--gp-r-xs) / 2);overflow:hidden}
   .track span{display:block;height:100%;background:rgb(var(--c-accent)/.7)}
   button{margin-top:6px}
 </style>

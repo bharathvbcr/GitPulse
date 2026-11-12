@@ -351,7 +351,7 @@ export function resolveTranscriptAnswer(
   }
   return {
     offer: null,
-    note: `Could not check whether a saved conversation exists: ${answer.reason ?? "unknown"}`,
+    note: `Couldn't check whether a saved conversation exists. ${answer.reason ?? "No reason was reported."}`,
   };
 }
 

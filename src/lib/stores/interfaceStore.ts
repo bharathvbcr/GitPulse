@@ -22,10 +22,28 @@ import {
   type DiagnosticsButtonMode,
 } from "../ui/diagnosticsButton";
 import {
+  installHeaderLabels,
+  readHeaderLabelMode,
+  type HeaderLabelMode,
+} from "../ui/headerLabels";
+import {
   clampTerminalDockHeight,
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
 import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
+import {
+  APPEARANCE_DEFAULTS,
+  FLOAT_BLUR_MAX,
+  installAppearance,
+  sanitizeAppearance,
+  type AppearancePrefs,
+  type FieldLevel,
+} from "../ui/appearance/apply";
+import type { Appearance } from "../ui/color/derive";
+import { densityFromLegacy, type Density } from "../ui/appearance/density";
+import type { GitPulseTheme } from "../ui/appearance/themeSchema";
+import { themeStore } from "./themeStore";
+import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
 import {
   DEFAULT_TAB_WIDTH,
@@ -35,7 +53,11 @@ import {
   type TabWidth,
 } from "../ui/codeDisplay";
 import { isTimestampStyle, type TimestampStyle } from "../ui/timestampStyle";
-import { isBranchRowLayout, type BranchRowLayout } from "../sidebar/metrics";
+import {
+  DEFAULT_BRANCH_ROW_LAYOUT,
+  isBranchRowLayout,
+  type BranchRowLayout,
+} from "../sidebar/metrics";
 import {
   DEFAULT_TASK_CARD_FIELDS,
   isBoardLayout,
@@ -68,7 +90,7 @@ import type { CodePercentageMode } from "../language/barStats";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
-export interface InterfacePrefs {
+export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Which accent tint the window wears. Applied as an inline `--c-accent`
    * override on `<html>`; see ui/accents.ts for why it is a per-theme pair
@@ -81,14 +103,35 @@ export interface InterfacePrefs {
    * less motion cannot be overridden from in here.
    */
   reduceMotion: boolean;
+  /**
+   * Ask macOS 26+ for its Liquid Glass window material in place of the standard
+   * one. Off by default. `true` is a request, not a fact: the backend answers
+   * with what is in effect and why not (`desktop/nativeRendering.ts`).
+   */
+  nativeGlass: boolean;
+  /**
+   * Ask WebKit to render above 60 Hz on the main webview. Off by default; a
+   * request like `nativeGlass`, and a no-op on a 60 Hz display.
+   */
+  highRefresh: boolean;
   /** Whether commit times read as "3d ago" or as a `YYYY-MM-DD` date. */
   timestampStyle: TimestampStyle;
   /**
-   * Whether a sidebar branch gets one line or two. Two is the default: on a
-   * default-width sidebar the single line handed the name whatever the chips
-   * and buttons left over, which was often three characters.
+   * Whether a sidebar branch gets one, two or three lines. Three is the
+   * default: on a default-width sidebar the single line handed the name
+   * whatever the chips and buttons left over, which was often three
+   * characters, and two lines still packed the numbers and the attribution
+   * together.
    */
   branchRowLayout: BranchRowLayout;
+  /**
+   * Which default `branchRowLayout` was last reconciled against. Stored
+   * "two-line" was the old default far more often than a choice, so a read
+   * that finds it under an older revision moves it to three lines once;
+   * `BRANCH_ROW_LAYOUT_REV` is written back with every save, which is what
+   * lets a later, deliberate "two-line" stay.
+   */
+  branchRowLayoutRev: number;
   /** Layout a diff opens in; the toolbar still switches the one on screen. */
   diffLayout: DiffLayout;
   /** Whether a diff opens with long lines wrapped. */
@@ -140,6 +183,12 @@ export interface InterfacePrefs {
   statusIconCounts: boolean;
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
+  /**
+   * Whether header buttons carry words. "auto" lets the header's width decide;
+   * "icons" holds the icon-only rendering at every width. Stored before the
+   * header rebuild as the boolean `showHeaderActionLabels`, which is still read.
+   */
+  headerLabels: HeaderLabelMode;
   /**
    * One exclusive application surface, independent of repository tab lifetime.
    *
@@ -227,6 +276,12 @@ export interface InterfacePrefs {
   taskBoards: Record<string, BoardPrefs>;
   /** Whether the scope navigator lists archived workspaces. */
   taskShowArchivedWorkspaces: boolean;
+  /**
+   * Whether the Tasks scope navigator is tucked away. A collapsed navigator
+   * is opened from the board toolbar as an overlay, so the choice gives the
+   * board its full width without removing the scopes.
+   */
+  taskNavigatorCollapsed: boolean;
   /**
    * What Return does in the board's quick-add line.
    *
@@ -351,11 +406,38 @@ export interface InterfacePrefs {
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
 
+/**
+ * Revision of the branch row layout default. Bumped to 1 when the default
+ * moved from two lines to three; see `branchRowLayoutRev`.
+ */
+export const BRANCH_ROW_LAYOUT_REV = 1;
+
+/**
+ * The layout to use for a stored value, reconciled once against the new
+ * default.
+ *
+ * - Not a layout (garbage, missing): the default.
+ * - "two-line" saved before revision 1: the old default rather than a
+ *   choice, so it becomes the new default. Made once: every save writes the
+ *   revision, so a "two-line" picked afterwards is kept.
+ * - Anything else, including "one-line" at any revision: as stored.
+ */
+export function migrateBranchRowLayout(stored: unknown, storedRev: unknown): BranchRowLayout {
+  if (!isBranchRowLayout(stored)) return DEFAULT_BRANCH_ROW_LAYOUT;
+  const reconciled = typeof storedRev === "number" && storedRev >= BRANCH_ROW_LAYOUT_REV;
+  if (stored === "two-line" && !reconciled) return DEFAULT_BRANCH_ROW_LAYOUT;
+  return stored;
+}
+
 const DEFAULTS: InterfacePrefs = {
+  ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
   reduceMotion: false,
+  nativeGlass: false,
+  highRefresh: false,
   timestampStyle: "relative",
-  branchRowLayout: "two-line",
+  branchRowLayout: DEFAULT_BRANCH_ROW_LAYOUT,
+  branchRowLayoutRev: BRANCH_ROW_LAYOUT_REV,
   diffLayout: "unified",
   diffWordWrap: false,
   diffSyntaxHighlight: true,
@@ -378,6 +460,7 @@ const DEFAULTS: InterfacePrefs = {
   hideDockWhenClosed: true,
   statusIconCounts: false,
   diagnosticsButton: "always",
+  headerLabels: "auto",
   globalSurface: "repository",
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
@@ -394,6 +477,7 @@ const DEFAULTS: InterfacePrefs = {
   taskOrder: "priority",
   taskBoards: {},
   taskShowArchivedWorkspaces: true,
+  taskNavigatorCollapsed: false,
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
@@ -469,21 +553,41 @@ function columnKeys(value: unknown, fallback: string[]): string[] {
   return [...seen];
 }
 
+const LEGACY_DENSITY_KEY = "gitpulse_density_mode";
+
+function readLegacyDensity(): Density {
+  try {
+    return densityFromLegacy(window.localStorage.getItem(LEGACY_DENSITY_KEY));
+  } catch {
+    return densityFromLegacy(null);
+  }
+}
+
 function readPrefs(): InterfacePrefs {
   if (typeof window === "undefined" || !window.localStorage) return freshDefaults();
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return freshDefaults();
+    // No stored preferences yet: a reader who only ever changed the old
+    // density setting still has it under its own key.
+    if (!raw) return { ...freshDefaults(), density: readLegacyDensity() };
     const parsed = JSON.parse(raw) as Partial<InterfacePrefs> & { fleetOpen?: unknown };
     return {
+      ...sanitizeAppearance({
+        ...parsed,
+        // Before the density merge the preference lived under its own key.
+        density: parsed.density ?? readLegacyDensity(),
+      }),
       accent: isAccentId(parsed.accent) ? parsed.accent : DEFAULTS.accent,
       reduceMotion: bool(parsed.reduceMotion, DEFAULTS.reduceMotion),
+      // Strictly `true`: a stored value this build cannot read must not turn a
+      // private-API switch on.
+      nativeGlass: parsed.nativeGlass === true,
+      highRefresh: parsed.highRefresh === true,
       timestampStyle: isTimestampStyle(parsed.timestampStyle)
         ? parsed.timestampStyle
         : DEFAULTS.timestampStyle,
-      branchRowLayout: isBranchRowLayout(parsed.branchRowLayout)
-        ? parsed.branchRowLayout
-        : DEFAULTS.branchRowLayout,
+      branchRowLayout: migrateBranchRowLayout(parsed.branchRowLayout, parsed.branchRowLayoutRev),
+      branchRowLayoutRev: BRANCH_ROW_LAYOUT_REV,
       diffLayout: isDiffLayout(parsed.diffLayout) ? parsed.diffLayout : DEFAULTS.diffLayout,
       diffWordWrap: bool(parsed.diffWordWrap, DEFAULTS.diffWordWrap),
       diffSyntaxHighlight: bool(
@@ -526,6 +630,7 @@ function readPrefs(): InterfacePrefs {
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
+      headerLabels: readHeaderLabelMode(parsed, DEFAULTS.headerLabels),
       globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "agents" || parsed.globalSurface === "repository"
         ? parsed.globalSurface
         : parsed.fleetOpen === true ? "fleet" : "repository",
@@ -549,6 +654,7 @@ function readPrefs(): InterfacePrefs {
         parsed.taskShowArchivedWorkspaces,
         DEFAULTS.taskShowArchivedWorkspaces,
       ),
+      taskNavigatorCollapsed: bool(parsed.taskNavigatorCollapsed, DEFAULTS.taskNavigatorCollapsed),
       // Anything unrecognizable falls back to manual. A stored value this
       // build cannot read must not be the one that spends a model call.
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
@@ -670,8 +776,29 @@ function createInterfaceStore() {
     subscribe,
     /** Saves a pending change now; the page-hide handler does the same. */
     flush: () => pendingSave.flush(),
-    setAccent: (accent: AccentId) => patch({ accent }),
+    setAccent: (accent: AccentId) => patch({ accent, customAccent: "" }),
+    /** A custom accent (`#rrggbb`); the contrast guard decides what it becomes. `""` returns to the preset. */
+    setCustomAccent: (hex: string) => patch({ customAccent: hex }),
+    setFontUi: (family: string) => patch({ fontUi: family }),
+    setFontMono: (family: string) => patch({ fontMono: family }),
+    setDensity: (density: Density) => patch({ density }),
+    setRadiusScale: (scale: number) => patch({ radiusScale: scale }),
+    /** Sets one appearance's intensity; the other keeps its own. */
+    setMaterialIntensity: (theme: Appearance, intensity: number) =>
+      patch((prefs) => ({ materialIntensity: { ...prefs.materialIntensity, [theme]: intensity } })),
+    setFloatBlur: (px: number) => patch({ floatBlur: Math.round(Math.min(FLOAT_BLUR_MAX, Math.max(0, px))) }),
+    setFieldLevel: (level: FieldLevel) => patch({ fieldLevel: level }),
+    setFieldHue: (degrees: number) => patch({ fieldHue: degrees }),
+    setReduceTransparency: (reduce: boolean) => patch({ reduceTransparency: reduce }),
+    setCustomTheme: (theme: GitPulseTheme | null) => patch({ customTheme: theme }),
+    /** Applies several appearance fields at once (an imported theme), as one save. */
+    patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
+    /** Puts every Appearance preference back without touching the rest. */
+    resetAppearance: () =>
+      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT, nativeGlass: false, highRefresh: false }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
+    setNativeGlass: (on: boolean) => patch({ nativeGlass: on }),
+    setHighRefresh: (on: boolean) => patch({ highRefresh: on }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),
     setBranchRowLayout: (layout: BranchRowLayout) => patch({ branchRowLayout: layout }),
     setDiffLayout: (layout: DiffLayout) => patch({ diffLayout: layout }),
@@ -701,6 +828,7 @@ function createInterfaceStore() {
       patch((prefs) => ({ collapseInactiveIncludeShells: !prefs.collapseInactiveIncludeShells })),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
+    setHeaderLabels: (mode: HeaderLabelMode) => patch({ headerLabels: mode }),
     /** Adds or removes one view from the header's hidden list. */
     setViewHidden: (view: ViewTab, hidden: boolean) =>
       patch((prefs) => ({
@@ -792,6 +920,7 @@ function createInterfaceStore() {
         taskCardFields: [...view.cardFields],
       }),
     setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
+    setTaskNavigatorCollapsed: (collapsed: boolean) => patch({ taskNavigatorCollapsed: collapsed }),
     setTaskQuickAddAssist: (assist: boolean) => patch({ taskQuickAddAssist: assist }),
     /**
      * Remembers the last handoff a reader chose.
@@ -816,6 +945,7 @@ function createInterfaceStore() {
         taskSwimlane: DEFAULTS.taskSwimlane,
         taskOrder: DEFAULTS.taskOrder,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
+        taskNavigatorCollapsed: DEFAULTS.taskNavigatorCollapsed,
         taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),
       }),
@@ -852,3 +982,9 @@ function createInterfaceStore() {
 }
 
 export const interfaceStore = createInterfaceStore();
+
+// The document follows the preferences from here on, whichever window or test
+// harness imported the store first; there is one subscription and it lives as
+// long as the page. It is a no-op without a document.
+installAppearance({ prefs: interfaceStore, theme: themeStore, platform: hostPlatform });
+installHeaderLabels(interfaceStore);

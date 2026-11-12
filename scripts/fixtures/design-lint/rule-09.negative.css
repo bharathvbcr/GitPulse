@@ -1,0 +1,6 @@
+.gp-a {
+  transition: opacity var(--gp-dur-fast), transform var(--gp-dur-fast);
+}
+.gp-b {
+  @apply transition-colors;
+}

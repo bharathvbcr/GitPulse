@@ -601,7 +601,7 @@ describe("formatHealthReport", () => {
       null,
       deadCodeReport({ available: false, reason: "no code graph", items: [], total: 0 }),
     );
-    expect(text).toContain("Dead-code check could not run: no code graph");
+    expect(text).toContain("Dead-code check couldn't run: no code graph");
     expect(text).toContain("That is not the same as finding no unreferenced symbols");
     expect(text).not.toContain("## Dead code");
   });

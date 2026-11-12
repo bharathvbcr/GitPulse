@@ -1,6 +1,9 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { get } from "svelte/store";
+  import { hostPlatform } from "../stores/platformStore";
   import {
+    anchorOwnsOpenPopup,
     tipGuideOf,
     tipTextOf,
     TOOLTIP_ANCHOR_SELECTOR,
@@ -90,10 +93,13 @@
     hide();
     activeEl = el;
     const key = tipGuideOf(el);
-    guide = key ? destinationGuide(key) : null;
+    guide = key ? destinationGuide(key, get(hostPlatform).os) : null;
     text = guide ? "" : tipTextOf(el);
     if (!guide && !text.trim()) return;
     timer = setTimeout(() => {
+      // Decided when the delay ends, not when the pointer arrived: a pill that
+      // opens its menu on pointer-enter is expanded by now.
+      if (anchorOwnsOpenPopup(el)) { hide(); return; }
       visible = true;
       placed = false;
       void tick().then(reveal);
@@ -163,7 +169,7 @@
   <div
     bind:this={bubble}
     role="tooltip"
-    class="gp-pop pointer-events-none fixed border border-border/80 bg-surface text-[11px] leading-snug text-textPrimary shadow-pop {guide
+    class="gp-pop pointer-events-none fixed border border-edgeStrong bg-surface text-meta leading-snug text-textPrimary shadow-pop {guide
       ? 'w-72 overflow-hidden rounded-xl p-0'
       : 'max-w-xs whitespace-pre-line rounded-lg px-2.5 py-1.5'} {placed
       ? 'opacity-100'

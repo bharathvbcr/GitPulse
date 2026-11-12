@@ -12,7 +12,7 @@
   import { repoStore } from "../stores/repoStore";
   import { redactDiagnosticText } from "../diagnostics/diagnostics";
   import { manviSectionId } from "../ui/manviFocus";
-  import { harnessPermissionMode, harnessPermissionSummary } from "../harness/availability";
+  import { harnessPermissionMode, harnessPermissionSummary, harnessPostureLabel } from "../harness/availability";
   import { NOTICE_TONE, scopedRunnerPresentation } from "../harness/policyPresentation";
   import {
     RefreshCw,
@@ -38,6 +38,7 @@
   let harness = $derived($harnessStore.harness);
   let harnessError = $derived($harnessStore.error);
   let permissionMode = $derived(harnessPermissionMode(harness));
+  let postureLabel = $derived(harnessPostureLabel(harness?.posture));
   let runnerPresentation = $derived(scopedRunnerPresentation(permissionMode, harnessError));
 
   /**
@@ -104,7 +105,7 @@
       <div class="gp-notice" data-tone="ok">
         <ShieldCheck size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
         <div class="min-w-0 flex-1 space-y-1.5">
-          <div class="font-medium">Connected · protocol {harness.protocol}, mode {harness.posture}</div>
+          <div class="font-medium">Connected · protocol {harness.protocol}{#if postureLabel}, {postureLabel}{/if}</div>
           <div class="font-mono text-meta text-textMuted break-all">{harness.binary}</div>
           <p class="text-textMuted leading-relaxed">
             Commits, pushes, merges, rebases, branch deletions, discards and conflict-editor

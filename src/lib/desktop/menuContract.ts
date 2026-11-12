@@ -91,7 +91,19 @@ export const MENU_ACTION_IDS: readonly string[] = [
   "terminal-dock", "fetch", "pull", "push", "stash", "stash-pop",
   "quick-commit", "rebase", "palette", "focus-filter", "close-tab",
   "next-repo-tab", "prev-repo-tab", "reopen-repo-tab",
+  "repo-tab-1", "repo-tab-2", "repo-tab-3", "repo-tab-4", "repo-tab-5", "repo-tab-6",
+  "repo-tab-7", "repo-tab-8", "repo-tab-9",
 ];
+
+/**
+ * The jump-to-repository-tab ids in digit order: `REPO_TAB_JUMP_IDS[n - 1]` is
+ * the item bound to ⌘n, and the ninth selects the LAST tab. Mirrors
+ * `actions::REPO_TAB_IDS`; both are entries of `MENU_ACTION_IDS`, which the
+ * contract test holds to `NativeAction::parse`.
+ */
+export const REPO_TAB_JUMP_IDS: readonly string[] = MENU_ACTION_IDS.filter((id) =>
+  /^repo-tab-[1-9]$/.test(id),
+);
 
 /**
  * Section destinations, taken from the registry rather than spelled again.

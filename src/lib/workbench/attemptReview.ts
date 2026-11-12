@@ -58,6 +58,6 @@ export function reviewSummary(view: AttemptReview): string {
     case "changes_requested": return `Changes requested on ${range}.${note(view.review.note)}`;
     case "denied": return `Denied in review: ${range}.${note(view.review.note)}`;
     case "stale": return `Approved at ${short(view.review.reviewed_head)}, but the branch has moved: ${range} needs a new review.`;
-    case "unreviewed": return view.ended ? `Not reviewed: ${range}.` : `Reviewable once the attempt ends: ${range}.`;
+    case "unreviewed": return view.ended ? `Not reviewed: ${range}.` : `Reviewable once the run ends: ${range}.`;
   }
 }

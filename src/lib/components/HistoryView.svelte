@@ -7,7 +7,12 @@
 
   /** Named once: the tab and its panel must agree on the id. */
   const view = "history" as const;
-  import FilterBar from "./FilterBar.svelte";
+  import { filterStore } from "../stores/filterStore";
+  import {
+    providePageSearchScope,
+    registerPageSearch,
+    registerStandingFilter,
+  } from "../search/pageSearch.svelte";
   import CommitTable from "./CommitTable.svelte";
   import GraphNotices from "./GraphNotices.svelte";
   import CommitDetails from "./CommitDetails.svelte";
@@ -58,30 +63,59 @@
   $effect(() => {
     suspectsQuery.bindRepo($currentRepoPath);
   });
+
+  // The view bar's search field. On Graph's Commits and HEAD moves lists it is
+  // the commit filter; the Diff section's viewer (mounted inside this scope)
+  // makes it a find instead. The Suspects list asks its question in the
+  // context bar (SuspectsQueryBar), so there the field has nothing of its own
+  // and searches the repository; ⌘F goes to the symptom (findChordTarget).
+  providePageSearchScope("history:diff");
+  $effect(() => {
+    if (asksSuspects) return;
+    return registerPageSearch("history:graph", {
+      kind: "filter",
+      label: "Filter commits",
+      placeholder: "Filter commits by message, author or path (author:alice, feat:)…",
+      query: () => $filterStore.searchQuery,
+      setQuery: (next) => filterStore.setSearch(next),
+      chip: () =>
+        $filterStore.selectedBranch
+          ? { label: $filterStore.selectedBranch, title: "Clear branch filter", clear: () => filterStore.selectBranch(null) }
+          : null,
+    });
+  });
+  // The filter narrows every section's commits: the graph walk, the diff's
+  // commit list and the reflog's loaded entries (the branch cannot apply to
+  // HEAD's log). Where the field is a find, the applied filter stays in view.
+  // It does not narrow the Suspects ranking, so no chip claims it does there.
+  $effect(() =>
+    registerStandingFilter("history", () => {
+      if (asksSuspects) return null;
+      const { searchQuery, selectedBranch } = $filterStore;
+      if (!searchQuery && !selectedBranch) return null;
+      const parts = [searchQuery && `“${searchQuery}”`, selectedBranch].filter(Boolean).join(" · ");
+      return { label: `Commits: ${parts}`, title: "The commit filter applied in Graph. Clear it", clear: () => filterStore.clear() };
+    }),
+  );
 </script>
 
 <div class="flex-1 flex flex-col min-h-0">
-  <ViewContextBar label="Commit filter">
-    {#if section === "graph"}
+  {#if section === "graph"}
+    <!-- Graph's three lists. The commit filter that used to sit beside them is
+         the view bar's search field now; the Suspects list's question stays
+         here, because a ranking is one answer, not a list text narrows. -->
+    <ViewContextBar label="Graph list">
       <SettingSegment
         ariaLabel="Graph list"
         options={HISTORY_LISTS}
         value={list}
         onselect={(next) => repoStore.setHistoryList(next)}
       />
-    {/if}
-    {#if asksSuspects}
-      <!-- A ranking is one answer, not a list text narrows: the Suspects list
-           takes its question here instead of the commit filter. -->
-      <SuspectsQueryBar />
-    {:else}
-      <!-- The filter applies to every other list here: the graph walk and
-           the diff's commit list are drawn from it, and the reflog list
-           narrows its loaded entries by the same text (the branch chip cannot
-           apply to HEAD's log). -->
-      <FilterBar />
-    {/if}
-  </ViewContextBar>
+      {#if asksSuspects}
+        <SuspectsQueryBar />
+      {/if}
+    </ViewContextBar>
+  {/if}
   <ViewSectionPanel {view} {section}>
 
     <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane

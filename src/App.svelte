@@ -43,15 +43,17 @@
   import { createMenuCommands, checkUpdatesFromMenu } from "./lib/desktop/menuCommands";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
   import Logo from "./lib/components/Logo.svelte";
-  import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
   import RepoPaneRecovery from "./lib/components/RepoPaneRecovery.svelte";
   import InsightsView from "./lib/components/InsightsView.svelte";
   import {
-    FOCUS_COMMIT_SEARCH_EVENT,
+    COMMIT_FILTER_SECTION,
+    FOCUS_PAGE_SEARCH_EVENT,
+    FOCUS_SUSPECTS_SYMPTOM_EVENT,
+    fieldOwnsFindChord,
+    findChordTarget,
     isCommitSearchChord,
-    ownsCommitSearchChord,
     tabForCommitSearch,
   } from "./lib/views/commitFilter";
   import { activeSectionFor } from "./lib/views/viewRegistry";
@@ -66,6 +68,7 @@
   import CoachMark from "./lib/components/CoachMark.svelte";
   // The gate loads the tour's component only while the tour is open.
   import ProductTour from "./lib/components/onboarding/ProductTourGate.svelte";
+  import DropOverlay from "./lib/components/DropOverlay.svelte";
   import {
     dismissFirstRun,
     onboardingStore,
@@ -79,7 +82,12 @@
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
   import LazyMount from "./lib/components/LazyMount.svelte";
+  // The first-run walkthrough is mounted at startup (it decides for itself whether
+  // to open) but its code is its own chunk; see lazyLoaders.ts for why the loader
+  // lives there.
+  import { warmLazyChunks } from "./lib/components/lazyLoaders";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
+  import Splash from "./lib/components/Splash.svelte";
 
   // Views the app does not need to start. Each becomes its own chunk, so
   // opening a repository no longer parses the coverage, health, storage,
@@ -128,10 +136,9 @@
   // at startup; it renders nothing until `onboardingStore.wizard.open`.
   const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
-  import ViewTabBar from "./lib/components/ViewTabBar.svelte";
+  import ViewBar from "./lib/components/ViewBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
   import {
-    RefreshCw,
     FolderOpen,
     Download,
     Clock,
@@ -220,7 +227,6 @@
     if ($setupWizard.open) setupWizardMounted = true;
   });
   let dropActive = $state(false);
-  let headerScroller: HTMLDivElement | undefined = $state();
   const macos = isMacOS();
 
   // --- terminal dock --------------------------------------------------------
@@ -336,18 +342,39 @@
   }
 
   /**
-   * Native "Search Commits" and ⌘F (except Files, which owns in-file search).
-   * Switching first is what makes the chord work on Work: FilterBar is not
-   * mounted there, so dispatching the focus event alone was a silent no-op.
+   * ⌘F: the view bar's search field, on whatever page is showing. The page
+   * decides what the field does (filter commits, find in a diff or a file,
+   * search the repository), so nothing switches view first.
+   */
+  function focusPageSearch() {
+    // Graph's Suspects list asks its question in the context bar, where the
+    // commit filter does not apply: there ⌘F means the symptom.
+    const target = findChordTarget({
+      tab: $repoStore.activeTab,
+      section: activeSectionFor($repoStore.activeTab, $repoStore.viewSections),
+      historyList: $repoStore.historyList,
+    });
+    window.dispatchEvent(new CustomEvent(target === "suspects-symptom" ? FOCUS_SUSPECTS_SYMPTOM_EVENT : FOCUS_PAGE_SEARCH_EVENT));
+  }
+
+  /**
+   * Native "Search Commits": the commit filter specifically, so it lands on
+   * History's graph first, where the field filters commits. The Suspects list
+   * has no commit filter, so it lands on the commit list instead.
    */
   async function focusCommitSearch() {
     const tab = $repoStore.activeTab;
     const target = tabForCommitSearch(tab);
-    if (target !== tab) {
-      repoStore.setActiveTab(target);
+    const section = activeSectionFor(target, $repoStore.viewSections);
+    if (target !== tab || section !== COMMIT_FILTER_SECTION) {
+      repoStore.setActiveTab(target, COMMIT_FILTER_SECTION);
       await tick();
     }
-    window.dispatchEvent(new CustomEvent(FOCUS_COMMIT_SEARCH_EVENT));
+    if ($repoStore.historyList === "suspects") {
+      repoStore.setHistoryList("commits");
+      await tick();
+    }
+    focusPageSearch();
   }
 
   let exitRequestPending = false;
@@ -380,7 +407,7 @@
       hosted: async () => (await readTerminalBackend()).managed?.hosted === true,
       listRuns: listAllLiveRuns,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if (managedRuns.cancelled) { cancelNativeExitRequest(); return; }
     // With the terminal host, sessions can outlive this app: a quit with any
@@ -390,12 +417,12 @@
     const decision = await decideQuitTerminals({
       ask: askChoice,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
     const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
     const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
     });
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
@@ -473,7 +500,7 @@
       exitApproved = false;
       cancelNativeExitRequest();
       diagnostics.error("desktop:exit", error);
-      toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
+      toastStore.error(`Couldn't quit GitPulse. ${formatError(error)}`);
     }
   }
 
@@ -491,6 +518,8 @@
 
   onMount(() => {
     applyPlatformClass();
+    // After first paint, fetch the chunks a hover or click would otherwise wait on.
+    warmLazyChunks();
     // HMR/unmount can tear the component down while the async subscription
     // chain is still awaiting; listeners tracked after dispose unlisten
     // immediately instead of leaking past the component.
@@ -589,6 +618,12 @@
     track(() => window.removeEventListener("gitpulse:settings", openSettings));
     window.addEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog);
     track(() => window.removeEventListener("gitpulse:branch-cleanup", openBranchCleanupDialog));
+    // The view bar's search runs the palette inline, outside this component:
+    // its Clone and Rebase commands reach these dialogs by event.
+    window.addEventListener("gitpulse:clone", openCloneDialog);
+    track(() => window.removeEventListener("gitpulse:clone", openCloneDialog));
+    window.addEventListener("gitpulse:rebase", openRebaseDialog);
+    track(() => window.removeEventListener("gitpulse:rebase", openRebaseDialog));
     const openToolsSetup = () => openSetupWizard("devmap", "explain");
     window.addEventListener("gitpulse:setup-tools", openToolsSetup);
     track(() => window.removeEventListener("gitpulse:setup-tools", openToolsSetup));
@@ -639,9 +674,17 @@
         repoStore.toggleTerminal();
         return;
       }
-      if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))) {
+      if (
+        isCommitSearchChord(e) &&
+        !isImeComposition(e) &&
+        fieldOwnsFindChord({
+          hasRepository: Boolean($repoStore.currentPath),
+          onRepositorySurface: $interfaceStore.globalSurface === "repository",
+          defaultPrevented: e.defaultPrevented,
+        })
+      ) {
         e.preventDefault();
-        void focusCommitSearch();
+        focusPageSearch();
         return;
       }
       // ⌥1…⌥n selects a section of the ACTIVE view. The consolidation left
@@ -682,7 +725,7 @@
 
     const openHelpPage = (path: string) => {
       void openExternal(`https://github.com/bharathvbcr/GitPulse/${path}`).catch((error) => {
-        toastStore.error(`Could not open help: ${formatError(error)}`);
+        toastStore.error(`Couldn't open help. ${formatError(error)}`);
       });
     };
 
@@ -756,6 +799,10 @@
       nextRepoTab: () => void repoStore.nextTab(),
       prevRepoTab: () => void repoStore.prevTab(),
       reopenRepoTab: () => void repoStore.reopenLastClosed(),
+      jumpRepoTab: (digit) => {
+        interfaceStore.setGlobalSurface("repository");
+        void repoStore.activateTabByDigit(digit);
+      },
       openError: (message) => toastStore.error(message),
       setDropActive: (active) => {
         setDropOverlay(active);
@@ -1060,7 +1107,7 @@
     <!-- Minimal crash isolation: a broken pane never takes down the window. -->
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatDiagnosticFailure(error)}>
       <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
-      <span class="text-[11px] text-textMuted">See Diagnostics for crash details</span>
+      <span class="text-meta text-textMuted">See Diagnostics for crash details</span>
       <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
     </div>
   {/snippet}
@@ -1078,41 +1125,40 @@
 >
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("header", error)}>
+    <!-- Row 1 of the header (HEADER_SPEC section 2): the title bar. The window
+         inset for the traffic lights, the logo mark (not a control), then
+         RepoTabBar, which is the surfaces, the repositories, Open and the
+         workspace actions; the host-wide chips sit at the right edge. Row 2,
+         the view bar, is the sibling below. `@container` makes this row's own
+         width the breakpoint source for everything inside it. -->
+    <!-- A container query measures the container's CONTENT box, so the padding
+         lives on the row inside it: the tiers (1100, 1280, 1440, 1600) are then
+         the window's own width, as HEADER_SPEC section 4 states them. -->
     <header
-    class="gp-glass gp-titlebar bg-surface border-b border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
-      ? 'h-12 pr-3'
-      : 'h-10 px-3'}"
+    class="@container gp-glass gp-repo-tabs relative bg-surface shrink-0 select-none min-w-0 {macos
+      ? 'h-12'
+      : 'h-10'}"
+    style:z-index={LAYERS.SCROLL_CUE}
+    data-tauri-drag-region
   >
+    <div class="flex h-full min-w-0 items-center {macos ? 'pr-3' : 'px-3'}" data-tauri-drag-region>
     {#if macos}
-      <div class="w-[76px] h-full shrink-0" data-tauri-drag-region></div>
+      <div class="gp-traffic-inset h-full shrink-0" data-tauri-drag-region></div>
     {/if}
     <div
-      class="gp-drag-children flex items-center gap-2 font-bold text-sm tracking-tight text-accent shrink-0"
+      class="gp-drag-children mr-2 flex items-center text-accent shrink-0"
       data-tauri-drag-region
     >
       <Logo size={19} variant="badge" />
-      <span class="text-textPrimary">GitPulse</span>
-    </div>
-    <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
-
-    <div class="relative min-w-0 flex-1 h-full">
-    <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
-      <!-- Everything in this row is measured as overflow, so nothing may sit
-           after the last control: a drag spacer (and the gap before it) or
-           trailing padding put the overflow cue over empty space. The row is
-           the drag region instead -- a bare attribute drags only on direct
-           hits, so the controls inside it still take their own clicks. -->
-      <div class="flex items-center gap-2 min-w-full w-max pl-2 h-full" data-tauri-drag-region>
-        {#if $repoStore.currentPath}
-          <ViewTabBar {conflictedCount} />
-        {/if}
-      </div>
-    </div>
-    <ScrollCue target={headerScroller} axis="x" />
     </div>
 
-    <!-- Right Actions -->
-    <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+    <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />
+
+    <!-- Host-wide chips, last so the Diagnostics badge sits at the window corner. -->
+    <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 pl-2 h-full">
+      {#if $interfaceStore.showHarnessBadges}
+        <HarnessBadge />
+      {/if}
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
@@ -1125,7 +1171,7 @@
         <Bug size={14} />
         {#if diagnosticErrorCount > 0}
           <span
-            class="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-rose-500 text-white text-[9px] leading-[15px] font-semibold text-center"
+            class="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-danger text-white text-micro leading-[15px] font-semibold text-center"
             title="{diagnosticErrorCount} error{diagnosticErrorCount === 1 ? '' : 's'} recorded"
           >
             {diagnosticErrorCount > 99 ? "99+" : diagnosticErrorCount}
@@ -1133,23 +1179,17 @@
         {/if}
       </button>
       {/if}
-      {#if $repoStore.currentPath}
-        <button
-          onclick={() => repoStore.refresh()}
-          title="Refresh Status"
-          class="gp-icon-btn"
-        >
-          <RefreshCw size={14} class={$repoStore.isLoading ? "animate-spin" : ""} />
-        </button>
-      {/if}
-      {#if $interfaceStore.showHarnessBadges}
-        <HarnessBadge />
-      {/if}
+    </div>
     </div>
   </header>
-  </svelte:boundary>
 
-  <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} onClone={openCloneDialog} />
+  <!-- Row 2 (HEADER_SPEC section 3): the lenses on the selected repository.
+       Not rendered on the welcome screen. Under a global surface it stays
+       mounted, inert, so the workspace never jumps. -->
+  {#if $repoStore.currentPath}
+    <ViewBar {conflictedCount} />
+  {/if}
+  </svelte:boundary>
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />
@@ -1171,7 +1211,7 @@
         <Logo size={68} variant="badge" animated />
 
         <div>
-          <h1 class="text-xl font-bold text-textPrimary">Welcome to GitPulse</h1>
+          <h1 class="text-lg font-semibold text-textPrimary">Welcome to GitPulse</h1>
           <p class="text-xs text-textMuted mt-1">High-performance, native Git client built with Rust & Svelte</p>
         </div>
 
@@ -1185,13 +1225,13 @@
           </button>
           <button onclick={openCloneDialog} class="gp-btn flex-1 py-2.5! px-4!">
             <Download size={15} />
-            <span>Clone Repo</span>
+            <span>Clone repository</span>
           </button>
         </div>
 
         {#if $repoStore.recentRepos.length > 0}
           <div class="w-full text-left pt-4">
-            <div class="flex items-center gap-1.5 text-[11px] font-semibold text-textMuted uppercase tracking-wider mb-2">
+            <div class="flex items-center gap-1.5 gp-label mb-2">
               <Clock size={12} />
               <span>Recent Repositories</span>
             </div>
@@ -1199,10 +1239,10 @@
               {#each $repoStore.recentRepos as repo}
                 <button
                   onclick={() => repoStore.openRepo(repo)}
-                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-xs hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
+                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-edge hover:border-accent/65 shadow-xs hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-colors text-left"
                 >
                   <span class="font-medium truncate">{displayName(repo)}</span>
-                  <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{repo}</span>
+                  <span class="text-micro text-textMuted font-mono truncate max-w-xs">{repo}</span>
                 </button>
               {/each}
             </div>
@@ -1211,7 +1251,7 @@
       </div>
     </div>
   {:else}
-      <div class="flex-1 flex overflow-hidden">
+      <div class="flex-1 flex overflow-hidden relative">
         <svelte:boundary failed={sidebarFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
           <Sidebar />
         </svelte:boundary>
@@ -1286,25 +1326,25 @@
 
     {#if $showFirstRunCard}
       <div
-        class="gp-pop gp-card fixed bottom-10 left-6 z-30 max-w-sm rounded-2xl border border-accent/40 bg-surface p-3 shadow-float"
+        style:z-index={LAYERS.TOUR} class="gp-pop gp-card fixed bottom-10 left-6 max-w-sm rounded-2xl border border-accent/35 bg-surface p-3 shadow-float"
         role="status"
       >
-        <div class="text-xs font-bold text-textPrimary mb-1">Optional tools</div>
-        <p class="text-[11px] text-textMuted leading-relaxed mb-2">
-          Install <span class="font-mono">devmap</span> (Code → Map) and
-          <span class="font-mono">manvi</span> (policy) when you want them — GitPulse works without either.
+        <div class="text-xs font-semibold text-textPrimary mb-1">Optional tools</div>
+        <p class="text-meta text-textMuted leading-relaxed mb-2">
+          Set up the code map (Code → Map) and
+          Manvi (policy) when you want them — GitPulse works without either.
         </p>
         <div class="flex items-center gap-2">
           <button
             type="button"
-            class="gp-btn text-[11px] px-2 py-0.5"
+            class="gp-btn text-meta px-2 py-0.5"
             onclick={() => openSetupWizard("devmap", "explain")}
           >
             Set up
           </button>
           <button
             type="button"
-            class="text-[11px] text-textMuted hover:text-textPrimary"
+            class="text-meta text-textMuted hover:text-textPrimary"
             onclick={() => void dismissFirstRun()}
           >
             Dismiss
@@ -1315,6 +1355,8 @@
   {/if}
   </div>
 
+  <!-- The gate reads the saved tour at launch and loads the tour's own chunk
+       (lazyLoaders' loadProductTour) only once it is open. -->
   <ProductTour onOpenRepository={() => repoStore.pickAndOpenRepo()}
     onSettings={() => (isSettingsModalOpen = true)} onTools={() => openSetupWizard("devmap", "explain")}
     onTasks={() => interfaceStore.setTasksOpen(true)}
@@ -1353,16 +1395,7 @@
   {/if}
 
   {#if dropActive}
-    <div
-      class="gp-overlay absolute inset-0 bg-accent/10 backdrop-blur-sm p-4 flex items-center justify-center pointer-events-none gp-gpu"
-      style="z-index: {LAYERS.DROP_OVERLAY}"
-    >
-      <div class="w-full h-full rounded-3xl border-2 border-dashed border-accent/70 bg-accent/5 flex items-center justify-center">
-        <div class="gp-pop px-6 py-4 rounded-2xl bg-surface border border-accent/50 text-sm font-semibold text-textPrimary shadow-float">
-          Drop a Git repository to open
-        </div>
-      </div>
-    </div>
+    <DropOverlay />
   {/if}
 
   <!-- Overlay widgets: repo views stay in the pane boundaries above. Prompt
@@ -1397,4 +1430,5 @@
       <LazyMount load={loadDiagnosticsModal} name="Diagnostics" props={{ isOpen: isDiagnosticsOpen, onClose: () => (isDiagnosticsOpen = false) }} />
     {/if}
   </svelte:boundary>
+  <Splash />
 </div>

@@ -20,7 +20,7 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.
 
-## Code (`⌘1` / `Ctrl+1`)
+## Code (`⌥⌘1` / `Ctrl+Shift+1`)
 
 Explorer and Blame are two lenses on one **file** (selection survives the switch). **Search** scans file contents across the working tree or revisions. **Map** is the structural navigator — DevMap repo map, code/doc graph, and tracked-markdown search — not a third reading of the open file. Sections: `⌥1` / `⌥2` / `⌥3` / `⌥4`.
 
@@ -38,7 +38,7 @@ are hidden; mixed areas stay visible. **Clear filters** restores the loaded
 nodes. Filters survive a refresh and reset when switching repositories or map
 views. Coverage and truncation counts still describe the original payload.
 
-## History (`⌘2` / `Ctrl+2`)
+## History (`⌥⌘2` / `Ctrl+Shift+2`)
 
 Lenses on one **commit** and regression history.
 
@@ -49,7 +49,7 @@ Lenses on one **commit** and regression history.
 
 ![Diff view: unified commit diff](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-diff.png)
 
-## Insights (`⌘3` / `Ctrl+3`)
+## Insights (`⌥⌘3` / `Ctrl+Shift+3`)
 
 Five on-demand scans of **this repository**. Each must say when it was capped rather than presenting a floor as a total.
 

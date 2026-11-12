@@ -7,6 +7,8 @@ import { diagnostics } from "../diagnostics/diagnostics";
 import { sessionActivity } from "../terminal/sessionActivity";
 import { buildMenuState, countAgentsWaiting } from "./menuState";
 import { sendableMenuState } from "./menuContract";
+import { expandedStacks } from "../repos/stackState";
+import { collapsedInactiveGroups, explicitlyExpandedGroups } from "../repos/groupState";
 
 /** Dialog/read activity before a Git command starts; the store owns actual mutations. */
 export const menuActivity = writable<Record<string, string[]>>({});
@@ -23,12 +25,14 @@ const reported = new Set<string>();
 
 export const nativeMenuState = derived(
   [repoStore, interfaceStore, themeStore.preferenceState, repoStore.mutationActivity, menuActivity, updateCheckInFlight,
-    sessionActivity],
+    sessionActivity, expandedStacks, collapsedInactiveGroups, explicitlyExpandedGroups],
   ([repo, prefs, theme, activity, pending, checking, sessions]) => {
-    // `undefined` keeps the platform's own path identity; the agent count is
-    // the only argument this projection adds to the builder's defaults.
+    // `undefined` keeps the platform's own path identity; the agent count and
+    // the strip's stop count are the arguments this projection adds to the
+    // builder's defaults. The last three inputs above carry no value here: they
+    // are what folds a stack or a group, so a change to them re-counts the stops.
     const built = buildMenuState(repo, prefs, theme, { ...pending, ...activity }, checking, activity, undefined,
-      countAgentsWaiting(sessions));
+      countAgentsWaiting(sessions), repoStore.jumpStopCount());
     // The last thing before the IPC boundary. `buildMenuState` is held to
     // producing only sendable payloads, and this is what keeps a lapse in that
     // from costing the menu bar, the tray and the popover at once: the native

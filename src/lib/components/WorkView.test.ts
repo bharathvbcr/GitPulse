@@ -55,6 +55,15 @@ describe("WorkView", () => {
     expect(source.indexOf("{degraded}")).toBeLessThan(rows);
   });
 
+  it("gives both could-not-check banners a Rescan that is the header's own refresh", () => {
+    const banner = (needle: string) => source.slice(source.indexOf(needle), source.indexOf("</div>", source.indexOf(needle)));
+    for (const needle of ["Couldn't check overlapping files", "<span>{degraded}</span>"]) {
+      const body = banner(needle);
+      expect(body).toContain(">Rescan</button>");
+      expect(body).toContain("void refresh($repoStore.currentPath)");
+    }
+  });
+
   it("tells an absent task store apart from a task store with nothing in it", () => {
     // The distinction is still consulted and still changes what the reader
     // sees — it drives the header subtitle and the catch-all row's label. It
@@ -131,7 +140,7 @@ describe("WorkView", () => {
     // with nothing parked in it, which is the one thing this screen may not
     // let happen.
     expect(source).toContain("$repoStore.operation.probeFailed");
-    expect(source).toContain("Could not check for a parked merge or rebase here");
+    expect(source).toContain("Couldn't check for a parked merge or rebase here");
   });
 
   it("surfaces a parked operation, which is the one thing that needs a person", () => {
@@ -198,7 +207,8 @@ describe("WorkView", () => {
   it("offers MCP setup without sending the reader to a system they may not run", () => {
     expect(source).toContain("gitpulse:settings");
     expect(source).toContain("Connect an agent");
-    expect(source).toContain("gitpulse_insights");
+    expect(source).toContain("Agents read this same snapshot over MCP 2.0");
+    expect(source).not.toContain("gitpulse_insights");
   });
 
   it("offers named review and repository navigation actions", () => {
@@ -328,8 +338,8 @@ describe("WorkView's lazily loaded disclosures", () => {
   it("can retry a chunk that failed to load instead of replaying the rejection", () => {
     expect(source).toContain("cleanupModule = null;");
     expect(source).toContain("activityModule = null;");
-    expect(source).toContain("onclick={() => cleanupAttempt++}>Retry</button>");
-    expect(source).toContain("onclick={() => activityAttempt++}>Retry</button>");
+    expect(source).toContain("onclick={() => cleanupAttempt++}>Try again</button>");
+    expect(source).toContain("onclick={() => activityAttempt++}>Try again</button>");
     expect(source).toContain("{#key cleanupAttempt}");
     expect(source).toContain("{#key activityAttempt}");
   });

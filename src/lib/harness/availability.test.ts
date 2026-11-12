@@ -4,6 +4,7 @@ import type { HarnessStatus } from "../stores/harnessStore";
 import {
   harnessPermissionMode,
   harnessPermissionSummary,
+  harnessPostureLabel,
 } from "./availability";
 
 function status(
@@ -50,6 +51,17 @@ describe("harness permission availability", () => {
     expect(summary).toContain("blocked");
     expect(summary).not.toContain("still work");
     expect(summary).not.toContain("unchecked mode");
+  });
+
+  it("shows Manvi's posture as words, never the raw value, and nothing when there is none", () => {
+    expect(harnessPostureLabel("host")).toBe("No task required (hard rules still apply)");
+    expect(harnessPostureLabel("Host ")).toBe("No task required (hard rules still apply)");
+    expect(harnessPostureLabel("devcouncil")).toBe("Task required");
+    expect(harnessPostureLabel("strict_write")).toBe("strict write");
+    expect(harnessPostureLabel("")).toBeNull();
+    expect(harnessPostureLabel("   ")).toBeNull();
+    expect(harnessPostureLabel(undefined)).toBeNull();
+    expect(readFileSync(new URL("../components/ManviConnection.svelte", import.meta.url), "utf8")).not.toContain("harness.posture}");
   });
 
   it("routes every MANVI status surface through the same permission truth", () => {

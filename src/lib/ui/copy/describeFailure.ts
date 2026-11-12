@@ -111,6 +111,20 @@ export function describeFailure(action: FailureAction, err: unknown, opts: Failu
 }
 
 /**
+ * A failure headline and its reason as one sentence pair, for a toast that has
+ * no room for a second line: `Couldn't <verb> <object>. <Reason>.` The headline
+ * is the caller's own wording; the reason is flattened to one line, starts with
+ * a capital and ends with a stop. A missing reason says what is true, that the
+ * action did not finish, rather than leaving the headline to read as a verdict.
+ */
+export function failureLine(headline: string, reason?: string | null): string {
+  const lead = `${bareWord(headline, "Couldn't finish")}.`;
+  const detail = toOneLine(reason ?? "", DETAIL_MAX_CHARS) || "It did not complete.";
+  const sentence = capitalize(detail);
+  return `${lead} ${/[.!?…]$/.test(sentence) ? sentence : `${sentence}.`}`;
+}
+
+/**
  * Build a destructive confirmation. The title is `<Verb> <object>?`, the
  * button repeats the verb, and `variant: "danger"` is never the primary
  * gradient. Throws `TypeError` when the verb, object or consequence is blank.

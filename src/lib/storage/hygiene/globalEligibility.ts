@@ -36,7 +36,7 @@ export function cleanupAllowed(inventory: CleanerInventory | null): boolean {
 export function coverageNotice(inventory: CleanerInventory | null): string | null {
   if (!inventory || !inventory.partial) return null;
   if (inventory.candidates.length === 0) {
-    return "Incomplete inventory, and nothing eligible was found. Cleanup needs at least one directory it read in full; what could not be read is named below.";
+    return "Incomplete inventory, and nothing eligible was found. Cleanup needs at least one directory it read in full; what couldn't be read is named below.";
   }
-  return "Incomplete inventory: part of the workspace could not be read. That does not hold up the rest — every directory listed below was read in full and stays eligible. What could not be read is named below and is left alone.";
+  return "Incomplete inventory: part of the workspace couldn't be read. That does not hold up the rest — every directory listed below was read in full and stays eligible. What couldn't be read is named below and is left alone.";
 }

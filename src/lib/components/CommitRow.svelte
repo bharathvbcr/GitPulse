@@ -32,7 +32,7 @@
   import { shortRefLabel } from "../graph/refScope";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
 
   import type { RefItem } from "../graph/graphDecorations";
   import type { SuspectMark } from "../codeintel/suspectsQuery";
@@ -112,28 +112,32 @@
   const isAbsoluteTime = $derived(timestampStyle === "absolute");
   const avatar = $derived(authorIdentity(row.author_name, row.author_email));
 
-  function getConventionalType(msg: string): { type: string; color: string } | null {
+  type ChipTone = "neutral" | "accent" | "ok" | "warn" | "danger" | "info" | "unknown";
+
+  /** The role tone a conventional-commit type wears. The word says what it is; the tone only groups it. */
+  const CONVENTIONAL_TONES: ReadonlyMap<string, ChipTone> = new Map<string, ChipTone>([
+    ["feat", "ok"],
+    ["fix", "danger"],
+    ["refactor", "accent"],
+    ["docs", "info"],
+    ["chore", "neutral"],
+    ["perf", "warn"],
+    ["test", "warn"],
+    ["build", "info"],
+    ["ci", "info"],
+  ]);
+
+  function getConventionalType(msg: string): { type: string; tone: ChipTone } | null {
     const match = msg.match(/^([a-zA-Z]+)(\([^\)]+\))?(!)?:\s/);
     if (!match) return null;
     const type = match[1].toLowerCase();
-    switch (type) {
-      case "feat": return { type: "feat", color: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30" };
-      case "fix": return { type: "fix", color: "bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-500/30" };
-      case "refactor": return { type: "refactor", color: "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30" };
-      case "docs": return { type: "docs", color: "bg-sky-500/15 text-sky-600 dark:text-sky-400 border-sky-500/30" };
-      case "chore": return { type: "chore", color: "bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/30" };
-      case "perf": return { type: "perf", color: "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30" };
-      case "test": return { type: "test", color: "bg-orange-500/15 text-orange-600 dark:text-orange-400 border-orange-500/30" };
-      case "build": return { type: "build", color: "bg-teal-500/15 text-teal-600 dark:text-teal-400 border-teal-500/30" };
-      case "ci": return { type: "ci", color: "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 border-indigo-500/30" };
-      default: return { type, color: "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400 border-zinc-500/30" };
-    }
+    return { type, tone: CONVENTIONAL_TONES.get(type) ?? "neutral" };
   }
 
   async function handleCopySha(e: MouseEvent) {
     e.stopPropagation();
     if (!(await copyText(row.id))) {
-      toastStore.error("Could not copy the commit SHA");
+      toastStore.error("Couldn't copy the commit SHA.");
       return;
     }
     isCopied = true;
@@ -173,7 +177,7 @@
   async function checkoutHere() {
     closeMenu();
     const outcome = await repoStore.checkoutDetached(row.id);
-    reportFailure(outcome, "Could not check out the commit");
+    reportFailure(outcome, "Couldn't check out the commit");
   }
 
   function filterByAuthor() {
@@ -238,19 +242,19 @@
   aria-pressed={isSelected}
   aria-haspopup="menu"
   aria-expanded={isMenuOpen}
-  class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg group {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-xs' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
+  class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-meta' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-colors rounded-lg group {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35' : 'hover:bg-surfaceHover text-textPrimary'}"
 >
   <!-- Short SHA with interactive Copy Button -->
   <button
     type="button"
     onclick={handleCopySha}
-    class="font-mono text-accent/80 hover:text-accent shrink-0 tracking-tight flex items-center gap-1 group/sha {isCompact ? 'text-[10px] w-16' : 'text-[11px] w-20'}"
+    class="font-mono text-accent hover:underline focus-visible:underline shrink-0 tracking-tight flex items-center gap-1 group/sha {isCompact ? 'text-micro w-16' : 'text-meta w-20'}"
     title="Click to copy full SHA ({row.id})"
     aria-label="Copy full SHA {row.id}"
   >
     <span>{row.id.substring(0, 7)}</span>
     {#if isCopied}
-      <Check size={11} class="text-emerald-500 shrink-0" />
+      <Check size={11} class="text-ok shrink-0" />
     {:else}
       <Copy size={10} class="opacity-0 group-hover/sha:opacity-100 group-focus-within/sha:opacity-100 text-textMuted transition-opacity shrink-0" />
     {/if}
@@ -259,7 +263,7 @@
   <!-- Commit Summary, Badges & Ref Pills -->
   <div class="flex-1 flex items-center gap-2 truncate">
     {#if conventional}
-      <span class="inline-flex items-center text-[9px] font-semibold px-1.5 py-0.5 rounded-full border {conventional.color}">
+      <span class="gp-chip font-semibold" data-tone={conventional.tone}>
         {conventional.type}
       </span>
     {/if}
@@ -269,7 +273,7 @@
     {/if}
 
     {#if row.is_merge}
-      <span class="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 dark:text-purple-300 rounded-full border border-purple-500/30 font-medium">
+      <span class="gp-chip font-medium" data-tone="accent">
         <GitMerge size={10} />
         merge
       </span>
@@ -277,26 +281,29 @@
 
     {#each refs as r}
       {#if r.kind === "head"}
-        <span class="inline-flex items-center gap-1 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded-full border border-accent bg-accent/25 text-accent shadow-xs">
+        <span class="gp-chip font-mono font-semibold" data-tone="accent">
           <Compass size={10} />
           HEAD
         </span>
       {:else if r.kind === "current-branch"}
+        <!-- The branch colour is the graph's own lane colour (canvas palette),
+             so it is handed through as a style, not mapped to a role tone. -->
         <span
-          class="inline-flex items-center gap-1 text-[9px] font-mono font-semibold px-2 py-0.5 rounded-full border shadow-xs"
+          class="gp-chip font-mono font-semibold"
           style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
         >
           <GitBranch size={10} />
           {r.name}
         </span>
       {:else if r.kind === "remote-branch"}
-        <span class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400">
+        <span class="gp-chip font-mono" data-tone="info">
           <Cloud size={10} />
           {r.name}
         </span>
       {:else if r.kind === "tag"}
         <span
-          class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300"
+          class="gp-chip font-mono"
+          data-tone="warn"
           title={r.comparedTo
             ? r.aheadOfBase && r.aheadOfBase > 0
               ? `Tag ${r.name} — ${r.aheadOfBase} commits not in ${r.comparedTo}`
@@ -318,16 +325,15 @@
           made these lanes unreadable.
         -->
         <span
-          class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-border/60 bg-surfaceHover/60 text-textMuted"
+          class="gp-chip font-mono"
+          data-tone="neutral"
           title="refs/{r.name} — outside branches, remotes and tags"
         >
           <Hash size={10} />
           {shortRefLabel(r.name)}
         </span>
       {:else}
-        <span
-          class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-border/80 bg-surfaceHover text-textPrimary"
-        >
+        <span class="gp-chip font-mono text-textPrimary" data-tone="neutral">
           <GitBranch size={10} class="text-textMuted" />
           {r.name}
         </span>
@@ -344,7 +350,7 @@
   </div>
 
   <!-- Author Name & Relative Date -->
-  <span class="{isCompact ? 'text-[10px] w-24' : 'text-[11px] w-28'} text-textMuted shrink-0 truncate text-right font-medium select-text">
+  <span class="{isCompact ? 'text-micro w-24' : 'text-meta w-28'} text-textMuted shrink-0 truncate text-right font-medium select-text">
     {row.author_name}
   </span>
   <!-- Widened for the absolute style: "2026-09-06" does not fit the column a
@@ -353,11 +359,11 @@
   <span
     class="{isCompact
       ? isAbsoluteTime
-        ? 'text-[10px] w-[4.6rem]'
-        : 'text-[10px] w-14'
+        ? 'text-micro w-[4.6rem]'
+        : 'text-micro w-14'
       : isAbsoluteTime
-        ? 'text-[11px] w-[5.2rem]'
-        : 'text-[11px] w-16'} text-textMuted/70 shrink-0 text-right"
+        ? 'text-meta w-[5.2rem]'
+        : 'text-meta w-16'} text-textMuted shrink-0 text-right"
     title={timestampTitle(row.timestamp, timestampStyle)}
   >
     {formatTimestamp(row.timestamp, timestampStyle)}
@@ -365,7 +371,7 @@
 
   <!-- Author Initials Avatar -->
   <div
-    class="{isCompact ? 'w-3.5 h-3.5 text-[8px]' : 'w-4.5 h-4.5 text-[10px]'} rounded-full flex items-center justify-center text-white font-bold shrink-0 shadow-xs ring-1 ring-background"
+    class="{isCompact ? 'w-4 h-4' : 'w-5 h-5'} text-micro rounded-full flex items-center justify-center text-white font-semibold shrink-0 ring-1 ring-background"
     style="background-color: {authorColor(avatar.hue)}"
     title="{row.author_name || 'Unknown'}{row.author_email ? ` <${row.author_email}>` : ''}"
   >
@@ -378,8 +384,8 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    use:popover={dismissal}
-    class="fixed z-50 min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden shadow-float"
+    use:popover={dismissal} out:popoverExit
+    class="fixed min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden shadow-float"
     style="z-index: {LAYERS.MENU};"
     role="menu"
     aria-orientation="vertical"
@@ -392,7 +398,7 @@
       onclick={(e) => { closeMenu(); handleCopySha(e); }}
     >
       <Copy size={12} class="text-textMuted" />
-      <span>Copy Full SHA</span>
+      <span>Copy full SHA</span>
     </button>
     <button
       role="menuitem"
@@ -403,13 +409,13 @@
           if (await copyText(row.summary)) {
             toastStore.info("Copied commit message", undefined, 2000);
           } else {
-            toastStore.error("Could not copy the commit message");
+            toastStore.error("Couldn't copy the commit message.");
           }
         }
       }}
     >
       <Copy size={12} class="text-textMuted" />
-      <span>Copy Message</span>
+      <span>Copy message</span>
     </button>
     <div class="gp-menu-sep" role="separator"></div>
     <button
@@ -418,7 +424,7 @@
       onclick={createBranchHere}
     >
       <Plus size={12} class="text-textMuted" />
-      <span>Create Branch Here…</span>
+      <span>Create branch here…</span>
     </button>
     <button
       role="menuitem"
@@ -434,7 +440,7 @@
       onclick={() => void checkoutHere()}
     >
       <GitBranch size={12} class="text-textMuted" />
-      <span>Checkout Commit</span>
+      <span>Check out commit</span>
     </button>
     <button
       role="menuitem"
@@ -458,7 +464,7 @@
       onclick={filterByAuthor}
     >
       <Filter size={12} class="text-textMuted" />
-      <span>Filter by this Author</span>
+      <span>Filter by this author</span>
     </button>
   </div>
 {/if}

@@ -49,6 +49,7 @@
 
 <script lang="ts">
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { LAYERS } from "../ui/layers";
   import { displayName } from "../repos/paths";
   import { repoScope } from "../repos/repoScope.svelte";
   import BranchList from "./BranchList.svelte";
@@ -83,15 +84,133 @@
     ChevronRight,
     DownloadCloud,
     FolderGit2,
-    FolderOpen,
     GitBranch,
     Minus,
     PanelLeftClose,
     PanelLeftOpen,
+    Pin,
+    PinOff,
     Plus,
     Search,
   } from "@lucide/svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import { onDestroy, tick, untrack } from "svelte";
+  import { motionExitMs, motionMs } from "../motion/tokens";
+  import { slideDocked } from "../sidebar/dockedSlide";
+  import { panelModes } from "../ui/panelMode";
+  import { floatingPanelDismiss } from "../ui/panelDismiss";
+  import { popover, type PopoverOptions } from "../ui/popover";
+  import { springEasing } from "../ui/transitions";
+
+  /* --- Mode, collapse and the slide ------------------------------------------ */
+
+  let overlay = $derived($panelModes.sidebar === "overlay");
+  let collapsed = $derived($layoutStore.collapsed);
+  /**
+   * What the docked column draws. It follows `collapsed` at once on an expand
+   * (the column widens first, then the panel slides in) and a beat late on a
+   * collapse (the panel slides out, then the column narrows), so the workspace
+   * reflows once either way and never while the panel is moving. The slide is
+   * transform and opacity only (dockedSlide.ts).
+   */
+  let shownCollapsed = $state($layoutStore.collapsed);
+  let dockedAside = $state<HTMLElement | null>(null);
+  let wasCollapsed = $layoutStore.collapsed;
+  let activeSlide: Animation | null = null;
+  /** Bumped whenever a slide is cancelled or replaced, so a late finish cannot act on a stale one. */
+  let slideGeneration = 0;
+
+  function endSlide() {
+    slideGeneration += 1;
+    activeSlide?.cancel();
+    activeSlide = null;
+  }
+
+  function followCollapsed(next: boolean, floating: boolean) {
+    const changed = next !== wasCollapsed;
+    wasCollapsed = next;
+    endSlide();
+    // Nothing to play: no change, a floating panel (it has its own transition),
+    // a column being dragged, or no column mounted yet.
+    if (!changed || floating || dragging || !dockedAside) {
+      shownCollapsed = next;
+      return;
+    }
+    const generation = slideGeneration;
+    const travel = $layoutStore.width - SIDEBAR_COLLAPSED_WIDTH;
+    if (!next) {
+      shownCollapsed = false;
+      void tick().then(() => {
+        if (generation === slideGeneration && dockedAside) {
+          activeSlide = slideDocked(dockedAside, "in", travel, () => {});
+        }
+      });
+      return;
+    }
+    activeSlide = slideDocked(dockedAside, "out", travel, () => {
+      if (generation !== slideGeneration) return;
+      shownCollapsed = true;
+      void tick().then(() => {
+        if (generation === slideGeneration && dockedAside) {
+          activeSlide = slideDocked(dockedAside, "settle", 0, () => {});
+        }
+      });
+    });
+  }
+
+  $effect(() => {
+    const next = collapsed;
+    const floating = overlay;
+    untrack(() => followCollapsed(next, floating));
+  });
+
+  function toggleCollapsed() {
+    layoutStore.toggleCollapsed();
+  }
+
+  function toggleMode() {
+    panelModes.toggle("sidebar");
+  }
+
+  /** Escape closes a floating panel, unless something inside it (a menu) took the key. */
+  function escapeCloses(event: KeyboardEvent) {
+    if (event.key !== "Escape" || event.defaultPrevented || !overlay || collapsed) return;
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest("[data-sidebar-panel]")) return;
+    layoutStore.toggleCollapsed();
+  }
+
+  /*
+   * A pointerdown outside the floating panel closes it. Menus the panel opened
+   * are portaled to <body>, so "inside" is a selector over the panel and every
+   * floating layer (ui/panelDismiss.ts), judged by the popover owner.
+   */
+  const panelDismissOptions: PopoverOptions = {
+    dismiss: floatingPanelDismiss("[data-sidebar-panel]"),
+    onDismiss: () => {
+      if (overlay && !collapsed) layoutStore.toggleCollapsed();
+    },
+  };
+
+  const slideEase = springEasing("spatial");
+
+  /** The floating panel rises out of the rail's edge: transform and opacity only. */
+  function panelIn(_node: Element) {
+    return {
+      duration: motionMs("base"),
+      easing: slideEase,
+      css: (t: number, u: number) => `opacity: ${t}; transform: translate3d(${-u * 100}%, 0, 0)`,
+    };
+  }
+
+  /** Leaves in an exit: opacity only, shorter than the entrance. */
+  function panelOut(_node: Element) {
+    return { duration: motionExitMs("base"), css: (t: number) => `opacity: ${t}` };
+  }
+
+  onDestroy(() => {
+    endSlide();
+  });
 
   // An agent can touch thousands of files in one pass; lists mount a window
   // and grow on demand so the sidebar never becomes the bottleneck.
@@ -204,7 +323,7 @@
   }
 
   function pathClass(conflicted: boolean): string {
-    return conflicted ? "text-amber-400 font-bold" : "text-textPrimary";
+    return conflicted ? "text-warn font-semibold" : "text-textPrimary";
   }
 
   /* --- Drag-to-resize (Pointer Events + capture) ---------------------------- */
@@ -265,46 +384,43 @@
   }
 </script>
 
-<aside
-  class="gp-glass gp-sidebar relative bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
-    ? 'transition-[width] duration-150'
-    : ''}"
-  style="width:{$layoutStore.collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
->
-  {#if !$layoutStore.collapsed}
-    <!-- Repo Header & Open Button -->
+{#snippet expanded()}
+    <!-- Repository header. Opening another repository is the title bar's
+         "Open" (decision D3, HEADER_SPEC §9): the sidebar no longer repeats it. -->
     <div class="p-3 flex items-center justify-between bg-surfaceHover/30 gap-1">
       <div class="flex items-center gap-2 truncate">
         <FolderGit2 size={15} class="text-accent shrink-0" />
-        <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No Repo"}>
-          {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No Repository"}
+        <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No repository"}>
+          {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No repository"}
         </span>
       </div>
       <div class="flex items-center shrink-0">
         <button
           type="button"
-          onclick={() => layoutStore.toggleCollapsed()}
-          title="Collapse sidebar"
-          aria-label="Collapse sidebar"
-          class="gp-icon-btn p-1! hover:text-accent"
+          onclick={toggleMode}
+          title={overlay ? "Dock the sidebar beside the workspace" : "Float the sidebar over the workspace"}
+          aria-label="Float sidebar over the workspace"
+          aria-pressed={overlay}
+          data-sidebar-mode-toggle
+          class="gp-icon-btn hover:text-accent" data-size="sm"
         >
-          <PanelLeftClose size={14} />
+          {#if overlay}<PinOff size={14} />{:else}<Pin size={14} />{/if}
         </button>
         <button
           type="button"
-          onclick={() => repoStore.pickAndOpenRepo()}
-          title="Open Repository"
-          aria-label="Open Repository"
-          class="gp-icon-btn p-1! hover:text-accent"
+          onclick={toggleCollapsed}
+          title="Collapse sidebar"
+          aria-label="Collapse sidebar"
+          class="gp-icon-btn hover:text-accent" data-size="sm"
         >
-          <FolderOpen size={14} />
+          <PanelLeftClose size={14} />
         </button>
       </div>
     </div>
 
     {#if $repoStore.currentPath}
       <!-- At-a-glance repo pulse strip -->
-      <div class="mx-3 mt-2 rounded-xl border border-border/70 bg-surface p-2.5 space-y-1.5">
+      <div class="mx-3 mt-2 rounded-xl border border-edge bg-surface p-2.5 space-y-1.5">
         <div class="flex items-center gap-1.5 min-w-0">
           <GitBranch size={13} class="text-accent shrink-0" />
           <span
@@ -318,7 +434,7 @@
           <div class="ml-auto flex items-center gap-1 shrink-0">
             {#if aheadCount > 0}
               <span
-                class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25"
+                class="text-micro font-mono font-semibold px-1 py-0 rounded-full bg-ok/15 text-ok border border-ok/35"
                 title={`${aheadCount} commit${aheadCount === 1 ? "" : "s"} ahead of upstream`}
               >
                 ↑{aheadCount}
@@ -326,7 +442,7 @@
             {/if}
             {#if behindCount > 0}
               <span
-                class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
+                class="text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
                 title={`${behindCount} commit${behindCount === 1 ? "" : "s"} behind upstream`}
               >
                 ↓{behindCount}
@@ -334,7 +450,7 @@
             {/if}
             {#if currentBranchInfo?.is_default}
               <span
-                class="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0 rounded-full border border-border/70 bg-surface text-textMuted"
+                class="text-micro font-semibold px-1.5 py-0 rounded-full border border-edge bg-surface text-textMuted"
                 title="The current branch is this repository's default branch"
               >
                 default
@@ -345,26 +461,26 @@
 
         <div class="space-y-1">
           {#if dirtyCount === 0}
-            <div class="flex items-center gap-1.5 text-textMuted/70" title="No uncommitted changes">
-              <CheckCircle2 size={12} class="text-green-400/80 shrink-0" />
+            <div class="flex items-center gap-1.5 text-faint" title="No uncommitted changes">
+              <CheckCircle2 size={12} class="text-ok/80 shrink-0" />
               <span>Working tree clean</span>
             </div>
           {:else}
             <div class="flex items-center justify-between gap-1.5 min-w-0 w-full">
               <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 flex-1 text-left hover:text-accent" title="Preview uncommitted files and modifications">
                 <span
-                  class="font-mono text-[11px] shrink-0"
+                  class="font-mono text-meta shrink-0"
                   title="Total added / deleted lines across all changed files"
                 >
-                  <span class="text-green-400">+{totalAdditions}</span>
-                  <span class="text-red-400">−{totalDeletions}</span>
+                  <span class="text-ok">+{totalAdditions}</span>
+                  <span class="text-danger">−{totalDeletions}</span>
                 </span>
                 <span class="truncate" title={`${dirtyCount} file${dirtyCount === 1 ? "" : "s"} with uncommitted changes`}>
                   {dirtyCount} changed file{dirtyCount === 1 ? "" : "s"}
                 </span>
                 {#if conflictedCount > 0}
                   <span
-                    class="ml-auto flex items-center gap-1 shrink-0 text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25"
+                    class="ml-auto flex items-center gap-1 shrink-0 text-micro font-mono font-semibold px-1 py-0 rounded-full bg-warn/15 text-warn border border-warn/35"
                     title={`${conflictedCount} file${conflictedCount === 1 ? "" : "s"} with merge conflicts`}
                   >
                     <AlertTriangle size={10} class="shrink-0" />
@@ -398,7 +514,7 @@
         <div class="@container/actions flex w-full min-w-0 gap-1 overflow-x-hidden pt-1.5 mt-2">
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.fetch()}
             disabled={$repoStore.isLoading}
             title="Fetch from remote"
@@ -409,7 +525,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.pull()}
             disabled={$repoStore.isLoading}
             title="Pull from upstream"
@@ -420,7 +536,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.push()}
             disabled={$repoStore.isLoading}
             title="Push to upstream"
@@ -431,7 +547,7 @@
           </button>
           <button
             type="button"
-            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! py-0.5! hover:text-accent disabled:cursor-not-allowed"
+            class="gp-btn min-w-0 flex-1 justify-center gap-1 px-1.5! hover:text-accent disabled:cursor-not-allowed" data-size="sm"
             onclick={() => void repoStore.stashSave()}
             disabled={$repoStore.isLoading}
             title="Stash changes"
@@ -446,7 +562,7 @@
 
     <!-- Main Scrollable Section -->
     <div class="relative flex-1 min-h-0 mt-2">
-    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5">
+    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5 scroll-py-12">
       <!-- Above the branch list on purpose. This says why everything below it
            may be incomplete, and the branch list has no height cap in this
            scroller — under it, on a repository with many branches, the notice
@@ -482,7 +598,7 @@
             onclick={() => toggleSection("staged")}
             aria-expanded={!sections.staged}
             title={sections.staged ? "Expand staged changes" : "Collapse staged changes"}
-            class="flex items-center gap-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
+            class="flex items-center gap-1 gp-label hover:text-textPrimary transition-colors"
           >
             {#if sections.staged}
               <ChevronRight size={12} />
@@ -500,7 +616,7 @@
               type="button"
               onclick={unstageAll}
               title="Unstage all files"
-              class="text-[9px] lowercase font-normal text-textMuted hover:text-red-400 transition-colors"
+              class="text-micro lowercase font-normal text-textMuted hover:text-danger transition-colors"
             >
               unstage all
             </button>
@@ -508,7 +624,7 @@
         </div>
         {#if !sections.staged}
           {#if filteredStaged.length === 0}
-            <div class="text-[11px] text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-faint px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "No staged changes"}
             </div>
           {:else}
@@ -519,12 +635,12 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
-                    class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
+                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, true)}
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                      <span class="text-faint text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
@@ -536,7 +652,7 @@
                     }}
                     title="Unstage file"
                     aria-label="Unstage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-red-400 shrink-0"
+                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-danger shrink-0"
                   >
                     <Minus size={12} />
                   </button>
@@ -545,7 +661,7 @@
               {#if filteredStaged.length > visibleStaged.length}
                 <button
                   type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[10px] text-textMuted hover:text-textPrimary"
+                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
                   onclick={() => (stagedLimit = growLimit(stagedLimit, filteredStaged.length))}
                 >
                   {showMoreLabel(filteredStaged.length, visibleStaged.length)}
@@ -564,7 +680,7 @@
             onclick={() => toggleSection("unstaged")}
             aria-expanded={!sections.unstaged}
             title={sections.unstaged ? "Expand working tree changes" : "Collapse working tree changes"}
-            class="flex items-center gap-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
+            class="flex items-center gap-1 gp-label hover:text-textPrimary transition-colors"
           >
             {#if sections.unstaged}
               <ChevronRight size={12} />
@@ -582,7 +698,7 @@
               type="button"
               onclick={stageAll}
               title="Stage all files"
-              class="text-[9px] lowercase font-normal text-textMuted hover:text-green-400 transition-colors"
+              class="text-micro lowercase font-normal text-textMuted hover:text-ok transition-colors"
             >
               stage all
             </button>
@@ -590,7 +706,7 @@
         </div>
         {#if !sections.unstaged}
           {#if filteredUnstaged.length === 0}
-            <div class="text-[11px] text-textMuted/60 px-2 py-1.5 italic">
+            <div class="text-meta text-faint px-2 py-1.5 italic">
               {isFiltering ? `No matches for '${fileFilter}'` : "Working tree clean"}
             </div>
           {:else}
@@ -601,12 +717,12 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
-                    class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
+                    class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, false)}
                     title={f.path}
                   >
                     {#if parts.dir}
-                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                      <span class="text-faint text-micro">{parts.dir}</span>
                     {/if}
                     <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
@@ -618,7 +734,7 @@
                     }}
                     title="Stage file"
                     aria-label="Stage file"
-                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-green-400 shrink-0"
+                    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-background hover:text-ok shrink-0"
                   >
                     <Plus size={12} />
                   </button>
@@ -627,7 +743,7 @@
               {#if filteredUnstaged.length > visibleUnstaged.length}
                 <button
                   type="button"
-                  class="w-full px-2 py-1 rounded-xl border border-dashed border-border/80 text-[10px] text-textMuted hover:text-textPrimary"
+                  class="w-full px-2 py-1 rounded-xl border border-dashed border-edgeStrong text-micro text-textMuted hover:text-textPrimary"
                   onclick={() => (unstagedLimit = growLimit(unstagedLimit, filteredUnstaged.length))}
                 >
                   {showMoreLabel(filteredUnstaged.length, visibleUnstaged.length)}
@@ -642,12 +758,15 @@
     </div>
 
     <CommitComposer />
-  {:else}
-    <!-- Collapsed rail -->
-    <div class="flex flex-col items-center gap-3 pt-3 pb-2 flex-1 overflow-hidden">
+{/snippet}
+
+{#snippet rail()}
+    <!-- Collapsed rail: a 44 px column of icons. Everything the open sidebar
+         does at a glance stays one click away. -->
+    <div class="flex flex-col items-center gap-3 pt-3 pb-2 flex-1 overflow-hidden" data-sidebar-rail>
       <button
         type="button"
-        onclick={() => layoutStore.toggleCollapsed()}
+        onclick={toggleCollapsed}
         title="Expand sidebar"
         aria-label="Expand sidebar"
         class="gp-icon-btn hover:text-accent"
@@ -657,21 +776,51 @@
       <FolderGit2 size={15} class="text-accent shrink-0" />
       {#if $repoStore.currentPath}
         <button type="button" onclick={() => void repoStore.previewUncommitted()}
-          class="text-[9px] font-mono font-bold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
-            ? 'bg-amber-500/15 text-amber-400 border border-amber-500/25'
-            : 'border border-border/70 bg-surface text-textMuted'}"
+          class="text-micro font-mono font-semibold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
+            ? 'bg-warn/15 text-warn border border-warn/35'
+            : 'border border-edge bg-surface text-textMuted'}"
           title={`${dirtyCount} changed file${dirtyCount === 1 ? "" : "s"}`}
         >
           {dirtyCount}
         </button>
         {#if dirtyCount > 0}
-          <AgentCommitMenu compact={true} align="left" />
+          <AgentCommitMenu compact={true} iconOnly={true} align="left" />
         {/if}
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.fetch()}
+          disabled={$repoStore.isLoading}
+          title="Fetch from remote"
+          aria-label="Fetch from remote"
+        >
+          <DownloadCloud size={14} />
+        </button>
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.pull()}
+          disabled={$repoStore.isLoading}
+          title="Pull from upstream"
+          aria-label="Pull from upstream"
+        >
+          <ArrowDownToLine size={14} />
+        </button>
+        <button
+          type="button"
+          class="gp-icon-btn hover:text-accent"
+          onclick={() => void repoStore.push()}
+          disabled={$repoStore.isLoading}
+          title="Push to upstream"
+          aria-label="Push to upstream"
+        >
+          <ArrowUpFromLine size={14} />
+        </button>
       {/if}
     </div>
-  {/if}
+{/snippet}
 
-  {#if !$layoutStore.collapsed}
+{#snippet resizer()}
     <!-- Resize handle: drag, double-click resets, arrow keys step.
          WAI-ARIA adjustable separator: focusable + keyboard-operable by design,
          so the div-with-role warnings are intentional. -->
@@ -689,7 +838,7 @@
       aria-valuemin={SIDEBAR_MIN_WIDTH}
       aria-valuemax={SIDEBAR_MAX_WIDTH}
       aria-valuenow={$layoutStore.width}
-      class="absolute top-0 right-[-3px] z-10 h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
+      style:z-index={LAYERS.STICKY} class="absolute top-0 right-[-3px] h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
       title="Drag to resize · double-click to reset · ←/→ to nudge"
       onpointerdown={startResize}
       onpointermove={moveResize}
@@ -701,5 +850,52 @@
       }}
     >
     </div>
+{/snippet}
+
+<!-- The window's one sidebar, in one of two modes (panelMode.ts).
+     Docked: the aside owns a column and the workspace reflows once, at the
+     start of an open or the end of a close, while the panel slides on
+     transform and opacity (dockedSlide.ts); a drag writes the width live with
+     no slide. Overlay: a 44 px rail keeps the column and the open panel floats
+     over the workspace, sliding on transform and opacity. -->
+<svelte:window onkeydown={escapeCloses} />
+
+{#if overlay}
+  <aside
+    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane"
+    style="width:{SIDEBAR_COLLAPSED_WIDTH}px"
+    data-sidebar-mode="overlay"
+    data-sidebar-rail-slot
+    inert={!collapsed}
+  >
+    {@render rail()}
+  </aside>
+  {#if !collapsed}
+    <aside
+      class="gp-glass gp-sidebar bg-surface flex flex-col font-sans select-none text-xs h-full gp-pane shadow-float"
+      style="position:absolute; top:0; bottom:0; left:0; width:{$layoutStore.width}px; z-index:{LAYERS.STICKY}"
+      data-sidebar-mode="overlay"
+      data-sidebar-panel
+      use:popover={panelDismissOptions}
+      in:panelIn
+      out:panelOut
+    >
+      {@render expanded()}
+      {@render resizer()}
+    </aside>
   {/if}
-</aside>
+{:else}
+  <aside
+    bind:this={dockedAside}
+    class="gp-glass gp-sidebar relative bg-surface flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane"
+    style="width:{shownCollapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"
+    data-sidebar-mode="docked"
+  >
+    {#if !shownCollapsed}
+      {@render expanded()}
+      {@render resizer()}
+    {:else}
+      {@render rail()}
+    {/if}
+  </aside>
+{/if}

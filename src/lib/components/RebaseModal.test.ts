@@ -31,3 +31,17 @@ describe("RebaseModal plan validation", () => {
     expect(body).not.toContain("no kept commit");
   });
 });
+
+/**
+ * The plan list is the dialog's one scroller (max-h-80). A hard clip slices the
+ * row at its edge in half; the shared edge fade softens it and the scroll
+ * padding keeps a focused row out from under the fade band. Rendered proof of
+ * the fade is the palette harness; this dialog has no harness page.
+ */
+describe("RebaseModal scroll edge", () => {
+  it("fades the plan list's clipped edge and pads its scroll by the fade band", () => {
+    expect(source).toContain('import { scrollEdgeFade } from "../ui/scrollEdgeFade";');
+    expect(source).toMatch(/<div class="[^"]*overflow-y-auto[^"]*scroll-py-8[^"]*" data-dialog-body use:scrollEdgeFade>/);
+    expect(source).toMatch(/overflow-y-auto scroll-py-8" data-dialog-body use:scrollEdgeFade>\s*\{#each items as commit\}/);
+  });
+});

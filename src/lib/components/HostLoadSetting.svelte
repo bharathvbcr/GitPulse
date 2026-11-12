@@ -59,8 +59,8 @@
   });
 </script>
 
-<div class="space-y-1 text-[11px]" data-testid="host-load-settings">
-  <div class="text-textMuted text-[10px] mb-1.5">Host load</div>
+<div class="space-y-1 text-meta" data-testid="host-load-settings">
+  <div class="text-textMuted text-micro mb-1.5">Host load</div>
   <SettingToggle
     label="Measure memory pressure and agent sessions"
     description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."
@@ -76,7 +76,7 @@
     onchange={(next) => void save({ govern_launches: next })}
   />
   {#if error}
-    <p class="text-amber-300">{error}</p>
-    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
+    <p class="text-warn">{error}</p>
+    <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Try again</button>
   {/if}
 </div>

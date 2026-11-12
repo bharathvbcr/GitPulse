@@ -903,7 +903,7 @@ describe("repoStore tabs", () => {
       await store.openRepo("/r/alpha");
       const closing = store.closeTab(get(store).activeTabId!);
       await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 3 terminal sessions?"));
-      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another checkout of this repository, hosted here; they keep running.");
+      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another worktree of this repository, hosted here; they keep running.");
       cancelPrompt();
       await closing;
       expect(get(store).openTabs).toHaveLength(1);
@@ -4084,7 +4084,7 @@ describe("repoStore stash actions", () => {
     await store.openRepo("/r/a");
     const outcome = await store.stashPop();
     expect(outcome.ok).toBe(false);
-    expect(outcome.error).toContain("could not be read");
+    expect(outcome.error).toContain("couldn't be read");
   });
 
   it("refuses to pop an empty stash rather than targeting stash@{0}", async () => {
@@ -5622,7 +5622,7 @@ describe("repositoryTrustRefused reads the kind, never the wording", () => {
 
   it("is true for the kind, however the message is worded or wrapped", () => {
     expect(repositoryTrustRefused(new IpcError("repository_trust_required", text))).toBe(true);
-    expect(repositoryTrustRefused(new IpcError("repository_trust_required", `Could not open: ${text}`))).toBe(true);
+    expect(repositoryTrustRefused(new IpcError("repository_trust_required", `couldn't open: ${text}`))).toBe(true);
     expect(repositoryTrustRefused(new IpcError("repository_trust_required", "reworded"))).toBe(true);
   });
 

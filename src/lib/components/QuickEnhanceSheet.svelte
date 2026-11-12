@@ -4,7 +4,8 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { cardScale, backdropFade, backdropFadeOut } from "../ui/transitions";
+  import { cardScale, cardScaleOut, backdropFade, backdropFadeOut } from "../ui/transitions";
+  import Skeleton from "./Skeleton.svelte";
   import { fade, scale } from "svelte/transition";
   import { getTask, explainError, type LockableField, type Task } from "../workbench/client";
   import { hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
@@ -118,19 +119,20 @@
   <div
     use:trapFocus={{ autofocus: true }}
     in:scale={cardScale()}
+    out:scale={cardScaleOut()}
     class="gp-card gp-glass shadow-float h-full flex flex-col overflow-hidden text-xs text-textPrimary gp-gpu"
     style="width: min(var(--gp-task-sheet-w), 96vw)"
     role="dialog"
     aria-modal="true"
     aria-labelledby="quick-enhance-title"
   >
-    <header class="px-[18px] pt-4 pb-2.5 border-b border-border/60 gp-section-edge flex items-start justify-between gap-3">
+    <header class="px-[18px] pt-4 pb-2.5 flex items-start justify-between gap-3">
       <div class="min-w-0">
         <p id="quick-enhance-title" class="text-sm font-semibold flex items-center gap-1.5">
           <Sparkles size={14} class="text-accent shrink-0" />
           Quick Enhance
         </p>
-        <p class="text-[11px] text-textMuted mt-1 leading-relaxed">
+        <p class="text-meta text-textMuted mt-1 leading-relaxed">
           {startRequest > 0
             ? "Task saved. A title and description are being drafted for you to accept or reject."
             : "Review hidden fields, then let Manvi rewrite title and description."}
@@ -140,18 +142,18 @@
     </header>
 
     <div class="flex-1 overflow-auto px-[18px] py-4 space-y-4">
-      {#if loading}<p role="status" class="text-textMuted">Loading task…</p>{/if}
-      {#if error}<p role="alert" class="text-rose-400">{error}</p>{/if}
+      {#if loading}<div role="status" aria-label="Loading task"><Skeleton variant="text" count={3} /></div>{/if}
+      {#if error}<p role="alert" class="text-danger">{error}</p>{/if}
       {#if task}
         <div>
-          <h3 class="text-[11px] font-semibold uppercase tracking-wide text-textMuted mb-1">Task</h3>
+          <h3 class="gp-label mb-1">Task</h3>
           <p class="font-medium text-textPrimary wrap-break-word">{task.title}</p>
-          <p class="text-[11px] text-textMuted mt-0.5">Primary repository: {repoName(task.primary_repository_id) ?? task.primary_repository_id}</p>
-          <p class="text-[11px] text-textMuted mt-0.5">Revision {task.revision} · {task.status.replace("_", " ")}</p>
+          <p class="text-meta text-textMuted mt-0.5">Primary repository: {repoName(task.primary_repository_id) ?? task.primary_repository_id}</p>
+          <p class="text-meta text-textMuted mt-0.5">Revision {task.revision} · {task.status.replace("_", " ")}</p>
         </div>
         <div class="space-y-2">
           <div class="flex items-center justify-between gap-2">
-            <h3 class="text-[11px] font-semibold uppercase tracking-wide text-textMuted">Hidden on the board</h3>
+            <h3 class="gp-label">Hidden on the board</h3>
           </div>
           <SettingToggle
             label="Show empty fields"
@@ -161,8 +163,8 @@
           />
           {#each visibleDetails as row (row.key)}
             <div>
-              <p class="text-[11px] text-textMuted">{row.label}</p>
-              <pre class="mt-0.5 whitespace-pre-wrap wrap-break-word max-h-32 overflow-auto rounded-lg border border-border/60 bg-background/50 px-2 py-1.5 {row.empty ? 'text-textMuted' : ''}">{row.value}</pre>
+              <p class="text-meta text-textMuted">{row.label}</p>
+              <pre class="mt-0.5 whitespace-pre-wrap wrap-break-word max-h-32 overflow-auto rounded-lg border border-edge bg-background/50 px-2 py-1.5 {row.empty ? 'text-textMuted' : ''}">{row.value}</pre>
             </div>
           {/each}
           {#if visibleDetails.length === 0}<p class="text-textMuted">No extra fields are filled in. Toggle empty fields to inspect them.</p>{/if}
@@ -182,7 +184,7 @@
         />
       {/if}
     </div>
-    <footer class="px-[18px] pt-2.5 pb-4 border-t border-border/45 flex justify-between gap-2">
+    <footer class="px-[18px] pt-2.5 pb-4 flex justify-between gap-2">
       <button type="button" class="gp-btn" disabled={!task || (busy && !editing)} onclick={() => void openEditor()}>Open full editor</button>
     </footer>
   </div>

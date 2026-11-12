@@ -7,7 +7,7 @@
   import { graphStore } from "../stores/graphStore";
   import { isPromptOpen } from "../stores/modalStore";
   import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
-  import { backdropFade, cardScale } from "../ui/transitions";
+  import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -16,16 +16,44 @@
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { checkoutNameFor, highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
   import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
   import { emptySearch, scheduleSearch, workspaceRoot } from "../palette/search";
 
-  let { openSignal = 0, onClone, onRebase }: { openSignal?: number } & PaletteHostActions = $props();
+  /**
+   * The view bar's search field shows this same palette inline, as a results
+   * card under the field, instead of a dialog with its own input. The field
+   * owns the text and the open state; the engine below (modes, prefixes,
+   * remote searches, frecency, paging, running) is the dialog's, unchanged.
+   */
+  interface DropdownHost {
+    /** The field's text box: the card lines up under its pill, and keys typed in it drive the list. */
+    input: HTMLInputElement;
+    anchor: HTMLElement;
+    query: string;
+    open: boolean;
+    setQuery: (next: string) => void;
+    onclose: () => void;
+    /** The highlighted option's id, for the field's aria-activedescendant. */
+    onactive?: (id: string | undefined) => void;
+  }
+
+  let { openSignal = 0, onClone, onRebase, dropdown = null }: { openSignal?: number; dropdown?: DropdownHost | null } & PaletteHostActions = $props();
+  /** Ids differ per presentation: the inline card and the ⌘K dialog can both be on screen. */
+  const idp = untrack(() => (dropdown ? "page-palette" : "palette"));
+  const listboxId = untrack(() => (dropdown ? "page-palette-listbox" : "command-palette-listbox"));
   let servedSignal = 0;
   let openEpoch = 0;
-  let isOpen = $state(false);
-  let query = $state("");
+  let dialogOpen = $state(false);
+  let dialogQuery = $state("");
+  const isOpen = $derived(dropdown ? dropdown.open : dialogOpen);
+  const query = $derived(dropdown ? dropdown.query : dialogQuery);
+  function setQuery(next: string) {
+    if (dropdown) dropdown.setQuery(next);
+    else dialogQuery = next;
+  }
   let highlighted = $state(0);
   let page = $state(0);
   let pendingAction = $state<string | null>(null);
@@ -69,9 +97,9 @@
   });
 
   function changeMode(next: PaletteMode) {
-    query = PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">";
+    setQuery(PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">");
     actionError = null;
-    inputEl?.focus();
+    focusInput();
   }
 
   function selectFile(path: string) {
@@ -83,7 +111,7 @@
     const opened = await repoStore.openRepo(root);
     const current = get(repoStore);
     if (!opened || !current.currentPath || !sameRepo(root, current.currentPath, { caseInsensitive: isCaseInsensitiveFs() })) {
-      throw Error(current.error || "The target repository could not be opened. No file was selected.");
+      throw Error(current.error || "The target repository couldn't be opened. No file was selected.");
     }
     selectFile(filePath);
   }
@@ -136,7 +164,17 @@
     listEl?.querySelector('[data-highlighted="true"]')?.scrollIntoView({ block: "nearest" });
   });
 
-  function close() { isOpen = false; }
+  /**
+   * A command that opens another dialog closes this one first, and the next
+   * dialog mounts on the following tick. `trapFocus` hands focus back to what
+   * held it when the palette opened, and only when the palette leaves the DOM,
+   * so for that close the exit is skipped (a zero-length transition ends
+   * synchronously). Otherwise the restore would land on top of the new dialog.
+   */
+  let handingOff = $state(false);
+  function focusInput() { (dropdown ? dropdown.input : inputEl)?.focus(); }
+  function close() { handingOff = false; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
+  function closeForHandoff() { handingOff = true; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
 
   async function run(index: number) {
     const command = filteredCommands[index];
@@ -145,7 +183,7 @@
     pendingAction = command.id;
     actionError = null;
     try {
-      if (command.closeBefore) { close(); await tick(); }
+      if (command.closeBefore) { closeForHandoff(); await tick(); }
       const result = await command.action();
       const failure = actionFailure(result);
       if (failure) {
@@ -169,20 +207,23 @@
     if (modalOccupied()) return;
     openEpoch += 1;
     history = readFrecency(storage());
-    query = ""; page = 0; highlighted = 0; actionError = null;
-    isOpen = true;
+    dialogQuery = ""; page = 0; highlighted = 0; actionError = null;
+    dialogOpen = true;
     inputEl?.focus();
   }
 
   function changePage(next: number) {
     page = Math.max(0, Math.min(next, pageCount - 1));
     highlighted = 0;
-    inputEl?.focus();
+    focusInput();
   }
 
   function handleKeyDown(event: KeyboardEvent) {
     if (isImeComposition(event)) return;
-    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+    // Inline, the card answers only keys typed in the field it hangs from;
+    // ⌘K stays the dialog's, and every other key is the page's.
+    if (dropdown && event.target !== dropdown.input) return;
+    if (!dropdown && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
       // Ctrl+K typed into a terminal is readline's kill-line, not the palette.
       if (shellOwnsKey(event)) return;
       if (modalOccupied()) return;
@@ -195,7 +236,7 @@
       event.preventDefault(); event.stopImmediatePropagation(); close(); return;
     }
     // Buttons (mode chips, Retry, paging) keep native Enter/Space behavior.
-    if (event.target !== inputEl || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.target !== (dropdown ? dropdown.input : inputEl) || event.metaKey || event.ctrlKey || event.altKey) return;
     if (!["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp", "Enter"].includes(event.key)) return;
     event.preventDefault(); event.stopImmediatePropagation();
     if (event.key === "ArrowDown") highlighted = Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1));
@@ -213,121 +254,178 @@
       untrack(requestOpen);
     }
   });
+  // Inline, each opening is a fresh session, as `requestOpen` is for the
+  // dialog: a new epoch (a late action result from the last one is dropped),
+  // the current frecency, the first page.
+  $effect(() => {
+    if (!dropdown?.open) return;
+    untrack(() => {
+      openEpoch += 1;
+      history = readFrecency(storage());
+      page = 0; highlighted = 0; actionError = null;
+    });
+  });
+  // The field carries the combobox; it names the highlighted option.
+  $effect(() => {
+    dropdown?.onactive?.(isOpen && activeCommand ? `${idp}-option-${highlighted}` : undefined);
+  });
   onMount(() => {
     window.addEventListener("keydown", handleKeyDown, true);
-    window.addEventListener("gitpulse:palette", requestOpen);
+    if (!dropdown) window.addEventListener("gitpulse:palette", requestOpen);
     return () => {
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("gitpulse:palette", requestOpen);
     };
   });
+
+  /** Inline, the card hangs from the field's pill, at least wide enough to read a result. */
+  let cardBox = $state<{ top: number; left: number; width: number } | null>(null);
+  function placeCard() {
+    if (!dropdown) return;
+    const box = dropdown.anchor.getBoundingClientRect();
+    const width = Math.min(Math.max(box.width, 440), window.innerWidth - 16);
+    const left = Math.max(8, Math.min(box.left, window.innerWidth - width - 8));
+    cardBox = { top: box.bottom + 6, left, width };
+  }
+  $effect(() => {
+    if (!dropdown?.open) return;
+    untrack(placeCard);
+    window.addEventListener("resize", placeCard);
+    return () => window.removeEventListener("resize", placeCard);
+  });
 </script>
 
-{#if isOpen}
+{#snippet modesNav()}
+  <nav class="palette-modes" aria-label="Search mode">
+    {#each PALETTE_MODES as entry}<button type="button" aria-pressed={mode === entry.mode} title={entry.hint} onclick={() => changeMode(entry.mode)}><span>{entry.label}</span><kbd>{entry.prefix}</kbd></button>{/each}
+  </nav>
+{/snippet}
+
+<!-- Everything under the header, shared by the dialog and the inline card. -->
+{#snippet cardBody()}
+  <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="{idp}-status" role="status" aria-live="polite">{resultSummary}</span></div>
+  {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
+  {#if searchNote || historyNote}
+    <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
+      <p>{searchNote ?? historyNote}</p>
+      {#if isRemoteSearch}
+        <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>
+        {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { closeForHandoff(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
+      {/if}
+      {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
+    </div>
+  {/if}
+  <div bind:this={listEl} id={listboxId} class="palette-results scroll-py-8" use:scrollEdgeFade role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
+    {#if searchResult.loading && isRemoteSearch}
+      <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
+    {:else}
+      {#each filteredCommands as cmd, i (cmd.id)}
+        <button id={`${idp}-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`${idp}-description-${i}`}
+          tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
+          onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
+          <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
+          <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`${idp}-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
+          <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
+        </button>
+      {/each}
+      {#if filteredCommands.length === 0}
+        <div class="palette-empty"><Search size={24} /><strong>{unavailable ? "Choose a repository to start" : !effectiveSearchText && (mode === "symbols" || mode === "workspace") ? "Start with a symbol name" : searchResult.failed ? "Search needs attention" : "No matching results"}</strong><span>{searchResult.failed ? "Use the recovery actions above to try again." : "Try another search or choose a mode above."}</span></div>
+      {/if}
+    {/if}
+  </div>
+  {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
+  <div id="{idp}-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
+  <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
+    {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
+  </footer>
+{/snippet}
+
+{#if isOpen && dropdown}
+  <!-- Inline: the results card under the view bar's field. No scrim, no
+       input of its own and no focus trap: focus stays in the field, which
+       carries the combobox. -->
+  {#if cardBox}
+    <!-- Pointer-down keeps focus in the field: the field closes the card when
+         it loses focus, and a click on a result would otherwise blur it first. -->
+    <div data-page-palette role="region" aria-label="Repository search results" in:scale={cardScale()} out:scale={cardScaleOut()}
+      onpointerdown={(event) => event.preventDefault()}
+      class="palette-card palette-inline gp-card bg-surface text-textPrimary border border-edgeStrong shadow-float"
+      style="position: fixed; top: {cardBox.top}px; left: {cardBox.left}px; width: {cardBox.width}px; z-index: {LAYERS.MENU}">
+      <div class="palette-header palette-header-inline">{@render modesNav()}</div>
+      {@render cardBody()}
+    </div>
+  {/if}
+{:else if isOpen}
   <div role="dialog" aria-modal="true" aria-labelledby="command-palette-title" data-command-palette tabindex="-1"
     onclick={event => { if (event.target === event.currentTarget) close(); }}
     onkeydown={event => event.stopPropagation()}
-    in:fade={backdropFade()} class="gp-scrim palette-scrim bg-black/40" style="z-index: {LAYERS.MODAL}">
+    in:fade={backdropFade()} out:fade={handingOff ? { duration: 0 } : backdropFadeOut()} class="gp-scrim palette-scrim bg-black/40" style="z-index: {LAYERS.MODAL}">
     <!-- Immediate teardown restores focus before a follow-on prompt mounts. -->
-    <div use:trapFocus={{ initial: () => inputEl ?? null }} in:scale={cardScale()} class="palette-card gp-card bg-surface text-textPrimary border border-border/80 shadow-float">
+    <div use:trapFocus={{ initial: () => inputEl ?? null }} in:scale={cardScale()} out:scale={handingOff ? { duration: 0 } : cardScaleOut()} class="palette-card gp-card bg-surface text-textPrimary border border-edgeStrong shadow-float">
       <header class="palette-header">
         <div class="palette-heading"><span class="palette-brand"><Search size={14} /> <h2 id="command-palette-title">Command palette</h2></span>
           <span class="palette-repo" title={repoPath ?? "No repository open"}><FolderGit2 size={12} />{repoPath ? displayName(repoPath) : "Workspace"}</span>
           <button type="button" class="palette-close" onclick={close} aria-label="Close command palette"><X size={15} /></button>
         </div>
         <div class="palette-search"><Search size={20} class="text-accent shrink-0" />
-          <input bind:this={inputEl} bind:value={query} type="text" maxlength={MAX_QUERY_LENGTH} autocomplete="off" spellcheck="false"
+          <input bind:this={inputEl} bind:value={dialogQuery} type="text" maxlength={MAX_QUERY_LENGTH} autocomplete="off" spellcheck="false"
             placeholder={currentMode.hint} aria-label="Search commands and repositories" role="combobox" aria-expanded="true" aria-autocomplete="list"
-            aria-controls="command-palette-listbox" aria-describedby="palette-status palette-detail"
-            aria-activedescendant={activeCommand ? `palette-option-${highlighted}` : undefined} />
-          {#if query}<button type="button" class="palette-clear" onclick={() => { query = ""; inputEl?.focus(); }} aria-label="Clear search"><X size={14} /></button>{/if}
+            aria-controls={listboxId} aria-describedby="{idp}-status {idp}-detail"
+            aria-activedescendant={activeCommand ? `${idp}-option-${highlighted}` : undefined} />
+          {#if query}<button type="button" class="palette-clear" onclick={() => { dialogQuery = ""; inputEl?.focus(); }} aria-label="Clear search"><X size={14} /></button>{/if}
         </div>
-        <nav class="palette-modes" aria-label="Search mode">
-          {#each PALETTE_MODES as entry}<button type="button" aria-pressed={mode === entry.mode} title={entry.hint} onclick={() => changeMode(entry.mode)}><span>{entry.label}</span><kbd>{entry.prefix}</kbd></button>{/each}
-        </nav>
+        {@render modesNav()}
       </header>
-      <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="palette-status" role="status" aria-live="polite">{resultSummary}</span></div>
-      {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
-      {#if searchNote || historyNote}
-        <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
-          <p>{searchNote ?? historyNote}</p>
-          {#if isRemoteSearch}
-            <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Retry search</button>
-            {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { close(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up devmap</button>{/if}
-          {/if}
-          {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
-        </div>
-      {/if}
-      <div bind:this={listEl} id="command-palette-listbox" class="palette-results" role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
-        {#if searchResult.loading && isRemoteSearch}
-          <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
-        {:else}
-          {#each filteredCommands as cmd, i (cmd.id)}
-            <button id={`palette-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`palette-description-${i}`}
-              tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
-              onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
-              <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
-              <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`palette-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
-              <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
-            </button>
-          {/each}
-          {#if filteredCommands.length === 0}
-            <div class="palette-empty"><Search size={24} /><strong>{unavailable ? "Choose a repository to start" : !effectiveSearchText && (mode === "symbols" || mode === "workspace") ? "Start with a symbol name" : searchResult.failed ? "Search needs attention" : "No matching results"}</strong><span>{searchResult.failed ? "Use the recovery actions above to try again." : "Try another search or choose a mode above."}</span></div>
-          {/if}
-        {/if}
-      </div>
-      {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
-      <div id="palette-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
-      <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
-        {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
-      </footer>
+      {@render cardBody()}
     </div>
   </div>
 {/if}
 
 <style>
   .palette-scrim { display:flex; align-items:flex-start; justify-content:center; padding: min(12vh, 100px) 16px 20px; }
-  .palette-card { width: min(680px, 100%); max-height: calc(100dvh - min(12vh, 100px) - 20px); display:flex; flex-direction:column; overflow:hidden; border-radius:18px; }
+  .palette-card { width: min(680px, 100%); max-height: calc(100dvh - min(12vh, 100px) - 20px); display:flex; flex-direction:column; overflow:hidden; border-radius: var(--gp-r-xl); }
   .palette-header { padding:16px 18px 0; flex-shrink:0; }
+  .palette-inline { max-height: min(560px, calc(100dvh - 120px)); }
+  .palette-header-inline { padding:10px 12px 0; }
   .palette-heading,.palette-brand,.palette-repo,.palette-search,.palette-meta,.palette-footer,.palette-pages { display:flex; align-items:center; }
-  .palette-heading { gap:12px; color:var(--color-textMuted); font-size:11px; }
+  .palette-heading { gap:12px; color:var(--color-textMuted); font-size:var(--text-meta); }
   .palette-brand { gap:7px; flex:1; }
-  h2 { font-size:11px; font-weight:600; margin:0; }
+  h2 { font-size:var(--text-meta); font-weight:600; margin:0; }
   .palette-repo { gap:5px; max-width:40%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-  .palette-close,.palette-clear { padding:5px; border-radius:6px; color:var(--color-textMuted); }
+  .palette-close,.palette-clear { padding:5px; border-radius: var(--gp-r-full); color:var(--color-textMuted); }
   .palette-search { gap:12px; padding:19px 0 17px; }
-  input { min-width:0; width:100%; background:transparent; border:0; border-radius:5px; font-size:17px; color:var(--color-textPrimary); }
-  input::placeholder { color:var(--color-textMuted); font-size:14px; }
+  input { min-width:0; width:100%; background:transparent; border:0; border-radius: var(--gp-r-xs); font-size: var(--text-lg); color:var(--color-textPrimary); }
+  input::placeholder { color:var(--color-textMuted); font-size: var(--text-sm); }
   .palette-modes { display:flex; gap:3px; overflow-x:auto; padding-bottom:12px; }
-  .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:10px; white-space:nowrap; border-radius:6px; color:var(--color-textMuted); }
+  .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:var(--text-micro); white-space:nowrap; border-radius: var(--gp-r-full); color:var(--color-textMuted); }
   .palette-modes button[aria-pressed="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); color:var(--color-accent); }
-  .palette-modes kbd { opacity:.65; font-size:9px; }
-  .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:10px; color:var(--color-textMuted); }
+  .palette-modes kbd { opacity:.65; font-size:var(--text-micro); }
+  .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:var(--text-micro); color:var(--color-textMuted); }
   .palette-results { min-height:130px; max-height:390px; overflow-y:auto; overscroll-behavior:contain; padding:0 8px 8px; }
-  .palette-option { display:flex; align-items:center; gap:11px; text-align:left; width:100%; padding:10px; border-radius:9px; color:var(--color-textPrimary); }
+  .palette-option { display:flex; align-items:center; gap:11px; text-align:left; width:100%; padding:10px; border-radius: var(--gp-r-sm); color:var(--color-textPrimary); }
   .palette-option[data-highlighted="true"] { background:var(--mac-fill-surface-hover, rgb(var(--c-surface-hover))); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--color-accent) 24%, transparent); }
-  .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius:8px; background:var(--mac-fill-bg, rgb(var(--c-bg))); color:var(--color-textMuted); }
+  .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius: var(--gp-r-sm); background:var(--mac-fill-bg, rgb(var(--c-bg))); color:var(--color-textMuted); }
   .palette-option[data-highlighted="true"] .palette-icon { color:var(--color-accent); }
   .palette-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:3px; }
-  .palette-label { font-size:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-label { font-size: var(--text-xs); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .palette-label b { color:var(--color-accent); font-weight:600; }
-  .palette-description { font-size:10px; color:var(--color-textMuted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-description { font-size:var(--text-micro); color:var(--color-textMuted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .palette-disabled .palette-label,.palette-disabled .palette-icon { color:var(--color-textMuted); }
-  .palette-trailing { display:flex; align-items:center; gap:10px; color:var(--color-textMuted); font-size:9px; }
-  .palette-empty { min-height:145px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--color-textMuted); font-size:11px; text-align:center; padding:22px; }
-  .palette-empty strong { color:var(--color-textPrimary); font-size:13px; font-weight:500; }
-  .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:11px; overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
+  .palette-trailing { display:flex; align-items:center; gap:10px; color:var(--color-textMuted); font-size:var(--text-micro); }
+  .palette-empty { min-height:145px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--color-textMuted); font-size:var(--text-meta); text-align:center; padding:22px; }
+  .palette-empty strong { color:var(--color-textPrimary); font-size: var(--text-sm); font-weight:500; }
+  .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:var(--text-meta); overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
   .palette-notice p { margin:0 0 6px; }
-  .palette-notice button { margin:2px 6px 0 0; font-size:10px; }
+  .palette-notice button { margin:2px 6px 0 0; font-size:var(--text-micro); }
   .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--mac-fill-bg, rgb(var(--c-bg))); }
-  .palette-detail { padding:9px 18px; min-height:34px; font-size:10px; color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
-  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:10px; color:var(--color-textMuted); gap:8px; }
-  .palette-footer kbd { margin:0 3px 0 6px; font-size:10px; }
+  .palette-detail { padding:9px 18px; min-height:34px; font-size:var(--text-micro); color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
+  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:var(--text-micro); color:var(--color-textMuted); gap:8px; }
+  .palette-footer kbd { margin:0 3px 0 6px; font-size:var(--text-micro); }
   .palette-pages { gap:8px; }
   .palette-pages button { padding:0 6px; }
   button:focus-visible { outline:2px solid var(--color-accent); outline-offset:-2px; }
   button:disabled { opacity:.4; }
-  .palette-card :global(.palette-spinner) { animation:palette-spin 1s linear infinite; }
+  .palette-card :global(.palette-spinner) { animation:palette-spin calc(var(--gp-dur-emphasis) * 2) linear infinite; }
   @keyframes palette-spin { to { transform:rotate(360deg); } }
   @media (prefers-reduced-motion:reduce) { .palette-card :global(.palette-spinner) { animation:none; } }
   @media (max-width:540px) { .palette-scrim { padding:16px 8px; } .palette-card { max-height:calc(100dvh - 32px); } .palette-category { display:none; } .palette-header { padding:12px 12px 0; } .palette-results { max-height:none; } }

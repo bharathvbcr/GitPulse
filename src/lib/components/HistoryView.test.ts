@@ -12,7 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const read = (name: string) => readFileSync(join(here, name), "utf8");
 const history = read("HistoryView.svelte");
 const sectionBar = read("ViewSectionTabs.svelte");
-const filterBar = read("FilterBar.svelte");
+const viewBar = read("ViewBar.svelte");
 const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
 const historyList = readFileSync(join(here, "..", "views", "historyList.ts"), "utf8");
 const query = readFileSync(join(here, "..", "codeintel", "suspectsQuery.ts"), "utf8");
@@ -53,16 +53,21 @@ describe("HistoryView", () => {
     expect(historyList).toMatch(/value: "suspects", *\n? *label: "Suspects"/);
   });
 
-  it("asks the suspects question where the filter sits, and only on that list", () => {
+  it("asks the suspects question in the context bar, and only on that list, where the field is not the commit filter", () => {
     // A ranking is one answer; narrowing it by text would reorder nothing and
-    // hide rows whose rank still counts. So the context bar swaps the filter
-    // for the question rather than showing both.
+    // hide rows whose rank still counts. So on Suspects the view bar's field
+    // stops being the commit filter (it registers no filter there, and the
+    // standing "Commits:" chip is withheld) and the question takes the
+    // context bar, rather than both applying at once.
     expect(history).toContain('const asksSuspects = $derived(section === "graph" && list === "suspects")');
     const bar = history.slice(history.indexOf("<ViewContextBar"), history.indexOf("</ViewContextBar>"));
     expect(bar.indexOf("{#if asksSuspects}")).toBeGreaterThan(-1);
     expect(bar.indexOf("<SuspectsQueryBar />")).toBeGreaterThan(bar.indexOf("{#if asksSuspects}"));
-    expect(bar.indexOf("<SuspectsQueryBar />")).toBeLessThan(bar.indexOf("{:else}"));
-    expect(bar.indexOf("<FilterBar />")).toBeGreaterThan(bar.indexOf("{:else}"));
+    expect(bar).not.toContain("<FilterBar");
+    const filter = history.slice(history.indexOf('registerPageSearch("history:graph"') - 200, history.indexOf('registerPageSearch("history:graph"'));
+    expect(filter).toContain("if (asksSuspects) return;");
+    const standing = history.slice(history.indexOf('registerStandingFilter("history"'));
+    expect(standing.slice(0, 200)).toContain("if (asksSuspects) return null;");
   });
 
   it("drops the suspects answer when the repository changes", () => {
@@ -103,9 +108,21 @@ describe("HistoryView", () => {
     expect(history).not.toContain("{#key section}");
   });
 
-  it("carries the commit filter in its own header", () => {
-    expect(history).toContain("<FilterBar />");
-    expect(history).toContain("<ViewContextBar");
+  it("gives the view bar's field its commit filter, and its diff a find", () => {
+    // Graph registers the filter; the Diff section's viewer registers inside
+    // the scope History provides. The branch rides in the field as a chip.
+    expect(history).toContain('registerPageSearch("history:graph"');
+    expect(history).toContain('kind: "filter"');
+    expect(history).toContain("filterStore.setSearch(next)");
+    expect(history).toContain("filterStore.selectBranch(null)");
+    expect(history).toContain('providePageSearchScope("history:diff")');
+    // The list segment keeps its own context bar, on Graph only.
+    expect(history).toContain('<ViewContextBar label="Graph list">');
+  });
+
+  it("keeps the commit filter in sight on every section it narrows", () => {
+    expect(history).toContain('registerStandingFilter("history"');
+    expect(history).toContain("filterStore.clear()");
   });
 });
 
@@ -146,7 +163,9 @@ describe("ViewSectionTabs", () => {
     expect(viewTabBar).toContain("<ViewSectionTabs");
     expect(sectionBar).not.toContain("class:gp-liquid-tabs");
     expect(sectionBar).toContain("gp-liquid-selection");
-    expect(sectionBar).toContain("<span>{section.label}</span>");
+    // The label is always rendered; below 1100px an inactive tab hides it
+    // (the icon and the destination guide stand in) and the active one keeps it.
+    expect(sectionBar).toContain("data-section-label>{section.label}</span>");
   });
 
   it("ships a destination guide instead of a label-only title", () => {
@@ -165,14 +184,13 @@ describe("ViewSectionTabs", () => {
   });
 });
 
-describe("the commit filter stopped being a full-width strip", () => {
-  it("no longer owns a row of its own", () => {
-    expect(filterBar).not.toContain('class="h-10 bg-surface/60 border-b');
-    expect(filterBar).toContain('class="flex-1 min-w-0 flex items-center');
-  });
-
-  it("is mounted by History, not by App", () => {
+describe("the commit filter stopped being a bar of its own", () => {
+  it("is the view bar's field, mounted once, not by App or History", () => {
+    // It was a full-width strip under the header, then a pill in History's
+    // section bar. It is the one search field in row 2 now.
     expect(app).not.toContain("<FilterBar");
-    expect(history).toContain("<FilterBar />");
+    expect(history).not.toContain("<FilterBar");
+    expect(history).not.toContain("<PageSearch");
+    expect(viewBar.match(/<PageSearch \/>/g)).toHaveLength(1);
   });
 });

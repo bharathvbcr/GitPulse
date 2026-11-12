@@ -108,7 +108,7 @@ export function quitQuestion(
     .join("\n");
   const omitted = count !== null && count > LISTED ? `\n…and ${count - LISTED} more` : "";
   const what =
-    count === null ? "Terminal sessions may still be running (GitPulse could not list them)."
+    count === null ? "Terminal sessions may still be running (GitPulse couldn't list them)."
       : count === 1 ? "A terminal session is still running:"
       : `${count} terminal sessions are still running:`;
   return {
@@ -198,12 +198,12 @@ export function quitManagedQuestion(
   let what: string;
   let title: string;
   if (count === null) {
-    what = "Managed agent runs may still be working (GitPulse could not list them).";
+    what = "Managed agent runs may still be working (GitPulse couldn't list them).";
     title = "Quit While Managed Runs May Be Working?";
   } else if (!complete) {
     what = count === 0
-      ? "The list of managed agent runs could not be read in full, so some may still be working."
-      : `The list of managed agent runs could not be read in full, so at least ${count} ${noun(count)} will be stopped:`;
+      ? "The list of managed agent runs couldn't be read in full, so some may still be working."
+      : `The list of managed agent runs couldn't be read in full, so at least ${count} ${noun(count)} will be stopped:`;
     title = "Quit While Managed Runs May Be Working?";
   } else {
     what = `${count} ${noun(count)} will be stopped:`;
@@ -249,11 +249,11 @@ export function quitManagedHostedQuestion(
   const omitted = count !== null && count > LISTED ? `\n…and ${count - LISTED} more` : "";
   const noun = (n: number) => (n === 1 ? "managed run is" : "managed runs are");
   let what: string;
-  if (count === null) what = "Managed agent runs may still be working (GitPulse could not list them).";
+  if (count === null) what = "Managed agent runs may still be working (GitPulse couldn't list them).";
   else if (!complete) {
     what = count === 0
-      ? "The list of managed agent runs could not be read in full, so some may still be working."
-      : `The list of managed agent runs could not be read in full, so at least ${count} ${noun(count)} still working:`;
+      ? "The list of managed agent runs couldn't be read in full, so some may still be working."
+      : `The list of managed agent runs couldn't be read in full, so at least ${count} ${noun(count)} still working:`;
   } else what = `${count} ${noun(count)} still working:`;
   const plural = count !== 1;
   return {

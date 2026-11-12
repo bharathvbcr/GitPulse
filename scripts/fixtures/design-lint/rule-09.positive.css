@@ -1,0 +1,17 @@
+.gp-a {
+  transition: box-shadow 1s;
+}
+.gp-b {
+  @apply transition-[width,opacity];
+}
+.gp-c {
+  transition-property: height;
+}
+@utility gp-slide-other {
+  transition-property: width;
+}
+/* The docked sidebar's old width slide: it was the one named exception, and is a hit now. */
+@utility gp-slide-docked {
+  transition-property: width, height;
+  transition-duration: var(--gp-dur-fast);
+}

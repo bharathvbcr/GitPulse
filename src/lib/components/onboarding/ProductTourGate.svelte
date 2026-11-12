@@ -1,19 +1,16 @@
-<script module lang="ts">
+<script lang="ts">
   /**
    * The product tour draws nothing until it is open, so its component loads
    * then. Imported eagerly it put ~19 KB in the entry chunk of every launch,
    * one of the modules that took `main` over the 640 KB production limit
-   * (vite.config.ts). Module scope, because LazyView keys its cache on the
-   * loader's identity.
+   * (vite.config.ts). The loader is the shared one (lazyLoaders.ts), so the
+   * after-first-paint warm-up and this mount fetch the same chunk.
    */
-  const loadProductTour = () => import("./ProductTour.svelte");
-</script>
-
-<script lang="ts">
   import { onMount, type ComponentProps } from "svelte";
   import type ProductTour from "./ProductTour.svelte";
   import { productTour } from "../../tools/productTour";
   import LazyView from "../LazyView.svelte";
+  import { loadProductTour } from "../lazyLoaders";
 
   /** Everything ProductTour takes, passed through as it is. */
   let props: ComponentProps<typeof ProductTour> = $props();

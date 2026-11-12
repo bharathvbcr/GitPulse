@@ -20,11 +20,11 @@ describe("ImageDiffViewer states", () => {
     expect(html).not.toContain("Nothing to compare");
   });
 
-  it("names a failed read with its reason and offers Retry", () => {
+  it("names a failed read with its reason and offers Try again", () => {
     const html = body({ status: "failed", error: "blob unreadable", onRetry: () => {} });
-    expect(html).toContain("Could not read this image");
+    expect(html).toContain("Couldn't read this image");
     expect(html).toContain("blob unreadable");
-    expect(html).toContain("Retry");
+    expect(html).toContain("Try again");
     expect(html).not.toContain("No image");
   });
 
@@ -32,7 +32,7 @@ describe("ImageDiffViewer states", () => {
     const html = body({ status: "ready" });
     expect(html).toContain("No image on either side");
     expect(html).not.toContain("Loading images");
-    expect(html).not.toContain("Could not read");
+    expect(html).not.toContain("Couldn't read");
   });
 
   it("labels the absent side in swipe mode instead of drawing one picture as both", () => {
@@ -47,7 +47,7 @@ describe("ImageDiffViewer states", () => {
   it("puts a side's own read error under its label, so a failure is not presented as Deleted", () => {
     const html = body({ oldSrc: IMG, newError: "gone from the working tree" });
     expect(html).toContain("No current version (deleted)");
-    expect(html).toContain("could not be read: gone from the working tree");
+    expect(html).toContain("couldn't be read: gone from the working tree");
   });
 
   it("shows no absence note when both pictures are there", () => {
@@ -56,8 +56,8 @@ describe("ImageDiffViewer states", () => {
     expect(html).not.toContain("No current version");
   });
 
-  it("wires Retry to the caller's handler", () => {
+  it("wires Try again to the caller's handler", () => {
     const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ImageDiffViewer.svelte"), "utf8");
-    expect(source).toContain('label: "Retry", onClick: onRetry');
+    expect(source).toContain('onclick={onRetry}>Try again</button>');
   });
 });

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Checkbox from "./Checkbox.svelte";
   import { invoke } from "../ipc/invoke";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { guardedDismiss } from "./modalGuard";
@@ -121,7 +122,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between">
+      <div class="p-4 gp-section-edge flex items-center justify-between">
         <h2 id="clone-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <Download size={16} class="text-accent" />
           <span>Clone Git Repository</span>
@@ -130,24 +131,24 @@
 
       <div class="p-4 space-y-3">
         {#if errorMsg}
-          <div class="p-2 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-xs">
+          <div class="p-2 bg-danger/10 border border-danger/35 rounded-xl text-danger text-xs">
             {errorMsg}
           </div>
         {/if}
 
         <div>
-          <label for="clone-url" class="block text-textMuted text-[11px] mb-1.5">Repository URL</label>
+          <label for="clone-url" class="block text-textMuted text-meta mb-1.5">Repository URL</label>
           <input
             id="clone-url"
             type="text"
             bind:value={url}
-            placeholder="https://github.com/owner/repo.git or git@github.com:..."
+            placeholder="https://github.com/owner/name.git or git@github.com:…"
             class="gp-field w-full font-mono"
           />
         </div>
 
         <div>
-          <label for="clone-dest" class="block text-textMuted text-[11px] mb-1.5">Destination Directory</label>
+          <label for="clone-dest" class="block text-textMuted text-meta mb-1.5">Destination Directory</label>
           <div class="flex items-center gap-2">
             <input
               id="clone-dest"
@@ -159,39 +160,39 @@
             <button
               onclick={pickTargetDir}
               title="Choose directory"
-              class="gp-btn px-2.5! py-1.5! shrink-0"
+              class="gp-btn px-2.5! shrink-0"
             >
               <FolderOpen size={14} />
             </button>
           </div>
         </div>
 
-        <details bind:open={showOptions} class="text-[11px]">
-          <summary class="cursor-pointer text-textMuted select-none">Options</summary>
+        <details bind:open={showOptions} class="text-meta">
+          <summary class="cursor-pointer text-textMuted select-none">Settings</summary>
           <div class="mt-2 space-y-2">
             <div>
-              <label for="clone-branch" class="block text-textMuted text-[11px] mb-1">Branch or tag (optional)</label>
+              <label for="clone-branch" class="block text-textMuted text-meta mb-1">Branch or tag (optional)</label>
               <input id="clone-branch" type="text" bind:value={branch} disabled={isCloning} placeholder="Remote default" class="gp-field w-full font-mono" />
             </div>
             <div>
-              <label for="clone-depth" class="block text-textMuted text-[11px] mb-1">History depth (optional)</label>
+              <label for="clone-depth" class="block text-textMuted text-meta mb-1">History depth (optional)</label>
               <input id="clone-depth" type="text" inputmode="numeric" bind:value={depthText} disabled={isCloning} placeholder="Full history" class="gp-field w-full font-mono" />
-              {#if depth === "invalid"}<p class="mt-1 text-[10px] text-amber-400">Enter a whole number from 1 to {MAX_CLONE_DEPTH.toLocaleString()}, or leave empty for full history.</p>
-              {:else if depth !== null}<p class="mt-1 text-[10px] text-textMuted">Shallow clone: only the last {depth} {depth === 1 ? "commit" : "commits"}.</p>{/if}
+              {#if depth === "invalid"}<p class="mt-1 text-micro text-warn">Enter a whole number from 1 to {MAX_CLONE_DEPTH.toLocaleString()}, or leave empty for full history.</p>
+              {:else if depth !== null}<p class="mt-1 text-micro text-textMuted">Shallow clone: only the last {depth} {depth === 1 ? "commit" : "commits"}.</p>{/if}
             </div>
-            <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={recurseSubmodules} disabled={isCloning} />Also clone submodules</label>
+            <label class="inline-flex items-center gap-1.5"><Checkbox ariaLabel="Also clone submodules" checked={recurseSubmodules} disabled={isCloning} onchange={(next) => (recurseSubmodules = next)} />Also clone submodules</label>
           </div>
         </details>
 
         {#if isCloning}
           <div role="status" aria-live="polite" class="space-y-1">
-            <div class="flex justify-between text-[11px] text-textMuted">
+            <div class="flex justify-between text-meta text-textMuted">
               <span>{progress?.phase ?? "Starting clone…"}</span>
               {#if progress?.percent != null}<span>{progress.percent}%</span>{/if}
             </div>
             <div class="h-1.5 rounded-full bg-surfaceHover overflow-hidden">
               {#if progress?.percent != null}
-                <div class="h-full bg-accent transition-[width]" style="width: {progress.percent}%"></div>
+                <div class="h-full w-full origin-left bg-accent transition-transform" style="transform: scaleX({progress.percent / 100})"></div>
               {:else}
                 <div class="h-full w-1/3 bg-accent/60 animate-pulse"></div>
               {/if}
@@ -200,7 +201,7 @@
         {/if}
       </div>
 
-      <div class="p-4 border-t border-border/60 gp-section-edge bg-surfaceHover/30 flex justify-end gap-2">
+      <div class="p-4 gp-section-edge bg-surfaceHover/30 flex justify-end gap-2">
         <button onclick={requestClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
         <button
           onclick={handleClone}
@@ -208,7 +209,7 @@
           class="gp-btn-primary"
         >
           <Check size={14} />
-          <span>{isCloning ? "Cloning..." : "Clone Repository"}</span>
+          <span>{isCloning ? "Cloning…" : "Clone repository"}</span>
         </button>
       </div>
     </div>

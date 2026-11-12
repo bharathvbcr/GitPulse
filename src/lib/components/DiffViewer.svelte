@@ -51,7 +51,7 @@
 </script>
 
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onMount, untrack } from "svelte";
   import type { FileBlob } from "../files/types";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { currentHeadTip } from "../stores/headTip";
@@ -91,18 +91,22 @@
     Copy,
     FileCode,
     GitBranch,
-    Loader2,
+    AlertTriangle,
     Palette,
     PanelLeftOpen,
-    Search,
     WrapText,
-    X,
   } from "@lucide/svelte";
   import LazyMount from "./LazyMount.svelte";
+  import FindField from "./FindField.svelte";
+  import { pageSearchScope, registerPageSearch } from "../search/pageSearch.svelte";
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
   const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
   import EmptyState from "./EmptyState.svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import Skeleton from "./Skeleton.svelte";
+  import { LAYERS } from "../ui/layers";
+  import { describeFailure } from "../ui/copy/describeFailure";
   import LanguageLogo from "./LanguageLogo.svelte";
   import VirtualList from "./VirtualList.svelte";
   import {
@@ -253,7 +257,13 @@
   let isDragging = $state(false);
   let copiedPatch = $state(false);
 
-  let searchOpen = $state(false);
+  /**
+   * Mounted as a page's own pane (History's Diff section), the view bar's
+   * search field is this diff's find: the viewer registers as its provider
+   * and draws no Find of its own. Mounted anywhere else it keeps its own.
+   */
+  const searchScope = pageSearchScope();
+  let searchOpen = $state(searchScope !== null);
   let searchQuery = $state("");
   let searchCase = $state(false);
   let searchRegex = $state(false);
@@ -282,11 +292,11 @@
   let blastOpen = $state(false);
   let impactWalkTitle = $derived(tooltipWalkIncomplete([impactWalkIncomplete]));
   let impactUnavailableTitle = $derived(
-    tooltipWalkIncomplete([impactReason, impactWalkIncomplete]) ?? "impact unavailable",
+    tooltipWalkIncomplete([impactReason, impactWalkIncomplete]) ?? "Impact unavailable",
   );
   let impactEdgesTitle = $derived(
     boundText(
-      `${impactEdges} downstream callers/dependencies affected by THIS FILE in devmap — the panel below counts the whole change set${
+      `${impactEdges} downstream callers/dependencies affected by this file in the code map — the panel below counts the whole change set${
         impactWalkTitle ? ` · walk incomplete: ${impactWalkTitle}` : ""
       }`,
     ),
@@ -542,21 +552,30 @@
   }
 
   function closeSearch(): void {
-    searchOpen = false;
+    searchOpen = searchScope !== null;
     searchQuery = "";
     searchIndex = 0;
   }
 
-  /** Enter and Shift+Enter step, Escape closes — owned by the box, so no window rule has to guess. */
-  function onSearchKeydown(event: KeyboardEvent): void {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      stepSearch(event.shiftKey ? -1 : 1);
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      closeSearch();
-    }
-  }
+  // The scope is fixed for the life of the pane, so the find registers once,
+  // on mount. Not an $effect: its getters and setters read and write this
+  // pane's search state, which an effect would then depend on.
+  onMount(() => {
+    if (!searchScope) return;
+    return registerPageSearch(searchScope, {
+      kind: "find",
+      label: "Find in this diff",
+      placeholder: "Find in this diff…",
+      query: () => searchQuery,
+      setQuery: (next) => (searchQuery = next),
+      caseSensitive: () => searchCase,
+      setCaseSensitive: (next) => (searchCase = next),
+      regex: () => searchRegex,
+      setRegex: (next) => (searchRegex = next),
+      status: () => ({ text: matchLabel(search, searchIndex), invalid: search.invalid, hasMatches: search.matches.length > 0 }),
+      step: stepSearch,
+    });
+  });
 
   // Re-anchor on the visible row whenever the result set changes, so typing
   // another character does not throw the reader back to match one.
@@ -585,10 +604,16 @@
       viewMode === "split" ? (line) => splitRowForLine(splitModel, line) : undefined,
     ),
   );
+  /** A toolbar toggle that is on: the accent edge, fill and ink. */
+  const PRESSED = "border-accent bg-accent/10 text-accent";
+  /** The chip tone for a file's status letter: a letter always rides with it. */
+  function statusTone(code: string): "ok" | "danger" | "info" | "warn" {
+    return code === "A" ? "ok" : code === "D" ? "danger" : code === "R" ? "info" : "warn";
+  }
   function toneClass(tone: number): string {
-    if (tone === TONE_ADD) return "bg-emerald-500";
-    if (tone === TONE_DEL) return "bg-rose-500";
-    if (tone === TONE_MOD) return "bg-amber-500";
+    if (tone === TONE_ADD) return "bg-ok";
+    if (tone === TONE_DEL) return "bg-danger";
+    if (tone === TONE_MOD) return "bg-warn";
     if (tone === TONE_FILE) return "bg-accent/70";
     return "bg-accent/40";
   }
@@ -866,6 +891,15 @@
         : null,
   );
 
+  const filesFailure = $derived(
+    filesError
+      ? describeFailure(
+          { verb: "list", object: compareBase !== null ? "the files of the compared commits" : "the files of this commit" },
+          filesError,
+        )
+      : null,
+  );
+
   function retryCommitFiles(): void {
     fetchedFor = null;
     compareFetchedFor = null;
@@ -1079,19 +1113,20 @@
     const onControl =
       target?.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"]') != null;
 
-    if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
+    // As a page's pane, ⌘F is the view bar field's (App routes it there).
+    if (!searchScope && (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
       event.preventDefault();
       openSearch();
       return;
     }
-    if (event.key === "Escape" && searchOpen && (nothingFocused || inPane)) {
+    if (event.key === "Escape" && searchOpen && !searchScope && (nothingFocused || inPane)) {
       event.preventDefault();
       closeSearch();
       return;
     }
     // Enter steps only from the diff body itself: on a focused button it is
     // that button's activation (Stage Hunk, Close find), and it is the find
-    // box's own business inside the box (see onSearchKeydown).
+    // box's own business inside the box (FindField owns Enter and Escape).
     const enterInDiff =
       searchOpen &&
       event.key === "Enter" &&
@@ -1264,7 +1299,7 @@
     const path = $repoStore.selectedFilePath;
     if (!path) return;
     const outcome = await (isStaged ? repoStore.unstageFile(path) : repoStore.stageFile(path));
-    reportFailure(outcome, isStaged ? "Could not unstage the file" : "Could not stage the file");
+    reportFailure(outcome, isStaged ? "Couldn't unstage the file" : "Couldn't stage the file");
   }
 
   async function stageHunk(hunkIndex: number) {
@@ -1297,7 +1332,7 @@
       .join("\n");
     const copied = await copyText(text);
     if (copied) toastStore.success(`Copied ${selectedLines.size} line${selectedLines.size === 1 ? "" : "s"}`);
-    else toastStore.error("Could not reach the clipboard");
+    else toastStore.error("Couldn't reach the clipboard");
   }
 
   async function stageSelected(isStaging: boolean) {
@@ -1313,7 +1348,7 @@
     const text = $repoStore.selectedDiff;
     if (!text) return;
     if (!(await copyText(text))) {
-      toastStore.error("Could not copy the patch to the clipboard");
+      toastStore.error("Couldn't copy the patch to the clipboard");
       return;
     }
     // A backend cut makes the clipboard text a prefix of the patch. The button
@@ -1574,6 +1609,7 @@
   const pending = $derived($repoStore.selectedDiffPending);
   /** Why the selected diff could not be read; per selection, not the repository's `error`. */
   const diffError = $derived($repoStore.selectedDiffError);
+  const diffFailure = $derived(diffError ? describeFailure({ verb: "read", object: "this diff" }, diffError) : null);
   const showEmpty = $derived(!pending && !diffError && lines.length === 0);
 
   /** Asks again for the selection whose read failed, through the same store call that failed. */
@@ -1615,7 +1651,7 @@
        reflowing its own text at EVERY width. Each item here still refuses to
        wrap internally. -->
   <div
-    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/60 gp-section-edge bg-surface/60 px-3 py-1.5 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 bg-surface/60 px-3 py-1.5 font-sans"
   >
     {#if languagePath}
       <LanguageLogo filePath={languagePath} size={15} class="shrink-0" />
@@ -1632,50 +1668,36 @@
     </button>
     {#if singleSection}
       <span
-        class="shrink-0 rounded px-1 font-mono text-[10px] {sectionStatus(singleSection) === 'A'
-          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-          : sectionStatus(singleSection) === 'D'
-            ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
-            : sectionStatus(singleSection) === 'R'
-              ? 'bg-sky-500/15 text-sky-600 dark:text-sky-400'
-              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}"
+        class="gp-chip shrink-0 font-mono"
+        data-kind="count"
+        data-tone={statusTone(sectionStatus(singleSection))}
         title={singleSection.oldPath ? `renamed from ${singleSection.oldPath}` : undefined}
       >
         {sectionStatus(singleSection)}
       </span>
     {/if}
     {#if churn}
-      <span class="shrink-0 font-mono text-[10px] tabular-nums text-textMuted">{churn}</span>
+      <span class="shrink-0 font-mono text-micro tabular-nums text-textMuted">{churn}</span>
     {/if}
     {#if contentLineCount > 0}
-      <span class="shrink-0 text-[10px] text-textMuted">{contentLineCount.toLocaleString()} lines</span>
+      <span class="shrink-0 text-micro text-textMuted">{contentLineCount.toLocaleString()} lines</span>
     {/if}
     {#if isWorkingTreeFile}
-      <span
-        class="shrink-0 rounded-full border px-1.5 text-[10px] {isStaged
-          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-          : 'border-border/70 text-textMuted'}"
-      >
-        {isStaged ? "staged" : "unstaged"}
+      <span class="gp-chip shrink-0" data-kind="label" data-tone={isStaged ? "ok" : "neutral"}>
+        {isStaged ? "Staged" : "Unstaged"}
       </span>
     {/if}
     {#if !impactAvailable}
-      <span
-        class="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 dark:text-amber-400"
-        title={impactUnavailableTitle}
-      >
-        impact unavailable
+      <span class="gp-chip shrink-0" data-kind="label" data-tone="unknown" title={impactUnavailableTitle}>
+        Impact unavailable
       </span>
     {:else if impactEdges > 0}
       <!-- Scope is stated on the chip because the panel below answers the same
            question for the whole change set. Two unlabelled impact numbers on
            one screen read as a contradiction rather than as two scopes.
            The walk qualification rides in the wording ("at least N") instead
-           of a separate amber word beside it: same disclosure, one chip. -->
-      <span
-        class="shrink-0 rounded-full border border-accent/30 bg-accent/15 px-2 py-0.5 text-[10px] text-accent"
-        title={impactEdgesTitle}
-      >
+           of a separate warning word beside it: same disclosure, one chip. -->
+      <span class="gp-chip shrink-0" data-kind="label" data-tone="accent" title={impactEdgesTitle}>
         {hedgedCount(impactEdges, Boolean(impactWalkIncomplete), "caller")}
         <span class="opacity-70">· this file</span>
       </span>
@@ -1693,7 +1715,8 @@
         <div class="flex items-center gap-1">
           <button
             type="button"
-            class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
+            class="gp-icon-btn disabled:opacity-40"
+            data-size="sm"
             disabled={!prevFile}
             onclick={() => prevFile && openRailEntry(prevFile)}
             title="Previous file (Alt+↑)"
@@ -1701,12 +1724,13 @@
           >
             <ChevronUp size={13} />
           </button>
-          <span class="text-[10px] tabular-nums text-textMuted">
+          <span class="text-micro tabular-nums text-textMuted">
             {position.index || "–"}/{position.total}
           </span>
           <button
             type="button"
-            class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
+            class="gp-icon-btn disabled:opacity-40"
+            data-size="sm"
             disabled={!nextFile}
             onclick={() => nextFile && openRailEntry(nextFile)}
             title="Next file (Alt+↓)"
@@ -1720,10 +1744,12 @@
       {#if isWorkingTreeFile}
         <button
           onclick={() => void toggleSelectedFileStaged()}
-          class="gp-btn-primary py-1!"
+          class="gp-btn"
+          data-variant="primary"
+          data-size="sm"
         >
           <Check size={13} />
-          <span>{isStaged ? "Unstage File" : "Stage File"}</span>
+          <span>{isStaged ? "Unstage file" : "Stage file"}</span>
         </button>
       {/if}
 
@@ -1738,12 +1764,13 @@
        reason: at a 420px pane the controls measured 694px wide and the
        layout toggles ran off an edge no scrollbar reaches. -->
   <div
-    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/60 gp-section-edge bg-surface/30 px-3 py-1 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 bg-surface/30 px-3 py-1 font-sans"
   >
     {#if !railOpen && hasRail}
       <button
         type="button"
-        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
+        class="gp-btn text-textMuted"
+        data-size="sm"
         onclick={() => (railOpen = true)}
         title="Show the file list"
       >
@@ -1758,9 +1785,8 @@
     {#if historyRows.length > 0}
       <button
         type="button"
-        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] {historyShowing
-          ? 'border-accent/60 bg-accent/10 text-accent'
-          : 'text-textMuted'}"
+        class="gp-btn {historyShowing ? PRESSED : 'text-textMuted'}"
+        data-size="sm"
         aria-pressed={historyShowing}
         onclick={toggleHistory}
         aria-label="Commit history"
@@ -1772,23 +1798,29 @@
       </button>
     {/if}
 
-    <button
-      type="button"
-      class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] {searchOpen
-        ? 'border-accent/60 bg-accent/10 text-accent'
-        : 'text-textMuted'}"
-      aria-pressed={searchOpen}
-      onclick={() => (searchOpen ? closeSearch() : openSearch())}
-      title="Find in this diff ({shortcutTextLabel('⌘F', $hostPlatform.os)})"
-    >
-      <Search size={13} />
-      <span class="hidden sm:inline">Find</span>
-    </button>
+    {#if !searchScope}
+    <FindField
+      bind:open={searchOpen}
+      bind:query={searchQuery}
+      bind:caseSensitive={searchCase}
+      bind:regex={searchRegex}
+      bind:input={searchInput}
+      label="Find in this diff"
+      placeholder="Find in this diff…"
+      shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+      status={matchLabel(search, searchIndex)}
+      invalid={search.invalid}
+      hasMatches={search.matches.length > 0}
+      onstep={stepSearch}
+      onclose={closeSearch}
+    />
+    {/if}
 
     <div class="flex items-center gap-1">
       <button
         type="button"
-        class="gp-btn py-0.5! px-1.5! text-textMuted"
+        class="gp-icon-btn"
+        data-size="sm"
         onclick={() => stepChange(-1)}
         title="Previous change (Alt+PageUp)"
         aria-label="Previous change"
@@ -1797,7 +1829,8 @@
       </button>
       <button
         type="button"
-        class="gp-btn py-0.5! px-1.5! text-textMuted"
+        class="gp-icon-btn"
+        data-size="sm"
         onclick={() => stepChange(1)}
         title="Next change (Alt+PageDown)"
         aria-label="Next change"
@@ -1809,7 +1842,8 @@
     <div class="ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
       <button
         type="button"
-        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
+        class="gp-btn text-textMuted"
+        data-size="sm"
         onclick={copyPatch}
         disabled={!$repoStore.selectedDiff}
         title={cutByBackend
@@ -1817,7 +1851,7 @@
           : "Copy the whole patch as unified diff text"}
       >
         {#if copiedPatch}
-          <Check size={13} class="text-emerald-500" />
+          <Check size={13} class="text-ok" />
         {:else}
           <Copy size={13} />
         {/if}
@@ -1830,12 +1864,11 @@
         aria-pressed={syntaxActive}
         disabled={!syntaxAvailable}
         title={syntaxAvailable
-          ? "Colour the code by language"
-          : `Syntax colouring is off above ${SYNTAX_MAX_LINES.toLocaleString()} lines — this diff has ${lines.length.toLocaleString()}.`}
-        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] disabled:opacity-40 {syntaxActive
-          ? 'border-accent/60 bg-accent/10 font-semibold text-accent'
-          : 'text-textMuted'}"
-        aria-label="Toggle syntax colouring"
+          ? "Color the code by language"
+          : `Syntax coloring is off above ${SYNTAX_MAX_LINES.toLocaleString()} lines — this diff has ${lines.length.toLocaleString()}.`}
+        class="gp-btn {syntaxActive ? `${PRESSED} font-semibold` : 'text-textMuted'}"
+        data-size="sm"
+        aria-label="Toggle syntax coloring"
       >
         <Palette size={13} />
         <span class="hidden md:inline">Syntax</span>
@@ -1849,22 +1882,19 @@
         title={wrapAvailable
           ? "Wrap long lines"
           : `Wrapping is unavailable above ${WRAP_MAX_LINES.toLocaleString()} lines — this diff has ${renderedRowCount.toLocaleString()}. Wrapped rows vary in height and cannot be windowed, so the whole diff would render at once.`}
-        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] disabled:opacity-40 {wrapping
-          ? 'border-accent/60 bg-accent/10 font-semibold text-accent'
-          : 'text-textMuted'}"
+        class="gp-btn {wrapping ? `${PRESSED} font-semibold` : 'text-textMuted'}"
+        data-size="sm"
         aria-label="Toggle word wrap"
       >
         <WrapText size={13} />
         <span class="hidden md:inline">Wrap</span>
       </button>
 
-      <label class="flex cursor-pointer items-center gap-1.5 text-[11px] text-textMuted hover:text-textPrimary">
-        <input
-          type="checkbox"
+      <label class="flex cursor-pointer items-center gap-1.5 text-meta text-textMuted hover:text-textPrimary">
+        <Checkbox
           checked={$repoStore.selectedIgnoreWhitespace}
-          onchange={(e) => repoStore.setIgnoreWhitespace(e.currentTarget.checked)}
-          class="rounded border-border bg-surface text-accent"
-          aria-label="Ignore whitespace-only changes"
+          onchange={(next) => repoStore.setIgnoreWhitespace(next)}
+          ariaLabel="Ignore whitespace-only changes"
         />
         <span class="hidden lg:inline">Ignore whitespace</span>
       </label>
@@ -1890,80 +1920,9 @@
     </div>
   </div>
 
-  {#if searchOpen}
-    <div
-      class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/50 px-3 py-1 font-sans"
-    >
-      <Search size={13} class="shrink-0 text-textMuted" />
-      <input
-        bind:this={searchInput}
-        bind:value={searchQuery}
-        onkeydown={onSearchKeydown}
-        type="text"
-        class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
-        placeholder="Find in this diff…"
-        aria-label="Find in this diff"
-      />
-      <span
-        class="shrink-0 tabular-nums text-[10px] {search.invalid ? 'text-rose-500' : 'text-textMuted'}"
-      >
-        {matchLabel(search, searchIndex)}
-      </span>
-      <button
-        type="button"
-        class="gp-btn py-0.5! px-1.5! text-[10px] {searchCase ? 'border-accent/60 text-accent' : 'text-textMuted'}"
-        aria-pressed={searchCase}
-        onclick={() => (searchCase = !searchCase)}
-        title="Match case"
-      >
-        Aa
-      </button>
-      <button
-        type="button"
-        class="gp-btn py-0.5! px-1.5! font-mono text-[10px] {searchRegex ? 'border-accent/60 text-accent' : 'text-textMuted'}"
-        aria-pressed={searchRegex}
-        onclick={() => (searchRegex = !searchRegex)}
-        title="Regular expression"
-      >
-        .*
-      </button>
-      <button
-        type="button"
-        class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
-        disabled={search.matches.length === 0}
-        onclick={() => stepSearch(-1)}
-        title="Previous match (Shift+F3)"
-        aria-label="Previous match"
-      >
-        <ChevronUp size={13} />
-      </button>
-      <button
-        type="button"
-        class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
-        disabled={search.matches.length === 0}
-        onclick={() => stepSearch(1)}
-        title="Next match (F3)"
-        aria-label="Next match"
-      >
-        <ChevronDown size={13} />
-      </button>
-      <button
-        type="button"
-        class="gp-icon-btn p-1!"
-        onclick={closeSearch}
-        title="Close find"
-        aria-label="Close find"
-      >
-        <X size={13} />
-      </button>
-    </div>
-  {/if}
-
   {#if truncatedSource}
-    <div
-      class="mx-3 mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 font-sans text-[11px] text-amber-600 dark:text-amber-300"
-    >
-      <span>⚠</span>
+    <div class="gp-notice flex shrink-0 items-center gap-2 font-sans" data-tone="warn" role="status">
+      <AlertTriangle size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
       <span>
         {#if cutByBackend}
           <!-- The backend says WHY. This asserted "larger than we read in one
@@ -2002,11 +1961,13 @@
        whole pane, so a clean merge or a `.png` left the reader with no way to
        reach the next file except by leaving for the Graph. -->
   {#if filesError}
-    <div class="flex shrink-0 items-center gap-2 border-b border-border/60 bg-surface/60 px-3 py-1 font-sans text-[11px] text-amber-500" role="status">
+    <div class="gp-notice flex shrink-0 items-center gap-2 font-sans" data-tone="unknown" role="status">
+      <AlertTriangle size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
       <span class="min-w-0 truncate">
-        Could not list {compareBase !== null ? "the compared commits'" : "this commit's"} files: {filesError}
+        {filesFailure?.headline}
+        {filesFailure?.detail ?? ""}
       </span>
-      <button type="button" class="gp-btn shrink-0 text-xs py-0.5 px-2" onclick={retryCommitFiles}>Retry</button>
+      <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryCommitFiles}>Try again</button>
     </div>
   {/if}
   <div class="relative flex min-h-0 flex-1 overflow-hidden">
@@ -2058,7 +2019,7 @@
       <!-- Where you are, when the file's own header has scrolled away. -->
       {#if currentSection && !showingImage && !showEmpty && !pending && !diffError && (outline.files.length > 1 || currentHunk)}
         <div
-          class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surfaceHover/60 px-3 py-0.5 font-sans text-[10px] text-textMuted"
+          class="flex shrink-0 select-none items-center gap-2 bg-surfaceHover/60 px-3 py-0.5 font-sans text-micro text-textMuted"
         >
           {#if currentSection.path}
             <span class="min-w-0 truncate font-medium text-textPrimary/80">{currentSection.path}</span>
@@ -2066,12 +2027,14 @@
           {#if currentHunk}
             <span class="shrink-0 font-mono opacity-70">{currentHunk.header}</span>
             {#if currentHunkSymbol}
-              <span class="min-w-0 truncate font-mono text-accent/80">{currentHunkSymbol}</span>
+              <span class="min-w-0 truncate font-mono text-accent">{currentHunkSymbol}</span>
               <!-- The symbol this hunk changes, as a symptom: which commit
                    since the last known good could have broken it. -->
               <button
                 type="button"
-                class="shrink-0 rounded px-1 text-micro text-textMuted hover:bg-surfaceHover hover:text-textPrimary"
+                class="gp-btn shrink-0"
+                data-variant="ghost"
+                data-size="inline"
                 onclick={() => openSuspectsFor(currentHunkSymbol)}
                 title="Find suspects for {currentHunkSymbol}: which commit since the last known good could have broken it"
                 aria-label="Find suspects for {currentHunkSymbol}"
@@ -2093,16 +2056,24 @@
       <div bind:this={bodyEl} class="relative flex min-h-0 flex-1" aria-busy={pending}>
         {#if pending}
           <div
-            class="flex flex-1 items-center justify-center gap-2 text-[11px] text-textMuted font-sans"
+            class="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-meta text-textMuted font-sans"
             role="status"
           >
-            <Loader2 size={14} class="animate-spin" />
             <span>Reading the diff…</span>
+            <div class="w-full max-w-md" aria-hidden="true">
+              <Skeleton variant="code-lines" count={8} />
+            </div>
           </div>
         {:else if diffError}
-          <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center font-sans" role="alert">
-            <span class="text-[11px] text-amber-500">Could not read this diff: {diffError}</span>
-            <button type="button" class="gp-btn text-xs py-1 px-2.5" onclick={retryDiff}>Retry</button>
+          <div class="flex flex-1 items-center justify-center px-4 font-sans">
+            <div class="gp-notice flex items-center gap-2" data-tone="unknown" role="alert">
+              <AlertTriangle size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
+              <span class="min-w-0">
+                {diffFailure?.headline}
+                {diffFailure?.detail ?? ""}
+              </span>
+              <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={retryDiff}>Try again</button>
+            </div>
           </div>
         {:else if showingImage}
           <!-- Deferred: only an image diff reaches this pane, so it does not
@@ -2135,7 +2106,7 @@
             overscan={OVERSCAN}
             contentWidth={!wrapping}
             bind:scrollTop={unifiedScroll}
-            class="gp-diff-surface flex-1 min-h-0 font-mono"
+            class="flex-1 min-h-0 font-mono"
           >
             {#snippet row(_, index)}
               {@const line = unifiedRow(index)}
@@ -2152,7 +2123,7 @@
             overscan={OVERSCAN}
             contentWidth={!wrapping}
             bind:scrollTop={splitScroll}
-            class="gp-diff-surface flex-1 min-h-0 font-mono"
+            class="flex-1 min-h-0 font-mono"
           >
             {#snippet row(_, index)}
               {@const item = splitRow(index)}
@@ -2172,7 +2143,7 @@
                route — Alt+PageUp/PageDown step changes, the list itself
                scrolls, and the file list jumps between files. -->
           <div
-            class="group/rail relative h-full w-3 shrink-0 cursor-pointer select-none overflow-hidden border-l border-border/70 bg-surface/90 transition-[width] duration-150 hover:w-4"
+            class="group/rail relative h-full w-3 shrink-0 cursor-pointer select-none overflow-hidden bg-surface hover:w-4"
             title="Diff map — click or drag to navigate"
             role="presentation"
             onpointerdown={(e) => {
@@ -2185,7 +2156,7 @@
           >
             {#if band}
               <div
-                class="pointer-events-none absolute inset-x-0 rounded-sm border border-accent/40 bg-accent/15"
+                class="pointer-events-none absolute inset-x-0 rounded-sm bg-accent/15 ring-1 ring-inset ring-accent/40"
                 style="top: {band.topPct}%; height: {band.heightPct}%;"
               ></div>
             {/if}
@@ -2210,28 +2181,28 @@
   <!-- Selection bar: only the action that applies to this side of the index. -->
   {#if isWorkingTreeFile && selectedLines.size > 0}
     <div
-      class="flex shrink-0 items-center justify-between border-t border-border/80 gp-section-edge bg-surface p-2.5 font-sans text-xs shadow-lg"
+      class="flex shrink-0 items-center justify-between bg-surface p-2.5 font-sans text-xs shadow-pop"
     >
-      <span class="font-mono text-[11px] text-textMuted">
+      <span class="font-mono text-meta text-textMuted">
         {selectedLines.size} line{selectedLines.size === 1 ? "" : "s"} selected
       </span>
       <div class="flex items-center gap-2">
-        <button onclick={() => (selectedLines = new Set())} class="gp-btn py-1! text-xs!">
+        <button onclick={() => (selectedLines = new Set())} class="gp-btn" data-size="sm">
           Clear
         </button>
-        <button onclick={copySelectedLines} class="gp-btn py-1! text-xs!" title="Copy the selected lines without their diff markers">
+        <button onclick={copySelectedLines} class="gp-btn" data-size="sm" title="Copy the selected lines without their diff markers">
           <Copy size={12} />
           <span>Copy</span>
         </button>
         {#if isStaged}
-          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
+          <button onclick={() => stageSelected(false)} class="gp-btn" data-variant="primary" data-size="sm" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
-            <span>Unstage Selected ({selectedLines.size})</span>
+            <span>Unstage selected ({selectedLines.size})</span>
           </button>
         {:else}
-          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
+          <button onclick={() => stageSelected(true)} class="gp-btn" data-variant="primary" data-size="sm" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
-            <span>Stage Selected ({selectedLines.size})</span>
+            <span>Stage selected ({selectedLines.size})</span>
           </button>
         {/if}
       </div>
@@ -2252,12 +2223,12 @@
     >{#each rowSpans(line, index) as span}<span
         class="{syntaxActive ? tokenClass(span.token) : ''} {span.changed
           ? line.type === 'del'
-            ? 'rounded-sm bg-rose-500/35 font-semibold'
-            : 'rounded-sm bg-emerald-500/35 font-semibold'
+            ? 'rounded-sm bg-danger/35 font-semibold'
+            : 'rounded-sm bg-ok/35 font-semibold'
           : ''} {span.match
           ? activeMatch?.lineIndex === index
-            ? 'rounded-sm bg-amber-400/70 text-black'
-            : 'rounded-sm bg-amber-400/30'
+            ? 'rounded-sm bg-warn text-onWarn'
+            : 'rounded-sm bg-warn/30'
           : ''}">{span.text}</span
       >{/each}</span
   >
@@ -2273,8 +2244,8 @@
     class="flex h-3.5 w-3.5 shrink-0 select-none items-center justify-center rounded border {selectedLines.has(
       index,
     )
-      ? 'border-accent bg-accent text-white'
-      : 'border-border/60 hover:border-accent/80'}"
+      ? 'border-accent bg-accent text-onAccent'
+      : 'border-edge hover:border-accent'}"
     disabled={whitespaceView}
     title={whitespaceView
       ? stagingBlockedReason
@@ -2289,18 +2260,18 @@
   {@const selected = selectedLines.has(index)}
   {@const tint =
     line.type === "add"
-      ? "bg-emerald-500/15"
+      ? "bg-ok/15"
       : line.type === "del"
-        ? "bg-rose-500/15"
+        ? "bg-danger/15"
         : line.type === "hdr" || line.type === "meta"
           ? "bg-surfaceHover/70"
           : line.type === "binary"
-            ? "bg-amber-500/10"
+            ? "bg-warn/10"
             : ""}
   <div
     class="flex w-full {wrapping ? 'items-start' : 'items-center'} {tint} {selected
       ? 'ring-1 ring-inset ring-accent/60'
-      : ''} {line.type === 'add' ? 'hover:bg-emerald-500/25' : line.type === 'del' ? 'hover:bg-rose-500/25' : 'hover:bg-surfaceHover/40'}"
+      : ''} {line.type === 'add' ? 'hover:bg-ok/25' : line.type === 'del' ? 'hover:bg-danger/25' : 'hover:bg-surfaceHover/40'}"
     style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}
     role="presentation"
     onpointerdown={(e) => onLinePointerDown(index, e)}
@@ -2311,7 +2282,7 @@
          the line numbers with it. The outer span is opaque and the tint rides
          on top of it: a sticky layer with a 12%-alpha background lets the code
          scroll visibly underneath the numbers. -->
-    <span class="sticky left-0 z-10 flex shrink-0 self-stretch bg-background">
+    <span class="sticky left-0 flex shrink-0 self-stretch bg-background" style="z-index: {LAYERS.STICKY}">
       <span class="flex select-none items-center gap-1 self-stretch px-2 {tint}">
         {#if isWorkingTreeFile}
           {#if line.type === "add" || line.type === "del"}
@@ -2321,18 +2292,18 @@
           {/if}
         {/if}
         <span
-          class="shrink-0 text-right text-[10px] tabular-nums text-textMuted/60"
+          class="shrink-0 text-right text-micro tabular-nums text-faint"
           style="width: {gutterDigits}ch">{line.oldNo ?? ""}</span
         >
         <span
-          class="shrink-0 text-right text-[10px] tabular-nums text-textMuted/60"
+          class="shrink-0 text-right text-micro tabular-nums text-faint"
           style="width: {gutterDigits}ch">{line.newNo ?? ""}</span
         >
         <span
-          class="w-2 shrink-0 text-center font-bold {line.type === 'add'
-            ? 'text-emerald-600 dark:text-emerald-400'
+          class="w-2 shrink-0 text-center font-semibold {line.type === 'add'
+            ? 'text-ok'
             : line.type === 'del'
-              ? 'text-rose-600 dark:text-rose-400'
+              ? 'text-danger'
               : 'text-transparent'}"
           >{line.type === "add" ? "+" : line.type === "del" ? "-" : " "}</span
         >
@@ -2340,29 +2311,30 @@
     </span>
 
     {#if line.type === "hdr" && line.content.startsWith("@@")}
-      <span class="flex min-w-0 flex-1 items-center gap-2 pr-3 text-[11px] text-textMuted">
+      <span class="flex min-w-0 flex-1 items-center gap-2 pr-3 text-meta text-textMuted">
         <span class="truncate font-mono">{line.content}</span>
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(index)}
             disabled={stagingBlocked}
             title={stagingBlockedReason}
-            class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
+            class="gp-btn ml-auto shrink-0 px-2! font-sans text-micro" data-size="sm"
+            data-variant="ghost"
           >
-            {isStaged ? "Unstage Hunk" : "Stage Hunk"}
+            {isStaged ? "Unstage hunk" : "Stage hunk"}
           </button>
         {/if}
       </span>
     {:else if line.type === "meta" && line.content.startsWith("diff --git ")}
       {@const section = sectionAt(outline, index)}
-      <span class="flex min-w-0 flex-1 items-center gap-2 pr-3 font-sans text-[11px]">
+      <span class="flex min-w-0 flex-1 items-center gap-2 pr-3 font-sans text-meta">
         {#if section?.path}
           <LanguageLogo filePath={section.path} size={12} class="shrink-0" />
           <span class="truncate font-semibold text-textPrimary">{section.path}</span>
           {#if section.oldPath}
-            <span class="shrink-0 text-[10px] text-textMuted">← {section.oldPath}</span>
+            <span class="shrink-0 text-micro text-textMuted">← {section.oldPath}</span>
           {/if}
-          <span class="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-textMuted">
+          <span class="ml-auto shrink-0 font-mono text-micro tabular-nums text-textMuted">
             {churnSummary(section.additions, section.deletions)}
           </span>
         {:else}
@@ -2370,20 +2342,20 @@
         {/if}
       </span>
     {:else if line.type === "meta"}
-      <span class="min-w-0 pr-3 text-[10px] italic text-textMuted/60 whitespace-pre">{line.content}</span>
+      <span class="min-w-0 pr-3 text-micro italic text-faint whitespace-pre">{line.content}</span>
     {:else if line.type === "binary"}
-      <span class="flex min-w-0 items-center gap-2 pr-3 text-[11px] text-amber-700 dark:text-amber-300/90">
-        <span class="shrink-0 rounded-sm bg-amber-500/20 px-1 font-sans">binary</span>
+      <span class="flex min-w-0 items-center gap-2 pr-3 text-meta text-warn">
+        <span class="shrink-0 rounded-sm bg-warn/20 px-1 font-sans">Binary</span>
         <span class="whitespace-pre">{line.content}</span>
       </span>
     {:else if line.type === "hdr"}
-      <span class="min-w-0 pr-3 text-[11px] text-textMuted whitespace-pre">{line.content}</span>
+      <span class="min-w-0 pr-3 text-meta text-textMuted whitespace-pre">{line.content}</span>
     {:else}
       <span
         class="min-w-0 pr-3 {line.type === 'add'
-          ? 'text-emerald-900 dark:text-emerald-200'
+          ? 'text-textPrimary'
           : line.type === 'del'
-            ? 'text-rose-900 dark:text-rose-200'
+            ? 'text-textPrimary'
             : 'text-textPrimary/80'}"
       >
         {@render code(line, index)}
@@ -2406,9 +2378,9 @@
     !line
       ? "bg-surfaceHover/25"
       : line.type === "add"
-        ? "bg-emerald-500/15"
+        ? "bg-ok/15"
         : line.type === "del"
-          ? "bg-rose-500/15"
+          ? "bg-danger/15"
           : ""}
   <div
     class="flex min-w-0 flex-1 {wrapping ? 'items-start' : 'items-center'} {tint} {selected
@@ -2419,7 +2391,7 @@
     onpointerenter={() => index >= 0 && onLinePointerEnter(index)}
     onpointerup={onLinePointerUp}
   >
-    <span class="flex shrink-0 select-none items-center gap-1 self-stretch px-2">
+    <span class="flex shrink-0 select-none items-center gap-1 self-stretch bg-surfaceHover/30 px-2">
       {#if isWorkingTreeFile}
         {#if line && (line.type === "add" || line.type === "del") && index >= 0}
           {@render stageBox(index)}
@@ -2428,15 +2400,15 @@
         {/if}
       {/if}
       <span
-        class="shrink-0 text-right text-[10px] tabular-nums text-textMuted/60"
+        class="shrink-0 text-right text-micro tabular-nums text-faint"
         style="width: {gutterDigits}ch"
         >{(side === "old" ? line?.oldNo : line?.newNo) ?? ""}</span
       >
       <span
-        class="w-2 shrink-0 text-center font-bold {line?.type === 'add'
-          ? 'text-emerald-600 dark:text-emerald-400'
+        class="w-2 shrink-0 text-center font-semibold {line?.type === 'add'
+          ? 'text-ok'
           : line?.type === 'del'
-            ? 'text-rose-600 dark:text-rose-400'
+            ? 'text-danger'
             : 'text-transparent'}"
         >{line?.type === "add" ? "+" : line?.type === "del" ? "-" : " "}</span
       >
@@ -2444,9 +2416,9 @@
     {#if line}
       <span
         class="min-w-0 flex-1 pr-2 {line.type === 'add'
-          ? 'text-emerald-900 dark:text-emerald-200'
+          ? 'text-textPrimary'
           : line.type === 'del'
-            ? 'text-rose-900 dark:text-rose-200'
+            ? 'text-textPrimary'
             : 'text-textPrimary/80'}"
       >
         {@render code(line, index)}
@@ -2468,35 +2440,36 @@
         {@const section = sectionAt(outline, row.index)}
         {#if section?.path}
           <LanguageLogo filePath={section.path} size={12} class="shrink-0" />
-          <span class="truncate font-sans text-[11px] font-semibold text-textPrimary">{section.path}</span>
-          <span class="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-textMuted">
+          <span class="truncate font-sans text-meta font-semibold text-textPrimary">{section.path}</span>
+          <span class="ml-auto shrink-0 font-mono text-micro tabular-nums text-textMuted">
             {churnSummary(section.additions, section.deletions)}
           </span>
         {:else}
-          <span class="truncate text-[11px] text-textMuted">{row.line.content}</span>
+          <span class="truncate text-meta text-textMuted">{row.line.content}</span>
         {/if}
       {:else if row.line.type === "hdr" && row.line.content.startsWith("@@")}
-        <span class="truncate text-[11px] text-textMuted">{row.line.content}</span>
+        <span class="truncate text-meta text-textMuted">{row.line.content}</span>
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(row.index)}
             disabled={stagingBlocked}
             title={stagingBlockedReason}
-            class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
+            class="gp-btn ml-auto shrink-0 px-2! font-sans text-micro" data-size="sm"
+            data-variant="ghost"
           >
-            {isStaged ? "Unstage Hunk" : "Stage Hunk"}
+            {isStaged ? "Unstage hunk" : "Stage hunk"}
           </button>
         {/if}
       {:else if row.line.type === "binary"}
-        <span class="shrink-0 rounded-sm bg-amber-500/20 px-1 font-sans text-[10px]">binary</span>
-        <span class="truncate text-[11px] text-amber-700 dark:text-amber-300/90">{row.line.content}</span>
+        <span class="shrink-0 rounded-sm bg-warn/20 px-1 font-sans text-micro">Binary</span>
+        <span class="truncate text-meta text-warn">{row.line.content}</span>
       {:else}
-        <span class="truncate text-[10px] italic text-textMuted/60">{row.line.content}</span>
+        <span class="truncate text-micro italic text-faint">{row.line.content}</span>
       {/if}
     </div>
   {:else}
     <div
-      class="flex w-full divide-x divide-border/70"
+      class="flex w-full"
       style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}
     >
       {@render splitSide(row.left, row.leftIndex, "old")}

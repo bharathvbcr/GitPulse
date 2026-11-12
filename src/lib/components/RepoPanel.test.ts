@@ -51,8 +51,8 @@ describe("RepoPanel remotes", () => {
 
   it("offers an explicit way to remove saved credentials from Set URL", () => {
     expect(source).toContain("drop_credentials: editDropCredentials");
-    expect(source).toContain("bind:checked={editDropCredentials}");
-    expect(source).toMatch(/\{#if remote\.has_credentials\}\s*<label/);
+    expect(source).toContain("checked={editDropCredentials}");
+    expect(source).toMatch(/\{#if remote\.has_credentials\}\s*<div class="w-full">\s*<Checkbox/);
   });
 
   it("arms destructive remote changes before executing them", () => {
@@ -67,21 +67,23 @@ describe("RepoPanel section headers on a failed read", () => {
   // list empty and `*Loaded` true, so without an error arm the header would
   // state "No remotes configured" / "has no submodules" as fact.
   const header = (name: string) => {
-    const at = source.indexOf(`{${name}Error ? "Could not read ${name}"`);
+    const at = source.indexOf(`{${name}Error ? "Couldn't read ${name}"`);
     expect(at, `${name} header has no error arm`).toBeGreaterThan(-1);
     return source.slice(source.lastIndexOf("<span", at), source.indexOf("</span>", at));
   };
 
   it("names the failure instead of describing an empty list", () => {
-    expect(header("remotes")).toContain('remotesLoaded ? describeRemotes(remotes) : "Loading…"');
-    expect(header("submodules")).toContain('submodulesLoaded ? describeSubmodules(submodules) : "Loading…"');
+    expect(header("remotes")).toContain("remotesLoaded ? describeRemotes(remotes) : null");
+    expect(header("remotes")).toContain("<Skeleton");
+    expect(header("submodules")).toContain("submodulesLoaded ? describeSubmodules(submodules) : null");
+    expect(header("submodules")).toContain("<Skeleton");
   });
 
   it("checks the error before the loaded flag and uses the body's error colour", () => {
     for (const name of ["remotes", "submodules"]) {
       const h = header(name);
       expect(h.indexOf(`${name}Error ?`)).toBeLessThan(h.indexOf(`${name}Loaded ?`));
-      expect(h).toContain("text-red-600 dark:text-red-400");
+      expect(h).toContain("text-danger");
     }
   });
 

@@ -75,6 +75,72 @@ describe("CodeGraphCanvas interaction cost and recovery", () => {
   });
 });
 
+/** The text of `function <name>(...) { ... }` in the component, braces balanced. */
+function functionBody(name: string): string {
+  const start = source.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`no function ${name}`);
+  const open = source.indexOf("{", source.indexOf(")", start));
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}" && (depth -= 1) === 0) return source.slice(start, i + 1);
+  }
+  throw new Error(`unbalanced function ${name}`);
+}
+
+describe("CodeGraphCanvas fit follows the stage", () => {
+  // The toolbar grows when a payload lands, so the stage shrinks after the
+  // first fit (702 px to 646 px in the app) and the fitted graph sat 28 px
+  // off-centre. The fit follows the stage until the reader moves the view.
+  const clears = "fitFollowsStage = false;";
+
+  it("is set by resetView, the one place that fits", () => {
+    expect(functionBody("resetView")).toContain("fitFollowsStage = true;");
+    expect(source.match(/fitFollowsStage = true;/g)).toHaveLength(1);
+  });
+
+  it("re-fits on a resize while it is set, and only repaints once the reader has moved the view", () => {
+    expect(functionBody("measure")).toMatch(/if \(fitFollowsStage\) resetView\(\);\s*else schedulePaint\(\);/);
+  });
+
+  it("is cleared by zoom (buttons, keys and wheel all go through zoomAt)", () => {
+    expect(functionBody("zoomAt")).toContain(clears);
+    expect(functionBody("onWheel")).toContain("zoomAt(");
+  });
+
+  it("is cleared by a drag, on the move that pans", () => {
+    const move = functionBody("onPointerMove");
+    const drag = move.slice(move.indexOf("if (dragging) {"));
+    expect(drag.indexOf(clears)).toBeGreaterThan(-1);
+    expect(drag.indexOf(clears)).toBeLessThan(drag.indexOf("panX +="));
+  });
+
+  it("is cleared by an arrow-key pan, but not by the fit and zoom keys", () => {
+    const keys = functionBody("onKeyDown");
+    const arrows = keys.slice(keys.indexOf('["ArrowLeft"'));
+    expect(arrows.indexOf(clears)).toBeGreaterThan(-1);
+    expect(arrows.indexOf(clears)).toBeLessThan(arrows.indexOf("panX +="));
+    expect(keys.slice(0, keys.indexOf('["ArrowLeft"'))).not.toContain(clears);
+    expect(keys).toContain('e.key === "0") resetView()');
+  });
+
+  it("is cleared by focusNode before it recentres", () => {
+    const focus = functionBody("focusNode");
+    expect(focus.indexOf(clears)).toBeGreaterThan(-1);
+    expect(focus.indexOf(clears)).toBeLessThan(focus.indexOf("panX ="));
+  });
+
+  it("leaves no other function that moves the view without clearing it", () => {
+    const moving = /\b(?:panX|panY|scale)\s*(?:\+=|-=|=(?!=))/;
+    const names = [...source.matchAll(/^\s*function (\w+)\(/gm)].map((m) => m[1]);
+    const offenders = names.filter((name) => {
+      const body = functionBody(name);
+      return moving.test(body) && !body.includes(clears) && name !== "resetView";
+    });
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe("buildCodeGraphModel layout space", () => {
   it("defaults to the fixed content space the canvas passes", async () => {
     const graph = await import("../codeintel/codeMap");

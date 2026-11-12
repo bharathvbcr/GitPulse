@@ -71,8 +71,8 @@ export function describeUpdateCheck(result: UpdateCheck): UpdateStatus {
     return {
       kind: "failed",
       message: reason
-        ? `Could not check for updates: ${reason}`
-        : "Could not check for updates.",
+        ? `Couldn't check for updates. ${reason}`
+        : "Couldn't check for updates.",
     };
   }
   if (result.updateAvailable) {

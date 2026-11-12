@@ -30,6 +30,7 @@
     type SessionAlertSettings,
   } from "../stores/sessionAlertsStore";
   import { loadOnce } from "../settings/loadOnce";
+  import Checkbox from "./Checkbox.svelte";
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -153,8 +154,8 @@
   });
 </script>
 
-<div class="space-y-2 text-[11px]" data-testid="session-alerts">
-  <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Agent session notifications</h4>
+<div class="space-y-2 text-meta" data-testid="session-alerts">
+  <h4 class="gp-label">Agent session notifications</h4>
   <p class="text-textMuted leading-snug">
     A native banner when an agent running in a terminal tab needs you or finishes. Suppressed while
     you are looking at that session.
@@ -168,35 +169,29 @@
 
   {#if draft}
     <fieldset class="grid gap-2 border-0 p-0" disabled={busy}>
-      <label class="flex items-center gap-2"><input type="checkbox" bind:checked={draft.enabled} /> Notify me about agent sessions</label>
-      <label class="flex items-center gap-2"><input type="checkbox" bind:checked={draft.sound} /> Play a sound</label>
-      <label class="flex items-center gap-2"><input type="checkbox" bind:checked={draft.shell_bell} /> Also notify for a plain shell's bell</label>
-      <label class="flex items-center gap-2">
-        <input type="checkbox" bind:checked={draft.configure_agents} />
-        Configure agent CLIs GitPulse launches
-      </label>
+      <Checkbox label="Notify me about agent sessions" checked={draft.enabled} onchange={(next) => { if (draft) draft.enabled = next; }} />
+      <Checkbox label="Play a sound" checked={draft.sound} onchange={(next) => { if (draft) draft.sound = next; }} />
+      <Checkbox label="Also notify for a plain shell's bell" checked={draft.shell_bell} onchange={(next) => { if (draft) draft.shell_bell = next; }} />
+      <Checkbox label="Configure agent CLIs GitPulse starts" checked={draft.configure_agents} onchange={(next) => { if (draft) draft.configure_agents = next; }} />
       <p class="text-textMuted pl-6 leading-snug">
         Adds each CLI's own documented notification flag to the sessions GitPulse starts —
         <span class="font-mono">claude --settings</span> and <span class="font-mono">codex -c tui.notifications</span>.
         For that session only; no file of yours is written and no other setting is changed. Without
         it, neither CLI signals this terminal and a waiting agent stays silent.
       </p>
-      <label class="flex items-center gap-2">
-        <input type="checkbox" bind:checked={draft.hook_bridge} disabled={!view.bridge_supported} />
-        Accept reports from agent hooks
-      </label>
+      <Checkbox label="Accept reports from agent hooks" checked={draft.hook_bridge} disabled={!view.bridge_supported} onchange={(next) => { if (draft) draft.hook_bridge = next; }} />
       <p class="text-textMuted pl-6 leading-snug">
         {#if view.bridge_supported}
           Opens a private socket in GitPulse's own folder, readable only by you, while the app is
           running. The GitPulse plugin's hooks use it to say <em>why</em> an agent stopped —
           permission, idle, finished — instead of only that it did. A report can raise a banner and
           nothing else.
-          {#if view.status.bridge_path}<br /><span class="font-mono text-[10px]">{view.status.bridge_path}</span>{/if}
+          {#if view.status.bridge_path}<br /><span class="font-mono text-micro">{view.status.bridge_path}</span>{/if}
         {:else}
           Needs a Unix socket, which this platform does not offer.
         {/if}
       </p>
-      <label class="flex items-center gap-2"><input type="checkbox" bind:checked={quiet} /> Quiet hours in this computer's local time</label>
+      <Checkbox label="Quiet hours in this computer's local time" checked={quiet} onchange={(next) => (quiet = next)} />
       {#if quiet}
         <div class="flex gap-3 pl-6">
           <label class="flex items-center gap-1">From <input class="gp-field" type="time" bind:value={start} /></label>
@@ -219,7 +214,7 @@
         {/if}
         {#if lost > 0}
           <p role="alert">
-            {view.status.dropped_queue} could not be queued, {view.status.dropped_scan} were read but
+            {view.status.dropped_queue} couldn't be queued, {view.status.dropped_scan} were read but
             not carried, and {view.status.displaced} were pushed out by other sessions. These were
             never judged; they are a fault, not a preference.
           </p>
@@ -239,18 +234,18 @@
     </div>
 
     <div class="flex gap-2">
-      <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={save} disabled={busy}>Save</button>
-      <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Recheck</button>
+      <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={save} disabled={busy}>Save</button>
+      <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={load} disabled={busy}>Refresh</button>
     </div>
   {/if}
   {#if error}
     <p role="alert" class="text-danger">{error}</p>
   {:else if !draft && $sessionAlertsLoadError}
     <p role="alert" class="text-danger" data-testid="session-alerts-load-error">
-      The notification settings could not be read: {$sessionAlertsLoadError}
+      The notification settings couldn't be read: {$sessionAlertsLoadError}
     </p>
   {/if}
   {#if !draft && (error || $sessionAlertsLoadError)}
-    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Retry</button>
+    <button type="button" class="gp-btn text-meta px-2 py-0.5" onclick={load} disabled={busy}>Try again</button>
   {/if}
 </div>

@@ -122,7 +122,7 @@ describe("fleetPulse", () => {
     expect(pulse.failed).toBe(1);
     expect(pulse.unscanned).toBe(1);
     expect(describePulseCoverage(pulse)).toContain("counted across 1 of 3");
-    expect(describePulseCoverage(pulse)).toContain("1 could not be read");
+    expect(describePulseCoverage(pulse)).toContain("1 couldn't be read");
     expect(describePulseCoverage(pulse)).toContain("1 not swept");
   });
 

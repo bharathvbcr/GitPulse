@@ -10,7 +10,13 @@ import {
  * definition, and so the check is made once here instead of as a platform
  * conditional scattered through the modal's markup.
  */
-export type SettingRequirement = "dockHiding" | "appleIntelligence" | "macos";
+export type SettingRequirement =
+  | "dockHiding"
+  | "appleIntelligence"
+  | "macos"
+  | "nativeMaterial"
+  | "liquidGlass"
+  | "highRefresh";
 
 export interface SettingEntry {
   readonly id: string;
@@ -55,7 +61,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "dock accessory menu bar hide closed window", requires: "dockHiding" },
   { id: "status-icon-counts", section: "layout", label: "Show counts beside the icon",
     keywords: "tray title counts conflicts changed menu bar" },
-  { id: "launch-at-login", section: "layout", label: "Launch at login",
+  { id: "launch-at-login", section: "layout", label: "Open at login",
     keywords: "autostart launch agent login item startup background" },
   {
     id: "session-alerts",
@@ -84,16 +90,90 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "dark light system appearance colour color scheme night mode",
   },
   {
+    id: "theme-file",
+    section: "appearance",
+    label: "Theme file",
+    keywords:
+      "theme import export file json custom share gitpulse-theme load save palette colors base contrast",
+  },
+  {
     id: "accent",
     section: "appearance",
-    label: "Accent colour",
-    keywords: "accent color highlight tint blue violet teal green amber rose brand",
+    label: "Accent color",
+    keywords: "accent colour color highlight tint blue violet teal green amber rose brand custom hex picker contrast",
   },
   {
     id: "ui-scale",
     section: "appearance",
-    label: "UI font scale",
-    keywords: "zoom size text bigger smaller scale font magnify",
+    label: "Text size",
+    keywords: "zoom size text bigger smaller scale font magnify ui font scale",
+  },
+  {
+    id: "font-ui",
+    section: "appearance",
+    label: "Interface font",
+    keywords: "font family typeface type text ui interface sans local installed system",
+  },
+  {
+    id: "font-mono",
+    section: "appearance",
+    label: "Code font",
+    keywords: "font family typeface monospace code mono terminal diff editor local installed ligatures",
+  },
+  {
+    id: "corner-style",
+    section: "appearance",
+    label: "Corner style",
+    keywords: "corners radius rounded sharp soft round shape squircle pill",
+  },
+  {
+    id: "material-intensity",
+    section: "appearance",
+    label: "Material intensity",
+    keywords: "glass material translucent transparency opacity opaque thickness liquid plate vibrancy see through",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "float-blur",
+    section: "appearance",
+    label: "Float blur",
+    keywords: "blur menus popovers dialogs backdrop glass frosted radius background blur performance",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "background-field",
+    section: "appearance",
+    label: "Background field",
+    keywords: "background field hue color glow gradient blobs wallpaper tint vivid subtle off rotate",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "transparency",
+    section: "appearance",
+    label: "Transparency",
+    keywords: "reduce transparency opaque translucent glass accessibility solid auto system",
+    requires: "nativeMaterial",
+  },
+  {
+    id: "native-glass",
+    section: "appearance",
+    label: "Liquid Glass window",
+    keywords: "liquid glass native window material macos 26 tahoe nsglasseffectview translucent vibrancy private api",
+    requires: "liquidGlass",
+  },
+  {
+    id: "high-refresh",
+    section: "appearance",
+    label: "120 Hz rendering",
+    keywords: "120 hz 120hz refresh rate promotion frame rate fps 60 smooth animation display webkit private api",
+    requires: "highRefresh",
+  },
+  {
+    id: "density",
+    section: "appearance",
+    label: "Density",
+    keywords:
+      "density compact comfortable spacious rows spacing padding branch spacing lanes height graph tight airy",
   },
   {
     id: "motion",
@@ -145,7 +225,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Sidebar branch rows",
     keywords:
-      "branch list sidebar two line rows truncated truncate ellipsis name width churn lines changed author age density compact",
+      "branch list sidebar one two three line rows truncated truncate ellipsis name width churn lines changed author age density compact",
   },
   {
     id: "coach-marks",
@@ -171,6 +251,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "layout",
     label: "Diagnostics button",
     keywords: "errors warnings header toolbar log troubleshoot",
+  },
+  {
+    id: "header-labels",
+    section: "layout",
+    label: "Header button labels",
+    keywords: "open clone title bar words icons text only automatic width narrow compact labels",
   },
   {
     id: "repo-tabs",
@@ -206,19 +292,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "harness-badges",
     section: "layout",
     label: "Manvi status in the title bar",
-    keywords: "manvi policy harness local model chips title bar header hide show toolbar agents",
+    keywords: "manvi policy checks harness local model chips status badges title bar header hide show toolbar agents",
   },
   {
     id: "view-visibility",
     section: "views",
     label: "Views in the header",
     keywords: "tabs nav navigation hide show work history files health insights fleet",
-  },
-  {
-    id: "branch-spacing",
-    section: "graph",
-    label: "Branch spacing",
-    keywords: "density compact spacious lanes rows height",
   },
   {
     id: "graph-width",
@@ -322,8 +402,8 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   {
     id: "external-tools",
     section: "agents",
-    label: "devmap and manvi",
-    keywords: "devmap manvi install update cargo go harness code map cli binary toolchain",
+    label: "DevMap and Manvi",
+    keywords: "devmap manvi install update cargo go checks harness code map cli binary toolchain",
   },
   {
     id: "update-check",

@@ -124,7 +124,7 @@ describe("CodeViewer", () => {
     expect(source).toContain("zoomPercent");
     expect(source).toContain("handleCopy");
     expect(source).toContain("if (!(await copyText(textToCopy)))");
-    expect(source).toContain('repoStore.setError("Could not copy file content to clipboard")');
+    expect(source).toContain(`repoStore.setError("Couldn't copy file content to clipboard")`);
   });
 
   it("windows the read-only view and caps oversized files", () => {

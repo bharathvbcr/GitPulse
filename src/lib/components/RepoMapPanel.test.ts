@@ -37,7 +37,7 @@ describe("RepoMapPanel", () => {
   it("prefers unwired and dead candidates over unreliable unreachable", () => {
     expect(source).toContain("preferredDeadLists");
     expect(source).toContain("unreachableSuppressed");
-    expect(source).toContain("liveness_unreachable_unreliable");
+    expect(source).toContain("marks that list as unreliable");
   });
 
   it("does not present capped samples as complete", () => {
@@ -192,6 +192,22 @@ describe("RepoMapPanel build gating", () => {
     expect(progress).toBeLessThan(otherwise);
     // The empty-state button lives only in the else branch.
     expect(emptyButton).toBeGreaterThan(otherwise);
+  });
+
+  it("renders the no-map state through EmptyState, keeping its reason, title and aria-busy", () => {
+    const empty = template.slice(template.indexOf("<EmptyState"));
+    // Main named the empty state "No code map yet" (the title says what would be here).
+    expect(empty).toContain('title="No code map yet"');
+    expect(empty).toContain('title: buildBlockedReason ?? "Build the map index"');
+    expect(empty).toContain('busy: building && buildKind === "build"');
+    expect(empty).toContain("disabled: building || !$repoStore.currentPath || buildBlockedReason != null");
+    expect(template).not.toContain("No repository map");
+  });
+
+  it("calls the map the code map in the copy it writes", () => {
+    for (const retired of ["repo map unavailable", "devmap ${kind} failed", "Copy DevMap logs", "Could not copy"]) {
+      expect(source).not.toContain(retired);
+    }
   });
 });
 

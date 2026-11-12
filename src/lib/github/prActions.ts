@@ -38,9 +38,9 @@ export function describePrWorktree(opened: PrWorktreeOpened): string {
     if (created.low_disk) {
       parts.push(`Build caches were not copied for want of disk: ${created.low_disk.skipped.join(", ")}`);
     }
-    if (created.disk_unknown) parts.push("Free disk space could not be read, so no cache copy was limited on its account");
-    if (created.devmap?.status === "failed") parts.push(`DevMap setup failed: ${created.devmap.error}`);
-    if (created.devmap?.status === "skipped") parts.push(`DevMap setup was skipped: ${created.devmap.reason}`);
+    if (created.disk_unknown) parts.push("Free disk space couldn't be read, so no cache copy was limited on its account");
+    if (created.devmap?.status === "failed") parts.push(`Code map setup failed: ${created.devmap.error}`);
+    if (created.devmap?.status === "skipped") parts.push(`Code map setup was skipped: ${created.devmap.reason}`);
   }
   return parts.join("; ");
 }

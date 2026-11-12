@@ -58,7 +58,7 @@ export function docsRenameHonesty(outcome: DocRenameOutcome | null | undefined):
   }
   if (outcome.failed.length > 0) {
     parts.push(
-      `${outcome.failed.length} note(s) could not be rewritten: ${listed(outcome.failed.map((f) => `${f.path} (${f.error})`), "; ")}`,
+      `${outcome.failed.length} note(s) couldn't be rewritten: ${listed(outcome.failed.map((f) => `${f.path} (${f.error})`), "; ")}`,
     );
   }
   if (outcome.leftBroken.length > 0) {

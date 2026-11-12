@@ -43,7 +43,7 @@ export interface MenuCommandDeps {
 export function defaultMenuCommandDeps(): MenuCommandDeps {
   return {
     repo: repoStore, state: () => get(repoStore), enabled: (id) => menuActionEnabled(get(nativeMenuState), id),
-    ready: (id) => menuActionEnabled(buildMenuState(get(repoStore), get(interfaceStore), themeStore.preference(), get(repoStore.mutationActivity), false), id),
+    ready: (id) => menuActionEnabled(buildMenuState(get(repoStore), get(interfaceStore), themeStore.preference(), get(repoStore.mutationActivity), false, undefined, undefined, undefined, repoStore.jumpStopCount()), id),
     quickCommit: () => promptQuickCommit(),
     askText, askConfirm, copy: copyText, reveal: revealRepository, open: openExternal,
     commitId: async (repoPath, ref) => ref === "HEAD" ? invoke<string>("cmd_get_head_id", { repoPath }) : ref,
@@ -104,7 +104,7 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
     const text = await value(state);
     if (!stillCurrent(state)) return;
     if (!text) throw new Error(`${label} is unavailable.`);
-    if (!await deps.copy(text)) throw new Error("Could not copy to the clipboard.");
+    if (!await deps.copy(text)) throw new Error("Couldn't copy to the clipboard.");
     deps.success(`${label} copied`);
   });
   return {
@@ -136,7 +136,7 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
     copyCommit: copy("copy-commit", "Commit SHA", async (state) => {
       if (!state.currentPath) return null;
       const sha = await deps.commitId(state.currentPath, state.selectedCommitId ?? "HEAD");
-      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) throw new Error("The commit could not be resolved to a full SHA.");
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) throw new Error("The commit couldn't be resolved to a full SHA.");
       return sha;
     }),
     revealRepo: () => run("reveal-repo", async (state) => { if (state.currentPath) await deps.reveal(state.currentPath); }),

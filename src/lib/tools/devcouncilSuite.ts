@@ -39,7 +39,7 @@ export function versionText(version: VersionReading): string {
     case "not_exposed":
       return `version not reported — ${version.detail}`;
     default:
-      return `could not run — ${version.detail}`;
+      return `couldn't run — ${version.detail}`;
   }
 }
 
@@ -82,7 +82,7 @@ export function healthSummary(report: SuiteReport): HealthSummary {
   if (!report.doctor || !report.doctor.available) {
     return {
       kind: "unchecked",
-      reason: "devmap doctor did not answer",
+      reason: "The DevMap doctor check did not answer",
     };
   }
   if (report.warnings.length === 0) return { kind: "clean" };

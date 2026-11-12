@@ -398,7 +398,7 @@
                   {/if}
                 </div>
                 {#if action.verdict?.grant_id}
-                  <div class="text-micro text-accent/80 font-mono pl-14">
+                  <div class="text-micro text-accent font-mono pl-14">
                     Grant {action.verdict.grant_id} by {action.verdict.granted_by || "human"} · {action.verdict.reason || "waived"}
                   </div>
                 {:else if action.verdict?.demoted}

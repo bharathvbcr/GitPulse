@@ -578,8 +578,10 @@ describe("interfaceStore chrome preferences", () => {
       // pill. Every upgraded profile still carries it, so the reader must drop
       // it rather than carry a preference no control can change back.
       expect(bad).not.toHaveProperty("showWalkthroughButton");
-      // showHeaderActionLabels is retired with the title bar's Open menu, the
-      // only control it labelled; upgraded profiles carry it, so drop it too.
+      // showHeaderActionLabels is the boolean this preference was stored as
+      // before the header was rebuilt. A malformed one says nothing, so it
+      // falls back to Automatic, and the old key is never carried forward.
+      expect(bad.headerLabels).toBe("auto");
       expect(bad).not.toHaveProperty("showHeaderActionLabels");
 
       // The control: valid values do survive, so the cases above are not
@@ -597,6 +599,72 @@ describe("interfaceStore chrome preferences", () => {
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
+  });
+
+  it("brings the header label choice back from the key it was stored under", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: Record<string, unknown>) => {
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: memoryStorage({ gitpulse_interface_prefs: JSON.stringify(stored) }) },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore);
+    };
+    try {
+      // `false` was a deliberate "no words": it comes back as Icons only.
+      expect((await load({ showHeaderActionLabels: false })).headerLabels).toBe("icons");
+      // `true` was the shipped default, which Automatic already is.
+      expect((await load({ showHeaderActionLabels: true })).headerLabels).toBe("auto");
+      // A profile written after the migration carries the new key, and it wins
+      // over a stale old one that is still lying in the same blob.
+      expect((await load({ headerLabels: "icons" })).headerLabels).toBe("icons");
+      expect((await load({ headerLabels: "auto", showHeaderActionLabels: false })).headerLabels).toBe("auto");
+      // Neither key, or a value no control can produce: the default.
+      expect((await load({})).headerLabels).toBe("auto");
+      expect((await load({ headerLabels: "words" })).headerLabels).toBe("auto");
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
+  });
+});
+
+describe("interfaceStore header labels", () => {
+  it("stamps the document for Icons only and clears it for Automatic and on reset", async () => {
+    const attributes = new Map<string, string>();
+    const root = {
+      setAttribute: (name: string, value: string) => void attributes.set(name, value),
+      removeAttribute: (name: string) => void attributes.delete(name),
+      style: { setProperty: () => {}, removeProperty: () => {} },
+      classList: { toggle: () => false, add: () => {}, remove: () => {}, contains: () => false },
+    };
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "document");
+    Object.defineProperty(globalThis, "document", {
+      value: { documentElement: root },
+      configurable: true,
+      writable: true,
+    });
+    try {
+      vi.resetModules();
+      const { interfaceStore: store } = await import("../interfaceStore");
+      expect(get(store).headerLabels).toBe("auto");
+      expect(attributes.has("data-header-labels")).toBe(false);
+      store.setHeaderLabels("icons");
+      expect(get(store).headerLabels).toBe("icons");
+      expect(attributes.get("data-header-labels")).toBe("icons");
+      store.setHeaderLabels("auto");
+      expect(attributes.has("data-header-labels")).toBe(false);
+      store.setHeaderLabels("icons");
+      store.reset();
+      expect(attributes.has("data-header-labels")).toBe(false);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "document", restore);
+      else delete (globalThis as { document?: unknown }).document;
       vi.resetModules();
     }
   });
@@ -965,6 +1033,35 @@ describe("tasks board view preferences", () => {
       taskShowArchivedWorkspaces: true,
       terminalFontSize: 18,
     });
+  });
+
+  it("keeps the scope navigator docked until the reader collapses it, and a view reset docks it again", () => {
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(false);
+    interfaceStore.setTaskNavigatorCollapsed(true);
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(true);
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskNavigatorCollapsed).toBe(false);
+  });
+
+  it("remembers a collapsed scope navigator across a reload and ignores a stored value that is not a boolean", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: unknown) => {
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ taskNavigatorCollapsed: stored }) }) },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore).taskNavigatorCollapsed;
+    };
+    try {
+      expect(await load(true)).toBe(true);
+      expect(await load("yes")).toBe(false);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
   });
 
   it("hides repositories one at a time and shows them all again in one action", () => {

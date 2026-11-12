@@ -122,7 +122,7 @@
   h4{margin:0}
   p{margin:0;color:rgb(var(--c-text-muted));line-height:1.5;overflow-wrap:anywhere}
   article{display:flex;flex-direction:column;gap:6px;padding:12px;border-radius:var(--gp-r-md);background:var(--mac-fill-bg,rgb(var(--c-bg)))}
-  .payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:0.6875rem}
+  .payload{font-family:monospace;max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--text-meta)}
   fieldset{padding:0;border:0}
   fieldset button{margin:4px 6px 4px 0}
   label{display:grid;gap:6px}

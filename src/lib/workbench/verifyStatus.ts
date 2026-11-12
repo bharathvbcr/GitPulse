@@ -57,7 +57,7 @@ export function postAvailability(
   repoPath: string,
 ): { allowed: boolean; reason: string } {
   if (repoPath.trim() === "") return { allowed: false, reason: "Open a repository to post its verdict." };
-  if (readError) return { allowed: false, reason: `The opt-in setting could not be read, so nothing can be posted: ${readError}` };
+  if (readError) return { allowed: false, reason: `The opt-in setting couldn't be read, so nothing can be posted: ${readError}` };
   if (enabled === null) return { allowed: false, reason: "Checking whether this repository posts verification results…" };
   if (!enabled) return { allowed: false, reason: "Posting verification results to GitHub is off for this repository." };
   return { allowed: true, reason: "" };
@@ -67,7 +67,7 @@ export function postAvailability(
 export const POST_CONFIRM = Object.freeze({
   title: "Post verify result?",
   message:
-    "This posts the task's latest verdict to GitHub as the devcouncil/verify commit status on the verified commit, through your own gh login. Anyone who can see the repository's commit statuses will see it. A verdict that is out of date or could not be established is posted as an error, never as a pass.",
+    "This posts the task's latest verdict to GitHub as the devcouncil/verify commit status on the verified commit, through your own gh login. Anyone who can see the repository's commit statuses will see it. A verdict that is out of date or couldn't be established is posted as an error, never as a pass.",
   confirmLabel: "Post to GitHub",
   cancelLabel: "Cancel",
 });

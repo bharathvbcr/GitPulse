@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 113 contracts over
- * 285 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 114 contracts over
+ * 287 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -204,6 +204,10 @@ export const CONTRACTS = Object.freeze([
   // renamed capability field would read as `undefined` in the frontend — falsy
   // — hiding a feature on a host that supports it, with nothing to notice.
   { label: "host platform", rustPath: rust("host_platform.rs"), tsPath: ts("platform.ts"), structs: ["HostPlatform"] },
+  // What the two opt-in rendering switches ended up as. `active` is observed,
+  // so a renamed field reading as `undefined` would turn a refusal into an
+  // absent answer instead of a reason in Diagnostics.
+  { label: "native rendering", rustPath: rust("native_rendering.rs"), tsPath: ts("desktop", "nativeRendering.ts"), structs: ["FlagStatus", "NativeRenderingStatus"] },
   { label: "repository trust", rustPath: rust("repository_trust.rs"), tsPath: ts("repos", "repositoryTrust.ts"), structs: ["TrustPreview"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },

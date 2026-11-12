@@ -42,21 +42,22 @@
 
 {#if visible}
   <label
-    class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-textMuted"
+    class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-micro text-textMuted"
     title={histLine ?? undefined}
   >
-    <span class="shrink-0">min rung</span>
+    <span class="shrink-0">Min confidence</span>
     <select
-      class="rounded border border-border/70 bg-background px-1 py-0.5 font-mono text-[10px] text-textPrimary"
+      class="gp-select font-mono"
+      data-size="sm"
       bind:value={minRung}
-      aria-label="Minimum resolution rung for impact"
+      aria-label="Minimum confidence for impact results"
     >
       {#each RUNG_OPTIONS as opt (opt.value)}
         <option value={opt.value}>{opt.label}</option>
       {/each}
     </select>
     {#if filteredOut > 0}
-      <span class="shrink-0 tabular-nums text-textMuted/80">
+      <span class="shrink-0 tabular-nums text-faint">
         −{filteredOut.toLocaleString()}
       </span>
     {/if}

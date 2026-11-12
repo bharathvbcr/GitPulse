@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
-export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-requests", "search", "conflicts", "uncommitted", "diff-history", "reflog", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "file-viewer", "github-panel", "fleet", "tab-switch", "send-to-agent", "frame-rate", "mutation-routing", "browser-session", "primitives", "settings", "overview"]);
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-requests", "search", "conflicts", "uncommitted", "diff-history", "reflog", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "file-viewer", "github-panel", "fleet", "tab-switch", "send-to-agent", "frame-rate", "mutation-routing", "browser-session", "primitives", "settings", "appearance", "hidden-pane", "overview"]);
 
 /**
  * How long one page may take, from server start to verdict.

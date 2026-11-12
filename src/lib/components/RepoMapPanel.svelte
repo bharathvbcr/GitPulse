@@ -60,7 +60,8 @@
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
   import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
-  import { Loader2 } from "@lucide/svelte";
+  import { Loader2, Network } from "@lucide/svelte";
+  import EmptyState from "./EmptyState.svelte";
   import { requestReveal } from "../files/revealRequests";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -92,8 +93,7 @@
     visibleAreaRows,
   } from "../codeintel/codeMap";
   import { tick } from "svelte";
-  import { ChevronDown, ChevronRight, Map as MapIcon } from "@lucide/svelte";
-  import EmptyState from "./EmptyState.svelte";
+  import { ChevronDown, ChevronRight } from "@lucide/svelte";
   import type {
     DevmapCliStatus,
     DevmapStatusPayload,
@@ -161,12 +161,13 @@
     { id: "symbols", label: "Symbols", title: "Symbol call graph (ranked cap)" },
     { id: "subsystems", label: "Subsystems", title: "Subsystem handoff map" },
     { id: "docgraph", label: "Doc graph", title: "Markdown doc link graph (same free-2D canvas)" },
-    { id: "docs", label: "Docs", title: "Repo markdown search and broken links" },
-    { id: "links", label: "Links", title: "Cross-repo import link candidates from the workspace registry" },
+    { id: "docs", label: "Docs", title: "Repository markdown search and broken links" },
+    { id: "links", label: "Links", title: "Cross-repository import link candidates from the workspace registry" },
   ];
 
   const CODE_GRAPH_VIEWS = new Set<MapView>(["files", "symbols", "subsystems", "docgraph"]);
   const BROKEN_LINKS_DISPLAY_CAP = 200;
+  const SETUP_TOOL = "devmap" as const;
 
   /**
    * Clip a process's own output to what a status strip can hold.
@@ -407,7 +408,7 @@
         if (mapResult.status === "fulfilled") {
           load = mapResult.value;
           if (!mapResult.value.available) {
-            errorMsg = mapResult.value.reason ?? "repo map unavailable";
+            errorMsg = mapResult.value.reason ?? "code map unavailable";
           }
         } else {
           load = null;
@@ -588,7 +589,7 @@
       if (!live()) return;
       if (!outcome.ok) {
         setNote(reportMapFailure(kind, repoPath,
-          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`)), "error");
+          buildFailureReason(outcome, outcome.stdout.trim() || `the code map ${kind} failed`)), "error");
       } else {
         setNote(`Map ${kind === "build" ? "built" : "refreshed"}.`, "ok");
       }
@@ -618,9 +619,9 @@
         liveIndex: liveIndex.get(repository),
         errors: [errorMsg, actionNote, docsError, brokenError, linksError],
       }, live);
-      if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Couldn't copy DevMap logs. Try again.";
+      if (live()) copyLogsNote = result === "copied" ? "Code map logs copied." : "Couldn't copy the code map logs. Try again.";
     } catch (error) {
-      if (live()) copyLogsNote = `Couldn't copy DevMap logs: ${reportMapFailure("copy logs", repository, error)}`;
+      if (live()) copyLogsNote = `Couldn't copy the code map logs. ${reportMapFailure("copy logs", repository, error)}`;
     } finally {
       if (live()) copyingLogs = false;
     }
@@ -797,21 +798,23 @@
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
   <!-- Freshness strip from cmd_devmap_status -->
   <div
-    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 bg-surface/60 px-3 py-2 text-[11px] text-textMuted"
+    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 bg-surface/60 px-3 py-2 text-meta text-textMuted"
     role="status"
   >
     {#if loading && !map}
-      <Skeleton variant="text" width="7rem" height="0.75rem" class="w-28!" />
+      <div class="w-28"><Skeleton variant="text" height="0.625rem" /></div>
     {:else if statusPayload}
+      <!-- Fresh is quiet; Stale is a toned chip. The word carries the state, the tone only reinforces it. -->
       <span
-        class={statusPayload.is_fresh ? "text-textMuted" : "gp-chip gp-notice-warn text-textPrimary"}
+        class={statusPayload.is_fresh ? "text-ok" : "gp-chip"}
+        data-tone={statusPayload.is_fresh ? undefined : "warn"}
         title={statusPayload.is_fresh ? "The index matches the latest commit" : "The index is behind the latest commit"}
       >
         {statusPayload.is_fresh ? "Fresh" : "Stale"}
       </span>
       <span title="Index build number">index {statusPayload.generation_id ?? "—"}</span>
       {#if statusPayload.schema_outdated}
-        <span class="gp-chip gp-notice-error" title="The index format is older than this version of GitPulse expects">
+        <span class="gp-chip" data-tone="danger" title="The index format is older than this version of GitPulse expects">
           index format out of date ({statusPayload.schema_version ?? "?"} → {statusPayload.expected_schema_version ?? "?"})
         </span>
       {:else if statusPayload.schema_version != null}
@@ -821,31 +824,31 @@
         <span>{statusPayload.node_count} nodes · {statusPayload.edge_count ?? "?"} edges</span>
       {/if}
       {#if coverageGapSummary(statusPayload)}
-        <span class="gp-chip gp-notice-warn text-textPrimary" title="Languages and files the index couldn't fully cover">
+        <span class="gp-chip" data-tone="warn" title="Languages and files the index couldn't fully cover">
           gaps: {coverageGapSummary(statusPayload)}
         </span>
       {/if}
     <!-- `mapFailureMessage` bounds what it returns, but these fallbacks reach
          the strip without passing through it, and both are process output. -->
     {:else if cliStatus && !cliStatus.available}
-      <span class="text-textPrimary">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "DevMap isn't installed"}</span>
+      <span class="text-warn">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "The code map tool isn't installed"}</span>
     {:else if load && !load.available}
-      <span class="text-textPrimary">{mapFailureText ?? boundStrip(load.reason) ?? "The code map isn't available"}</span>
+      <span class="text-warn">{mapFailureText ?? boundStrip(load.reason) ?? "The code map isn't available"}</span>
     {:else}
       <span>Status unknown</span>
     {/if}
     <span class="ml-auto flex items-center gap-1.5">
       <button
         type="button"
-        class="gp-btn text-[11px] px-2 py-0.5"
+        class="gp-btn text-meta px-2 py-0.5"
         disabled={copyingLogs || !currentRepo}
         onclick={() => void copyMapLogs()}
       >
-        {copyingLogs ? "Copying logs…" : "Copy DevMap logs"}
+        {copyingLogs ? "Copying logs…" : "Copy code map logs"}
       </button>
       <button
         type="button"
-        class="gp-btn text-[11px] px-2 py-0.5"
+        class="gp-btn text-meta px-2 py-0.5"
         disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
         title={buildBlockedReason ?? "Refresh the map index"}
         aria-busy={building && buildKind === "refresh"}
@@ -859,7 +862,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn text-[11px] px-2 py-0.5"
+        class="gp-btn text-meta px-2 py-0.5"
         disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
         title={buildBlockedReason ?? "Build the map index"}
         aria-busy={building && buildKind === "build"}
@@ -875,7 +878,7 @@
   </div>
 
   {#if copyLogsNote}
-    <p class="shrink-0 px-3 py-1 text-[11px] text-textMuted" role="status">{copyLogsNote}</p>
+    <p class="shrink-0 px-3 py-1 text-meta text-textMuted" role="status">{copyLogsNote}</p>
   {/if}
 
   {#if cliStatus && !cliStatus.available}
@@ -883,13 +886,13 @@
       <p class="text-xs text-textPrimary">{mapFailureMessage("no_cli")}</p>
       <button
         type="button"
-        class="gp-btn text-[11px] px-2 py-0.5"
+        class="gp-btn text-meta px-2 py-0.5"
         onclick={() => openSetupWizard("devmap", "explain")}
       >
-        Set up devmap
+        Set up code map
       </button>
       <ExternalToolsPanel
-        only="devmap"
+        only={SETUP_TOOL}
         compact
         onInstalled={() => {
           void reload();
@@ -913,7 +916,7 @@
   <!-- View switcher: navigator vs canvases vs docs vs links -->
   <div
     bind:this={tablistEl}
-    class="shrink-0 flex flex-wrap items-center gap-1 border-b border-border/50 px-2 py-1 text-[11px]"
+    class="shrink-0 flex flex-wrap items-center gap-1 px-2 py-1 text-meta"
     role="tablist"
     aria-label="Map views"
     tabindex="-1"
@@ -951,18 +954,18 @@
   {:else if mapView === "docs"}
     <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-4" data-testid="docs-panel">
       {#if docsStatus}
-        <p class="text-xs text-textMuted" role="status">
+        <p class="text-meta text-textMuted" role="status">
           {docsStatus.noteCount} note{docsStatus.noteCount === 1 ? "" : "s"} indexed
         </p>
       {/if}
       {#if docsHonesty}
-        <p class="text-xs text-textPrimary" role="note" data-testid="docs-status-honesty">
+        <p class="text-micro text-warn" role="note" data-testid="docs-status-honesty">
           {docsHonesty}
         </p>
       {/if}
 
       <section aria-labelledby="docs-search-heading">
-        <h3 id="docs-search-heading" class="text-xs font-medium text-textMuted mb-1.5">
+        <h3 id="docs-search-heading" class="gp-label mb-1.5">
           Search docs
         </h3>
         <form
@@ -979,26 +982,26 @@
             bind:value={docsQuery}
             aria-label="Search repository markdown"
           />
-          <button type="submit" class="gp-btn text-[11px] px-2 py-1" disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}>
+          <button type="submit" class="gp-btn text-meta px-2 py-1" disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}>
             {docsSearching ? "Searching…" : "Search"}
           </button>
         </form>
         {#if searchHonesty}
-          <p class="mt-1 text-xs text-textPrimary" data-testid="docs-search-honesty">
+          <p class="mt-1 text-micro text-warn" data-testid="docs-search-honesty">
             {searchHonesty}
           </p>
         {/if}
         {#if docsError}
-          <p class="mt-2 text-xs text-textPrimary" role="alert" data-testid="docs-search-error">{boundStrip(docsError)}</p>
+          <p class="mt-2 text-meta text-danger" role="alert" data-testid="docs-search-error">{boundStrip(docsError)}</p>
         {/if}
         {#if searchPrompt === "none"}
-          <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-no-hits">No hits for "{searchedQuery}".</p>
+          <p class="mt-2 text-meta text-textMuted" data-testid="docs-no-hits">No hits for "{searchedQuery}".</p>
         {:else if searchPrompt === "press-enter"}
-          <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-search-prompt">Press Enter to search.</p>
+          <p class="mt-2 text-meta text-textMuted" data-testid="docs-search-prompt">Press Enter to search.</p>
         {/if}
         {#if docsHits.length > 0}
           {#if hitsStale}
-            <p class="mt-2 text-[10px] text-textMuted" data-testid="docs-hits-stale">Results for "{searchedQuery}"</p>
+            <p class="mt-2 text-micro text-textMuted" data-testid="docs-hits-stale">Results for "{searchedQuery}"</p>
           {/if}
           <ul class="mt-2 space-y-1.5" class:opacity-60={hitsStale}>
             {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
@@ -1008,9 +1011,9 @@
                   class="w-full text-left rounded-md px-2 py-1.5 hover:bg-surface/80"
                   onclick={() => openHit(hit)}
                 >
-                  <span class="font-mono text-[11px] text-accent block truncate">{hit.path}:{hit.line}</span>
-                  <span class="text-[11px] text-textPrimary block truncate">{hit.title}</span>
-                  <span class="text-[10px] text-textMuted block truncate">{hit.context}</span>
+                  <span class="font-mono text-meta text-accent block truncate">{hit.path}:{hit.line}</span>
+                  <span class="text-meta text-textPrimary block truncate">{hit.title}</span>
+                  <span class="text-micro text-textMuted block truncate">{hit.context}</span>
                 </button>
               </li>
             {/each}
@@ -1018,29 +1021,29 @@
         {/if}
       </section>
 
-      <section aria-labelledby="docs-broken-heading">
-        <h3 id="docs-broken-heading" class="text-xs font-medium text-textMuted mb-1.5">
+      <section aria-labelledby="docs-broken-heading" class="pt-3">
+        <h3 id="docs-broken-heading" class="gp-label mb-1.5">
           Broken links
           {#if brokenSection === "list" || brokenSection === "empty"}
             <span class="font-normal ml-1">({brokenLinks.length})</span>
           {/if}
         </h3>
         {#if brokenSection === "loading"}
-          <Skeleton variant="text" count={3} />
+          <Skeleton variant="rect" count={2} height="2.75rem" />
         {:else if brokenSection === "error"}
-          <p class="text-xs text-textPrimary" role="alert" data-testid="docs-broken-error">Couldn't check links. {boundStrip(brokenError)}</p>
-          <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Try again</button>
+          <p class="text-meta text-danger" role="alert" data-testid="docs-broken-error">Couldn't check links. {boundStrip(brokenError)}</p>
+          <button type="button" class="gp-btn text-meta px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Try again</button>
         {:else if brokenSection === "empty"}
-          <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>
+          <p class="text-meta text-textMuted">None found in the indexed vault.</p>
         {:else}
           {#if brokenDisplay.honesty}
-            <p class="mb-1 text-xs text-textPrimary" data-testid="docs-broken-honesty">
+            <p class="mb-1 text-micro text-warn" data-testid="docs-broken-honesty">
               {brokenDisplay.honesty}
             </p>
           {/if}
           <ul class="space-y-0.5 max-h-64 overflow-y-auto">
             {#each keyedList(brokenDisplay.shown, (link) => JSON.stringify([link.source, link.target])) as { item: link, key: renderKey } (renderKey)}
-              <li class="text-[11px]">
+              <li class="text-meta">
                 <button
                   type="button"
                   class="gp-btn font-mono max-w-full"
@@ -1059,25 +1062,25 @@
   {:else if mapView === "links"}
     <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-3" data-testid="link-candidates-panel">
       <header>
-        <h3 class="text-xs font-medium text-textMuted">Cross-repo link candidates</h3>
-        <p class="text-[11px] text-textMuted mt-0.5">
-          Import-graph edges between registered workspace repos — not name-matched call edges.
+        <h3 class="gp-label">Cross-repository link candidates</h3>
+        <p class="text-meta text-textMuted mt-0.5">
+          Import-graph edges between registered workspace repositories — not name-matched call edges.
         </p>
       </header>
       {#if linksHonesty}
-        <p class="text-[10px] text-textMuted" role="status" data-testid="link-candidates-honesty">
+        <p class="text-micro text-textMuted" role="status" data-testid="link-candidates-honesty">
           {linksHonesty}
         </p>
       {/if}
       {#if linksError}
-        <p class="text-xs text-textPrimary" role="alert">{boundStrip(linksError)}</p>
+        <p class="text-meta text-danger" role="alert">{boundStrip(linksError)}</p>
       {/if}
       {#if linksLoading}
-        <Skeleton variant="text" count={3} />
+        <Skeleton variant="rect" count={2} height="2.75rem" />
       {:else if linkResult && linkResult.links.length > 0}
         <ul class="space-y-1.5">
           {#each keyedList(linkResult.links, (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
-            <li class="rounded-md bg-surface/60 px-2 py-1.5 text-[11px]">
+            <li class="rounded-md bg-surface/60 px-2 py-1.5 text-meta">
               <div class="font-mono text-textPrimary truncate">
                 [{link.from_repo}] {link.from_file}
               </div>
@@ -1087,7 +1090,7 @@
                 <span class="font-mono text-accent">[{link.to_repo}]</span>
               </div>
               {#if link.evidence}
-                <div class="text-[10px] text-textMuted mt-0.5 truncate" title={link.evidence}>
+                <div class="text-micro text-textMuted mt-0.5 truncate" title={link.evidence}>
                   {link.evidence}
                 </div>
               {/if}
@@ -1097,7 +1100,7 @@
       {/if}
       <button
         type="button"
-        class="gp-btn text-[11px] px-2 py-1"
+        class="gp-btn text-meta px-2 py-1"
         disabled={linksLoading || !$repoStore.currentPath}
         onclick={() => void reloadLinks()}
       >
@@ -1113,36 +1116,31 @@
       <Skeleton variant="text" count={5} />
     </div>
   {:else if !map}
-    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
-      <EmptyState
-        icon={MapIcon}
-        title="No code map yet"
-        hint={indexBusy && indexActivity
-          ? ""
-          : (mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests.")}
-      />
-      {#if indexBusy && indexActivity}
-        <p class="text-xs text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
+    {#if indexBusy && indexActivity}
+      <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
+        <p class="text-sm text-textPrimary">Building the code map</p>
+        <p class="text-meta text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
           <Loader2 size={12} class="animate-spin" aria-hidden="true" />
           {indexActivity}
         </p>
-      {:else}
-        <button
-          type="button"
-          class="gp-btn"
-          disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
-          title={buildBlockedReason ?? "Build the map index"}
-          aria-busy={building && buildKind === "build"}
-          onclick={() => void runBuild("build")}
-        >
-          {#if building && buildKind === "build"}
-            <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
-          {:else}
-            Build index
-          {/if}
-        </button>
-      {/if}
-    </div>
+      </div>
+    {:else}
+      <div class="flex-1 flex items-center justify-center" role="status">
+        <EmptyState
+          icon={Network}
+          title="No code map yet"
+          hint={mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
+          action={{
+            label: building && buildKind === "build" ? "Building…" : "Build index",
+            onClick: () => void runBuild("build"),
+            variant: "secondary",
+            disabled: building || !$repoStore.currentPath || buildBlockedReason != null,
+            title: buildBlockedReason ?? "Build the map index",
+            busy: building && buildKind === "build",
+          }}
+        />
+      </div>
+    {/if}
   {:else}
     {@const doc = map as RepoMapDocument}
     <div class="flex-1 flex min-h-0 gap-2 p-2">
@@ -1152,7 +1150,7 @@
         aria-label="Subsystems"
       >
         <div class="shrink-0 space-y-2 px-2.5 pt-2.5 pb-2">
-          <div class="text-xs font-medium text-textMuted">
+          <div class="gp-label">
             Subsystems
             <span class="font-normal ml-1">
               {formatCap(
@@ -1163,7 +1161,7 @@
             </span>
           </div>
           {#if doc.liveness_meta.subsystems.truncated}
-            <span class="gp-chip gp-notice-warn text-textPrimary" data-testid="map-subsystems-cap">
+            <span class="gp-chip" data-tone="warn" data-testid="map-subsystems-cap">
               Showing {doc.liveness_meta.subsystems.shown} of {doc.liveness_meta.subsystems.total}
               {#if doc.liveness_meta.subsystems.dropped_no_area > 0}
                 · {doc.liveness_meta.subsystems.dropped_no_area} dropped (no area)
@@ -1237,10 +1235,10 @@
             <div class="min-w-0">
               <h2 class="font-mono text-sm text-textPrimary break-all">{selected.area}</h2>
               {#if detailSummary}
-                <p class="text-xs text-textMuted mt-0.5">{detailSummary}</p>
+                <p class="text-meta text-textMuted mt-0.5">{detailSummary}</p>
               {/if}
               {#if selectedRow && selectedRow.duplicateCount > 1}
-                <p class="text-xs text-textMuted mt-0.5" data-testid="map-duplicate-area">
+                <p class="text-meta text-textMuted mt-0.5" data-testid="map-duplicate-area">
                   {selectedRow.duplicateCount} subsystems share this area; showing the first.
                 </p>
               {/if}
@@ -1256,11 +1254,11 @@
           </header>
 
           <section aria-labelledby="map-entry-points">
-            <h3 id="map-entry-points" class="text-xs font-medium text-textMuted mb-1">
+            <h3 id="map-entry-points" class="gp-label mb-1">
               Entry points
             </h3>
             {#if selected.entry_points.length === 0}
-              <p class="text-[11px] text-textMuted">None listed.</p>
+              <p class="text-meta text-textMuted">None listed.</p>
             {:else}
               <ul class="space-y-0.5">
                 {#each selected.entry_points as path, i (`${path}#${i}`)}
@@ -1279,11 +1277,11 @@
           </section>
 
           <section aria-labelledby="map-critical">
-            <h3 id="map-critical" class="text-xs font-medium text-textMuted mb-1">
+            <h3 id="map-critical" class="gp-label mb-1">
               Critical files
             </h3>
             {#if selected.critical_files.length === 0}
-              <p class="text-[11px] text-textMuted">None listed.</p>
+              <p class="text-meta text-textMuted">None listed.</p>
             {:else}
               <ul class="space-y-0.5">
                 {#each selected.critical_files as path, i (`${path}#${i}`)}
@@ -1302,7 +1300,7 @@
           </section>
 
           <section aria-labelledby="map-tests">
-            <h3 id="map-tests" class="text-xs font-medium text-textMuted mb-1">
+            <h3 id="map-tests" class="gp-label mb-1">
               Tests
               {#if tests}
                 <span class="font-normal ml-1">
@@ -1311,9 +1309,9 @@
               {/if}
             </h3>
             {#if !tests || tests.paths.length === 0}
-              <p class="text-[11px] text-textMuted">
+              <p class="text-meta text-textMuted">
                 {tests && tests.total > 0
-                  ? `Sample empty; role_file_counts says ${tests.total} test file(s).`
+                  ? `Sample empty; the index lists ${tests.total} test file(s).`
                   : "No test role files in this area."}
               </p>
             {:else}
@@ -1331,7 +1329,7 @@
                 {/each}
               </ul>
               {#if tests.truncated}
-                <p class="mt-1 text-xs text-textPrimary">
+                <p class="mt-1 text-micro text-warn">
                   Sample of {tests.paths.length}; {tests.total} total for this area.
                 </p>
               {/if}
@@ -1340,7 +1338,7 @@
 
           {#if selected.neighbors.length > 0}
             <section aria-labelledby="map-neighbors">
-              <h3 id="map-neighbors" class="text-xs font-medium text-textMuted mb-1">
+              <h3 id="map-neighbors" class="gp-label mb-1">
                 Neighbors
               </h3>
               <ul class="flex flex-wrap gap-1.5">
@@ -1368,9 +1366,9 @@
 
         <!-- Dead / unwired candidates (prefer over unreachable) -->
         {#if deadLists}
-          <section class="space-y-3" aria-label="Dead and unwired candidates">
+          <section class="pt-3 space-y-3" aria-label="Dead and unwired candidates">
             <div>
-              <h3 class="text-xs font-medium text-textMuted mb-1">
+              <h3 class="gp-label mb-1">
                 Unwired candidates
                 <span class="font-normal ml-1">
                   {formatCap(
@@ -1381,14 +1379,14 @@
                 </span>
               </h3>
               {#if deadLists.unwired.length === 0}
-                <p class="text-[11px] text-textMuted">None in this sample.</p>
+                <p class="text-meta text-textMuted">None in this sample.</p>
               {:else}
                 <ul class="space-y-0.5 max-h-32 overflow-y-auto">
                   {#each deadLists.unwired as path, i (`${path}#${i}`)}
                     <li>
                       <button
                         type="button"
-                        class="font-mono text-[11px] text-textMuted hover:text-accent truncate max-w-full"
+                        class="font-mono text-meta text-textMuted hover:text-accent truncate max-w-full"
                         onclick={() => openFile(path)}
                       >
                         {path}
@@ -1398,13 +1396,13 @@
                 </ul>
               {/if}
               {#if unwiredExclusionSummary(doc.liveness_meta.unwired).length > 0}
-                <p class="mt-1 text-[10px] text-textMuted">
+                <p class="mt-1 text-micro text-textMuted">
                   Excluded: {unwiredExclusionSummary(doc.liveness_meta.unwired).join(", ")}
                 </p>
               {/if}
             </div>
             <div>
-              <h3 class="text-xs font-medium text-textMuted mb-1">
+              <h3 class="gp-label mb-1">
                 Dead symbol candidates
                 <span class="font-normal ml-1">
                   {formatCap(
@@ -1415,28 +1413,28 @@
                 </span>
               </h3>
               {#if deadLists.deadSymbols.length === 0}
-                <p class="text-[11px] text-textMuted">None in this sample.</p>
+                <p class="text-meta text-textMuted">None in this sample.</p>
               {:else}
                 <ul class="space-y-0.5 max-h-40 overflow-y-auto">
                   {#each deadLists.deadSymbols as id, i (`${id}#${i}`)}
-                    <li class="font-mono text-[11px] text-textMuted truncate" title={id}>{id}</li>
+                    <li class="font-mono text-meta text-textMuted truncate" title={id}>{id}</li>
                   {/each}
                 </ul>
               {/if}
             </div>
             {#if deadLists.unreachableSuppressed}
-              <p class="text-xs text-textPrimary">
-                Unreachable files ignored — liveness_unreachable_unreliable is set.
+              <p class="text-micro text-warn">
+                Unreachable files are hidden because the index marks that list as unreliable.
                 Prefer unwired and dead-symbol candidates above.
               </p>
             {:else if deadLists.unreachable.length > 0}
               <div>
-                <h3 class="text-xs font-medium text-textMuted mb-1">
+                <h3 class="gp-label mb-1">
                   Unreachable files (secondary)
                 </h3>
                 <ul class="space-y-0.5 max-h-24 overflow-y-auto">
                   {#each deadLists.unreachable as path, i (`${path}#${i}`)}
-                    <li class="font-mono text-[11px] text-textMuted truncate">{path}</li>
+                    <li class="font-mono text-meta text-textMuted truncate">{path}</li>
                   {/each}
                 </ul>
               </div>
@@ -1445,7 +1443,7 @@
         {/if}
 
         {#if doc.liveness_meta.entry_roots.truncated || doc.liveness_meta.subsystems.role_files_truncated}
-          <p class="text-xs text-textMuted">
+          <p class="text-micro text-textMuted pt-2">
             Caps:
             entry roots {formatCap(
               doc.liveness_meta.entry_roots.shown,

@@ -274,6 +274,51 @@ than entrances to avoid stacking dimmed backdrops when rapidly reopened.
 See [Svelte transitions](https://svelte.dev/docs/svelte/transition) and
 [crossfade](https://svelte.dev/docs/svelte/svelte-transition#crossfade).
 
+### Native Liquid Glass and 120 Hz (opt-in, both off by default)
+
+Two Appearance switches, `native-glass` (Material) and `high-refresh` (Motion),
+sent to `cmd_native_rendering_apply` (`src-tauri/src/native_rendering.rs`,
+`src/lib/desktop/nativeRendering.ts`). The backend answers with what it
+observed, never what was asked, and a refusal is shown on the row and written
+to Diagnostics (source `native-rendering`).
+
+- **Liquid Glass.** Tauri's window-effect wrapper
+  (`Effect::LiquidGlassRegular`, then `UnderWindowBackground` as the fallback)
+  calls `window_vibrancy::apply_liquid_glass` (0.8.1, already in the lockfile;
+  no dependency was added). `NSGlassEffectView` is a public AppKit class in the
+  macOS 26 SDK headers, so this is not private API; the only private piece in the
+  window path is Tauri's `macos-private-api`, already on for the transparent
+  window. The wrapper swallows its result, so GitPulse gates on
+  `NSAppKitVersionNumber >= 2685` (the number the library gates on) before
+  calling, and afterwards reads the content view for the glass view's tag.
+  Only that observation reports "In effect". Below macOS 26, or if the view is
+  missing, the window keeps `underWindowBackground` and the reason is recorded.
+  Toggling at runtime works and is idempotent (checked in the built app).
+- **120 Hz.** WebKit's `PreferPageRenderingUpdatesNear60FPSEnabled` feature
+  holds `requestAnimationFrame` to 60 Hz on a 120 Hz display. It is turned off
+  through the private `+[WKPreferences _features]` and
+  `-[WKPreferences _setEnabled:forFeature:]` / `_isEnabledForFeature:`, reached
+  through `WebviewWindow::with_webview` (wry hands over the `WKWebView`; no wry
+  change). The class, both selectors and the feature's `key` are looked up at
+  run time, the value is read back after the write, and any missing piece leaves
+  WebKit at its default with the reason recorded.
+  **WebKit fixes the page's frame rate when the page starts**: in the built app,
+  switching the feature at run time reports it changed while the running page
+  stays at 60 Hz (and a page already at 120 Hz stays there), and a launch with
+  the preference on runs at about 120 Hz. So a 120 Hz change takes effect the
+  next time GitPulse starts, and the row says so. Boot always sends one request,
+  even with both switches off, so the feature is put back to WebKit's default.
+- **Measured** (`tmp/overhaul/G`, real debug app window, fresh launch per arm,
+  counterbalanced A B C D D C B A A B C D; A = both off, B = 120 Hz, C = glass,
+  D = both; n = 3 per arm; window unfocused in every valid run). Mean rAF rate,
+  idle / float open (command palette) / float open-close cycling:
+  A 60 / 60 / 59.9 Hz; B 119.9 / 119.9-120 / 116.8-117.9 Hz;
+  C 60.1 / 60 / 59.9-60 Hz; D 119.9-120 / 119.9 / 116.7-117.6 Hz.
+  p99 frame interval: 19 ms at 60 Hz, 11 ms idle at 120 Hz. Glass changed no
+  cadence or p99 at either rate. It was measured on a fresh profile's welcome
+  surface, not a loaded repository; WindowServer cost of glass is not captured
+  by rAF and was not measured.
+
 ## Accessibility and fallbacks
 
 - Unsupported backdrop filtering gets a solid surface by default.

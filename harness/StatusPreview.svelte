@@ -26,6 +26,16 @@
   <p class="action" aria-live="polite">Last action: {lastAction}</p>
 </main>
 <style>
+  /* The desktop blur the native material gets from the window server. Only the
+     fixture needs a CSS stand-in for it, so it lives here: the component itself
+     may not blur (only the float rule in app.css does). The component's
+     reduced-transparency rules out-rank this one by specificity and turn it off. */
+  @supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
+    :global(.status-shell[data-material="preview"] .panel) {
+      -webkit-backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
+      backdrop-filter:blur(34px) saturate(190%) brightness(1.06);
+    }
+  }
   :global(body) { margin:0; }
   :global(*) { box-sizing:border-box; }
   main { min-height:100vh; background:radial-gradient(ellipse at 24% 26%,#95c0eb 0,transparent 44%),radial-gradient(ellipse at 72% 55%,#cab2de 0,transparent 40%),linear-gradient(130deg,#e9ecf1,#c2d9d5); padding:25px; font-family:-apple-system,BlinkMacSystemFont,sans-serif; }

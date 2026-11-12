@@ -14,9 +14,20 @@ const source = readFileSync(
 describe("Sidebar", () => {
   it("labels its icon-only controls for screen readers", () => {
     const { body } = render(Sidebar);
-    // Gold standard (FilterBar): every icon-only button carries an explicit
+    // Gold standard (the view bar search field): every icon-only button carries an explicit
     // aria-label alongside its title.
-    expect(body).toContain('aria-label="Open Repository"');
+    expect(body).toContain('aria-label="Collapse sidebar"');
+    expect(body).toContain('aria-label="Float sidebar over the workspace"');
+  });
+
+  it("no longer carries its own Open button (decision D3)", () => {
+    // Was: expect(body).toContain('aria-label="Open Repository"'). The title
+    // bar's "Open" is the one place to open a repository (HEADER_SPEC §9 D3),
+    // so the sidebar's icon was a third copy and is retired.
+    const { body } = render(Sidebar);
+    expect(body).not.toContain('aria-label="Open Repository"');
+    expect(source).not.toContain("pickAndOpenRepo");
+    expect(source).not.toContain("FolderOpen");
   });
 
   it("keeps the per-file stage/unstage affordances titled", () => {
@@ -62,26 +73,76 @@ describe("Sidebar resize shell", () => {
 
   it("drives width from the persisted layout store, not a hardcoded class", () => {
     expect(source).not.toContain("w-80 ");
-    expect(source).toMatch(/style="width:\{\$layoutStore/);
-    // No width transition mid-drag; smooth otherwise.
-    expect(source).toContain("transition-[width] duration-150");
+    expect(source).toMatch(/style="width:\{shownCollapsed \? SIDEBAR_COLLAPSED_WIDTH : \$layoutStore\.width\}px"/);
+    // Was: "transition-[width] duration-(--gp-dur-fast)" on every non-drag
+    // frame, then the one-shot `gp-slide-docked` width utility. Nothing
+    // animates layout now: the column takes its final width once (at the start
+    // of an open, at the end of a close) and the panel slides on transform and
+    // opacity (dockedSlide.ts), never mid-drag.
+    expect(source).not.toContain("transition-[width]");
+    expect(source).not.toContain("gp-slide-docked");
+    expect(source).toMatch(/slideDocked\(dockedAside, "in", travel/);
+    expect(source).toMatch(/slideDocked\(dockedAside, "out", travel/);
+    expect(source).toMatch(/!changed \|\| floating \|\| dragging \|\| !dockedAside/);
     expect(source).toContain("if (!dragging) return;");
   });
 
+  it("slides the overlay panel on transform and opacity only, from the motion tokens", () => {
+    const panel = source.slice(source.indexOf("function panelIn("), source.indexOf("onDestroy("));
+    expect(panel).toContain('motionMs("base")');
+    expect(panel).toContain('motionExitMs("base")');
+    expect(panel).toContain("translate3d(");
+    expect(panel).not.toMatch(/\b(width|height|margin|left|top)\s*:/);
+    expect(source).toContain("in:panelIn");
+    expect(source).toContain("out:panelOut");
+  });
+
+  it("keeps a 44 px rail in the column while the overlay panel floats", () => {
+    expect(source).toContain("data-sidebar-rail-slot");
+    expect(source).toContain("style=\"width:{SIDEBAR_COLLAPSED_WIDTH}px\"");
+    expect(source).toContain("inert={!collapsed}");
+    expect(source).toContain("data-sidebar-panel");
+  });
+
   it("hides the resizer while collapsed", () => {
-    const resizer = source.slice(source.indexOf('role="separator"'));
     const railStart = source.indexOf("Collapsed rail");
     expect(railStart).toBeGreaterThan(-1);
-    expect(resizer.length).toBeGreaterThan(0);
-    // The separator block is gated behind the same !collapsed condition as the
-    // expanded shell (the only {#if} wrapping it).
-    expect(source.match(/\{#if !\$layoutStore\.collapsed\}/g)?.length).toBe(2);
+    // The resizer snippet is rendered only beside the expanded shell: once in
+    // the docked aside and once in the overlay panel, each inside its own
+    // `{#if !collapsed}` / `{#if !shownCollapsed}` (the docked column draws the
+    // panel until its slide-out ends), and never in the rail.
+    expect(source.match(/\{#if !(?:collapsed|shownCollapsed)\}/g)?.length).toBe(2);
+    expect(source.match(/\{@render resizer\(\)\}/g)?.length).toBe(2);
+    const rail = source.slice(source.indexOf("{#snippet rail()}"), source.indexOf("{#snippet resizer()}"));
+    expect(rail).not.toContain('role="separator"');
+  });
+});
+
+describe("Sidebar mode", () => {
+  it("offers a docked or overlay toggle in the header, persisted by panelMode", () => {
+    expect(source).toContain('panelModes.toggle("sidebar")');
+    expect(source).toContain("data-sidebar-mode-toggle");
+    expect(source).toContain("aria-pressed={overlay}");
+  });
+
+  it("closes the floating panel on an outside pointerdown, through the popover owner and the portal-aware selector", () => {
+    expect(source).toContain("use:popover={panelDismissOptions}");
+    expect(source).toContain('floatingPanelDismiss("[data-sidebar-panel]")');
+    expect(source).toContain("if (overlay && !collapsed) layoutStore.toggleCollapsed();");
+  });
+
+  it("lets Escape close a floating panel only when the key was not taken inside it", () => {
+    expect(source).toContain("event.defaultPrevented");
+    expect(source).toContain('closest("[data-sidebar-panel]")');
   });
 });
 
 describe("Sidebar collapse toggle", () => {
   it("toggles and persists collapse state from the header and the rail", () => {
-    expect((source.match(/layoutStore\.toggleCollapsed\(\)/g) ?? []).length).toBe(2);
+    // The header and the rail both call the shared toggle, which plays the
+    // one-shot docked slide before it flips the persisted flag.
+    expect((source.match(/onclick=\{toggleCollapsed\}/g) ?? []).length).toBe(2);
+    expect(source).toContain("layoutStore.toggleCollapsed();");
     expect(source).toContain("PanelLeftClose");
     expect(source).toContain("PanelLeftOpen");
     expect(source).toContain('aria-label="Collapse sidebar"');
@@ -89,9 +150,9 @@ describe("Sidebar collapse toggle", () => {
     expect(source).toContain("SIDEBAR_COLLAPSED_WIDTH");
   });
 
-  it("shows the dirty-file badge with amber emphasis on the collapsed rail", () => {
+  it("shows the dirty-file badge with warn emphasis on the collapsed rail", () => {
     expect(source).toContain("{dirtyCount}");
-    expect(source).toMatch(/dirtyCount > 0\s*\?\s*'bg-amber-500\/15 text-amber-400/);
+    expect(source).toMatch(/dirtyCount > 0\s*\?\s*'bg-warn\/15 text-warn/);
   });
 });
 
@@ -108,9 +169,9 @@ describe("Sidebar repo pulse strip", () => {
     expect(source).toContain("{#if aheadCount > 0}");
     expect(source).toContain("{#if behindCount > 0}");
     expect(source).toContain("{#if currentBranchInfo?.is_default}");
-    // Chip styling matches BranchList's emerald-up / amber-down pills.
-    expect(source).toContain("bg-emerald-500/15 text-emerald-400 border border-emerald-500/25");
-    expect(source).toContain("bg-amber-500/15 text-amber-400 border border-amber-500/25");
+    // Chip styling matches BranchList's ok-up / warn-down pills.
+    expect(source).toContain("bg-ok/15 text-ok border border-ok/35");
+    expect(source).toContain("bg-warn/15 text-warn border border-warn/35");
   });
 
   it("summarizes the working tree with additions, deletions, conflicts, or clean state", () => {
@@ -240,10 +301,10 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("limit + FILE_LIST_STEP");
   });
 
-  it("styles conflicted paths amber-bold in both lists via one helper", () => {
+  it("styles conflicted paths warn-semibold in both lists via one helper", () => {
     const uses = source.match(/pathClass\(f\.is_conflicted\)/g) ?? [];
     expect(uses.length).toBe(2);
-    expect(source).toContain('return conflicted ? "text-amber-400 font-bold" : "text-textPrimary";');
+    expect(source).toContain('return conflicted ? "text-warn font-semibold" : "text-textPrimary";');
   });
 
   it("no longer nests interactive buttons inside a role=button row", () => {

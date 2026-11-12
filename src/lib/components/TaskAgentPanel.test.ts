@@ -58,17 +58,17 @@ describe("a history that could not be read is not an empty task", () => {
   it("the summary and the History empty state name the failed read before saying nothing exists", () => {
     const summary = source.slice(source.indexOf("const summary = $derived.by"));
     expect(summary.indexOf("historyError")).toBeGreaterThan(-1);
-    expect(summary.indexOf("historyError")).toBeLessThan(summary.indexOf("No attempts yet."));
+    expect(summary.indexOf("historyError")).toBeLessThan(summary.indexOf("No runs yet."));
     const history = source.slice(source.indexOf("{#if !runs.length}"));
     expect(history.indexOf("historyError")).toBeGreaterThan(-1);
     expect(history.indexOf("historyError")).toBeLessThan(history.indexOf("No runs yet."));
   });
 
-  it("keeps the launch form shut until a first read has succeeded, and offers a Retry in the banner", () => {
+  it("keeps the launch form shut until a first read has succeeded, and offers Try again in the banner", () => {
     expect(source).toMatch(/const formOpen = \$derived\(expandedForm \?\? \(readOnce && live\.length === 0\)\);/);
     expect(source).toContain("readOnce = true;");
     const banner = /\{#if historyError\}[^\n]*\{\/if\}/.exec(source)?.[0] ?? "";
-    expect(banner).toContain(">Retry</button>");
+    expect(banner).toContain(">Try again</button>");
   });
 });
 

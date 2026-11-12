@@ -12,15 +12,26 @@ bun run test:browser -- --harness branches
 bun run test:webkit -- --harness branches
 ```
 
-The checks open with the two-line branch row, which is geometry and so can
-only be measured where real layout exists: each row is exactly as tall as the
-window math believes, headers stay one line, neither line paints under the
-hover actions or past the row's edge, the name owns line one and is shown in
-full, and line two clips — author first, never a count. A stale branch shows
-its tinted age rather than a chip. Fixture branches carry churn and divergence
-derived from their names, and `release/0.0.9` is deliberately 120 days old;
-without both, none of that chrome renders and the layout it used to break
-cannot be seen.
+The checks open with the two-line branch row (chosen explicitly, since three
+lines is the default now), which is geometry and so can only be measured where
+real layout exists: each row is exactly as tall as the window math believes,
+headers stay one line, neither line paints under the hover actions or past the
+row's edge, the name owns line one and is shown in full, and line two clips —
+author first, never a count. A stale branch shows its tinted age rather than a
+chip. Fixture branches carry churn and divergence derived from their names, and
+`release/0.0.9` is deliberately 120 days old; without both, none of that chrome
+renders and the layout it used to break cannot be seen.
+
+The three-line row, the default, is measured next: three separate line boxes
+stacked top to bottom, a content stack of 47px that the row's declared height
+holds at 15px of padding (9px compact) so a wrong constant fails there, a
+30-character name shown in full at the sidebar's 360px default width, the age
+then the author on line three, and a clipped line two that leaves line three
+alone. Then, over 40 branches in 10 folders: ArrowDown and ArrowUp keep the
+selected row rendered and fully in view across the mixed 30px and 62px heights,
+and "Locate checked-out branch" parks the row a third of the way down the
+viewport. Add `?layout=one-line|two-line|three-line`, `?density=compact`,
+`?width=360` and `?many` to look at any of that by eye.
 
 The remaining checks cover full-name copying and denial feedback, keyboard focus and
 activation, context-menu preselection, local and remote source selection,

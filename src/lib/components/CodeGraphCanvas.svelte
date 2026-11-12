@@ -44,10 +44,13 @@
   import { easeOutCubic, motionDuration, prefersReducedMotion } from "../motion/easing";
   import { observeResize } from "../dom/observeResize";
   import { themeStore } from "../stores/themeStore";
+  import { Filter, Minus, Network, Plus } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
   import { getLanguageIconColor, type LanguageIconKey } from "../language/languageLogos";
   import { popover } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
-  import Skeleton from "./Skeleton.svelte";
 
   /**
    * Code / subsystem graph canvas for the Map section.
@@ -109,6 +112,11 @@
   // effect below reads it, and it must not re-run that effect.
   let needsFit = false;
   let appliedFocusId: string | null = null;
+  // The toolbar grows or shrinks when a payload lands (legend, groups and the
+  // filter count), so the stage is resized after the first fit. Until the
+  // reader pans, rotates or zooms, the fit follows the stage; afterwards the
+  // view is theirs. Plain, not $state, for the same reason as needsFit.
+  let fitFollowsStage = false;
   let dragging = false;
   let dragDistance = 0;
   let pointerStart = { x: 0, y: 0 };
@@ -237,7 +245,8 @@
     const rect = hostEl.getBoundingClientRect();
     width = Math.max(160, Math.floor(rect.width));
     height = Math.max(160, Math.floor(rect.height));
-    schedulePaint();
+    if (fitFollowsStage) resetView();
+    else schedulePaint();
   }
 
   function cancelTween() {
@@ -262,6 +271,7 @@
     // Drag arithmetic is in client space (deltas), so it never reads layout.
     const pt = { x: e.clientX, y: e.clientY };
     if (dragging) {
+      fitFollowsStage = false;
       dragDistance = Math.max(dragDistance, Math.hypot(pt.x - pointerStart.x, pt.y - pointerStart.y));
       if (globeActive) {
         const turned = rotateByDrag({ yaw, pitch }, pt.x - lastPointer.x, pt.y - lastPointer.y, globeRadius() * globeZoom);
@@ -334,6 +344,7 @@
   }
 
   function zoomAt(factor: number, x = width / 2, y = height / 2) {
+    fitFollowsStage = false;
     if (globeActive) {
       globeZoom = Math.min(GLOBE_ZOOM_MAX, Math.max(GLOBE_ZOOM_MIN, globeZoom * factor));
       schedulePaint();
@@ -353,22 +364,25 @@
     zoomAt(Math.exp(-Math.max(-120, Math.min(120, e.deltaY)) * 0.002), e.clientX - rect.left, e.clientY - rect.top);
   }
 
-  function resetFlatView() {
-    const fitted = fitGraphView(matches, width, height);
-    panX = fitted.panX;
-    panY = fitted.panY;
-    scale = fitted.scale;
-  }
-
   function resetGlobeView() {
     yaw = 0;
     pitch = 0;
     globeZoom = 1;
   }
 
+  /**
+   * The one fit. The flat layout always fits the filtered nodes, even under the
+   * globe, so a later switch to Flat starts fitted; the globe, when it is
+   * showing, faces front. Until the reader moves the view, a resize fits again.
+   */
   function resetView() {
     cancelTween();
-    if (globeActive) resetGlobeView(); else resetFlatView();
+    const fitted = fitGraphView(matches, width, height);
+    panX = fitted.panX;
+    panY = fitted.panY;
+    scale = fitted.scale;
+    if (globeActive) resetGlobeView();
+    fitFollowsStage = true;
     schedulePaint();
   }
 
@@ -378,6 +392,7 @@
     const point = at === undefined ? undefined : unitPoints[at];
     if (!point) return;
     cancelTween();
+    fitFollowsStage = false;
     const target = rotationToFace(point);
     const duration = motionDuration(FOCUS_TWEEN_MS);
     if (prefersReducedMotion() || duration === 0 || typeof requestAnimationFrame !== "function") {
@@ -406,6 +421,7 @@
     query = "";
     showNodeList = false;
     connectionPage = 0;
+    fitFollowsStage = false;
     if (globeActive) {
       faceNode(id);
       return;
@@ -435,6 +451,7 @@
       if (path) onOpenNode(path, selectedNode.id);
     }
     else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) {
+      fitFollowsStage = false;
       if (globeActive) {
         cancelTween();
         yaw += e.key === "ArrowLeft" ? KEY_ROTATION : e.key === "ArrowRight" ? -KEY_ROTATION : 0;
@@ -506,7 +523,7 @@
     untrack(() => {
       cancelTween();
       if (nextScope !== previousScope) {
-        clearFilters(); resetFlatView(); resetGlobeView(); schedulePaint(); showNodeList = false; direction = "both"; depth = 1;
+        clearFilters(); resetGlobeView(); resetView(); showNodeList = false; direction = "both"; depth = 1;
         filtersOpen = false;
         communityPage = 0;
         previousModel = null;
@@ -515,7 +532,7 @@
         // First payload for this scope: fit it once. Later same-scope refreshes
         // keep the user's zoom and pan.
         if (needsFit && nextModel.nodes.length > 0) {
-          resetFlatView(); resetGlobeView(); schedulePaint();
+          resetGlobeView(); resetView();
           needsFit = false;
         }
         const oldNode = previousModel?.nodes.find(n => n.id === selectedId);
@@ -572,7 +589,7 @@
 <div class="code-map bg-background flex flex-col min-h-0 flex-1" class:narrow={width <= 760}>
   <div class="map-toolbar flex flex-wrap items-center gap-x-3 gap-y-2 px-5 pt-4 pb-3">
     <div class="map-heading min-w-0 mr-auto">
-      <span class="block text-xs font-medium text-textMuted">Dependency map</span>
+      <span class="gp-label block">Dependency map</span>
       {#if loading}
         <Skeleton variant="text" width="12rem" height="0.75rem" class="mt-1.5" />
       {:else}
@@ -584,7 +601,7 @@
             {#if legend.linksLabel}<span>· {legend.linksLabel}</span>{/if}
             <span>· {model.communities.length} groups</span>
             <span>·</span><span data-testid="graph-filter-count">{matches.length} of {model.nodes.length} match filters</span>
-            {#if filtersActive}<button type="button" class="gp-btn px-2 py-0.5" data-testid="map-clear-filters" onclick={clearFilters}>Clear filters</button>{/if}
+            {#if filtersActive}<button type="button" class="gp-btn" data-size="sm" data-testid="map-clear-filters" onclick={clearFilters}>Clear filters</button>{/if}
           {/if}
         </div>
       {/if}
@@ -596,8 +613,8 @@
           onkeydown={(e) => { if (e.key === "Enter" && matches[0]) focusNode(matches[0].id); }} />
         {#if query}<button type="button" class="gp-icon-btn -mr-1.5 p-0.5" aria-label="Clear search" onclick={() => query = ""}>×</button>{/if}
       </label>
-      <button type="button" class="gp-btn" data-testid="map-nodes-toggle" class:text-accent={showNodeList} aria-pressed={showNodeList} onclick={() => showNodeList = !showNodeList}>Nodes</button>
-      <button type="button" class="gp-btn" class:text-accent={showLabels} aria-pressed={showLabels} onclick={() => showLabels = !showLabels}>Labels</button>
+      <button type="button" class="gp-btn" data-size="sm" data-testid="map-nodes-toggle" class:text-accent={showNodeList} aria-pressed={showNodeList} onclick={() => showNodeList = !showNodeList}>Nodes</button>
+      <button type="button" class="gp-btn" data-size="sm" class:text-accent={showLabels} aria-pressed={showLabels} onclick={() => showLabels = !showLabels}>Labels</button>
       {#if globeAvailable}
         <div class="gp-segmented" role="group" aria-label="Layout" data-testid="map-layout">
           <button type="button" class="gp-seg-btn" data-active={!globeActive} aria-pressed={!globeActive} onclick={() => setGlobe(false)}>Flat</button>
@@ -605,14 +622,16 @@
         </div>
       {/if}
       <div class="relative" data-map-filters>
-        <button type="button" class="gp-btn" data-testid="map-filters-toggle" class:text-accent={filtersActive} aria-haspopup="true" aria-expanded={filtersOpen} onclick={() => filtersOpen = !filtersOpen}>Filters</button>
+        <button type="button" class="gp-btn" data-size="sm" data-testid="map-filters-toggle" class:text-accent={filtersActive} aria-haspopup="true" aria-expanded={filtersOpen} onclick={() => filtersOpen = !filtersOpen}>Filters</button>
         {#if filtersOpen}
           <div class="map-filters gp-menu absolute right-0 top-full mt-1 w-64 max-h-[70vh] overflow-y-auto! text-xs" style={`z-index:${LAYERS.MENU}`}
             use:popover={filtersDismissal} role="group" aria-label="Graph filters">
-            <label class="gp-menu-item cursor-pointer" title="Identified by conventional test directory and filename patterns"><input class="accent-accent" type="checkbox" bind:checked={hideTests} onchange={filtersChanged}/> Hide tests</label>
-            <label class="gp-menu-item cursor-pointer" title="Identified by conventional generated, build, and vendor paths"><input class="accent-accent" type="checkbox" bind:checked={hideGenerated} onchange={filtersChanged}/> Hide generated/vendor</label>
-            <label class="gp-menu-item cursor-pointer" title="Keep nodes with relationships in the loaded graph"><input class="accent-accent" type="checkbox" bind:checked={connectedOnly} onchange={filtersChanged}/> Connected only</label>
-            <label class="gp-menu-item cursor-pointer" title="Hide document and note nodes, or subsystems made entirely of documentation"><input class="accent-accent" type="checkbox" aria-label="Hide notes & Markdown" bind:checked={hideNotes} onchange={filtersChanged}/> Hide notes &amp; Markdown</label>
+            <!-- The row is the menu item and owns the visible text; Checkbox is
+                 the box alone (it takes the row's words as its name). -->
+            <label class="gp-menu-item cursor-pointer" title="Identified by conventional test directory and filename patterns"><Checkbox ariaLabel="Hide tests" checked={hideTests} onchange={(next) => { hideTests = next; filtersChanged(); }} /> Hide tests</label>
+            <label class="gp-menu-item cursor-pointer" title="Identified by conventional generated, build, and vendor paths"><Checkbox ariaLabel="Hide generated/vendor" checked={hideGenerated} onchange={(next) => { hideGenerated = next; filtersChanged(); }} /> Hide generated/vendor</label>
+            <label class="gp-menu-item cursor-pointer" title="Keep nodes with relationships in the loaded graph"><Checkbox ariaLabel="Connected only" checked={connectedOnly} onchange={(next) => { connectedOnly = next; filtersChanged(); }} /> Connected only</label>
+            <label class="gp-menu-item cursor-pointer" title="Hide document and note nodes, or subsystems made entirely of documentation"><Checkbox ariaLabel="Hide notes & Markdown" checked={hideNotes} onchange={(next) => { hideNotes = next; filtersChanged(); }} /> Hide notes &amp; Markdown</label>
             {#if languages.length > 0}
               <div class="gp-menu-sep" role="separator"></div>
               <div class="map-languages" role="group" aria-label="Node colors by language">
@@ -642,9 +661,9 @@
   {#if model.communities.length > 0}
     <div class="map-group-row">
     <div class="map-communities" aria-label="Communities">
-      <button type="button" class="gp-chip cursor-pointer hover:bg-surfaceHover {activeCommunity ? 'text-textMuted' : 'bg-surfaceHover text-textPrimary'}" data-map-group="" aria-pressed={!activeCommunity} onclick={() => { activeCommunity = null; filtersChanged(); }}>All groups</button>
+      <button type="button" class="gp-chip shrink-0 max-w-[220px] cursor-pointer {activeCommunity ? 'text-textMuted hover:bg-surfaceHover' : ''}" data-tone={!activeCommunity ? "accent" : undefined} data-map-group="" aria-pressed={!activeCommunity} onclick={() => { activeCommunity = null; filtersChanged(); }}>All groups</button>
       {#each model.communities.slice(currentCommunityPage * 40, (currentCommunityPage + 1) * 40) as community (community.name)}
-        <button type="button" class="gp-chip cursor-pointer hover:bg-surfaceHover {activeCommunity === community.name ? 'bg-surfaceHover text-textPrimary' : 'text-textMuted'}" data-map-group={community.name}
+        <button type="button" class="gp-chip shrink-0 max-w-[220px] cursor-pointer {activeCommunity === community.name ? '' : 'text-textMuted hover:bg-surfaceHover'}" data-tone={activeCommunity === community.name ? "accent" : undefined} data-map-group={community.name}
           aria-pressed={activeCommunity === community.name}
           title={`${community.name} · ${community.shown} shown of ${community.count}`}
           onclick={() => { activeCommunity = activeCommunity === community.name ? null : community.name; filtersChanged(); }}>
@@ -681,9 +700,9 @@
         {/each}
         {#if matches.length === 0}<p>No nodes match the current filters.</p>{/if}
         {#if pageCount > 1}<div class="map-pagination">
-          <button type="button" class="gp-btn px-2 py-0.5" aria-label="Previous nodes" disabled={currentPage === 0} onclick={() => page = currentPage - 1}>Previous</button>
+          <button type="button" class="gp-btn" data-size="sm" aria-label="Previous nodes" disabled={currentPage === 0} onclick={() => page = currentPage - 1}>Previous</button>
           <span>{currentPage + 1} / {pageCount}</span>
-          <button type="button" class="gp-btn px-2 py-0.5" aria-label="Next nodes" disabled={currentPage + 1 >= pageCount} onclick={() => page = currentPage + 1}>Next</button>
+          <button type="button" class="gp-btn" data-size="sm" aria-label="Next nodes" disabled={currentPage + 1 >= pageCount} onclick={() => page = currentPage + 1}>Next</button>
         </div>{/if}
       </div>
     {:else if selectedNode}
@@ -715,24 +734,24 @@
           {#if visibleConnections.length === 0}<p>No direct relationships match this view.</p>{/if}
         </div>
         {#if connectionPages > 1}<div class="map-pagination">
-          <button type="button" class="gp-btn px-2 py-0.5" aria-label="Previous connections" disabled={currentConnectionPage === 0} onclick={() => connectionPage = currentConnectionPage - 1}>Previous</button>
+          <button type="button" class="gp-btn" data-size="sm" aria-label="Previous connections" disabled={currentConnectionPage === 0} onclick={() => connectionPage = currentConnectionPage - 1}>Previous</button>
           <span>{currentConnectionPage + 1} / {connectionPages}</span>
-          <button type="button" class="gp-btn px-2 py-0.5" aria-label="Next connections" disabled={currentConnectionPage + 1 >= connectionPages} onclick={() => connectionPage = currentConnectionPage + 1}>Next</button>
+          <button type="button" class="gp-btn" data-size="sm" aria-label="Next connections" disabled={currentConnectionPage + 1 >= connectionPages} onclick={() => connectionPage = currentConnectionPage + 1}>Next</button>
         </div>{/if}
       </aside>
     {/if}
 
     {#if !loading && load?.available && model.nodes.length === 0}
-      <div class="map-empty"><strong>No nodes to display</strong><span>This graph payload is empty.</span></div>
+      <div class="map-empty"><EmptyState icon={Network} title="No nodes to display" hint="This graph payload is empty." compact /></div>
     {:else if !loading && load?.available && matches.length === 0}
-      <div class="map-empty"><strong>No nodes match the current filters</strong><span>Clear filters to show all loaded nodes.</span></div>
+      <div class="map-empty"><EmptyState icon={Filter} title="No nodes match the current filters" hint="Clear filters to show all loaded nodes." compact /></div>
     {/if}
 
     <div class="map-zoom" aria-label="Graph view controls">
-      <button type="button" class="gp-icon-btn h-7 w-7" aria-label="Zoom out" onclick={() => zoomAt(1 / 1.2)} disabled={zoomValue <= zoomMin}>−</button>
+      <button type="button" class="gp-icon-btn" data-size="md" aria-label="Zoom out" onclick={() => zoomAt(1 / 1.2)} disabled={zoomValue <= zoomMin}><Minus size={14} aria-hidden="true" /></button>
       <span>{zoomValue < 0.01 ? "<1" : Math.round(zoomValue * 100)}%</span>
-      <button type="button" class="gp-icon-btn h-7 w-7" aria-label="Zoom in" onclick={() => zoomAt(1.2)} disabled={zoomValue >= zoomMax}>+</button>
-      <button type="button" class="gp-btn ml-1" data-testid="map-fit" onclick={resetView} title={globeActive ? "Face the globe front-on (0)" : "Fit filtered nodes into the view (0)"}>{globeActive ? "Reset view" : "Fit view"}</button>
+      <button type="button" class="gp-icon-btn" data-size="md" aria-label="Zoom in" onclick={() => zoomAt(1.2)} disabled={zoomValue >= zoomMax}><Plus size={14} aria-hidden="true" /></button>
+      <button type="button" class="gp-btn ml-1" data-size="md" data-testid="map-fit" onclick={resetView} title={globeActive ? "Face the globe front-on (0)" : "Fit filtered nodes into the view (0)"}>{globeActive ? "Reset view" : "Fit view"}</button>
     </div>
     <div class="map-help">{globeActive ? "Drag to rotate" : "Drag to explore"} <span>·</span> Scroll to zoom <span>·</span> Select to trace connections</div>
   </div>
@@ -748,7 +767,7 @@
       {#if selectedNode}<span class="connection-count">{connections.length} loaded connections</span>{/if}
       {#if inspectedNode.flags?.length}<span class="inspector-kind">{inspectedNode.flags.map(f => f.flag).join(" · ")}</span>{/if}
       {#if onOpenNode && openPath}
-        <button type="button" class="gp-btn" onclick={() => { if (inspectedNode && openPath) onOpenNode?.(openPath, inspectedNode.id); }}>Open file ↗</button>
+        <button type="button" class="gp-btn" data-size="sm" onclick={() => { if (inspectedNode && openPath) onOpenNode?.(openPath, inspectedNode.id); }}>Open file ↗</button>
       {/if}
       {#if selectedNode}<button type="button" class="gp-icon-btn" aria-label="Clear selection" onclick={() => selectedId = null}>×</button>{/if}
     {:else}
@@ -764,40 +783,39 @@
     --map-border: rgb(var(--c-border) / 0.45);
     --map-muted: rgb(var(--c-text-muted));
     --map-hover: rgb(var(--c-surface-hover) / 0.55); }
-  .map-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; font-size: 11px; color: var(--map-muted); }
+  .map-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; font-size: var(--text-meta); color: var(--map-muted); }
   canvas:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
-  .map-honesty { margin: 0; padding: 0 20px 10px; color: rgb(var(--c-status-amber)); font-size: 11px; }
+  .map-honesty { margin: 0; padding: 0 20px 10px; color: rgb(var(--c-warn)); font-size: var(--text-meta); }
   .map-group-row { display: flex; min-width: 0; }
-  .group-pages { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 12px 12px 0; font-size: 10px; color: var(--map-muted); }
+  .group-pages { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 12px 12px 0; font-size: var(--text-micro); color: var(--map-muted); }
   .map-communities { display: flex; flex: 1; min-width: 0; gap: 5px; overflow-x: auto; padding: 0 20px 12px; scrollbar-width: thin; }
-  .map-communities > :global(.gp-chip) { flex: none; max-width: 220px; }
   .community-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; }
   .chip-count { opacity: .55; font-variant-numeric: tabular-nums; }
-  .map-neighbors { position: absolute; right: 16px; top: 8px; width: 304px; max-height: calc(100% - 76px); overflow: auto; padding: 10px; border: 1px solid var(--map-border); border-radius: 10px; background: var(--map-panel); box-shadow: var(--shadow-pop); }
+  .map-neighbors { position: absolute; right: 16px; top: 8px; width: 304px; max-height: calc(100% - 76px); overflow: auto; padding: 10px; border: 1px solid var(--map-border); border-radius: var(--gp-r-md); background: var(--map-panel); box-shadow: var(--shadow-pop); }
   .neighbor-heading, .trace-controls, .map-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .neighbor-heading { font-size: 11px; margin-bottom: 9px; }
+  .neighbor-heading { font-size: var(--text-meta); margin-bottom: 9px; }
   .node-suspects { width: 100%; margin-bottom: 9px; justify-content: flex-start; }
-  .trace-summary, .neighbor-list p { margin: 8px 0; font-size: 10px; line-height: 1.5; color: var(--map-muted); }
-  .map-pagination { padding: 5px; font-size: 10px; color: var(--map-muted); }
+  .trace-summary, .neighbor-list p { margin: 8px 0; font-size: var(--text-micro); line-height: 1.5; color: var(--map-muted); }
+  .map-pagination { padding: 5px; font-size: var(--text-micro); color: var(--map-muted); }
   .map-stage { overflow: hidden; background-image: radial-gradient(circle, rgb(var(--c-text-muted) / 0.08) .65px, transparent .65px); background-size: 22px 22px; }
-  .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: 9px; background: var(--map-panel); box-shadow: var(--shadow-pop); }
-  .map-zoom span { width: 42px; text-align: center; font-size: 10px; color: var(--map-muted); font-variant-numeric: tabular-nums; }
-  .map-help { position: absolute; bottom: 25px; left: 20px; font-size: 10px; color: var(--map-muted); pointer-events: none; }
+  .map-zoom { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; padding: 4px; border: 1px solid var(--map-border); border-radius: var(--gp-r-full); background: var(--map-panel); box-shadow: var(--shadow-card); }
+  .map-zoom span { width: 42px; text-align: center; font-size: var(--text-micro); color: var(--map-muted); font-variant-numeric: tabular-nums; }
+  .map-help { position: absolute; bottom: 25px; left: 20px; font-size: var(--text-micro); color: var(--map-muted); pointer-events: none; }
   .map-help span { padding: 0 6px; opacity: .4; }
-  .map-results { position: absolute; top: 8px; left: 16px; width: min(310px, calc(100% - 32px)); max-height: 60%; overflow-y: auto; padding: 6px; border-radius: 10px; border: 1px solid var(--map-border); background: var(--map-panel); box-shadow: var(--shadow-pop); }
-  .result-heading, .map-results p { padding: 7px; font-size: 10px; color: var(--map-muted); }
+  .map-results { position: absolute; top: 8px; left: 16px; width: min(310px, calc(100% - 32px)); max-height: 60%; overflow-y: auto; padding: 6px; border-radius: var(--gp-r-md); border: 1px solid var(--map-border); background: var(--map-panel); box-shadow: var(--shadow-float); }
+  .result-heading, .map-results p { padding: 7px; font-size: var(--text-micro); color: var(--map-muted); }
   .result-copy { display: flex; flex-direction: column; gap: 3px; overflow: hidden; }
-  .result-copy strong { font-size: 11px; font-weight: 500; }
+  .result-copy strong { font-size: var(--text-meta); font-weight: 500; }
   .result-copy strong, .inspector-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .result-copy small { font-size: 10px; color: var(--map-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 12px; color: var(--map-muted); pointer-events: none; }
-  .map-inspector { min-height: 55px; padding: 10px 20px; display: flex; align-items: center; gap: 12px; font-size: 11px; }
+  .result-copy small { font-size: var(--text-micro); color: var(--map-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .map-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: var(--text-xs); color: var(--map-muted); pointer-events: none; }
+  .map-inspector { min-height: 55px; padding: 10px 20px; display: flex; align-items: center; gap: 12px; font-size: var(--text-meta); }
   .inspector-copy { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
   .inspector-copy strong { font-weight: 500; }
-  .inspector-copy span { color: var(--map-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .inspector-kind, .connection-count { color: var(--map-muted); font-size: 10px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inspector-copy span { color: var(--map-muted); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .inspector-kind, .connection-count { color: var(--map-muted); font-size: var(--text-micro); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .inspector-placeholder { flex: 1; color: var(--map-muted); }
-  .inspector-key { color: var(--map-muted); font-size: 10px; opacity: .7; }
+  .inspector-key { color: var(--map-muted); font-size: var(--text-micro); opacity: .7; }
   .narrow .map-neighbors { left: 16px; width: auto; max-height: 38%; }
   .narrow .map-inspector { flex-wrap: wrap; }
   .narrow .map-help, .narrow .inspector-key { display: none; }

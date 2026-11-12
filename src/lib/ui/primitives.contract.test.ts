@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ACCENTS, accentFor } from "./accents";
 import { NON_TEXT_MIN, TEXT_MIN } from "./color/guard";
@@ -31,6 +31,7 @@ const TONES = ["ok", "warn", "danger", "info", "unknown"] as const;
 const TINT = 0.06;
 const notice = blockOf("@utility gp-notice {");
 const field = blockOf("@utility gp-field-multi {");
+const single = blockOf("@utility gp-field {");
 
 describe("gp-notice", () => {
   it("has one rule per tone, each pointing --gp-notice-tone at its status role", () => {
@@ -145,28 +146,64 @@ describe("gp-field-multi", () => {
     expect(shape).toContain("padding-block: var(--gp-space-2);");
   });
 
-  it("turns the edge and the focus ring to the danger role when invalid", () => {
-    expect(field).toContain('&[data-invalid]:not([data-invalid="false"]),');
-    expect(field).toContain('&[aria-invalid="true"] {');
-    expect(field).toMatch(/border-color:\s*rgb\(var\(--c-danger\)\);/);
-    expect(field).toContain("box-shadow: 0 0 0 3px rgb(var(--c-danger) / 0.28);");
+  it("turns the edge to the danger role when invalid, focused or not, with no halo (the state is gp-field's, so multi inherits it)", () => {
+    expect(single).toContain('&[data-invalid]:not([data-invalid="false"]),');
+    expect(single).toContain('&[aria-invalid="true"] {');
+    expect(single).toMatch(/border-color:\s*rgb\(var\(--c-danger\)\);/);
+    expect(single).not.toContain("rgb(var(--c-danger) / 0.28)");
   });
 
-  it("dims and locks a disabled field", () => {
+  it("dims a disabled field, and a disabled multiline field also loses its resize handle", () => {
     const disabled = blockOf('&:disabled,\n  &[aria-disabled="true"] {');
     expect(disabled).toContain("@apply cursor-not-allowed opacity-40;");
-    expect(disabled).toContain("resize: none;");
+    expect(field).toContain('&[aria-disabled="true"] {');
+    expect(field).toContain("resize: none;");
   });
 
-  it("keeps gp-field's focus: the accent edge and --ring-focus, inherited, not restated", () => {
-    expect(blockOf("@utility gp-field {")).toContain("box-shadow: var(--ring-focus);");
-    expect(field.replace(/\/\*[\s\S]*?\*\//g, "")).not.toContain("--ring-focus");
+  // Owner, 2026-11-11: "make the focus ring less annoying". A text field
+  // being typed in shows its caret; the focus is an edge leaning toward the
+  // accent, not a halo. The ring stays for operated controls.
+  it("focuses a field by its edge (--field-focus-edge), with no halo, inherited by multi, not restated", () => {
+    const code = (block: string) => block.replace(/\/\*[\s\S]*?\*\//g, "");
+    const focus = /&:focus \{([^}]*)\}/.exec(code(single))?.[1] ?? "";
+    expect(focus).toContain("border-color: var(--field-focus-edge);");
+    expect(focus).not.toContain("box-shadow");
+    expect(code(single)).not.toContain("--ring-focus");
+    expect(code(field)).not.toMatch(/--ring-focus|--field-focus-edge/);
+  });
+
+  it("derives the field's focus edge from the accent in both themes, so a user-picked accent carries", () => {
+    for (const theme of ["html.dark {", "html.light {"]) {
+      expect(blockOf(theme)).toMatch(/--field-focus-edge:\s*rgb\(var\(--c-accent\) \/ 0\.\d+\);/);
+    }
+  });
+
+  it("is not restated by a component: no field-like box draws the old halo or the full-accent edge on focus", () => {
+    const root = new URL("../components/", import.meta.url);
+    const offenders: string[] = [];
+    const walk = (dir: URL) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) walk(new URL(`${entry.name}/`, dir));
+        else if (entry.name.endsWith(".svelte")) {
+          const text = readFileSync(new URL(entry.name, dir), "utf8");
+          if (/\bfocus(-within)?:(shadow-\(--ring-focus\)|border-accent\b(?!\/))/.test(text)) offenders.push(entry.name);
+        }
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
+  });
+
+  it("gives the ring back, opaque, to a user who asked for more contrast", () => {
+    const more = blockOf("@media (prefers-contrast: more) {");
+    expect(more).toContain("--field-focus-edge: rgb(var(--c-accent));");
+    expect(more).toMatch(/\.gp-field:focus,\s*\.gp-field:focus-within,\s*\.gp-field-multi:focus \{\s*box-shadow: var\(--ring-focus\);/);
   });
 
   it("is in both reduced-motion lists and the macOS field fill, beside gp-field", () => {
-    // gp-check sits between gp-field-multi and gp-slide-docked in both lists.
-    expect(css).toMatch(/html :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-slide-docked[^)]*\) \{\s*transition: none !important;/);
-    expect(css).toMatch(/html\[data-motion="reduced"\] :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-slide-docked[^)]*\) \{\s*transition: none !important;/);
+    // gp-check sits between gp-field-multi and gp-view-flyout-item in both lists.
+    expect(css).toMatch(/html :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-view-flyout-item[^)]*\) \{\s*transition: none !important;/);
+    expect(css).toMatch(/html\[data-motion="reduced"\] :is\([^)]*\.gp-field, \.gp-field-multi, \.gp-check, \.gp-view-flyout-item[^)]*\) \{\s*transition: none !important;/);
     expect(css).toContain('html.macos :where([class~="bg-background"], .gp-field, .gp-field-multi, .gp-select) {');
   });
 

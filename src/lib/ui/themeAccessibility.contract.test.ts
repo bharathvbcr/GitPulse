@@ -28,9 +28,22 @@ describe("focus is visible when the system paints the colours", () => {
     expect(forced).toMatch(/outline:\s*2px solid Highlight/);
   });
 
-  it("covers every role the base focus rule covers", () => {
+  it("rings every operated control, and forced colours outline those plus every text field", () => {
     const base = block("  button:focus-visible");
     const forced = block("@media (forced-colors: active)");
+    for (const role of [
+      "button:focus-visible",
+      '[role="button"]:focus-visible',
+      '[role="tab"]:focus-visible',
+      'input[type="checkbox"]:focus-visible',
+      'input[type="radio"]:focus-visible',
+      'input[type="range"]:focus-visible',
+      'input[type="color"]:focus-visible',
+      'input[type="file"]:focus-visible',
+      "select:focus-visible",
+    ]) {
+      expect(base).toContain(role);
+    }
     for (const role of [
       "button:focus-visible",
       '[role="button"]:focus-visible',
@@ -39,9 +52,17 @@ describe("focus is visible when the system paints the colours", () => {
       "textarea:focus-visible",
       "select:focus-visible",
     ]) {
-      expect(base).toContain(role);
       expect(forced).toContain(role);
     }
+  });
+
+  it("draws no ring on a text box being typed in (owner decision 2026-11-11)", () => {
+    // A focused text box always matches :focus-visible, so the base ring drew
+    // a box inside every search pill while typing. The caret marks it; the
+    // forced-colours outline above still applies.
+    const base = block("  button:focus-visible");
+    expect(base).not.toMatch(/^\s*input:focus-visible,?$/m);
+    expect(base).not.toMatch(/^\s*textarea:focus-visible,?$/m);
   });
 
   it("uses system colour keywords rather than theme tokens", () => {
@@ -63,7 +84,9 @@ describe("native fields keep theme ink in WKWebView", () => {
     // transparent (macOSPrivateApi). The fill colour is what actually paints.
     const field = block("@utility gp-field {");
     expect(field).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
-    expect(field).toMatch(/::placeholder[\s\S]*-webkit-text-fill-color:\s*rgb\(var\(--c-text-muted\)/);
+    expect(field).toMatch(/::placeholder[\s\S]*-webkit-text-fill-color:\s*rgb\(var\(--c-text-faint\)\);/);
+    // An opaque role, not the muted colour at 60% alpha: faint is held to 4.5:1 on every surface.
+    expect(field).not.toMatch(/--c-text-muted\) \/ 0\.6|placeholder:text-textMuted\/60/);
     const select = block("@utility gp-select {");
     expect(select).toContain("-webkit-text-fill-color: rgb(var(--c-text))");
   });

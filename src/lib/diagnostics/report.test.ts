@@ -171,7 +171,7 @@ describe("withPersistedLogSection", () => {
   it("turns a failed read into a stated reason, not an empty log", () => {
     const out = withPersistedLogSection("r", unreadablePersistedLog("IPC rejected"));
     expect(out).toContain("Durable backend log — unavailable");
-    expect(out).toContain("could not be read: IPC rejected");
+    expect(out).toContain("couldn't be read: IPC rejected");
   });
 
   it("redacts credentials from legacy durable metadata and lines before export", () => {

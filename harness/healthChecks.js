@@ -122,15 +122,15 @@ export async function runHealthChecks(ctx) {
     await rescan("findings");
 
     button("Fix with Manvi").click();
-    await until(() => !!section("plan") && has(section("plan"), "Rescan Health"));
+    await until(() => !!section("plan") && has(section("plan"), "Rescan health"));
     repoStore.setTerminalOpen(false);
     button("Terminal").click(); await tick();
     check("the plan opens the terminal beside it, not instead of it", () =>
       get(repoStore).terminalOpen === true && !!section("plan") && has(section("plan"), "Run all steps"));
     const scansBeforeRescan = scanCalls(REPO);
-    button("Rescan Health").click();
+    button("Rescan health").click();
     await settle();
-    check("the plan's Rescan Health rescans", () => scanCalls(REPO) === scansBeforeRescan + 1);
+    check("the plan's Rescan health rescans", () => scanCalls(REPO) === scansBeforeRescan + 1);
     check("a rescan supersedes the plan it was written against", () => !section("plan"));
 
     // ---- Coding-agent launch: the shared channel, the dock, and cancellation ---
@@ -143,7 +143,7 @@ export async function runHealthChecks(ctx) {
     check("the terminal dock opens before the launch is awaited", () => get(repoStore).terminalOpen === true && has(agentBar(), "Opening agent terminal…"));
     terminalLaunchRequests.take(REPO).complete(); await wait();
     check("a claimed launch reports the session as opened", () =>
-      has(agentBar(), `${PROVIDER_LABELS.claude} session opened in the terminal. Rescan Health after it finishes.`));
+      has(agentBar(), `${PROVIDER_LABELS.claude} session opened in the terminal. Rescan health after it finishes.`));
     runButton().click(); await tick();
     terminalLaunchRequests.take(REPO).complete("Fixture launch refused"); await wait();
     check("a refused launch says why", () => has(agentBar().querySelector('[role="alert"]'), "Fixture launch refused"));
@@ -228,9 +228,16 @@ export async function runHealthChecks(ctx) {
 
     // ---- Scan lifecycle: one scan per visit, cache, no foreign data -------------
     const visits = scanCalls("/fixture/Visit");
+    const secretVisits = secretsScans("/fixture/Visit");
     await switchTo("/fixture/Visit");
     await wait(400);
     check("opening a repository scans it exactly once", () => scanCalls("/fixture/Visit") === visits + 1, () => scanCalls("/fixture/Visit") - visits);
+    // The palette's "Scan dependencies and secrets" replaced two commands by
+    // opening this panel (palette/catalog.test.ts pins that it does), so opening
+    // the panel has to be what starts BOTH scans.
+    check("opening Health starts the secrets scan together with the dependency scan, once each", () =>
+      secretsScans("/fixture/Visit") === secretVisits + 1 && scanCalls("/fixture/Visit") === visits + 1,
+      () => `secrets ${secretsScans("/fixture/Visit") - secretVisits}, dependencies ${scanCalls("/fixture/Visit") - visits}`);
     knobs.scanDelay = 700;
     await switchTo("/fixture/Other");
     await switchTo(REPO);
@@ -294,7 +301,7 @@ export async function runHealthChecks(ctx) {
     knobs.dead = deadAnswer({ available: false, reason: "index is stale" });
     await rescan("findings");
     check("a dead-code check that could not run is not read as finding nothing", () =>
-      has(section("dead-code"), "Dead-code check could not run: index is stale") && has(section("dead-code"), "not the same as finding no unreferenced symbols"));
+      has(section("dead-code"), "Dead-code check couldn't run: index is stale") && has(section("dead-code"), "not the same as finding no unreferenced symbols"));
     knobs.dead = deadAnswer({});
     await rescan("findings");
     check("an answered, empty graph says there are no candidates", () => has(section("dead-code"), "No dead-code candidates in the indexed graph."));

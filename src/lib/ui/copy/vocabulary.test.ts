@@ -57,6 +57,10 @@ const EXAMPLES: Record<string, { hit: string[]; miss: string[] }> = {
   },
   successfully: { hit: ["Saved successfully", "Successfully merged"], miss: ["success", "Saved"] },
   Oops: { hit: ["Oops, that failed", "oops"], miss: ["hoops", "Loops"] },
+  "could not": {
+    hit: ["The log could not be read", "Could not save", "COULD NOT RUN"],
+    miss: ["The log couldn't be read", "Couldn't save", "could nothing", "discourse could notably"],
+  },
   please: { hit: ["Please wait", "Wait, please."], miss: ["pleasure", "displease"] },
   "exclamation mark": {
     hit: ["Done!", "Saved! ", 'Welcome!"', "Nice (really)! Yes"],
@@ -90,6 +94,7 @@ describe("BANNED_UI_TERMS contract", () => {
         "attempt",
         "code graph",
         "codeintel",
+        "could not",
         "devmap",
         "generation N",
         "harness",

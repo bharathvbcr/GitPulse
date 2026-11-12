@@ -8,12 +8,13 @@
    * the reader's preferences (`interfaceStore.taskBoards`), not in the task
    * store, so saving one never writes a task or a workspace.
    *
-   * Placed and dismissed the way the View menu beside it is: `absolute` under
-   * its own trigger, with dismissal from the shared popover owner.
+   * Placed and dismissed by the shared popover owner: portaled to the body,
+   * anchored under its own trigger, and clamped to the window.
    */
   import { Bookmark, X } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { popover } from "../ui/popover";
+  import { portal } from "../dom/portal";
+  import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import { MAX_VIEW_NAME, boardPrefs, sameSnapshot, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import { newID } from "../workbench/client";
@@ -28,7 +29,6 @@
   } = $props();
 
   let open = $state(false);
-  let root: HTMLDivElement | undefined = $state();
   let name = $state("");
   let message = $state("");
   let failed = $state(false);
@@ -38,13 +38,24 @@
   // A different board's draft name and message must not carry over.
   $effect(() => { board; name = ""; message = ""; failed = false; });
 
-  const dismissal = {
-    dismiss: { inside: "[data-task-saved-views]", escape: "bubble" as const },
+  let toggleEl: HTMLButtonElement | undefined = $state();
+
+  /**
+   * Anchored under the trigger and right-aligned to it, then clamped to the
+   * window: the Tasks pane is paint-contained and sits beside the sidebar, so
+   * a CSS `absolute` panel that opens leftwards was cut off at the pane edge.
+   * `revision` re-places it when a saved or deleted view changes its height.
+   */
+  const dismissal = $derived({
+    anchor: { kind: "element" as const, element: toggleEl, gap: 4, align: "end" as const },
+    inset: 8,
+    revision: `${views.length}|${message}`,
+    dismiss: { inside: "[data-task-saved-views]", escape: "bubble" as const, resize: true },
     onDismiss: (reason: string) => {
       open = false;
-      if (reason === "escape") root?.querySelector<HTMLButtonElement>("[data-task-views-toggle]")?.focus();
+      if (reason === "escape") restoreFocusTo(toggleEl);
     },
-  };
+  });
 
   function save(event: SubmitEvent) {
     event.preventDefault();
@@ -66,11 +77,12 @@
   }
 </script>
 
-<div class="relative" bind:this={root} data-task-saved-views>
+<div class="relative" data-task-saved-views>
   <button
     type="button"
     class="gp-btn"
     data-task-views-toggle
+    bind:this={toggleEl}
     aria-expanded={open}
     aria-haspopup="true"
     {disabled}
@@ -82,14 +94,16 @@
   </button>
   {#if open}
     <div
-      use:popover={dismissal}
-      class="panel absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-64 flex flex-col gap-1"
+      use:portal={"body"}
+      use:popover={dismissal} out:popoverExit
+      data-task-saved-views
+      class="panel fixed gp-menu gp-pop p-2 w-64 flex flex-col gap-1"
       style="z-index: {LAYERS.MENU}"
       role="group"
       aria-label={`Saved views for ${boardName}`}
       data-testid="task-saved-views"
     >
-      <p class="px-1.5 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Views on {boardName}</p>
+      <p class="gp-label px-1.5 pb-1">Views on {boardName}</p>
       {#if views.length === 0}<p class="note">None yet. Arrange the board, then save it here by name.</p>{/if}
       {#each views as view (view.id)}
         <div class="view-row" data-task-view={view.id}>
@@ -98,7 +112,7 @@
         </div>
       {/each}
       <form class="save" onsubmit={save}>
-        <input class="gp-field" aria-label="View name" placeholder="Name this view" maxlength={MAX_VIEW_NAME} bind:value={name} />
+        <input class="gp-field" data-size="sm" aria-label="View name" placeholder="Name this view" maxlength={MAX_VIEW_NAME} bind:value={name} />
         <button type="submit" class="gp-btn">Save</button>
       </form>
       <p class="note" role="status" class:failed>{message}</p>
@@ -109,12 +123,12 @@
 <style>
   .panel{max-height:min(70vh,32rem);overflow:hidden auto}
   .view-row{display:flex;align-items:center;gap:4px}
-  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:5px;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .apply{flex:1;min-width:0;text-align:left;padding:4px 6px;border-radius:var(--gp-r-sm);font-size:var(--text-meta);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .apply:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .apply[aria-pressed="true"]{color:rgb(var(--c-accent));font-weight:600}
-  .apply:focus-visible{outline:2px solid rgb(var(--c-accent) / 0.6);outline-offset:-1px}
-  .save{display:flex;gap:4px;padding-top:4px;border-top:1px solid rgb(var(--c-border) / 0.6)}
-  .save input{flex:1;min-width:0;font-size:11px;padding:3px 6px}
-  .note{margin:0;padding:0 6px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
-  .note.failed{color:#d15a64}
+  .apply:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:-1px}
+  .save{display:flex;gap:4px;padding-top:6px}
+  .save input{flex:1;min-width:0;font-size:var(--text-meta)}
+  .note{margin:0;padding:0 6px;font-size:var(--text-micro);line-height:1.35;color:rgb(var(--c-text-muted));min-height:0}
+  .note.failed{color:rgb(var(--c-danger))}
 </style>

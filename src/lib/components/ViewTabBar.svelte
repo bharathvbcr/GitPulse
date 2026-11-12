@@ -14,7 +14,7 @@
   import { isMacOS } from "../platform";
   import { liquidSelection } from "../ui/transitions";
   import { portal } from "../dom/portal";
-  import { popover } from "../ui/popover";
+  import { popover, popoverExit } from "../ui/popover";
   import { LAYERS } from "../ui/layers";
   import ViewSectionTabs from "./ViewSectionTabs.svelte";
 
@@ -83,7 +83,7 @@
   function tabClass(item: ViewNavItem, active: boolean): string {
     const warning = item.id === "work" && conflictedCount > 0;
     if (active && warning) {
-      return "text-amber-400!";
+      return "text-warn!";
     }
     return "";
   }
@@ -220,7 +220,9 @@
   });
 </script>
 
-<nav class="relative shrink-0" aria-label="Views" data-tour="views">
+<!-- The `nav "Views"` landmark is the view bar that hosts this switcher
+     (ViewBar.svelte): the switcher is one part of it, beside the pills. -->
+<div class="relative shrink-0" data-tour="views">
   <div class="sr-only">
     {#each navItems as item (item.id)}
       {@const guide = destinationGuide(tipGuideKey(item.id))}
@@ -248,7 +250,7 @@
            view button inside is the control, and the keyboard needs no flyout. -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
-        class="gp-view-group gp-segmented"
+        class="gp-segmented"
         class:gp-liquid-tabs={macos}
         data-view-group={item.id}
         data-active={active ? "true" : "false"}
@@ -283,7 +285,7 @@
           <span>{formatViewTabLabel(item, conflictedCount)}</span>
           {#if flag}
             <b
-              class="gp-attention-badge {flag.tone === 'rose' ? 'bg-rose-500' : 'bg-amber-500'} {flag.count === null ? 'gp-attention-dot' : ''}"
+              class="gp-attention-badge {flag.tone === 'rose' ? 'bg-danger' : 'bg-warn'} {flag.count === null ? 'gp-attention-dot' : ''}"
               aria-hidden="true">{flag.count ?? ""}</b
             >
           {/if}
@@ -297,14 +299,9 @@
           />
         {/if}
       </div>
-      {#if item.id === "history" && $repoStore.statuses.length > 0}
-        <button type="button" class="px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-600 dark:text-amber-300 font-semibold hover:bg-amber-500/30"
-          title="Preview uncommitted files and modifications" aria-label="Preview {$repoStore.statuses.length} uncommitted changes"
-          onclick={() => void repoStore.previewUncommitted()}>{$repoStore.statuses.length}</button>
-      {/if}
     {/each}
   </div>
-</nav>
+</div>
 
 {#if flyoutView && flyoutAnchor}
   {@const view = flyoutView}
@@ -317,7 +314,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     use:portal={"body"}
-    use:popover={flyoutPlacement}
+    use:popover={flyoutPlacement} out:popoverExit
     data-view-flyout={view}
     role="group"
     aria-label="{item?.label ?? view} sections"
@@ -331,7 +328,7 @@
       <Icon size={14} class="shrink-0 text-accent" aria-hidden="true" />
       <span class="min-w-0">
         <span class="block font-semibold">{item?.label ?? view}</span>
-        {#if guide}<span class="block text-[11px] leading-snug text-textMuted whitespace-normal">{guide.summary}</span>{/if}
+        {#if guide}<span class="block text-meta leading-snug text-textMuted whitespace-normal">{guide.summary}</span>{/if}
       </span>
     </button>
     <div class="gp-separator my-1" aria-hidden="true"></div>
@@ -348,7 +345,7 @@
         <SectionIcon size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
         <span class="flex-1 min-w-0 truncate">{section.label}</span>
         {#if flag}
-          <span class="shrink-0 rounded-full px-1.5 text-[10px] font-semibold text-white {flag.tone === 'rose' ? 'bg-rose-500' : 'bg-amber-500'}" title={flag.reason}
+          <span class="shrink-0 rounded-full px-1.5 text-micro font-semibold text-white {flag.tone === 'rose' ? 'bg-danger' : 'bg-warn'}" title={flag.reason}
             >{flag.count ?? "!"}</span
           >
         {/if}

@@ -22,7 +22,7 @@ describe("RepoTabBar", () => {
     // Escape still closes the tab menus; every switch happens after the guard.
     expect(guard).toBeGreaterThan(handler.indexOf('e.key === "Escape"'));
     expect(guard).toBeLessThan(handler.indexOf("switch (classifyShortcut(e))"));
-    expect(guard).toBeLessThan(handler.indexOf("repoStore.activateTabAt"));
+    expect(guard).toBeLessThan(handler.indexOf("repoStore.activateTabByDigit"));
     expect(guard).toBeLessThan(handler.indexOf("repoStore.closeActiveTab"));
     expect(guard).toBeLessThan(handler.indexOf("onOpen?.()"));
   });
@@ -33,6 +33,179 @@ describe("RepoTabBar", () => {
     expect(body).toContain('data-testid="fleet-tab-chip"');
     expect(body).toContain('data-testid="open-repo-tab"');
     expect(body).toContain('title="Open repository"');
+  });
+
+  it("keeps Fleet before Agents before Tasks, each a tab named with its count", () => {
+    const { body } = render(RepoTabBar);
+    const fleet = body.indexOf('data-testid="fleet-tab-chip"');
+    const agents = body.indexOf('data-testid="agents-tab-chip"');
+    const tasks = body.indexOf('data-testid="tasks-tab-chip"');
+    expect(fleet).toBeGreaterThan(-1);
+    expect(agents).toBeGreaterThan(fleet);
+    expect(tasks).toBeGreaterThan(agents);
+    // Below 1100px the label gives way to icon plus badge, so the count must
+    // live in the name: the badge is aria-hidden.
+    expect(source).toContain("aria-label={surfaceCount > 0 ? `${spec.label}, ${surfaceCount} ${spec.countNoun ?? \"\"}`.trim() : spec.label}");
+  });
+
+  it("opens the recent-repositories menu aligned to the trigger's end edge", () => {
+    // Open sits at the right edge now, so a start-aligned 320px menu would
+    // spill off the window.
+    const placement = source.slice(source.indexOf("const recentsPlacement"), source.indexOf("estimate: { width: 320"));
+    expect(placement).toContain('align: "end"');
+    expect(placement).not.toContain('align: "start"');
+  });
+
+  it("orders the title bar: the tablist, the drag zone, Open pinned right, then the workspace actions", () => {
+    // Open is the first control of the right-hand cluster, so its position is
+    // fixed rather than following the last tab. The free space before it is
+    // the window-drag zone (E3): the strip scrolls before that space shrinks
+    // below 48px.
+    const tabs = source.indexOf('aria-label="Workspace"');
+    const zone = source.indexOf("data-drag-zone");
+    const open = source.indexOf('data-testid="open-repo-tab"');
+    const menu = source.indexOf('data-testid="open-repo-menu"');
+    const actions = source.indexOf("<WorkspaceActions");
+    expect(tabs).toBeGreaterThan(-1);
+    expect(zone).toBeGreaterThan(tabs);
+    expect(open).toBeGreaterThan(zone);
+    expect(menu).toBeGreaterThan(open);
+    expect(actions).toBeGreaterThan(menu);
+    const zoneTag = source.slice(source.lastIndexOf("<div", zone), source.indexOf("></div>", zone));
+    expect(zoneTag).toContain("min-w-12");
+    expect(zoneTag).toContain("flex-1");
+    expect(zoneTag).toContain("data-tauri-drag-region");
+    const openTag = source.slice(source.lastIndexOf("<button", open), source.indexOf("\n    >", open));
+    expect(openTag).not.toContain("ml-auto");
+    expect(openTag).toContain("shrink-0");
+  });
+
+  it("is one tablist, Workspace, holding the surfaces and the repositories with one roving stop", async () => {
+    interfaceStore.setFleetOpen(false);
+    await repoStore.openRepo("/repo/one-list", { allowBroken: true, activate: true });
+    try {
+      const { body } = render(RepoTabBar);
+      expect(body.match(/role="tablist"/g)).toHaveLength(1);
+      expect(body).toContain('aria-label="Workspace"');
+      // The surfaces are tabs of that list, in Fleet, Agents, Tasks order.
+      const tabs = [...body.matchAll(/<button\b[^>]*role="tab"[^>]*>/g)].map((match) => match[0]);
+      const surfaces = tabs.filter((tag) => tag.includes("data-surface-tab"));
+      expect(surfaces.map((tag) => /data-surface-tab="(\w+)"/.exec(tag)?.[1])).toEqual(["fleet", "agents", "tasks"]);
+      // Exactly one tab is the roving stop: the active repository, with the
+      // repository surface showing.
+      expect(tabs.filter((tag) => tag.includes('tabindex="0"'))).toHaveLength(1);
+      expect(tabs.filter((tag) => tag.includes('aria-selected="true"'))).toHaveLength(1);
+      const stop = tabs.find((tag) => tag.includes('tabindex="0"')) ?? "";
+      expect(stop).toContain("data-tab-id");
+      expect(surfaces.every((tag) => tag.includes('aria-selected="false"'))).toBe(true);
+    } finally {
+      await repoStore.closeActiveTab();
+    }
+  });
+
+  it("moves the one selected tab and the roving stop onto the open surface", async () => {
+    await repoStore.openRepo("/repo/surface-stop", { allowBroken: true, activate: true });
+    interfaceStore.setTasksOpen(true);
+    try {
+      const { body } = render(RepoTabBar);
+      const tabs = [...body.matchAll(/<button\b[^>]*role="tab"[^>]*>/g)].map((match) => match[0]);
+      expect(tabs.filter((tag) => tag.includes('aria-selected="true"'))).toHaveLength(1);
+      const stops = tabs.filter((tag) => tag.includes('tabindex="0"'));
+      expect(stops).toHaveLength(1);
+      expect(stops[0]).toContain('data-surface-tab="tasks"');
+    } finally {
+      interfaceStore.setTasksOpen(false);
+      await repoStore.closeActiveTab();
+    }
+  });
+
+  it("makes Fleet the way in when nothing is selected", () => {
+    const { body } = render(RepoTabBar);
+    const tabs = [...body.matchAll(/<button\b[^>]*role="tab"[^>]*>/g)].map((match) => match[0]);
+    const stops = tabs.filter((tag) => tag.includes('tabindex="0"'));
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toContain('data-surface-tab="fleet"');
+  });
+
+  it("replaces the native title tooltip with the hover card, opened after the intent delay", () => {
+    // Native `title` on the tab shell is gone (the card says more and is
+    // placed by the popover owner); the card is portaled and closes on drag.
+    const tab = source.slice(source.indexOf("{#snippet repoTab"), source.indexOf("{#snippet stackHead"));
+    expect(tab).not.toMatch(/\n    title=\{/);
+    expect(tab).toContain("onpointerenter={(e) => onTabEnter(e, tab.id)}");
+    expect(tab).toContain("closeCard();");
+    expect(source).toContain("const CARD_INTENT_MS = 500;");
+    expect(source).toContain("use:popover={cardPlacement}");
+    expect(source).toContain("use:portal={\"body\"}");
+  });
+
+  it("jumps to a repository with Cmd/Ctrl+1-9 through the store, which makes 9 the last", () => {
+    const handler = source.slice(source.indexOf("function handleKey"), source.indexOf("onMount("));
+    // The digit-to-stop rule lives in `jumpTargetIndex`, shared with the native
+    // menu's repository-tab items; this handler only forwards the digit.
+    expect(handler).toContain("repoStore.activateTabByDigit(Number(digit[1]))");
+    expect(handler).not.toContain("activationStops");
+    // A key a terminal or editor already consumed is not a tab jump.
+    const jump = handler.slice(handler.indexOf('case "jumpToTab"'), handler.indexOf('case "cycleTabs"'));
+    expect(jump).toContain("if (e.defaultPrevented) return;");
+  });
+
+  it("hints the digit that reaches a tab, and none for a stop no digit reaches", () => {
+    expect(source).toContain("jumpDigitFor(stops.indexOf(cardTab.id), stops.length)");
+    expect(source).toContain("shortcutTextLabel(`⌘${jumpDigit}`, $hostPlatform.os)");
+    expect(source).not.toContain("⌃⌥");
+  });
+
+  it("marks a background tab whose agent asks for the reader, and never marks an unread one", () => {
+    const tab = source.slice(source.indexOf("{#snippet repoTab"), source.indexOf("{#snippet stackHead"));
+    expect(tab).toContain("data-agent-mark={ask.reason}");
+    expect(tab).toContain("{#if !(tab.isActive && viewingRepo)}");
+    // Only an `attention` state draws a mark; unknown stays unknown.
+    expect(source).toContain('return state?.state === "attention" ? state : null;');
+  });
+
+  it("opens the overflow menu only while the strip hides units", () => {
+    // Nothing is hidden in a server render, so the trigger is absent.
+    expect(render(RepoTabBar).body).not.toContain('data-testid="repo-overflow"');
+    expect(source).toContain("new IntersectionObserver(");
+    expect(source).toContain("{#if !hideTabStrip && overflowUnits.length > 0}");
+  });
+
+  it("gives the strip the diffuse edge", () => {
+    expect(source).toContain('<ScrollCue target={scroller} axis="x" diffuse />');
+  });
+
+  it("dismisses Fleet with the same close control Agents and Tasks use", () => {
+    interfaceStore.setFleetOpen(false);
+    expect(render(RepoTabBar).body).not.toContain('data-testid="fleet-tab-close"');
+
+    interfaceStore.setFleetOpen(true);
+    try {
+      const { body } = render(RepoTabBar);
+      expect(body).toContain('data-testid="fleet-tab-close"');
+      expect(body).toContain('aria-label="Close Fleet"');
+      // The close is the icon-button dialect, danger-toned: no palette class.
+      const close = /<button\b[^>]*data-testid="fleet-tab-close"[^>]*>/.exec(body)?.[0] ?? "";
+      expect(close).toContain('class="gp-icon-btn"');
+      expect(close).toContain('data-tone="danger"');
+      expect(close).not.toContain("rose");
+    } finally {
+      interfaceStore.setFleetOpen(false);
+    }
+
+    // One snippet draws all three surfaces, so Fleet's wiring is read at its
+    // call site and the close control's behaviour at the snippet.
+    const fleet = source.slice(
+      source.indexOf('id: "fleet"'),
+      source.indexOf('id: "agents"'),
+    );
+    expect(fleet).toContain("onselect: () => interfaceStore.toggleFleet()");
+    expect(fleet).toContain("onclose: () => interfaceStore.setFleetOpen(false)");
+    const snippet = source.slice(source.indexOf("{#snippet surfaceTab"), source.indexOf("{#snippet groupHead"));
+    expect(snippet.indexOf("onclick={spec.onselect}")).toBeLessThan(snippet.indexOf('data-testid="{spec.id}-tab-close"'));
+    expect(snippet).toContain("{#if spec.open}");
+    expect(snippet).toContain("event.stopPropagation()");
+    expect(snippet).toContain("spec.onclose()");
   });
 
   it("renders tab bar when tabs are open", async () => {
@@ -55,7 +228,9 @@ describe("RepoTabBar", () => {
     expect(body).toContain('data-testid="fleet-tab-chip"');
     expect(body).toContain('data-testid="open-repo-tab"');
     expect(body).toContain('title="Clone or open a recent repository"');
-    expect(body).not.toContain('role="tablist"');
+    // The surfaces stay a tablist; only the repository strip goes away.
+    expect(body).toContain('aria-label="Workspace"');
+    expect(body).not.toContain("data-repo-strip-scroller");
     expect(body).not.toContain("alone-project");
 
     interfaceStore.setAutoHideRepoTabs(false);

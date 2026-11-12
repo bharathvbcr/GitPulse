@@ -36,7 +36,7 @@ describe("BranchCleanupModal backups read failure", () => {
     const view = source.slice(source.indexOf("{#if backupsError}"));
     const errorView = view.slice(0, view.indexOf("{:else if backups.length === 0}"));
     expect(errorView).toContain("disabled={backupsLoading}");
-    expect(errorView).toContain('{backupsLoading ? "Retrying…" : "Retry"}');
+    expect(errorView).toContain('{backupsLoading ? "Trying again…" : "Try again"}');
   });
 
   it("never lets the empty-state sentence stand in for a failed read", () => {
@@ -52,7 +52,7 @@ describe("BranchCleanupModal backups read failure", () => {
     expect(errorView).toContain("Couldn't read branch backups.");
     expect(errorView).toContain("{backupsError}");
     expect(errorView).toContain("onclick={() => void loadBackups()}");
-    expect(errorView).toContain("Retry");
+    expect(errorView).toContain("Try again");
   });
 
   it("does not print a count for a list it could not read", () => {

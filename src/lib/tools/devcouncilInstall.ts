@@ -26,7 +26,7 @@ export const DEVCOUNCIL_PRESETS: {
   {
     id: "analysis",
     label: "Analysis suite",
-    detail: "devmap, dcstore, dcverify, dcgrep — no Go host.",
+    detail: "The DevMap, dcstore, dcverify and dcgrep commands — no Go host.",
   },
   {
     id: "all",

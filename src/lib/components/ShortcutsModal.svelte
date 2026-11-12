@@ -4,11 +4,14 @@
   import { fade, scale } from "svelte/transition";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
+  import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { LAYERS } from "../ui/layers";
-  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "@lucide/svelte";
+  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff, SquareTerminal } from "@lucide/svelte";
+  import { terminalGuideShortcuts } from "../terminal/shortcutGuide";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { isDialogEscape } from "../keyboard/dialogEscape";
   import { isModalOccupied } from "../keyboard/modalOccupied";
+  import type { HostOS } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutKeyLabels, shortcutTextLabel } from "../ui/platformCopy";
 
@@ -33,18 +36,22 @@
     shortcuts: ShortcutItem[];
   }
 
-  const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
+  // A function of the host because the view chord is not the same words on
+  // every host (see viewShortcuts.ts); everything else is authored in macOS
+  // notation and mapped below.
+  function shortcutCategories(os: HostOS): ShortcutCategory[] {
+    return [
     {
       title: "Workspace & Tabs",
       icon: LayoutGrid,
       shortcuts: [
         { keys: ["⌘", "O"], description: "Open Repository…" },
         { keys: ["⌘", "T"], description: "Open Repository… (new tab)" },
-        { keys: ["⌘", "⇧", "O"], description: "Clone Repository…" },
+        { keys: ["⌘", "⇧", "O"], description: "Clone repository…" },
         { keys: ["⌘", "⇧", "W"], description: "Close active repository tab" },
         { keys: ["Ctrl", "Tab"], description: "Cycle to next repository tab" },
         { keys: ["Ctrl", "⇧", "Tab"], description: "Cycle to previous repository tab" },
-        { keys: ["Ctrl", "Alt", "1–9"], description: "Jump to specific repository tab" },
+        { keys: ["⌘", "1–9"], description: "Jump to a repository tab; 9 is the last one" },
         { keys: ["Ctrl", "⇧", "← / →"], description: "Move the focused repository tab left or right" },
       ],
     },
@@ -57,12 +64,12 @@
         // views ("Files, Graph, Diff, Resolve, Blame, Stack, GitHub, Coverage,
         // Health") for months after the app consolidated to four — from the
         // one screen whose entire job is to be right about this.
-        ...viewShortcutRows(),
+        ...viewShortcutRows(os),
         ...sectionShortcutRows(),
         { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
         { keys: ["⌘", "⇧", "A"], description: "Open the Agents plane" },
         { keys: ["Ctrl", "`"], description: "Toggle the terminal dock" },
-        { keys: ["⌘", "F"], description: "Search commits — switches to History from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
+        { keys: ["⌘", "F"], description: "Search commits (switches to History). In Code it searches the open file; in History → Diff, the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
         { keys: ["⌘", "+"], description: "Zoom in — scales the whole interface" },
         { keys: ["⌘", "-"], description: "Zoom out — scales the whole interface" },
@@ -102,14 +109,15 @@
         { keys: ["?"], description: "Help and shortcuts preview" },
       ],
     },
-  ];
+    ];
+  }
 
   // The accelerators themselves are bound as CmdOrCtrl and already resolve to
   // Control off macOS; only this printed reference was wrong. Mapping happens
   // before filtering so that searching "ctrl" on Windows finds the rows whose
   // keys are authored as macOS glyphs.
-  let platformCategories = $derived(
-    SHORTCUT_CATEGORIES.map((cat) => ({
+  let platformCategories = $derived([
+    ...shortcutCategories($hostPlatform.os).map((cat) => ({
       ...cat,
       shortcuts: cat.shortcuts.map((item) => ({
         ...item,
@@ -119,7 +127,14 @@
         description: shortcutTextLabel(item.description, $hostPlatform.os),
       })),
     })),
-  );
+    // Already written for this host. A ⌘ on Find would become Ctrl off macOS,
+    // and the terminal's find chord there is Ctrl+Shift, not Ctrl.
+    {
+      title: "Terminal",
+      icon: SquareTerminal,
+      shortcuts: terminalGuideShortcuts($hostPlatform.os),
+    },
+  ]);
 
   let filteredCategories = $derived.by(() => {
     const q = filterQuery.trim().toLowerCase();
@@ -187,17 +202,17 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-3xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
+      class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-edgeStrong"
     >
       <!-- Header -->
-      <div class="p-4 border-b border-border/70 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
+      <div class="p-4 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
         <div class="flex items-center gap-2.5">
           <div class="p-2 rounded-xl bg-accent/10 text-accent ring-1 ring-accent/25">
             <Keyboard size={18} />
           </div>
           <div>
             <h2 class="text-sm font-semibold text-textPrimary">Keyboard Shortcuts</h2>
-            <p class="text-[11px] text-textMuted">GitPulse navigation and workflow accelerators</p>
+            <p class="text-meta text-textMuted">GitPulse navigation and workflow accelerators</p>
           </div>
         </div>
 
@@ -208,7 +223,7 @@
               type="text"
               bind:value={filterQuery}
               placeholder="Search shortcuts…"
-              class="gp-field pl-7! py-1! text-xs! w-44!"
+              class="gp-field pl-7! text-xs! w-44!" data-size="sm"
             />
           </div>
           <button
@@ -223,23 +238,22 @@
       </div>
 
       <!-- Content -->
-      <div class="p-5 overflow-y-auto max-h-[60vh] space-y-6">
+      <div class="p-5 overflow-y-auto max-h-[60vh] space-y-6 scroll-py-8" data-dialog-body use:scrollEdgeFade>
         {#each filteredCategories as category (category.title)}
           {@const CatIcon = category.icon}
           <div>
-            <div class="flex items-center gap-2 text-xs font-semibold text-textPrimary">
+            <div class="mb-2 flex items-center gap-2 text-xs font-semibold text-textPrimary">
               <CatIcon size={14} class="text-accent" />
               <span>{category.title}</span>
             </div>
-            <div class="gp-separator" aria-hidden="true"></div>
 
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {#each category.shortcuts as item}
-                <div class="flex items-center justify-between gap-3 p-2 rounded-xl bg-background/50 border border-border/60 hover:border-border transition-colors">
-                  <span class="text-xs text-textMuted leading-tight truncate">{item.description}</span>
+                <div class="flex items-center justify-between gap-3 p-2 rounded-xl bg-background/50 border border-edge hover:border-border transition-colors">
+                  <span data-shortcut-description class="min-w-0 text-xs text-textMuted leading-snug text-pretty">{item.description}</span>
                   <div class="flex items-center gap-1 shrink-0">
                     {#each item.keys as key}
-                      <kbd class="gp-keycap text-[11px] font-sans font-medium px-1.5 py-0.5">{key}</kbd>
+                      <kbd class="gp-keycap text-meta font-sans font-medium px-1.5 py-0.5">{key}</kbd>
                     {/each}
                   </div>
                 </div>
@@ -256,9 +270,9 @@
       </div>
 
       <!-- Footer -->
-      <div class="p-3 border-t border-border/70 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-[11px] text-textMuted px-5">
+      <div class="p-3 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-meta text-textMuted px-5">
         <span>Tip: Press <kbd class="gp-keycap">?</kbd> anywhere to reopen</span>
-        <button type="button" class="gp-btn py-1! px-3!" onclick={close}>Done</button>
+        <button type="button" class="gp-btn px-3!" data-size="sm" onclick={close}>Done</button>
       </div>
     </div>
   </div>

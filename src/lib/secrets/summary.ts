@@ -39,7 +39,7 @@ export const LOCATION_COPY: Record<
   },
   unknown: {
     label: "Unknown",
-    hint: "Git status could not be read, so this may be tracked.",
+    hint: "Git status couldn't be read, so this may be tracked.",
     tone: "warn",
   },
   untracked: {
@@ -48,7 +48,7 @@ export const LOCATION_COPY: Record<
     tone: "warn",
   },
   nested_repo: {
-    label: "Nested repo",
+    label: "Nested repository",
     hint: "Belongs to a nested repository or submodule inside this tree.",
     tone: "warn",
   },
@@ -153,7 +153,7 @@ export function verdict(report: SecretsReport): Verdict {
         ? "No findings, but the scan was partial"
         : "No findings, completeness unverified",
       detail: partial
-        ? "Kingfisher could not read some files (permissions, or files that changed mid-scan). This is not a clean result."
+        ? "Kingfisher couldn't read some files (permissions, or files that changed mid-scan). This is not a clean result."
         : "This Kingfisher did not report whether it read every file. This is not a clean result.",
     };
   }
@@ -168,18 +168,18 @@ export function verdict(report: SecretsReport): Verdict {
 function findingsDetail(report: SecretsReport): string {
   const parts: string[] = [];
   if (report.completeness === "partial") {
-    parts.push("Some files could not be read, so this list is a floor.");
+    parts.push("Some files couldn't be read, so this list is a floor.");
   } else if (report.completeness === "unverified") {
     parts.push("Kingfisher did not report whether it read every file.");
   }
   if (report.findings_truncated) parts.push("Kingfisher omitted findings past its own report cap.");
   const lost = report.findings_unreadable;
   if (lost > 0) {
-    parts.push(`${plural(lost, "finding")} could not be read and ${lost === 1 ? "is" : "are"} not listed.`);
+    parts.push(`${plural(lost, "finding")} couldn't be read and ${lost === 1 ? "is" : "are"} not listed.`);
   }
   if (!report.git_status_known) {
     parts.push(
-      "Git status could not be read, so locations other than .git and nested repositories are unknown.",
+      "Git status couldn't be read, so locations other than .git and nested repositories are unknown.",
     );
   }
   return parts.join(" ");
@@ -200,7 +200,7 @@ export function scopeNotes(report: SecretsReport): string[] {
     "Working tree only: commit history is not scanned.",
     "Values are matched locally and never validated against a provider.",
     "Symbolic links are not followed, and Kingfisher skips some directories itself (node_modules).",
-    "Inline kingfisher:ignore comments are honoured.",
+    "Inline kingfisher:ignore comments are honored.",
   ];
   if (report.max_file_size_mb > 0) {
     notes.push(`Files over ${report.max_file_size_mb} MB are skipped without being reported.`);

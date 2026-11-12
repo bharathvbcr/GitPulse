@@ -64,7 +64,7 @@
       (count) => {
         if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the terminal dock.`, 10000);
       },
-      (error: unknown) => say(`Terminal sessions left running before the window reloaded could not be listed: ${String(error)}`, 15000),
+      (error: unknown) => say(`Terminal sessions left running before the window reloaded couldn't be listed: ${String(error)}`, 15000),
     );
     const listeners = createListenerTracker();
     void listen<string>("gitpulse-session-notification-open", (event) => void open(event.payload))
@@ -96,7 +96,7 @@
     right: 20px;
     max-width: 360px;
     padding: 12px;
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: rgb(var(--c-text));
   }
 </style>
