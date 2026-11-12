@@ -118,6 +118,7 @@
     sanitizeWorktreeSlug,
     tabFor,
     paneOnScreen,
+    setTabAutoWake,
     setTabStartDir,
     setTabTitle,
     setTabUrl,
@@ -1082,11 +1083,12 @@
     }
   }
 
-  function newTab(launcher: SessionKind, initialPrompt?: string): boolean {
+  function newTab(launcher: SessionKind, initialPrompt?: string, autoWake = false): boolean {
     if (!repoPath || !canCreateKind(launcher)) return false;
     const prevActive = tabState.activeId;
     focusTabStrip = false;
     tabState = openTab(tabState, launcher, initialPrompt);
+    if (autoWake && tabState.activeId) tabState = setTabAutoWake(tabState, tabState.activeId, true);
     if (splitRoot && prevActive && tabState.activeId && tabState.activeId !== prevActive && !hasPane(splitRoot, tabState.activeId)) {
       splitRoot = replacePane(splitRoot, prevActive, tabState.activeId);
     }
@@ -1188,7 +1190,7 @@
         );
         return;
       }
-      const opened = newTab(claimed.launcher, claimed.prompt);
+      const opened = newTab(claimed.launcher, claimed.prompt, claimed.autoWake === true);
       const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
       // started from the palette must not appear in the agent list that
@@ -2823,6 +2825,7 @@
               tabId={tab.id}
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}
+              initialAutoWake={tab.autoWake ?? false}
               startDir={tab.startDir}
               active={visible && tab.id === tabState.activeId && mode === "shell"}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}

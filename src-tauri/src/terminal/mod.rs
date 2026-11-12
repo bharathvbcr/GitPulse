@@ -36,7 +36,7 @@ mod transcript;
 pub use events::{AppEvents, SessionEnded, SessionEvents};
 use executor::Executor;
 use flow::{OutputFlow, Route};
-pub use ipc::{control_async, resize_async, write_async};
+pub use ipc::{control_async, deliver_peer_wake_async, resize_async, write_async};
 pub use ring::RING_BYTES;
 use serde::{Deserialize, Serialize};
 use sink::OutputSlot;
@@ -1533,6 +1533,8 @@ impl SessionWatcher {
                 subject: None,
                 subagent: false,
                 agent_id: None,
+                fully_idle: None,
+                provider_session_id: None,
             });
         }
         let telemetry_events = self.scanner.drain_telemetry();
@@ -1574,6 +1576,8 @@ impl SessionWatcher {
                     subject: None,
                     subagent: false,
                     agent_id: None,
+                    fully_idle: None,
+                    provider_session_id: None,
                 });
             }
         }
@@ -1611,6 +1615,8 @@ impl SessionWatcher {
             subject: None,
             subagent: false,
             agent_id: None,
+            fully_idle: None,
+            provider_session_id: None,
         });
     }
 }
@@ -3597,6 +3603,117 @@ pub fn write_to_session(
     data: &str,
 ) -> Result<(), String> {
     write_input(state, session_id, data.as_bytes())
+}
+
+/// One-line prompt injected into an idle `agy` terminal tab when the user
+/// clicks `[Deliver]` (or when the 5-invariant quiescent auto-wake fires).
+/// `agy`'s `PreInvocation` hook (`gitpulse-hook peer-inbox`) then atomically
+/// claims and injects the pending `<gitpulse-peer-message>` envelope.
+pub const PEER_WAKE_PROMPT: &str = "Process pending GitPulse peer inbox message.\r";
+
+/// Whether `process_name` names the Antigravity CLI (`agy`) in a terminal's
+/// foreground. Shells (`zsh`, `bash`, `sh`) and editors (`vim`) return `false`
+/// so a post-exit shell can never execute the wake prompt as a command.
+pub(crate) fn is_agy_foreground_process(process_name: Option<&str>) -> bool {
+    matches!(process_name, Some("agy"))
+}
+
+/// Verifies unread peer messages exist in `mailbox` for `provider_session_id`
+/// (without claiming them) AND verifies under the session's `child` mutex that
+/// `"agy"` is the foreground process before writing [`PEER_WAKE_PROMPT`].
+pub(crate) fn deliver_peer_wake_with_mailbox(
+    state: &TerminalSessions,
+    mailbox: &crate::agent_mailbox::Mailbox,
+    session_id: &str,
+    provider_session_id: &str,
+    now: std::time::SystemTime,
+) -> Result<bool, String> {
+    if !mailbox
+        .has_pending(provider_session_id, now)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        let context = host.context(session_id)?;
+        if !is_agy_foreground_process(context.process.as_deref()) {
+            return Err(format!(
+                "Antigravity (`agy`) is not the foreground process in this terminal (found {}).",
+                context.process.as_deref().unwrap_or("unknown")
+            ));
+        }
+        host.write_blocking(session_id, PEER_WAKE_PROMPT.as_bytes())?;
+        return Ok(true);
+    }
+    let (child, master, writer, dead, closing) = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|s| {
+            (
+                s.child.clone(),
+                s.master.clone(),
+                s.writer.clone(),
+                s.dead.clone(),
+                s.closing.clone(),
+            )
+        })
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    #[cfg(unix)]
+    {
+        let mut child = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if closing.load(Ordering::SeqCst) > 0 || dead.load(Ordering::Acquire) {
+            return Err("Terminal session is closed".into());
+        }
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Err(
+                "Antigravity (`agy`) is not the foreground process in this terminal.".into(),
+            );
+        }
+        let Some(root) = child.process_id().and_then(|p| i32::try_from(p).ok()) else {
+            return Err(
+                "Antigravity (`agy`) is not the foreground process in this terminal.".into(),
+            );
+        };
+        let group = lock_within(&master, MASTER_LOCK_BUDGET)?.process_group_leader();
+        // SAFETY: getsid takes a numeric id and reads nothing else.
+        let leader = group.filter(|g| *g > 1 && unsafe { libc::getsid(*g) } == root);
+        let fg = foreground::describe(leader.unwrap_or(root));
+        if !is_agy_foreground_process(fg.name.as_deref()) {
+            return Err(format!(
+                "Antigravity (`agy`) is not the foreground process in this terminal (found {}).",
+                fg.name.as_deref().unwrap_or("unknown")
+            ));
+        }
+        // Hold `child` across the write so the session leader cannot be reaped
+        // or recycled into a parent shell between verification and delivery.
+        input::write(&writer, &dead, PEER_WAKE_PROMPT.as_bytes())?;
+        drop(child);
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, master, writer, dead, closing);
+        Err("Peer terminal wakeup requires Unix foreground process verification.".into())
+    }
+}
+
+/// Production entry point using [`crate::agent_mailbox::Mailbox::at_default`].
+pub fn deliver_peer_wake(
+    state: &TerminalSessions,
+    session_id: &str,
+    provider_session_id: &str,
+) -> Result<bool, String> {
+    let mailbox = crate::agent_mailbox::Mailbox::at_default().map_err(|e| e.to_string())?;
+    deliver_peer_wake_with_mailbox(
+        state,
+        &mailbox,
+        session_id,
+        provider_session_id,
+        std::time::SystemTime::now(),
+    )
 }
 
 /// xterm's onBinary stream encodes one byte per Latin-1 character.
@@ -9721,5 +9838,124 @@ mod tests {
         assert_eq!(entries.first(), Some(&helper_dir));
         assert!(env_of(&cmd, crate::alerts::bridge::SESSION_ENV).is_none());
         assert!(env_of(&cmd, TERMINAL_SESSION_ENV).is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn deliver_peer_wake_verifies_agy_foreground_and_leaves_mailbox_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_test_repo(&repo);
+        let mbox_dir = tempfile::tempdir().unwrap();
+        let mailbox = crate::agent_mailbox::Mailbox::new(
+            mbox_dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("agent-mailbox"),
+        );
+        let conv_id = "11111111-2222-3333-4444-555555555555";
+        let now = std::time::SystemTime::now();
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let agy_bin = bin.join("agy");
+        let (exe, args) = crate::sysload::procscan::tests::fixture_command();
+        if std::fs::hard_link(&exe, &agy_bin).is_err() {
+            std::fs::copy(&exe, &agy_bin).unwrap();
+        }
+        let pidfile = bin.join("agy.pid");
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+
+        let agy_session = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo.to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some(agy_bin.to_string_lossy().into_owned()),
+            Some(args),
+            Some(HashMap::from([(
+                crate::sysload::procscan::tests::FIXTURE_ENV.to_string(),
+                format!("sleep=30,pidfile={}", pidfile.display()),
+            )])),
+            discard(),
+            None,
+        )
+        .unwrap();
+        let _pid = crate::sysload::procscan::tests::fixture_pid(&pidfile);
+
+        // 1. Empty mailbox -> Ok(false)
+        assert!(
+            !deliver_peer_wake_with_mailbox(&state, &mailbox, &agy_session.id, conv_id, now)
+                .unwrap()
+        );
+
+        // Deposit one peer envelope.
+        mailbox
+            .deposit_with_provenance(
+                conv_id,
+                "m-wake-1",
+                "Please review src/lib.rs",
+                crate::agent_mailbox::EnvelopeProvenance::PeerAgent {
+                    msg_id: "m-wake-1".into(),
+                    from_peer: "claude-main".into(),
+                    provider: "claude".into(),
+                    branch: "main".into(),
+                    thread_key: "t1".into(),
+                    hop: 1,
+                    max_hops: 6,
+                    truncated_in_bus: false,
+                    repo_root: repo.to_string_lossy().into_owned(),
+                },
+                now,
+            )
+            .unwrap();
+
+        // 2. Shell session (`/bin/sh`) must be refused without claiming the envelope!
+        let sh_session = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo.to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), "sleep 30".into()]),
+            None,
+            discard(),
+            None,
+        )
+        .unwrap();
+        let err = deliver_peer_wake_with_mailbox(&state, &mailbox, &sh_session.id, conv_id, now)
+            .expect_err("non-agy foreground process must be refused");
+        assert!(
+            err.contains("Antigravity (`agy`) is not the foreground process"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !reads_as_session_gone(&err),
+            "refusal for non-agy foreground must not mark live terminal gone: {err}"
+        );
+        assert!(
+            mailbox.has_pending(conv_id, now).unwrap(),
+            "refusal must leave envelope pending"
+        );
+
+        // 3. Live `agy` foreground -> Ok(true) and envelope STILL pending for PreInvocation!
+        assert!(
+            deliver_peer_wake_with_mailbox(&state, &mailbox, &agy_session.id, conv_id, now)
+                .unwrap()
+        );
+        assert!(
+            mailbox.has_pending(conv_id, now).unwrap(),
+            "wake delivery must leave envelope pending so PreInvocation claims it"
+        );
+
+        kill_session(&state, &sh_session.id).unwrap();
+        kill_session(&state, &agy_session.id).unwrap();
     }
 }

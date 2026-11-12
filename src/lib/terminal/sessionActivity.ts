@@ -99,8 +99,45 @@ export interface SessionAttention {
 
 export interface SessionActivity {
   lastOutputAt: number | null;
+  lastInputAt?: number | null;
+  lastPromptSubmittedAt?: number | null;
+  dirtyPrompt?: boolean;
+  fullyIdle?: boolean;
+  providerSessionId?: string | null;
   title: string | null;
   attention: SessionAttention | null;
+}
+
+/** Silence required on both input and output before quiescent auto-wake may fire. */
+export const PEER_QUIESCENCE_MS = 3_000;
+
+export interface AutoWakeFacts {
+  autoWake: boolean;
+  activity: SessionActivity | undefined;
+  foregroundProcess: string | null;
+  inboxGeneration: number;
+  attemptedGeneration: number;
+  now: number;
+}
+
+/**
+ * Verdict 2's 5-invariant quiescent auto-wake check for an Antigravity (`agy`)
+ * terminal tab:
+ *  1. `autoWake` is armed AND `Stop` reported `fullyIdle === true` (`NO_TOOL_CALL`),
+ *  2. Foreground process in the PTY is `"agy"`,
+ *  3. `dirtyPrompt === false` (latched `true` on any user keystroke; cleared only on `PreInvocation`),
+ *  4. `>= 3_000ms` silence since both `lastInputAt` and `lastOutputAt`,
+ *  5. Single-shot per `inboxGeneration` (`attemptedGeneration < inboxGeneration`).
+ */
+export function canAutoWakePeerInbox(facts: AutoWakeFacts): boolean {
+  if (!facts.autoWake) return false;
+  if (facts.inboxGeneration <= 0 || facts.attemptedGeneration >= facts.inboxGeneration) return false;
+  if (facts.foregroundProcess !== "agy") return false;
+  const activity = facts.activity;
+  if (!activity || !activity.fullyIdle || activity.dirtyPrompt) return false;
+  if (activity.lastInputAt != null && facts.now - activity.lastInputAt < PEER_QUIESCENCE_MS) return false;
+  if (activity.lastOutputAt != null && facts.now - activity.lastOutputAt < PEER_QUIESCENCE_MS) return false;
+  return true;
 }
 
 /** Publish at most this often per session for output and title changes. */
@@ -110,6 +147,7 @@ export const MAX_TRACKED_ACTIVITY = MAX_TERMINAL_SESSIONS * 2;
 const MAX_TITLE = 120;
 const MAX_DETAIL = 240;
 const SESSION_ID = /^[\w-]{1,128}$/;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * The code points the cleaner drops (format characters `Cf`: bidirectional
@@ -174,6 +212,12 @@ const CSI_KEY = /\x1b(?:\[[0-?]*[ -/]*[@-~]|O[A-DHF])/g;
 export function isReaderInput(data: string): boolean {
   if (!data) return false;
   return data.replace(TERMINAL_REPLY, "").replace(CSI_KEY, "").length > 0;
+}
+
+/** Whether data xterm sent to the PTY is purely an automatic terminal reply. */
+function isTerminalReplyOnly(data: string): boolean {
+  if (!data) return true;
+  return data.replace(TERMINAL_REPLY, "").length === 0;
 }
 
 /**
@@ -247,12 +291,23 @@ export interface StandingAttention {
   event: string | null;
   detail: string | null;
   age_ms: number;
+  fully_idle?: boolean;
+  provider_session_id?: string;
 }
 
 /** The longest age a replayed attention may claim: a clock that went wrong is not a week-old prompt. */
 const MAX_REPLAY_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-const EMPTY: SessionActivity = Object.freeze({ lastOutputAt: null, title: null, attention: null });
+const EMPTY: SessionActivity = Object.freeze({
+  lastOutputAt: null,
+  lastInputAt: null,
+  lastPromptSubmittedAt: null,
+  dirtyPrompt: false,
+  fullyIdle: false,
+  providerSessionId: null,
+  title: null,
+  attention: null,
+});
 
 export function createSessionActivity(clock: () => number = Date.now) {
   const entries = new Map<string, SessionActivity>();
@@ -284,7 +339,7 @@ export function createSessionActivity(clock: () => number = Date.now) {
       let oldest: string | null = null;
       let oldestAt = Infinity;
       for (const [key, value] of entries) {
-        const at = Math.max(value.lastOutputAt ?? 0, value.attention?.at ?? 0);
+        const at = Math.max(value.lastOutputAt ?? 0, value.lastInputAt ?? 0, value.attention?.at ?? 0);
         if (at < oldestAt) { oldest = key; oldestAt = at; }
       }
       if (oldest) { entries.delete(oldest); published.delete(oldest); changed.delete(oldest); }
@@ -307,17 +362,44 @@ export function createSessionActivity(clock: () => number = Date.now) {
       if (update(session, (current) => ({ ...current, title, lastOutputAt: now }))) publishThrottled(session, now);
     },
     /**
-     * The reader typed into the session: whatever it asked is answered.
+     * The reader typed into the session: whatever it asked is answered, and
+     * `dirtyPrompt` latches true until `PreInvocation` / `prompt_submitted`
+     * fires (never cleared on Backspace or Escape).
      * True when something stood, so the caller can tell the notifier — which
      * would otherwise replay the question to the next page and leave its
      * banner up.
      */
     input(session: string, data: string): boolean {
-      if (!isReaderInput(data)) return false;
-      const current = entries.get(session);
-      if (!current?.attention) return false;
-      entries.set(session, { ...current, attention: null });
-      changed.set(session, clock());
+      if (isTerminalReplyOnly(data)) return false;
+      const now = clock();
+      const answers = isReaderInput(data);
+      const hadAttention = answers && Boolean(entries.get(session)?.attention);
+      if (
+        update(session, (current) => ({
+          ...current,
+          lastInputAt: now,
+          dirtyPrompt: true,
+          attention: answers ? null : current.attention,
+        }))
+      ) {
+        if (hadAttention) changed.set(session, now);
+        publish();
+      }
+      return hadAttention;
+    },
+    /** Clears `dirtyPrompt` and `fullyIdle` when a prompt boundary (`PreInvocation`) fires. */
+    markPromptSubmitted(session: string): boolean {
+      const now = clock();
+      if (
+        !update(session, (current) => ({
+          ...current,
+          dirtyPrompt: false,
+          fullyIdle: false,
+          lastPromptSubmittedAt: now,
+        }))
+      ) {
+        return false;
+      }
       publish();
       return true;
     },
@@ -326,15 +408,50 @@ export function createSessionActivity(clock: () => number = Date.now) {
       const now = clock();
       const parsed = parseAttention(raw, now);
       if (!parsed) return false;
+      const row = raw as Record<string, unknown>;
+      const rawEvent = typeof row.event === "string" ? row.event : null;
+      const rawFullyIdle = typeof row.fully_idle === "boolean" ? row.fully_idle : undefined;
+      const rawProviderSessionId =
+        typeof row.provider_session_id === "string" && CANONICAL_UUID.test(row.provider_session_id)
+          ? row.provider_session_id.toLowerCase()
+          : undefined;
       // The notifier owns what stands (it folds a bell into the request it
       // repeats, and decides what an answer ends), and its announcements
       // arrive in order from one thread. So the pane mirrors it rather than
       // second-guessing it: a second rule here would disagree with it exactly
       // when the notifier has reason to differ.
-      const current = entries.get(parsed.session)?.attention ?? null;
-      if (parsed.attention === null && !current) return true;
+      const currentEntry = entries.get(parsed.session);
+      const current = currentEntry?.attention ?? null;
+      const nextDirtyPrompt =
+        rawEvent === "prompt_submitted" || rawEvent === "session_ended"
+          ? false
+          : (currentEntry?.dirtyPrompt ?? false);
+      const nextFullyIdle =
+        rawEvent === "turn_finished" || rawEvent === "agent_completed"
+          ? rawFullyIdle === true
+          : false;
+      const nextPromptSubmittedAt =
+        rawEvent === "prompt_submitted" ? now : (currentEntry?.lastPromptSubmittedAt ?? null);
+      const nextProviderSessionId = rawProviderSessionId ?? currentEntry?.providerSessionId ?? null;
+      const metaChanged =
+        nextDirtyPrompt !== (currentEntry?.dirtyPrompt ?? false) ||
+        nextFullyIdle !== (currentEntry?.fullyIdle ?? false) ||
+        nextPromptSubmittedAt !== (currentEntry?.lastPromptSubmittedAt ?? null) ||
+        nextProviderSessionId !== (currentEntry?.providerSessionId ?? null);
+      if (parsed.attention === null && !current && !metaChanged) return true;
       changed.set(parsed.session, now);
-      if (update(parsed.session, (entry) => ({ ...entry, attention: parsed.attention }))) publish();
+      if (
+        update(parsed.session, (entry) => ({
+          ...entry,
+          attention: parsed.attention,
+          dirtyPrompt: nextDirtyPrompt,
+          fullyIdle: nextFullyIdle,
+          lastPromptSubmittedAt: nextPromptSubmittedAt,
+          providerSessionId: nextProviderSessionId,
+        }))
+      ) {
+        publish();
+      }
       return true;
     },
     /**
@@ -350,12 +467,31 @@ export function createSessionActivity(clock: () => number = Date.now) {
         const parsed = parseAttention(row, now);
         if (!parsed?.attention) continue;
         if ((changed.get(parsed.session) ?? -Infinity) >= since) continue;
-        const age = row && typeof row === "object" ? (row as Record<string, unknown>).age_ms : undefined;
+        const rec = row && typeof row === "object" ? (row as Record<string, unknown>) : undefined;
+        const age = rec?.age_ms;
         const at = typeof age === "number" && Number.isFinite(age) && age >= 0
           ? now - Math.min(age, MAX_REPLAY_AGE_MS)
           : now;
+        const rawEvent = typeof rec?.event === "string" ? rec.event : null;
+        const rawFullyIdle = typeof rec?.fully_idle === "boolean" ? rec.fully_idle : undefined;
+        const rawProviderSessionId =
+          typeof rec?.provider_session_id === "string" && CANONICAL_UUID.test(rec.provider_session_id)
+            ? rec.provider_session_id.toLowerCase()
+            : undefined;
         const attention = { ...parsed.attention, at };
-        if (update(parsed.session, (entry) => ({ ...entry, attention }))) applied += 1;
+        if (
+          update(parsed.session, (entry) => ({
+            ...entry,
+            attention,
+            fullyIdle:
+              rawEvent === "turn_finished" || rawEvent === "agent_completed"
+                ? rawFullyIdle === true
+                : entry.fullyIdle,
+            providerSessionId: rawProviderSessionId ?? entry.providerSessionId,
+          }))
+        ) {
+          applied += 1;
+        }
       }
       if (applied) publish();
       return applied;

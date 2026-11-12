@@ -326,6 +326,8 @@ describe("declaredHookSubcommands", () => {
     expect(declared).toContain("collision-guard");
     expect(declared).toContain("command-gate");
     expect(declared).toContain("session-brief");
+    expect(declared).toContain("peer-inbox");
+    expect(declared).toContain("stop-or-notify");
   });
 
   it("throws rather than returning an empty list when the manifest is unreadable", async () => {

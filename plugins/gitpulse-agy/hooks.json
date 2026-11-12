@@ -1,0 +1,95 @@
+{
+  "gitpulse": {
+    "PreToolUse": [
+      {
+        "matcher": "^(write_file|write_to_file|edit_file|replace_file_content|multi_edit|multi_replace_file_content|notebook_edit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook collision-guard",
+            "timeout": 10,
+            "env": {
+              "GITPULSE_HOST": "antigravity"
+            }
+          }
+        ]
+      },
+      {
+        "matcher": "^run_command$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook command-gate",
+            "timeout": 10,
+            "env": {
+              "GITPULSE_HOST": "antigravity"
+            }
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify tool_finished",
+            "timeout": 5,
+            "env": {
+              "GITPULSE_HOST": "antigravity"
+            }
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook session-brief",
+        "timeout": 10,
+        "env": {
+          "GITPULSE_HOST": "antigravity"
+        }
+      },
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "GITPULSE_HOST": "antigravity"
+        }
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "GITPULSE_HOST": "antigravity"
+        }
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook peer-inbox",
+        "timeout": 5,
+        "env": {
+          "GITPULSE_HOST": "antigravity"
+        }
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "gitpulse-hook stop-or-notify",
+        "timeout": 5,
+        "env": {
+          "GITPULSE_HOST": "antigravity"
+        }
+      }
+    ]
+  }
+}

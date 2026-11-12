@@ -73,7 +73,11 @@ fn main() {
 fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
     std::panic::catch_unwind(decide).unwrap_or_else(|_| {
         log::error!(target: "hook", "gitpulse-hook panicked; no decision");
-        hooks::worktree::exit_code_after_panic()
+        let code = hooks::worktree::exit_code_after_panic();
+        if code == 0 && hooks::is_antigravity_env() {
+            emit("{}\n".into());
+        }
+        code
     })
 }
 
@@ -95,6 +99,8 @@ fn decide() -> i32 {
         Some("--host=agy") => (true, &raw_args[1..]),
         _ => (false, &raw_args[..]),
     };
+
+    let antigravity_env = flag_is_agy || hooks::is_antigravity_env();
 
     let Some(subcommand) = args.first().cloned() else {
         // Exit 2, the host's "block", not 0: a host that does not know the
@@ -127,7 +133,7 @@ fn decide() -> i32 {
 
     if !SUBCOMMANDS.contains(&subcommand.as_str()) {
         log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
-        if flag_is_agy {
+        if antigravity_env {
             emit("{}\n".to_string());
         }
         return 0;
@@ -136,7 +142,8 @@ fn decide() -> i32 {
     // An unparseable payload is reported on stderr and dropped. Guessing at a
     // decision from input we could not read would be the worst of both worlds:
     // neither a check that ran nor an admission that one did not. Exiting 0
-    // with no stdout leaves the host's own permission flow exactly as it was.
+    // with no stdout leaves the host's own permission flow exactly as it was
+    // (or `"{}"` on Antigravity, which never accepts empty stdout).
     //
     // `notify` takes the matcher's name as a second argument, because a
     // `Notification` payload does not say which matcher routed it. It is taken
@@ -151,7 +158,7 @@ fn decide() -> i32 {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
-            if flag_is_agy && !worktree_hook {
+            if antigravity_env && !worktree_hook {
                 emit("{}\n".to_string());
             }
             // Nothing was done; the launcher can still have plain git do it.
@@ -162,8 +169,13 @@ fn decide() -> i32 {
             };
         }
     };
+    // One answer to "is this Antigravity": the payload's own shape (already in
+    // `input.host`), or the `--host=agy` registration, or the environment.
     if flag_is_agy {
         input.is_agy = true;
+    }
+    if !input.is_cursor {
+        input.host = hooks::effective_host_kind(input.host, antigravity_env);
     }
 
     if worktree_hook {
@@ -205,7 +217,7 @@ fn decide() -> i32 {
         Err(error) => {
             let diagnostic = hooks::diagnostic(&error);
             log::log!(target: "hook", diagnostic.level, "{}", diagnostic.line);
-            if input.is_agy && diagnostic.exit_code == 0 {
+            if input.is_antigravity() && diagnostic.exit_code == 0 {
                 emit("{}\n".to_string());
             }
             diagnostic.exit_code

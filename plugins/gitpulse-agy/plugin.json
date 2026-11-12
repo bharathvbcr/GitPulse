@@ -1,0 +1,21 @@
+{
+  "name": "gitpulse-agy",
+  "version": "1.5.0",
+  "description": "GitPulse control plane and bidirectional A2A bridge for Antigravity: worktrees, collision guards, command gates, code intelligence, and peer messaging.",
+  "author": {
+    "name": "GitPulse Team",
+    "url": "https://gitpulse.vbcr.dev"
+  },
+  "homepage": "https://gitpulse.vbcr.dev",
+  "repository": "https://github.com/bharathvbcr/GitPulse",
+  "license": "MIT",
+  "logo": "assets/logo.svg",
+  "keywords": [
+    "git",
+    "mcp",
+    "worktrees",
+    "code-intelligence",
+    "a2a",
+    "antigravity"
+  ]
+}

@@ -190,6 +190,7 @@ impl Store {
                 | "runs.prepare"
                 | "runs.claim"
                 | "runs.started"
+                | "runs.bind_thread"
                 | "runs.protocol"
                 | "runs.finish"
                 | "runs.reconcile"
@@ -692,8 +693,8 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         | "notifications.finish"
         | "notifications.activate"
         | "notifications.ack" => Entity::NotificationDelivery,
-        "runs.prepare" | "runs.claim" | "runs.started" | "runs.protocol" | "runs.finish"
-        | "runs.reconcile" | "runs.cancel" => Entity::Run,
+        "runs.prepare" | "runs.claim" | "runs.started" | "runs.bind_thread" | "runs.protocol"
+        | "runs.finish" | "runs.reconcile" | "runs.cancel" => Entity::Run,
         "enhancements.create"
         | "enhancements.complete"
         | "enhancements.accept"

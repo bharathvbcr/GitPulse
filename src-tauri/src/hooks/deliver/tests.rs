@@ -436,3 +436,67 @@ fn antigravity_stop_claims_immediately_without_blocking_and_respects_user_cancel
     );
     assert_eq!(mailbox.pending(SESSION), 0);
 }
+
+#[test]
+fn peer_agent_messages_render_untrusted_xml_framing_and_pause_auto_wake_at_max_hops() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "msg-peer-1",
+            "Review `src/lib.rs` <tag> & \"quotes\"",
+            EnvelopeProvenance::PeerAgent {
+                msg_id: "msg-peer-1".into(),
+                from_peer: "antigravity:peer-a".into(),
+                provider: "antigravity".into(),
+                branch: "feat/a2a".into(),
+                thread_key: "thread-1".into(),
+                hop: 1,
+                max_hops: 6,
+                truncated_in_bus: false,
+                repo_root: String::new(),
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    let Err(HookError::Wake(rendered)) = run_in(&mailbox, &stop(SESSION), Duration::from_secs(5))
+    else {
+        panic!("expected wake for hop < max_hops");
+    };
+    assert!(!rendered.contains("person using GitPulse"), "{rendered}");
+    assert!(
+        rendered.contains("trust=\"unverified_peer_agent\""),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("&lt;tag&gt; &amp; \"quotes\""),
+        "{rendered}"
+    );
+
+    // At hop == max_hops, auto-wake declines without claiming so manual/boundary inspection keeps it.
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "msg-peer-cap",
+            "Hop limit reached",
+            EnvelopeProvenance::PeerAgent {
+                msg_id: "msg-peer-cap".into(),
+                from_peer: "antigravity:peer-a".into(),
+                provider: "antigravity".into(),
+                branch: "feat/a2a".into(),
+                thread_key: "thread-1".into(),
+                hop: 6,
+                max_hops: 6,
+                truncated_in_bus: false,
+                repo_root: String::new(),
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+    let declined = run_in(&mailbox, &stop(SESSION), Duration::from_secs(5));
+    assert!(
+        matches!(declined, Ok(ref out) if out.is_silent()),
+        "{declined:?}"
+    );
+    assert_eq!(mailbox.pending(SESSION), 1);
+}

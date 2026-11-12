@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskWrite, scopeParams, taskSuggestions } from "./client";
+import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskRun, taskWrite, scopeParams, taskSuggestions } from "./client";
 
 const full = { id: "t1", revision: 2, updated_at: 1, title: "Preserve task evidence", description: "exact error: E42", acceptance_criteria: ["Round-trip evidence"], kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null, labels: ["regression"], repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 10 };
 describe("workbench boundary", () => {
@@ -94,5 +94,72 @@ describe("task suggestions", () => {
       { ...reply, suggestions: Array(21).fill(reply.suggestions[0]) }, { ...reply, excluded: { ...reply.excluded, blocked: -1 } }, null, [],
     ];
     for (const value of bad) expect(() => taskSuggestions(value)).toThrow("invalid response");
+  });
+});
+
+describe("taskRun external_terminal thread binding", () => {
+  const baseRun = {
+    id: "run-agy-1",
+    revision: 3,
+    updated_at: 10,
+    kind: "external_terminal",
+    task_id: "t1",
+    source_revision: 2,
+    task_title: "Audit A2A",
+    repository_id: "r1",
+    provider: "agy",
+    permission_mode: "inspect",
+    state: "running",
+    cwd: "/work/repo",
+    created_at: 1,
+    expires_at: 300,
+    session_id: "term-1",
+    exit_code: null,
+    reason: "",
+    outcome_uncertain: false,
+  };
+
+  it("decodes an external_terminal run after runs.bind_thread sets provider_thread_id without provider_state", () => {
+    const bound = taskRun({
+      ...baseRun,
+      provider_thread_id: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11",
+    });
+    expect(bound.kind).toBe("external_terminal");
+    expect(bound.provider).toBe("agy");
+    expect(bound.provider_thread_id).toBe("6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11");
+    expect(bound.provider_state).toBeUndefined();
+
+    // Ended external_terminal run retains its bound provider_thread_id for resume/history.
+    const exited = taskRun({
+      ...baseRun,
+      state: "exited",
+      exit_code: 0,
+      provider_thread_id: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11",
+    });
+    expect(exited.provider_thread_id).toBe("6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11");
+  });
+
+  it("still rejects provider_thread_id on a prepared external_terminal run, managed runs without provider_state, or turn ids without provider_state", () => {
+    expect(() =>
+      taskRun({
+        ...baseRun,
+        state: "prepared",
+        provider_thread_id: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11",
+      }),
+    ).toThrow("invalid response");
+    expect(() =>
+      taskRun({
+        ...baseRun,
+        kind: "managed",
+        provider_thread_id: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11",
+      }),
+    ).toThrow("invalid response");
+    expect(() =>
+      taskRun({
+        ...baseRun,
+        provider_thread_id: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11",
+        provider_turn_id: "turn-1",
+      }),
+    ).toThrow("invalid response");
   });
 });

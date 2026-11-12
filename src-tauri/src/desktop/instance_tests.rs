@@ -2116,3 +2116,95 @@ fn terminal_orchestrate_roundtrips_over_the_mailbox_and_refuses_when_unattached(
     assert_eq!(reply["total"], 0);
     assert_eq!(reply["parent_session_id"], "term-100-1");
 }
+
+#[test]
+fn agent_deliver_echoes_request_id_and_caps_concurrent_handlers_at_four() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+
+    let req = |id: &str| Request::AgentDeliver {
+        id: id.into(),
+        repo: "/repo/wt".into(),
+        peer_id: "peer-agy-1".into(),
+        msg_id: "msg-1".into(),
+        spawn: None,
+        provider: None,
+        branch: None,
+        prompt: None,
+        task_id: None,
+    };
+
+    // Unattached owner refuses cleanly.
+    let unattached = Secondary::connect(&socket)
+        .ok()
+        .expect("reach owner")
+        .agent_deliver(&req("d-0"), Duration::from_secs(5));
+    assert_eq!(unattached, Err("the agent delivery is not attached".into()));
+
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_agent_deliver(Arc::new(move |request| {
+            let Request::AgentDeliver {
+                peer_id, msg_id, ..
+            } = request
+            else {
+                return Err("unexpected request".into());
+            };
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "peer_id": peer_id,
+                "msg_id": msg_id,
+                "delivery_outcome": "woken_immediately"
+            }))
+        }));
+    }
+
+    let held: Vec<_> = (0..MAX_DELIVER_HANDLERS)
+        .map(|n| {
+            let socket = socket.clone();
+            let r = req(&format!("d-{n}"));
+            std::thread::spawn(move || {
+                Secondary::connect(&socket)
+                    .ok()
+                    .expect("reach owner")
+                    .agent_deliver(&r, Duration::from_secs(30))
+            })
+        })
+        .collect();
+
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            entered.load(Ordering::Acquire) >= MAX_DELIVER_HANDLERS
+        }),
+        "deliver handlers never filled"
+    );
+
+    // 5th concurrent AgentDeliver is answered busy immediately and matches `is_busy_refusal`.
+    let over = Secondary::connect(&socket)
+        .ok()
+        .expect("reach owner")
+        .agent_deliver(&req("d-over"), Duration::from_secs(5))
+        .expect_err("5th deliver must be refused as busy");
+    assert_eq!(over, "the agent delivery is busy");
+    assert!(is_busy_refusal(&over));
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in held {
+        let reply = worker.join().unwrap().expect("deliver reply");
+        assert_eq!(reply["delivery_outcome"], "woken_immediately");
+    }
+}

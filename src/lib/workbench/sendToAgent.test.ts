@@ -200,9 +200,11 @@ describe("the host's answers, decoded strictly", () => {
     });
   });
 
-  it("reads a resume as not sent by the host, with the action the renderer takes", async () => {
-    native.mockResolvedValueOnce(answer({ route: "resume", sent: false, action: "open_resume" }));
-    expect(await sendAgentMessage("run", "hi", "r1", "resume")).toMatchObject({ route: "resume", sent: false, action: "open_resume" });
+  it("reads a resume as not sent by the host, with the action and provider the renderer takes", async () => {
+    native.mockResolvedValueOnce(answer({ route: "resume", provider: "agy", sent: false, action: "open_resume" }));
+    expect(await sendAgentMessage("run", "hi", "r1", "resume")).toMatchObject({ route: "resume", resumeProvider: "agy", sent: false, action: "open_resume" });
+    native.mockResolvedValueOnce(answer({ route: "resume", provider: "grok", sent: false, action: "open_resume" }));
+    await expect(sendAgentMessage("run", "hi", "r1", "resume")).rejects.toBeInstanceOf(WorkbenchError);
   });
 
   it("refuses a send that claims to have gone without saying how, or by another route than the one shown", async () => {

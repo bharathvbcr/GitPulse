@@ -42,6 +42,8 @@ fn bell(session: &str, detail: Option<&str>) -> Notice {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 

@@ -195,6 +195,18 @@ pub async fn cmd_terminal_write(
     crate::terminal::write_async(&state, session_id, data, binary.unwrap_or(false)).await
 }
 
+/// Wakes an idle `agy` terminal tab when unread peer messages are waiting in
+/// `agent_mailbox`, without claiming mailbox envelopes upfront and only after
+/// verifying `"agy"` is the foreground process under the session's child mutex.
+#[tauri::command(async)]
+pub async fn cmd_terminal_deliver_peer(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    provider_session_id: String,
+) -> Result<bool, String> {
+    crate::terminal::deliver_peer_wake_async(&state, session_id, provider_session_id).await
+}
+
 /// Resizes a live session's PTY to the frontend grid.
 #[tauri::command(async)]
 pub async fn cmd_terminal_resize(

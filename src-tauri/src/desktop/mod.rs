@@ -37,6 +37,8 @@ pub const MENU_EVENT: &str = "gitpulse-menu";
 pub const OPEN_REPO_EVENT: &str = "gitpulse-open-repo";
 pub const OPEN_ERROR_EVENT: &str = "gitpulse-open-error";
 pub const EXIT_REQUESTED_EVENT: &str = "gitpulse-exit-requested";
+pub const PEER_INBOX_EVENT: &str = "gitpulse-peer-inbox";
+pub const AGENT_KICKOFF_EVENT: &str = "gitpulse-agent-kickoff";
 
 #[derive(Default)]
 pub struct DesktopState {
@@ -448,7 +450,8 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         instance::Request::GateCommand { .. }
         | instance::Request::CollisionScan { .. }
         | instance::Request::InsightsRead { .. }
-        | instance::Request::TerminalOrchestrate { .. } => {}
+        | instance::Request::TerminalOrchestrate { .. }
+        | instance::Request::AgentDeliver { .. } => {}
         // An agent's `gitpulse_browser_open`. The window opens the repository
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.
@@ -539,6 +542,327 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
     });
     if let Err(error) = scheduled {
         log::error!(target: "desktop", "A request from another launch was dropped: {error}");
+    }
+}
+
+/// Answers an MCP process's [`instance::Request::AgentDeliver`] within the 4s
+/// [`instance::HANDLER_TIMEOUT`]: re-verifies repository trust, wakes an idle
+/// hosted terminal tab (`TerminalSession.svelte`), forwards a peer turn to a
+/// parked Managed run (`managed_run::deliver_peer_follow_up`), or spawns an
+/// unattended kickoff session (`gitpulse_kickoff_agent`).
+#[cfg(target_os = "macos")]
+pub fn serve_agent_deliver<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    request: &instance::Request,
+) -> Result<serde_json::Value, String> {
+    let instance::Request::AgentDeliver {
+        repo,
+        peer_id,
+        msg_id,
+        spawn,
+        provider,
+        branch,
+        prompt,
+        task_id,
+        ..
+    } = request
+    else {
+        return Err("not an agent deliver request".into());
+    };
+    crate::repository_trust::require(Path::new(repo)).map_err(|e| e.message().to_string())?;
+
+    if let Some(mode) = spawn.as_deref() {
+        return serve_kickoff_spawn(
+            app,
+            repo,
+            msg_id,
+            mode,
+            provider.as_deref(),
+            branch.as_deref(),
+            prompt.as_deref(),
+            task_id.as_deref(),
+        );
+    }
+
+    let peers = crate::engine::agent_bus::list_reconciled_peers(repo)
+        .map_err(|e| e.message().to_string())?;
+    let Some(peer) = peers.into_iter().find(|p| p.record.peer_id == *peer_id) else {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "delivery_outcome": "queued_for_hook_boundary",
+        }));
+    };
+
+    let msg = crate::engine::agent_bus::get_message_by_id(repo, msg_id)
+        .ok()
+        .flatten();
+    if msg
+        .as_ref()
+        .is_some_and(|m| m.hop.unwrap_or(0) >= m.max_hops.unwrap_or(6))
+    {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "delivery_outcome": "paused_hop_limit",
+        }));
+    }
+
+    if peer.liveness != "live" {
+        let outcome = if peer.liveness == "resumable" {
+            "requires_resume"
+        } else {
+            "queued_for_hook_boundary"
+        };
+        return Ok(serde_json::json!({
+            "ok": true,
+            "delivery_outcome": outcome,
+        }));
+    }
+
+    if peer.record.surface == "managed" {
+        if let (Some(run_id), Some(wb), Some(m)) = (
+            peer.record.run_id.clone(),
+            app.try_state::<crate::workbench::WorkbenchState>()
+                .map(|s| s.inner().clone()),
+            msg.as_ref(),
+        ) {
+            let formatted = crate::hooks::deliver::format_peer_xml(
+                msg_id,
+                &m.from_agent,
+                "peer",
+                m.branch.as_deref().unwrap_or(""),
+                m.thread_key.as_deref().unwrap_or(""),
+                m.hop.unwrap_or(1),
+                m.max_hops.unwrap_or(6),
+                &m.body,
+            );
+            let req_id: String = msg_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(64)
+                .collect();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let run_id_clone = run_id.clone();
+            let _ = crate::supervisor::spawn_one_of_many(
+                "agent-deliver-managed",
+                "agent-deliver",
+                move || {
+                    let res = crate::workbench::managed_run::deliver_peer_follow_up(
+                        &wb,
+                        &run_id_clone,
+                        &req_id,
+                        &formatted,
+                    );
+                    let _ = tx.send(res);
+                },
+            );
+            if let Ok(Ok(ans)) = rx.recv_timeout(std::time::Duration::from_millis(2800)) {
+                if ans["state"] == "delivered" {
+                    let _ = crate::engine::agent_bus::ack_messages(
+                        repo,
+                        &peer.record.peer_id,
+                        std::slice::from_ref(msg_id),
+                    );
+                    if let (Some(sid), Ok(mb)) = (
+                        peer.record.provider_session_id.as_deref(),
+                        crate::agent_mailbox::Mailbox::at_default(),
+                    ) {
+                        let _ = mb.mark_claimed_by_id(sid, msg_id, std::time::SystemTime::now());
+                    }
+                    return Ok(serde_json::json!({
+                        "ok": true,
+                        "delivery_outcome": "woken_immediately",
+                    }));
+                }
+            }
+            return Ok(serde_json::json!({
+                "ok": true,
+                "delivery_outcome": "queued_for_hook_boundary",
+            }));
+        }
+    }
+
+    if peer.record.provider == "agy" && peer.record.turn_state != "working" {
+        if let Some(tid) = peer.record.terminal_session_id.as_deref() {
+            let agy_foreground = app
+                .try_state::<crate::terminal::TerminalSessions>()
+                .and_then(|ts| crate::terminal::session_context(ts.inner(), tid).ok())
+                .is_some_and(|ctx| {
+                    crate::terminal::is_agy_foreground_process(ctx.process.as_deref())
+                });
+            if agy_foreground {
+                let _ = app.emit(
+                    PEER_INBOX_EVENT,
+                    serde_json::json!({
+                        "session_id": peer.record.terminal_session_id,
+                        "provider_session_id": peer.record.provider_session_id,
+                        "peer_id": peer.record.peer_id,
+                        "from_peer": msg.as_ref().map(|m| m.from_agent.as_str()),
+                        "msg_id": msg_id,
+                        "repo": repo,
+                    }),
+                );
+                let outcome = if peer.record.auto_wake && peer.record.turn_state == "idle" {
+                    "woken_immediately"
+                } else {
+                    "awaiting_banner_confirm"
+                };
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "delivery_outcome": outcome,
+                }));
+            }
+        }
+    }
+
+    if peer.record.provider == "claude" {
+        if let Some(sid) = peer.record.provider_session_id.as_deref() {
+            let listening = crate::agent_mailbox::Mailbox::at_default()
+                .ok()
+                .is_some_and(|mb| mb.listening(sid, std::time::SystemTime::now()));
+            if listening {
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "delivery_outcome": "woken_immediately",
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "delivery_outcome": "queued_for_hook_boundary",
+    }))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn serve_kickoff_spawn<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    repo: &str,
+    request_id: &str,
+    mode: &str,
+    provider: Option<&str>,
+    branch: Option<&str>,
+    prompt: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let chosen_provider = provider.unwrap_or("claude");
+    if !matches!(chosen_provider, "claude" | "agy" | "codex") {
+        return Err(format!("unsupported kickoff provider '{chosen_provider}'"));
+    }
+    match mode {
+        "terminal" => {
+            let prompt_text = prompt
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .ok_or("terminal kickoff spawn requires a non-empty prompt")?;
+            let payload = serde_json::json!({
+                "repo": repo,
+                "provider": chosen_provider,
+                "branch": branch,
+                "prompt": prompt_text,
+                "auto_wake": true,
+            });
+            app.emit(AGENT_KICKOFF_EVENT, payload)
+                .map_err(|e| format!("could not emit kickoff request: {e}"))?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "spawn": "terminal",
+                "provider": chosen_provider,
+                "auto_wake": true,
+                "delivery_outcome": "woken_immediately",
+            }))
+        }
+        "managed" => {
+            let tid = task_id
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .ok_or("managed kickoff spawn requires task_id")?;
+            let wb = app
+                .try_state::<crate::workbench::WorkbenchState>()
+                .map(|s| s.inner().clone())
+                .ok_or("workbench state is unavailable")?;
+            let task = wb
+                .request("items.get", &serde_json::json!({ "id": tid }).to_string())
+                .map_err(|e| format!("{}: {}", e.code, e.message))?;
+            let source_revision = task["item"]["revision"]
+                .as_u64()
+                .ok_or("task item has no revision")?;
+            let repo_id = task["item"]["primary_repository_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("task item has no primary_repository_id")?
+                .to_string();
+            let repo_row = wb
+                .request(
+                    "repositories.get",
+                    &serde_json::json!({ "id": repo_id }).to_string(),
+                )
+                .map_err(|e| format!("{}: {}", e.code, e.message))?;
+            let repo_revision = repo_row["item"]["revision"]
+                .as_u64()
+                .ok_or("repository has no revision")?;
+            let clean_req: String = request_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+            let run_id = format!("run_{clean_req}");
+            let prepare_body = serde_json::json!({
+                "id": run_id,
+                "request_id": format!("prep_{clean_req}"),
+                "task_id": tid,
+                "source_revision": source_revision,
+                "repository_id": repo_id,
+                "repository_revision": repo_revision,
+                "provider": chosen_provider,
+                "permission_mode": "inspect",
+                "repo_path": repo,
+            });
+            wb.request("runs.prepare_managed", &prepare_body.to_string())
+                .map_err(|e| format!("{}: {}", e.code, e.message))?;
+            let launch_id = run_id.clone();
+            crate::supervisor::spawn_one_of_many(
+                "agent-kickoff-managed",
+                "agent-kickoff",
+                move || {
+                    let launch_body = serde_json::json!({
+                        "id": launch_id,
+                        "max_continuations": 4,
+                    });
+                    if let Err(err) = wb.request("runs.launch_managed", &launch_body.to_string()) {
+                        log::warn!(
+                            target: "workbench",
+                            "managed kickoff launch {} failed: {}: {}",
+                            launch_id,
+                            err.code,
+                            err.message
+                        );
+                    }
+                },
+            )
+            .map_err(|e| format!("could not launch managed kickoff worker: {e}"))?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "spawn": "managed",
+                "provider": chosen_provider,
+                "run_id": run_id,
+                "delivery_outcome": "woken_immediately",
+            }))
+        }
+        other => Err(format!("unsupported spawn surface '{other}'")),
     }
 }
 
@@ -1199,5 +1523,101 @@ mod tests {
         exit::settle(handle, pending, false);
         assert_eq!(exit_choice(), ExitChoice::Leave);
         crate::harness::hosted::reset_exit_choice();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serve_agent_deliver_rejects_ide_external_and_working_agy_peers_without_emitting_banner() {
+        use tauri::Listener;
+        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
+        let repo = repo_dir.path().to_str().unwrap().to_string();
+        crate::test_support::trust_repo(repo_dir.path());
+
+        let my_pid = std::process::id();
+        let my_birth = crate::workbench::process_birth::started_unix_nanos(my_pid).unwrap();
+
+        // 1. Live Antigravity IDE peer (`terminal_session_id: None`, `surface: "ide"`).
+        let ide_sid = "99999999-9999-4999-8999-999999999901";
+        let ide_peer = crate::engine::agent_bus::upsert_peer(
+            &repo,
+            crate::engine::agent_bus::PeerUpsert {
+                peer_id: None,
+                provider: "agy".into(),
+                surface: "ide".into(),
+                provider_session_id: Some(ide_sid.into()),
+                terminal_session_id: None,
+                run_id: None,
+                worktree_path: repo.clone(),
+                branch: Some("main".into()),
+                role: Some("ide-agent".into()),
+                turn_state: Some("idle".into()),
+                auto_wake: Some(true),
+                pid: Some(my_pid),
+                proc_start_ns: Some(my_birth),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+        // 2. Hosted `agy` terminal tab whose `TerminalSessions` has no live `"agy"` foreground PTY.
+        let dead_pty_sid = "99999999-9999-4999-8999-999999999902";
+        let dead_pty_peer = crate::engine::agent_bus::upsert_peer(
+            &repo,
+            crate::engine::agent_bus::PeerUpsert {
+                peer_id: None,
+                provider: "agy".into(),
+                surface: "terminal".into(),
+                provider_session_id: Some(dead_pty_sid.into()),
+                terminal_session_id: Some("term-missing-42".into()),
+                run_id: None,
+                worktree_path: repo.clone(),
+                branch: Some("main".into()),
+                role: Some("missing-pty".into()),
+                turn_state: Some("idle".into()),
+                auto_wake: Some(true),
+                pid: Some(my_pid),
+                proc_start_ns: Some(my_birth),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .manage(crate::terminal::TerminalSessions::default())
+            .build(crate::context())
+            .unwrap();
+        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let emitted_sink = std::sync::Arc::clone(&emitted);
+        let _listener = app.listen_any(PEER_INBOX_EVENT, move |_| {
+            emitted_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        for (label, pid_key) in [
+            ("ide", ide_peer.peer_id.clone()),
+            ("missing_pty", dead_pty_peer.peer_id.clone()),
+        ] {
+            let req = instance::Request::AgentDeliver {
+                id: format!("req_{label}"),
+                repo: repo.clone(),
+                peer_id: pid_key,
+                msg_id: format!("msg_{label}"),
+                spawn: None,
+                provider: None,
+                branch: None,
+                prompt: None,
+                task_id: None,
+            };
+            let ans = serve_agent_deliver(app.handle(), &req).expect("serve_agent_deliver");
+            assert_eq!(
+                ans["delivery_outcome"], "queued_for_hook_boundary",
+                "{label} must queue for hook boundary instead of claiming banner/wake: {ans}"
+            );
+        }
+        assert_eq!(
+            emitted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "PEER_INBOX_EVENT must not be emitted when no hosted agy PTY is in the foreground"
+        );
     }
 }

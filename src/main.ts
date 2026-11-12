@@ -3,6 +3,7 @@ import App from "./App.svelte";
 import { mount } from "svelte";
 import { applyPlatformClass, isTauri } from "./lib/platform";
 import { installBrowseRequests } from "./lib/browser/browseRequests";
+import { installAgentKickoffRequests } from "./lib/terminal/launchRequests";
 import { loadHostPlatform } from "./lib/stores/platformStore";
 import { installNativeRendering } from "./lib/desktop/nativeRendering";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
@@ -85,7 +86,14 @@ if (isTauri()) {
     console.warn("[browser] agent browser session requests are not being heard:", error);
     return null;
   });
-  import.meta.hot?.dispose(() => void stopBrowseRequests.then((stop) => stop?.()));
+  const stopKickoffRequests = installAgentKickoffRequests().catch((error: unknown) => {
+    console.warn("[terminal] agent kickoff session requests are not being heard:", error);
+    return null;
+  });
+  import.meta.hot?.dispose(() => {
+    void stopBrowseRequests.then((stop) => stop?.());
+    void stopKickoffRequests.then((stop) => stop?.());
+  });
 }
 
 export default app;

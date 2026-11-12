@@ -784,6 +784,80 @@ pub(super) fn claim(state: &WorkbenchState, input: &str) -> Result<Value, Workbe
     state.with_store(|store| query(store, "runs.claim", input))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindTerminalThread {
+    id: String,
+    session_id: String,
+    provider_thread_id: String,
+}
+
+/// Binds an active `external_terminal` workbench attempt to the runtime
+/// conversation ID observed from its provider (such as Antigravity's
+/// `conversationId`), delegating to the immutable `runs.bind_thread` store method.
+pub(super) fn bind_terminal_thread(
+    state: &WorkbenchState,
+    input: &str,
+) -> Result<Value, WorkbenchError> {
+    if input.len() > 4096 || !input.trim_start().starts_with('{') {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Thread binding must be a JSON object of at most 4 KiB.",
+        ));
+    }
+    let ask: BindTerminalThread = serde_json::from_str(input)
+        .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+    if !super::is_record_id(&ask.id) || !super::is_record_id(&ask.session_id) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Thread binding requires valid attempt and session identities.",
+        ));
+    }
+    if !super::terminal_command::is_canonical_uuid(&ask.provider_thread_id) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Thread binding requires a canonical conversation UUID.",
+        ));
+    }
+    let canonical_thread = ask.provider_thread_id.to_ascii_lowercase();
+    let saved =
+        state.with_store(|store| query(store, "runs.get", &json!({"id": ask.id}).to_string()))?;
+    let item = &saved["item"];
+    if item["kind"] != "external_terminal" {
+        return Err(WorkbenchError::new(
+            "run_kind_mismatch",
+            "Thread binding applies only to external terminal attempts.",
+        ));
+    }
+    if item["session_id"].as_str() != Some(ask.session_id.as_str()) {
+        return Err(WorkbenchError::new(
+            "revision_conflict",
+            "The attempt's terminal session does not match this tab.",
+        ));
+    }
+    if item["provider_thread_id"].as_str() == Some(canonical_thread.as_str()) {
+        return Ok(saved);
+    }
+    let owner_id = item["owner_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            WorkbenchError::new("invalid_state", "The attempt has no active owner identity.")
+        })?;
+    let revision = item["revision"].as_u64().ok_or_else(|| {
+        WorkbenchError::new("protocol_error", "The attempt has no valid revision.")
+    })?;
+    let payload = json!({
+        "id": ask.id,
+        "request_id": format!("bind-thread-{}", ask.id),
+        "expected_revision": revision,
+        "owner_id": owner_id,
+        "session_id": ask.session_id,
+        "provider_thread_id": canonical_thread,
+    });
+    state.with_store(|store| query(store, "runs.bind_thread", &payload.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Inner, WorkbenchState};

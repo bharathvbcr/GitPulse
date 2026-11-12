@@ -334,8 +334,11 @@ describe("annotated but unregistered commands", () => {
     // prints all three numbers, so a bump made without re-running it will not
     // agree. 321 with cmd_native_rendering_apply (Liquid Glass and the 120 Hz
     // switch), which main added on top of cmd_cancel_read while the terminal
-    // overhaul added its seven; the two counts met when the branch merged.
-    expect(found.size).toBe(321);
+    // overhaul added its seven; the two counts met when the branch merged. And
+    // 322 with cmd_terminal_deliver_peer (wakes a quiescent Antigravity CLI
+    // terminal session for a peer message), which the A2A branch added.
+    expect(found.size).toBe(322);
+    expect(found.has("cmd_terminal_deliver_peer")).toBe(true);
     expect(found.has("cmd_native_rendering_apply")).toBe(true);
     expect(found.has("cmd_browser_snapshot")).toBe(true);
     expect(found.has("cmd_browser_snapshot_preview")).toBe(true);

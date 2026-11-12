@@ -375,6 +375,15 @@ describe("resumeTaskConversation", () => {
     expect(openRepo).not.toHaveBeenCalled();
     expect(get(taskTerminalRequests)).toEqual([]);
   });
+
+  it("resumes an ended Antigravity conversation with its saved provider and initial prompt", async () => {
+    findConversation.mockResolvedValueOnce({ resumable: true, provider: "agy", sessionId: SESSION, cwd: "/work/a", mode: "edit", reason: "saved" });
+    openRepo.mockResolvedValueOnce(true);
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" }, "background", "Please address CI failure")).toEqual({ outcome: "started" });
+    expect(get(taskTerminalRequests)).toEqual([
+      { runId: "a", repoPath: "/work/a", provider: "agy", title: "Fix", resume: { sessionId: SESSION, mode: "edit", runId: "a", prompt: "Please address CI failure" } },
+    ]);
+  });
 });
 
 describe("an open the repository store will refuse", () => {

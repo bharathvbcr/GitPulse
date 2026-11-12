@@ -112,6 +112,8 @@ export interface TerminalTab {
   revealSeq?: number;
   /** Read-only virtual command-output snippet rendered in `TerminalFilePane.svelte` without dirtying Git. */
   snippet?: { title: string; content: string };
+  /** Pre-arms quiescent peer auto-wake on unattended kickoff sessions. */
+  autoWake?: boolean;
 }
 
 /**
@@ -512,6 +514,12 @@ export function closeTab(state: TabState, id: string, prefer?: string | null): T
 export function setTabStartDir(state: TabState, id: string, startDir: string | null): TabState {
   if (startDir === null || !state.tabs.some((tab) => tab.id === id)) return state;
   return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, startDir } : tab)) };
+}
+
+/** Pre-arms quiescent peer auto-wake on an unattended kickoff tab. */
+export function setTabAutoWake(state: TabState, id: string, autoWake: boolean): TabState {
+  if (!state.tabs.some((tab) => tab.id === id)) return state;
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, autoWake } : tab)) };
 }
 
 export function activateTab(state: TabState, id: string): TabState {

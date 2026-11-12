@@ -190,6 +190,8 @@ pub(crate) fn from_scan(
             session_id: entry.and_then(|e| nonempty(&e.session_id)),
             proc_start: entry.and_then(|e| nonempty(&e.proc_start)),
             registry_cwd: entry.map(|e| e.cwd.clone()),
+            ide_hosted: session.ide_hosted,
+            terminal_session_id: session.terminal_session_id.clone(),
         });
     }
     kinds
@@ -357,6 +359,8 @@ fn read_claude_registry(dir: &Path, alive: &dyn Fn(u32, u128) -> Liveness) -> Ki
                 session_id: nonempty(&entry.session_id),
                 proc_start: nonempty(&entry.proc_start),
                 registry_cwd: Some(entry.cwd),
+                ide_hosted: false,
+                terminal_session_id: None,
             }),
             // Claude Code removes an entry when its session exits cleanly; one
             // left behind by a crash names a process that is gone.
@@ -919,6 +923,8 @@ mod tests {
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            ide_hosted: false,
+            terminal_session_id: None,
         }
     }
 
@@ -1202,6 +1208,8 @@ mod tests {
             footprint: crate::sysload::Reading::Value(1),
             members: 1,
             unreadable_members: 0,
+            ide_hosted: false,
+            terminal_session_id: None,
         }
     }
 

@@ -289,6 +289,7 @@
     "allow-cmd-terminal-clipboard-files",
     "allow-cmd-terminal-context",
     "allow-cmd-terminal-conversations",
+    "allow-cmd-terminal-deliver-peer",
     "allow-cmd-terminal-detach",
     "allow-cmd-terminal-export",
     "allow-cmd-terminal-save-clipboard-image",

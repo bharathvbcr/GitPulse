@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::agent_bus::DEFAULT_MAX_HOPS;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SESSION: &str = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
@@ -650,4 +651,175 @@ fn a_waiter_arriving_at_a_full_session_waits_and_hears_the_message() {
         newcomer.join().unwrap()
     });
     assert!(matches!(outcome, Wait::Message(_)), "{outcome:?}");
+}
+
+#[test]
+fn crlf_is_normalized_to_lf_while_bare_carriage_return_is_still_refused() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "crlf-1", "first line\r\nsecond line\r\n", now)
+        .unwrap();
+    let claim = mailbox.claim_next(SESSION, now).unwrap().unwrap();
+    assert_eq!(claim.text, "first line\nsecond line\n");
+    assert!(matches!(
+        mailbox.deposit(SESSION, "bare-cr", "safe\roverwrite", now),
+        Err(MailboxError::Invalid(_))
+    ));
+}
+
+#[test]
+fn peer_provenance_and_large_preview_pointers_round_trip_without_spoofing_human_approval() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    let body = "αβγ ".repeat(1500);
+    assert!(body.len() > INLINE_PREVIEW_BYTES);
+    let (preview, truncated) = preview_for_mailbox(&body, "msg-99");
+    assert!(truncated);
+    assert!(preview.len() <= INLINE_PREVIEW_BYTES);
+    assert!(preview.contains("msg_id=msg-99"));
+
+    let prov = EnvelopeProvenance::PeerAgent {
+        msg_id: "msg-99".into(),
+        from_peer: "peer-agy-1".into(),
+        provider: "antigravity".into(),
+        branch: "feat/a2a".into(),
+        thread_key: "review-1".into(),
+        hop: 2,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: truncated,
+        repo_root: "/tmp/repo".into(),
+    };
+    mailbox
+        .deposit_with_provenance(SESSION, "msg-99", &preview, prov.clone(), now)
+        .unwrap();
+    assert!(mailbox.has_pending(SESSION, now).unwrap());
+    // Retrying same request_id with HumanConfirmed must be rejected!
+    assert!(matches!(
+        mailbox.deposit(SESSION, "msg-99", &preview, now),
+        Err(MailboxError::Invalid(_))
+    ));
+    let batch = mailbox.try_claim_batch(SESSION, 8, now).unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].claim.request_id, "msg-99");
+    assert_eq!(batch[0].provenance, prov);
+    assert!(!mailbox.has_pending(SESSION, now).unwrap());
+}
+
+#[test]
+fn external_waiters_are_capped_at_sixteen_and_never_starve_hosted_sessions() {
+    let (_dir, mailbox) = mailbox();
+    let mut external_held = Vec::new();
+    let ext_sessions = MAX_WAITERS_EXTERNAL / MAX_WAITERS_PER_SESSION;
+    for n in 0..ext_sessions {
+        let session = session_n(500 + n);
+        let dir = mailbox.ensure_session(&session, SystemTime::now()).unwrap();
+        for _ in 0..MAX_WAITERS_PER_SESSION {
+            external_held.push(
+                Waiter::register_in_pool(&mailbox, &dir, &session, WaitPool::External).unwrap(),
+            );
+        }
+    }
+    let extra_ext = session_n(599);
+    let extra_ext_dir = mailbox
+        .ensure_session(&extra_ext, SystemTime::now())
+        .unwrap();
+    assert!(matches!(
+        Waiter::register_in_pool(&mailbox, &extra_ext_dir, &extra_ext, WaitPool::External),
+        Err(MailboxError::Full(_))
+    ));
+
+    // Hosted sessions still get all 48 guaranteed slots even with external saturated!
+    let mut hosted_held = Vec::new();
+    let hosted_sessions = MAX_WAITERS_HOSTED / MAX_WAITERS_PER_SESSION;
+    for n in 0..hosted_sessions {
+        let session = session_n(700 + n);
+        let dir = mailbox.ensure_session(&session, SystemTime::now()).unwrap();
+        for _ in 0..MAX_WAITERS_PER_SESSION {
+            hosted_held.push(
+                Waiter::register_in_pool(&mailbox, &dir, &session, WaitPool::Hosted).unwrap(),
+            );
+        }
+    }
+    assert_eq!(hosted_held.len(), MAX_WAITERS_HOSTED);
+    let extra_hosted = session_n(799);
+    let extra_hosted_dir = mailbox
+        .ensure_session(&extra_hosted, SystemTime::now())
+        .unwrap();
+    assert!(matches!(
+        Waiter::register_in_pool(&mailbox, &extra_hosted_dir, &extra_hosted, WaitPool::Hosted),
+        Err(MailboxError::Full(_))
+    ));
+    drop(external_held);
+    drop(hosted_held);
+}
+
+#[test]
+fn bumping_turn_epoch_displaces_prior_stop_waiters_and_resets_continuations() {
+    let (_dir, mailbox) = mailbox();
+    assert_eq!(mailbox.bump_continuation(SESSION).unwrap(), 1);
+    assert_eq!(mailbox.bump_continuation(SESSION).unwrap(), 2);
+    assert_eq!(mailbox.continuation_count(SESSION).unwrap(), 2);
+
+    let outcome = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            mailbox
+                .wait_in_pool(SESSION, Duration::from_secs(15), WaitPool::Hosted)
+                .unwrap()
+        });
+        assert!(
+            crate::test_support::env::wait_until(Duration::from_secs(5), || {
+                mailbox.listening(SESSION, SystemTime::now())
+            }),
+            "the waiter never registered"
+        );
+        assert_eq!(mailbox.bump_turn_epoch(SESSION).unwrap(), 1);
+        waiter.join().unwrap()
+    });
+    assert!(matches!(outcome, EnvelopeWait::Declined(_)), "{outcome:?}");
+    assert_eq!(mailbox.continuation_count(SESSION).unwrap(), 0);
+}
+
+#[test]
+fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "msg-hop-max",
+            "at hop limit",
+            EnvelopeProvenance::PeerAgent {
+                msg_id: "msg-hop-max".into(),
+                from_peer: "peer-1".into(),
+                provider: "claude".into(),
+                branch: "main".into(),
+                thread_key: "t".into(),
+                hop: 6,
+                max_hops: 6,
+                truncated_in_bus: false,
+                repo_root: String::new(),
+            },
+            now,
+        )
+        .unwrap();
+
+    let wait_res = mailbox
+        .wait_in_pool_filtered(SESSION, Duration::from_secs(5), WaitPool::Hosted, |prov| {
+            !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
+        })
+        .unwrap();
+    assert!(
+        matches!(wait_res, EnvelopeWait::Declined(_)),
+        "{wait_res:?}"
+    );
+    // Still pending for manual / boundary inspection!
+    assert_eq!(mailbox.status(SESSION, "msg-hop-max"), Delivery::Pending);
+    assert!(mailbox
+        .mark_claimed_by_id(SESSION, "msg-hop-max", now)
+        .unwrap());
+    assert!(!mailbox
+        .mark_claimed_by_id(SESSION, "msg-hop-max", now)
+        .unwrap());
+    assert_eq!(mailbox.status(SESSION, "msg-hop-max"), Delivery::Claimed);
 }

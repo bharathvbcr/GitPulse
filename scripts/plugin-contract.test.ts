@@ -160,6 +160,7 @@ describe("plugin hooks", () => {
         for (const handler of group.hooks) {
           const subcommand = bareHookCommand(String(handler.command)).split(/\s+/)[1];
           const reports = subcommand === "notify";
+          const injectsPeerInbox = subcommand === "peer-inbox";
           // `deliver` is the one hook that waits, in the background: `asyncRewake`
           // runs it without blocking the agent and wakes the agent on exit 2. It
           // is not `async`, which "cannot block" and so cannot wake.
@@ -168,6 +169,12 @@ describe("plugin hooks", () => {
             expect(event, "deliver only makes sense where a turn ends").toBe("Stop");
             expect(handler.asyncRewake, "deliver is asyncRewake").toBe(true);
             expect(handler.async, "an async hook cannot wake the agent").toBeUndefined();
+            continue;
+          }
+          if (injectsPeerInbox) {
+            expect(["PostToolUse", "SessionStart", "UserPromptSubmit"]).toContain(event);
+            expect(handler.async, "peer-inbox injects context synchronously").toBeUndefined();
+            expect(handler.asyncRewake, "peer-inbox is not a background waiter").toBeUndefined();
             continue;
           }
           if (mustBeAsync.has(event)) expect(handler.async, `${event} blocks the agent on a report`).toBe(true);
@@ -450,6 +457,27 @@ describe("the package's executables are installable", () => {
         if (typeof server.command === "string" && server.command) found.add(server.command);
       }
     }
+
+    const agyHooks = JSON.parse(
+      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "hooks.json"), "utf8"),
+    ) as Record<string, Record<string, Array<{ command?: string; hooks?: Array<{ command?: string }> }>>>;
+    for (const namedHook of Object.values(agyHooks)) {
+      for (const entries of Object.values(namedHook)) {
+        for (const item of entries) {
+          const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+          for (const handler of handlers) {
+            const bin = bareHookCommand(String(handler.command ?? "")).split(/\s+/)[0];
+            if (bin) found.add(bin);
+          }
+        }
+      }
+    }
+    const agyMcp = JSON.parse(
+      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "mcp_config.json"), "utf8"),
+    ) as { mcpServers?: Record<string, { command?: string }> };
+    for (const server of Object.values(agyMcp.mcpServers ?? {})) {
+      if (typeof server.command === "string" && server.command) found.add(server.command);
+    }
     return found;
   }
 
@@ -532,121 +560,203 @@ describe("the package's executables are installable", () => {
  * languages in different files, so this is the only place the ordering can be
  * stated. Both sides are parsed rather than repeated.
  */
-describe("hook budgets sit inside the host's timeouts", () => {
-  const hookSource = readFileSync(
-    path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"),
-    "utf8",
+const hookSource = readFileSync(
+  path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"),
+  "utf8",
+);
+const notifyInputSource = readFileSync(
+  path.join(ROOT, "src-tauri", "src", "hooks", "notify_input.rs"),
+  "utf8",
+);
+
+/** A `const NAME: Duration = Duration::from_secs|millis(N)` in hooks/mod.rs, in seconds. */
+function hookDurationSeconds(constant: string): number {
+  const declared = new RegExp(
+    `const ${constant}: Duration = Duration::from_(secs|millis)\\((\\d+)\\)`,
+  ).exec(hookSource);
+  expect(declared, `${constant} is not a plain Duration constant; update this contract`).toBeTruthy();
+  const value = Number(declared![2]);
+  return declared![1] === "secs" ? value : value / 1000;
+}
+
+function hookBudgetSeconds(): number {
+  const match = /pub const BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(hookSource);
+  expect(match, "hooks::BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
+  return Number(match![1]);
+}
+
+/**
+ * The worktree hooks' whole-process deadline: `WORKTREE_BUDGET` in
+ * hooks/worktree.rs. Not `TOTAL_BUDGET`: creating a worktree runs git, a cache
+ * copy and the repository's approved post_create hooks, and Claude Code waits.
+ */
+function worktreeBudgetSeconds(): number {
+  const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "worktree.rs"), "utf8");
+  const declared = /pub const WORKTREE_BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+  expect(declared, "WORKTREE_BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
+  return Number(declared![1]);
+}
+
+/**
+ * How long `deliver` waits for a message: `DELIVER_WAIT` in hooks/deliver.rs,
+ * a plain whole number of seconds. It is not `BUDGET` or `TOTAL_BUDGET`: those
+ * are for hooks the agent is waiting on, and a waiter cut to them would give
+ * up on an idle session. The entry's `timeout` has to outlast it, or the host
+ * kills the waiter mid-wait and a message claimed in that instant is lost.
+ */
+function deliverWaitSeconds(): number {
+  const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "deliver.rs"), "utf8");
+  const declared = /pub const DELIVER_WAIT: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+  expect(declared, "DELIVER_WAIT is no longer a whole number of seconds; update this contract").toBeTruthy();
+  return Number(declared![1]);
+}
+
+/**
+ * What one `notify` run waits out for `event`: the read and then the socket
+ * report, each for the budget `notify_input::budgets_for` gives that event.
+ * Derived from the source, never listed here: the function is read, the two
+ * constants it names (one for `session_ended`, one for everything else) are
+ * resolved to their plain `Duration`s, and the handlers are checked to take
+ * their budgets from it, so a handler that stopped doing so fails this
+ * rather than being measured against a number it no longer uses.
+ */
+function notifyRunSeconds(event: string): number {
+  expect(
+    /fn run_notify\b[\s\S]*?budgets_for\(/.exec(hookSource),
+    "run_notify no longer takes its send budget from budgets_for; update this contract",
+  ).toBeTruthy();
+  expect(
+    /pub fn read_for\b[\s\S]*?budgets_for\(/.exec(hookSource),
+    "read_for no longer takes notify's read budget from budgets_for; update this contract",
+  ).toBeTruthy();
+  const classes = /fn budgets_for\b[\s\S]*?"session_ended"\s*=>\s*([A-Z_]+),\s*_\s*=>\s*([A-Z_]+),/.exec(
+    notifyInputSource,
   );
+  expect(classes, "budgets_for no longer maps session_ended and the rest to two constants; update this contract").toBeTruthy();
+  const each = hookDurationSeconds(event === "session_ended" ? classes![1] : classes![2]);
+  return each * 2;
+}
 
-  function hookBudgetSeconds(): number {
-    const match = /pub const BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(hookSource);
-    expect(match, "hooks::BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
-    return Number(match![1]);
-  }
-
-  /**
-   * The ceiling the work behind one subcommand actually waits out.
-   *
-   * Not every subcommand shares `BUDGET`. `notify` reports rather than checks,
-   * runs while the user is already waiting, and has nothing worth waiting for,
-   * so it has its own much shorter one. Which budget applies is *derived* from
-   * the source — the subcommand's handler is read and the constant it passes
-   * to `within_budget` is the answer — rather than listed here, because a list
-   * would go stale exactly when a handler changed its mind.
-   */
-  function budgetSecondsFor(subcommand: string, argument = ""): number {
-    if (subcommand === "notify") return notifyRunSeconds(argument);
-    if (subcommand === "deliver") return deliverWaitSeconds();
-    if (subcommand === "worktree-create" || subcommand === "worktree-remove") return worktreeBudgetSeconds();
-    const handler = new RegExp(
-      `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?within_budget\\(\\s*([A-Z_]+)`,
-    ).exec(hookSource);
-    if (!handler) return hookBudgetSeconds();
-    const constant = handler[1];
-    if (constant === "BUDGET") return hookBudgetSeconds();
-    return durationSeconds(constant);
-  }
-
-  /** A `const NAME: Duration = Duration::from_secs|millis(N)` in hooks/mod.rs, in seconds. */
-  function durationSeconds(constant: string): number {
-    const declared = new RegExp(
-      `const ${constant}: Duration = Duration::from_(secs|millis)\\((\\d+)\\)`,
-    ).exec(hookSource);
-    expect(declared, `${constant} is not a plain Duration constant; update this contract`).toBeTruthy();
-    const value = Number(declared![2]);
-    return declared![1] === "secs" ? value : value / 1000;
-  }
-
-  /**
-   * The worktree hooks' whole-process deadline: `WORKTREE_BUDGET` in
-   * hooks/worktree.rs. Not `TOTAL_BUDGET`: creating a worktree runs git, a cache
-   * copy and the repository's approved post_create hooks, and Claude Code waits.
-   */
-  function worktreeBudgetSeconds(): number {
-    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "worktree.rs"), "utf8");
-    const declared = /pub const WORKTREE_BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(source);
-    expect(declared, "WORKTREE_BUDGET is no longer a whole number of seconds; update this contract").toBeTruthy();
-    return Number(declared![1]);
-  }
-
-  const notifyInputSource = readFileSync(
-    path.join(ROOT, "src-tauri", "src", "hooks", "notify_input.rs"),
-    "utf8",
-  );
-
-  /**
-   * How long `deliver` waits for a message: `DELIVER_WAIT` in hooks/deliver.rs,
-   * a plain whole number of seconds. It is not `BUDGET` or `TOTAL_BUDGET`: those
-   * are for hooks the agent is waiting on, and a waiter cut to them would give
-   * up on an idle session. The entry's `timeout` has to outlast it, or the host
-   * kills the waiter mid-wait and a message claimed in that instant is lost.
-   */
-  function deliverWaitSeconds(): number {
-    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "deliver.rs"), "utf8");
-    const declared = /pub const DELIVER_WAIT: Duration = Duration::from_secs\((\d+)\)/.exec(source);
-    expect(declared, "DELIVER_WAIT is no longer a whole number of seconds; update this contract").toBeTruthy();
-    return Number(declared![1]);
-  }
-
-  /**
-   * What one `notify` run waits out for `event`: the read and then the socket
-   * report, each for the budget `notify_input::budgets_for` gives that event.
-   * Derived from the source, never listed here: the function is read, the two
-   * constants it names (one for `session_ended`, one for everything else) are
-   * resolved to their plain `Duration`s, and the handlers are checked to take
-   * their budgets from it, so a handler that stopped doing so fails this
-   * rather than being measured against a number it no longer uses.
-   */
-  function notifyRunSeconds(event: string): number {
-    expect(
-      /fn run_notify\b[\s\S]*?budgets_for\(/.exec(hookSource),
-      "run_notify no longer takes its send budget from budgets_for; update this contract",
-    ).toBeTruthy();
-    expect(
-      /pub fn read_for\b[\s\S]*?budgets_for\(/.exec(hookSource),
-      "read_for no longer takes notify's read budget from budgets_for; update this contract",
-    ).toBeTruthy();
-    const classes = /fn budgets_for\b[\s\S]*?"session_ended"\s*=>\s*([A-Z_]+),\s*_\s*=>\s*([A-Z_]+),/.exec(
-      notifyInputSource,
+/**
+ * What one `stop-or-notify` run waits out: `read_for`'s `PEER_INBOX_BUDGET`
+ * stdin walk plus `run_stop_or_notify`'s explicit `turn_finished` socket budget.
+ */
+function stopOrNotifySeconds(): number {
+  const readArm =
+    /if matches!\(subcommand,\s*"peer-inbox"\s*\|\s*"stop-or-notify"\)[\s\S]*?read_notify_input_within\([\s\S]*?,\s*([A-Z_]+),?\s*\)/.exec(
+      hookSource,
     );
-    expect(classes, "budgets_for no longer maps session_ended and the rest to two constants; update this contract").toBeTruthy();
-    const each = durationSeconds(event === "session_ended" ? classes![1] : classes![2]);
-    return each * 2;
-  }
+  expect(
+    readArm,
+    "read_for no longer bounds stop-or-notify with a plain Duration constant; update this contract",
+  ).toBeTruthy();
+  const sendCall =
+    /pub fn run_stop_or_notify\b[\s\S]*?run_notify_within\([\s\S]*?Some\(Duration::from_(secs|millis)\((\d+)\)\)/.exec(
+      hookSource,
+    );
+  expect(
+    sendCall,
+    "run_stop_or_notify no longer passes a plain Duration to run_notify_within; update this contract",
+  ).toBeTruthy();
+  const sendSeconds =
+    sendCall![1] === "secs" ? Number(sendCall![2]) : Number(sendCall![2]) / 1000;
+  return hookDurationSeconds(readArm![1]) + sendSeconds;
+}
 
-  function declaredTimeouts(): Array<{ event: string; command: string; timeout: number }> {
+/**
+ * The ceiling the work behind one subcommand actually waits out.
+ *
+ * Not every subcommand shares `BUDGET`. `notify` reports rather than checks,
+ * runs while the user is already waiting, and has nothing worth waiting for,
+ * so it has its own much shorter one. Which budget applies is *derived* from
+ * the source — the subcommand's handler is read and the constant it passes
+ * to `within_budget` is the answer — rather than listed here, because a list
+ * would go stale exactly when a handler changed its mind.
+ */
+function budgetSecondsFor(subcommand: string, argument = ""): number {
+  if (subcommand === "notify") return notifyRunSeconds(argument);
+  if (subcommand === "deliver") return deliverWaitSeconds();
+  if (subcommand === "worktree-create" || subcommand === "worktree-remove") return worktreeBudgetSeconds();
+  if (subcommand === "stop-or-notify") return stopOrNotifySeconds();
+  const fnBlock = new RegExp(
+    `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?\\n\\}`,
+  ).exec(hookSource)?.[0];
+  const handler = fnBlock ? /within_budget\(\s*([A-Z_]+)/.exec(fnBlock) : null;
+  if (!handler) return hookBudgetSeconds();
+  const constant = handler[1];
+  if (constant === "BUDGET") return hookBudgetSeconds();
+  return hookDurationSeconds(constant);
+}
+
+/**
+ * Minimum host `timeout` (in seconds) required for `subcommand` (`argument`) so
+ * the internal deadline finishes with `HOST_TIMEOUT_MARGIN` to print stdout and
+ * reap children before the host kills the subprocess.
+ */
+function minHostTimeoutSeconds(subcommand: string, argument = ""): number {
+  const margin = hookDurationSeconds("HOST_TIMEOUT_MARGIN");
+  if (subcommand === "notify") return notifyRunSeconds(argument) + margin;
+  if (subcommand === "worktree-create" || subcommand === "worktree-remove") {
+    return worktreeBudgetSeconds() + margin;
+  }
+  if (subcommand === "peer-inbox") {
+    return hookDurationSeconds("PEER_INBOX_BUDGET") + margin;
+  }
+  if (subcommand === "stop-or-notify") {
+    return stopOrNotifySeconds() + margin;
+  }
+  return hookDurationSeconds("TOTAL_BUDGET") + margin;
+}
+
+describe("hook budgets sit inside the host's timeouts", () => {
+  function declaredTimeouts(): Array<{
+    manifest: "gitpulse" | "gitpulse-agy";
+    event: string;
+    command: string;
+    timeout: number;
+  }> {
     const hooks = JSON.parse(
       readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8"),
     ) as { hooks: Record<string, Array<{ hooks: Array<{ command?: string; timeout?: number }> }>> };
-    const rows: Array<{ event: string; command: string; timeout: number }> = [];
+    const rows: Array<{
+      manifest: "gitpulse" | "gitpulse-agy";
+      event: string;
+      command: string;
+      timeout: number;
+    }> = [];
     for (const [event, groups] of Object.entries(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
           rows.push({
+            manifest: "gitpulse",
             event,
             command: bareHookCommand(String(handler.command)),
             timeout: Number(handler.timeout),
           });
+        }
+      }
+    }
+    const agyHooks = JSON.parse(
+      readFileSync(path.join(ROOT, "plugins", "gitpulse-agy", "hooks.json"), "utf8"),
+    ) as Record<
+      string,
+      Record<
+        string,
+        Array<{ command?: string; timeout?: number; hooks?: Array<{ command?: string; timeout?: number }> }>
+      >
+    >;
+    for (const namedHook of Object.values(agyHooks)) {
+      for (const [event, entries] of Object.entries(namedHook)) {
+        for (const item of entries) {
+          const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+          for (const handler of handlers) {
+            rows.push({
+              manifest: "gitpulse-agy",
+              event,
+              command: bareHookCommand(String(handler.command)),
+              timeout: Number(handler.timeout),
+            });
+          }
         }
       }
     }
@@ -655,17 +765,18 @@ describe("hook budgets sit inside the host's timeouts", () => {
 
   it("reads a budget and at least one declared timeout", () => {
     expect(hookBudgetSeconds()).toBeGreaterThan(0);
-    expect(declaredTimeouts().length).toBeGreaterThan(0);
+    expect(declaredTimeouts().filter((r) => r.manifest === "gitpulse").length).toBeGreaterThan(0);
+    expect(declaredTimeouts().filter((r) => r.manifest === "gitpulse-agy").length).toBeGreaterThan(0);
   });
 
   it("gives every hook longer than the work inside it is allowed to take", () => {
-    for (const { event, command, timeout } of declaredTimeouts()) {
+    for (const { manifest, event, command, timeout } of declaredTimeouts()) {
       const [, subcommand = "", argument = ""] = command.split(/\s+/);
       const budget = budgetSecondsFor(subcommand, argument);
-      expect(Number.isFinite(timeout), `${event} ${command} has no numeric timeout`).toBe(true);
+      expect(Number.isFinite(timeout), `${manifest}:${event} ${command} has no numeric timeout`).toBe(true);
       expect(
         timeout,
-        `${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before giving up — the host discards the output of a timed-out hook, so whatever it had to say would never be delivered`,
+        `${manifest}:${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before giving up — the host discards the output of a timed-out hook, so whatever it had to say would never be delivered`,
       ).toBeGreaterThan(budget);
     }
   });
@@ -679,34 +790,27 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(rows[0].timeout - wait).toBeGreaterThanOrEqual(30);
     expect(rows[0].timeout).toBeLessThanOrEqual(1800);
     // And it is not clamped to the short budget the deciding hooks share.
-    expect(wait).toBeGreaterThan(Number(/pub const TOTAL_BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(hookSource)![1]));
+    expect(wait).toBeGreaterThan(hookDurationSeconds("TOTAL_BUDGET"));
   });
 
   it("ends the whole process, not just each wait, a stated margin before the host's timeout", () => {
     // Each wait is cut to what is left of TOTAL_BUDGET from process start, so
     // stdin + scope check + scan cannot add up to the host's timeout. The margin
     // is what printing the answer and reaping a child need after the work ends.
-    const seconds = (name: string): number => {
-      const declared = new RegExp(
-        `pub const ${name}: Duration = Duration::from_secs\\((\\d+)\\)`,
-      ).exec(hookSource);
-      expect(declared, `${name} is no longer a whole number of seconds; update this contract`).toBeTruthy();
-      return Number(declared![1]);
-    };
-    const total = seconds("TOTAL_BUDGET");
-    const margin = seconds("HOST_TIMEOUT_MARGIN");
+    const total = hookDurationSeconds("TOTAL_BUDGET");
+    const margin = hookDurationSeconds("HOST_TIMEOUT_MARGIN");
     expect(total).toBeGreaterThanOrEqual(hookBudgetSeconds());
-    // Reports (`notify`) wait their own short budget; the deciding hooks are
-    // the ones that can reach the whole deadline.
-    for (const { event, command, timeout } of declaredTimeouts()) {
-      const subcommand = command.split(/\s+/)[1];
-      if (subcommand === "notify") continue;
-      // The worktree hooks have their own whole-process deadline.
-      const deadline = subcommand === "worktree-create" || subcommand === "worktree-remove" ? worktreeBudgetSeconds() : total;
+    expect(margin).toBeGreaterThan(0);
+    for (const { manifest, event, command, timeout } of declaredTimeouts()) {
+      const [, subcommand = "", argument = ""] = command.split(/\s+/);
+      if (subcommand === "deliver") continue;
+      // SessionEnd has its own tighter 1 s exit budget checked below.
+      if (event === "SessionEnd") continue;
+      const required = minHostTimeoutSeconds(subcommand, argument);
       expect(
         timeout,
-        `${event} "${command}" times out at ${timeout}s; the hook's own deadline is ${deadline}s plus a ${margin}s margin`,
-      ).toBeGreaterThanOrEqual(deadline + margin);
+        `${manifest}:${event} "${command}" times out at ${timeout}s; its internal budget + ${margin}s margin requires ${required}s`,
+      ).toBeGreaterThanOrEqual(required);
     }
   });
 
@@ -718,6 +822,8 @@ describe("hook budgets sit inside the host's timeouts", () => {
     // SessionEnd's report has its own, shorter one: the injected copy is held to 1 s.
     expect(budgetSecondsFor("notify", "session_ended")).toBeLessThan(budgetSecondsFor("notify", "tool_finished"));
     expect(budgetSecondsFor("notify", "session_ended")).toBeLessThan(1);
+    expect(budgetSecondsFor("peer-inbox")).toBeLessThan(hookBudgetSeconds());
+    expect(budgetSecondsFor("stop-or-notify")).toBeLessThan(hookBudgetSeconds());
     expect(budgetSecondsFor("collision-guard")).toBe(hookBudgetSeconds());
   });
 
@@ -915,5 +1021,309 @@ describe("gitpulse-terminal plugin skill contract", () => {
       expect(orchestrateRs).toMatch(new RegExp(`(?:pub ${field}:|"${field}":)`));
       expect(skillMd).toContain(`\`${field}\``);
     }
+  });
+});
+
+describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
+  const AGY_PLUGIN = path.join(ROOT, "plugins", "gitpulse-agy");
+
+  type AgyHandler = {
+    type?: unknown;
+    command?: unknown;
+    timeout?: unknown;
+    env?: Record<string, unknown>;
+  };
+  type AgyEntry = AgyHandler & {
+    matcher?: unknown;
+    hooks?: AgyHandler[];
+  };
+
+  const hooks = loadJsonAt(path.join(AGY_PLUGIN, "hooks.json")) as Record<
+    string,
+    Record<string, AgyEntry[]>
+  >;
+  const known = hookSource.match(/pub const SUBCOMMANDS: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
+  const implemented = new Set([...known.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]));
+
+  const bridge = readFileSync(path.join(ROOT, "src-tauri", "src", "alerts", "bridge.rs"), "utf8");
+  const bridgeTable = bridge.slice(
+    bridge.indexOf("pub const EVENTS"),
+    bridge.indexOf("];", bridge.indexOf("pub const EVENTS")),
+  );
+  const notifyEvents = new Set([...bridgeTable.matchAll(/name: "([a-z_]+)"/g)].map((m) => m[1]));
+
+  const incomingFn = /fn incoming_edit\([\s\S]*?\n\}\n/.exec(hookSource)?.[0] ?? "";
+  const armHeaders = [...incomingFn.matchAll(/^\s{8}("[^"]+"(?:\s*\|\s*"[^"]+")*)\s*=>/gm)].map(
+    (m) => m[1],
+  );
+  const agyEditTools = armHeaders
+    .flatMap((arm) => [...arm.matchAll(/"([a-z][a-z_]*)"/g)].map((m) => m[1]))
+    .sort();
+
+  const HANDLER_KEYS = ["command", "env", "timeout", "type"];
+  const GROUP_KEYS = ["hooks", "matcher"];
+
+  function validateAgyHooks(candidate: Record<string, Record<string, AgyEntry[]>>) {
+    expect(Object.keys(candidate)).toEqual(["gitpulse"]);
+    expect(Object.keys(candidate.gitpulse).sort()).toEqual([
+      "PostInvocation",
+      "PostToolUse",
+      "PreInvocation",
+      "PreToolUse",
+      "SessionStart",
+      "Stop",
+    ]);
+    expect(implemented.size).toBeGreaterThan(0);
+    expect(notifyEvents.size).toBeGreaterThan(0);
+    expect(agyEditTools.length).toBeGreaterThan(0);
+
+    const groupedEvents = new Set(["PreToolUse", "PostToolUse"]);
+    const routes: Array<string> = [];
+
+    for (const [event, entries] of Object.entries(candidate.gitpulse)) {
+      expect(entries.length, `${event} has no entries`).toBeGreaterThan(0);
+      for (const item of entries) {
+        if (groupedEvents.has(event)) {
+          expect(Object.keys(item).sort(), `${event} group has extra or missing keys`).toEqual(
+            GROUP_KEYS,
+          );
+          expect(Array.isArray(item.hooks), `${event} must use grouped hooks wrapper`).toBe(true);
+          expect(typeof item.matcher, `${event} group must declare a matcher`).toBe("string");
+          const matcher = String(item.matcher);
+          if (event === "PreToolUse") {
+            expect(matcher.startsWith("^") && matcher.endsWith("$"), matcher).toBe(true);
+          } else {
+            expect(matcher).toBe("*");
+          }
+        } else {
+          expect(item.hooks, `${event} is a flat lifecycle event in agy`).toBeUndefined();
+          expect(item.matcher, `${event} ignores matchers in agy`).toBeUndefined();
+        }
+
+        const handlers = Array.isArray(item.hooks) ? item.hooks : [item];
+        expect(handlers.length, `${event} group has no handlers`).toBeGreaterThan(0);
+        for (const handler of handlers) {
+          expect(
+            Object.keys(handler).sort(),
+            `${event} handler has unsupported or missing fields`,
+          ).toEqual(HANDLER_KEYS);
+          expect(handler.type, `${event}`).toBe("command");
+          expect(typeof handler.command, `${event}`).toBe("string");
+          const rawCommand = String(handler.command);
+          expect(rawCommand, `${event}: untrimmed command`).toBe(rawCommand.trim());
+          expect(
+            rawCommand.startsWith(WORKTREE_LAUNCHER_PREFIX),
+            `${event}: Claude worktree launcher is invalid in agy`,
+          ).toBe(false);
+          expect(
+            rawCommand.includes("$"),
+            `${event}: uninterpolated shell variable in ${rawCommand}`,
+          ).toBe(false);
+
+          const [bin, ...rest] = rawCommand.split(/\s+/);
+          expect(bin, `${event}`).toBe("gitpulse-hook");
+          expect(rest.length, `${event}: ${rawCommand}`).toBeGreaterThan(0);
+          const sub = rest[0];
+          expect(implemented, `${event}: ${sub}`).toContain(sub);
+          if (sub === "notify") {
+            expect(rest.length, `${event}: ${rawCommand} requires an event name`).toBe(2);
+            expect(notifyEvents, `${event}: unknown notify event ${rest[1]}`).toContain(rest[1]);
+          } else {
+            expect(rest.length, `${event}: ${rawCommand} takes no second argument`).toBe(1);
+          }
+
+          // Antigravity's `hooks.json` contract (`HookHandlerConfig.timeout` int32)
+          // measures `timeout` in whole seconds (default 30), NOT milliseconds.
+          expect(typeof handler.timeout, `${event}: ${rawCommand} has no timeout`).toBe("number");
+          const timeout = handler.timeout as number;
+          expect(Number.isInteger(timeout), `${event}: ${rawCommand} timeout must be an int`).toBe(true);
+          expect(timeout, `${event}: ${rawCommand}`).toBeGreaterThan(0);
+          expect(timeout, `${event}: ${rawCommand}`).toBeLessThanOrEqual(60);
+
+          const minTimeout = minHostTimeoutSeconds(sub, rest[1] ?? "");
+          expect(
+            timeout,
+            `${event} "${rawCommand}" times out at ${timeout}s before its ${minTimeout}s internal budget + margin`,
+          ).toBeGreaterThanOrEqual(minTimeout);
+
+          // `agy` natively injects `PLUGIN_ROOT` into plugin hook subprocesses
+          // and does NOT interpolate `$PLUGIN_ROOT` in JSON `env` maps.
+          expect(handler.env, `${event}: ${rawCommand}`).toEqual({
+            GITPULSE_HOST: "antigravity",
+          });
+
+          const matcherKey = groupedEvents.has(event) ? String(item.matcher) : "";
+          routes.push(`${event}|${matcherKey}|${rawCommand}`);
+        }
+      }
+    }
+
+    const editMatcher = String(candidate.gitpulse.PreToolUse[0]?.matcher ?? "");
+    const editGroupMatch = /^\^\(([a-z_|]+)\)\$$/.exec(editMatcher);
+    expect(editGroupMatch, `invalid edit matcher ${editMatcher}`).toBeTruthy();
+    const declaredEditTools = editGroupMatch![1].split("|");
+    expect(new Set(declaredEditTools).size, "duplicate edit tool in matcher").toBe(
+      declaredEditTools.length,
+    );
+    expect([...declaredEditTools].sort()).toEqual(agyEditTools);
+
+    expect(routes).toEqual([
+      `PreToolUse|${editMatcher}|gitpulse-hook collision-guard`,
+      "PreToolUse|^run_command$|gitpulse-hook command-gate",
+      "PostToolUse|*|gitpulse-hook notify tool_finished",
+      "SessionStart||gitpulse-hook session-brief",
+      "SessionStart||gitpulse-hook peer-inbox",
+      "PreInvocation||gitpulse-hook peer-inbox",
+      "PostInvocation||gitpulse-hook peer-inbox",
+      "Stop||gitpulse-hook stop-or-notify",
+    ]);
+  }
+
+  it("carries a valid Antigravity manifest, logo asset, MCP config, and named-hook root hooks.json", () => {
+    const manifest = loadJsonAt(path.join(AGY_PLUGIN, "plugin.json"));
+    expect(manifest.name).toBe(path.basename(AGY_PLUGIN));
+    expect(manifest.logo).toBe("assets/logo.svg");
+    const logoPath = path.resolve(AGY_PLUGIN, String(manifest.logo));
+    expect(logoPath.startsWith(AGY_PLUGIN + path.sep)).toBe(true);
+    expect(existsSync(logoPath)).toBe(true);
+    expect(readFileSync(logoPath, "utf8").trimStart().startsWith("<svg")).toBe(true);
+
+    const mcp = loadJsonAt(path.join(AGY_PLUGIN, "mcp_config.json")) as Record<string, unknown>;
+    expect(Object.keys(mcp)).toEqual(["mcpServers"]);
+    const servers = mcp.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(servers)).toEqual(["gitpulse"]);
+    expect(servers.gitpulse).toEqual({
+      command: "gitpulse-mcp",
+      args: [],
+      env: { GITPULSE_HOST: "antigravity" },
+    });
+
+    validateAgyHooks(hooks);
+  });
+
+  it.runIf(gitAvailable)("keeps every file in plugins/gitpulse-agy committable", () => {
+    const files: string[] = [];
+    const walk = (current: string) => {
+      for (const name of readdirSync(current)) {
+        const full = path.join(current, name);
+        if (statSync(full).isDirectory()) walk(full);
+        else files.push(full);
+      }
+    };
+    walk(AGY_PLUGIN);
+    expect(files.length).toBeGreaterThan(0);
+    const ignored = files.filter(isIgnored).map((file) => path.relative(ROOT, file));
+    expect(ignored, `these would not survive a clone: ${ignored.join(", ")}`).toEqual([]);
+  });
+
+  it("rejects millisecond, zero, negative, fractional, missing, or below-budget timeouts, invalid matchers, and uninterpolated env vars", () => {
+    // Boundary acceptance: 60s (the synchronous ceiling) is valid.
+    const atCeiling = structuredClone(hooks);
+    atCeiling.gitpulse.PreToolUse[0].hooks![0].timeout = 60;
+    expect(() => validateAgyHooks(atCeiling)).not.toThrow();
+
+    // Invalid timeouts: missing, string, 0, negative, float, >60s, millisecond values, and below internal budget.
+    for (const badTimeout of [undefined, "10", 0, -5, 5.5, 61, 5000, 10000, 9]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PreToolUse[0].hooks![0].timeout = badTimeout;
+      expect(() => validateAgyHooks(copy), `collision-guard timeout=${String(badTimeout)}`).toThrow();
+    }
+    const belowPeerBudget = structuredClone(hooks);
+    belowPeerBudget.gitpulse.PreInvocation[0].timeout = 3;
+    expect(() => validateAgyHooks(belowPeerBudget)).toThrow();
+
+    // `notify tool_finished` waits 1.5s read + 1.5s send = 3.0s, plus 2s host margin = 5s.
+    for (const badNotifyTimeout of [3, 4]) {
+      const belowNotifyBudget = structuredClone(hooks);
+      belowNotifyBudget.gitpulse.PostToolUse[0].hooks![0].timeout = badNotifyTimeout;
+      expect(
+        () => validateAgyHooks(belowNotifyBudget),
+        `notify tool_finished timeout=${badNotifyTimeout}`,
+      ).toThrow();
+    }
+
+    // `stop-or-notify` waits 2.0s read + 0.8s send + 2.0s host margin = 4.8s -> integer >= 5s.
+    const belowStopOrNotifyBudget = structuredClone(hooks);
+    belowStopOrNotifyBudget.gitpulse.Stop[0].timeout = 4;
+    expect(() => validateAgyHooks(belowStopOrNotifyBudget), "stop-or-notify timeout=4").toThrow();
+
+    // `notify` with missing argument or unknown bridge event.
+    for (const badNotifyCmd of ["gitpulse-hook notify", "gitpulse-hook notify unknown_event"]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PostToolUse[0].hooks![0].command = badNotifyCmd;
+      expect(() => validateAgyHooks(copy), badNotifyCmd).toThrow();
+    }
+
+    // Claude worktree launcher or uninterpolated `$` variable in `command`.
+    for (const badCommand of [
+      `${WORKTREE_LAUNCHER_PREFIX}gitpulse-hook collision-guard`,
+      '"$PLUGIN_ROOT/gitpulse-hook" collision-guard',
+    ]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PreToolUse[0].hooks![0].command = badCommand;
+      expect(() => validateAgyHooks(copy), badCommand).toThrow();
+    }
+
+    // Unsupported extra fields on handler (`async`, `asyncRewake`, `timeoutMs`) or group wrapper.
+    for (const extraField of ["async", "asyncRewake", "timeoutMs"]) {
+      const copy = structuredClone(hooks);
+      (copy.gitpulse.PostToolUse[0].hooks![0] as Record<string, unknown>)[extraField] = true;
+      expect(() => validateAgyHooks(copy), `handler extra field ${extraField}`).toThrow();
+    }
+    const extraOnGroup = structuredClone(hooks);
+    extraOnGroup.gitpulse.PostToolUse[0].timeout = 5;
+    expect(() => validateAgyHooks(extraOnGroup), "group wrapper extra timeout").toThrow();
+
+    // Deleting a safety gate (`command-gate`), startup brief (`session-brief`), or retargeting `Stop`.
+    const deletedCommandGate = structuredClone(hooks);
+    deletedCommandGate.gitpulse.PreToolUse.splice(1, 1);
+    expect(() => validateAgyHooks(deletedCommandGate), "deleted command-gate").toThrow();
+
+    const deletedSessionBrief = structuredClone(hooks);
+    deletedSessionBrief.gitpulse.SessionStart.splice(0, 1);
+    expect(() => validateAgyHooks(deletedSessionBrief), "deleted session-brief").toThrow();
+
+    const retargetedStop = structuredClone(hooks);
+    retargetedStop.gitpulse.Stop[0].command = "gitpulse-hook peer-inbox";
+    expect(() => validateAgyHooks(retargetedStop), "retargeted Stop to peer-inbox").toThrow();
+
+    const driftedEditMatcher = structuredClone(hooks);
+    driftedEditMatcher.gitpulse.PreToolUse[0].matcher = "^(write_file|edit_file)$";
+    expect(() => validateAgyHooks(driftedEditMatcher), "dropped edit tools from matcher").toThrow();
+
+    // Uninterpolated `$PLUGIN_ROOT` or missing `GITPULSE_HOST` in `env`.
+    const uninterpolatedEnv = structuredClone(hooks);
+    uninterpolatedEnv.gitpulse.Stop[0].env = {
+      GITPULSE_HOST: "antigravity",
+      GITPULSE_AGY_PLUGIN_ROOT: "$PLUGIN_ROOT",
+    };
+    expect(() => validateAgyHooks(uninterpolatedEnv)).toThrow();
+
+    const emptyEnv = structuredClone(hooks);
+    emptyEnv.gitpulse.Stop[0].env = {};
+    expect(() => validateAgyHooks(emptyEnv)).toThrow();
+
+    // Missing or invalid matchers on grouped vs flat events.
+    for (const badPostMatcher of [undefined, ""]) {
+      const copy = structuredClone(hooks);
+      copy.gitpulse.PostToolUse[0].matcher = badPostMatcher;
+      expect(() => validateAgyHooks(copy), `PostToolUse matcher=${String(badPostMatcher)}`).toThrow();
+    }
+    const unanchoredPre = structuredClone(hooks);
+    unanchoredPre.gitpulse.PreToolUse[1].matcher = "run_command";
+    expect(() => validateAgyHooks(unanchoredPre)).toThrow();
+
+    const flatWithMatcher = structuredClone(hooks);
+    flatWithMatcher.gitpulse.Stop[0].matcher = "*";
+    expect(() => validateAgyHooks(flatWithMatcher)).toThrow();
+
+    // Empty event or handler arrays.
+    const emptyGroup = structuredClone(hooks);
+    emptyGroup.gitpulse.PostToolUse[0].hooks = [];
+    expect(() => validateAgyHooks(emptyGroup)).toThrow();
+
+    const emptyEvent = structuredClone(hooks);
+    emptyEvent.gitpulse.Stop = [];
+    expect(() => validateAgyHooks(emptyEvent)).toThrow();
   });
 });

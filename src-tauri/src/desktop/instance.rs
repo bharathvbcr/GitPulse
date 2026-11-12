@@ -79,6 +79,11 @@ const MAX_INSIGHTS_HANDLERS: usize = 4;
 /// at once, counted in their own budget so blocking `Wait` calls can neither
 /// starve hooks nor block app relaunches.
 const MAX_ORCHESTRATE_HANDLERS: usize = 8;
+/// Agent A2A deliveries/kickoffs in flight at once: a share of
+/// [`MAX_GATE_HANDLERS`], bounded inside [`HANDLER_TIMEOUT`].
+const MAX_DELIVER_HANDLERS: usize = 4;
+/// Longest prompt text an unattended `gitpulse_kickoff_agent` spawn may pass.
+const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
 /// Requests held for an owner whose window is not up yet.
 const MAX_QUEUED: usize = 32;
 /// How long the owner gives one connection end to end. Longer than the
@@ -174,6 +179,31 @@ pub enum Request {
         id: String,
         call: crate::terminal::orchestrate::OrchestrateCall,
     },
+    /// A `gitpulse-mcp` process asking the running desktop owner to wake an
+    /// idle hosted agent tab (`TerminalSession.svelte`), forward a peer turn to
+    /// a Managed run (`managed_run::follow_up_with`), or spawn an unattended
+    /// kickoff session (`gitpulse_kickoff_agent`). Answered on its connection
+    /// within [`HANDLER_TIMEOUT`] under [`MAX_DELIVER_HANDLERS`].
+    AgentDeliver {
+        /// Echoed in the answer, as for [`Request::GateCommand`].
+        id: String,
+        /// The repository checkout (absolute). The owner re-checks trust in it.
+        repo: String,
+        /// Target peer identifier (or `"kickoff"` when `spawn` is set).
+        peer_id: String,
+        /// Persisted `agent_bus` message id (or kickoff request id).
+        msg_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+    },
 }
 
 impl Request {
@@ -184,7 +214,8 @@ impl Request {
             Request::GateCommand { id, .. }
             | Request::CollisionScan { id, .. }
             | Request::InsightsRead { id, .. }
-            | Request::TerminalOrchestrate { id, .. } => Some(id),
+            | Request::TerminalOrchestrate { id, .. }
+            | Request::AgentDeliver { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -344,6 +375,72 @@ impl Request {
                     return Err("orchestrate request id is empty, too long or not printable".into());
                 }
                 call.validate()
+            }
+            Request::AgentDeliver {
+                id,
+                repo,
+                peer_id,
+                msg_id,
+                spawn,
+                provider,
+                branch,
+                prompt,
+                task_id,
+            } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("deliver request id is empty, too long or not printable".into());
+                }
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("deliver repository must be an absolute path".into());
+                }
+                if peer_id.is_empty()
+                    || peer_id.len() > MAX_NATIVE_ID
+                    || peer_id.chars().any(char::is_control)
+                {
+                    return Err("deliver peer_id is empty, too long or not printable".into());
+                }
+                if msg_id.is_empty()
+                    || msg_id.len() > MAX_NATIVE_ID
+                    || msg_id.chars().any(char::is_control)
+                {
+                    return Err("deliver msg_id is empty, too long or not printable".into());
+                }
+                if let Some(mode) = spawn.as_deref() {
+                    if !matches!(mode, "terminal" | "managed") {
+                        return Err("deliver spawn must be 'terminal' or 'managed'".into());
+                    }
+                }
+                if let Some(p) = provider.as_deref() {
+                    if !matches!(p, "claude" | "agy" | "codex") {
+                        return Err("deliver provider must be claude, agy or codex".into());
+                    }
+                }
+                if let Some(b) = branch.as_deref() {
+                    if b.is_empty() || b.len() > MAX_NATIVE_ID || b.chars().any(char::is_control) {
+                        return Err("deliver branch is empty, too long or not printable".into());
+                    }
+                }
+                if let Some(p) = prompt.as_deref() {
+                    if p.trim().is_empty() || p.len() > MAX_KICKOFF_PROMPT_BYTES || p.contains('\0')
+                    {
+                        return Err(
+                            "deliver prompt is empty, contains NUL or exceeds 16 KiB".into()
+                        );
+                    }
+                }
+                if let Some(tid) = task_id.as_deref() {
+                    if tid.is_empty()
+                        || tid.len() > MAX_NATIVE_ID
+                        || tid.chars().any(char::is_control)
+                    {
+                        return Err("deliver task_id is empty, too long or not printable".into());
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -754,6 +851,20 @@ impl Secondary {
         self.answered(&request, within)
     }
 
+    /// Asks the owner to deliver an A2A peer message or spawn an unattended
+    /// kickoff session: the owner's reply to [`Request::AgentDeliver`], on the
+    /// same terms as [`Secondary::gate`].
+    pub fn agent_deliver(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::AgentDeliver { .. }) {
+            return Err("not an agent deliver request".into());
+        }
+        self.answered(request, within)
+    }
+
     fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
         let id = request
             .answered_id()
@@ -820,6 +931,8 @@ pub type OrchestrateSink = Arc<
         + Send
         + Sync,
 >;
+/// Delivers an A2A peer message or kickoff spawn for an MCP process.
+pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
@@ -837,9 +950,12 @@ struct Shared {
     gate: Mutex<Option<GateSink>>,
     collision: Mutex<Option<ScanSink>>,
     insights: Mutex<Option<InsightsSink>>,
+    deliver: Mutex<Option<DeliverSink>>,
     /// Insights reads in flight, a share of `gating` of their own.
     reading: AtomicUsize,
     orchestrate: Mutex<Option<OrchestrateSink>>,
+    /// Agent deliveries in flight, a share of `gating` of their own.
+    delivering: AtomicUsize,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -860,8 +976,10 @@ impl Shared {
             gate: Mutex::new(None),
             collision: Mutex::new(None),
             insights: Mutex::new(None),
+            deliver: Mutex::new(None),
             reading: AtomicUsize::new(0),
             orchestrate: Mutex::new(None),
+            delivering: AtomicUsize::new(0),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -995,6 +1113,18 @@ impl Primary {
         *self
             .shared
             .orchestrate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where MCP processes' A2A deliveries and kickoff spawns are answered once
+    /// the Tauri `AppHandle` exists (`launch::attach`). Until this is called a
+    /// [`Request::AgentDeliver`] is refused and the caller falls back to
+    /// mailbox/bus hook-boundary delivery.
+    pub fn attach_agent_deliver(&self, sink: DeliverSink) {
+        *self
+            .shared
+            .deliver
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1331,6 +1461,9 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if let Request::TerminalOrchestrate { id, call } = request {
         return answer_orchestrate(stream, shared, &id, call).map_err(Ended::Refused);
     }
+    if let Request::AgentDeliver { id, .. } = &request {
+        return answer_agent_deliver(stream, shared, id, &request).map_err(Ended::Refused);
+    }
     let verdict = admit(shared, request);
     let ack = match &verdict {
         Ok(_) => Ack::accepted(),
@@ -1398,6 +1531,21 @@ fn answer_insights(
     })
 }
 
+fn answer_agent_deliver(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    request: &Request,
+) -> Result<(), String> {
+    let delivering = DeliverSlot::take(shared);
+    answer_asked(stream, shared, id, "the agent delivery", || {
+        if delivering.is_none() {
+            return Err("the agent delivery is busy".to_string());
+        }
+        attached(&shared.deliver, "the agent delivery")?(request)
+    })
+}
+
 /// The sink in `slot`, cloned out so its lock is not held while the answer is
 /// worked out.
 fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> {
@@ -1462,6 +1610,26 @@ impl<'a> ReadSlot<'a> {
 impl Drop for ReadSlot<'_> {
     fn drop(&mut self) {
         self.0.reading.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One of the [`MAX_DELIVER_HANDLERS`] agent deliveries in flight, released on
+/// drop.
+struct DeliverSlot<'a>(&'a Shared);
+
+impl<'a> DeliverSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.delivering.fetch_add(1, Ordering::AcqRel) >= MAX_DELIVER_HANDLERS {
+            shared.delivering.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for DeliverSlot<'_> {
+    fn drop(&mut self) {
+        self.0.delivering.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

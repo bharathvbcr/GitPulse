@@ -160,8 +160,12 @@ pub fn attach(app: &tauri::AppHandle) {
                 crate::terminal::orchestrate::AppOrchestrateUiSink::new(orchestrate_app.clone());
             crate::terminal::orchestrate::execute(&terminals, &ui, call)
         }));
-        let app = app.clone();
-        primary.attach(move |request| super::answer_forwarded(&app, request));
+        let forwarded = app.clone();
+        primary.attach(move |request| super::answer_forwarded(&forwarded, request));
+        let deliver_app = app.clone();
+        primary.attach_agent_deliver(std::sync::Arc::new(move |request| {
+            super::serve_agent_deliver(&deliver_app, request)
+        }));
     }
 }
 

@@ -97,6 +97,8 @@ fn notice(key: &str) -> Notice {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 
@@ -442,6 +444,8 @@ fn hook(key: &str, event: &str, detail: Option<&str>) -> Notice {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     }
 }
 
@@ -484,6 +488,8 @@ fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
                 channel: "hook",
                 event: Some("permission_prompt"),
                 detail: Some("Bash: cargo test".into()),
+                fully_idle: None,
+                provider_session_id: None,
             }]
         );
     }
@@ -634,6 +640,8 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         channel: "hook",
         event: Some("permission_prompt"),
         detail: Some("Bash: cargo test".into()),
+        fully_idle: None,
+        provider_session_id: None,
     };
     assert_eq!(serde_json::to_string(&hook).unwrap(), WIRE_HOOK);
     let signal = Attention {
@@ -641,8 +649,22 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         channel: "bell",
         event: None,
         detail: None,
+        fully_idle: None,
+        provider_session_id: None,
     };
     assert_eq!(serde_json::to_string(&signal).unwrap(), WIRE_SIGNAL);
+    let agy_idle = Attention {
+        session: "term-1".into(),
+        channel: "hook",
+        event: Some("turn_finished"),
+        detail: None,
+        fully_idle: Some(true),
+        provider_session_id: Some("conv-uuid-123".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&agy_idle).unwrap(),
+        r#"{"session":"term-1","channel":"hook","event":"turn_finished","detail":null,"fully_idle":true,"provider_session_id":"conv-uuid-123"}"#
+    );
 }
 
 // ---- One request, two channels -------------------------------------------

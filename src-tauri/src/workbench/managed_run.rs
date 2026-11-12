@@ -261,10 +261,42 @@ fn launch_with(
             "work.runs.managed.activate",
             json!({"id":id,"owner_id":prepared.owner_id,"session_id":prepared.session_id,"process_id":prepared.process_id,"process_start":birth}),
         )?;
-        saved(state, &id)
+        Ok((saved(state, &id)?, prepared.process_id))
     })();
     match activation {
-        Ok(result) => Ok(result),
+        Ok((result, process_id)) => {
+            if let (Some(cwd), Some(provider)) = (
+                result["item"]["cwd"].as_str().filter(|s| !s.is_empty()),
+                result["item"]["provider"]
+                    .as_str()
+                    .filter(|s| !s.is_empty()),
+            ) {
+                let thread_sid = result["item"]["provider_thread_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let _ = crate::engine::agent_bus::upsert_peer(
+                    cwd,
+                    crate::engine::agent_bus::PeerUpsert {
+                        peer_id: None,
+                        provider: provider.to_owned(),
+                        surface: "managed".to_owned(),
+                        provider_session_id: thread_sid,
+                        terminal_session_id: None,
+                        run_id: Some(id.clone()),
+                        worktree_path: cwd.to_owned(),
+                        branch: None,
+                        role: None,
+                        turn_state: Some("running".to_owned()),
+                        auto_wake: Some(true),
+                        pid: Some(process_id),
+                        proc_start_ns: process_birth::started_unix_nanos(process_id),
+                        transcript_path: None,
+                    },
+                );
+            }
+            Ok(result)
+        }
         Err(error) => {
             // Preparation started a helper. A failed native observation must
             // close that exact session, never leave an unactivated model host.
@@ -485,6 +517,20 @@ pub(super) fn follow_up_with(
         ));
     }
     follow_up_answer(call(OP_CONTINUE, continue_params(id, request_id, message)))
+}
+
+/// Delivers an A2A peer message to a live managed run when it is parked between
+/// turns (`Request::AgentDeliver`), using the profile worker's `work.runs.managed.continue`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn deliver_peer_follow_up(
+    state: &WorkbenchState,
+    id: &str,
+    request_id: &str,
+    message: &str,
+) -> Result<Value, WorkbenchError> {
+    follow_up_with(state, id, Some(request_id), Some(message), |op, params| {
+        state.worker_call_current(op, params)
+    })
 }
 
 #[cfg(test)]
@@ -760,6 +806,100 @@ mod tests {
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["status"],
             "inbox"
         );
+    }
+
+    #[test]
+    fn managed_launch_registers_peer_in_peers_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, root) = prepared_attempt(dir.path(), "agy");
+        let thread_id = "77777777-7777-4777-8777-777777777777";
+        let pid = std::process::id();
+        let birth = process_birth::read(pid).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let eff_cfg = json!({"cwd": canonical_root, "sandbox": {"type": "none"}}).to_string();
+        let result = launch_with(
+            &state,
+            r#"{"id":"run"}"#,
+            |op, params| match op {
+                "work.runs.managed.prepare" => {
+                    state.with_store(|store| {
+                        query(
+                            store,
+                            "runs.claim",
+                            &json!({
+                                "id": "run",
+                                "request_id": "claim",
+                                "expected_revision": 1,
+                                "kind": "managed",
+                                "owner_id": "owner",
+                                "session_id": "session"
+                            })
+                            .to_string(),
+                        )
+                    })?;
+                    Ok(json!({
+                        "protocol_version": 2,
+                        "id": "run",
+                        "owner_id": "owner",
+                        "session_id": "session",
+                        "process_id": pid,
+                        "phase": "awaiting_activation"
+                    }))
+                }
+                "work.runs.managed.activate" => state.with_store(|store| {
+                    query(
+                        store,
+                        "runs.started",
+                        &json!({
+                            "id": "run",
+                            "request_id": "started",
+                            "expected_revision": 2,
+                            "owner_id": "owner",
+                            "session_id": "session",
+                            "process_id": params["process_id"],
+                            "process_start": params["process_start"]
+                        })
+                        .to_string(),
+                    )?;
+                    query(
+                        store,
+                        "runs.protocol",
+                        &json!({
+                            "id": "run",
+                            "request_id": "ready",
+                            "expected_revision": 3,
+                            "owner_id": "owner",
+                            "session_id": "session",
+                            "provider_state": "ready",
+                            "provider_thread_id": thread_id,
+                            "effective_configuration": eff_cfg,
+                            "output": "",
+                            "output_truncated": false
+                        })
+                        .to_string(),
+                    )
+                }),
+                _ => panic!("unexpected operation {op}: {birth}"),
+            },
+            process_birth::read,
+        )
+        .unwrap();
+        assert_eq!(result["item"]["state"], "running");
+
+        let peers = crate::engine::agent_bus::list_reconciled_peers(root.to_str().unwrap())
+            .expect("reconcile peers after managed launch");
+        let managed = peers
+            .iter()
+            .find(|p| p.record.run_id.as_deref() == Some("run"))
+            .unwrap_or_else(|| panic!("managed run missing from peers.json: {peers:?}"));
+        assert_eq!(managed.record.provider, "agy");
+        assert_eq!(managed.record.surface, "managed");
+        assert_eq!(
+            managed.record.provider_session_id.as_deref(),
+            Some(thread_id)
+        );
+        assert!(managed.record.auto_wake);
+        assert_eq!(managed.record.pid, Some(pid));
     }
 
     /// Builds a registered repository, a task, and one prepared managed

@@ -34,16 +34,20 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_ACTIVE_LANES: usize = 64;
+pub const MAX_PEER_RECORDS: usize = 256;
 pub const MAX_CLAIMED_ITEMS: usize = 128;
 pub const MAX_BUS_MESSAGES: usize = 256;
 pub const MAX_PINNED_OPEN_ASKS: usize = 64;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_READ_BY_ENTRIES: usize = 64;
+pub const DEFAULT_MAX_HOPS: u32 = 6;
 pub const MAX_ODB_RADAR_PAIRS: usize = 32;
 pub const MAX_RADAR_CONFLICTS_PER_LAYER: usize = 128;
 
 const LANES_SUBDIR: &str = "gitpulse/lanes";
 const CLAIMS_FILE: &str = "claims.json";
 const MESSAGES_FILE: &str = "messages.json";
+const PEERS_FILE: &str = "peers.json";
 
 /// Registration and intent-claim record for one parallel agent lane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +66,113 @@ struct ClaimsState {
     lanes: Vec<AgentLaneClaim>,
 }
 
+/// Persisted peer identity and session state in `<git-common-dir>/gitpulse/lanes/peers.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub peer_id: String,
+    pub provider: String,
+    pub surface: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub worktree_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub turn_state: String,
+    #[serde(default)]
+    pub auto_wake: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PeersState {
+    peers: Vec<PeerRecord>,
+}
+
+/// Reconciled peer view combining `peers.json` with live OS/lock/transcript truth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciledPeer {
+    #[serde(flatten)]
+    pub record: PeerRecord,
+    /// `"live"` | `"resumable"` | `"exited"` | `"unknown"`
+    pub liveness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_reason: Option<String>,
+}
+
+/// Parameters to upsert a peer in `peers.json`.
+#[derive(Debug, Clone, Default)]
+pub struct PeerUpsert {
+    pub peer_id: Option<String>,
+    pub provider: String,
+    pub surface: String,
+    pub provider_session_id: Option<String>,
+    pub terminal_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    pub role: Option<String>,
+    pub turn_state: Option<String>,
+    pub auto_wake: Option<bool>,
+    pub pid: Option<u32>,
+    pub proc_start_ns: Option<u64>,
+    pub transcript_path: Option<String>,
+}
+
+/// Fail-closed peer target resolution error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerResolutionError {
+    AmbiguousPeer {
+        target: String,
+        candidates: Vec<ReconciledPeer>,
+    },
+    NotFound {
+        target: String,
+    },
+    Bus(CommandError),
+}
+
+impl PeerResolutionError {
+    pub fn into_command_error(self) -> CommandError {
+        match self {
+            Self::AmbiguousPeer { target, candidates } => {
+                let ids: Vec<String> = candidates
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} (provider={}, branch={}, session={})",
+                            c.record.peer_id,
+                            c.record.provider,
+                            c.record.branch.as_deref().unwrap_or("-"),
+                            c.record.provider_session_id.as_deref().unwrap_or("-")
+                        )
+                    })
+                    .collect();
+                CommandError::from(format!(
+                    "ambiguous_peer: target '{target}' matched {} live sessions [{}]; pass an explicit peer_id or provider_session_id",
+                    candidates.len(),
+                    ids.join(", ")
+                ))
+            }
+            Self::NotFound { target } => CommandError::from(format!(
+                "peer_not_found: no live or resumable peer matched '{target}'"
+            )),
+            Self::Bus(err) => err,
+        }
+    }
+}
+
 /// Structured agent-to-agent coordination message stored under `<git-common-dir>/gitpulse/lanes/`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentBusMessage {
@@ -74,6 +185,14 @@ pub struct AgentBusMessage {
     pub created_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hops: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -685,6 +804,18 @@ pub fn list_lanes(repo_path: &str) -> Result<Vec<AgentLaneClaim>, CommandError> 
     })
 }
 
+/// Returns `<git-common-dir>/gitpulse/lanes/messages.json` (ensuring `lanes/` exists
+/// when `create_dir` is true) so MCP waiters can watch it via `notify`.
+pub fn lanes_messages_path(repo_path: &str, create_dir: bool) -> Result<PathBuf, CommandError> {
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    if create_dir {
+        fs::create_dir_all(&lanes_dir).map_err(|e| {
+            CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
+        })?;
+    }
+    Ok(lanes_dir.join(MESSAGES_FILE))
+}
+
 /// Posts a bounded agent-to-agent coordination message with an optional thread key.
 pub fn post_thread_message(
     repo_path: &str,
@@ -694,6 +825,39 @@ pub fn post_thread_message(
     kind: &str,
     body: &str,
     branch: Option<&str>,
+) -> Result<AgentBusMessage, CommandError> {
+    let is_human = matches!(
+        from_agent.trim(),
+        "developer" | "human" | "human-dev" | "user"
+    );
+    let hop = if is_human { 0 } else { 1 };
+    post_peer_message(
+        repo_path,
+        from_agent,
+        to_agent,
+        thread_key,
+        kind,
+        body,
+        branch,
+        None,
+        hop,
+        DEFAULT_MAX_HOPS,
+    )
+}
+
+/// Posts a bounded peer message with explicit `msg_id`, `hop`, and `max_hops`.
+#[allow(clippy::too_many_arguments)]
+pub fn post_peer_message(
+    repo_path: &str,
+    from_agent: &str,
+    to_agent: Option<&str>,
+    thread_key: Option<&str>,
+    kind: &str,
+    body: &str,
+    branch: Option<&str>,
+    explicit_msg_id: Option<&str>,
+    hop: u32,
+    max_hops: u32,
 ) -> Result<AgentBusMessage, CommandError> {
     let from = sanitize_token("from_agent", from_agent, 128)?;
     let to = match to_agent.map(str::trim).filter(|s| !s.is_empty()) {
@@ -705,7 +869,8 @@ pub fn post_thread_message(
         None => None,
     };
     let msg_kind = sanitize_token("kind", kind, 64)?;
-    let trimmed_body = body.trim();
+    let normalized_body = crate::agent_mailbox::normalize_crlf(body);
+    let trimmed_body = normalized_body.trim();
     if trimmed_body.is_empty() || trimmed_body.contains('\0') {
         return Err(CommandError::from("message body must not be empty"));
     }
@@ -718,14 +883,43 @@ pub fn post_thread_message(
         Some(b) => Some(sanitize_token("branch", b, 256)?),
         None => None,
     };
+    let caller_msg_id = match explicit_msg_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            if !crate::agent_mailbox::valid_request_id(id) {
+                return Err(CommandError::from(
+                    "msg_id must be 1 to 64 ASCII letters, digits, '-' or '_'",
+                ));
+            }
+            Some(id.to_string())
+        }
+        None => None,
+    };
+    let effective_max_hops = max_hops.clamp(1, 32);
 
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, true, || {
         let messages_path = lanes_dir.join(MESSAGES_FILE);
         let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
 
+        if let Some(ref want_id) = caller_msg_id {
+            if let Some(existing) = state
+                .messages
+                .iter()
+                .find(|m| m.msg_id.as_deref() == Some(want_id.as_str()))
+            {
+                if existing.body == trimmed_body && existing.from_agent == from {
+                    return Ok(existing.clone());
+                }
+                return Err(CommandError::from(format!(
+                    "msg_id '{want_id}' already exists with a different payload"
+                )));
+            }
+        }
+
         let seq = state.next_seq.saturating_add(1);
         state.next_seq = seq;
+        let created_at_ms = now_epoch_ms();
+        let msg_id = caller_msg_id.unwrap_or_else(|| format!("msg-{seq}-{created_at_ms}"));
 
         let msg = AgentBusMessage {
             seq,
@@ -734,8 +928,12 @@ pub fn post_thread_message(
             kind: msg_kind,
             body: trimmed_body.to_string(),
             branch: msg_branch,
-            created_at_ms: now_epoch_ms(),
+            created_at_ms,
             thread_key: t_key,
+            msg_id: Some(msg_id),
+            read_by: Vec::new(),
+            hop: Some(hop),
+            max_hops: Some(effective_max_hops),
         };
         state.messages.push(msg.clone());
         if state.messages.len() > MAX_BUS_MESSAGES {
@@ -787,6 +985,714 @@ pub fn post_thread_message(
         crate::workbench::notifications::sync_graft_inbox_message(persisted);
         #[cfg(test)]
         let _ = persisted;
+    })
+}
+
+/// Looks up one message by `msg_id` (used to hydrate `> 6 KiB` mailbox pointer envelopes).
+pub fn get_message_by_id(
+    repo_path: &str,
+    msg_id: &str,
+) -> Result<Option<AgentBusMessage>, CommandError> {
+    let clean_id = sanitize_token("msg_id", msg_id, 64)?;
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let state: MessagesState =
+            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        Ok(state
+            .messages
+            .into_iter()
+            .find(|m| m.msg_id.as_deref() == Some(clean_id.as_str())))
+    })
+}
+
+/// Marks `msg_ids` (or `msg-<seq>` fallback) as read by `reader_id` in `messages.json`.
+pub fn ack_messages(
+    repo_path: &str,
+    reader_id: &str,
+    msg_ids: &[String],
+) -> Result<usize, CommandError> {
+    if msg_ids.is_empty() {
+        return Ok(0);
+    }
+    let reader = sanitize_token("reader_id", reader_id, 128)?;
+    let wanted: BTreeSet<String> = msg_ids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let messages_path = lanes_dir.join(MESSAGES_FILE);
+        if !messages_path.is_file() {
+            return Ok(0);
+        }
+        let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
+        let mut updated = 0usize;
+        for msg in &mut state.messages {
+            let eff_id = msg
+                .msg_id
+                .clone()
+                .unwrap_or_else(|| format!("msg-{}", msg.seq));
+            if wanted.contains(&eff_id)
+                && !msg.read_by.contains(&reader)
+                && msg.read_by.len() < MAX_READ_BY_ENTRIES
+            {
+                msg.read_by.push(reader.clone());
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            let bytes = serde_json::to_vec_pretty(&state)
+                .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+            devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
+                CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
+            })?;
+        }
+        Ok(updated)
+    })
+}
+
+/// Reads unread messages addressed to any of `peer_aliases` (plus optional broadcasts),
+/// excluding messages sent by any of `peer_aliases` or already listed in `read_by`.
+pub fn read_unread_for_peer(
+    repo_path: &str,
+    peer_aliases: &[String],
+    since_seq: u64,
+    thread_key: Option<&str>,
+    include_broadcasts: bool,
+) -> Result<AgentInboxPage, CommandError> {
+    read_messages_for_peer(
+        repo_path,
+        peer_aliases,
+        since_seq,
+        thread_key,
+        include_broadcasts,
+        true,
+    )
+}
+
+/// Reads messages addressed to any of `peer_aliases` (plus optional broadcasts),
+/// optionally filtering out messages already acknowledged in `read_by`.
+pub fn read_messages_for_peer(
+    repo_path: &str,
+    peer_aliases: &[String],
+    since_seq: u64,
+    thread_key: Option<&str>,
+    include_broadcasts: bool,
+    unread_only: bool,
+) -> Result<AgentInboxPage, CommandError> {
+    let aliases: BTreeSet<String> = peer_aliases
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let state: MessagesState =
+            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let latest_seq = state.next_seq;
+        let filtered = state
+            .messages
+            .into_iter()
+            .filter(|m| m.seq > since_seq)
+            .filter(|m| match t_filter {
+                Some(tk) => m.thread_key.as_deref() == Some(tk),
+                None => true,
+            })
+            .filter(|m| !aliases.contains(&m.from_agent))
+            .filter(|m| !unread_only || !m.read_by.iter().any(|r| aliases.contains(r)))
+            .filter(|m| match &m.to_agent {
+                Some(to) => aliases.is_empty() || aliases.contains(to),
+                None => include_broadcasts,
+            })
+            .collect();
+        Ok(AgentInboxPage {
+            messages: filtered,
+            latest_seq,
+            dropped_before_seq: state.dropped_before_seq,
+        })
+    })
+}
+
+/* ── Peer Registry (`peers.json`) & Liveness Reconciliation ───────────────── */
+
+pub(crate) fn canonical_provider(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "antigravity" | "agy" => "agy".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn canonical_surface(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => "external_cli".to_string(),
+        "hosted_terminal" | "terminal" => "terminal".to_string(),
+        "antigravity_ide" | "ide" => "ide".to_string(),
+        "managed" => "managed".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn providers_match(record_provider: &str, query_provider: &str) -> bool {
+    canonical_provider(record_provider) == canonical_provider(query_provider)
+}
+
+/// Probes whether an Antigravity `<home>/presence/<conversationId>.lock` file is
+/// actively held by a live Antigravity CLI or IDE process via non-blocking `flock`.
+pub(crate) fn is_antigravity_presence_locked(homes: &[PathBuf], session_id: &str) -> bool {
+    if !crate::workbench::terminal_command::is_canonical_uuid(session_id) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_name = format!("{}.lock", session_id.to_ascii_lowercase());
+        for home in homes {
+            let candidate = home.join("presence").join(&lock_name);
+            let Ok(file) = fs::File::open(&candidate) else {
+                continue;
+            };
+            // SAFETY: `file` is an open descriptor owned by this scope; if we acquire
+            // `LOCK_EX | LOCK_NB` we unlock it immediately before closing.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                unsafe {
+                    let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                }
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || err.raw_os_error() == Some(libc::EAGAIN)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (homes, session_id);
+        false
+    }
+}
+
+/// Upserts a peer record in `<git-common-dir>/gitpulse/lanes/peers.json` under `.bus.lock`.
+pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, CommandError> {
+    let provider = sanitize_token("provider", &canonical_provider(&update.provider), 32)?;
+    let surface = sanitize_token("surface", &canonical_surface(&update.surface), 32)?;
+    let worktree_clean = if update.worktree_path.trim().is_empty() {
+        repo_path.trim().to_string()
+    } else {
+        update.worktree_path.trim().to_string()
+    };
+    let provider_sid = update
+        .provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
+        .map(|s| s.to_ascii_lowercase());
+    let term_sid = update
+        .terminal_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_token("terminal_session_id", s, 128))
+        .transpose()?;
+    let run_id = update
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_token("run_id", s, 128))
+        .transpose()?;
+    let derived_peer_id = match update
+        .peer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(explicit) => sanitize_token("peer_id", explicit, 128)?,
+        None => {
+            if let Some(ref sid) = provider_sid {
+                format!("{provider}:{sid}")
+            } else if let Some(ref tid) = term_sid {
+                format!("{provider}:{tid}")
+            } else if let Some(pid) = update.pid {
+                format!("{provider}:pid-{pid}")
+            } else {
+                return Err(CommandError::from(
+                    "peer registration requires peer_id, provider_session_id, terminal_session_id, or pid",
+                ));
+            }
+        }
+    };
+    let role = update
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_token("role", s, 64))
+        .transpose()?;
+    let branch = update
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_token("branch", s, 256))
+        .transpose()?;
+    let turn_state = update
+        .turn_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("running")
+        .to_string();
+    let transcript_path = update
+        .transcript_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('\0') && s.len() <= 1024)
+        .map(str::to_string);
+
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, true, || {
+        let peers_path = lanes_dir.join(PEERS_FILE);
+        let mut state: PeersState = read_json_bounded(&peers_path, 4 * 1024 * 1024)?;
+        let now = now_epoch_ms();
+
+        let existing_idx = state.peers.iter().position(|p| {
+            p.peer_id == derived_peer_id
+                || (provider_sid.is_some() && p.provider_session_id == provider_sid)
+                || (term_sid.is_some()
+                    && provider_sid.is_none()
+                    && p.terminal_session_id == term_sid
+                    && providers_match(&p.provider, &provider))
+        });
+
+        let record = if let Some(idx) = existing_idx {
+            let prev = &state.peers[idx];
+            let merged_peer_id = if update.peer_id.is_some() || provider_sid.is_some() {
+                derived_peer_id.clone()
+            } else {
+                prev.peer_id.clone()
+            };
+            let next = PeerRecord {
+                peer_id: merged_peer_id,
+                provider: provider.clone(),
+                surface: if update.surface.trim().is_empty() {
+                    prev.surface.clone()
+                } else {
+                    surface
+                },
+                provider_session_id: provider_sid.or_else(|| prev.provider_session_id.clone()),
+                terminal_session_id: term_sid.or_else(|| prev.terminal_session_id.clone()),
+                run_id: run_id.or_else(|| prev.run_id.clone()),
+                worktree_path: worktree_clean,
+                branch: branch.or_else(|| prev.branch.clone()),
+                role: role.or_else(|| prev.role.clone()),
+                turn_state: if update.turn_state.is_some() {
+                    turn_state
+                } else {
+                    prev.turn_state.clone()
+                },
+                auto_wake: update.auto_wake.unwrap_or(prev.auto_wake),
+                pid: update.pid.or(prev.pid),
+                proc_start_ns: update.proc_start_ns.or(prev.proc_start_ns),
+                transcript_path: transcript_path.or_else(|| prev.transcript_path.clone()),
+                updated_at_ms: now,
+            };
+            state.peers[idx] = next.clone();
+            next
+        } else {
+            if state.peers.len() >= MAX_PEER_RECORDS {
+                state.peers.sort_by_key(|p| p.updated_at_ms);
+                state.peers.remove(0);
+            }
+            let next = PeerRecord {
+                peer_id: derived_peer_id,
+                provider,
+                surface,
+                provider_session_id: provider_sid,
+                terminal_session_id: term_sid,
+                run_id,
+                worktree_path: worktree_clean,
+                branch,
+                role,
+                turn_state,
+                auto_wake: update.auto_wake.unwrap_or(false),
+                pid: update.pid,
+                proc_start_ns: update.proc_start_ns,
+                transcript_path,
+                updated_at_ms: now,
+            };
+            state.peers.push(next.clone());
+            next
+        };
+
+        state.peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        let bytes = serde_json::to_vec_pretty(&state)
+            .map_err(|e| CommandError::from(format!("cannot serialize peers: {e}")))?;
+        devmap_query::write_atomic(&peers_path, &bytes).map_err(|e| {
+            CommandError::from(format!("cannot write {}: {e}", peers_path.display()))
+        })?;
+        Ok(record)
+    })
+}
+
+/// Returns `provider_session_id` recorded in `peers.json` for `run_id` when present.
+pub(crate) fn peer_session_id_for_run(repo_path: &str, run_id: &str) -> Option<String> {
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path).ok()?;
+    let state: PeersState = with_bus_lock(&lanes_dir, false, || {
+        read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
+    })
+    .ok()?;
+    state
+        .peers
+        .into_iter()
+        .filter(|p| p.run_id.as_deref() == Some(run_id))
+        .max_by_key(|p| p.updated_at_ms)
+        .and_then(|p| p.provider_session_id)
+}
+
+/// Checks Verdict 1 Rule 3 for external Claude `Stop` `deliver`: returns true iff
+/// `peers.json` holds a live record for `session_id` with `auto_wake == true`
+/// and matching live `(pid, proc_start_ns)`.
+pub(crate) fn is_external_peer_auto_wake_opted_in(repo_path: &str, session_id: &str) -> bool {
+    let Ok(sid) = crate::agent_mailbox::session_key(session_id) else {
+        return false;
+    };
+    let Ok((_repo, lanes_dir)) = lanes_dir_for_repo(repo_path) else {
+        return false;
+    };
+    let Ok(state) = with_bus_lock(&lanes_dir, false, || {
+        read_json_bounded::<PeersState>(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
+    }) else {
+        return false;
+    };
+    state.peers.iter().any(|peer| {
+        if !peer.auto_wake || peer.provider_session_id.as_deref() != Some(sid.as_str()) {
+            return false;
+        }
+        let (Some(pid), Some(start_ns)) = (peer.pid, peer.proc_start_ns) else {
+            return false;
+        };
+        matches!(
+            crate::workbench::process_birth::running_since(pid, u128::from(start_ns)),
+            crate::workbench::process_birth::Liveness::Alive
+        )
+    })
+}
+
+/// Lists and reconciles all peers across all worktrees of `repo_path`.
+pub fn list_reconciled_peers(repo_path: &str) -> Result<Vec<ReconciledPeer>, CommandError> {
+    let agy_homes = crate::workbench::conversation::antigravity_homes();
+    list_reconciled_peers_with(
+        repo_path,
+        &agy_homes,
+        &crate::workbench::process_birth::running_since,
+        &crate::workbench::conversation::has_saved_transcript,
+    )
+}
+
+pub(crate) fn list_reconciled_peers_with(
+    repo_path: &str,
+    agy_homes: &[PathBuf],
+    alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
+    has_transcript: &dyn Fn(&str, &str) -> bool,
+) -> Result<Vec<ReconciledPeer>, CommandError> {
+    let live_obs = crate::insights::live_sessions::observe();
+    list_reconciled_peers_from_observation(
+        repo_path,
+        agy_homes,
+        &live_obs,
+        alive_probe,
+        has_transcript,
+    )
+}
+
+pub(crate) fn list_reconciled_peers_from_observation(
+    repo_path: &str,
+    agy_homes: &[PathBuf],
+    live_obs: &crate::insights::live_sessions::Observation,
+    alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
+    has_transcript: &dyn Fn(&str, &str) -> bool,
+) -> Result<Vec<ReconciledPeer>, CommandError> {
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    let stored: PeersState = with_bus_lock(&lanes_dir, false, || {
+        read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
+    })?;
+    let worktrees = list_worktrees(repo_path).unwrap_or_default();
+    let wt_paths: Vec<String> = worktrees.iter().map(|w| w.path.clone()).collect();
+    let wt_branch_by_path: HashMap<String, Option<String>> = worktrees
+        .iter()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+        .collect();
+
+    let live_facet = crate::insights::live_sessions::attribute(live_obs, &wt_paths);
+    let mut live_by_pid: HashMap<u32, (&crate::insights::LiveSession, &str)> = HashMap::new();
+    let mut live_by_sid: HashMap<String, (&crate::insights::LiveSession, &str)> = HashMap::new();
+    for wt in &live_facet.worktrees {
+        for sess in &wt.sessions {
+            live_by_pid.insert(sess.pid, (sess, wt.path.as_str()));
+            if let Some(ref sid) = sess.session_id {
+                live_by_sid.insert(sid.to_ascii_lowercase(), (sess, wt.path.as_str()));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut covered_pids = BTreeSet::new();
+    let mut covered_sids = BTreeSet::new();
+
+    for mut peer in stored.peers {
+        peer.provider = canonical_provider(&peer.provider);
+        peer.surface = canonical_surface(&peer.surface);
+        if peer.branch.is_none() {
+            if let Some(Some(br)) = wt_branch_by_path.get(&peer.worktree_path) {
+                peer.branch = Some(br.clone());
+            }
+        }
+        let sid_lower = peer
+            .provider_session_id
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase());
+        if let Some(ref s) = sid_lower {
+            covered_sids.insert(s.clone());
+        }
+        if let Some(pid) = peer.pid {
+            covered_pids.insert(pid);
+        }
+
+        let mut is_alive = false;
+        let mut unknown_reason: Option<String> = None;
+
+        if let Some(ref s) = sid_lower {
+            if live_by_sid.contains_key(s)
+                || (providers_match(&peer.provider, "agy")
+                    && is_antigravity_presence_locked(agy_homes, s))
+            {
+                is_alive = true;
+            }
+        }
+
+        if !is_alive {
+            if let (Some(pid), Some(start_ns)) = (peer.pid, peer.proc_start_ns) {
+                if peer.turn_state != "exited" {
+                    match alive_probe(pid, u128::from(start_ns)) {
+                        crate::workbench::process_birth::Liveness::Alive => is_alive = true,
+                        crate::workbench::process_birth::Liveness::Gone => {}
+                        crate::workbench::process_birth::Liveness::Unknown(why) => {
+                            unknown_reason = Some(why);
+                        }
+                    }
+                }
+            } else if let Some(pid) = peer.pid {
+                if peer.turn_state != "exited" && live_by_pid.contains_key(&pid) {
+                    is_alive = true;
+                }
+            }
+        }
+
+        let (liveness, liveness_reason) = if is_alive {
+            ("live".to_string(), None)
+        } else if let Some(why) = unknown_reason {
+            peer.turn_state = "unknown".to_string();
+            ("unknown".to_string(), Some(why))
+        } else {
+            peer.turn_state = "exited".to_string();
+            let resumable = sid_lower
+                .as_deref()
+                .is_some_and(|s| has_transcript(&peer.provider, s));
+            if resumable {
+                ("resumable".to_string(), None)
+            } else {
+                ("exited".to_string(), None)
+            }
+        };
+
+        out.push(ReconciledPeer {
+            record: peer,
+            liveness,
+            liveness_reason,
+        });
+    }
+
+    // Also include live process-scanned sessions in this repo that have not yet
+    // written a `peers.json` record (for example a freshly opened CLI or IDE).
+    for wt in &live_facet.worktrees {
+        let branch = wt_branch_by_path.get(&wt.path).cloned().flatten();
+        for sess in &wt.sessions {
+            let sid_lower = sess.session_id.as_deref().map(|s| s.to_ascii_lowercase());
+            if covered_pids.contains(&sess.pid)
+                || sid_lower
+                    .as_deref()
+                    .is_some_and(|s| covered_sids.contains(s))
+            {
+                continue;
+            }
+            let provider = canonical_provider(&sess.kind);
+            let term_sid = sess.terminal_session_id.clone().or_else(|| {
+                sess.tree
+                    .as_deref()
+                    .and_then(|t| t.strip_prefix("session:"))
+                    .map(str::to_string)
+            });
+            let surface = if term_sid.is_some() {
+                "terminal".to_string()
+            } else if sess.ide_hosted {
+                "ide".to_string()
+            } else if sess.run_id.is_some() {
+                "managed".to_string()
+            } else {
+                "external_cli".to_string()
+            };
+            let peer_id = match sid_lower.as_deref() {
+                Some(s) => format!("{provider}:{s}"),
+                None => format!("{provider}:pid-{}", sess.pid),
+            };
+            out.push(ReconciledPeer {
+                record: PeerRecord {
+                    peer_id,
+                    provider,
+                    surface,
+                    provider_session_id: sid_lower,
+                    terminal_session_id: term_sid,
+                    run_id: sess.run_id.clone(),
+                    worktree_path: wt.path.clone(),
+                    branch: branch.clone(),
+                    role: None,
+                    turn_state: if sess.status.is_empty() {
+                        "running".into()
+                    } else {
+                        sess.status.clone()
+                    },
+                    auto_wake: false,
+                    pid: Some(sess.pid),
+                    proc_start_ns: None,
+                    transcript_path: None,
+                    updated_at_ms: now_epoch_ms(),
+                },
+                liveness: "live".into(),
+                liveness_reason: None,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.record.peer_id.cmp(&b.record.peer_id));
+    Ok(out)
+}
+
+/// Resolves a target selector (`peer_id`, `provider_session_id`, `terminal_session_id`,
+/// `run_id`, `role`, `branch`, or bare `provider`) against reconciled peers, failing
+/// closed with [`PeerResolutionError::AmbiguousPeer`] whenever multiple live (or
+/// resumable) sessions match.
+pub fn resolve_target_peer(
+    repo_path: &str,
+    target: &str,
+) -> Result<ReconciledPeer, PeerResolutionError> {
+    let peers = list_reconciled_peers(repo_path).map_err(PeerResolutionError::Bus)?;
+    resolve_target_from_list(&peers, target)
+}
+
+pub(crate) fn resolve_target_from_list(
+    peers: &[ReconciledPeer],
+    target: &str,
+) -> Result<ReconciledPeer, PeerResolutionError> {
+    let clean = target.trim();
+    if clean.is_empty() {
+        return Err(PeerResolutionError::NotFound {
+            target: String::new(),
+        });
+    }
+    let clean_lower = clean.to_ascii_lowercase();
+
+    let exact_matches = |p: &ReconciledPeer| -> bool {
+        p.record.peer_id == clean
+            || p.record
+                .provider_session_id
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&clean_lower))
+            || p.record.terminal_session_id.as_deref() == Some(clean)
+            || p.record.run_id.as_deref() == Some(clean)
+    };
+
+    let exact_live: Vec<ReconciledPeer> = peers
+        .iter()
+        .filter(|p| p.liveness == "live" && exact_matches(p))
+        .cloned()
+        .collect();
+    if exact_live.len() == 1 {
+        return Ok(exact_live.into_iter().next().unwrap());
+    }
+    if exact_live.len() > 1 {
+        return Err(PeerResolutionError::AmbiguousPeer {
+            target: clean.to_string(),
+            candidates: exact_live,
+        });
+    }
+
+    let selector_matches = |p: &ReconciledPeer| -> bool {
+        providers_match(&p.record.provider, clean)
+            || p.record.role.as_deref() == Some(clean)
+            || p.record.branch.as_deref() == Some(clean)
+    };
+
+    let live_candidates: Vec<ReconciledPeer> = peers
+        .iter()
+        .filter(|p| p.liveness == "live" && selector_matches(p))
+        .cloned()
+        .collect();
+    if live_candidates.len() == 1 {
+        return Ok(live_candidates.into_iter().next().unwrap());
+    }
+    if live_candidates.len() > 1 {
+        return Err(PeerResolutionError::AmbiguousPeer {
+            target: clean.to_string(),
+            candidates: live_candidates,
+        });
+    }
+
+    // Fall back to resumable conversations so `gitpulse_agent_send` can report
+    // `delivery_outcome: "requires_resume"` instead of losing track of an exited peer.
+    let resumable_exact: Vec<ReconciledPeer> = peers
+        .iter()
+        .filter(|p| p.liveness == "resumable" && exact_matches(p))
+        .cloned()
+        .collect();
+    if resumable_exact.len() == 1 {
+        return Ok(resumable_exact.into_iter().next().unwrap());
+    }
+    if resumable_exact.len() > 1 {
+        return Err(PeerResolutionError::AmbiguousPeer {
+            target: clean.to_string(),
+            candidates: resumable_exact,
+        });
+    }
+
+    let resumable_sel: Vec<ReconciledPeer> = peers
+        .iter()
+        .filter(|p| p.liveness == "resumable" && selector_matches(p))
+        .cloned()
+        .collect();
+    if resumable_sel.len() == 1 {
+        return Ok(resumable_sel.into_iter().next().unwrap());
+    }
+    if resumable_sel.len() > 1 {
+        return Err(PeerResolutionError::AmbiguousPeer {
+            target: clean.to_string(),
+            candidates: resumable_sel,
+        });
+    }
+
+    Err(PeerResolutionError::NotFound {
+        target: clean.to_string(),
     })
 }
 
@@ -2067,5 +2973,420 @@ mod tests {
         let t_61 = threads.iter().find(|t| t.thread_key == "t-61").unwrap();
         assert_eq!(t_61.title, format!("{}…", "E".repeat(57)));
         assert_eq!(t_61.title.chars().count(), 58);
+    }
+
+    #[test]
+    fn peer_registry_reconciles_antigravity_presence_flock_and_resumable_transcripts() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        let agy_home = tempfile::tempdir().unwrap();
+        let presence_dir = agy_home.path().join("presence");
+        fs::create_dir_all(&presence_dir).unwrap();
+
+        let conv_live = "11111111-2222-4333-8444-555555555555";
+        let conv_stale = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+
+        let live_lock_path = presence_dir.join(format!("{conv_live}.lock"));
+        let stale_lock_path = presence_dir.join(format!("{conv_stale}.lock"));
+        let live_lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&live_lock_path)
+            .unwrap();
+        // Leave stale_lock_path on disk unlocked (exact Antigravity post-exit behavior).
+        fs::write(&stale_lock_path, b"").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc =
+                unsafe { libc::flock(live_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(rc, 0, "test holds active flock on conv_live");
+        }
+
+        let homes = vec![agy_home.path().to_path_buf()];
+        assert!(is_antigravity_presence_locked(&homes, conv_live));
+        assert!(
+            !is_antigravity_presence_locked(&homes, conv_stale),
+            "unlocked 0-byte presence file must not report live"
+        );
+
+        let p1 = upsert_peer(
+            anchor,
+            PeerUpsert {
+                provider: "antigravity".into(),
+                surface: "ide".into(),
+                provider_session_id: Some(conv_live.into()),
+                run_id: Some("run-agy-1".into()),
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                role: Some("planner".into()),
+                turn_state: Some("idle".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p1.provider, "agy");
+        assert_eq!(p1.peer_id, format!("agy:{conv_live}"));
+        assert_eq!(
+            peer_session_id_for_run(anchor, "run-agy-1").as_deref(),
+            Some(conv_live)
+        );
+
+        upsert_peer(
+            anchor,
+            PeerUpsert {
+                provider: "agy".into(),
+                surface: "terminal".into(),
+                provider_session_id: Some(conv_stale.into()),
+                worktree_path: anchor.into(),
+                branch: Some("feat/stale".into()),
+                turn_state: Some("idle".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reconciled = list_reconciled_peers_with(
+            anchor,
+            &homes,
+            &|_pid, _birth| crate::workbench::process_birth::Liveness::Gone,
+            &|_prov, sid| sid == conv_stale,
+        )
+        .unwrap();
+
+        let r_live = reconciled
+            .iter()
+            .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
+            .expect("conv_live peer");
+        assert_eq!(r_live.liveness, "live");
+
+        let r_stale = reconciled
+            .iter()
+            .find(|p| p.record.provider_session_id.as_deref() == Some(conv_stale))
+            .expect("conv_stale peer");
+        assert_eq!(r_stale.liveness, "resumable");
+        assert_eq!(r_stale.record.turn_state, "exited");
+
+        drop(live_lock_file);
+        let reconciled_after_exit = list_reconciled_peers_with(
+            anchor,
+            &homes,
+            &|_pid, _birth| crate::workbench::process_birth::Liveness::Gone,
+            &|_prov, _sid| false,
+        )
+        .unwrap();
+        let r_exited = reconciled_after_exit
+            .iter()
+            .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
+            .unwrap();
+        assert_eq!(r_exited.liveness, "exited");
+    }
+
+    #[test]
+    fn resolve_target_from_list_fails_closed_on_ambiguous_provider_or_branch() {
+        let sid_a = "aaaaaaaa-1111-4222-8333-444444444444";
+        let sid_b = "bbbbbbbb-1111-4222-8333-444444444444";
+        let peers = vec![
+            ReconciledPeer {
+                record: PeerRecord {
+                    peer_id: format!("claude:{sid_a}"),
+                    provider: "claude".into(),
+                    surface: "terminal".into(),
+                    provider_session_id: Some(sid_a.into()),
+                    terminal_session_id: Some("term-1".into()),
+                    run_id: None,
+                    worktree_path: "/repo/wt-a".into(),
+                    branch: Some("main".into()),
+                    role: Some("reviewer".into()),
+                    turn_state: "idle".into(),
+                    auto_wake: false,
+                    pid: Some(101),
+                    proc_start_ns: Some(1000),
+                    transcript_path: None,
+                    updated_at_ms: 10,
+                },
+                liveness: "live".into(),
+                liveness_reason: None,
+            },
+            ReconciledPeer {
+                record: PeerRecord {
+                    peer_id: format!("claude:{sid_b}"),
+                    provider: "claude".into(),
+                    surface: "external_cli".into(),
+                    provider_session_id: Some(sid_b.into()),
+                    terminal_session_id: None,
+                    run_id: None,
+                    worktree_path: "/repo/wt-b".into(),
+                    branch: Some("main".into()),
+                    role: Some("implementer".into()),
+                    turn_state: "running".into(),
+                    auto_wake: true,
+                    pid: Some(102),
+                    proc_start_ns: Some(2000),
+                    transcript_path: None,
+                    updated_at_ms: 20,
+                },
+                liveness: "live".into(),
+                liveness_reason: None,
+            },
+        ];
+
+        // Bare provider or shared branch MUST fail closed with AmbiguousPeer.
+        match resolve_target_from_list(&peers, "claude") {
+            Err(PeerResolutionError::AmbiguousPeer { candidates, .. }) => {
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousPeer on 'claude', got {other:?}"),
+        }
+        match resolve_target_from_list(&peers, "main") {
+            Err(PeerResolutionError::AmbiguousPeer { candidates, .. }) => {
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousPeer on 'main', got {other:?}"),
+        }
+
+        // Explicit role, session UUID, or peer_id resolves deterministically.
+        let by_role = resolve_target_from_list(&peers, "reviewer").unwrap();
+        assert_eq!(by_role.record.provider_session_id.as_deref(), Some(sid_a));
+        let by_sid = resolve_target_from_list(&peers, sid_b).unwrap();
+        assert_eq!(by_sid.record.peer_id, format!("claude:{sid_b}"));
+    }
+
+    #[test]
+    fn post_peer_message_hydrates_large_payload_idempotently_and_acks_unread() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        let large_body = format!("header\r\n{}", "payload-line\n".repeat(700));
+        assert!(large_body.len() > crate::agent_mailbox::INLINE_PREVIEW_BYTES);
+        assert!(large_body.len() < MAX_MESSAGE_BODY_BYTES);
+
+        let m1 = post_peer_message(
+            anchor,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            Some("a2a-review"),
+            "peer_message",
+            &large_body,
+            Some("feat/a2a"),
+            Some("req_large_001"),
+            1,
+            6,
+        )
+        .unwrap();
+        assert_eq!(m1.msg_id.as_deref(), Some("req_large_001"));
+        assert_eq!(m1.hop, Some(1));
+        assert_eq!(m1.max_hops, Some(6));
+        assert!(!m1.body.contains('\r'), "CRLF normalized to LF");
+
+        // Idempotent retry with identical msg_id + body + sender returns existing message.
+        let m1_dup = post_peer_message(
+            anchor,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            Some("a2a-review"),
+            "peer_message",
+            &large_body,
+            Some("feat/a2a"),
+            Some("req_large_001"),
+            1,
+            6,
+        )
+        .unwrap();
+        assert_eq!(m1_dup.seq, m1.seq);
+
+        // Conflicting payload on same msg_id fails closed.
+        assert!(post_peer_message(
+            anchor,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            Some("a2a-review"),
+            "peer_message",
+            "different body",
+            Some("feat/a2a"),
+            Some("req_large_001"),
+            1,
+            6,
+        )
+        .is_err());
+
+        let hydrated = get_message_by_id(anchor, "req_large_001")
+            .unwrap()
+            .expect("full body stored in agent_bus");
+        assert_eq!(hydrated.body, m1.body);
+
+        let aliases = vec![
+            "claude:aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        ];
+        let unread = read_unread_for_peer(anchor, &aliases, 0, None, true).unwrap();
+        assert_eq!(unread.messages.len(), 1);
+
+        let acked = ack_messages(
+            anchor,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            &["req_large_001".to_string()],
+        )
+        .unwrap();
+        assert_eq!(acked, 1);
+
+        let unread_after = read_unread_for_peer(anchor, &aliases, 0, None, true).unwrap();
+        assert!(unread_after.messages.is_empty());
+    }
+
+    #[test]
+    fn reconcile_classifies_surface_and_canonicalizes_legacy_hook_surfaces() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        // Legacy hook surface spellings canonicalize on upsert.
+        let legacy_ide = upsert_peer(
+            anchor,
+            PeerUpsert {
+                peer_id: None,
+                provider: "antigravity".into(),
+                surface: "antigravity_ide".into(),
+                provider_session_id: Some("88888888-8888-4888-8888-888888888881".into()),
+                terminal_session_id: None,
+                run_id: None,
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                role: None,
+                turn_state: Some("idle".into()),
+                auto_wake: None,
+                pid: Some(99001),
+                proc_start_ns: Some(100),
+                transcript_path: Some("/tmp/ide.pb".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_ide.provider, "agy");
+        assert_eq!(legacy_ide.surface, "ide");
+
+        let legacy_term = upsert_peer(
+            anchor,
+            PeerUpsert {
+                peer_id: None,
+                provider: "antigravity".into(),
+                surface: "hosted_terminal".into(),
+                provider_session_id: Some("88888888-8888-4888-8888-888888888882".into()),
+                terminal_session_id: Some("term-99".into()),
+                run_id: None,
+                worktree_path: anchor.into(),
+                branch: Some("main".into()),
+                role: None,
+                turn_state: Some("idle".into()),
+                auto_wake: None,
+                pid: Some(99002),
+                proc_start_ns: Some(100),
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_term.provider, "agy");
+        assert_eq!(legacy_term.surface, "terminal");
+
+        // Process-scanned sessions distinguish IDE, external_terminal task run, managed run, and external_cli.
+        let obs = vec![crate::insights::live_sessions::KindObservation {
+            kind: "antigravity".into(),
+            ok: true,
+            live: vec![
+                // 1. Antigravity IDE (`ide_hosted: true`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88001,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: None,
+                    run_id: None,
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: true,
+                    terminal_session_id: None,
+                },
+                // 2. External-terminal task run (`GITPULSE_RUN_ID` + `GITPULSE_SESSION_ID` -> `tree: "run:r1"`, `terminal_session_id: Some("term-1")`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88002,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: Some("run:r1".into()),
+                    run_id: Some("r1".into()),
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: Some("term-1".into()),
+                },
+                // 3. Managed run (`run_id: Some("r2")`, no `terminal_session_id`)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88003,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: Some("run:r2".into()),
+                    run_id: Some("r2".into()),
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: None,
+                },
+                // 4. Plain external `agy` CLI (`ide_hosted: false`, no launch ids)
+                crate::insights::LiveSession {
+                    kind: "antigravity".into(),
+                    pid: 88004,
+                    entrypoint: String::new(),
+                    status: "running".into(),
+                    cwd: anchor.into(),
+                    tree: None,
+                    run_id: None,
+                    parent_pid: None,
+                    session_id: None,
+                    proc_start: None,
+                    registry_cwd: None,
+                    ide_hosted: false,
+                    terminal_session_id: None,
+                },
+            ],
+            ..Default::default()
+        }];
+        let reconciled = list_reconciled_peers_from_observation(
+            anchor,
+            &[],
+            &obs,
+            &|_, _| crate::workbench::process_birth::Liveness::Gone,
+            &|_, _| false,
+        )
+        .unwrap();
+        let by_pid = |pid: u32| {
+            reconciled
+                .iter()
+                .find(|p| p.record.pid == Some(pid))
+                .unwrap_or_else(|| panic!("missing pid {pid} in {reconciled:?}"))
+        };
+        assert_eq!(by_pid(88001).record.surface, "ide");
+        assert_eq!(by_pid(88002).record.surface, "terminal");
+        assert_eq!(
+            by_pid(88002).record.terminal_session_id.as_deref(),
+            Some("term-1")
+        );
+        assert_eq!(by_pid(88002).record.run_id.as_deref(), Some("r1"));
+        assert_eq!(by_pid(88003).record.surface, "managed");
+        assert_eq!(by_pid(88004).record.surface, "external_cli");
     }
 }

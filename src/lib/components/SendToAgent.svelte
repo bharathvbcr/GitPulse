@@ -125,7 +125,11 @@
       if (disposed) return;
       if (result.route === "resume" && result.action === "open_resume") {
         const title = taskTitle ?? (await getTaskRun(runId)).task_title;
-        const resumed = await resumeTaskConversation({ id: runId, task_title: title }, "background", sentText);
+        const resumed = await resumeTaskConversation(
+          { id: runId, task_title: title, ...(result.resumeProvider ? { provider: result.resumeProvider } : {}) },
+          "background",
+          sentText,
+        );
         if (disposed) return;
         if (resumed.outcome === "unavailable") {
           outcome = { tone: "error", text: `Nothing was sent. ${resumed.reason}` };

@@ -75,12 +75,14 @@ const WRITE_TIMEOUT_ENV: &str = "GITPULSE_MCP_WRITE_TIMEOUT_MS";
 /// is the *client* waiting: the answer goes out at the deadline and the server
 /// keeps serving. Overridable so the stress tests do not have to wait a minute
 /// to observe the behaviour.
-const DEFAULT_CALL_BUDGET: Duration = Duration::from_secs(60);
-const CALL_BUDGET_ENV: &str = "GITPULSE_MCP_CALL_TIMEOUT_MS";
+const DEFAULT_CALL_BUDGET: Duration = Duration::from_millis(mcp::DEFAULT_CALL_BUDGET_MS);
+const CALL_BUDGET_ENV: &str = mcp::CALL_BUDGET_ENV;
 
 /// Requests allowed to be executing at once. Past this the server says so
 /// instead of spawning unbounded threads: a client that pipelines faster than
-/// the disk can answer must be refused, not absorbed.
+/// the disk can answer must be refused, not absorbed. Blocking peer waits
+/// (`gitpulse_agent_wait`) are further capped at [`mcp::MAX_WAIT_CALLS`] (`4`)
+/// so parked waiters can never starve ordinary tool calls.
 const MAX_IN_FLIGHT: usize = 32;
 
 /// Longest the watchdog sleeps with nothing pending, so a broken wire still

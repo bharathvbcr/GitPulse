@@ -125,7 +125,7 @@ export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id:
  * it is the host watcher's alone: `WorkbenchState::request` refuses it from here with `host_only`, because a CI
  * result is the host's observation of GitHub or of a local run and a renderer must not be able to write one.
  */
-export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest" | "tasks.organize";
+export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.bind_thread" | "runs.bind_terminal_thread" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest" | "tasks.organize";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -595,7 +595,8 @@ export function taskRun(value: unknown): TaskRun {
   const turn = raw.provider_turn_id === undefined ? undefined : nullableText(raw.provider_turn_id);
   if (providerState && ["ready", "running", "completed"].includes(providerState) && !thread?.trim()) return invalid();
   if (providerState && ["running", "completed"].includes(providerState) && !turn?.trim()) return invalid();
-  if ((thread !== undefined || turn !== undefined) && (!providerState || !thread?.trim())) return invalid();
+  if (thread !== undefined && (!thread.trim() || (kind === "external_terminal" && state === "prepared") || (kind === "managed" && !providerState))) return invalid();
+  if (turn !== undefined && (!providerState || !thread?.trim())) return invalid();
   const named = asAgentProvider(provider);
   if (!state || !permission || !named) return invalid();
   const source = integer(raw.source_revision);
@@ -768,6 +769,11 @@ export async function findConversation(id: string): Promise<RunConversation> {
   if (!isSessionId(sessionId)) return invalid();
   return { resumable: true, ...(provider ? { provider } : {}), sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
 }
+/** Immutably binds a dynamically discovered provider conversation id (`agy`) to an owned `external_terminal` run. */
+export async function bindTerminalRunThread(id: string, sessionId: string, providerThreadId: string): Promise<void> {
+  if (!isSessionId(providerThreadId)) return;
+  await request("runs.bind_terminal_thread", { id, session_id: sessionId, provider_thread_id: providerThreadId.toLowerCase() });
+}
 /** The ways a message to an attempt's agent can go. `unavailable` is a route with a reason, not an error. */
 export const SEND_ROUTES = ["mailbox", "resume", "managed", "unavailable"] as const;
 export type SendRoute = (typeof SEND_ROUTES)[number];
@@ -781,6 +787,8 @@ export interface AgentSendPreview {
   listening?: boolean;
   /** Managed: Manvi's reading of the run, `parked` (between turns) or `running`. */
   managedState?: "parked" | "running";
+  /** Resume: saved conversation provider (`"claude"` | `"agy"`), when reported by the host. */
+  resumeProvider?: ResumableProvider;
 }
 /**
  * What a confirmed send did. `sent` is a tri-state. `true` is a message that left GitPulse: `queued` is in the
@@ -808,7 +816,8 @@ function sendPreview(raw: Record<string, unknown>): AgentSendPreview {
   const reason = text(raw.reason);
   if (raw.ok !== true || !route || !reason.trim()) return invalid();
   const managed = raw.managed_state === undefined ? undefined : (raw.managed_state === "parked" || raw.managed_state === "running" ? raw.managed_state : invalid());
-  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}) };
+  const resumeProvider = raw.provider === undefined ? undefined : (RESUMABLE_PROVIDERS.find((p) => p === raw.provider) ?? invalid());
+  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}), ...(resumeProvider ? { resumeProvider } : {}) };
 }
 /** Asks which way `text` would go to the agent behind an attempt, and sends nothing. */
 export async function previewAgentMessage(runId: string, message: string, requestId: string): Promise<AgentSendPreview> {

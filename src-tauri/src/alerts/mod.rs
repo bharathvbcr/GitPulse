@@ -122,6 +122,12 @@ pub struct Notice {
     /// only: coalescing and policy still read `subagent`, so an id never
     /// changes what a notice does.
     pub agent_id: Option<String>,
+    /// Whether an Antigravity `Stop` reported `fullyIdle == true` (or `false`
+    /// on turn start). Absent for providers that do not report turn quiescence.
+    pub fully_idle: Option<bool>,
+    /// Provider conversation/session identifier reported by the hook (for
+    /// example Antigravity's `conversationId`). Validated with `bridge::valid_key`.
+    pub provider_session_id: Option<String>,
 }
 
 impl Notice {
@@ -246,6 +252,12 @@ pub struct Attention {
     pub event: Option<&'static str>,
     /// What the agent itself said, sanitized and bounded.
     pub detail: Option<String>,
+    /// Optional turn-quiescence flag from Antigravity hooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fully_idle: Option<bool>,
+    /// Optional provider conversation/session id from agent hooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
 }
 
 impl Attention {
@@ -266,6 +278,8 @@ impl Attention {
             channel: notice.channel,
             event: notice.event,
             detail: notice.detail.as_deref().and_then(bound),
+            fully_idle: notice.fully_idle,
+            provider_session_id: notice.provider_session_id.clone(),
         })
     }
 
@@ -276,6 +290,8 @@ impl Attention {
             channel: by.channel,
             event: by.event,
             detail: None,
+            fully_idle: by.fully_idle,
+            provider_session_id: by.provider_session_id.clone(),
         }
     }
 }
@@ -291,6 +307,10 @@ pub struct StandingAttention {
     pub event: Option<String>,
     pub detail: Option<String>,
     pub age_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fully_idle: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
 }
 
 impl StandingAttention {
@@ -301,6 +321,8 @@ impl StandingAttention {
             event: attention.event.map(str::to_owned),
             detail: attention.detail.clone(),
             age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+            fully_idle: attention.fully_idle,
+            provider_session_id: attention.provider_session_id.clone(),
         }
     }
 }
@@ -608,6 +630,8 @@ pub fn answer(session: &str) -> Result<(), &'static str> {
         subject: None,
         subagent: false,
         agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
     })
     .taken();
     if taken {
@@ -1110,7 +1134,10 @@ fn stand(entry: &mut Tracked, notice: &Notice) {
 /// not strand its pane on a question that has been answered.
 fn resolve(entry: &mut Tracked, notice: &Notice, known: bool, counters: &Counters) {
     let Some(standing) = &entry.standing else {
-        if !known && notice.event == Some("prompt_submitted") && shows(notice) {
+        if notice.event == Some("prompt_submitted")
+            && shows(notice)
+            && (!known || notice.provider_session_id.is_some() || notice.fully_idle.is_some())
+        {
             entry.unannounced = Some(Attention::cleared(&notice.key, notice));
         }
         return;

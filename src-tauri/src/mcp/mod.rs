@@ -33,6 +33,7 @@
 //! carry `destructiveHint: true`, and every writing tool is held to the explicit
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
+pub mod a2a;
 #[cfg(test)]
 mod adversarial_deferral_tests;
 #[cfg(test)]
@@ -66,6 +67,10 @@ use serde_json::{json, Value};
 use crate::insights::{self, McpToolInfo};
 use crate::tasks::file_tasks as ft;
 use crate::workbench::intake;
+pub use a2a::{
+    effective_call_budget_ms, CALL_BUDGET_ENV, DEFAULT_CALL_BUDGET_MS, MAX_WAIT_CALLS,
+    MAX_WAIT_TIMEOUT_MS,
+};
 use validate::{tool_args, Spec, ToolArgs};
 
 /// MCP 2.0 / 2026-07-28. The only modern version this build speaks.
@@ -1176,6 +1181,10 @@ tool_args! {
 }
 
 const KICKOFF_PROVIDERS: &[&str] = &["claude", "agy", "codex"];
+const PEER_PROVIDERS: &[&str] = &["claude", "agy", "antigravity", "codex"];
+const KICKOFF_SPAWN_SURFACES: &[&str] = &["terminal", "managed"];
+const PEER_SURFACES: &[&str] = &["terminal", "managed", "external_cli", "ide"];
+const PEER_WAKE_MODES: &[&str] = &["boundary", "auto"];
 
 tool_args! {
     struct KickoffAgentArgs {
@@ -1186,6 +1195,10 @@ tool_args! {
         provider: Option<String> = Spec::one_of(
             "Agent harness provider ('claude', 'agy', or 'codex')",
             KICKOFF_PROVIDERS,
+        ),
+        spawn: Option<String> = Spec::one_of(
+            "Optional unattended launch surface ('terminal' or 'managed')",
+            KICKOFF_SPAWN_SURFACES,
         ),
         branch: Option<String> = Spec::bytes(
             "Target branch for the worker lane (defaults to feat/<task_id>)",
@@ -1223,6 +1236,195 @@ tool_args! {
             1,
             crate::engine::campaign_formal::MAX_CAMPAIGN_AUDIT_ITEMS as u64,
         ),
+    }
+}
+
+tool_args! {
+    pub(crate) struct AgentRegisterArgs {
+        repo_path: String = repo_spec(),
+        peer_id: Option<String> = Spec::bytes(
+            "Explicit peer identifier (defaults to <provider>:<session_or_pid>)",
+            1,
+            128,
+        ),
+        provider: Option<String> = Spec::one_of(
+            "Agent runtime provider ('claude', 'agy', 'antigravity', or 'codex'; inferred from existing session when omitted)",
+            PEER_PROVIDERS,
+        ),
+        surface: Option<String> = Spec::one_of(
+            "Execution surface ('terminal', 'managed', 'external_cli', or 'ide')",
+            PEER_SURFACES,
+        ),
+        provider_session_id: Option<String> = Spec::bytes(
+            "Canonical UUID of the Claude session_id or Antigravity conversationId",
+            1,
+            64,
+        ),
+        terminal_session_id: Option<String> = Spec::bytes(
+            "GitPulse terminal session identifier when hosted in a terminal tab",
+            1,
+            128,
+        ),
+        run_id: Option<String> = Spec::bytes(
+            "Workbench run identifier when bound to a workbench run",
+            1,
+            128,
+        ),
+        role: Option<String> = Spec::bytes(
+            "Peer role label for addressing (e.g. 'reviewer', 'implementer', 'planner')",
+            1,
+            64,
+        ),
+        branch: Option<String> = Spec::bytes(
+            "Branch this peer is working on (defaults to current worktree HEAD branch)",
+            1,
+            256,
+        ),
+        wake_mode: Option<String> = Spec::one_of(
+            "Delivery wake mode ('boundary' for hook boundaries only, 'auto' to opt into idle async/auto wake)",
+            PEER_WAKE_MODES,
+        ),
+        pid: Option<u32> = Spec::int(
+            "Live agent OS process id for liveness reconciliation",
+            1,
+            u32::MAX as u64,
+        ),
+        claimed_files: Option<Vec<String>> = Spec::bytes_array(
+            "Optional pre-edit file paths claimed by this peer",
+            64,
+            512,
+        ),
+        claimed_symbols: Option<Vec<String>> = Spec::bytes_array(
+            "Optional symbols claimed by this peer",
+            64,
+            256,
+        ),
+    }
+}
+
+tool_args! {
+    pub(crate) struct AgentPeersArgs {
+        repo_path: String = repo_spec(),
+        provider: Option<String> = Spec::one_of(
+            "Optional provider filter ('claude', 'agy', 'antigravity', or 'codex')",
+            PEER_PROVIDERS,
+        ),
+        include_exited: Option<bool> = Spec::flag(
+            "Include exited non-resumable peers in addition to live and resumable sessions (default false)",
+        ),
+    }
+}
+
+tool_args! {
+    pub(crate) struct AgentSendArgs {
+        repo_path: String = repo_spec(),
+        from_peer: String = Spec::bytes("Sender peer or agent identifier", 1, 128),
+        to_peer: String = Spec::bytes(
+            "Target peer selector (peer_id, provider_session_id, terminal_session_id, run_id, role, branch, or bare provider when unambiguous)",
+            1,
+            128,
+        ),
+        body: String = Spec::bytes(
+            "Message payload in Markdown or structured text",
+            1,
+            crate::engine::agent_bus::MAX_MESSAGE_BODY_BYTES,
+        ),
+        kind: Option<String> = Spec::bytes(
+            "Message kind ('note', 'ask', 'reply', or 'handoff'; default 'note')",
+            1,
+            64,
+        ),
+        thread_key: Option<String> = Spec::bytes(
+            "Optional conversation thread key for grouping multi-turn replies",
+            1,
+            80,
+        ),
+        msg_id: Option<String> = Spec::bytes(
+            "Optional idempotency message identifier (1-64 ASCII letters, digits, '-' or '_')",
+            1,
+            64,
+        ),
+        hop: Option<u32> = Spec::int(
+            "Explicit hop count (defaults to 1, or previous thread hop + 1; human messages reset to 0)",
+            0,
+            32,
+        ),
+        max_hops: Option<u32> = Spec::int(
+            "Maximum automatic wake hops before pausing for human review (default 6)",
+            1,
+            32,
+        ),
+    }
+}
+
+tool_args! {
+    pub(crate) struct AgentInboxArgs {
+        repo_path: String = repo_spec(),
+        for_peer: String = Spec::bytes(
+            "Recipient peer_id, role, or agent identifier reading its inbox",
+            1,
+            128,
+        ),
+        provider_session_id: Option<String> = Spec::bytes(
+            "Optional canonical UUID of the session's mailbox to deduplicate and cross-ack",
+            1,
+            64,
+        ),
+        since_seq: Option<u64> = Spec::int(
+            "Return bus messages strictly after this sequence number (default 0)",
+            0,
+            MAX_REVISION,
+        ),
+        thread_key: Option<String> = Spec::bytes(
+            "Optional conversation thread filter",
+            1,
+            80,
+        ),
+        include_broadcasts: Option<bool> = Spec::flag(
+            "Include broadcast coordination messages where to_agent is null (default false)",
+        ),
+        ack: Option<bool> = Spec::flag(
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        ),
+        limit: Option<u32> = Spec::int("Maximum messages to return (default 50)", 1, 256),
+    }
+}
+
+tool_args! {
+    pub(crate) struct AgentWaitArgs {
+        repo_path: String = repo_spec(),
+        for_peer: String = Spec::bytes(
+            "Recipient peer_id, role, or agent identifier waiting for a peer message",
+            1,
+            128,
+        ),
+        provider_session_id: Option<String> = Spec::bytes(
+            "Optional canonical UUID of the session's mailbox to watch and cross-ack",
+            1,
+            64,
+        ),
+        since_seq: Option<u64> = Spec::int(
+            "Wait for bus messages strictly after this sequence number (default 0)",
+            0,
+            MAX_REVISION,
+        ),
+        thread_key: Option<String> = Spec::bytes(
+            "Optional conversation thread filter",
+            1,
+            80,
+        ),
+        include_broadcasts: Option<bool> = Spec::flag(
+            "Wake on broadcast coordination messages where to_agent is null (default false)",
+        ),
+        timeout_ms: Option<u64> = Spec::int(
+            "Maximum milliseconds to wait (clamped to <= 45000ms and server budget - 5000ms; default 15000)",
+            0,
+            60_000,
+        ),
+        ack: Option<bool> = Spec::flag(
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        ),
+        limit: Option<u32> = Spec::int("Maximum messages to return on wake (default 20)", 1, 256),
     }
 }
 
@@ -2511,11 +2713,127 @@ fn build_tools() -> Vec<Value> {
                             "seq", "from_agent", "to_agent", "kind", "body",
                             "branch", "created_at_ms"
                         ]
-                    }
+                    },
+                    "spawn_outcome": { "type": ["string", "null"] }
                 },
                 "required": [
                     "ok", "task_id", "task_updated", "provider", "to_agent",
                     "branch", "thread_key", "claim", "claim_conflicts", "message"
+                ]
+            }),
+            false,
+        ),
+        mutating_tool(
+            "gitpulse_agent_register",
+            "Register live peer agent identity and wake mode",
+            "Register or update a live coding agent session (claude, agy, or codex) in peers.json with role, wake_mode ('boundary' or 'auto'), and optional pre-edit lane claims",
+            AgentRegisterArgs::properties(),
+            &AgentRegisterArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "peer": { "type": "object" },
+                    "claim_conflicts": { "type": "array" }
+                },
+                "required": ["ok", "repo_path", "peer", "claim_conflicts"]
+            }),
+            false,
+        ),
+        tool(
+            "gitpulse_agent_peers",
+            "List live and resumable peer agents across worktrees",
+            "Discover live and resumable Claude Code, Antigravity (agy CLI and IDE), and Manvi Managed sessions across all worktrees of a trusted repository with reconciled liveness states",
+            AgentPeersArgs::properties(),
+            &AgentPeersArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "total": { "type": "integer", "minimum": 0 },
+                    "peers": { "type": "array" }
+                },
+                "required": ["ok", "repo_path", "total", "peers"]
+            }),
+        ),
+        mutating_tool(
+            "gitpulse_agent_send",
+            "Send peer-to-peer message across Claude and Antigravity sessions",
+            "Send an A2A message to a peer session (fail-closed on ambiguous targets), persisting up to 16 KiB in agent_bus, depositing a cross-process mailbox envelope, and waking live GUI/waiter targets within hop limits",
+            AgentSendArgs::properties(),
+            &AgentSendArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "msg_id": { "type": "string" },
+                    "to_peer": { "type": "string" },
+                    "liveness": { "type": "string" },
+                    "delivery_outcome": { "type": "string" },
+                    "hop": { "type": "integer", "minimum": 0 },
+                    "max_hops": { "type": "integer", "minimum": 1 },
+                    "truncated_in_mailbox": { "type": "boolean" },
+                    "message": { "type": "object" }
+                },
+                "required": [
+                    "ok", "repo_path", "msg_id", "to_peer", "liveness",
+                    "delivery_outcome", "hop", "max_hops", "truncated_in_mailbox", "message"
+                ]
+            }),
+            false,
+        ),
+        mutating_tool(
+            "gitpulse_agent_inbox",
+            "Read and cross-ack deduplicated peer inbox messages",
+            "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies and cross-acknowledging both stores when ack is true",
+            AgentInboxArgs::properties(),
+            &AgentInboxArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "for_peer": { "type": "string" },
+                    "acked": { "type": "boolean" },
+                    "acked_count": { "type": "integer", "minimum": 0 },
+                    "latest_seq": { "type": "integer", "minimum": 0 },
+                    "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "has_more": { "type": "boolean" },
+                    "messages": { "type": "array" }
+                },
+                "required": [
+                    "ok", "repo_path", "for_peer", "acked", "acked_count",
+                    "latest_seq", "dropped_before_seq", "has_more", "messages"
+                ]
+            }),
+            false,
+        ),
+        mutating_tool(
+            "gitpulse_agent_wait",
+            "Wait for incoming peer message with bounded kqueue notify",
+            "Block up to 45s (MAX_WAIT_CALLS = 4 concurrent slots) watching lanes/messages.json and agent_mailbox for an incoming peer reply, cross-acknowledging both stores on wake",
+            AgentWaitArgs::properties(),
+            &AgentWaitArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "for_peer": { "type": "string" },
+                    "timed_out": { "type": "boolean" },
+                    "waited_ms": { "type": "integer", "minimum": 0 },
+                    "effective_timeout_ms": { "type": "integer", "minimum": 0 },
+                    "acked": { "type": "boolean" },
+                    "acked_count": { "type": "integer", "minimum": 0 },
+                    "latest_seq": { "type": "integer", "minimum": 0 },
+                    "messages": { "type": "array" }
+                },
+                "required": [
+                    "ok", "repo_path", "for_peer", "timed_out", "waited_ms",
+                    "effective_timeout_ms", "acked", "acked_count", "latest_seq", "messages"
                 ]
             }),
             false,
@@ -4356,6 +4674,32 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(CommandError::into_message)?;
 
+            let spawn_outcome = if let Some(ref mode) = a.spawn {
+                let kickoff_prompt = format!(
+                    "Delegated task {} on branch {}: {}",
+                    a.task_id,
+                    branch,
+                    a.instructions.as_deref().unwrap_or(
+                        "Execute delegated task inside claimed files and report status."
+                    )
+                );
+                let msg_id = message
+                    .msg_id
+                    .clone()
+                    .unwrap_or_else(|| format!("msg-{}", message.seq));
+                Some(a2a::dispatch_kickoff_spawn(
+                    &a.repo_path,
+                    mode,
+                    provider,
+                    &branch,
+                    &kickoff_prompt,
+                    &a.task_id,
+                    &msg_id,
+                )?)
+            } else {
+                None
+            };
+
             Ok(json!({
                 "ok": true,
                 "task_id": a.task_id,
@@ -4367,8 +4711,14 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "claim": claim,
                 "claim_conflicts": claim_conflicts,
                 "message": message,
+                "spawn_outcome": spawn_outcome,
             }))
         }
+        "gitpulse_agent_register" => a2a::handle_agent_register(parse(name, arguments)?),
+        "gitpulse_agent_peers" => a2a::handle_agent_peers(parse(name, arguments)?),
+        "gitpulse_agent_send" => a2a::handle_agent_send(parse(name, arguments)?),
+        "gitpulse_agent_inbox" => a2a::handle_agent_inbox(parse(name, arguments)?),
+        "gitpulse_agent_wait" => a2a::handle_agent_wait(parse(name, arguments)?),
         "gitpulse_worktree_radar" => {
             let a: RepoArgs = parse(name, arguments)?;
             let report = crate::engine::agent_bus::scan_parallel_agent_radar(&a.repo_path)
@@ -5511,6 +5861,10 @@ mod tests {
                             | "gitpulse_inbox_post"
                             | "gitpulse_inbox_withdraw"
                             | "gitpulse_kickoff_agent"
+                            | "gitpulse_agent_register"
+                            | "gitpulse_agent_send"
+                            | "gitpulse_agent_inbox"
+                            | "gitpulse_agent_wait"
                     ),
                     "unexpected mutating tool {name}"
                 );
@@ -6371,6 +6725,10 @@ mod tests {
             "one inbox ask withdrawal receipt, no list",
         ),
         (
+            "gitpulse_agent_send",
+            "one peer message delivery receipt, no list",
+        ),
+        (
             "gitpulse_worktree_overlay_sync",
             "one worktree overlay sync report, no list",
         ),
@@ -7012,6 +7370,50 @@ mod tests {
             }),
             &mut validated,
         );
+        call_writer(
+            "gitpulse_agent_register",
+            json!({
+                "repo_path": wt_repo,
+                "provider": "agy",
+                "surface": "terminal",
+                "provider_session_id": "99999999-9999-4999-8999-999999999999",
+                "role": "schema-worker",
+                "wake_mode": "auto",
+                "pid": std::process::id(),
+                "claimed_files": ["src/lib.rs"],
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_agent_send",
+            json!({
+                "repo_path": wt_repo,
+                "from_peer": "claude:schema-lead",
+                "to_peer": "schema-worker",
+                "body": "Coordinate schema verification on src/lib.rs.",
+                "thread_key": "schema-a2a-thread",
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_agent_inbox",
+            json!({
+                "repo_path": wt_repo,
+                "for_peer": "schema-worker",
+                "ack": false,
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_agent_wait",
+            json!({
+                "repo_path": wt_repo,
+                "for_peer": "schema-worker",
+                "timeout_ms": 50,
+                "ack": true,
+            }),
+            &mut validated,
+        );
         git(&["-C", &wt_merge_path, "add", "feature.txt"]);
         git(&[
             "-C",
@@ -7120,6 +7522,7 @@ mod tests {
             "gitpulse_worktree_radar",
             "gitpulse_campaign_audit",
             "gitpulse_inbox_read",
+            "gitpulse_agent_peers",
         ] {
             let tool = tools()
                 .into_iter()
@@ -9268,6 +9671,23 @@ mod tests {
                 json!({ "repo_path": repo, "from_agent": "agent-untrusted", "to_agent": "worker-1", "task_id": "gp-probe" }),
             ),
             (
+                "gitpulse_agent_register",
+                json!({ "repo_path": repo, "provider": "agy", "role": "probe" }),
+            ),
+            ("gitpulse_agent_peers", json!({ "repo_path": repo })),
+            (
+                "gitpulse_agent_send",
+                json!({ "repo_path": repo, "from_peer": "claude:a", "to_peer": "agy:b", "body": "probe" }),
+            ),
+            (
+                "gitpulse_agent_inbox",
+                json!({ "repo_path": repo, "for_peer": "agy:b" }),
+            ),
+            (
+                "gitpulse_agent_wait",
+                json!({ "repo_path": repo, "for_peer": "agy:b", "timeout_ms": 10 }),
+            ),
+            (
                 "gitpulse_worktree_overlay_sync",
                 json!({ "repo_path": repo }),
             ),
@@ -10148,6 +10568,11 @@ mod tests {
             ("gitpulse_inbox_read", InboxReadArgs),
             ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
             ("gitpulse_kickoff_agent", KickoffAgentArgs),
+            ("gitpulse_agent_register", AgentRegisterArgs),
+            ("gitpulse_agent_peers", AgentPeersArgs),
+            ("gitpulse_agent_send", AgentSendArgs),
+            ("gitpulse_agent_inbox", AgentInboxArgs),
+            ("gitpulse_agent_wait", AgentWaitArgs),
             ("gitpulse_worktree_radar", RepoArgs),
             ("gitpulse_campaign_audit", CampaignAuditArgs),
             ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
@@ -10274,6 +10699,11 @@ mod tests {
                 ("gitpulse_inbox_read", InboxReadArgs),
                 ("gitpulse_inbox_withdraw", InboxWithdrawArgs),
                 ("gitpulse_kickoff_agent", KickoffAgentArgs),
+                ("gitpulse_agent_register", AgentRegisterArgs),
+                ("gitpulse_agent_peers", AgentPeersArgs),
+                ("gitpulse_agent_send", AgentSendArgs),
+                ("gitpulse_agent_inbox", AgentInboxArgs),
+                ("gitpulse_agent_wait", AgentWaitArgs),
                 ("gitpulse_worktree_radar", RepoArgs),
                 ("gitpulse_campaign_audit", CampaignAuditArgs),
                 ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
@@ -11933,3 +12363,6 @@ mod ledger_wire_adv_tests;
 
 #[cfg(test)]
 mod ledger_brief_adv_tests;
+
+#[cfg(test)]
+mod a2a_tests;

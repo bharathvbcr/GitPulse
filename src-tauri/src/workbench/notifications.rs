@@ -720,6 +720,72 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
         if let Err(error) = self.app.emit(crate::alerts::ATTENTION_EVENT, attention) {
             log::warn!(target: "alerts", "session attention event: {error}");
         }
+        if let Some(provider_thread_id) = attention
+            .provider_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            let app = self.app.clone();
+            let session = attention.session.clone();
+            let provider_thread_id = provider_thread_id.to_owned();
+            let work = move || {
+                let Some(sessions) = app.try_state::<crate::terminal::TerminalSessions>() else {
+                    return;
+                };
+                let Ok(listed) = crate::terminal::list_sessions(&sessions) else {
+                    return;
+                };
+                let Some(entry) = listed.iter().find(|entry| entry.id == session) else {
+                    return;
+                };
+                let Some(run_id) = entry.run_id.as_deref() else {
+                    return;
+                };
+                let Some(workbench) = app.try_state::<super::WorkbenchState>() else {
+                    return;
+                };
+                let _ = workbench.with_store(|store| {
+                    let current =
+                        super::query(store, "runs.get", &json!({ "id": run_id }).to_string())?;
+                    let item = &current["item"];
+                    if item["run_kind"] != "external_terminal" {
+                        return Ok(());
+                    }
+                    if let Some(bound_session) = item["session_id"].as_str() {
+                        if !bound_session.is_empty() && bound_session != session {
+                            return Ok(());
+                        }
+                    }
+                    if item["provider_thread_id"]
+                        .as_str()
+                        .is_some_and(|existing| !existing.is_empty())
+                    {
+                        return Ok(());
+                    }
+                    let Some(owner_id) = item["owner_id"].as_str().filter(|o| !o.is_empty()) else {
+                        return Ok(());
+                    };
+                    let _ = super::query(
+                        store,
+                        "runs.bind_thread",
+                        &json!({
+                            "id": run_id,
+                            "owner_id": owner_id,
+                            "provider_thread_id": provider_thread_id,
+                        })
+                        .to_string(),
+                    )?;
+                    Ok(())
+                });
+            };
+            if let Err(error) = crate::supervisor::spawn_one_of_many(
+                "session-bind-thread",
+                "session bind thread",
+                work,
+            ) {
+                log::warn!(target: "alerts", "session bind_thread not recorded: {error}");
+            }
+        }
     }
 }
 
@@ -1497,6 +1563,10 @@ mod tests {
             branch: Some("feat/inbox".into()),
             created_at_ms: 1000,
             thread_key: Some("feat/inbox-wal".into()),
+            msg_id: None,
+            read_by: Vec::new(),
+            hop: None,
+            max_hops: None,
         };
         sync_graft_inbox_message(&ask);
 
@@ -1520,6 +1590,10 @@ mod tests {
             branch: Some("feat/inbox".into()),
             created_at_ms: 2000,
             thread_key: Some("feat/inbox-wal".into()),
+            msg_id: None,
+            read_by: Vec::new(),
+            hop: None,
+            max_hops: None,
         };
         sync_graft_inbox_message(&reply);
 

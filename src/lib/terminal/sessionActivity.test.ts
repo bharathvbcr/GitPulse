@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, asksForReader, bindAttention, clean, createSessionActivity, isReaderInput, parseAttention, setSignalledAsksForReader } from "./sessionActivity";
+import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, PEER_QUIESCENCE_MS, asksForReader, bindAttention, canAutoWakePeerInbox, clean, createSessionActivity, isReaderInput, parseAttention, setSignalledAsksForReader } from "./sessionActivity";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -325,6 +325,144 @@ describe("what answers a request", () => {
         .toEqual([true, true, false, false, false]);
       setSignalledAsksForReader(true);
       expect(asksForReader("signalled")).toBe(true);
+    });
+  });
+
+  describe("Antigravity peer auto-wake invariants", () => {
+    it("latches dirtyPrompt on any human keystroke (including Backspace and Escape) and clears only on prompt_submitted", () => {
+      let now = 10_000;
+      const activity = createSessionActivity(() => now);
+      const convId = "11111111-2222-4333-8444-555555555555";
+      activity.announce({
+        session: "term-agy",
+        channel: "hook",
+        event: "turn_finished",
+        fully_idle: true,
+        provider_session_id: convId.toUpperCase(),
+      });
+      expect(get(activity).get("term-agy")).toMatchObject({
+        fullyIdle: true,
+        dirtyPrompt: false,
+        providerSessionId: convId,
+      });
+
+      // Terminal reply does NOT set dirtyPrompt.
+      activity.input("term-agy", "\x1b[I");
+      expect(get(activity).get("term-agy")?.dirtyPrompt).toBe(false);
+
+      // Typing half a prompt latches dirtyPrompt; Backspace and Escape MUST NOT clear it!
+      now += 100;
+      activity.input("term-agy", "fix");
+      expect(get(activity).get("term-agy")?.dirtyPrompt).toBe(true);
+      now += 50;
+      activity.input("term-agy", "\x7f\x7f\x7f");
+      expect(get(activity).get("term-agy")?.dirtyPrompt).toBe(true);
+      now += 50;
+      activity.input("term-agy", "\x1b");
+      expect(get(activity).get("term-agy")?.dirtyPrompt).toBe(true);
+
+      // Even after >=3s silence, dirtyPrompt blocks auto-wake.
+      now += PEER_QUIESCENCE_MS + 500;
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: true,
+          activity: get(activity).get("term-agy"),
+          foregroundProcess: "agy",
+          inboxGeneration: 1,
+          attemptedGeneration: 0,
+          now,
+        }),
+      ).toBe(false);
+
+      // PreInvocation (`prompt_submitted`) clears dirtyPrompt and fullyIdle and stamps lastPromptSubmittedAt.
+      now += 100;
+      activity.announce({
+        session: "term-agy",
+        channel: "hook",
+        event: "prompt_submitted",
+        fully_idle: false,
+        provider_session_id: convId,
+      });
+      expect(get(activity).get("term-agy")).toMatchObject({
+        dirtyPrompt: false,
+        fullyIdle: false,
+        lastPromptSubmittedAt: now,
+        providerSessionId: convId,
+      });
+    });
+
+    it("enforces all 5 Verdict 2 invariants in canAutoWakePeerInbox", () => {
+      let now = 50_000;
+      const activity = createSessionActivity(() => now);
+      activity.output("term-agy");
+      activity.announce({
+        session: "term-agy",
+        channel: "hook",
+        event: "turn_finished",
+        fully_idle: true,
+      });
+      const snap = () => get(activity).get("term-agy");
+
+      // Invariant 4: <3s output silence -> false
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: true,
+          activity: snap(),
+          foregroundProcess: "agy",
+          inboxGeneration: 1,
+          attemptedGeneration: 0,
+          now: now + PEER_QUIESCENCE_MS - 1,
+        }),
+      ).toBe(false);
+
+      now += PEER_QUIESCENCE_MS;
+      // All 5 hold -> true
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: true,
+          activity: snap(),
+          foregroundProcess: "agy",
+          inboxGeneration: 1,
+          attemptedGeneration: 0,
+          now,
+        }),
+      ).toBe(true);
+
+      // Invariant 1: autoWake off -> false
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: false,
+          activity: snap(),
+          foregroundProcess: "agy",
+          inboxGeneration: 1,
+          attemptedGeneration: 0,
+          now,
+        }),
+      ).toBe(false);
+
+      // Invariant 2: foreground is zsh (post-exit shell) -> false
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: true,
+          activity: snap(),
+          foregroundProcess: "zsh",
+          inboxGeneration: 1,
+          attemptedGeneration: 0,
+          now,
+        }),
+      ).toBe(false);
+
+      // Invariant 5: single-shot per inboxGeneration -> false once attempted
+      expect(
+        canAutoWakePeerInbox({
+          autoWake: true,
+          activity: snap(),
+          foregroundProcess: "agy",
+          inboxGeneration: 1,
+          attemptedGeneration: 1,
+          now,
+        }),
+      ).toBe(false);
     });
   });
 });
