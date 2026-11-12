@@ -64,6 +64,7 @@
   import type { SavedFile } from "../files/types";
   import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
+  import FileTreeColumn from "./files/FileTreeColumn.svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import LazyView from "./LazyView.svelte";
   import { explorerLens, showExplorerRail, toggleBlameLens } from "../files/explorerLens";
@@ -75,7 +76,11 @@
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { observeResize } from "../dom/observeResize";
-  import { resolveFilePaneLayout } from "../files/filePaneLayout";
+  import {
+    FILE_DASHBOARD_WIDTH,
+    FILE_EDITOR_MIN_WIDTH,
+    resolveFilePaneLayout,
+  } from "../files/filePaneLayout";
   import {
     activateEditorTab,
     completeEditorSave,
@@ -162,6 +167,11 @@
     preferredPane: preferredSidePane,
     compactPane,
   }));
+  // The tree may grow, but not into the editor's minimum — or the dashboard,
+  // which stays a fixed rail beside it.
+  let explorerReserve = $derived(
+    FILE_EDITOR_MIN_WIDTH + (paneLayout.dashboardVisible ? FILE_DASHBOARD_WIDTH : 0),
+  );
 
   let pathSegments = $derived.by(() => (activeTabPath ? activeTabPath.split("/") : []));
 
@@ -1000,16 +1010,26 @@
     </div>
   {/if}
 
+  {#snippet explorerTree()}
+    <ExplorerRail
+      selectedFile={activeTabPath}
+      {revealRequest}
+      onSelectFile={(path) => previewFile(path)}
+      onPinFile={(path) => pinFile(path)}
+    />
+  {/snippet}
+
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
     {#if paneLayout.explorerVisible}
-      <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-72 shrink-0' : 'flex-1 min-w-0'}">
-        <ExplorerRail
-          selectedFile={activeTabPath}
-          {revealRequest}
-          onSelectFile={(path) => previewFile(path)}
-          onPinFile={(path) => pinFile(path)}
-        />
-      </div>
+      {#if paneLayout.editorVisible}
+        <FileTreeColumn reserve={explorerReserve}>
+          {@render explorerTree()}
+        </FileTreeColumn>
+      {:else}
+        <div class="h-full overflow-hidden flex-1 min-w-0">
+          {@render explorerTree()}
+        </div>
+      {/if}
     {/if}
 
     {#if paneLayout.editorVisible}

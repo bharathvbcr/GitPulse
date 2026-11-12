@@ -29,4 +29,11 @@ describe("BlameViewer source contracts", () => {
     // the ring); that nothing bypasses it with `String(err)` is only visible here.
     expect(source).not.toMatch(/String\(\s*(err|reason|error|e)\s*\)/);
   });
+
+  it("sizes the file tree from the shared column instead of a fixed w-72", () => {
+    const body = source.slice(source.indexOf("<!-- Body -->"));
+    expect(body).toContain("<FileTreeColumn>");
+    expect(body).not.toContain("w-72");
+    expect(source).toContain('import FileTreeColumn from "./files/FileTreeColumn.svelte"');
+  });
 });
