@@ -43,6 +43,7 @@
   import EmptyState from "./EmptyState.svelte";
 
   let {
+    repoPath = null,
     /**
      * How the host opens a file. Explorer passes its tree's own handler, so a
      * hit previews like a click in the tree and brings the editor forward on
@@ -51,7 +52,14 @@
      * selection is set directly.
      */
     onOpen,
-  }: { onOpen?: (path: string) => void } = $props();
+    onSelectMatch,
+  }: {
+    repoPath?: string | null;
+    onOpen?: (path: string) => void;
+    onSelectMatch?: (path: string, line: number | null, column: number | null) => void;
+  } = $props();
+
+  const effectiveRepoPath = $derived(repoPath ?? $currentRepoPath);
 
   let pattern = $state("");
   let fixedStrings = $state(true);
@@ -74,7 +82,7 @@
   }
 
   async function run() {
-    const repo = $repoStore.currentPath;
+    const repo = effectiveRepoPath;
     if (!repo || !pattern) return;
     stop();
     const guard = createAsyncGuard();
@@ -126,6 +134,11 @@
    * editor, so a hit that names one also turns Blame off.
    */
   function open(path: string, match: ContentMatch | null = null) {
+    if (onSelectMatch) {
+      const hasLine = Boolean(match && !report?.revision);
+      onSelectMatch(path, hasLine ? (match?.line ?? null) : null, hasLine ? (match?.column ?? null) : null);
+      return;
+    }
     if (match && !report?.revision && requestReveal(match.path, match.line, match.column)) {
       setEditorLens("edit");
     }
@@ -137,7 +150,7 @@
   // A different repository is a different subject: it shows what was last
   // searched there, or nothing.
   $effect(() => {
-    const repo = $currentRepoPath;
+    const repo = effectiveRepoPath;
     untrack(() => {
       stop();
       running = false;
@@ -152,7 +165,7 @@
   });
 
   $effect(() => {
-    const repo = $currentRepoPath;
+    const repo = effectiveRepoPath;
     const memo: SearchMemo = { pattern, fixedStrings, ignoreCase, revision, report };
     if (repo) untrack(() => searchMemo.set(repo, memo));
   });

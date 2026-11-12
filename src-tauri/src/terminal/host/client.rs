@@ -428,6 +428,12 @@ struct Inner {
     leaving: AtomicBool,
     /// What is wrong with the host, said plainly, when something is.
     trouble: Mutex<Vec<String>>,
+    /// Shared orchestration registry so child terminals hosted in `gitpulse-ptyd`
+    /// stream output into their `vt100` parser and revoke capability tokens on exit.
+    orchestration: Arc<crate::terminal::orchestrate::OrchestrationRegistry>,
+    /// Shared `SessionStart` metadata map so adopted sessions keep their
+    /// `conversation_id` and `artifact_dir` across GUI restarts.
+    agent_meta: Arc<Mutex<HashMap<String, crate::terminal::AgentSessionMeta>>>,
     /// Run once by `adopt`, between its scan of `proxies` and its read of
     /// `vouched.late`, so a test can confirm a spawn exactly there.
     #[cfg(test)]
@@ -442,6 +448,14 @@ pub struct HostClient {
 
 impl HostClient {
     pub fn new(config: HostConfig) -> Self {
+        Self::with_shared_state(config, Arc::default(), Arc::default())
+    }
+
+    pub(crate) fn with_shared_state(
+        config: HostConfig,
+        orchestration: Arc<crate::terminal::orchestrate::OrchestrationRegistry>,
+        agent_meta: Arc<Mutex<HashMap<String, crate::terminal::AgentSessionMeta>>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -459,6 +473,8 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                orchestration,
+                agent_meta,
                 #[cfg(test)]
                 adopt_seam: Mutex::default(),
             }),
@@ -724,6 +740,53 @@ impl HostClient {
         )
     }
 
+    /// Whether a view in this app is currently attached to `session` (so live
+    /// `HostFrame::Output` bytes are already streaming into `orchestration`).
+    pub fn is_attached(&self, session: &str) -> bool {
+        lock(&self.inner.proxies)
+            .get(session)
+            .is_some_and(|proxy| proxy.viewed)
+    }
+
+    /// Reads live loopback TCP `LISTEN` ports owned by `session` and its descendants.
+    pub fn listening_ports(&self, session: &str) -> Result<Vec<u16>, String> {
+        self.call(
+            Request::ListeningPorts {
+                session: session.to_owned(),
+            },
+            CALL_DEADLINE,
+        )
+    }
+
+    /// Reads `session`'s authoritative OSC 7 / 133 / 7501 + loopback telemetry
+    /// from `gitpulse-ptyd`'s `SessionWatcher`.
+    pub fn telemetry(
+        &self,
+        session: &str,
+    ) -> Result<Option<crate::terminal::SessionTelemetry>, String> {
+        self.call(
+            Request::Telemetry {
+                session: session.to_owned(),
+            },
+            CALL_DEADLINE,
+        )
+    }
+
+    /// Best-effort mirror of `SessionStart` metadata into `gitpulse-ptyd` so an
+    /// app restart adopts `conversation_id` and `artifact_dir` intact.
+    pub fn set_agent_meta(&self, session: &str, meta: crate::terminal::AgentSessionMeta) {
+        if let Some(conn) = self.inner.current() {
+            let _ = conn.send(
+                Request::SetAgentMeta {
+                    session: session.to_owned(),
+                    meta,
+                },
+                &[],
+                None,
+            );
+        }
+    }
+
     pub fn detach(&self, session: &str) -> Result<bool, String> {
         if let Some(proxy) = lock(&self.inner.proxies).get_mut(session) {
             proxy.viewed = false;
@@ -766,6 +829,9 @@ impl HostClient {
         };
         let previous = slot.current();
         slot.replace(output);
+        self.inner
+            .orchestration
+            .reset_parser_for_attach_replay(session, rows, cols);
         let attached = conn
             .call_in_order(
                 Request::Attach {
@@ -804,6 +870,9 @@ impl HostClient {
         };
         let previous = slot.current();
         slot.replace(output);
+        self.inner
+            .orchestration
+            .reset_parser_for_attach_replay(&session, rows, cols);
         let attached = conn
             .call_in_order(
                 Request::AttachTracked {
@@ -1238,6 +1307,25 @@ impl Inner {
             reattach
         };
         self.adopted.store(true, Ordering::Release);
+        if !listed.is_empty() {
+            if let Ok(value) = conn.call(Request::OrchestrationSnapshot, &[], CALL_DEADLINE) {
+                if value.is_array() {
+                    if let Ok(snapshots) =
+                        serde_json::from_value::<Vec<crate::terminal::HostedSessionMeta>>(value)
+                    {
+                        {
+                            let mut meta_map = lock(&self.agent_meta);
+                            for snap in &snapshots {
+                                if let Some(meta) = &snap.agent_meta {
+                                    meta_map.insert(snap.session_id.clone(), meta.clone());
+                                }
+                            }
+                        }
+                        self.orchestration.adopt_hosted_sessions(&snapshots);
+                    }
+                }
+            }
+        }
         let receipts: Result<Vec<WireEnded>, String> = conn
             .call(Request::Receipts, &[], CALL_DEADLINE)
             .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
@@ -1397,6 +1485,8 @@ impl Inner {
                 message: "The connection to the terminal host was lost and restored; the screen was redrawn from what it kept.".into(),
             });
         }
+        self.orchestration
+            .reset_parser_for_attach_replay(session, rows, cols);
         if let Err(error) = conn.call(
             Request::Attach {
                 session: session.to_owned(),
@@ -1505,6 +1595,7 @@ impl Inner {
                 }
             }
             lock(&self.proxies).remove(&id);
+            self.orchestration.mark_ended(&id, ended.payload.exit_code);
             // The host sent its own end marker if the session's view was
             // live; a session ended while the connection was down never did.
             if let Some(slot) = slot {
@@ -1539,6 +1630,7 @@ impl Inner {
     }
 
     fn output(&self, conn: &Connection, session: &str, bytes: &[u8]) {
+        self.orchestration.observe_output_from_host(session, bytes);
         let target = lock(&self.proxies)
             .get(session)
             .map(|p| (p.output.clone(), p.failing.clone()));

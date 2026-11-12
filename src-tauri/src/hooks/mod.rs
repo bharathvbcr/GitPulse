@@ -224,6 +224,14 @@ pub struct HookInput {
     /// and Codex do not. The stdout schema splits on this, not on event-name
     /// casing: camelCase `sessionStart` is not a host signal.
     pub is_cursor: bool,
+    /// Antigravity (`agy`) native payloads carry camelCase protojson fields
+    /// (`conversationId`, `workspacePaths`, `toolCall`, `artifactDirectoryPath`,
+    /// `terminationReason`) and require JSON objects on stdout.
+    pub is_agy: bool,
+    /// Antigravity's `artifactDirectoryPath` (`<appDataDir>/brain/<id>`).
+    pub artifact_dir: String,
+    /// Antigravity `Stop`'s `terminationReason` (`NO_TOOL_CALL`, `USER_CANCELED`, …).
+    pub termination_reason: String,
     /// The host's own wording for a `Notification` event (`message`).
     ///
     /// Never required. The reason GitPulse shows comes from the matcher the
@@ -279,15 +287,24 @@ impl HookInput {
     /// Reads the fields we use out of one already-parsed hook payload.
     pub fn from_value(value: &Value) -> Self {
         let tool_input = value.get("tool_input");
+        let tool_call = value.get("toolCall").filter(|v| v.is_object());
+        let tool_args = tool_call
+            .and_then(|tc| tc.get("args"))
+            .filter(|v| v.is_object());
         // `file_path` is the documented field for Write and Edit and is always
         // absolute. `notebook_path` is NotebookEdit's, checked against that
         // tool's own published input schema rather than the hook reference's
-        // `tool_input` table, which does not list it. Should either name ever
-        // move we derive no path and report a non-check, which is the safe
-        // direction to be wrong in.
+        // `tool_input` table, which does not list it. Antigravity's `write_file`
+        // and `edit_file` pass `toolCall.args.Path`. Should any name move we
+        // derive no path and report a non-check, which is the safe direction.
         let file_path = string_at(tool_input, "file_path");
         let file_path = if file_path.is_empty() {
             string_at(tool_input, "notebook_path")
+        } else {
+            file_path
+        };
+        let file_path = if file_path.is_empty() {
+            string_at(tool_args, "Path")
         } else {
             file_path
         };
@@ -297,17 +314,32 @@ impl HookInput {
         } else {
             cwd
         };
+        let session_id = Some(string_at(Some(value), "session_id"))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| string_at(Some(value), "conversationId"));
+        let tool_name = Some(string_at(Some(value), "tool_name"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| string_at(tool_call, "name"));
+        let command = Some(string_at(tool_input, "command"))
+            .filter(|cmd| !cmd.is_empty())
+            .unwrap_or_else(|| string_at(tool_args, "CommandLine"));
+        let message = Some(string_at(Some(value), "message"))
+            .filter(|msg| !msg.is_empty())
+            .unwrap_or_else(|| string_at(Some(value), "lastUserInput"));
         HookInput {
             hook_event_name: string_at(Some(value), "hook_event_name"),
-            session_id: string_at(Some(value), "session_id"),
+            session_id,
             cwd,
-            tool_name: string_at(Some(value), "tool_name"),
+            tool_name,
             file_path,
             incoming: incoming_edit(value),
-            command: string_at(tool_input, "command"),
+            command,
             source: string_at(Some(value), "source"),
             is_cursor: is_cursor_payload(value),
-            message: string_at(Some(value), "message"),
+            is_agy: is_agy_payload(value),
+            artifact_dir: string_at(Some(value), "artifactDirectoryPath"),
+            termination_reason: string_at(Some(value), "terminationReason"),
+            message,
             tool_subject: tool_subject(value),
             tool_summary: tool_summary(value),
             agent_id: string_at(Some(value), "agent_id"),
@@ -334,11 +366,21 @@ impl HookInput {
 /// is asked about, rather than as no edit at all.
 fn incoming_edit(value: &Value) -> Option<insights::IncomingEdit> {
     let input = value.get("tool_input");
-    match string_at(Some(value), "tool_name").as_str() {
-        "Write" | "NotebookEdit" => Some(insights::IncomingEdit::WholeFile),
+    let tool_call = value.get("toolCall").filter(|v| v.is_object());
+    let tool_args = tool_call
+        .and_then(|tc| tc.get("args"))
+        .filter(|v| v.is_object());
+    let tool_name = Some(string_at(Some(value), "tool_name"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| string_at(tool_call, "name"));
+    match tool_name.as_str() {
+        "Write" | "NotebookEdit" | "write_file" => Some(insights::IncomingEdit::WholeFile),
         "Edit" => Some(insights::IncomingEdit::Replacing(vec![string_at(
             input,
             "old_string",
+        )])),
+        "edit_file" => Some(insights::IncomingEdit::Replacing(vec![string_at(
+            tool_args, "Target",
         )])),
         "MultiEdit" => {
             let edits = input
@@ -393,13 +435,19 @@ fn canonical(value: &Value, out: &mut String) {
 /// waiting request early, and the peer able to cause it is the same user —
 /// so the cheapest stable hash that needs no dependency is the right one.
 fn tool_subject(value: &Value) -> String {
-    let name = string_at(Some(value), "tool_name");
+    let tool_call = value.get("toolCall").filter(|v| v.is_object());
+    let name = Some(string_at(Some(value), "tool_name"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| string_at(tool_call, "name"));
     if name.is_empty() {
         return String::new();
     }
     let mut text = name;
     text.push('\0');
-    if let Some(input) = value.get("tool_input") {
+    if let Some(input) = value
+        .get("tool_input")
+        .or_else(|| tool_call.and_then(|tc| tc.get("args")))
+    {
         canonical(input, &mut text);
     }
     format!("{:016x}", fnv1a(&text))
@@ -421,15 +469,22 @@ const TOOL_SUMMARY_CHARS: usize = 160;
 /// `tool_input`, said in a line, for the board: the tool and the one field a
 /// person would read to decide — a command, a path, a URL.
 fn tool_summary(value: &Value) -> String {
-    let name = string_at(Some(value), "tool_name");
+    let tool_call = value.get("toolCall").filter(|v| v.is_object());
+    let name = Some(string_at(Some(value), "tool_name"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| string_at(tool_call, "name"));
     if name.is_empty() {
         return String::new();
     }
-    let input = value.get("tool_input");
+    let input = value
+        .get("tool_input")
+        .or_else(|| tool_call.and_then(|tc| tc.get("args")));
     let what = [
         "command",
+        "CommandLine",
         "file_path",
         "notebook_path",
+        "Path",
         "url",
         "pattern",
         "query",
@@ -454,19 +509,32 @@ fn is_cursor_payload(value: &Value) -> bool {
         .is_some_and(|version| !version.is_null())
 }
 
+/// Antigravity (`agy`) native payloads use camelCase protojson fields and have
+/// no `cursor_version`.
+fn is_agy_payload(value: &Value) -> bool {
+    !is_cursor_payload(value)
+        && (!string_at(Some(value), "conversationId").is_empty()
+            || value.get("toolCall").is_some_and(Value::is_object)
+            || value.get("workspacePaths").is_some_and(Value::is_array)
+            || !string_at(Some(value), "artifactDirectoryPath").is_empty()
+            || !string_at(Some(value), "terminationReason").is_empty())
+}
+
 /// How many `workspace_roots` entries we will examine. Cursor's array is
 /// unbounded; a pathological payload must not turn SessionStart into a
 /// walk of a million empty strings.
 const MAX_WORKSPACE_ROOTS: usize = 256;
 
-/// Cursor native sessionStart sends `workspace_roots` (and often no `cwd`).
-/// The first non-empty string is the repository we brief; everything else is
-/// ignored. Hostile shapes (a string, an object, numbers) yield empty, which
-/// is the same answer as "the host told us nothing".
+/// Cursor native sessionStart sends `workspace_roots` and Antigravity sends
+/// `workspacePaths` (often with no `cwd`). The first non-empty string is the
+/// repository we brief; everything else is ignored. Hostile shapes (a string,
+/// an object, numbers) yield empty, which is the same answer as "the host told
+/// us nothing".
 fn first_workspace_root(value: &Value) -> String {
     value
         .get("workspace_roots")
         .or_else(|| value.get("workspaceRoots"))
+        .or_else(|| value.get("workspacePaths"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -561,6 +629,20 @@ impl HookOutput {
         }
     }
 
+    /// Forces an Antigravity `Stop` hook to re-enter the execution loop with
+    /// `reason` injected as a system message (`{"decision":"continue","reason":...}`).
+    pub fn stop_continue(reason: impl Into<String>) -> Self {
+        HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: "Stop".to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(reason.into()),
+            }),
+            system_message: None,
+        }
+    }
+
     pub fn is_silent(&self) -> bool {
         self.hook_specific_output.is_none() && self.system_message.is_none()
     }
@@ -578,6 +660,16 @@ impl HookOutput {
         serde_json::to_string(self).ok()
     }
 
+    /// Host- and subcommand-specific stdout. Antigravity requires a JSON object
+    /// on stdout for every hook event (`{}` when silent) and uses event-specific
+    /// camelCase schemas (`decision`/`reason`, `injectSteps`).
+    pub fn render_for_invocation(&self, subcommand: &str, input: &HookInput) -> Option<String> {
+        if input.is_agy {
+            return Some(self.render_agy(subcommand));
+        }
+        self.render_for_host(input.is_cursor)
+    }
+
     /// Host-specific stdout. Claude pastes Claude nested JSON; Cursor native
     /// sessionStart injects only top-level `additional_context`, and Cursor
     /// `preToolUse` is a permission hook whose schema is not Claude's — a
@@ -587,6 +679,85 @@ impl HookOutput {
             return self.render_cursor();
         }
         self.render()
+    }
+
+    fn render_agy(&self, subcommand: &str) -> String {
+        match subcommand {
+            "collision-guard" | "command-gate" => {
+                if let Some(specific) = &self.hook_specific_output {
+                    if let Some(decision) = specific.permission_decision {
+                        let decision_str = match decision {
+                            PermissionDecision::Deny => "deny",
+                            PermissionDecision::Ask => "ask",
+                        };
+                        let base = specific
+                            .permission_decision_reason
+                            .as_deref()
+                            .unwrap_or_default();
+                        let reason = match &self.system_message {
+                            Some(note) if !base.is_empty() => format!("{base}\n{note}"),
+                            Some(note) => note.clone(),
+                            None => base.to_string(),
+                        };
+                        return json!({
+                            "decision": decision_str,
+                            "reason": reason,
+                        })
+                        .to_string();
+                    }
+                    if specific.additional_context.is_some() {
+                        if let Some(note) = &self.system_message {
+                            log::info!(target: "hooks", "{note}");
+                        }
+                        return "{}".to_string();
+                    }
+                }
+                if let Some(note) = &self.system_message {
+                    return json!({
+                        "decision": "ask",
+                        "reason": note,
+                    })
+                    .to_string();
+                }
+                "{}".to_string()
+            }
+            "session-brief" => {
+                let text = self
+                    .hook_specific_output
+                    .as_ref()
+                    .and_then(|s| s.additional_context.as_deref())
+                    .or(self.system_message.as_deref());
+                match text.filter(|t| !t.trim().is_empty()) {
+                    Some(message) => json!({
+                        "injectSteps": [
+                            {
+                                "systemMessage": {
+                                    "systemMessage": message
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    None => "{}".to_string(),
+                }
+            }
+            "deliver" => {
+                if let Some(reason) = self
+                    .hook_specific_output
+                    .as_ref()
+                    .filter(|s| s.hook_event_name == "Stop")
+                    .and_then(|s| s.additional_context.as_deref())
+                {
+                    return json!({
+                        "decision": "continue",
+                        "reason": reason,
+                    })
+                    .to_string();
+                }
+                "{}".to_string()
+            }
+            _ => "{}".to_string(),
+        }
     }
 
     fn render_cursor(&self) -> Option<String> {
@@ -1526,7 +1697,8 @@ fn owning_checkout(here: &Path, file: &Path) -> Owner {
 /// planned file as `scope.operation`, and the tool already says which it is.
 fn write_op(tool_name: &str, file: &Path) -> &'static str {
     match tool_name {
-        "Write" if !file.exists() => "create",
+        "Write" | "write_file" if !file.exists() => "create",
+        "write_file" | "edit_file" => "modify",
         t if FILE_WRITE_TOOLS.contains(&t) => "modify",
         _ => "write",
     }
@@ -1724,6 +1896,52 @@ fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
 /// ([`under_bypass`]).
 pub fn run_command_gate(input: &HookInput) -> HookOutput {
     command_gate_call(input, |job| within_budget(BUDGET, job))
+}
+
+/// Judges a command an orchestrated child terminal is about to run (`spawn`
+/// initial `command`, or `send` input line) using the exact same [`signal_guard`]
+/// and [`command_gate_with`] path as interactive `PreToolUse` hooks, with bypass
+/// disabled. Both `Deny` and `Ask` refuse here because a background PTY write
+/// has no interactive approval prompt; any `system_message` notice (such as an
+/// absent harness or warning rung) is returned so callers surface non-checks
+/// honestly rather than reporting them as clean passes.
+pub(crate) fn gate_child_command(cwd: &str, command: &str) -> Result<Option<String>, String> {
+    let input = HookInput {
+        hook_event_name: PRE_TOOL_USE.to_string(),
+        cwd: cwd.to_string(),
+        tool_name: "Bash".to_string(),
+        command: command.to_string(),
+        ..Default::default()
+    };
+    let output = run_command_gate(&input);
+    if let Some(specific) = &output.hook_specific_output {
+        if matches!(
+            specific.permission_decision,
+            Some(PermissionDecision::Deny | PermissionDecision::Ask)
+        ) {
+            let base = specific
+                .permission_decision_reason
+                .as_deref()
+                .unwrap_or_default()
+                .trim();
+            let reason = match output
+                .system_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(note) if !base.is_empty() => format!("{base}\n{note}"),
+                Some(note) => note.to_string(),
+                None if !base.is_empty() => base.to_string(),
+                None => "command refused by GitPulse policy".to_string(),
+            };
+            return Err(reason);
+        }
+    }
+    Ok(output
+        .system_message
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
 }
 
 /// [`run_command_gate`] with the harness's runner injected, for the same reason
@@ -2747,12 +2965,14 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
     let here = root.to_string_lossy().into_owned();
     let arg = here.clone();
     let Some(snapshot) = within_budget(BUDGET, move || insights::snapshot(&arg)) else {
+        report_agent_session_meta(&here, input);
         return HookOutput::notice(format!(
             "GitPulse could not read this repository within {}s, so this session starts \
              without a repository brief.",
             BUDGET.as_secs()
         ));
     };
+    report_agent_session_meta(&here, input);
     let brief = session_brief(&snapshot, &here, &input.source);
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
@@ -2770,6 +2990,174 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
         system_message: None,
     }
 }
+
+/// Reports an agent's authoritative `conversationId` and `artifactDirectoryPath`
+/// back to the owning GitPulse PTY session (`GITPULSE_SESSION_ID`) so multi-tab
+/// Antigravity / Claude sessions bind exact resume IDs and companion plan panes.
+#[cfg(target_os = "macos")]
+fn report_agent_session_meta(repo_root: &str, input: &HookInput) {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let Some(terminal_id) = session_env() else {
+        return;
+    };
+    if !crate::alerts::bridge::valid_key(&terminal_id) {
+        return;
+    }
+    if !crate::workbench::terminal_command::is_canonical_uuid(&input.session_id) {
+        return;
+    }
+    let Some(dir) = scan_profile(repo_root) else {
+        return;
+    };
+    let agent = if input.is_agy
+        || std::env::var(AGENT_KIND_ENV)
+            .ok()
+            .is_some_and(|kind| kind == "agy")
+    {
+        "agy"
+    } else {
+        "claude"
+    };
+    let artifact_dir = (!input.artifact_dir.trim().is_empty()).then(|| input.artifact_dir.clone());
+    let request = Request::AgentSessionMeta {
+        terminal_id,
+        agent: agent.to_string(),
+        conversation_id: input.session_id.clone(),
+        artifact_dir,
+    };
+    let _ = within_budget(Duration::from_millis(300), move || {
+        if let Some(owner) = reach_owner(&dir, Duration::from_millis(250)) {
+            let _ = owner.forward(&request);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn report_agent_session_meta(_repo_root: &str, _input: &HookInput) {}
+
+/// Repo-relative edit or Antigravity plan artifact extracted from a successful
+/// file-modifying `PostToolUse` hook payload for live "Follow Agent" split panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TouchedFileReport {
+    pub repo: String,
+    pub path: String,
+    pub artifact: bool,
+}
+
+fn normalize_normal_relative(rel: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(seg) => {
+                let text = seg.to_str()?;
+                if text.is_empty() || text.contains('\0') {
+                    return None;
+                }
+                parts.push(text);
+            }
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+pub(crate) fn extract_touched_file_report(input: &HookInput) -> Option<TouchedFileReport> {
+    if input.incoming.is_none()
+        || input.hook_event_name == "PostToolUseFailure"
+        || !input.error.trim().is_empty()
+        || input.file_path.trim().is_empty()
+        || input.cwd.trim().is_empty()
+    {
+        return None;
+    }
+    let here = find_git_root(Path::new(&input.cwd))?;
+    let raw_file = if Path::new(&input.file_path).is_absolute() {
+        PathBuf::from(&input.file_path)
+    } else {
+        Path::new(&input.cwd).join(&input.file_path)
+    };
+    let file = canonical_enough(&raw_file).ok()?;
+
+    if !input.artifact_dir.trim().is_empty() && Path::new(&input.artifact_dir).is_absolute() {
+        if let Ok(canon_art) = canonical_enough(Path::new(&input.artifact_dir)) {
+            if let Ok(rel) = file.strip_prefix(&canon_art) {
+                if let Some(rel_slash) = normalize_normal_relative(rel) {
+                    return Some(TouchedFileReport {
+                        repo: here.to_string_lossy().into_owned(),
+                        path: rel_slash,
+                        artifact: true,
+                    });
+                }
+            }
+        }
+    }
+
+    match owning_checkout(&here, &file) {
+        Owner::Here(target) => Some(TouchedFileReport {
+            repo: here.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::Elsewhere { root, target, .. } => Some(TouchedFileReport {
+            repo: root.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::Unresolved {
+            nested_in_here: Some(target),
+            ..
+        } => Some(TouchedFileReport {
+            repo: here.to_string_lossy().into_owned(),
+            path: target,
+            artifact: false,
+        }),
+        Owner::NoRepo
+        | Owner::Unresolved {
+            nested_in_here: None,
+            ..
+        } => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn report_agent_touched_file(input: &HookInput) {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let Some(terminal_id) = session_env() else {
+        return;
+    };
+    if !crate::alerts::bridge::valid_key(&terminal_id) {
+        return;
+    }
+    let Some(report) = extract_touched_file_report(input) else {
+        return;
+    };
+    let Some(dir) = scan_profile(&report.repo) else {
+        return;
+    };
+    let request = Request::AgentTouchedFile {
+        terminal_id,
+        repo: report.repo,
+        path: report.path,
+        artifact: report.artifact,
+    };
+    if request.validate().is_err() {
+        return;
+    }
+    let _ = within_budget(Duration::from_millis(250), move || {
+        if let Some(owner) = reach_owner(&dir, Duration::from_millis(200)) {
+            let _ = owner.forward(&request);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn report_agent_touched_file(_input: &HookInput) {}
 
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
@@ -2893,7 +3281,11 @@ fn run_notify(
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
 ) -> Result<HookOutput, HookError> {
-    run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None)
+    let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
+    if argument == Some("tool_finished") {
+        report_agent_touched_file(input);
+    }
+    out
 }
 
 /// [`run_notify`] with the two things a test must be able to name: where an
@@ -3165,6 +3557,7 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
         // Codex or Cursor plugin, and Claude Code is the one whose
         // `Notification` event exists.
         _ if input.is_cursor => "cursor".to_string(),
+        _ if input.is_agy => "agy".to_string(),
         _ => "claude".to_string(),
     };
     let mut report = serde_json::Map::new();
@@ -9086,6 +9479,246 @@ done
                 "{}",
                 text(&output)
             );
+        }
+
+        #[test]
+        fn antigravity_wire_protocol_parses_camelcase_inputs_and_renders_event_json() {
+            let session_start = parse_input(
+                &json!({
+                    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                    "workspacePaths": ["/Users/dev/Code/repo"],
+                    "artifactDirectoryPath": "/Users/dev/.gemini/antigravity/brain/ec33ebf9",
+                    "modelName": "auto"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(session_start.is_agy);
+            assert!(!session_start.is_cursor);
+            assert_eq!(
+                session_start.session_id,
+                "ec33ebf9-0cba-4100-8142-c61503f6c587"
+            );
+            assert_eq!(session_start.cwd, "/Users/dev/Code/repo");
+            assert_eq!(
+                session_start.artifact_dir,
+                "/Users/dev/.gemini/antigravity/brain/ec33ebf9"
+            );
+
+            let brief_out = HookOutput {
+                hook_specific_output: Some(HookSpecificOutput {
+                    hook_event_name: SESSION_START.to_string(),
+                    permission_decision: None,
+                    permission_decision_reason: None,
+                    additional_context: Some(
+                        "GitPulse brief (session start)\nrepo: /Users/dev/Code/repo".into(),
+                    ),
+                }),
+                system_message: None,
+            };
+            let brief_json: Value = serde_json::from_str(
+                &brief_out
+                    .render_for_invocation("session-brief", &session_start)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                brief_json["injectSteps"][0]["systemMessage"]["systemMessage"],
+                "GitPulse brief (session start)\nrepo: /Users/dev/Code/repo"
+            );
+
+            let edit_call = parse_input(
+                &json!({
+                    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                    "workspacePaths": ["/Users/dev/Code/repo"],
+                    "toolCall": {
+                        "name": "edit_file",
+                        "args": {
+                            "Path": "/Users/dev/Code/repo/src/main.rs",
+                            "Target": "fn old() {}",
+                            "Replacement": "fn new() {}"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(edit_call.is_agy);
+            assert_eq!(edit_call.tool_name, "edit_file");
+            assert_eq!(edit_call.file_path, "/Users/dev/Code/repo/src/main.rs");
+            assert_eq!(
+                edit_call.incoming,
+                Some(insights::IncomingEdit::Replacing(
+                    vec!["fn old() {}".into()]
+                ))
+            );
+            assert!(!edit_call.tool_subject.is_empty());
+            assert_eq!(
+                edit_call.tool_summary,
+                "edit_file: /Users/dev/Code/repo/src/main.rs"
+            );
+
+            let cmd_call = parse_input(
+                &json!({
+                    "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                    "workspacePaths": ["/Users/dev/Code/repo"],
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": { "CommandLine": "git reset --hard" }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(cmd_call.tool_name, "run_command");
+            assert_eq!(cmd_call.command, "git reset --hard");
+
+            // Silent pass renders `{}` on Antigravity PreToolUse and notify.
+            assert_eq!(
+                HookOutput::silent().render_for_invocation("collision-guard", &edit_call),
+                Some("{}".to_string())
+            );
+            assert_eq!(
+                HookOutput::silent().render_for_invocation("notify", &cmd_call),
+                Some("{}".to_string())
+            );
+
+            // Deny / Ask / Unchecked notice render Antigravity PreToolUse decisions.
+            let deny_out = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    PermissionDecision::Deny,
+                    "blocked destructive command".into(),
+                )),
+                system_message: None,
+            };
+            let deny_json: Value = serde_json::from_str(
+                &deny_out
+                    .render_for_invocation("command-gate", &cmd_call)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(deny_json["decision"], "deny");
+            assert_eq!(deny_json["reason"], "blocked destructive command");
+
+            let unchecked_out = HookOutput::notice("collision check did NOT run");
+            let unchecked_json: Value = serde_json::from_str(
+                &unchecked_out
+                    .render_for_invocation("collision-guard", &edit_call)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(unchecked_json["decision"], "ask");
+            assert_eq!(unchecked_json["reason"], "collision check did NOT run");
+        }
+
+        #[test]
+        fn extracts_touched_file_reports_for_claude_and_antigravity_edits_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join("src/lib")).unwrap();
+            std::fs::write(repo.join("src/lib/app.ts"), "export const x = 1;\n").unwrap();
+            let canon_repo = std::fs::canonicalize(&repo).unwrap();
+
+            let artifact_dir = tmp
+                .path()
+                .join("brain/ec33ebf9-0cba-4100-8142-c61503f6c587");
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let plan_file = artifact_dir.join("implementation_plan.md");
+            std::fs::write(&plan_file, "# Plan\n").unwrap();
+
+            // 1. Claude Code Edit -> repo-relative touched file.
+            let claude_edit = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy(),
+                    "old_string": "1",
+                    "new_string": "2"
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&claude_edit),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "src/lib/app.ts".into(),
+                    artifact: false,
+                })
+            );
+
+            // 2. Antigravity write_file inside repo -> repo-relative touched file.
+            let agy_write = HookInput::from_value(&json!({
+                "hookEventName": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                "artifactDirectoryPath": artifact_dir.to_string_lossy(),
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {
+                        "Path": canon_repo.join("src/lib/new_file.ts").to_string_lossy(),
+                        "Content": "export const y = 2;\n"
+                    }
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&agy_write),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "src/lib/new_file.ts".into(),
+                    artifact: false,
+                })
+            );
+
+            // 3. Antigravity edit_file inside artifactDirectoryPath -> artifact: true.
+            let agy_plan = HookInput::from_value(&json!({
+                "hookEventName": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587",
+                "artifactDirectoryPath": artifact_dir.to_string_lossy(),
+                "toolCall": {
+                    "name": "edit_file",
+                    "args": {
+                        "Path": plan_file.to_string_lossy(),
+                        "Target": "# Plan",
+                        "Replacement": "# Updated Plan"
+                    }
+                }
+            }));
+            assert_eq!(
+                extract_touched_file_report(&agy_plan),
+                Some(TouchedFileReport {
+                    repo: canon_repo.to_string_lossy().into_owned(),
+                    path: "implementation_plan.md".into(),
+                    artifact: true,
+                })
+            );
+
+            // 4. Non-editing Read / read_file tools are ignored.
+            let claude_read = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUse",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Read",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy()
+                }
+            }));
+            assert_eq!(extract_touched_file_report(&claude_read), None);
+
+            // 5. PostToolUseFailure is ignored even on an editing tool.
+            let failed_edit = HookInput::from_value(&json!({
+                "hook_event_name": "PostToolUseFailure",
+                "cwd": canon_repo.to_string_lossy(),
+                "tool_name": "Edit",
+                "error": "old_string not found",
+                "tool_input": {
+                    "file_path": canon_repo.join("src/lib/app.ts").to_string_lossy(),
+                    "old_string": "missing",
+                    "new_string": "2"
+                }
+            }));
+            assert_eq!(extract_touched_file_report(&failed_edit), None);
         }
     }
 }

@@ -11,19 +11,16 @@
 //! find out that a host speaks another version, and to ask an idle one to go.
 
 use super::super::{
-    SpawnRequest, TerminalContext, TerminalExitPayload, TerminalListing, TerminalLossPayload,
-    TerminalSpawned,
+    AgentSessionMeta, SpawnRequest, TerminalContext, TerminalExitPayload, TerminalListing,
+    TerminalLossPayload, TerminalSpawned,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// What this build speaks. Bumped whenever a frame changes shape or meaning.
-/// 3 added `Request::Transcript`: a host of protocol 2 ends the connection of
-/// an app that sends a request it cannot decode, and the socket name carries
-/// the protocol, so the two never meet. The request's optional `run_id` and the
-/// transcript answer's `unrecorded_bytes`, `run_id` and `reused` state were
-/// added before protocol 3 was released, so they did not bump it.
-pub const PROTOCOL: u32 = 3;
+/// 3 added `Request::Transcript`; 4 added child-orchestration lineage,
+/// `Telemetry`, `SetAgentMeta`, `OrchestrationSnapshot`, and `TranscriptTail::total_bytes`.
+pub const PROTOCOL: u32 = 4;
 
 /// Longest JSON header accepted. A spawn request (argv and environment are
 /// bounded at 128 KiB each by `validate_pty_options`) is the largest a caller
@@ -87,6 +84,9 @@ pub enum Request {
     Context {
         session: String,
     },
+    ListeningPorts {
+        session: String,
+    },
     Background {
         sessions: Vec<String>,
     },
@@ -129,6 +129,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
     },
+    /// Current OSC 7 / 133 / 7501 + loopback readiness snapshot for `session`.
+    Telemetry {
+        session: String,
+    },
+    /// Persists `SessionStart` metadata (`agent`, `conversation_id`, `artifact_dir`)
+    /// inside `gitpulse-ptyd` so a reconnecting app adopts it intact.
+    SetAgentMeta {
+        session: String,
+        meta: AgentSessionMeta,
+    },
+    /// Returns orchestration lineage, session token hashes (RAM-only), telemetry,
+    /// and `AgentSessionMeta` for live sessions held by `gitpulse-ptyd`.
+    OrchestrationSnapshot,
 }
 
 /// A request with the id its reply will carry.
@@ -218,8 +231,8 @@ pub struct WireNotice {
 }
 
 /// The channels a terminal's own output can raise a notice on: the scanner's,
-/// and `exit` for the end of a session.
-const TERMINAL_CHANNELS: [&str; 5] = ["bell", "osc9", "osc777", "osc99", "exit"];
+/// `osc7501` for Herdr agent status coordination, and `exit` for session end.
+const TERMINAL_CHANNELS: [&str; 6] = ["bell", "osc9", "osc777", "osc99", "osc7501", "exit"];
 
 impl WireNotice {
     pub fn from_notice(notice: &crate::alerts::Notice) -> Self {
@@ -472,10 +485,10 @@ mod tests {
     /// named for the protocol.
     #[test]
     fn the_transcript_request_has_a_pinned_shape_and_lives_on_protocol_three() {
-        assert_eq!(PROTOCOL, 3);
+        assert_eq!(PROTOCOL, 4);
         assert_ne!(
             crate::terminal::host::socket_name(PROTOCOL),
-            crate::terminal::host::socket_name(2)
+            crate::terminal::host::socket_name(3)
         );
         let request = serde_json::to_value(Envelope {
             id: 9,
@@ -561,6 +574,7 @@ mod tests {
                     data_b64: "aGk=".into(),
                     bytes: 2,
                     retained: 2,
+                    total_bytes: 2,
                     truncated: false,
                     rotated: false,
                     clipped: false,

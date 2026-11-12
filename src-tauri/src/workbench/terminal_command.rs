@@ -1204,7 +1204,7 @@ pub(super) fn arguments(
     } else {
         COMPLETION
     };
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the gitpulse-terminal skill covers spawning and orchestrating child terminals or split file panes. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",

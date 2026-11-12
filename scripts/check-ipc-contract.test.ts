@@ -326,12 +326,24 @@ describe("annotated but unregistered commands", () => {
     // cmd_browser_navigate, cmd_browser_go, cmd_browser_close), and 312 with
     // cmd_get_accessibility_display (the system Reduce Transparency setting,
     // which WKWebView cannot read), and 313 with cmd_cancel_read (a read whose
-    // callers have all gone is stopped);
+    // callers have all gone is stopped), and 316 with cmd_browser_snapshot,
+    // cmd_terminal_save_clipboard_image, and cmd_terminal_read_agent_artifact,
+    // and 320 with cmd_browser_snapshot_preview, cmd_browser_inspect_point,
+    // cmd_terminal_clipboard_files, and cmd_terminal_listening_ports;
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
-    // agree. 314 with cmd_native_rendering_apply (Liquid Glass and the 120 Hz
-    // switch), counted on top of cmd_cancel_read when the overhaul merged.
-    expect(found.size).toBe(314);
+    // agree. 321 with cmd_native_rendering_apply (Liquid Glass and the 120 Hz
+    // switch), which main added on top of cmd_cancel_read while the terminal
+    // overhaul added its seven; the two counts met when the branch merged.
+    expect(found.size).toBe(321);
+    expect(found.has("cmd_native_rendering_apply")).toBe(true);
+    expect(found.has("cmd_browser_snapshot")).toBe(true);
+    expect(found.has("cmd_browser_snapshot_preview")).toBe(true);
+    expect(found.has("cmd_browser_inspect_point")).toBe(true);
+    expect(found.has("cmd_terminal_save_clipboard_image")).toBe(true);
+    expect(found.has("cmd_terminal_clipboard_files")).toBe(true);
+    expect(found.has("cmd_terminal_read_agent_artifact")).toBe(true);
+    expect(found.has("cmd_terminal_listening_ports")).toBe(true);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

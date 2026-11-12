@@ -34,6 +34,9 @@ describe("gitpulseManualChunk", () => {
 
   it("is cross-platform and leaves application modules in the entry graph", () => {
     expect(gitpulseManualChunk("C:\\repo\\node_modules\\@xterm\\addon-fit\\lib.js")).toBe(
+      "vendor-xterm-addons",
+    );
+    expect(gitpulseManualChunk("C:\\repo\\node_modules\\@xterm\\xterm\\lib\\xterm.js")).toBe(
       "vendor-xterm",
     );
     expect(gitpulseManualChunk("/repo/src/lib/components/CoverageViewer.svelte")).toBeUndefined();

@@ -48,6 +48,12 @@ pub struct TranscriptTail {
     /// Bytes of the session's output that are still on disk. More than
     /// `bytes` when the tail was clipped.
     pub retained: u64,
+    /// Monotonic total content bytes written to this session's transcript in
+    /// the current host's lifetime (falls back to `retained` across host
+    /// restarts), so incremental readers continue advancing across segment
+    /// rotations when `retained` shrinks.
+    #[serde(default)]
+    pub total_bytes: u64,
     /// The start of the session's output is not in `data_b64`: `rotated` or
     /// `clipped`.
     pub truncated: bool,

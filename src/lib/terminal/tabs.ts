@@ -32,6 +32,12 @@ export const LAUNCHERS: readonly { kind: LauncherKind; label: string }[] = [
  */
 export type SessionKind = LauncherKind | "browser";
 
+/**
+ * Any pane kind in the terminal dock: a process, a browser view, or an
+ * integrated file/code/Markdown split (`TerminalFilePane.svelte`).
+ */
+export type TabKind = SessionKind | "file";
+
 /** Every session type, in the order the new-session menu lists them. */
 export const SESSION_TYPES: readonly { kind: SessionKind; label: string }[] = [
   ...LAUNCHERS,
@@ -54,7 +60,7 @@ export function offeredSessionKind(kind: unknown, browserSessions: boolean): Ses
 
 export interface TerminalTab {
   id: string;
-  launcher: SessionKind;
+  launcher: TabKind;
   /**
    * What the running program last called itself (an OSC 0/2 title), or null
    * while it has said nothing. Null is not "no title" — it is "nothing has
@@ -84,11 +90,28 @@ export interface TerminalTab {
    */
   attachSessionId?: string;
   /**
+   * Parent backend PTY session ID when this tab is an Option A child session
+   * spawned via `gitpulse_terminal_spawn` / `gitpulse-hook term spawn`.
+   */
+  parentSessionId?: string;
+  /**
    * A browser tab's address: the one it was opened on, then whatever its page
    * last loaded (`setTabUrl`). What an agent's or a link's request for the
    * same address finds (`browserTabFor`) instead of opening another tab.
    */
   url?: string;
+  /** Repository-relative path open inside a `file` pane (`TerminalFilePane.svelte`). */
+  filePath?: string;
+  /** Repo-root fallback path when a subdirectory link could also refer to the root (`W6.5-8`). */
+  fallbackPath?: string;
+  /** 1-based line requested for a `file` pane reveal. */
+  revealLine?: number | null;
+  /** 1-based column requested for a `file` pane reveal. */
+  revealColumn?: number | null;
+  /** Monotonic bump so clicking the same `path:line` twice re-reveals it. */
+  revealSeq?: number;
+  /** Read-only virtual command-output snippet rendered in `TerminalFilePane.svelte` without dirtying Git. */
+  snippet?: { title: string; content: string };
 }
 
 /**
@@ -165,7 +188,8 @@ export interface TabState {
   activeId: string | null;
 }
 
-export function launcherLabel(kind: SessionKind): string {
+export function launcherLabel(kind: TabKind): string {
+  if (kind === "file") return "Files";
   return SESSION_TYPES.find((l) => l.kind === kind)?.label ?? kind;
 }
 
@@ -175,7 +199,13 @@ export function launcherLabel(kind: SessionKind): string {
  * arbitrarily long one, and a tab strip is not the place to discover that.
  */
 export function tabLabel(tab: TerminalTab): string {
-  const reported = tab.name?.trim() || tab.title?.trim() || "";
+  const fileFallback =
+    tab.launcher === "file"
+      ? tab.filePath
+        ? (tab.filePath.split(/[\\/]/).pop() ?? "")
+        : (tab.snippet?.title ?? "")
+      : "";
+  const reported = tab.name?.trim() || tab.title?.trim() || fileFallback;
   if (!reported) return launcherLabel(tab.launcher);
   return reported.length > 28 ? `${reported.slice(0, 27)}…` : reported;
 }
@@ -188,7 +218,7 @@ function nextTabId(): string {
   return `tab-${sequence}`;
 }
 
-export function createTab(launcher: SessionKind, initialPrompt?: string): TerminalTab {
+export function createTab(launcher: TabKind, initialPrompt?: string): TerminalTab {
   return { id: nextTabId(), launcher, title: null, ...(initialPrompt === undefined ? {} : { initialPrompt }) };
 }
 
@@ -254,10 +284,10 @@ export function paneOnScreen({ visible, mode, splitIds, activeId, tabId }: PaneV
  * Silent refusal is the caller's cue to have disabled the control already;
  * this returning the same object is what makes "nothing happened" checkable.
  */
-export function openTab(state: TabState, launcher: SessionKind, launch?: string | TaskLaunch): TabState {
-  // A browser session runs no process, so it has nothing to hand a prompt or
+export function openTab(state: TabState, launcher: TabKind, launch?: string | TaskLaunch): TabState {
+  // Non-process panes run no process, so they have nothing to hand a prompt or
   // a task attempt to.
-  if (launcher === "browser" && launch !== undefined) return state;
+  if ((launcher === "browser" || launcher === "file") && launch !== undefined) return state;
   const task = typeof launch === "object" ? launch : undefined;
   if (task) {
     const existing = tabFor(state, task);
@@ -281,6 +311,176 @@ export function openTab(state: TabState, launcher: SessionKind, launch?: string 
   if (startDir) tab.startDir = startDir;
   if (task && !task.attach && task.checkout) tab.checkout = task.checkout;
   return { tabs: [...state.tabs, tab], activeId: tab.id };
+}
+
+/**
+ * Adopts an already-spawned child PTY (`terminal-child-spawned`) into the tab
+ * strip via `attachSessionId` so `TerminalSession` attaches to the running
+ * process instead of starting a second one.
+ *
+ * Idempotent on `sessionId`, bounded by `MAX_STRIP_TABS`, and leaves active
+ * focus on the caller's current tab unless `focus` is true or the strip is empty.
+ */
+export function openAttachedChildTab(
+  state: TabState,
+  options: {
+    sessionId: string;
+    parentSessionId?: string | null;
+    launcher?: string | null;
+    title?: string | null;
+    startDir?: string | null;
+    focus?: boolean;
+  },
+): { state: TabState; id: string | null; opened: boolean } {
+  const sessionId = options.sessionId.trim();
+  if (!sessionId) return { state, id: null, opened: false };
+  const parentId = options.parentSessionId?.trim() || undefined;
+  const existing = state.tabs.find((tab) => tab.attachSessionId === sessionId);
+  if (existing) {
+    const updatedTabs =
+      parentId && existing.parentSessionId !== parentId
+        ? state.tabs.map((tab) =>
+            tab.id === existing.id ? { ...tab, parentSessionId: parentId } : tab,
+          )
+        : state.tabs;
+    const nextBase = updatedTabs === state.tabs ? state : { ...state, tabs: updatedTabs };
+    return {
+      state: options.focus ? activateTab(nextBase, existing.id) : nextBase,
+      id: existing.id,
+      opened: false,
+    };
+  }
+  if (!canOpenTab(state, MAX_STRIP_TABS)) {
+    return { state, id: null, opened: false };
+  }
+  const kind: LauncherKind =
+    LAUNCHERS.find((candidate) => candidate.kind === options.launcher)?.kind ?? "shell";
+  const tab = createTab(kind);
+  tab.attachSessionId = sessionId;
+  if (parentId) tab.parentSessionId = parentId;
+  if (options.title) {
+    const cleaned = cleanTabName(options.title);
+    if (cleaned) tab.name = cleaned;
+  }
+  const relDir = relativeStartDir(options.startDir);
+  if (relDir) tab.startDir = relDir;
+  return {
+    state: {
+      tabs: [...state.tabs, tab],
+      activeId: options.focus || !state.activeId ? tab.id : state.activeId,
+    },
+    id: tab.id,
+    opened: true,
+  };
+}
+
+/**
+ * Returns live child tabs owned by `parentSessionId` (`status !== "exited"`).
+ */
+export function childTabsForParent(
+  state: TabState,
+  parentSessionId: string | null | undefined,
+  statuses?: Readonly<Record<string, string | undefined>>,
+): TerminalTab[] {
+  const pid = parentSessionId?.trim();
+  if (!pid) return [];
+  return state.tabs.filter(
+    (tab) => tab.parentSessionId === pid && statuses?.[tab.id] !== "exited",
+  );
+}
+
+const ANSI_CSI_OR_OSC =
+  // eslint-disable-next-line no-control-regex
+  /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+
+/**
+ * Builds a bounded, ANSI-stripped handoff prompt for 1-click context transfer
+ * between paired Claude Code and Antigravity split panes.
+ */
+export function buildPairHandoffPrompt(options: {
+  fromLauncher: TabKind;
+  checkoutBranch?: string | null;
+  openFilePath?: string | null;
+  openFileLine?: number | null;
+  terminalTail?: string | null;
+}): string {
+  const sender = launcherLabel(options.fromLauncher);
+  const branchTag = options.checkoutBranch?.trim() ? ` (${options.checkoutBranch.trim()})` : "";
+  const parts: string[] = [`[Handoff from ${sender}${branchTag}]`];
+  const filePath = options.openFilePath?.trim();
+  if (filePath) {
+    const lineRef =
+      typeof options.openFileLine === "number" && options.openFileLine > 0
+        ? `#L${options.openFileLine}`
+        : "";
+    parts.push(`Context file: @${filePath}${lineRef}`);
+  }
+  const cleanedTail = (options.terminalTail ?? "")
+    .replace(ANSI_CSI_OR_OSC, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (cleanedTail.length > 0) {
+    let tailText = cleanedTail.slice(-20).join("\n");
+    if (tailText.length > 1600) {
+      tailText = `…${tailText.slice(tailText.length - 1600)}`;
+    }
+    parts.push(`Recent terminal context:\n\`\`\`\n${tailText}\n\`\`\``);
+  }
+  return `${parts.join("\n")}\n`;
+}
+
+/**
+ * Normalizes a user-supplied worktree slug into a safe `[a-z0-9._-]` segment,
+ * or returns `null` when empty or unsafe (`..`).
+ */
+export function sanitizeWorktreeSlug(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s/\\]+/g, "-")
+    .replace(/[^a-z0-9._-]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 48)
+    .replace(/[.-]+$/g, "");
+  if (!cleaned || cleaned.includes("..")) return null;
+  return cleaned;
+}
+
+/**
+ * Opens an interactive process tab bound to an explicit worktree `checkout`
+ * without fabricating a `taskRunId`.
+ */
+export function openCheckoutTab(
+  state: TabState,
+  launcher: LauncherKind,
+  options: {
+    checkout: string;
+    name?: string | null;
+    startDir?: string | null;
+    initialPrompt?: string;
+  },
+): { state: TabState; id: string | null } {
+  const checkout = options.checkout.trim();
+  if (!checkout || !canOpenTab(state, MAX_STRIP_TABS)) {
+    return { state, id: null };
+  }
+  const tab = createTab(launcher, options.initialPrompt);
+  tab.checkout = checkout;
+  if (options.name) {
+    const cleaned = cleanTabName(options.name);
+    if (cleaned) tab.name = cleaned;
+  }
+  const relDir = relativeStartDir(options.startDir);
+  if (relDir) tab.startDir = relDir;
+  return {
+    state: { tabs: [...state.tabs, tab], activeId: tab.id },
+    id: tab.id,
+  };
 }
 
 /**
@@ -362,6 +562,207 @@ export function setTabUrl(state: TabState, id: string, url: string): TabState {
   const address = url.slice(0, MAX_TAB_URL);
   if (tab.url === address) return state;
   return { ...state, tabs: state.tabs.map((candidate) => (candidate.id === id ? { ...candidate, url: address } : candidate)) };
+}
+
+const MAX_TAB_FILE_PATH = 4096;
+
+/** Normalizes and validates a repository-relative file path for a `file` pane. */
+export function normalizePaneFilePath(raw: string | null | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim().replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+  if (!trimmed || trimmed.length > MAX_TAB_FILE_PATH || trimmed.includes("\0")) return undefined;
+  if (trimmed.startsWith("/") || /^[A-Za-z]:/.test(trimmed)) return undefined;
+  if (trimmed.split("/").some((part) => part === ".." || part === "")) return undefined;
+  return trimmed;
+}
+
+/** Finds an existing `file` tab in the same checkout (matching `filePath` when supplied, or the first `file` tab in that checkout). */
+export function fileTabFor(
+  state: TabState,
+  filePath?: string,
+  checkout?: string,
+): TerminalTab | undefined {
+  const cleanPath = normalizePaneFilePath(filePath);
+  const normalizedCheckout = checkout?.trim() || undefined;
+  const sameCheckout = (tab: TerminalTab) => (tab.checkout || undefined) === normalizedCheckout;
+  if (cleanPath) {
+    const exact = state.tabs.find(
+      (tab) => tab.launcher === "file" && sameCheckout(tab) && tab.filePath === cleanPath,
+    );
+    if (exact) return exact;
+  }
+  return state.tabs.find((tab) => tab.launcher === "file" && sameCheckout(tab));
+}
+
+/** Updates a `file` tab's selected path and optional 1-based reveal line/column. */
+export function setTabFile(
+  state: TabState,
+  id: string,
+  filePath?: string,
+  line: number | null = null,
+  column: number | null = null,
+  options?: {
+    checkout?: string;
+    fallbackPath?: string;
+    preserveReveal?: boolean;
+  },
+): TabState {
+  const tab = state.tabs.find((candidate) => candidate.id === id);
+  if (!tab || tab.launcher !== "file") return state;
+  const cleanPath = normalizePaneFilePath(filePath);
+  const cleanFallback = normalizePaneFilePath(options?.fallbackPath);
+  const effectiveFallback =
+    cleanFallback && cleanFallback !== cleanPath ? cleanFallback : undefined;
+  const nextCheckout = options?.checkout !== undefined ? (options.checkout.trim() || undefined) : tab.checkout;
+  const nextLine = options?.preserveReveal
+    ? (tab.revealLine ?? null)
+    : (line && line > 0 ? Math.floor(line) : null);
+  const nextColumn = options?.preserveReveal
+    ? (tab.revealColumn ?? null)
+    : (column && column > 0 ? Math.floor(column) : null);
+  const nextSeq = options?.preserveReveal ? (tab.revealSeq ?? 1) : (tab.revealSeq ?? 0) + 1;
+  return {
+    ...state,
+    tabs: state.tabs.map((candidate) =>
+      candidate.id === id
+        ? {
+            ...candidate,
+            ...(cleanPath !== undefined ? { filePath: cleanPath, snippet: undefined } : {}),
+            fallbackPath: effectiveFallback,
+            ...(nextCheckout ? { checkout: nextCheckout } : { checkout: undefined }),
+            revealLine: nextLine,
+            revealColumn: nextColumn,
+            revealSeq: nextSeq,
+          }
+        : candidate,
+    ),
+  };
+}
+
+/**
+ * Opens or reuses a `file` pane tab (`TerminalFilePane.svelte`).
+ *
+ * When `reuseExisting` is true (default), clicking multiple file links in a
+ * terminal updates the already-open file split in place rather than piling up
+ * tabs; passing `focus: false` leaves keyboard focus on the terminal beside it.
+ */
+export function openFileTab(
+  state: TabState,
+  options: {
+    filePath?: string;
+    fallbackPath?: string;
+    checkout?: string;
+    line?: number | null;
+    column?: number | null;
+    reuseExisting?: boolean;
+    focus?: boolean;
+  } = {},
+): { state: TabState; id: string | null; opened: boolean } {
+  const {
+    filePath,
+    fallbackPath,
+    checkout,
+    line = null,
+    column = null,
+    reuseExisting = true,
+    focus = true,
+  } = options;
+  const cleanPath = normalizePaneFilePath(filePath);
+  const cleanFallback = normalizePaneFilePath(fallbackPath);
+  const effectiveFallback =
+    cleanFallback && cleanFallback !== cleanPath ? cleanFallback : undefined;
+  const cleanCheckout = checkout?.trim() || undefined;
+  if (filePath !== undefined && filePath.trim() !== "" && !cleanPath) {
+    return { state, id: null, opened: false };
+  }
+  if (reuseExisting) {
+    const existing = fileTabFor(state, cleanPath, cleanCheckout);
+    if (existing) {
+      const updated = setTabFile(state, existing.id, cleanPath ?? existing.filePath, line, column, {
+        checkout: cleanCheckout,
+        fallbackPath: effectiveFallback,
+      });
+      return {
+        state: focus ? activateTab(updated, existing.id) : updated,
+        id: existing.id,
+        opened: false,
+      };
+    }
+  }
+  if (!canOpenTab(state, MAX_STRIP_TABS)) return { state, id: null, opened: false };
+  const tab = createTab("file");
+  if (cleanPath) tab.filePath = cleanPath;
+  if (effectiveFallback) tab.fallbackPath = effectiveFallback;
+  if (cleanCheckout) tab.checkout = cleanCheckout;
+  tab.revealLine = line && line > 0 ? Math.floor(line) : null;
+  tab.revealColumn = column && column > 0 ? Math.floor(column) : null;
+  tab.revealSeq = 1;
+  return {
+    state: {
+      tabs: [...state.tabs, tab],
+      activeId: focus || !state.activeId ? tab.id : state.activeId,
+    },
+    id: tab.id,
+    opened: true,
+  };
+}
+
+/**
+ * Opens or reuses a read-only virtual `file` pane tab showing captured terminal
+ * command output (`snippet`), avoiding an existing `file` tab that is currently
+ * viewing a disk file so unsaved editor drafts are never displaced.
+ */
+export function openSnippetTab(
+  state: TabState,
+  options: {
+    title: string;
+    content: string;
+    reuseExisting?: boolean;
+    focus?: boolean;
+  },
+): { state: TabState; id: string | null; opened: boolean } {
+  const title = cleanTabName(options.title, 64) || "Command output";
+  const content = options.content.slice(0, 256 * 1024);
+  const { reuseExisting = true, focus = false } = options;
+  if (reuseExisting) {
+    const existing = state.tabs.find(
+      (tab) => tab.launcher === "file" && !tab.filePath,
+    );
+    if (existing) {
+      const updated: TabState = {
+        ...state,
+        tabs: state.tabs.map((tab) =>
+          tab.id === existing.id
+            ? {
+                ...tab,
+                filePath: undefined,
+                snippet: { title, content },
+                revealLine: 1,
+                revealColumn: null,
+                revealSeq: (tab.revealSeq ?? 0) + 1,
+              }
+            : tab,
+        ),
+      };
+      return {
+        state: focus ? activateTab(updated, existing.id) : updated,
+        id: existing.id,
+        opened: false,
+      };
+    }
+  }
+  if (!canOpenTab(state, MAX_STRIP_TABS)) return { state, id: null, opened: false };
+  const tab = createTab("file");
+  tab.snippet = { title, content };
+  tab.revealSeq = 1;
+  return {
+    state: {
+      tabs: [...state.tabs, tab],
+      activeId: focus || !state.activeId ? tab.id : state.activeId,
+    },
+    id: tab.id,
+    opened: true,
+  };
 }
 
 export function setTabTitle(state: TabState, id: string, title: string): TabState {

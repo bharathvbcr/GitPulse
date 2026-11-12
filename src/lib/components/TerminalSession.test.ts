@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import TerminalSession, { hexColor, shouldRefit } from "./TerminalSession.svelte";
+import TerminalSession, { hexColor, isTranslucentHexColor, shouldRefit } from "./TerminalSession.svelte";
 
 /**
  * These contracts moved here with the PTY itself when tabs arrived: they were
@@ -87,6 +87,13 @@ describe("TerminalSession hosted conversation records", () => {
     );
     expect(settleBody).toContain("hostedClaude.forget(conversation);");
     expect(settleBody).toContain("unindexedExitOffer(");
+  });
+
+  it("binds live Antigravity SessionStart metadata and opens active agent plan artifacts beside the terminal", () => {
+    expect(source).toContain("agentEvents.subscribeAgentMeta(spawned.id");
+    expect(source).toContain("hostedClaude.bindAgentMeta({");
+    expect(source).toContain('"cmd_terminal_read_agent_artifact"');
+    expect(source).toContain('data-testid="terminal-open-agent-plan"');
   });
 });
 
@@ -306,14 +313,29 @@ describe("TerminalSession surface colour", () => {
     expect(hexColor("rgb(20, 26)")).toBe("rgb(20, 26)");
   });
 
-  it("reads the terminal's own token, and asks for transparency support", () => {
+  it("reads the terminal's own token, and enables allowTransparency only when the surface is translucent", () => {
     // `--bg-surface` has a second runtime reader — the graph's node stroke —
     // and a stroke is not a fill. `allowTransparency` must be set before
-    // `open()`, so it belongs in the constructor options.
+    // `open()`, so it belongs in the constructor options, keeping the opaque
+    // WebGL fast-path when alpha is 1.0.
     expect(source).toContain('hexColor(v("--bg-terminal"');
-    expect(source).toContain("allowTransparency: true");
+    expect(source).toContain("allowTransparency: isTranslucentHexColor(termTheme().background)");
+    expect(isTranslucentHexColor("#141a29")).toBe(false);
+    expect(isTranslucentHexColor("#141a29ff")).toBe(false);
+    expect(isTranslucentHexColor("#123f")).toBe(false);
+    expect(isTranslucentHexColor("#141a2980")).toBe(true);
+    expect(isTranslucentHexColor("#00000000")).toBe(true);
+    expect(isTranslucentHexColor("#1238")).toBe(true);
     // The block cursor's glyph colour is a foreground and stays opaque.
     expect(source).toContain('cursorAccent: v("--bg-surface"');
+  });
+
+  it("opens split file links in hosted worktrees with subdir fallbackPath, passes hintArtifactDir, and clears OSC 7501 badges on clear", () => {
+    expect(source).not.toContain("!checkout && onOpenFileSplit");
+    expect(source).not.toContain("!checkout && artifact.repo_relative_path");
+    expect(source).toContain("onOpenFileSplit?.(resolved.path, resolved.line, resolved.column, resolved.fallbackPath)");
+    expect(source).toContain("hintArtifactDir:");
+    expect(source).toContain('parsed.state === "clear" ? null : parsed');
   });
 });
 
@@ -390,6 +412,26 @@ describe("TerminalSession GPU wiring", () => {
     expect(source).toContain("refresh: () => t.refresh(0, t.rows - 1)");
     expect(source).toContain("data-terminal-gpu-note");
     expect(source).toContain("Drawing without GPU after a graphics reset");
+  });
+
+  it("clears the WebGL glyph atlas on theme flips, coalesces frame writes behind syncFrames, fits synchronously on reveal, and snapshots visual ANSI scrollback", () => {
+    const themeBody = source.slice(
+      source.indexOf("function applyTheme()"),
+      source.indexOf("function linkBuffer("),
+    );
+    expect(themeBody).toContain("gpu?.clearAtlas();");
+    expect(source).toContain("new SerializeAddon()");
+    expect(source).toContain("rafWrites.enqueue(bytes, written)");
+    const cleanupIdx = source.indexOf("disposed = true;");
+    expect(source.indexOf("rafWrites.discard()", cleanupIdx)).toBeLessThan(
+      source.indexOf("credit.releaseAll()", cleanupIdx),
+    );
+    const revealStart = source.indexOf("export function reveal()");
+    const revealBody = source.slice(revealStart, source.indexOf("\n  }", revealStart));
+    expect(revealBody.indexOf("fitNow();")).toBeGreaterThan(-1);
+    expect(revealBody.indexOf("fitNow();")).toBeLessThan(revealBody.indexOf("fits.settle();"));
+    expect(source).toContain("scrollbackSnapshots.capture(");
+    expect(source).toContain("scrollbackSnapshots.take(");
   });
 });
 
@@ -476,5 +518,32 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     expect(alert).toContain("max-h-24");
     // The text is in the node, not only in a tooltip.
     expect(alert).not.toContain("title=");
+  });
+
+  it("falls back to native Finder file pasteboard URLs before raw filename text", () => {
+    expect(source).toContain("clipboardMayHoldFiles(");
+    expect(source).toContain('invoke<string[]>("cmd_terminal_clipboard_files")');
+    const pasteIdx = source.indexOf("const onPasteCapture =");
+    expect(pasteIdx).toBeGreaterThan(-1);
+    const pasteBody = source.slice(pasteIdx, source.indexOf("const onEraseCapture =", pasteIdx));
+    // DataTransfer must be read synchronously before any async IPC call neuters clipboardData.
+    expect(pasteBody.indexOf("extractClipboardImageFile(event.clipboardData)")).toBeLessThan(
+      pasteBody.indexOf('invoke<string[]>("cmd_terminal_clipboard_files")'),
+    );
+    expect(pasteBody).toContain("formatDroppedPathsForSession(paths, {");
+  });
+
+  it("registers bounded OSC 133 gutter decorations with 1-click Ask agent on non-zero exit and clears them on reset/unmount", () => {
+    expect(source).toContain("createCommandDecorationRing(");
+    expect(source).toContain("created.registerDecoration(");
+    expect(source).toContain("formatFailedCommandForAgent(");
+    expect(source).toContain("terminal-osc133-ask-agent");
+    expect(source).toContain("commandDecorations.clear()");
+  });
+
+  it("polls cmd_terminal_listening_ports via createAdaptiveTimer only while onscreen with no devServerUrl yet", () => {
+    expect(source).toContain("createAdaptiveTimer(");
+    expect(source).toContain('invoke<number[]>("cmd_terminal_listening_ports"');
+    expect(source).toContain("`http://localhost:${ports[0]}`");
   });
 });

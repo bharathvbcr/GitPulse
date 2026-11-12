@@ -104,6 +104,18 @@ const skillNames = (dir: string): string[] => {
   ].sort();
 };
 const bundledSkills = [...skillNames(".agents/skills"), ...skillNames("plugins/gitpulse/skills")];
+/**
+ * Host-bound skills that require a live GitPulse PTY (`GITPULSE_SESSION_TOKEN`)
+ * rather than the lane-neutral brief shared with headless Manvi runs and
+ * external clipboard copies (`dc-store`'s vendored `agent_guidance.md`).
+ * Until `dc-store` names them directly, the terminal launch lane
+ * (`terminal_command.rs`) must name every one of them explicitly.
+ */
+const TERMINAL_HOST_SKILLS = new Set(["gitpulse-terminal"]);
+const terminalLaunchSource = readFileSync(
+  new URL("../src-tauri/src/workbench/terminal_command.rs", import.meta.url),
+  "utf8",
+);
 /** "devmap" must match on its own, not inside "devmap-impact". */
 const namesWhole = (haystack: string, needle: string): boolean =>
   new RegExp(`(?<![\\w-])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`).test(haystack);
@@ -113,7 +125,14 @@ describe("the agent guidance every task handoff carries", () => {
     // Non-vacuity: an empty read would make every assertion below trivially true.
     expect(bundledSkills.length).toBeGreaterThanOrEqual(6);
     for (const skill of bundledSkills) {
-      expect(namesWhole(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
+      if (TERMINAL_HOST_SKILLS.has(skill) && !namesWhole(GUIDANCE, skill)) {
+        expect(
+          namesWhole(terminalLaunchSource, skill),
+          `neither preamble nor terminal launch prompt names ${skill}`,
+        ).toBe(true);
+      } else {
+        expect(namesWhole(GUIDANCE, skill), `preamble omits ${skill}`).toBe(true);
+      }
     }
   });
 

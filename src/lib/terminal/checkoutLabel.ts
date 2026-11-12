@@ -27,6 +27,32 @@ export interface CheckoutTab {
   path: string;
   label: string;
   familyRoot?: string | null;
+  currentBranch?: string | null;
+  changedCount?: number;
+  conflictedCount?: number;
+}
+
+export interface CheckoutSummary {
+  label: CheckoutLabel;
+  currentBranch: string | null;
+  changedCount: number;
+  conflictedCount: number;
+}
+
+export function summarizeCheckout(
+  path: string,
+  tabs: readonly CheckoutTab[],
+  options: PathIdentityOptions,
+): CheckoutSummary {
+  const identity = (candidate: string) => identityKey(candidate, options);
+  const key = identity(path);
+  const tab = key ? tabs.find((candidate) => identity(candidate.path) === key) : undefined;
+  return {
+    label: resolveCheckout(path, tabs, options).label,
+    currentBranch: tab?.currentBranch ?? null,
+    changedCount: tab?.changedCount ?? 0,
+    conflictedCount: tab?.conflictedCount ?? 0,
+  };
 }
 
 export interface CheckoutLabel {

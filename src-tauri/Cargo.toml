@@ -93,6 +93,8 @@ notify = "8.2"
 regex = "1.13"
 rfd = "0.17"
 portable-pty = "0.9"
+vt100 = "0.18.1"
+getrandom = "0.4.3"
 base64 = "0.23"
 log = "0.4"
 
@@ -214,7 +216,7 @@ tauri-plugin-single-instance = "2"
 # only the APIs needed for delivery, settings, actions and delegate activation.
 # Request construction needs UNNotificationTrigger even for immediate delivery.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2 = { version = "0.6.4", default-features = false, features = ["std", "exception"] }
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",

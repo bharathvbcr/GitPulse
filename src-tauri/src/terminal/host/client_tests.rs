@@ -186,6 +186,7 @@ fn serve(
                             run_id: None,
                             detached: false,
                             ending: false,
+                            parent_session_id: None,
                         })
                         .collect();
                     serde_json::to_value(sessions)

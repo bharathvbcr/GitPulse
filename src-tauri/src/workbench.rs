@@ -14,6 +14,7 @@ use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
 mod agent_worktree;
+pub(crate) mod agy_plugin;
 #[doc(hidden)]
 pub(crate) mod ci_watch;
 pub(crate) mod claude_hook;

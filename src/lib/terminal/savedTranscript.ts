@@ -159,6 +159,9 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
   const retained = nonNegativeInteger(record.retained);
   const gapMarkers = nonNegativeInteger(record.gap_markers);
   const unrecordedBytes = nonNegativeInteger(record.unrecorded_bytes);
+  if (record.total_bytes !== undefined && nonNegativeInteger(record.total_bytes) === null) {
+    return failed("The terminal host's transcript was malformed.");
+  }
   const flags = ["truncated", "rotated", "clipped", "redacted", "live", "settled"] as const;
   if (typeof record.data_b64 !== "string" || bytes === null || retained === null || gapMarkers === null || unrecordedBytes === null) {
     return failed("The terminal host's transcript was malformed.");

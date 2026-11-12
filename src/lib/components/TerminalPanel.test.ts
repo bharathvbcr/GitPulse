@@ -267,4 +267,61 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
       expect(text, name).not.toContain("validationError =");
     }
   });
+
+  it("offers the Claude + Antigravity pair split preset and passes snippet split support to TerminalSession", () => {
+    expect(source).toContain("function openPairSplit()");
+    expect(source).toContain('data-testid="terminal-pair-split-preset"');
+    expect(source).toContain("onOpenSnippetSplit=");
+  });
+
+  it("subscribes to scoped child terminal spawns and agent open-file split requests scoped by repository identity", () => {
+    expect(source).toContain("agentEvents.subscribePanelEvents({");
+    expect(source).toContain("unsubAgentPanel();");
+    expect(source).toContain("function handleChildSpawned(payload: TerminalChildSpawnedPayload)");
+    expect(source).toContain("openAttachedChildTab(tabState, {");
+    expect(source).toContain("function handleAgentOpenFile(payload: TerminalOpenFileRequestPayload)");
+    expect(source).toContain("sameRepo(payload.repo_path, repoPath, pathOpts)");
+  });
+
+  it("gates cold-boot split hydration on detached session adoption, keeps split panes at their minimum height by scrolling, formats drops for recipient launcher, and guards 8-pane tab drops", () => {
+    expect(source).toContain("detachedAdoptionSettled");
+    expect(source).toContain("serializeSplitWorkspace(");
+    // Panes are fractions of a canvas at least `minimumSplitHeight` tall, so a
+    // short dock scrolls instead of crushing a split's grids to no rows; a
+    // split pane's own min-height is never zeroed again.
+    expect(source).toContain("minimumSplitHeight(splitRoot, activeId, zoomedPaneId)");
+    expect(source).toContain("style:min-height={`${paneCanvasMinHeight}px`}");
+    expect(source).not.toContain('.terminal-pane { min-height: 0; }');
+    expect(source).toContain("function sendPathsToPreferredSession(paths: readonly string[])");
+    expect(source).toContain("repoPath={tab.checkout ?? repoPath}");
+    expect(source).toContain("fallbackPath={tab.fallbackPath}");
+    expect(source).toContain("!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES");
+  });
+
+  it("exposes Follow Agent toggle, live-reveals or refreshes touched files and plan artifacts, and wires onSendToAgent to TerminalSession", () => {
+    expect(source).toContain('data-testid="terminal-follow-agent-toggle"');
+    expect(source).toContain("onTouchedFile: handleAgentTouchedFile");
+    expect(source).toContain("function handleAgentTouchedFile(payload: TerminalAgentTouchedFilePayload)");
+    expect(source).toContain("reloadIfClean()");
+    expect(source).toContain("onSendToAgent={sendReferenceToAgent}");
+  });
+
+  it("wires parent-child supervision (↳ badge, Stop children, onChildClosed) and 1-click Claude <-> Antigravity pair handoff", () => {
+    expect(source).toContain("onChildClosed: handleChildClosed");
+    expect(source).toContain("function handleChildClosed(payload: TerminalChildClosedPayload)");
+    expect(source).toContain('data-testid="terminal-tab-child-badge"');
+    expect(source).toContain('data-testid="terminal-stop-children-btn"');
+    expect(source).toContain('data-testid="terminal-pair-handoff-btn"');
+    expect(source).toContain("buildPairHandoffPrompt(");
+  });
+
+  it("offers all four Workspace Split Presets and delegates isolated worktree provisioning to the dock host", () => {
+    expect(source).toContain('data-testid="terminal-preset-agent-diff"');
+    expect(source).toContain('data-testid="terminal-pair-split-preset"');
+    expect(source).toContain('data-testid="terminal-preset-fullstack"');
+    expect(source).toContain('data-testid="terminal-preset-worktree-agent"');
+    expect(source).toContain("onCreateAgentWorktree");
+    expect(source).not.toContain('"cmd_add_worktree"');
+    expect(source).toContain("openCheckoutTab(");
+  });
 });

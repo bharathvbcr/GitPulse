@@ -14,6 +14,8 @@ vi.mock("../ipc/invoke", () => ({ invoke: (...args: unknown[]) => invoke(...(arg
 const {
   DEFAULT_ADDRESS,
   browserIpc,
+  computeElementCropBox,
+  formatPickedElementReference,
   isOccluded,
   lastAddress,
   normalizeAddress,
@@ -80,6 +82,9 @@ describe("the commands", () => {
     await browserIpc.navigate("t1", "http://localhost:3000/b");
     await browserIpc.go("t1", "back");
     await browserIpc.close("t1");
+    await browserIpc.snapshot("t1");
+    await browserIpc.snapshotPreview("t1");
+    await browserIpc.inspectPoint("t1", 120, 80, 640, 480);
     expect(invoke.mock.calls).toEqual([
       ["cmd_browser_open", { id: "t1", url: "http://localhost:3000/", bounds }],
       ["cmd_browser_set_bounds", { id: "t1", bounds }],
@@ -87,6 +92,9 @@ describe("the commands", () => {
       ["cmd_browser_navigate", { id: "t1", url: "http://localhost:3000/b" }],
       ["cmd_browser_go", { id: "t1", to: "back" }],
       ["cmd_browser_close", { id: "t1" }],
+      ["cmd_browser_snapshot", { id: "t1" }],
+      ["cmd_browser_snapshot_preview", { id: "t1" }],
+      ["cmd_browser_inspect_point", { id: "t1", x: 120, y: 80, viewportWidth: 640, viewportHeight: 480 }],
     ]);
   });
 });
@@ -218,14 +226,72 @@ describe("placement", () => {
     });
   });
 
-  it("shows the view only when opened, on screen, uncovered and of real size", () => {
+  it("shows the view only when opened, on screen, uncovered, not picking, and of real size", () => {
     const bounds = { x: 0, y: 0, width: 10, height: 10 };
     const base = { opened: true, onscreen: true, occluded: false, bounds };
     expect(paneShown(base)).toBe(true);
+    expect(paneShown({ ...base, picking: false })).toBe(true);
+    expect(paneShown({ ...base, picking: true })).toBe(false);
     expect(paneShown({ ...base, opened: false })).toBe(false);
     expect(paneShown({ ...base, onscreen: false })).toBe(false);
     expect(paneShown({ ...base, occluded: true })).toBe(false);
     expect(paneShown({ ...base, bounds: null })).toBe(false);
     expect(paneShown({ ...base, bounds: { ...bounds, width: 0.5 } })).toBe(false);
+  });
+});
+
+describe("element picker formatting and cropping", () => {
+  it("formats picked element context cleanly for coding agents and strips control characters", () => {
+    expect(
+      formatPickedElementReference("/tmp/captures/crop-1.png", {
+        selector: "button#deploy.cta.primary",
+        tag: "button",
+        id: "deploy",
+        classes: ["cta", "primary"],
+        text: "Deploy\n  now\t\"prod\"",
+        url: "http://localhost:5173/dashboard",
+        rect: { x: 10, y: 20, width: 100, height: 36 },
+        viewport_width: 800,
+        viewport_height: 600,
+      }),
+    ).toBe('@/tmp/captures/crop-1.png [http://localhost:5173/dashboard <button#deploy.cta.primary> "Deploy now \'prod\'"] ');
+
+    expect(
+      formatPickedElementReference("/tmp/with space/crop.png", {
+        selector: "svg.icon",
+        tag: "svg",
+        id: "",
+        classes: ["icon"],
+        text: "   ",
+        url: "http://localhost:3000/",
+        rect: { x: 0, y: 0, width: 16, height: 16 },
+        viewport_width: 400,
+        viewport_height: 300,
+      }),
+    ).toBe('@"/tmp/with space/crop.png" [http://localhost:3000/ <svg.icon>] ');
+  });
+
+  it("scales viewport element rects to Retina image pixels with clamped padding", () => {
+    const box = computeElementCropBox(
+      { x: 350, y: 280, width: 100, height: 40 },
+      800,
+      600,
+      1600,
+      1200,
+      8,
+    );
+    expect(box).toEqual({ sx: 684, sy: 544, sw: 232, sh: 112 });
+
+    const edgeBox = computeElementCropBox(
+      { x: 2, y: 2, width: 50, height: 30 },
+      400,
+      300,
+      400,
+      300,
+      10,
+    );
+    expect(edgeBox).toEqual({ sx: 0, sy: 0, sw: 62, sh: 42 });
+
+    expect(computeElementCropBox({ x: 0, y: 0, width: 0, height: 20 }, 400, 300, 800, 600)).toBeNull();
   });
 });

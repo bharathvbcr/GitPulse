@@ -394,4 +394,99 @@ describe("resolveTranscriptAnswer and fresh Antigravity signal-exit recovery", (
       sessionId: ID,
     });
   });
+
+  it("binds live Antigravity SessionStart conversationId + artifactDir so signal-exit resumes the exact conversation", async () => {
+    const { createAgentEventBus } = await import("./agentEvents");
+    const storage = memory();
+    const store = createHostedAgentStore(storage);
+
+    const bound = store.bindAgentMeta({
+      terminalId: "term-agy-live",
+      sessionId: ID.toUpperCase(),
+      provider: "agy",
+      repoPath: "/work/repo",
+      startDir: null,
+      mode: "edit",
+      artifactDir: "/Users/dev/.gemini/antigravity/brain/550e8400",
+      startedAt: 123,
+    });
+    expect(bound).toMatchObject({
+      sessionId: ID,
+      provider: "agy",
+      terminalId: "term-agy-live",
+      artifactDir: "/Users/dev/.gemini/antigravity/brain/550e8400",
+    });
+    expect(store.byTerminal("term-agy-live")?.sessionId).toBe(ID);
+
+    // Reloading from localStorage preserves artifactDir
+    const reloaded = createHostedAgentStore(storage);
+    expect(reloaded.get(ID)?.artifactDir).toBe("/Users/dev/.gemini/antigravity/brain/550e8400");
+
+    // Rebinding the same terminalId to a new conversation unbinds the prior one
+    store.bindAgentMeta({
+      terminalId: "term-agy-live",
+      sessionId: OTHER,
+      provider: "agy",
+      repoPath: "/work/repo",
+      startDir: null,
+      mode: "edit",
+      artifactDir: "/Users/dev/.gemini/antigravity/brain/660e8400",
+    });
+    expect(store.byTerminal("term-agy-live")?.sessionId).toBe(OTHER);
+    expect(store.get(ID)?.terminalId).toBeNull();
+
+    // AgentEventBus delivers early-cached metadata and panel orchestration events
+    const listeners = new Map<string, (event: { payload: unknown }) => void>();
+    const bus = createAgentEventBus(async (event, handler) => {
+      listeners.set(event, handler as (event: { payload: unknown }) => void);
+      return () => {
+        listeners.delete(event);
+      };
+    });
+    const panelSeen: unknown[] = [];
+    const stopPanel = bus.subscribePanelEvents({
+      onOpenFile: (req) => panelSeen.push(req),
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    listeners.get("terminal-agent-meta")?.({
+      payload: {
+        id: "term-early",
+        agent: "agy",
+        conversation_id: ID,
+        artifact_dir: "/tmp/brain",
+      },
+    });
+    const metaSeen: unknown[] = [];
+    const stopMeta = bus.subscribeAgentMeta("term-early", (m) => metaSeen.push(m));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(metaSeen).toEqual([
+      {
+        id: "term-early",
+        agent: "agy",
+        conversation_id: ID,
+        artifact_dir: "/tmp/brain",
+      },
+    ]);
+    listeners.get("terminal-open-file-request")?.({
+      payload: {
+        caller_session_id: "term-early",
+        repo_path: "/work/repo",
+        path: "src/main.ts",
+        line: 42,
+        column: null,
+      },
+    });
+    expect(panelSeen).toEqual([
+      {
+        caller_session_id: "term-early",
+        repo_path: "/work/repo",
+        path: "src/main.ts",
+        line: 42,
+        column: null,
+      },
+    ]);
+    stopMeta();
+    stopPanel();
+    expect(listeners.size).toBe(0);
+  });
 });

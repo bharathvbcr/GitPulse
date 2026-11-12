@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import { isSessionId, type LauncherKind, type SessionKind } from "./tabs";
+import { isSessionId, normalizePaneFilePath, type LauncherKind, type SessionKind, type TabKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
@@ -61,11 +61,15 @@ interface LaunchRequest {
    * request, open a tab and report capacity refusals, and `agentPromptArgs`
    * already returns "no arguments" for a promptless launch of any kind.
    */
-  launcher: SessionKind;
+  launcher: TabKind;
   /** Absent for a plain session; a literal CLI argument when present. */
   prompt?: string;
   /** A browser session's first address (`requestBrowser`); absent otherwise. */
   url?: string;
+  /** A file pane's repository-relative path and optional reveal coordinates (`requestFile`). */
+  filePath?: string;
+  line?: number | null;
+  column?: number | null;
   complete(error?: string): void;
 }
 
@@ -141,6 +145,23 @@ export function createTerminalLaunchRequests() {
     async requestBrowser(repoPath: string, url: string, signal?: AbortSignal): Promise<void> {
       if (!url.trim() || url.length > 2048) throw new Error("A browser session needs an address of at most 2048 characters");
       return enqueue({ repoPath, launcher: "browser", url: url.trim() }, signal);
+    },
+    /**
+     * Opens or reuses a `TerminalFilePane` split on `filePath` in `repoPath`'s
+     * terminal dock, optionally scrolling to 1-based `line` / `column`.
+     */
+    async requestFile(
+      repoPath: string,
+      filePath: string,
+      line?: number | null,
+      column?: number | null,
+      signal?: AbortSignal,
+    ): Promise<void> {
+      const cleanPath = normalizePaneFilePath(filePath);
+      if (!cleanPath) {
+        throw new Error("A terminal file pane requires a valid repository-relative path");
+      }
+      return enqueue({ repoPath, launcher: "file", filePath: cleanPath, line: line ?? null, column: column ?? null }, signal);
     },
     /** Whether a launch is waiting to be claimed; a caller with its own queue waits for this. */
     get busy(): boolean {

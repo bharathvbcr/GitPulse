@@ -96,6 +96,87 @@ const MAX_PENDING_CHUNKED: usize = 4;
 /// counted rather than dropped silently.
 const MAX_SIGNALS_PER_FEED: usize = 16;
 
+/// Structured shell/agent telemetry events retained between drains.
+const MAX_TELEMETRY_BUFFER: usize = 32;
+
+/// Maximum ground-state bytes buffered per line when scanning for loopback URLs.
+const MAX_LINE_SCAN_BYTES: usize = 512;
+
+/// Semantic shell prompt/command boundary markers (`OSC 133`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShellMark {
+    PromptStart,
+    CommandStart,
+    CommandExecuted,
+    CommandFinished { exit_code: Option<i32> },
+}
+
+/// Herdr-compatible terminal agent coordination states (`OSC 7501`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HerdrState {
+    Working,
+    Blocked,
+    Idle,
+    Done,
+    Error,
+}
+
+impl HerdrState {
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "working" | "running" => Some(Self::Working),
+            "blocked" | "waiting" | "needs_input" => Some(Self::Blocked),
+            "idle" => Some(Self::Idle),
+            "done" | "completed" => Some(Self::Done),
+            "error" | "failed" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+
+    /// Maps a Herdr state onto the closed [`super::bridge::EVENTS`] vocabulary
+    /// so terminal-emitted agent statuses update GitPulse's native notifications
+    /// and Agents attention store without widening the wire event table.
+    pub fn bridge_event(self) -> &'static str {
+        match self {
+            Self::Working => "prompt_submitted",
+            Self::Blocked => "agent_needs_input",
+            Self::Idle => "turn_finished",
+            Self::Done => "agent_completed",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HerdrStatus {
+    pub state: HerdrState,
+    pub detail: Option<String>,
+}
+
+/// Structured terminal telemetry observed alongside attention signals on the
+/// same single-pass resumable byte scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetryEvent {
+    Osc7Cwd(String),
+    Osc133(ShellMark),
+    Osc7501(HerdrStatus),
+    Osc7501Clear,
+    Osc7501Probe,
+    LoopbackUrl(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Ground,
@@ -140,6 +221,14 @@ pub struct Scanner {
     /// Signals this scanner produced but did not return, for the caller to
     /// report rather than discover from a count that does not add up.
     dropped: u64,
+    /// Structured OSC 7 / 133 / 7501 and loopback server URLs observed since
+    /// the last [`Self::drain_telemetry`] call.
+    telemetry: Vec<TelemetryEvent>,
+    /// Ground-state printable bytes on the current line, stripped of ANSI
+    /// control sequences, used to detect loopback dev-server readiness URLs.
+    line_buf: Vec<u8>,
+    line_overflowed: bool,
+    last_loopback_url: Option<String>,
 }
 
 impl Default for Scanner {
@@ -158,12 +247,43 @@ impl Scanner {
             overflowed: false,
             pending: Vec::new(),
             dropped: 0,
+            telemetry: Vec::new(),
+            line_buf: Vec::new(),
+            line_overflowed: false,
+            last_loopback_url: None,
         }
     }
 
     /// Signals this scanner produced but could not return within a feed's cap.
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Drains structured telemetry events (`OSC 7`, `OSC 133`, `OSC 7501`, and
+    /// loopback server URLs) accumulated by [`Self::feed`].
+    pub fn drain_telemetry(&mut self) -> Vec<TelemetryEvent> {
+        std::mem::take(&mut self.telemetry)
+    }
+
+    fn record_telemetry(&mut self, event: TelemetryEvent) {
+        if self.telemetry.len() < MAX_TELEMETRY_BUFFER {
+            self.telemetry.push(event);
+        }
+    }
+
+    fn flush_line_token(&mut self, clear_line: bool) {
+        if !self.line_overflowed && !self.line_buf.is_empty() {
+            if let Some(url) = extract_loopback_url(&self.line_buf) {
+                if self.last_loopback_url.as_deref() != Some(url.as_str()) {
+                    self.last_loopback_url = Some(url.clone());
+                    self.record_telemetry(TelemetryEvent::LoopbackUrl(url));
+                }
+            }
+        }
+        if clear_line {
+            self.line_buf.clear();
+            self.line_overflowed = false;
+        }
     }
 
     /// Consumes one PTY read and returns whatever completed inside it.
@@ -195,6 +315,22 @@ impl Scanner {
                     })
                 }
                 0x1b => self.state = State::Escape,
+                b'\r' | b'\n' => self.flush_line_token(true),
+                b' ' | b'\t' | b')' | b']' | b'>' | b'"' | b'\'' => {
+                    self.flush_line_token(false);
+                    if !self.line_overflowed && self.line_buf.len() < MAX_LINE_SCAN_BYTES {
+                        self.line_buf.push(byte);
+                    } else {
+                        self.line_overflowed = true;
+                    }
+                }
+                0x21..=0x7e => {
+                    if !self.line_overflowed && self.line_buf.len() < MAX_LINE_SCAN_BYTES {
+                        self.line_buf.push(byte);
+                    } else {
+                        self.line_overflowed = true;
+                    }
+                }
                 _ => {}
             },
             State::Escape => match byte {
@@ -313,9 +449,27 @@ impl Scanner {
             return None;
         }
         match ident.as_slice() {
+            b"7" => {
+                if let Some(cwd) = osc7(&payload) {
+                    self.record_telemetry(TelemetryEvent::Osc7Cwd(cwd));
+                }
+                None
+            }
             b"9" => osc9(&payload),
-            b"777" => osc777(&payload),
             b"99" => self.osc99(&payload),
+            b"133" => {
+                if let Some(mark) = osc133(&payload) {
+                    self.record_telemetry(TelemetryEvent::Osc133(mark));
+                }
+                None
+            }
+            b"777" => osc777(&payload),
+            b"7501" => {
+                if let Some(ev) = osc7501(&payload) {
+                    self.record_telemetry(ev);
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -487,6 +641,249 @@ fn text_of(bytes: &[u8]) -> Option<String> {
     }
     let text = sanitize(std::str::from_utf8(bytes).ok()?);
     (!text.is_empty()).then_some(text)
+}
+
+/// Decodes `OSC 7 ; file://<host>/<percent-encoded-path>`.
+fn osc7(payload: &[u8]) -> Option<String> {
+    let raw = std::str::from_utf8(payload).ok()?.trim();
+    let rest = raw.strip_prefix("file://")?;
+    let slash = rest.find('/')?;
+    let encoded = &rest[slash..];
+    let decoded = percent_decode(encoded)?;
+    if decoded.is_empty() || decoded.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    // `/C:/repo` on Windows URI syntax normalizes to `C:/repo`.
+    let normalized = if decoded.len() >= 4
+        && decoded.as_bytes()[0] == b'/'
+        && decoded.as_bytes()[1].is_ascii_alphabetic()
+        && decoded.as_bytes()[2] == b':'
+        && decoded.as_bytes()[3] == b'/'
+    {
+        &decoded[1..]
+    } else {
+        decoded.as_str()
+    };
+    let trimmed = if normalized.len() > 1 {
+        normalized.trim_end_matches('/')
+    } else {
+        normalized
+    };
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses FinalTerm / Kitty / VS Code `OSC 133` prompt & command markers.
+fn osc133(payload: &[u8]) -> Option<ShellMark> {
+    let raw = std::str::from_utf8(payload).ok()?.trim();
+    let mut parts = raw.split(';');
+    match parts.next()? {
+        "A" => Some(ShellMark::PromptStart),
+        "B" => Some(ShellMark::CommandStart),
+        "C" => Some(ShellMark::CommandExecuted),
+        "D" => {
+            let exit_code = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<i32>().ok());
+            Some(ShellMark::CommandFinished { exit_code })
+        }
+        _ => None,
+    }
+}
+
+/// Parses Herdr terminal agent coordination sequences (`OSC 7501`).
+///
+/// Accepts positional (`7501;[status;]<state>[;<detail>]`), colon-positional
+/// (`7501;[status:]<state>[:<detail>]`), key-value (`state=...;msg=...` or
+/// `state=...:title_b64=...`), `7501;clear` / `state=clear`, and `7501;?` probe.
+fn osc7501(payload: &[u8]) -> Option<TelemetryEvent> {
+    let raw = std::str::from_utf8(payload).ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "?" || raw.eq_ignore_ascii_case("probe") || raw.eq_ignore_ascii_case("status;?") {
+        return Some(TelemetryEvent::Osc7501Probe);
+    }
+    if raw.eq_ignore_ascii_case("clear")
+        || raw.eq_ignore_ascii_case("reset")
+        || raw.eq_ignore_ascii_case("status;clear")
+        || raw.eq_ignore_ascii_case("status:clear")
+    {
+        return Some(TelemetryEvent::Osc7501Clear);
+    }
+
+    let rest = if raw.len() >= 7
+        && raw[..6].eq_ignore_ascii_case("status")
+        && matches!(raw.as_bytes()[6], b';' | b':')
+    {
+        raw[7..].trim()
+    } else {
+        raw
+    };
+
+    let sep = if rest.contains(';') { ';' } else { ':' };
+    let first_seg = rest.split(sep).next().unwrap_or(rest).trim();
+    if first_seg.contains('=') {
+        let mut state_token: Option<&str> = None;
+        let mut detail_plain: Option<&str> = None;
+        let mut detail_b64: Option<&str> = None;
+        for part in rest.split(sep) {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            match key.as_str() {
+                "state" | "status" => state_token = Some(val),
+                "msg" | "message" | "detail" | "title" | "text" => detail_plain = Some(val),
+                "msg_b64" | "message_b64" | "detail_b64" | "title_b64" | "text_b64" => {
+                    detail_b64 = Some(val)
+                }
+                _ => {}
+            }
+        }
+        let token = state_token?;
+        if token.eq_ignore_ascii_case("clear") || token.eq_ignore_ascii_case("reset") {
+            return Some(TelemetryEvent::Osc7501Clear);
+        }
+        let state = HerdrState::parse(token)?;
+        let decoded_detail = if let Some(b64) = detail_b64 {
+            decode_osc7501_b64(b64)
+        } else {
+            detail_plain.map(sanitize)
+        }
+        .filter(|text| !text.is_empty());
+        return Some(TelemetryEvent::Osc7501(HerdrStatus {
+            state,
+            detail: decoded_detail,
+        }));
+    }
+
+    let (state_raw, detail_raw) = match rest.split_once(sep) {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (rest, None),
+    };
+    if state_raw.trim().eq_ignore_ascii_case("clear")
+        || state_raw.trim().eq_ignore_ascii_case("reset")
+    {
+        return Some(TelemetryEvent::Osc7501Clear);
+    }
+    let state = HerdrState::parse(state_raw)?;
+    let detail = detail_raw.map(sanitize).filter(|text| !text.is_empty());
+    Some(TelemetryEvent::Osc7501(HerdrStatus { state, detail }))
+}
+
+fn decode_osc7501_b64(encoded: &str) -> Option<String> {
+    use base64::Engine as _;
+    let trimmed = encoded.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_OSC_BYTES {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .ok()?;
+    let utf8 = std::str::from_utf8(&bytes).ok()?;
+    let clean = sanitize(utf8);
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// Extracts a valid `http(s)://localhost:<port>` / `127.0.0.1:<port>` /
+/// `[::1]:<port>` URL from ANSI-stripped ground bytes.
+fn extract_loopback_url(bytes: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(bytes).ok()?;
+    for prefix in ["http://", "https://"] {
+        let mut offset = 0;
+        while let Some(pos) = line[offset..].find(prefix) {
+            let start = offset + pos;
+            let rest = &line[start..];
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            ')' | ']'
+                                | '>'
+                                | '<'
+                                | '"'
+                                | '\''
+                                | '`'
+                                | ','
+                                | '\\'
+                                | '{'
+                                | '}'
+                                | '|'
+                                | '^'
+                        )
+                })
+                .unwrap_or(rest.len());
+            let candidate = rest[..end].trim_end_matches(['.', ';', '!']);
+            if is_loopback_url_with_port(candidate) {
+                return Some(candidate.to_owned());
+            }
+            offset = start + prefix.len();
+        }
+    }
+    None
+}
+
+fn is_loopback_url_with_port(candidate: &str) -> bool {
+    let after_scheme = candidate
+        .strip_prefix("http://")
+        .or_else(|| candidate.strip_prefix("https://"));
+    let Some(after_scheme) = after_scheme else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let port_str = if let Some(rest) = authority.strip_prefix("[::1]:") {
+        rest
+    } else if let Some(rest) = authority.strip_prefix("localhost:") {
+        rest
+    } else if let Some(rest) = authority.strip_prefix("127.0.0.1:") {
+        rest
+    } else {
+        return false;
+    };
+    if port_str.is_empty() || port_str.len() > 5 || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(port_str.parse::<u32>(), Ok(1..=65535))
 }
 
 #[cfg(test)]
@@ -740,6 +1137,88 @@ mod tests {
             assert!(scanner.payload.len() <= MAX_OSC_BYTES);
             assert!(scanner.ident.len() <= MAX_IDENT_BYTES);
             assert!(scanner.pending.len() <= MAX_PENDING_CHUNKED);
+            assert!(scanner.line_buf.len() <= MAX_LINE_SCAN_BYTES);
+            assert!(scanner.telemetry.len() <= MAX_TELEMETRY_BUFFER);
         }
+    }
+
+    #[test]
+    fn telemetry_osc7_osc133_osc7501_and_loopback_urls_survive_byte_splits() {
+        let stream = concat!(
+            "\x1b]7;file://macbook.local/Users/dev/my%20repo/src-tauri\x07",
+            "\x1b]133;A\x07$ cargo run\r\n",
+            "\x1b]133;C\x07",
+            "  ➜  Local:   \x1b[36mhttp://localhost:5173/\x1b[39m\r\n",
+            "\x1b]7501;status;blocked;Approve migration\x1b\\",
+            "\x1b]133;D;0\x07",
+        );
+
+        let mut whole_scanner = Scanner::new();
+        whole_scanner.feed(stream.as_bytes());
+        let expected = whole_scanner.drain_telemetry();
+
+        assert_eq!(
+            expected,
+            vec![
+                TelemetryEvent::Osc7Cwd("/Users/dev/my repo/src-tauri".into()),
+                TelemetryEvent::Osc133(ShellMark::PromptStart),
+                TelemetryEvent::Osc133(ShellMark::CommandExecuted),
+                TelemetryEvent::LoopbackUrl("http://localhost:5173/".into()),
+                TelemetryEvent::Osc7501(HerdrStatus {
+                    state: HerdrState::Blocked,
+                    detail: Some("Approve migration".into()),
+                }),
+                TelemetryEvent::Osc133(ShellMark::CommandFinished { exit_code: Some(0) }),
+            ]
+        );
+
+        let mut split_scanner = Scanner::new();
+        let mut by_byte = Vec::new();
+        for &byte in stream.as_bytes() {
+            split_scanner.feed(&[byte]);
+            by_byte.extend(split_scanner.drain_telemetry());
+        }
+        assert_eq!(by_byte, expected);
+    }
+
+    #[test]
+    fn herdr_bridge_events_belong_to_closed_bridge_vocabulary() {
+        for state in [
+            HerdrState::Working,
+            HerdrState::Blocked,
+            HerdrState::Idle,
+            HerdrState::Done,
+            HerdrState::Error,
+        ] {
+            let name = state.bridge_event();
+            assert!(
+                crate::alerts::bridge::event(name).is_some(),
+                "Herdr state {state:?} mapped to unknown bridge event {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7501_parses_key_value_and_colon_separators() {
+        let mut scanner = Scanner::new();
+        scanner.feed(b"\x1b]7501;state=working;message=Running cargo test\x07");
+        scanner.feed(b"\x1b]7501;state=done:title_b64=QWxsIHRlc3RzIHBhc3NlZA==\x1b\\");
+        scanner.feed(b"\x1b]7501;clear\x07\x1b]7501;?\x07");
+        let events = scanner.drain_telemetry();
+        assert_eq!(
+            events,
+            vec![
+                TelemetryEvent::Osc7501(HerdrStatus {
+                    state: HerdrState::Working,
+                    detail: Some("Running cargo test".into()),
+                }),
+                TelemetryEvent::Osc7501(HerdrStatus {
+                    state: HerdrState::Done,
+                    detail: Some("All tests passed".into()),
+                }),
+                TelemetryEvent::Osc7501Clear,
+                TelemetryEvent::Osc7501Probe,
+            ]
+        );
     }
 }

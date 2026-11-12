@@ -12,8 +12,21 @@ import { createFrameScheduler, type Caf, type Raf } from "../motion/frameSchedul
  */
 export const FIT_MIN_INTERVAL_MS = 32;
 
+/**
+ * Quiet interval (ms) required before fitting mid-drag when a dock or split
+ * sash is actively held by the pointer.
+ *
+ * Full-screen TUIs (Claude Code, Antigravity, vim, htop) clear and repaint
+ * their entire viewport on every `SIGWINCH`. Trailing-debouncing during an
+ * active pointer drag suppresses intermediate `SIGWINCH` storms while the
+ * pointer is moving, fits once if the user pauses mid-drag to inspect, and
+ * commits immediately on `setDragging(false)` (pointer release).
+ */
+export const FIT_DRAG_SETTLE_MS = 96;
+
 export interface FitSchedulerOptions {
   minIntervalMs?: number;
+  dragSettleMs?: number;
   now?: () => number;
   setTimer?: (run: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -29,6 +42,13 @@ export interface FitScheduler {
    * always fitted.
    */
   request(): void;
+  /**
+   * Marks whether a pointer drag (dock height handle or split sash) is in
+   * flight. While true, layout requests use a trailing settle debounce so TUI
+   * programs are not flooded with intermediate `SIGWINCH` resizes; setting
+   * false settles on the next animation frame if any request arrived.
+   */
+  setDragging(dragging: boolean): void;
   /**
    * The terminal is being shown, or the metrics under its grid changed: fit
    * once on the next animation frame, which is after the layout that made it
@@ -47,6 +67,7 @@ export interface FitScheduler {
  */
 export function createFitScheduler(run: () => void, options: FitSchedulerOptions = {}): FitScheduler {
   const minInterval = options.minIntervalMs ?? FIT_MIN_INTERVAL_MS;
+  const dragSettle = options.dragSettleMs ?? FIT_DRAG_SETTLE_MS;
   const now = options.now ?? (() => performance.now());
   const setTimer = options.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const clearTimer = options.clearTimer ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
@@ -54,6 +75,8 @@ export function createFitScheduler(run: () => void, options: FitSchedulerOptions
   const afterFit = new Set<() => void>();
   let lastRun = Number.NEGATIVE_INFINITY;
   let timer: unknown = null;
+  let dragging = false;
+  let dragDirty = false;
 
   const runNow = () => {
     lastRun = now();
@@ -65,8 +88,31 @@ export function createFitScheduler(run: () => void, options: FitSchedulerOptions
     timer = null;
   };
 
+  const settle: FitScheduler["settle"] = (after) => {
+    if (after) afterFit.add(after);
+    dragDirty = false;
+    dropTimer();
+    frames.schedule(() => {
+      const done = [...afterFit];
+      afterFit.clear();
+      dropTimer();
+      runNow();
+      for (const callback of done) callback();
+    });
+  };
+
   return {
     request() {
+      if (dragging) {
+        dragDirty = true;
+        dropTimer();
+        timer = setTimer(() => {
+          timer = null;
+          dragDirty = false;
+          runNow();
+        }, dragSettle);
+        return;
+      }
       if (timer !== null) return;
       const wait = lastRun + minInterval - now();
       if (wait <= 0) {
@@ -78,18 +124,17 @@ export function createFitScheduler(run: () => void, options: FitSchedulerOptions
         runNow();
       }, wait);
     },
-    settle(after) {
-      if (after) afterFit.add(after);
-      dropTimer();
-      frames.schedule(() => {
-        const done = [...afterFit];
-        afterFit.clear();
-        dropTimer();
-        runNow();
-        for (const callback of done) callback();
-      });
+    setDragging(next) {
+      if (dragging === next) return;
+      dragging = next;
+      if (!next && (dragDirty || timer !== null)) {
+        settle();
+      }
     },
+    settle,
     cancel() {
+      dragging = false;
+      dragDirty = false;
       dropTimer();
       frames.cancel();
       afterFit.clear();

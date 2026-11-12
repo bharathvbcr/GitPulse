@@ -10,6 +10,9 @@ import {
   launcherLabel,
   MAX_STRIP_TABS,
   openTab,
+  openAttachedChildTab,
+  openFileTab,
+  normalizePaneFilePath,
   tabFor,
   setTabTitle,
   tabLabel,
@@ -343,5 +346,194 @@ describe("a tab taking over a session a reload left running", () => {
     const start = initialState();
     expect(openTab(start, "claude", { ...attach, resume: { sessionId: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11", mode: "edit" as const } })).toBe(start);
     expect(openTab(start, "claude", { ...attach, attach: { sessionId: "" } })).toBe(start);
+  });
+});
+
+describe("file pane tabs", () => {
+  it("normalizes relative paths and refuses traversal or absolute paths", () => {
+    expect(normalizePaneFilePath("./src/lib/main.ts")).toBe("src/lib/main.ts");
+    expect(normalizePaneFilePath("src\\lib\\main.ts")).toBe("src/lib/main.ts");
+    expect(normalizePaneFilePath("../etc/passwd")).toBeUndefined();
+    expect(normalizePaneFilePath("/abs/file.ts")).toBeUndefined();
+    expect(normalizePaneFilePath("a/\0/b")).toBeUndefined();
+  });
+
+  it("opens a file tab, reuses it across link clicks, and optionally preserves terminal focus", () => {
+    const start = initialState();
+    const shellId = start.activeId!;
+    const first = openFileTab(start, { filePath: "src/App.svelte", line: 42, focus: false });
+    expect(first.opened).toBe(true);
+    expect(first.state.activeId).toBe(shellId);
+    const fileTab = first.state.tabs.find((t) => t.id === first.id)!;
+    expect(fileTab.filePath).toBe("src/App.svelte");
+    expect(fileTab.revealLine).toBe(42);
+    expect(tabLabel(fileTab)).toBe("App.svelte");
+
+    const second = openFileTab(first.state, { filePath: "src/main.ts", line: 10, column: 4, focus: false });
+    expect(second.opened).toBe(false);
+    expect(second.id).toBe(first.id);
+    expect(second.state.tabs).toHaveLength(2);
+    const updated = second.state.tabs.find((t) => t.id === second.id)!;
+    expect(updated.filePath).toBe("src/main.ts");
+    expect(updated.revealLine).toBe(10);
+    expect(updated.revealColumn).toBe(4);
+    expect((updated.revealSeq ?? 0)).toBeGreaterThan(fileTab.revealSeq ?? 0);
+  });
+
+  it("isolates worktree checkouts across file tabs and carries subdir fallbackPath", () => {
+    const start = initialState();
+    const rootFile = openFileTab(start, {
+      filePath: "src-tauri/src-tauri/src/lib.rs",
+      fallbackPath: "src-tauri/src/lib.rs",
+      line: 18,
+      focus: false,
+    });
+    const rootTab = rootFile.state.tabs.find((t) => t.id === rootFile.id)!;
+    expect(rootTab.checkout).toBeUndefined();
+    expect(rootTab.fallbackPath).toBe("src-tauri/src/lib.rs");
+
+    // A hosted worktree agent opening a file split gets its own worktree-bound file tab
+    // instead of hijacking the root checkout's file tab.
+    const wtFile = openFileTab(rootFile.state, {
+      filePath: "src/lib/main.ts",
+      checkout: "/repo/.gitpulse/worktrees/lane-a",
+      line: 7,
+      focus: false,
+    });
+    expect(wtFile.opened).toBe(true);
+    expect(wtFile.id).not.toBe(rootFile.id);
+    const wtTab = wtFile.state.tabs.find((t) => t.id === wtFile.id)!;
+    expect(wtTab.checkout).toBe("/repo/.gitpulse/worktrees/lane-a");
+    expect(wtTab.fallbackPath).toBeUndefined();
+
+    // Subsequent link click in the same worktree reuses that worktree's file tab.
+    const wtNext = openFileTab(wtFile.state, {
+      filePath: "README.md",
+      checkout: "/repo/.gitpulse/worktrees/lane-a",
+      line: 3,
+      focus: false,
+    });
+    expect(wtNext.opened).toBe(false);
+    expect(wtNext.id).toBe(wtFile.id);
+  });
+});
+
+describe("orchestrated child tabs (openAttachedChildTab)", () => {
+  it("adopts a child PTY without stealing focus, deduplicates by sessionId, and sanitizes metadata", () => {
+    const start = openTab(initialState(), "claude");
+    const parentId = start.activeId!;
+    const adopted = openAttachedChildTab(start, {
+      sessionId: "term-99-child",
+      launcher: "agy",
+      title: "Review\u0007Worker",
+      startDir: "packages/core",
+      focus: false,
+    });
+    expect(adopted.opened).toBe(true);
+    expect(adopted.state.activeId).toBe(parentId);
+    const childTab = adopted.state.tabs.find((t) => t.id === adopted.id)!;
+    expect(childTab).toMatchObject({
+      launcher: "agy",
+      attachSessionId: "term-99-child",
+      name: "Review Worker",
+      startDir: "packages/core",
+    });
+
+    const duplicate = openAttachedChildTab(adopted.state, {
+      sessionId: "term-99-child",
+      launcher: "shell",
+      focus: false,
+    });
+    expect(duplicate.opened).toBe(false);
+    expect(duplicate.id).toBe(adopted.id);
+    expect(duplicate.state).toBe(adopted.state);
+
+    const focusedDup = openAttachedChildTab(adopted.state, {
+      sessionId: "term-99-child",
+      focus: true,
+    });
+    expect(focusedDup.opened).toBe(false);
+    expect(focusedDup.state.activeId).toBe(adopted.id);
+  });
+
+  it("falls back to shell for unknown launcher kinds, strips unsafe startDir, and stops at MAX_STRIP_TABS", () => {
+    const blank = openAttachedChildTab(initialState(), { sessionId: "   " });
+    expect(blank.opened).toBe(false);
+    expect(blank.id).toBeNull();
+
+    const fallback = openAttachedChildTab(initialState(), {
+      sessionId: "term-100-x",
+      launcher: "unknown-cli",
+      startDir: "../escape",
+    });
+    const tab = fallback.state.tabs.find((t) => t.id === fallback.id)!;
+    expect(tab.launcher).toBe("shell");
+    expect(tab.startDir).toBeUndefined();
+
+    let full: TabState = initialState();
+    while (canOpenTab(full, MAX_STRIP_TABS)) full = openTab(full, "shell");
+    const refused = openAttachedChildTab(full, { sessionId: "term-over-limit" });
+    expect(refused.opened).toBe(false);
+    expect(refused.id).toBeNull();
+    expect(refused.state).toBe(full);
+  });
+
+  it("records parentSessionId on attached child tabs, filters live children per parent, and builds pair handoff prompts", async () => {
+    const mod = await import("./tabs");
+    const base = initialState("claude");
+    const adoptedA = openAttachedChildTab(base, {
+      sessionId: "term-parent-child-1",
+      parentSessionId: "term-parent-1",
+      launcher: "shell",
+      title: "worker-1",
+    });
+    const adoptedB = openAttachedChildTab(adoptedA.state, {
+      sessionId: "term-parent-child-2",
+      parentSessionId: "term-parent-1",
+      launcher: "agy",
+      title: "worker-2",
+    });
+    const otherParent = openAttachedChildTab(adoptedB.state, {
+      sessionId: "term-other-child",
+      parentSessionId: "term-parent-2",
+      launcher: "shell",
+    });
+
+    const childTabs = mod.childTabsForParent(otherParent.state, "term-parent-1", {
+      [adoptedA.id!]: "running",
+      [adoptedB.id!]: "exited",
+    });
+    expect(childTabs.map((t: { id: string }) => t.id)).toEqual([adoptedA.id]);
+
+    const handoff = mod.buildPairHandoffPrompt({
+      fromLauncher: "claude",
+      openFilePath: "src/lib/app.ts",
+      openFileLine: 42,
+      terminalTail: "\x1b[32mPASS\x1b[0m src/lib/app.test.ts\nNeeds UI polish in Header\n",
+    });
+    expect(handoff).toContain("Handoff from Claude");
+    expect(handoff).toContain("@src/lib/app.ts#L42");
+    expect(handoff).toContain("PASS src/lib/app.test.ts");
+    expect(handoff).not.toContain("\x1b[");
+  });
+
+  it("validates worktree slugs and opens checkout-bound agent tabs without fake taskRunIds", async () => {
+    const mod = await import("./tabs");
+    expect(mod.sanitizeWorktreeSlug("  Feature_42 / Fix  ")).toBe("feature_42-fix");
+    expect(mod.sanitizeWorktreeSlug("..")).toBeNull();
+    expect(mod.sanitizeWorktreeSlug("   ")).toBeNull();
+
+    const wtOpened = mod.openCheckoutTab(initialState("shell"), "claude", {
+      checkout: "/Users/dev/repo.wt-agent-1",
+      name: "Claude · agent-1",
+    });
+    expect(wtOpened.id).toBeTruthy();
+    const created = wtOpened.state.tabs.find((t: { id: string }) => t.id === wtOpened.id)!;
+    expect(created).toMatchObject({
+      launcher: "claude",
+      checkout: "/Users/dev/repo.wt-agent-1",
+      name: "Claude · agent-1",
+    });
+    expect(created.taskRunId).toBeUndefined();
   });
 });

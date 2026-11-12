@@ -31,6 +31,7 @@
     RotateCcw,
     Hash,
     Loader2,
+    Send,
   } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
@@ -54,6 +55,8 @@
     onSave,
     onDraftChange,
     onRequestDiscard,
+    revealTarget = null,
+    onSendSelectionToAgent,
   }: {
     filePath: string;
     content: string;
@@ -69,6 +72,10 @@
     onSave?: (newContent: string) => Promise<void>;
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
+    /** Pane-local line reveal target (used by `TerminalFilePane` so split panes never collide on the global `revealRequest` store). */
+    revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
+    /** Inserts `@path#Lstart-Lend` into the active agent terminal (`⌘L`). */
+    onSendSelectionToAgent?: (reference: string) => void;
   } = $props();
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
@@ -377,7 +384,26 @@
     setTimeout(() => (copied = false), 1800);
   }
 
+  function formatAgentSelectionRef(): string {
+    if (selectedLine === null) return `@${filePath} `;
+    const end = selectedLineEnd ?? selectedLine;
+    const lo = Math.min(selectedLine, end);
+    const hi = Math.max(selectedLine, end);
+    return lo === hi ? `@${filePath}#L${lo} ` : `@${filePath}#L${lo}-L${hi} `;
+  }
+
+  function sendSelectionToAgent() {
+    if (!onSendSelectionToAgent || !filePath) return;
+    onSendSelectionToAgent(formatAgentSelectionRef());
+  }
+
   function handleKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l" && onSendSelectionToAgent) {
+      e.preventDefault();
+      e.stopPropagation();
+      sendSelectionToAgent();
+      return;
+    }
     // As the page's pane, ⌘F is the view bar field's (App routes it there).
     if (!searchScope && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
@@ -463,6 +489,21 @@
     if (!target) return;
     // A reference can name a line past the end of the file it was written
     // about; clamp rather than refuse, so the file still opens near the mark.
+    const line = Math.min(target.line, lineCount);
+    untrack(() => {
+      selectedLine = line;
+      selectedLineEnd = null;
+      scrollToLine(line - 1);
+    });
+  });
+
+  let appliedRevealSeq = 0;
+  $effect(() => {
+    const target = revealTarget;
+    const lineCount = rawLines.length;
+    if (!target || lineCount === 0 || target.seq === appliedRevealSeq) return;
+    appliedRevealSeq = target.seq;
+    if (!target.line || target.line <= 0) return;
     const line = Math.min(target.line, lineCount);
     untrack(() => {
       selectedLine = line;
@@ -562,6 +603,20 @@
         <span>Go to Line</span>
         <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘G", $hostPlatform.os)}</span>
       </button>
+
+      {#if onSendSelectionToAgent}
+        <button
+          type="button"
+          onclick={sendSelectionToAgent}
+          data-testid="code-send-to-agent"
+          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta border-accent/35 text-accent"
+          title="Send selected line range as @file#Lstart-Lend to the active terminal"
+        >
+          <Send size={11} />
+          <span>{selectedLine !== null ? `Send L${Math.min(selectedLine, selectedLineEnd ?? selectedLine)}${selectedLineEnd && selectedLineEnd !== selectedLine ? `–${Math.max(selectedLine, selectedLineEnd)}` : ""}` : "Send @file"}</span>
+          <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘L", $hostPlatform.os)}</span>
+        </button>
+      {/if}
     </div>
 
     <div class="flex items-center gap-1.5 shrink-0">

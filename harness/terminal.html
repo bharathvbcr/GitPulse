@@ -172,6 +172,10 @@
           case "cmd_workspace_sync": return null;
           case "cmd_devcouncil_init": return {repo:args?.repoPath??"/fixture/GitPulse",state_dir:"/fixture/GitPulse/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false};
           case "cmd_devmap_maybe_refresh": return {decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null};
+          // What a file pane beside the terminal reads: the same 400-line
+          // fixture the code view shows, so both ways of following a file
+          // reference land on the same named line.
+          case "cmd_get_file_blob": return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       });
@@ -243,8 +247,8 @@
         await wait(80);
       };
       const hover = async (needle, offset) => { await mouse("mousemove", pointAt(needle, offset)); };
-      const clickLink = async (needle, offset) => {
-        const at = pointAt(needle, offset);
+      const clickLink = async (needle, offset, modifiers = {}) => {
+        const at = { ...pointAt(needle, offset), ...modifiers };
         await mouse("mousemove", at);
         await mouse("mousedown", at);
         await mouse("mouseup", at);
@@ -405,9 +409,34 @@
           // its scroll position, so line 240 being in the DOM at all is the
           // proof that the scroll happened — its absence is what a reveal that
           // silently opened at the top would look like.
+          // A plain click opens the file in a pane split beside the terminal;
+          // ⌘/Ctrl-click opens it in the code view. Both land on the line.
+          const filePane = () => visible("[data-terminal-file-pane]")[0];
           await clickLink("src/lib/terminal/links.ts:240:5", 3);
+          await wait(600);
+          check("clicking a file reference opens that file beside the terminal, not in the code view",
+            () => visible("[data-terminal-file-pane]").length === 1 && !visible("[data-code-host]").length
+              && !visible('[data-testid="terminal-file-pane-error"]').length);
+          check("the file pane lands on the line the reference named",
+            () => filePane().textContent.includes("line 240 of the fixture file"));
+          check("the file pane reports the revealed line as selected", () => filePane().textContent.includes("Ln 240"));
+          // Closed through its own tab's Close button, so the rest of the page
+          // runs with the terminal at full width as it did before the split.
+          {
+            const paneTab = document.getElementById(`terminal-tab-${filePane().dataset.terminalFilePane}`);
+            paneTab?.parentElement?.querySelector('button[aria-label^="Close "]')?.click();
+            await wait(400);
+          }
+          check("closing the file pane's tab removes the pane", () => !visible("[data-terminal-file-pane]").length);
+          // xterm asks for a row's links only when the pointer enters a new
+          // cell, and the resize back to full width cleared the one it had.
+          // This synthetic pointer never left the cell the plain click used,
+          // and 184 → 90 → 184 columns puts the reference back under it; a
+          // real pointer has moved away, to the Close button, by now.
+          await hover("src/lib/terminal/links.ts:240:5", 12);
+          await clickLink("src/lib/terminal/links.ts:240:5", 3, { metaKey: true });
           await wait(400);
-          check("clicking a file reference opens that file", () => !!visible("[data-code-host]").length);
+          check("⌘-clicking a file reference opens that file in the code view", () => !!visible("[data-code-host]").length);
           check("the viewer lands on the line the reference named",
             () => visible("[data-code-host]")[0].textContent.includes("line 240 of the fixture file"));
           check("the viewer reports the revealed line as selected",
@@ -465,6 +494,11 @@
             // Wide glyphs must not skew what is read back from the grid: a link
             // after an emoji keeps its own cells, and a search finds text that
             // follows one. Both read the last row written above.
+            // The cursor replies prove the bytes were parsed, not painted: the
+            // row reaches the DOM on a later frame, and writes are batched per
+            // frame. Wait for the paint (bounded) before pointing at it.
+            const paintDeadline = performance.now() + 2000;
+            while (!visible(".xterm-rows > div").some((row) => row.textContent.includes("emoji.example")) && performance.now() < paintDeadline) await wait(20);
             await hover("emoji.example", 2);
             check("a link after an emoji still names its own target", () => footer().includes("Open https://emoji.example/w in your browser"));
             button("Find in terminal").click(); await wait();
@@ -818,16 +852,22 @@
           const launcherMenu = label("New session type menu");
           const gridAfterLauncher = visible("[data-terminal-session]")[0].getBoundingClientRect();
           check("launcher menu does not shift the session grid", () => Math.abs(gridAfterLauncher.top - gridBeforeLauncher.top) < 1);
+          // Anchored to its trigger: below it, or above it when the menu does
+          // not fit below (the popover flips; with the Files type the menu is
+          // taller than the room under a dock near the bottom of the window).
+          // Either way it sits against the trigger and inside the viewport.
           check("launcher menu is a compact overlay", () => {
             const box = launcherMenu.getBoundingClientRect();
             const dock = document.querySelector("[data-terminal-dock]").getBoundingClientRect();
             const trigger = button("New session type").getBoundingClientRect();
+            const below = box.top >= trigger.bottom - 1 && box.top <= trigger.bottom + 16;
+            const above = box.bottom <= trigger.top + 1 && box.bottom >= trigger.top - 16;
             return launcherMenu.parentElement === document.body
               && getComputedStyle(launcherMenu).position === "fixed"
               && box.width < dock.width - 16
               && box.width >= 160
-              && box.top >= trigger.bottom - 1
-              && box.top <= trigger.bottom + 16;
+              && (below || above)
+              && box.top >= 0 && box.bottom <= innerHeight;
           });
           const launcherSearch = label("Search session types");
           launcherSearch.value = "zzzz-missing"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
@@ -839,7 +879,10 @@
           button("Move terminal tab left").click(); await wait();
           check("tab reorder preserves sessions and selection", () => visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
           await press(label("Terminal tab name"), "Escape");
-          button("Split terminal").click(); await wait();
+          // Splits take an explicit direction; a narrow dock stacks its panes
+          // by splitting down (main's 620px container rule that stacked a
+          // side-by-side split is gone with the split tree).
+          button("Split terminal down").click(); await wait();
           check("split view shows two existing sessions", () => visible('[role="tabpanel"]').length === 2 && report.spawned === beforeOptions);
           const panes = visible('[role="tabpanel"]').map((el) => el.getBoundingClientRect());
           check("narrow split stacks panes without overlap", () => Math.min(panes[0].bottom, panes[1].bottom) <= Math.max(panes[0].top, panes[1].top) + 1);
@@ -1392,7 +1435,7 @@
 
         await section(async (check) => {
           tabs()[0].click(); await wait(300);
-          button("Split terminal").click(); await wait(500);
+          button("Split terminal right").click(); await wait(500);
           check("split view shows two panes", () => shownPanels().length === 2);
           const mark = resizeLog.length;
           interfaceStore.setTerminalFontSize(15); await wait(600);
@@ -1468,7 +1511,7 @@
           const flood = Promise.all(ids.map((id) => output(id, chunk)));
           const mark = resizeLog.length;
           for (let i = 0; i < 3; i++) {
-            button(label("Close split view") ? "Close split view" : "Split terminal").click(); await wait(60);
+            button(label("Close split view") ? "Close split view" : "Split terminal right").click(); await wait(60);
             interfaceStore.setTerminalDockHeight(i % 2 ? 400 : 260); await wait(60);
             interfaceStore.setTerminalFontSize(i % 2 ? 12 : 13); await wait(60);
           }

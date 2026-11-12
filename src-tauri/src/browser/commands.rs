@@ -4,7 +4,9 @@
 //! instead of a dead app). Elsewhere than macOS each answers
 //! [`UNSUPPORTED`](super::UNSUPPORTED).
 
-use super::{policy, validate_id, Bounds};
+use super::{
+    policy, validate_id, validate_inspect_point, Bounds, BrowserElementPick, BrowserSnapshotPreview,
+};
 use serde::Deserialize;
 use tauri::AppHandle;
 
@@ -85,6 +87,42 @@ pub async fn cmd_browser_close(app: AppHandle, id: String) -> Result<(), String>
     imp::close(app, id).await
 }
 
+/// Captures a native PNG screenshot of session `id`'s viewport and writes it to
+/// an owner-only `0600` scratch file so local coding agents can inspect `@path`.
+#[tauri::command]
+pub async fn cmd_browser_snapshot(app: AppHandle, id: String) -> Result<String, String> {
+    validate_id(&id)?;
+    imp::snapshot(app, id).await
+}
+
+/// Captures a native PNG screenshot of session `id`'s viewport, writes an owner-only
+/// `0600` scratch file, and returns both the path and a `data:image/png;base64,...`
+/// preview URL for the interactive element-picker overlay.
+#[tauri::command]
+pub async fn cmd_browser_snapshot_preview(
+    app: AppHandle,
+    id: String,
+) -> Result<BrowserSnapshotPreview, String> {
+    validate_id(&id)?;
+    imp::snapshot_preview(app, id).await
+}
+
+/// Evaluates a zero-IPC hit-test inside `WKContentWorld.defaultClientWorld` at `(x, y)`
+/// within `viewport_width` x `viewport_height` and returns bounded element metadata.
+#[tauri::command]
+pub async fn cmd_browser_inspect_point(
+    app: AppHandle,
+    id: String,
+    x: f64,
+    y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> Result<BrowserElementPick, String> {
+    validate_id(&id)?;
+    let (norm_x, norm_y) = validate_inspect_point(x, y, viewport_width, viewport_height)?;
+    imp::inspect_point(app, id, norm_x, norm_y).await
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::{self as browser, Bounds, BrowserError, EventSink, PaneEvent, EVENT};
@@ -161,11 +199,99 @@ mod imp {
         })
         .await
     }
+
+    pub async fn snapshot(app: AppHandle, id: String) -> Result<String, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        let pane_id = id.clone();
+        on_main_thread(app, move |_| {
+            browser::snapshot_png(
+                &pane_id,
+                Box::new(move |outcome| {
+                    let _ = sender.send(outcome);
+                }),
+            )
+            .map_err(text)
+        })
+        .await?;
+
+        crate::commands::off_thread(move || {
+            let bytes = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| format!("browser snapshot timed out: {e}"))??;
+            let path = crate::terminal::scratch_media::write_scratch_png("browser", &id, &bytes)?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .await
+        .map_err(|e| e.message)
+    }
+
+    pub async fn snapshot_preview(
+        app: AppHandle,
+        id: String,
+    ) -> Result<browser::BrowserSnapshotPreview, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        let pane_id = id.clone();
+        on_main_thread(app, move |_| {
+            browser::snapshot_png(
+                &pane_id,
+                Box::new(move |outcome| {
+                    let _ = sender.send(outcome);
+                }),
+            )
+            .map_err(text)
+        })
+        .await?;
+
+        crate::commands::off_thread(move || {
+            use base64::Engine as _;
+            let bytes = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| format!("browser snapshot timed out: {e}"))??;
+            let path = crate::terminal::scratch_media::write_scratch_png("browser", &id, &bytes)?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(browser::BrowserSnapshotPreview {
+                path: path.to_string_lossy().into_owned(),
+                data_url: format!("data:image/png;base64,{encoded}"),
+            })
+        })
+        .await
+        .map_err(|e| e.message)
+    }
+
+    pub async fn inspect_point(
+        app: AppHandle,
+        id: String,
+        norm_x: f64,
+        norm_y: f64,
+    ) -> Result<browser::BrowserElementPick, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<String, String>>(1);
+        on_main_thread(app, move |_| {
+            browser::inspect_point(
+                &id,
+                norm_x,
+                norm_y,
+                Box::new(move |outcome| {
+                    let _ = sender.send(outcome);
+                }),
+            )
+            .map_err(text)
+        })
+        .await?;
+
+        crate::commands::off_thread(move || {
+            let raw = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| format!("browser element inspection timed out: {e}"))??;
+            Ok(browser::parse_evaluated_element_pick(&raw)?)
+        })
+        .await
+        .map_err(|e| e.message)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::super::{Bounds, UNSUPPORTED};
+    use super::super::{Bounds, BrowserElementPick, BrowserSnapshotPreview, UNSUPPORTED};
     use super::BrowserGo;
     use tauri::AppHandle;
 
@@ -186,6 +312,23 @@ mod imp {
     }
     pub async fn close(_: AppHandle, _: String) -> Result<(), String> {
         Ok(())
+    }
+    pub async fn snapshot(_: AppHandle, _: String) -> Result<String, String> {
+        Err(UNSUPPORTED.into())
+    }
+    pub async fn snapshot_preview(
+        _: AppHandle,
+        _: String,
+    ) -> Result<BrowserSnapshotPreview, String> {
+        Err(UNSUPPORTED.into())
+    }
+    pub async fn inspect_point(
+        _: AppHandle,
+        _: String,
+        _: f64,
+        _: f64,
+    ) -> Result<BrowserElementPick, String> {
+        Err(UNSUPPORTED.into())
     }
 }
 

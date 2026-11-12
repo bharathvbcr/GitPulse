@@ -1591,6 +1591,334 @@
     ],
     "type": "object"
   },
+  "gitpulse_terminal_close": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "child_session_id": {
+        "description": "Child terminal session id previously spawned by this parent session",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "child_session_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_list": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_open_file": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional caller session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional caller session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "column": {
+        "description": "Optional 1-based column number",
+        "maximum": 10000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "line": {
+        "description": "Optional 1-based line number to scroll to",
+        "maximum": 1000000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "path": {
+        "description": "Repository-relative path of an existing file inside repo_path to open in a right-hand split viewer pane",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_read": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "child_session_id": {
+        "description": "Child terminal session id previously spawned by this parent session",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "max_lines": {
+        "description": "Maximum rendered screen lines to return from the bottom of the vt100 grid (default 80, max 200)",
+        "maximum": 200,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "child_session_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_send": {
+    "additionalProperties": false,
+    "properties": {
+      "append_newline": {
+        "description": "Append a trailing newline when submitting input (default true; ignored for pure Ctrl-C/Ctrl-D)",
+        "type": "boolean"
+      },
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "child_session_id": {
+        "description": "Child terminal session id previously spawned by this parent session",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "input": {
+        "description": "Plain-text command or prompt to write to the child PTY",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "child_session_id",
+      "input"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_spawn": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "cols": {
+        "description": "Initial PTY width in columns (default 100)",
+        "maximum": 1000,
+        "minimum": 20,
+        "type": "integer"
+      },
+      "command": {
+        "description": "Optional initial shell command when launcher is 'shell'",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "cwd": {
+        "description": "Optional subdirectory inside repo_path for the child session working directory",
+        "maxLength": 1024,
+        "minLength": 1,
+        "type": "string"
+      },
+      "launcher": {
+        "description": "Child terminal launcher",
+        "enum": [
+          "shell",
+          "claude",
+          "agy",
+          "codex",
+          "manvi",
+          "grok"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "prompt": {
+        "description": "Optional initial task prompt when launcher is an agent",
+        "maxLength": 8192,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "rows": {
+        "description": "Initial PTY height in rows (default 28)",
+        "maximum": 500,
+        "minimum": 4,
+        "type": "integer"
+      },
+      "split": {
+        "description": "Open the child session as a right-hand split pane beside the parent session",
+        "type": "boolean"
+      },
+      "title": {
+        "description": "Optional tab or split-pane title displayed in GitPulse",
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_wait": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "child_session_id": {
+        "description": "Child terminal session id previously spawned by this parent session",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "pattern": {
+        "description": "Optional plain-text substring to match against the rendered, secret-redacted child screen",
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Optional telemetry event sequence cursor; defaults to the child's baseline_seq recorded at the latest Send or matched Wait",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "timeout_ms": {
+        "description": "Maximum milliseconds to wait before returning timed_out=true",
+        "maximum": 25000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "wait_for_idle": {
+        "description": "Wake when an OSC 133 shell command finishes, OSC 7501 agent status reaches idle/done/blocked/error, or a loopback dev server becomes ready",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "repo_path",
+      "child_session_id"
+    ],
+    "type": "object"
+  },
   "gitpulse_worktree_claim": {
     "additionalProperties": false,
     "properties": {

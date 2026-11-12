@@ -68,13 +68,17 @@
   import ScrollCue from "../ScrollCue.svelte";
   import EmptyState from "../EmptyState.svelte";
   import LanguageLogo from "../LanguageLogo.svelte";
+  import { terminalDropZones } from "../../terminal/dropZoneRegistry";
 
   let {
+    repoPath = null,
     onSelectFile,
     onPinFile,
     selectedFile = null,
     revealRequest = null,
   }: {
+    /** Optional checkout path override (e.g. a hosted worktree's `TerminalFilePane`). */
+    repoPath?: string | null;
     onSelectFile?: (path: string) => void;
     onPinFile?: (path: string) => void;
     selectedFile?: string | null;
@@ -86,6 +90,10 @@
      */
     revealRequest?: { path: string; nonce: number } | null;
   } = $props();
+
+  const EMPTY_STATUSES: readonly FileStatus[] = [];
+  const effectiveRepoPath = $derived(repoPath ?? $currentRepoPath);
+  const isOverrideRepo = $derived(Boolean(repoPath && repoPath !== $currentRepoPath));
 
   let ROW_HEIGHT = $derived(rowHeight("fileTree", $densityStore));
   const OVERSCAN = 12;
@@ -148,17 +156,18 @@
   // the same array does not notify, so everything below recomputes on a status
   // change and not on a file click, a loading flag or a background tab.
   const statuses = $derived($repoStore.statuses);
+  const effectiveStatuses = $derived(isOverrideRepo ? EMPTY_STATUSES : statuses);
 
   let statusMap = $derived.by(() => {
     const map = new Map<string, FileStatus>();
-    for (const status of statuses) {
+    for (const status of effectiveStatuses) {
       map.set(status.path, status);
     }
     return map;
   });
 
   let statusCounts = $derived.by(() => {
-    const summary = summarizeStatuses(statuses);
+    const summary = summarizeStatuses(effectiveStatuses);
     return {
       modified: summary.unstaged,
       staged: summary.staged,
@@ -167,7 +176,7 @@
     };
   });
 
-  let dirtyDirs = $derived.by(() => dirtyAncestorCounts(statuses.map((s) => s.path)));
+  let dirtyDirs = $derived.by(() => dirtyAncestorCounts(effectiveStatuses.map((s) => s.path)));
 
   let parsedQuery = $derived.by(() => parseFileQuery(debouncedQuery));
 
@@ -239,18 +248,19 @@
   // flag and error. The repository key, this membership string and HEAD
   // (see `currentHeadTip`) compare by value, so the listing below reloads only
   // when the repository, the set of dirty paths, or HEAD changes.
-  const statusMembership = $derived(statusPathKey(statuses));
+  const repoStatusKey = $derived(statusPathKey(statuses));
+  const statusMembership = $derived(isOverrideRepo ? "" : repoStatusKey);
 
   // A new repository starts with every folder expanded again.
   $effect(() => {
-    void $currentRepoPath;
+    void effectiveRepoPath;
     untrack(() => (collapsed = {}));
   });
 
   // No teardown: `loadFiles` cancels its predecessor itself, and unmount is
   // the effect above.
   $effect(() => {
-    const repo = $currentRepoPath;
+    const repo = effectiveRepoPath;
     void statusMembership;
     void $currentHeadTip;
     untrack(() => {
@@ -271,7 +281,7 @@
   let listedPaths = $derived.by(() =>
     mergeListedAndStatusPaths(
       files,
-      statuses.map((s) => s.path),
+      effectiveStatuses.map((s) => s.path),
     ),
   );
 
@@ -724,7 +734,7 @@
 
   async function openInSystem(filePath: string) {
     closeContextMenu();
-    const repo = $repoStore.currentPath;
+    const repo = effectiveRepoPath;
     if (!repo) return;
     try {
       await openInDefaultApp(repo, filePath);
@@ -743,7 +753,7 @@
 
   async function revealInFinder(filePath: string) {
     closeContextMenu();
-    const repo = $repoStore.currentPath;
+    const repo = effectiveRepoPath;
     if (!repo) return;
     try {
       await revealInFileManager(repo, filePath);
@@ -1174,11 +1184,23 @@
                 id={treeItemId(r)}
                 role="treeitem"
                 tabindex="-1"
+                draggable="true"
                 aria-selected={isOpen}
                 aria-level={r.depth + 1}
                 aria-setsize={rows.length}
                 aria-posinset={index + 1}
                 aria-expanded={r.kind === "dir" ? !isCollapsed(r.path) : undefined}
+                ondragstart={(e) => {
+                  const base = ($currentRepoPath ?? "").replace(/\/+$/, "");
+                  const fullPath = base ? `${base}/${r.path}` : r.path;
+                  e.dataTransfer?.setData("application/x-gitpulse-filepath", fullPath);
+                  e.dataTransfer?.setData("text/plain", r.path);
+                  if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+                  terminalDropZones.beginInAppDrag([fullPath], r.kind === "file");
+                }}
+                ondragend={() => {
+                  terminalDropZones.endInAppDrag();
+                }}
                 onclick={() => rowAction(r)}
                 ondblclick={() => { if (r.kind === "file") pinFile(r.path); }}
                 onkeydown={(e) => { if (e.key === "Enter") rowAction(r); }}

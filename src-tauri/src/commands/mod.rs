@@ -96,7 +96,7 @@ pub use worktrees::*;
 /// for exactly this text (`crate::ipc_error::run_command`); the text is never
 /// searched, so a wrapped, relayed or quoted message is `unclassified`, and a
 /// deferral never leaves a user action as a retryable kind.
-async fn off_thread<F, T>(body: F) -> Result<T, IpcError>
+pub(crate) async fn off_thread<F, T>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> Result<T, crate::ipc_error::CommandError> + Send + 'static,
     T: Send + 'static,

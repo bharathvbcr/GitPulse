@@ -75,6 +75,10 @@ const MAX_GATE_HANDLERS: usize = 16;
 /// top of it. A snapshot's reads are heavier than a verdict or one file's
 /// collision scan, and every agent session has an MCP process that may ask.
 const MAX_INSIGHTS_HANDLERS: usize = 4;
+/// Terminal orchestration requests (`Wait`, `Spawn`, `Read`, `Send`) in flight
+/// at once, counted in their own budget so blocking `Wait` calls can neither
+/// starve hooks nor block app relaunches.
+const MAX_ORCHESTRATE_HANDLERS: usize = 8;
 /// Requests held for an owner whose window is not up yet.
 const MAX_QUEUED: usize = 32;
 /// How long the owner gives one connection end to end. Longer than the
@@ -145,6 +149,31 @@ pub enum Request {
         /// The repository to read (absolute). The owner re-checks trust in it.
         repo: String,
     },
+    /// An agent `SessionStart` hook running inside a GitPulse PTY reporting its
+    /// authoritative host conversation id and optional artifact directory
+    /// (such as Antigravity's `conversationId` and `artifactDirectoryPath`).
+    AgentSessionMeta {
+        terminal_id: String,
+        agent: String,
+        conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_dir: Option<String>,
+    },
+    /// Reports a file or plan artifact an agent just modified inside a GitPulse PTY
+    /// (`PostToolUse` -> `gitpulse-hook notify tool_finished`) so "Follow Agent"
+    /// split panes live-open or refresh the active file/diff without polling.
+    AgentTouchedFile {
+        terminal_id: String,
+        repo: String,
+        path: String,
+        artifact: bool,
+    },
+    /// An authenticated parent session orchestrating a scoped child terminal or
+    /// requesting a terminal split file pane (`gitpulse_terminal_*` / `gitpulse-hook term`).
+    TerminalOrchestrate {
+        id: String,
+        call: crate::terminal::orchestrate::OrchestrateCall,
+    },
 }
 
 impl Request {
@@ -154,7 +183,8 @@ impl Request {
         match self {
             Request::GateCommand { id, .. }
             | Request::CollisionScan { id, .. }
-            | Request::InsightsRead { id, .. } => Some(id),
+            | Request::InsightsRead { id, .. }
+            | Request::TerminalOrchestrate { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -250,6 +280,70 @@ impl Request {
                     return Err("insights repository must be an absolute path".into());
                 }
                 Ok(())
+            }
+            Request::AgentSessionMeta {
+                terminal_id,
+                agent,
+                conversation_id,
+                artifact_dir,
+            } => {
+                if !crate::alerts::bridge::valid_key(terminal_id) {
+                    return Err("agent session terminal_id is invalid".into());
+                }
+                if !matches!(agent.as_str(), "agy" | "claude") {
+                    return Err("agent session kind must be agy or claude".into());
+                }
+                if !crate::workbench::terminal_command::is_canonical_uuid(conversation_id) {
+                    return Err("agent session conversation_id must be a canonical UUID".into());
+                }
+                if let Some(dir) = artifact_dir {
+                    if dir.is_empty()
+                        || dir.len() > MAX_PATH_BYTES
+                        || dir.contains('\0')
+                        || !Path::new(dir).is_absolute()
+                    {
+                        return Err("agent session artifact_dir must be an absolute path".into());
+                    }
+                }
+                Ok(())
+            }
+            Request::AgentTouchedFile {
+                terminal_id,
+                repo,
+                path,
+                ..
+            } => {
+                if !crate::alerts::bridge::valid_key(terminal_id) {
+                    return Err("touched-file terminal_id is invalid".into());
+                }
+                if repo.is_empty()
+                    || repo.len() > MAX_PATH_BYTES
+                    || repo.contains('\0')
+                    || !Path::new(repo).is_absolute()
+                {
+                    return Err("touched-file repository must be an absolute path".into());
+                }
+                if path.is_empty()
+                    || path.len() > MAX_PATH_BYTES
+                    || path.contains('\0')
+                    || Path::new(path).is_absolute()
+                {
+                    return Err("touched-file path must be relative".into());
+                }
+                for component in Path::new(path).components() {
+                    if !matches!(component, std::path::Component::Normal(_)) {
+                        return Err(
+                            "touched-file path must contain only normal relative segments".into(),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Request::TerminalOrchestrate { id, call } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("orchestrate request id is empty, too long or not printable".into());
+                }
+                call.validate()
             }
         }
     }
@@ -645,6 +739,21 @@ impl Secondary {
         self.answered(request, within)
     }
 
+    /// Asks the owner to execute one Option A terminal orchestration call,
+    /// waiting up to `call.reply_deadline()` and verifying the echoed `id`.
+    pub fn orchestrate(
+        self,
+        id: &str,
+        call: crate::terminal::orchestrate::OrchestrateCall,
+    ) -> Result<serde_json::Value, String> {
+        let within = call.reply_deadline();
+        let request = Request::TerminalOrchestrate {
+            id: id.to_owned(),
+            call,
+        };
+        self.answered(&request, within)
+    }
+
     fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
         let id = request
             .answered_id()
@@ -705,6 +814,13 @@ pub type ScanSink = GateSink;
 /// Reads for an MCP process: `repo` to the insights facets' JSON.
 pub type InsightsSink = Arc<dyn Fn(&str) -> Result<serde_json::Value, String> + Send + Sync>;
 
+/// Executes an authenticated [`crate::terminal::orchestrate::OrchestrateCall`].
+pub type OrchestrateSink = Arc<
+    dyn Fn(crate::terminal::orchestrate::OrchestrateCall) -> Result<serde_json::Value, String>
+        + Send
+        + Sync,
+>;
+
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
 #[derive(Default)]
@@ -717,11 +833,13 @@ struct Shared {
     closing: AtomicBool,
     active: AtomicUsize,
     gating: AtomicUsize,
+    orchestrating: AtomicUsize,
     gate: Mutex<Option<GateSink>>,
     collision: Mutex<Option<ScanSink>>,
     insights: Mutex<Option<InsightsSink>>,
     /// Insights reads in flight, a share of `gating` of their own.
     reading: AtomicUsize,
+    orchestrate: Mutex<Option<OrchestrateSink>>,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -738,10 +856,12 @@ impl Shared {
             closing: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             gating: AtomicUsize::new(0),
+            orchestrating: AtomicUsize::new(0),
             gate: Mutex::new(None),
             collision: Mutex::new(None),
             insights: Mutex::new(None),
             reading: AtomicUsize::new(0),
+            orchestrate: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -870,6 +990,15 @@ impl Primary {
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
 
+    /// Where Option A terminal orchestration calls are answered from now on.
+    pub fn attach_terminal_orchestrate(&self, sink: OrchestrateSink) {
+        *self
+            .shared
+            .orchestrate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
     /// Stops answering and takes the mailbox down, keeping the lock. A launch
     /// from here on waits for the lock instead, which the kernel releases when
     /// this process is gone — so a relaunch during a slow quit becomes the next
@@ -927,7 +1056,7 @@ struct PoolState {
 }
 
 impl HandlerPool {
-    const MAX_WORKERS: usize = MAX_HANDLERS + MAX_GATE_HANDLERS;
+    const MAX_WORKERS: usize = MAX_HANDLERS + MAX_GATE_HANDLERS + MAX_ORCHESTRATE_HANDLERS;
 
     fn new(shared: Arc<Shared>) -> Arc<Self> {
         Arc::new(Self {
@@ -1052,7 +1181,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, wake: &Wake) {
                 continue;
             }
         };
-        if shared.active.fetch_add(1, Ordering::AcqRel) >= MAX_HANDLERS + MAX_GATE_HANDLERS {
+        if shared.active.fetch_add(1, Ordering::AcqRel) >= HandlerPool::MAX_WORKERS {
             shared.active.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
@@ -1198,6 +1327,9 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     }
     if let Request::InsightsRead { id, repo } = &request {
         return answer_insights(stream, shared, id, repo).map_err(Ended::Refused);
+    }
+    if let Request::TerminalOrchestrate { id, call } = request {
+        return answer_orchestrate(stream, shared, &id, call).map_err(Ended::Refused);
     }
     let verdict = admit(shared, request);
     let ack = match &verdict {
@@ -1349,6 +1481,58 @@ impl<'a> GateSlot<'a> {
 impl Drop for GateSlot<'_> {
     fn drop(&mut self) {
         self.0.gating.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn answer_orchestrate(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    call: crate::terminal::orchestrate::OrchestrateCall,
+) -> Result<(), String> {
+    let slot = OrchestrateSlot::take(shared);
+    let sink = shared
+        .orchestrate
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let outcome = if shared.closing.load(Ordering::Acquire) {
+        Err("GitPulse is quitting".to_string())
+    } else if slot.is_none() {
+        Err("terminal orchestration is busy".to_string())
+    } else {
+        match sink {
+            Some(sink) => sink(call),
+            None => Err("terminal orchestration is not attached".to_string()),
+        }
+    };
+    let ack = match outcome {
+        Ok(reply) => Ack {
+            accepted: true,
+            reason: None,
+            id: Some(id.to_string()),
+            reply: Some(reply),
+        },
+        Err(reason) => Ack::refused(reason),
+    };
+    write_frame(stream, &ack)
+}
+
+struct OrchestrateSlot<'a>(&'a Shared);
+
+impl<'a> OrchestrateSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.orchestrating.fetch_add(1, Ordering::AcqRel) >= MAX_ORCHESTRATE_HANDLERS {
+            shared.orchestrating.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for OrchestrateSlot<'_> {
+    fn drop(&mut self) {
+        self.0.orchestrating.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

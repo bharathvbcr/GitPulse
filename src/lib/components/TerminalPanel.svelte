@@ -4,7 +4,7 @@
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { closeWithConfirmation, terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
+  import { closeWithConfirmation, sessionByNativeId, terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
@@ -36,11 +36,14 @@
     PinOff,
     Minimize2,
     Columns2,
+    Rows2,
+    FolderTree,
     Settings2,
     ChevronLeft,
     ChevronRight,
     ChevronsUpDown,
     Globe,
+    Eye,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -49,15 +52,58 @@
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
   import BrowserSession from "./BrowserSession.svelte";
+  import TerminalFilePane from "./TerminalFilePane.svelte";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
-  import { askConfirm } from "../stores/modalStore";
+  import { askConfirm, askText } from "../stores/modalStore";
+  import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
-  import { groupSessionsByRepository, sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
+  import { groupSessionsByRepository, sessionRow, summarizeCheckout, type CheckoutTab } from "../terminal/checkoutLabel";
   import { sessionCountLabel, sessionIsLive, sessionListCommand, sessionListNotice, sessionStatusLabel } from "../terminal/sessionList";
   import { forgetEndedTail } from "../terminal/endedBuffer";
+  import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
+  import { detachedAdoptionSettled, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import { isTauri } from "../platform";
+  import { formatDroppedPathsForSession, relativeToRepo } from "../terminal/dropFormatting";
+  import { classifyDropRegion, terminalDropZones, type DropRegion } from "../terminal/dropZoneRegistry";
+  import {
+    agentEvents,
+    type TerminalAgentTouchedFilePayload,
+    type TerminalChildClosedPayload,
+    type TerminalChildSpawnedPayload,
+    type TerminalOpenFileRequestPayload,
+  } from "../terminal/agentEvents";
+  import type { AgentOscStatus } from "../terminal/commandBlocks";
+  import { getCollisionRisk } from "../insights/client";
+  import type { CollisionRisk } from "../insights/types";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
+  import {
+    adjacentPane,
+    computeSplitLayout,
+    equalizeSplits,
+    hasPane,
+    leafPaneIds,
+    MAX_SPLIT_PANES,
+    minimumSplitHeight,
+    movePaneToSplit,
+    parsePersistedSplitWorkspace,
+    remapSplitTree,
+    removePane,
+    replacePane,
+    resizeBranch,
+    serializeSplitWorkspace,
+    splitPane,
+    terminalSplitChord,
+    visiblePaneIds,
+    type PersistedSplitLeafMeta,
+    type SashDescriptor,
+    type SplitDirection,
+    type SplitNode,
+  } from "../terminal/splitTree";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     activateTab,
+    buildPairHandoffPrompt,
+    childTabsForParent,
     offeredSessionKind,
     sessionTypesFor,
     canOpenTab,
@@ -66,7 +112,10 @@
     cycleTab,
     initialState,
     launcherLabel,
+    openAttachedChildTab,
+    openCheckoutTab,
     openTab,
+    sanitizeWorktreeSlug,
     tabFor,
     paneOnScreen,
     setTabStartDir,
@@ -74,12 +123,18 @@
     setTabUrl,
     browserTabFor,
     openBrowserTab,
+    fileTabFor,
+    openFileTab,
+    openSnippetTab,
+    setTabFile,
     renameTab,
     moveTab,
     tabLabel,
     terminalTabChord,
     terminalTabDestination,
     type SessionKind,
+    type LauncherKind,
+    type TabKind,
     type TabState,
   } from "../terminal/tabs";
   import {
@@ -100,17 +155,22 @@
   let {
     repoPath = null,
     visible = true,
+    dockDragging = false,
     onClose,
     expanded = false,
     onToggleExpanded,
     dockMode = "docked",
     onToggleDockMode,
     onGoToSession,
+    onOpenInCodeView,
+    onCreateAgentWorktree,
     checkouts = [],
   }: {
     repoPath?: string | null;
     /** False while another repository's panel (or a closed dock) is showing. */
     visible?: boolean;
+    /** True while the dock height separator is actively dragged. */
+    dockDragging?: boolean;
     onClose?: () => void;
     expanded?: boolean;
     onToggleExpanded?: () => void;
@@ -125,6 +185,16 @@
      * panel deliberately cannot see — see `goToSession`.
      */
     onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
+    onOpenInCodeView?: (path: string, line: number | null) => void;
+    /**
+     * Provisions a sibling Git worktree on behalf of this panel's repository
+     * tab via the dock's `MutationTarget`, keeping this panel decoupled from
+     * the repository store.
+     */
+    onCreateAgentWorktree?: (
+      targetPath: string,
+      newBranch: string,
+    ) => Promise<{ ok: true; path: string } | { ok: false; error: string | null }>;
     /**
      * The open repository tabs, for naming the checkout each listed session
      * runs in (repository, checkout, agent worktree), and for deciding which
@@ -167,13 +237,28 @@
   let tabScroller: HTMLDivElement | undefined = $state();
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let adoptionTimedOut = $state(false);
+  let followAgent = $state(false);
 
   onMount(() => {
     inputEl?.focus();
     // The session limit is an agent default; read it before the first
     // session so the panel stops where the backend does.
     void loadAgentDefaults().catch(() => {});
+    const adoptionFallbackTimer = isTauri()
+      ? setTimeout(() => {
+          adoptionTimedOut = true;
+        }, 1500)
+      : null;
+    const unsubAgentPanel = agentEvents.subscribePanelEvents({
+      onChildSpawned: handleChildSpawned,
+      onChildClosed: handleChildClosed,
+      onOpenFile: handleAgentOpenFile,
+      onTouchedFile: handleAgentTouchedFile,
+    });
     return () => {
+      unsubAgentPanel();
+      if (adoptionFallbackTimer !== null) clearTimeout(adoptionFallbackTimer);
       if (copiedResetTimer !== null) {
         clearTimeout(copiedResetTimer);
         copiedResetTimer = null;
@@ -216,13 +301,158 @@
    * `sessions[id]`, finds nothing for a browser tab, and does nothing.
    */
   let browsers = $state<Record<string, BrowserSession | undefined>>({});
+  let filePanes = $state<Record<string, TerminalFilePane | undefined>>({});
+  let panesContainerEl = $state<HTMLDivElement | null>(null);
   /** The session types this host can open; browser sessions are macOS-only. */
   const sessionTypes = $derived(sessionTypesFor($hostPlatform.browser_sessions));
   /** What the reader chose last; shown as `nextLauncher` once this host is known to offer it. */
   let chosenLauncher = $state<SessionKind>(get(interfaceStore).terminalLauncher);
   const nextLauncher = $derived(offeredSessionKind(chosenLauncher, $hostPlatform.browser_sessions));
-  const activeIsBrowser = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.launcher === "browser");
-  let splitIds = $state<[string, string] | null>(null);
+  const activeLauncher = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.launcher ?? null);
+  const activeIsNonTerminal = $derived(activeLauncher === "browser" || activeLauncher === "file");
+  let splitRoot = $state<SplitNode | null>(null);
+  let zoomedPaneId = $state<string | null>(null);
+  let draggedTabId = $state<string | null>(null);
+  let tabDropHint = $state<{ paneId: string; direction: SplitDirection; position: "before" | "after" } | null>(null);
+  let fileDropHint = $state<{ paneId: string; region: DropRegion } | null>(null);
+  const visibleIds = $derived(visiblePaneIds(splitRoot, activeId, zoomedPaneId));
+  const splitIds = $derived(splitRoot ? visibleIds : null);
+  const splitLayout = $derived(computeSplitLayout(splitRoot, activeId, zoomedPaneId));
+  /** The pane canvas's least height; below it the pane area scrolls (`minimumSplitHeight`). */
+  const paneCanvasMinHeight = $derived(minimumSplitHeight(splitRoot, activeId, zoomedPaneId));
+  const hasVisibleFilePane = $derived(
+    tabState.tabs.some(
+      (tab) => tab.launcher === "file" && (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
+    ),
+  );
+  let sashDragging = $state(false);
+  const layoutDragging = $derived(dockDragging || sashDragging);
+
+  function splitStorageKey(path: string | null | undefined): string | null {
+    return path ? `gitpulse.terminal.splitLayout:${path}` : null;
+  }
+
+  let hydratedSplitForRepo: string | null = null;
+  $effect(() => {
+    const key = splitStorageKey(repoPath);
+    const readyToHydrate = !isTauri() || $detachedAdoptionSettled || adoptionTimedOut;
+    const ids = new Set(tabState.tabs.map((tab) => tab.id));
+    if (!key || !readyToHydrate || hydratedSplitForRepo === key || ids.size === 0) return;
+    hydratedSplitForRepo = key;
+    untrack(() => {
+      if (splitRoot) return;
+      try {
+        const stored = globalThis.localStorage?.getItem(key);
+        const parsed = parsePersistedSplitWorkspace(stored);
+        if (!parsed) return;
+        const paneIdMap = new Map<string, string>();
+        for (const id of ids) paneIdMap.set(id, id);
+        let nextState = tabState;
+        const usedCurrentTabs = new Set<string>();
+        for (const leafId of leafPaneIds(parsed.tree)) {
+          if (paneIdMap.has(leafId)) {
+            usedCurrentTabs.add(leafId);
+            continue;
+          }
+          const meta = parsed.leaves[leafId];
+          if (!meta) continue;
+          if (meta.launcher === "file") {
+            const opened = openFileTab(nextState, {
+              filePath: meta.filePath,
+              checkout: meta.checkout,
+              line: meta.revealLine ?? null,
+              column: meta.revealColumn ?? null,
+              reuseExisting: false,
+              focus: false,
+            });
+            if (opened.id) {
+              nextState = opened.state;
+              paneIdMap.set(leafId, opened.id);
+              usedCurrentTabs.add(opened.id);
+            }
+            continue;
+          }
+          if (meta.launcher === "browser") {
+            if ($hostPlatform.browser_sessions) {
+              const opened = openBrowserTab(nextState, meta.url);
+              if (opened.id) {
+                nextState = { ...opened.state, activeId: nextState.activeId ?? opened.id };
+                paneIdMap.set(leafId, opened.id);
+                usedCurrentTabs.add(opened.id);
+              }
+            }
+            continue;
+          }
+          if (meta.backendSessionId) {
+            const reclaimed = reclaimAdoptedSession(meta.backendSessionId);
+            if (reclaimed && repoPath && sameRepo(reclaimed.repoPath, repoPath, pathOpts)) {
+              const attached = openAttachedChildTab(nextState, {
+                sessionId: reclaimed.sessionId,
+                parentSessionId: meta.parentSessionId,
+                launcher: reclaimed.launcher,
+                title: reclaimed.title ?? null,
+                focus: false,
+              });
+              if (attached.id) {
+                nextState = attached.state;
+                paneIdMap.set(leafId, attached.id);
+                usedCurrentTabs.add(attached.id);
+                continue;
+              }
+            }
+          }
+          const fallbackExisting = nextState.tabs.find(
+            (tab) => !usedCurrentTabs.has(tab.id) && tab.launcher === meta.launcher,
+          );
+          if (fallbackExisting) {
+            paneIdMap.set(leafId, fallbackExisting.id);
+            usedCurrentTabs.add(fallbackExisting.id);
+          }
+        }
+        if (nextState !== tabState) tabState = nextState;
+        const restored = remapSplitTree(parsed.tree, paneIdMap);
+        if (restored) splitRoot = restored;
+      } catch {
+        /* localStorage unavailable */
+      }
+    });
+  });
+
+  $effect(() => {
+    const key = splitStorageKey(repoPath);
+    const currentRoot = splitRoot;
+    const currentTabs = tabState.tabs;
+    if (!key || hydratedSplitForRepo !== key) return;
+    const leaves: Record<string, PersistedSplitLeafMeta> = {};
+    currentTabs.forEach((tab, slotIndex) => {
+      const backendId = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
+      leaves[tab.id] = {
+        launcher: tab.launcher,
+        slotIndex,
+        ...(backendId ? { backendSessionId: backendId } : {}),
+        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
+        ...(tab.filePath ? { filePath: tab.filePath } : {}),
+        ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
+        ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
+        ...(tab.url ? { url: tab.url } : {}),
+        ...(tab.checkout ? { checkout: tab.checkout } : {}),
+      };
+    });
+    const serialized = serializeSplitWorkspace(currentRoot, leaves);
+    try {
+      if (serialized) globalThis.localStorage?.setItem(key, serialized);
+      else globalThis.localStorage?.removeItem(key);
+    } catch {
+      /* localStorage unavailable */
+    }
+  });
+
+  $effect(() => {
+    const activeDrag = layoutDragging;
+    for (const session of Object.values(sessions)) {
+      session?.setDragging(activeDrag);
+    }
+  });
   let tabOptions = $state(false);
   let sessionListOpen = $state(false);
   let sessionSearchOpen = $state(false);
@@ -241,7 +471,85 @@
   let sessionListHighlight = $state<number | null>(null);
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
+  let tabAgentStatuses = $state<Record<string, AgentOscStatus | null>>({});
   let unread = $state(new Set<string>());
+  const checkoutInfo = $derived(repoPath ? summarizeCheckout(repoPath, checkouts, pathOpts) : null);
+  const activeTab = $derived(tabState.tabs.find((tab) => tab.id === activeId));
+  const activeBackendSessionId = $derived.by(() => {
+    if (!activeTab) return null;
+    void tabStatuses[activeTab.id];
+    const reg = $terminalSessions.find(
+      (entry) =>
+        entry.key === activeTab.id &&
+        (!repoPath || sameRepo(entry.repoPath, repoPath, pathOpts)),
+    );
+    return (
+      reg?.sessionId ||
+      sessions[activeTab.id]?.backendSessionId?.() ||
+      activeTab.attachSessionId ||
+      null
+    );
+  });
+  const activeChildTabs = $derived(
+    childTabsForParent(tabState, activeBackendSessionId, tabStatuses),
+  );
+  const pairHandoffTarget = $derived.by(() => {
+    if (!splitRoot || !activeTab) return null;
+    if (activeTab.launcher !== "claude" && activeTab.launcher !== "agy") return null;
+    const wantedPartner = activeTab.launcher === "claude" ? "agy" : "claude";
+    return (
+      tabState.tabs.find(
+        (candidate) =>
+          candidate.id !== activeTab.id &&
+          visibleIds.includes(candidate.id) &&
+          candidate.launcher === wantedPartner &&
+          tabStatuses[candidate.id] !== "exited",
+      ) ?? null
+    );
+  });
+  let collisionSummary = $state<CollisionRisk | null>(null);
+
+  $effect(() => {
+    const here = repoPath;
+    if (!visible || !here) {
+      collisionSummary = null;
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      void getCollisionRisk(here)
+        .then((risk) => {
+          if (!cancelled) collisionSummary = risk;
+        })
+        .catch(() => {
+          if (!cancelled) collisionSummary = null;
+        });
+    };
+    poll();
+    const stopTimer = createAdaptiveTimer(poll, 15_000);
+    return () => {
+      cancelled = true;
+      stopTimer();
+    };
+  });
+
+  function oscStatusBadge(status: AgentOscStatus | null | undefined): { label: string; cls: string } | null {
+    if (!status) return null;
+    switch (status.state) {
+      case "working":
+        return { label: "Working", cls: "text-accent" };
+      case "blocked":
+        return { label: "Input", cls: "text-warn" };
+      case "done":
+        return { label: "Done", cls: "text-ok" };
+      case "error":
+        return { label: "Failed", cls: "text-danger" };
+      case "idle":
+        return { label: "Idle", cls: "text-textMuted" };
+      default:
+        return null;
+    }
+  }
   // Reads the live limit, so raising it in Settings lets a waiting task
   // terminal open at once rather than when a session next closes.
   // Two bounds, each saying itself: live sessions (the user's limit, across
@@ -256,11 +564,17 @@
    * bounds it here; the backend caps open pages (`browser::MAX_PANES`) and
    * says so in the session if that is what stops it.
    */
-  function canCreateKind(kind: SessionKind): boolean {
+  function canCreateKind(kind: TabKind): boolean {
+    if (kind === "file") return !stripFull;
     if (kind !== "browser") return canCreate;
     return !stripFull && $hostPlatform.browser_sessions;
   }
-  function capacityTitleFor(kind: SessionKind): string {
+  function capacityTitleFor(kind: TabKind): string {
+    if (kind === "file") {
+      return stripFull
+        ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
+        : "Open files & Markdown beside terminal";
+    }
     if (kind !== "browser") return capacityTitle;
     if (!$hostPlatform.browser_sessions) return "Browser sessions are not available on this computer yet";
     return stripFull
@@ -305,7 +619,7 @@
    */
   const launcherMenuDismissal = $derived({
     anchor: { kind: "element" as const, element: launcherTriggerEl, gap: 6 },
-    estimate: { width: 208, height: 220 },
+    estimate: { width: 208, height: 260 },
     inset: 8,
     revision: `${launcherQuery}:${filteredLaunchers.length}`,
     dismiss: {
@@ -393,6 +707,177 @@
     chosenLauncher = kind;
     interfaceStore.setTerminalLauncher(kind);
     launcherMenuOpen = false;
+  }
+
+  function preferredPresetAgent(): LauncherKind {
+    return isPromptLauncher(nextLauncher) ? nextLauncher : "claude";
+  }
+
+  function openAgentDiffPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    const agentKind = preferredPresetAgent();
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 1 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    mode = "shell";
+    const afterAgent = openTab(tabState, agentKind);
+    const agentId = afterAgent.activeId;
+    if (!agentId) return;
+    const afterFile = openFileTab(afterAgent, { reuseExisting: true, focus: false });
+    const fileId = afterFile.id;
+    if (!fileId || fileId === agentId) return;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    followAgent = true;
+    tabState = activateTab(afterFile.state, agentId);
+    splitRoot = splitPane(null, agentId, fileId, "row", "after", 0.5);
+  }
+
+  function openPairSplit() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 2 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor("claude");
+      return;
+    }
+    mode = "shell";
+    const afterFirst = openTab(tabState, "claude");
+    const firstId = afterFirst.activeId;
+    const afterSecond = openTab(afterFirst, "agy");
+    const secondId = afterSecond.activeId;
+    if (!firstId || !secondId || firstId === secondId) return;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    tabState = activateTab(afterSecond, firstId);
+    splitRoot = splitPane(null, firstId, secondId, "row", "after", 0.5);
+  }
+
+  function openFullStackPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    const agentKind = preferredPresetAgent();
+    const withBrowser = $hostPlatform.browser_sessions;
+    const neededTabs = withBrowser ? 3 : 2;
+    if (
+      tabState.tabs.length + neededTabs > MAX_STRIP_TABS ||
+      $terminalSessions.length + 2 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    mode = "shell";
+    const afterAgent = openTab(tabState, agentKind);
+    const agentId = afterAgent.activeId;
+    const afterShell = openTab(afterAgent, "shell");
+    const shellId = afterShell.activeId;
+    if (!agentId || !shellId || agentId === shellId) return;
+    let nextState = afterShell;
+    let tree = splitPane(null, agentId, shellId, "row", "after", 0.5);
+    if (withBrowser) {
+      const openedBrowser = openBrowserTab(nextState, undefined);
+      if (openedBrowser.id && openedBrowser.id !== shellId) {
+        nextState = openedBrowser.state;
+        tree = splitPane(tree, shellId, openedBrowser.id, "col", "after", 0.5);
+      }
+    }
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    tabState = activateTab(nextState, agentId);
+    splitRoot = tree;
+  }
+
+  let creatingWorktreePreset = $state(false);
+
+  async function openWorktreeAgentPreset() {
+    launcherMenuOpen = false;
+    const baseRepo = repoPath;
+    if (!baseRepo || !onCreateAgentWorktree || creatingWorktreePreset) return;
+    const agentKind = preferredPresetAgent();
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 1 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    const rawSlug = await askText({
+      title: "New Isolated Agent Worktree",
+      message:
+        "Creates a sibling worktree (<repo>.wt-<slug>) on branch wt/<slug> and opens an agent + live file split inside it.",
+      placeholder: "agent-1",
+      initialValue: "agent-1",
+      confirmLabel: "Create & Open",
+      validate: (value) =>
+        sanitizeWorktreeSlug(value)
+          ? null
+          : "Enter a valid slug using letters, numbers, dots, underscores, or hyphens.",
+    });
+    if (rawSlug === null) return;
+    const slug = sanitizeWorktreeSlug(rawSlug);
+    if (!slug || !repoPath || !sameRepo(repoPath, baseRepo, pathOpts)) return;
+
+    const trimmedRepo = baseRepo.replace(/[\\/]+$/, "");
+    const sep = trimmedRepo.includes("\\") ? "\\" : "/";
+    const lastSep = Math.max(trimmedRepo.lastIndexOf("/"), trimmedRepo.lastIndexOf("\\"));
+    if (lastSep <= 0) {
+      sessionError = "Could not resolve parent directory for sibling worktree.";
+      return;
+    }
+    const parentDir = trimmedRepo.slice(0, lastSep);
+    const repoBase = trimmedRepo.slice(lastSep + 1);
+    const targetPath = `${parentDir}${sep}${repoBase}.wt-${slug}`;
+    const newBranch = `wt/${slug}`;
+
+    creatingWorktreePreset = true;
+    try {
+      const outcome = await onCreateAgentWorktree(targetPath, newBranch);
+      if (!outcome.ok) {
+        if (outcome.error) {
+          if (visible && repoPath && sameRepo(repoPath, baseRepo, pathOpts)) {
+            sessionError = `Could not create isolated worktree: ${outcome.error}`;
+          } else {
+            toastStore.error(`Could not create isolated worktree: ${outcome.error}`);
+          }
+        }
+        return;
+      }
+      if (!repoPath || !sameRepo(repoPath, baseRepo, pathOpts)) return;
+
+      const checkoutPath = outcome.path;
+      mode = "shell";
+      const openedAgent = openCheckoutTab(tabState, agentKind, {
+        checkout: checkoutPath,
+        name: `${launcherLabel(agentKind)} · ${slug}`,
+      });
+      if (!openedAgent.id) {
+        sessionError = capacityTitleFor(agentKind);
+        return;
+      }
+      const openedFile = openFileTab(openedAgent.state, {
+        checkout: checkoutPath,
+        reuseExisting: true,
+        focus: false,
+      });
+      focusTabStrip = false;
+      zoomedPaneId = null;
+      followAgent = true;
+      tabState = activateTab(openedFile.state, openedAgent.id);
+      if (openedFile.id && openedFile.id !== openedAgent.id) {
+        splitRoot = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
+      }
+    } catch (err) {
+      sessionError = `Could not create isolated worktree: ${formatError(err)}`;
+    } finally {
+      creatingWorktreePreset = false;
+    }
   }
 
   function chooseSearchedTab(id: string) {
@@ -599,9 +1084,12 @@
 
   function newTab(launcher: SessionKind, initialPrompt?: string): boolean {
     if (!repoPath || !canCreateKind(launcher)) return false;
+    const prevActive = tabState.activeId;
     focusTabStrip = false;
     tabState = openTab(tabState, launcher, initialPrompt);
-    if (splitIds && activeId) splitIds = [splitIds[0], activeId];
+    if (splitRoot && prevActive && tabState.activeId && tabState.activeId !== prevActive && !hasPane(splitRoot, tabState.activeId)) {
+      splitRoot = replacePane(splitRoot, prevActive, tabState.activeId);
+    }
     return true;
   }
 
@@ -651,7 +1139,7 @@
       // Close ends the process here, explicitly. Dropping the tab only
       // unmounts it, and an unmount keeps whatever is still running.
       try {
-        await (sessions[id] ?? browsers[id])?.close();
+        await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
       } catch (error: unknown) {
         sessionError = formatError(error);
         return;
@@ -668,6 +1156,7 @@
     if (!tab) return false;
     // A browser session runs no job to interrupt; its page closes with it.
     if (tab.launcher === "browser") return true;
+    if (tab.launcher === "file") return (await filePanes[id]?.confirmClose()) ?? true;
     const status = tabStatuses[id];
     const agent = tab.launcher === "shell" ? null : {
       name: launcherLabel(tab.launcher),
@@ -693,6 +1182,12 @@
         claimed.complete(openBrowserFor(claimed.url));
         return;
       }
+      if (claimed.launcher === "file") {
+        claimed.complete(
+          openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, { focus: false }),
+        );
+        return;
+      }
       const opened = newTab(claimed.launcher, claimed.prompt);
       const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
@@ -715,15 +1210,20 @@
     for (const tab of tabState.tabs) {
       terminalLaunchRequests.forget(tab.id);
       forgetEndedTail(tab.id);
+      scrollbackSnapshots.forget(tab.id);
     }
     releaseTaskTerminal(holder);
   });
 
   function selectTab(id: string, keepStripFocus = false) {
     focusTabStrip = keepStripFocus;
-    if (splitIds && !splitIds.includes(id)) splitIds = [splitIds[0], id];
+    const prevActive = tabState.activeId;
+    if (zoomedPaneId && zoomedPaneId !== id) zoomedPaneId = null;
+    if (splitRoot && !hasPane(splitRoot, id)) {
+      const slotToReplace = prevActive && hasPane(splitRoot, prevActive) ? prevActive : leafPaneIds(splitRoot).at(-1);
+      if (slotToReplace) splitRoot = replacePane(splitRoot, slotToReplace, id);
+    }
     tabState = activateTab(tabState, id);
-
   }
 
   /**
@@ -737,6 +1237,7 @@
   function dropTab(id: string, keepRequest = false) {
     terminalLaunchRequests.forget(id);
     forgetEndedTail(id);
+    scrollbackSnapshots.forget(id);
     // A tab closed before it took a slot no longer counts against the room
     // this panel leaves for queued starts, and gives up its hold. Closed by
     // the reader, its request goes too — it was still queued, and would
@@ -750,16 +1251,24 @@
       admitting.delete(id);
     }
     focusTabStrip = false;
-    const partner = splitIds?.includes(id) ? splitIds.find((other) => other !== id) ?? null : null;
-    if (splitIds?.includes(id)) splitIds = null;
+    if (zoomedPaneId === id) zoomedPaneId = null;
+    const remainingSplitLeaves = hasPane(splitRoot, id)
+      ? leafPaneIds(splitRoot).filter((other) => other !== id)
+      : [];
+    const partner = remainingSplitLeaves[0] ?? null;
+    if (hasPane(splitRoot, id)) splitRoot = removePane(splitRoot, id);
     tabState = closeTab(tabState, id, partner);
     const { [id]: _status, ...statuses } = tabStatuses;
     tabStatuses = statuses;
+    const { [id]: _osc, ...oscStatuses } = tabAgentStatuses;
+    tabAgentStatuses = oscStatuses;
     unread = new Set([...unread].filter((key) => key !== id));
     const { [id]: _gone, ...rest } = sessions;
     sessions = rest;
     const { [id]: _page, ...pages } = browsers;
     browsers = pages;
+    const { [id]: _file, ...files } = filePanes;
+    filePanes = files;
   }
 
   /**
@@ -777,22 +1286,416 @@
       return undefined;
     }
     if (!canCreateKind("browser")) return capacityTitleFor("browser");
+    const prevActive = tabState.activeId;
     const opened = openBrowserTab(tabState, url);
     if (!opened.id) return capacityTitleFor("browser");
     focusTabStrip = false;
     tabState = opened.state;
-    if (splitIds && activeId) splitIds = [splitIds[0], activeId];
+    if (prevActive && opened.id !== prevActive && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+      zoomedPaneId = null;
+      splitRoot = splitPane(splitRoot, prevActive, opened.id, "row", "after", 0.5);
+    } else if (splitRoot && prevActive && !hasPane(splitRoot, opened.id)) {
+      splitRoot = replacePane(splitRoot, prevActive, opened.id);
+    }
     return undefined;
   }
 
-  /** Brings a tab's session forward: the terminal's grid, or the browser's page. */
+  /**
+   * Opens or reuses a split `TerminalFilePane` beside the current terminal.
+   * Returns an error message when refused, or `undefined` when shown.
+   */
+  function openFileSplitFor(
+    filePath?: string,
+    line: number | null = null,
+    column: number | null = null,
+    options?: {
+      focus?: boolean;
+      anchorId?: string;
+      checkout?: string;
+      fallbackPath?: string;
+      direction?: SplitDirection;
+      position?: "before" | "after";
+    },
+  ): string | undefined {
+    if (!repoPath) return "Open a repository first";
+    const anchorId = options?.anchorId ?? tabState.activeId;
+    const direction = options?.direction ?? "row";
+    const position = options?.position ?? "after";
+    const shouldFocus = options?.focus ?? false;
+    const existing = fileTabFor(tabState, filePath, options?.checkout);
+    if (!existing && !canCreateKind("file")) return capacityTitleFor("file");
+    const result = openFileTab(tabState, {
+      filePath,
+      fallbackPath: options?.fallbackPath,
+      checkout: options?.checkout,
+      line,
+      column,
+      reuseExisting: true,
+      focus: shouldFocus,
+    });
+    if (!result.id) return capacityTitleFor("file");
+    focusTabStrip = false;
+    tabState = result.state;
+    if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+    if (anchorId && result.id !== anchorId && !hasPane(splitRoot, result.id)) {
+      const splitTarget = splitRoot
+        ? (hasPane(splitRoot, anchorId) ? anchorId : leafPaneIds(splitRoot)[0])
+        : anchorId;
+      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+        splitRoot = splitPane(splitRoot, splitTarget, result.id, direction, position, 0.5);
+      } else if (splitRoot && splitTarget) {
+        splitRoot = replacePane(splitRoot, splitTarget, result.id);
+      }
+    } else if (
+      options?.direction &&
+      anchorId &&
+      result.id !== anchorId &&
+      hasPane(splitRoot, result.id)
+    ) {
+      splitRoot = movePaneToSplit(splitRoot, result.id, anchorId, direction, position);
+    }
+    return undefined;
+  }
+
+  function tabIdForBackendSession(backendSessionId: string): string | null {
+    if (!backendSessionId) return null;
+    for (const [id, inst] of Object.entries(sessions)) {
+      if (inst?.backendSessionId?.() === backendSessionId) return id;
+    }
+    const byAttach = tabState.tabs.find((tab) => tab.attachSessionId === backendSessionId);
+    if (byAttach) return byAttach.id;
+    const reg = sessionByNativeId(get(terminalSessions), backendSessionId);
+    if (reg && tabState.tabs.some((tab) => tab.id === reg.key)) return reg.key;
+    return null;
+  }
+
+  function handleChildSpawned(payload: TerminalChildSpawnedPayload) {
+    if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
+    const startDir = relativeToRepo(payload.cwd, repoPath);
+    const parentTabId = tabIdForBackendSession(payload.parent_session_id) ?? tabState.activeId;
+    const result = openAttachedChildTab(tabState, {
+      sessionId: payload.id,
+      parentSessionId: payload.parent_session_id,
+      launcher: payload.launcher,
+      title: payload.title,
+      startDir: startDir && startDir !== "." ? startDir : null,
+      focus: false,
+    });
+    if (!result.id) {
+      sessionError = capacityTitleFor("shell");
+      return;
+    }
+    focusTabStrip = false;
+    mode = "shell";
+    tabState = result.state;
+    if (payload.split && parentTabId && parentTabId !== result.id && !hasPane(splitRoot, result.id)) {
+      const splitTarget = splitRoot
+        ? (hasPane(splitRoot, parentTabId) ? parentTabId : leafPaneIds(splitRoot)[0])
+        : parentTabId;
+      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+        if (zoomedPaneId && zoomedPaneId !== parentTabId) zoomedPaneId = null;
+        splitRoot = splitPane(splitRoot, splitTarget, result.id, "row", "after", 0.5);
+      }
+    }
+  }
+
+  function handleChildClosed(payload: TerminalChildClosedPayload) {
+    if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
+    const childTabId = tabIdForBackendSession(payload.id);
+    if (!childTabId) return;
+    if (tabState.tabs.some((tab) => tab.id === childTabId)) {
+      dropTab(childTabId);
+    }
+  }
+
+  async function stopActiveChildren() {
+    const targets = [...activeChildTabs];
+    for (const child of targets) {
+      try {
+        await sessions[child.id]?.close();
+      } catch (error: unknown) {
+        sessionError = formatError(error);
+        continue;
+      }
+      if (tabState.tabs.some((candidate) => candidate.id === child.id)) {
+        dropTab(child.id);
+      }
+    }
+  }
+
+  function handOffToPairPartner() {
+    const partner = pairHandoffTarget;
+    if (!activeTab || !partner) return;
+    const visibleFileTab = tabState.tabs.find(
+      (tab) => tab.launcher === "file" && visibleIds.includes(tab.id) && tab.filePath,
+    );
+    const tail =
+      sessions[activeTab.id]?.retainedOutput() ||
+      sessions[activeTab.id]?.serializeVisualOutput() ||
+      "";
+    const prompt = buildPairHandoffPrompt({
+      fromLauncher: activeTab.launcher,
+      checkoutBranch: checkoutInfo?.currentBranch ?? null,
+      openFilePath: visibleFileTab?.filePath ?? null,
+      openFileLine: visibleFileTab?.revealLine ?? null,
+      terminalTail: tail,
+    });
+    selectTab(partner.id);
+    const inserted = sessions[partner.id]?.insertText(prompt, { focus: true }) ?? false;
+    if (!inserted) {
+      sessionError = `${launcherLabel(partner.launcher)} session is not ready to receive input yet.`;
+    }
+  }
+
+  function handleAgentOpenFile(payload: TerminalOpenFileRequestPayload) {
+    if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
+    const anchorId = tabIdForBackendSession(payload.caller_session_id) ?? tabState.activeId ?? undefined;
+    mode = "shell";
+    const err = openFileSplitFor(payload.path, payload.line, payload.column, {
+      focus: false,
+      anchorId,
+    });
+    if (err) sessionError = err;
+  }
+
+  function handleAgentTouchedFile(payload: TerminalAgentTouchedFilePayload) {
+    if (!repoPath) return;
+    const sourceTabId = tabIdForBackendSession(payload.id);
+    const sourceTab = sourceTabId ? tabState.tabs.find((t) => t.id === sourceTabId) : undefined;
+    const matchesPanel =
+      sameRepo(payload.repo_path, repoPath, pathOpts) ||
+      Boolean(sourceTab?.checkout && sameRepo(payload.repo_path, sourceTab.checkout, pathOpts));
+    if (!matchesPanel) return;
+
+    // Always live-refresh any file pane already displaying this exact file on disk.
+    if (!payload.artifact) {
+      for (const tab of tabState.tabs) {
+        if (
+          tab.launcher === "file" &&
+          tab.filePath === payload.path &&
+          sameRepo(tab.checkout ?? repoPath, payload.repo_path, pathOpts)
+        ) {
+          filePanes[tab.id]?.reloadIfClean();
+        }
+      }
+    }
+
+    if (!followAgent) return;
+    if (sourceTabId && sourceTabId !== tabState.activeId && !visibleIds.includes(sourceTabId)) {
+      return;
+    }
+
+    if (payload.artifact) {
+      if (sourceTabId) {
+        void sessions[sourceTabId]?.openAgentArtifact();
+      }
+      return;
+    }
+
+    const checkout = sourceTab?.checkout;
+    const existingVisibleFile = tabState.tabs.find(
+      (t) =>
+        t.launcher === "file" &&
+        visibleIds.includes(t.id) &&
+        sameRepo(t.checkout ?? repoPath, payload.repo_path, pathOpts),
+    );
+    if (existingVisibleFile) {
+      if (existingVisibleFile.filePath !== payload.path) {
+        tabState = setTabFile(tabState, existingVisibleFile.id, payload.path, 1, null);
+      }
+      void tick().then(() => filePanes[existingVisibleFile.id]?.reloadIfClean());
+      return;
+    }
+
+    const err = openFileSplitFor(payload.path, 1, null, {
+      focus: false,
+      anchorId: sourceTabId ?? tabState.activeId ?? undefined,
+      checkout,
+    });
+    if (err) {
+      sessionError = err;
+      return;
+    }
+    void tick().then(() => {
+      const target = fileTabFor(tabState, payload.path, checkout);
+      if (target) filePanes[target.id]?.reloadIfClean();
+    });
+  }
+
+  function handleFileDropOnPane(paneId: string, paths: string[], region: DropRegion): boolean {
+    if (!repoPath || paths.length === 0) return false;
+    const tab = tabState.tabs.find((candidate) => candidate.id === paneId);
+    const paneRepo = tab?.checkout ?? repoPath;
+    if (region !== "center" && paths.length === 1) {
+      const rel = relativeToRepo(paths[0], paneRepo);
+      if (rel && rel !== ".") {
+        const direction: SplitDirection = region === "left" || region === "right" ? "row" : "col";
+        const position: "before" | "after" = region === "left" || region === "top" ? "before" : "after";
+        const err = openFileSplitFor(rel, 1, null, {
+          focus: true,
+          anchorId: paneId,
+          checkout: tab?.checkout,
+          direction,
+          position,
+        });
+        if (err) sessionError = err;
+        return true;
+      }
+    }
+
+    if (!tab) return false;
+    if (tab.launcher === "file") {
+      const rel = relativeToRepo(paths[0], paneRepo);
+      if (rel && rel !== ".") {
+        tabState = setTabFile(tabState, tab.id, rel, 1, null);
+        selectTab(tab.id);
+      } else {
+        sendPathsToPreferredSession(paths);
+      }
+      return true;
+    }
+    if (tab.launcher === "browser") {
+      sendPathsToPreferredSession(paths);
+      return true;
+    }
+    const formatted = formatDroppedPathsForSession(paths, {
+      launcher: tab.launcher,
+      repoPath: paneRepo,
+    });
+    if (!formatted) return false;
+    selectTab(tab.id);
+    const inserted = sessions[tab.id]?.insertText(formatted, { focus: true }) ?? false;
+    if (!inserted) {
+      sessionError = "This terminal session is no longer running.";
+    }
+    return true;
+  }
+
+  function canEdgeSplitDrop(paths: readonly string[], paneId?: string): boolean {
+    if (!repoPath || paths.length !== 1 || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) {
+      return false;
+    }
+    const paneTab = paneId ? tabState.tabs.find((candidate) => candidate.id === paneId) : undefined;
+    const rel = relativeToRepo(paths[0], paneTab?.checkout ?? repoPath);
+    return rel !== null && rel !== ".";
+  }
+
+  function paneDropZone(node: HTMLElement, initialPaneId: string) {
+    let currentId = initialPaneId;
+    let unregister = registerFor(currentId);
+
+    function registerFor(id: string) {
+      return terminalDropZones.register({
+        id,
+        getRect: () => node.getBoundingClientRect(),
+        isVisible: () =>
+          Boolean(
+            visible &&
+              mode === "shell" &&
+              (splitIds ? splitIds.includes(id) : activeId === id),
+          ),
+        canSplitEdges: (paths) => canEdgeSplitDrop(paths, id),
+        onHover: (region) => {
+          if (region) {
+            fileDropHint = { paneId: id, region };
+          } else if (fileDropHint?.paneId === id) {
+            fileDropHint = null;
+          }
+        },
+        onDrop: (paths, region) => handleFileDropOnPane(id, paths, region),
+      });
+    }
+
+    return {
+      update(nextId: string) {
+        if (nextId === currentId) return;
+        unregister();
+        currentId = nextId;
+        unregister = registerFor(currentId);
+      },
+      destroy() {
+        unregister();
+      },
+    };
+  }
+
+  function toggleFilePaneSplit() {
+    const existing = tabState.tabs.find((tab) => tab.launcher === "file");
+    if (existing && splitRoot && hasPane(splitRoot, existing.id)) {
+      void requestClose(existing.id);
+      return;
+    }
+    const err = openFileSplitFor(undefined, null, null, { focus: true });
+    if (err) sessionError = err;
+  }
+
+  function preferredRecipientSessionTab() {
+    const liveCandidates = tabState.tabs.filter(
+      (tab) => tab.launcher !== "browser" && tab.launcher !== "file" && sessions[tab.id]?.isLive(),
+    );
+    return (
+      liveCandidates.find((tab) => visibleIds.includes(tab.id) && isPromptLauncher(tab.launcher)) ??
+      liveCandidates.find((tab) => isPromptLauncher(tab.launcher)) ??
+      liveCandidates.find((tab) => visibleIds.includes(tab.id)) ??
+      liveCandidates[0]
+    );
+  }
+
+  /** Routes `@file#Lstart-Lend` or `@snapshot.png` attachments to the best live agent/shell session. */
+  function sendReferenceToAgent(reference: string) {
+    const preferred = preferredRecipientSessionTab();
+    if (!preferred) {
+      sessionError = "Open an agent or shell session first to send a reference.";
+      return;
+    }
+    selectTab(preferred.id);
+    sessions[preferred.id]?.insertText(reference, { focus: true });
+  }
+
+  /** Formats dropped/pasted paths for the actual recipient session (`@path` for agents, shell-escaped for shells). */
+  function sendPathsToPreferredSession(paths: readonly string[]) {
+    const preferred = preferredRecipientSessionTab();
+    if (!preferred || preferred.launcher === "browser" || preferred.launcher === "file" || !repoPath) {
+      sessionError = "Open an agent or shell session first to send a reference.";
+      return;
+    }
+    const formatted = formatDroppedPathsForSession(paths, {
+      launcher: preferred.launcher,
+      repoPath: preferred.checkout ?? repoPath,
+    });
+    if (!formatted) return;
+    selectTab(preferred.id);
+    sessions[preferred.id]?.insertText(formatted, { focus: true });
+  }
+
+  /** Brings a tab's session forward: the terminal's grid, the browser's page, or the file viewer. */
   function revealTab(id: string) {
-    (sessions[id] ?? browsers[id])?.reveal();
+    (sessions[id] ?? browsers[id] ?? filePanes[id])?.reveal();
   }
 
   function handleChord(event: KeyboardEvent): boolean {
     if (mode !== "shell") return false;
     if (!visible || event.defaultPrevented) return false;
+    const splitAction = terminalSplitChord(event, $hostPlatform.os);
+    if (splitAction) {
+      event.preventDefault();
+      event.stopPropagation();
+      focusTabStrip = false;
+      if (splitAction === "split-right") void splitActive("row");
+      else if (splitAction === "split-down") void splitActive("col");
+      else if (splitAction === "zoom-pane") toggleZoomPane();
+      else if (
+        splitAction === "focus-left" ||
+        splitAction === "focus-right" ||
+        splitAction === "focus-up" ||
+        splitAction === "focus-down"
+      ) {
+        const dir = splitAction.slice("focus-".length) as "left" | "right" | "up" | "down";
+        const neighbor = activeId ? adjacentPane(splitRoot, activeId, dir) : null;
+        if (neighbor) selectTab(neighbor);
+      }
+      return true;
+    }
     const chord = terminalTabChord(event);
     if (!chord) return false;
     event.preventDefault();
@@ -818,7 +1721,9 @@
       return;
     }
     if (handleChord(event)) return;
-    if (mode === "shell" && activeId) sessions[activeId]?.handleViewChord(event);
+    if (mode === "shell" && activeId) {
+      (sessions[activeId] ?? filePanes[activeId])?.handleViewChord(event);
+    }
   }
 
   async function handleTabKey(event: KeyboardEvent) {
@@ -885,13 +1790,125 @@
     });
   });
 
-  async function toggleSplit() {
-    if (splitIds) { splitIds = null; return; }
+  async function splitActive(direction: SplitDirection = "row") {
     const first = activeId;
     if (!first) return;
-    let second = tabState.tabs.find((tab) => tab.id !== first)?.id;
-    if (!second) { await openBeside(nextLauncher); second = activeId ?? undefined; }
-    if (second && second !== first && tabState.tabs.some((tab) => tab.id === first)) splitIds = [first, second];
+    zoomedPaneId = null;
+    if (leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) return;
+    const currentlyShown = new Set(splitRoot ? leafPaneIds(splitRoot) : [first]);
+    let second = tabState.tabs.find((tab) => !currentlyShown.has(tab.id))?.id;
+    if (!second) {
+      const savedRoot = splitRoot;
+      const fromId = tabState.activeId;
+      const read = nextLauncher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
+      const dir = startDirFrom(read ?? CONTEXT_UNKNOWN);
+      if (!repoPath || !canCreateKind(nextLauncher)) return;
+      focusTabStrip = false;
+      const created = openTab(tabState, nextLauncher);
+      const added = created.tabs.find((tab) => !tabState.tabs.includes(tab));
+      if (!added) return;
+      tabState = dir ? setTabStartDir(created, added.id, dir) : created;
+      splitRoot = savedRoot;
+      second = added.id;
+    }
+    if (second && second !== first && tabState.tabs.some((tab) => tab.id === first)) {
+      splitRoot = splitPane(splitRoot, first, second, direction, "after", 0.5);
+    }
+  }
+
+  async function toggleSplit() {
+    if (splitRoot) {
+      zoomedPaneId = null;
+      splitRoot = null;
+      return;
+    }
+    await splitActive("row");
+  }
+
+  function toggleZoomPane() {
+    if (!splitRoot || !activeId || !hasPane(splitRoot, activeId)) return;
+    zoomedPaneId = zoomedPaneId === activeId ? null : activeId;
+    void tick().then(() => {
+      if (activeId) revealTab(activeId);
+    });
+  }
+
+  function startSashDrag(event: PointerEvent, sash: SashDescriptor) {
+    if (event.button !== 0 || !panesContainerEl) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const handle = event.currentTarget as HTMLElement | null;
+    const pointerId = event.pointerId;
+    handle?.setPointerCapture?.(pointerId);
+    sashDragging = true;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (!panesContainerEl) return;
+      const rect = panesContainerEl.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      if (sash.direction === "row") {
+        const relX = (moveEvent.clientX - rect.left) / rect.width;
+        const localRatio = sash.parentBox.width > 0 ? (relX - sash.parentBox.left) / sash.parentBox.width : 0.5;
+        splitRoot = resizeBranch(splitRoot, sash.branchId, localRatio);
+      } else {
+        const relY = (moveEvent.clientY - rect.top) / rect.height;
+        const localRatio = sash.parentBox.height > 0 ? (relY - sash.parentBox.top) / sash.parentBox.height : 0.5;
+        splitRoot = resizeBranch(splitRoot, sash.branchId, localRatio);
+      }
+    };
+
+    const finish = () => {
+      handle?.releasePointerCapture?.(pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      sashDragging = false;
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  }
+
+  function handleSashKeydown(event: KeyboardEvent, sash: SashDescriptor) {
+    const step = event.shiftKey ? 0.1 : 0.05;
+    if (sash.direction === "row" && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      event.stopPropagation();
+      splitRoot = resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowRight" ? step : -step));
+    } else if (sash.direction === "col" && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      event.stopPropagation();
+      splitRoot = resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowDown" ? step : -step));
+    } else if (event.key === "Enter" || event.key === "Home") {
+      event.preventDefault();
+      event.stopPropagation();
+      splitRoot = equalizeSplits(splitRoot, sash.branchId);
+    }
+  }
+
+  function computeTabDropHint(event: DragEvent, paneId: string): { paneId: string; direction: SplitDirection; position: "before" | "after" } | null {
+    const el = event.currentTarget;
+    if (!(el instanceof HTMLElement)) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const rx = (event.clientX - rect.left) / rect.width;
+    const ry = (event.clientY - rect.top) / rect.height;
+    const distLeft = rx;
+    const distRight = 1 - rx;
+    const distTop = ry;
+    const distBottom = 1 - ry;
+    const min = Math.min(distLeft, distRight, distTop, distBottom);
+    if (min === distLeft) return { paneId, direction: "row", position: "before" };
+    if (min === distRight) return { paneId, direction: "row", position: "after" };
+    if (min === distTop) return { paneId, direction: "col", position: "before" };
+    return { paneId, direction: "col", position: "after" };
+  }
+
+  function paneBoxStyle(id: string): string {
+    const box = splitLayout.panes[id];
+    if (!box) return "left: 0%; top: 0%; width: 100%; height: 100%;";
+    return `left: ${(box.left * 100).toFixed(4)}%; top: ${(box.top * 100).toFixed(4)}%; width: ${(box.width * 100).toFixed(4)}%; height: ${(box.height * 100).toFixed(4)}%;`;
   }
 
   function showTabOptions() {
@@ -907,6 +1924,28 @@
     tabOptions = false;
   }
 
+  function openSnippetSplitFor(title: string, content: string): string | undefined {
+    if (!repoPath) return "Open a repository first";
+    if (!canCreateKind("file")) return capacityTitleFor("file");
+    const anchorId = tabState.activeId;
+    const result = openSnippetTab(tabState, { title, content, focus: false });
+    if (!result.id) return capacityTitleFor("file");
+    focusTabStrip = false;
+    tabState = result.state;
+    if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+    if (anchorId && result.id !== anchorId && !hasPane(splitRoot, result.id)) {
+      const splitTarget = splitRoot
+        ? (hasPane(splitRoot, anchorId) ? anchorId : leafPaneIds(splitRoot)[0])
+        : anchorId;
+      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+        splitRoot = splitPane(splitRoot, splitTarget, result.id, "row", "after", 0.5);
+      } else if (splitRoot && splitTarget) {
+        splitRoot = replacePane(splitRoot, splitTarget, result.id);
+      }
+    }
+    return undefined;
+  }
+
   function outputAction(event: Event) {
     if (!(event.currentTarget instanceof HTMLSelectElement) || !activeId) return;
     const session = sessions[activeId], action = event.currentTarget.value;
@@ -914,6 +1953,19 @@
     if (action === "selection") void session?.copySelection();
     else if (action === "copy") void session?.copyOutput();
     else if (action === "export") session?.exportOutput();
+    else if (action === "last-copy") {
+      void Promise.resolve(session?.copyLastCommandOutput()).then((copied) => {
+        if (!copied) sessionError = "No completed command block output available yet.";
+      });
+    } else if (action === "last-split") {
+      const block = session?.lastCommandOutput();
+      if (!block || !block.output.trim()) {
+        sessionError = "No completed command block output available yet.";
+        return;
+      }
+      const err = openSnippetSplitFor("Last command output", block.output);
+      if (err) sessionError = err;
+    }
   }
 
   function trimExecutions() {
@@ -1087,6 +2139,46 @@
       <span class="text-textMuted font-mono truncate text-micro" title={repoPath ?? "No repository"}>
         {repoPath?.split(/[\\/]/).pop() ?? "No repository"}
       </span>
+      {#if checkoutInfo && (checkoutInfo.currentBranch || checkoutInfo.label.checkout)}
+        <span
+          class="px-1.5 py-0.5 rounded border border-border/65 bg-surface font-mono text-micro text-textMuted truncate max-w-44"
+          data-testid="terminal-checkout-pill"
+          title={`Checkout: ${checkoutInfo.label.repository}${checkoutInfo.label.checkout ? ` · ${checkoutInfo.label.checkout}` : ""}${checkoutInfo.currentBranch ? ` (${checkoutInfo.currentBranch})` : ""}`}
+        >
+          {#if checkoutInfo.label.checkout}{checkoutInfo.label.checkout}{#if checkoutInfo.currentBranch} · {/if}{/if}{#if checkoutInfo.currentBranch}{checkoutInfo.currentBranch}{/if}
+        </span>
+      {/if}
+      {#if checkoutInfo && checkoutInfo.conflictedCount > 0}
+        <span
+          class="px-1.5 py-0.5 rounded border border-danger/35 bg-danger/10 text-danger text-micro shrink-0"
+          data-testid="terminal-conflict-pill"
+        >
+          {checkoutInfo.conflictedCount} {checkoutInfo.conflictedCount === 1 ? "conflict" : "conflicts"}
+        </span>
+      {/if}
+      {#if collisionSummary}
+        {#if !collisionSummary.ok}
+          <span
+            class="px-1.5 py-0.5 rounded border border-border/65 bg-surface text-textMuted text-micro shrink-0"
+            data-testid="terminal-collision-unverified"
+            title={collisionSummary.error || "Cross-worktree collision check unavailable"}
+          >
+            Collisions unverified
+          </span>
+        {:else if collisionSummary.overlapping_files > 0 || collisionSummary.shared_worktree_files > 0}
+          <span
+            class="px-1.5 py-0.5 rounded border border-warn/35 bg-warn/10 text-warn text-micro shrink-0"
+            data-testid="terminal-collision-pill"
+            title={collisionSummary.items.slice(0, 6).map((item) => item.path).join(", ") || "Concurrent dirty files across worktrees or live sessions"}
+          >
+            {#if collisionSummary.overlapping_files > 0}
+              {collisionSummary.overlapping_files} cross-worktree {collisionSummary.overlapping_files === 1 ? "collision" : "collisions"}
+            {:else}
+              {collisionSummary.shared_worktree_files} shared dirty {collisionSummary.shared_worktree_files === 1 ? "file" : "files"}
+            {/if}
+          </span>
+        {/if}
+      {/if}
     </div>
     <div class="flex items-center gap-1 shrink-0">
       <div class="gp-segmented" role="group" aria-label="Terminal mode">
@@ -1112,8 +2204,8 @@
         </button>
       </div>
       {#if mode === "shell"}
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsBrowser} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsBrowser} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsNonTerminal} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsNonTerminal} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
       {/if}
       {#if mode === "console" && executions.length > 0}
         <button
@@ -1310,7 +2402,9 @@
           class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-meta shrink-0 transition-colors {tab.id ===
           tabState.activeId
             ? 'bg-surface border-edgeStrong text-textPrimary'
-            : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
+            : splitRoot && visibleIds.includes(tab.id)
+              ? 'bg-surface/40 border-border/65 text-textPrimary'
+              : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
         >
           <button
             type="button"
@@ -1319,12 +2413,22 @@
             aria-controls={`terminal-pane-${tab.id}`}
             aria-selected={tab.id === tabState.activeId}
             tabindex={tab.id === tabState.activeId ? 0 : -1}
+            draggable="true"
+            ondragstart={(event) => {
+              draggedTabId = tab.id;
+              event.dataTransfer?.setData("application/x-gitpulse-terminal-tab", tab.id);
+              if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+            }}
+            ondragend={() => {
+              draggedTabId = null;
+              tabDropHint = null;
+            }}
             class="terminal-tab-label truncate"
             onclick={() => selectTab(tab.id)}
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
           >
-            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{/if}
+            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent/80 mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
           <button
             type="button"
@@ -1343,8 +2447,77 @@
       </div>
 
       <div class="flex items-center gap-1 shrink-0 pl-2">
+        {#if activeChildTabs.length > 0}
+          <button
+            type="button"
+            class="gp-btn py-0! px-1.5! text-micro! text-danger border-danger/35"
+            data-testid="terminal-stop-children-btn"
+            title="Terminate and close child sessions spawned by this agent"
+            onclick={() => void stopActiveChildren()}
+          >Stop children ({activeChildTabs.length})</button>
+        {/if}
+        {#if pairHandoffTarget}
+          <button
+            type="button"
+            class="gp-btn py-0! px-1.5! text-micro!"
+            data-testid="terminal-pair-handoff-btn"
+            title={`Send bounded context handoff to ${launcherLabel(pairHandoffTarget.launcher)}`}
+            onclick={handOffToPairPartner}
+          >Hand off → {launcherLabel(pairHandoffTarget.launcher)}</button>
+        {/if}
         <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
-        <button type="button" class="gp-icon-btn" aria-label={splitIds ? "Close split view" : "Split terminal"} aria-pressed={Boolean(splitIds)} disabled={!activeId || (tabState.tabs.length < 2 && !canCreate)} onclick={toggleSplit}><Columns2 size={13} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
+          aria-label={followAgent ? "Stop following agent edits" : "Follow agent file edits in split"}
+          aria-pressed={followAgent}
+          disabled={!repoPath}
+          data-testid="terminal-follow-agent-toggle"
+          title={followAgent ? "Following agent edits — live-opens or refreshes modified files & plans" : "Follow agent — auto-open modified files & plans in split pane"}
+          onclick={() => { followAgent = !followAgent; }}
+        ><Eye size={13} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn"
+          aria-label={hasVisibleFilePane ? "Close files split" : "Open files beside terminal"}
+          aria-pressed={hasVisibleFilePane}
+          disabled={!repoPath || (!hasVisibleFilePane && !canCreateKind("file"))}
+          title={hasVisibleFilePane ? "Close files split" : "Open files & Markdown beside terminal"}
+          onclick={toggleFilePaneSplit}
+        ><FolderTree size={13} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn"
+          aria-label="Split terminal right"
+          disabled={!activeId || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES || (tabState.tabs.length <= visibleIds.length && !canCreateKind(nextLauncher))}
+          title={`Split right (${platformChord("⌘D", "Ctrl+Shift+D", $hostPlatform.os)})`}
+          onclick={() => void splitActive("row")}
+        ><Columns2 size={13} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn"
+          aria-label="Split terminal down"
+          disabled={!activeId || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES || (tabState.tabs.length <= visibleIds.length && !canCreateKind(nextLauncher))}
+          title={`Split down (${platformChord("⌘⇧D", "Ctrl+Shift+Alt+D", $hostPlatform.os)})`}
+          onclick={() => void splitActive("col")}
+        ><Rows2 size={13} /></button>
+        {#if splitRoot}
+          <button
+            type="button"
+            class="gp-icon-btn px-1.5! text-micro!"
+            aria-label={zoomedPaneId ? "Restore split panes" : "Zoom active pane"}
+            aria-pressed={Boolean(zoomedPaneId)}
+            title={zoomedPaneId ? `Restore split panes (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})` : `Zoom active pane (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})`}
+            onclick={toggleZoomPane}
+          >{zoomedPaneId ? "Unzoom" : "Zoom"}</button>
+          <button
+            type="button"
+            class="gp-icon-btn px-1.5! text-micro!"
+            aria-label="Close split view"
+            title="Unsplit all panes (keeps tabs open)"
+            onclick={toggleSplit}
+          >1×</button>
+        {/if}
         <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
         <div class="relative shrink-0" data-terminal-launcher>
           <button
@@ -1434,6 +2607,50 @@
             <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
         </div>
+        <div class="gp-menu-sep my-1"></div>
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Workspace split presets">
+          <span class="gp-label px-2.5 py-0.5">Split presets</span>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-agent-diff"
+            disabled={!repoPath || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
+            title="Open coding agent beside a live Follow-Agent file/diff split"
+            onclick={openAgentDiffPreset}
+          >
+            Agent + Live Diff
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-pair-split-preset"
+            disabled={!repoPath || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 2 > $terminalSessionLimit}
+            title="Open Claude Code and Antigravity side-by-side in a 50/50 split"
+            onclick={openPairSplit}
+          >
+            Pair split: Claude + Antigravity
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-fullstack"
+            disabled={!repoPath || tabState.tabs.length + ($hostPlatform.browser_sessions ? 3 : 2) > MAX_STRIP_TABS || $terminalSessions.length + 2 > $terminalSessionLimit}
+            title="Open coding agent left with Shell + Browser stacked on the right"
+            onclick={openFullStackPreset}
+          >
+            Full-Stack: Agent + Shell + Browser
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-worktree-agent"
+            disabled={!repoPath || !onCreateAgentWorktree || creatingWorktreePreset || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
+            title="Provision a fresh sibling Git worktree (CoW caches + DevMap) and open an agent + live diff split inside it"
+            onclick={() => void openWorktreeAgentPreset()}
+          >
+            Isolated Worktree Agent Split…
+          </button>
+        </div>
       </div>
     {/if}
 
@@ -1443,14 +2660,18 @@
         <button type="submit" class="gp-btn" data-size="sm">Rename</button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
         <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={tabState.tabs.at(-1)?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, 1))}><ChevronRight size={13} /></button>
-        {#if !activeIsBrowser}
+        {#if !activeIsNonTerminal}
           <select aria-label="Terminal output actions" onchange={outputAction} class="gp-select">
-            <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
+            <option value="">Output actions</option><option value="selection">Copy selection</option><option value="last-copy">Copy last command output</option><option value="last-split">Open last output in split</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
           </select>
         {/if}
       </form>
     {/if}
-    <div class="terminal-panes flex-1 min-h-0 relative" class:hidden={mode !== "shell"}>
+    <div class="terminal-panes flex-1 min-h-0 relative" data-split={splitRoot !== null ? "true" : "false"} class:hidden={mode !== "shell"}>
+      <!-- Pane boxes are fractions of this canvas, which is never shorter
+           than every pane's minimum: a short dock scrolls its panes instead
+           of squeezing a split to grids with no rows. Sash drags measure it. -->
+      <div bind:this={panesContainerEl} class="terminal-panes-canvas relative h-full" style:min-height={`${paneCanvasMinHeight}px`}>
       {#if !repoPath}
         <div class="h-full flex items-center justify-center text-textMuted text-xs">
           Open a repository to start a shell.
@@ -1474,12 +2695,90 @@
           <!-- Absolute so hidden siblings keep their box: a session laid out
                at zero height would have its xterm reflow to a 1-row grid and
                tell the shell about it. -->
+          {@const isVisiblePane = splitIds ? splitIds.includes(tab.id) : tab.id === tabState.activeId}
           <div
-            class="terminal-pane absolute inset-0"
-            data-position={splitIds?.[0] === tab.id ? "left" : splitIds?.[1] === tab.id ? "right" : "full"}
-            class:hidden={splitIds ? !splitIds.includes(tab.id) : tab.id !== tabState.activeId}
+            use:paneDropZone={tab.id}
+            class="terminal-pane absolute overflow-hidden {splitRoot && !zoomedPaneId && tab.id === tabState.activeId ? 'ring-1 ring-inset ring-accent/40' : ''}"
+            style={paneBoxStyle(tab.id)}
+            data-pane-id={tab.id}
+            data-split-active={splitRoot && tab.id === tabState.activeId ? "true" : "false"}
+            class:hidden={!isVisiblePane}
             onfocusin={() => { if (activeId !== tab.id) selectTab(tab.id); }}
+            onpointerdown={() => { if (splitRoot && activeId !== tab.id) selectTab(tab.id); }}
+            ondragover={(event) => {
+              if (draggedTabId) {
+                if (draggedTabId === tab.id) return;
+                if (!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) return;
+                event.preventDefault();
+                if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+                tabDropHint = computeTabDropHint(event, tab.id);
+                return;
+              }
+              const inApp = terminalDropZones.currentInAppDrag();
+              const isFileDrag = Boolean(
+                inApp || event.dataTransfer?.types.includes("application/x-gitpulse-filepath"),
+              );
+              if (!isFileDrag) return;
+              event.preventDefault();
+              if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+              const el = event.currentTarget;
+              if (!(el instanceof HTMLElement)) return;
+              const allowEdges = Boolean(inApp?.filesOnly && canEdgeSplitDrop(inApp.paths, tab.id));
+              const region = classifyDropRegion(
+                { x: event.clientX, y: event.clientY },
+                el.getBoundingClientRect(),
+                allowEdges,
+              );
+              fileDropHint = region ? { paneId: tab.id, region } : null;
+            }}
+            ondragleave={(event) => {
+              if (event.currentTarget instanceof HTMLElement && event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                return;
+              }
+              if (tabDropHint?.paneId === tab.id) tabDropHint = null;
+              if (fileDropHint?.paneId === tab.id) fileDropHint = null;
+            }}
+            ondrop={(event) => {
+              if (draggedTabId) {
+                if (draggedTabId === tab.id) return;
+                if (!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) {
+                  draggedTabId = null;
+                  tabDropHint = null;
+                  return;
+                }
+                event.preventDefault();
+                const hint = computeTabDropHint(event, tab.id);
+                const moving = draggedTabId;
+                draggedTabId = null;
+                tabDropHint = null;
+                if (hint) {
+                  zoomedPaneId = null;
+                  splitRoot = movePaneToSplit(splitRoot, moving, tab.id, hint.direction, hint.position);
+                  selectTab(moving);
+                }
+                return;
+              }
+              const inApp = terminalDropZones.currentInAppDrag();
+              const transferred = event.dataTransfer?.getData("application/x-gitpulse-filepath")?.trim();
+              const paths = inApp?.paths ?? (transferred ? [transferred] : []);
+              if (paths.length === 0) return;
+              event.preventDefault();
+              const el = event.currentTarget;
+              const allowEdges = Boolean((inApp?.filesOnly ?? true) && canEdgeSplitDrop(paths, tab.id));
+              const region =
+                el instanceof HTMLElement
+                  ? classifyDropRegion(
+                      { x: event.clientX, y: event.clientY },
+                      el.getBoundingClientRect(),
+                      allowEdges,
+                    )
+                  : "center";
+              fileDropHint = null;
+              terminalDropZones.endInAppDrag();
+              handleFileDropOnPane(tab.id, paths, region ?? "center");
+            }}
             role="tabpanel"
+            tabindex="-1"
             id={`terminal-pane-${tab.id}`}
             aria-labelledby={`terminal-tab-${tab.id}`}
             aria-label={tabLabel(tab)}
@@ -1492,6 +2791,24 @@
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               initialUrl={tab.url}
               onUrl={(url) => (tabState = setTabUrl(tabState, tab.id, url))}
+              onSendToAgent={sendReferenceToAgent}
+            />
+            {:else if tab.launcher === "file"}
+            <TerminalFilePane
+              bind:this={filePanes[tab.id]}
+              repoPath={tab.checkout ?? repoPath}
+              tabId={tab.id}
+              filePath={tab.filePath}
+              fallbackPath={tab.fallbackPath}
+              snippet={tab.snippet ?? null}
+              revealLine={tab.revealLine ?? null}
+              revealColumn={tab.revealColumn ?? null}
+              revealSeq={tab.revealSeq ?? 0}
+              onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
+              onSelectFile={(fp, line, col) => (tabState = setTabFile(tabState, tab.id, fp, line ?? null, col ?? null))}
+              onResolvedPath={(fp) => (tabState = setTabFile(tabState, tab.id, fp, null, null, { preserveReveal: true }))}
+              onOpenInCodeView={onOpenInCodeView}
+              onSendToAgent={sendReferenceToAgent}
             />
             {:else}
             <TerminalSession
@@ -1511,6 +2828,10 @@
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
+              onOpenFileSplit={(path, line, column, fallbackPath) => Boolean(openFileSplitFor(path, line, column, { focus: false, anchorId: tab.id, checkout: tab.checkout, fallbackPath }) === undefined)}
+              onOpenSnippetSplit={(title, content) => openSnippetSplitFor(title, content) === undefined}
+              onSendToAgent={sendReferenceToAgent}
+              onAgentStatus={(st) => { tabAgentStatuses = { ...tabAgentStatuses, [tab.id]: st }; }}
               revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
               confirmCloseSelf={() => confirmClose(tab.id)}
               title={tab.name}
@@ -1518,9 +2839,72 @@
               onActivity={() => { if (paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
             {/if}
+            {#if tabDropHint?.paneId === tab.id}
+              <div
+                class="pointer-events-none absolute bg-accent/20 border-2 border-accent/65 transition-opacity"
+                style:z-index={LAYERS.SCROLL_CUE}
+                style={tabDropHint.direction === "row"
+                  ? (tabDropHint.position === "before" ? "left:0;top:0;width:50%;height:100%;" : "left:50%;top:0;width:50%;height:100%;")
+                  : (tabDropHint.position === "before" ? "left:0;top:0;width:100%;height:50%;" : "left:0;top:50%;width:100%;height:50%;")}
+              ></div>
+            {/if}
+            {#if fileDropHint?.paneId === tab.id}
+              <div
+                data-testid={`terminal-file-drop-${fileDropHint.region}`}
+                class="pointer-events-none absolute flex items-center justify-center bg-accent/15 border-2 border-dashed border-accent/65 transition-opacity"
+                style:z-index={LAYERS.SCROLL_CUE}
+                style={fileDropHint.region === "center"
+                  ? "left:6px;top:6px;right:6px;bottom:6px;border-radius:8px;"
+                  : fileDropHint.region === "left"
+                    ? "left:0;top:0;width:50%;height:100%;"
+                    : fileDropHint.region === "right"
+                      ? "left:50%;top:0;width:50%;height:100%;"
+                      : fileDropHint.region === "top"
+                        ? "left:0;top:0;width:100%;height:50%;"
+                        : "left:0;top:50%;width:100%;height:50%;"}
+              >
+                <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/65 text-meta font-medium text-textPrimary shadow-sm">
+                  {fileDropHint.region !== "center"
+                    ? "Split & open file"
+                    : isPromptLauncher(tab.launcher)
+                      ? `Attach @path to ${launcherLabel(tab.launcher)}`
+                      : tab.launcher === "file"
+                        ? "Open file in pane"
+                        : "Insert path into shell"}
+                </span>
+              </div>
+            {/if}
+          </div>
+        {/each}
+        {#each splitLayout.sashes as sash (sash.branchId)}
+          <!-- Justified: WAI-ARIA 1.2 Window Splitter pattern requires a focusable separator with arrow-key resizing; Svelte's static check classifies role="separator" as non-interactive. -->
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <div
+            role="separator"
+            tabindex="0"
+            aria-orientation={sash.direction === "row" ? "vertical" : "horizontal"}
+            aria-label={sash.direction === "row" ? "Resize split columns (double-click to equalize)" : "Resize split rows (double-click to equalize)"}
+            aria-valuenow={Math.round(sash.ratio * 100)}
+            aria-valuemin={15}
+            aria-valuemax={85}
+            data-split-sash={sash.branchId}
+            class="terminal-split-sash absolute flex items-center justify-center select-none group {sash.direction === 'row' ? '-ml-[3px] w-1.5 cursor-col-resize' : '-mt-[3px] h-1.5 cursor-row-resize'}"
+            style:z-index={LAYERS.STICKY}
+            style={sash.direction === "row"
+              ? `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; height: ${(sash.box.height * 100).toFixed(4)}%;`
+              : `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; width: ${(sash.box.width * 100).toFixed(4)}%;`}
+            onpointerdown={(event) => startSashDrag(event, sash)}
+            ondblclick={() => { splitRoot = equalizeSplits(splitRoot, sash.branchId); }}
+            onkeydown={(event) => handleSashKeydown(event, sash)}
+          >
+            <span
+              class="pointer-events-none transition-colors bg-border group-hover:bg-accent/70 group-focus-visible:bg-accent {sash.direction === 'row' ? 'w-px h-full group-hover:w-0.5' : 'h-px w-full group-hover:h-0.5'}"
+            ></span>
           </div>
         {/each}
       {/if}
+      </div>
     </div>
 
   {#if mode === "console"}
@@ -1751,14 +3135,7 @@
   .terminal-tab-label { max-width: 14rem; }
   [data-crowded="true"] .terminal-tab-label { max-width: 7rem; }
   .terminal-panes { container-type: inline-size; overflow: auto; }
-  /* Keep a readable grid after Find, warnings, popovers, and the footer
-     take their space. Short docks scroll their panes instead of crushing
-     them to zero. */
-  .terminal-pane { min-height: 180px; }
-  .terminal-pane[data-position="left"] { right: 50%; border-right: 1px solid var(--color-border); }
-  .terminal-pane[data-position="right"] { left: 50%; }
-  @container (max-width: 620px) {
-    .terminal-pane[data-position="left"] { right: 0; bottom: auto; height: max(50%, 180px); border-right: 0; border-bottom: 1px solid var(--color-border); }
-    .terminal-pane[data-position="right"] { left: 0; top: max(50%, 180px); bottom: auto; height: max(50%, 180px); }
-  }
+  /* Each pane keeps at least MIN_PANE_HEIGHT_PX through the canvas's
+     min-height (`minimumSplitHeight`), so Find, warnings and the footer leave
+     a readable grid and short docks scroll their panes instead. */
 </style>

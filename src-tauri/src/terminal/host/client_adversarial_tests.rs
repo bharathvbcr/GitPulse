@@ -261,6 +261,7 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                             run_id: run.clone(),
                             detached: false,
                             ending: false,
+                            parent_session_id: None,
                         })
                         .collect();
                     Ok(serde_json::to_value(listed).unwrap())
@@ -379,6 +380,10 @@ fn spawn_request(session: &str) -> SpawnRequest {
         args: None,
         env: None,
         run_id: None,
+        parent_session_id: None,
+        child_launcher: None,
+        child_title: None,
+        token_hash_hex: None,
     }
 }
 

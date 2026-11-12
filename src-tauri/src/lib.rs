@@ -322,6 +322,7 @@ pub fn run() {
             // writer election and reads instead.
             start_host_load_sampler(app.handle());
             alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
+            workbench::agy_plugin::apply_from_settings();
             crate::tool_install::set_app_handle(app.handle().clone());
             crate::devmap::set_build_progress_handle(app.handle().clone());
             if let Err(error) = storage::hygiene::global::start_scheduler() {
@@ -336,6 +337,14 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let Err(error) = desktop::terminate::install(app.handle()) {
                 log::error!(target: "setup", "quit guard not installed; AppKit quits bypass it: {error}");
+            }
+            // Unlock 120 Hz ProMotion rendering on macOS WKWebView (guarded by
+            // `objc2::exception::catch` in case a future WebKit drops the KVC key).
+            {
+                use tauri::Manager as _;
+                if let Some(window) = app.get_webview_window("main") {
+                    desktop::webview_perf::unlock_window_high_refresh_rate(&window);
+                }
             }
             // Login-item / LaunchAgent starts with --background: stay in the
             // menu bar until the frontend projects showStatusIcon. If the icon
@@ -394,6 +403,9 @@ pub fn run() {
             browser::commands::cmd_browser_navigate,
             browser::commands::cmd_browser_go,
             browser::commands::cmd_browser_close,
+            browser::commands::cmd_browser_snapshot,
+            browser::commands::cmd_browser_snapshot_preview,
+            browser::commands::cmd_browser_inspect_point,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,
@@ -568,12 +580,16 @@ pub fn run() {
             cmd_terminal_write,
             cmd_terminal_ack,
             cmd_terminal_export,
+            cmd_terminal_save_clipboard_image,
+            cmd_terminal_clipboard_files,
+            cmd_terminal_read_agent_artifact,
             cmd_terminal_resize,
             cmd_terminal_kill,
             cmd_terminal_incidents,
             cmd_terminal_conversations,
             cmd_terminal_backend,
             cmd_terminal_context,
+            cmd_terminal_listening_ports,
             cmd_terminal_sessions,
             cmd_terminal_transcript,
             cmd_terminal_attach,

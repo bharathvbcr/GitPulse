@@ -107,6 +107,8 @@ export interface HostedAgent {
   startedAt: number;
   /** The signal that ended it, when one did. Null while it runs or after a clean end. */
   endedSignal: string | null;
+  /** Live artifact directory reported by Antigravity `SessionStart`, when present. */
+  artifactDir?: string | null;
 }
 
 export type HostedClaude = HostedAgent;
@@ -183,6 +185,7 @@ export function readHostedAgent(raw: unknown): HostedAgent | null {
     mode: isPermissionMode(r.mode) ? r.mode : null,
     startedAt: r.startedAt,
     endedSignal: text(r.endedSignal, 128),
+    artifactDir: text(r.artifactDir, 4096),
   };
 }
 
@@ -228,6 +231,7 @@ export function createHostedAgentStore(storage: HostedStorage | null) {
         provider: record.provider ?? "claude",
         terminalId: null,
         endedSignal: null,
+        artifactDir: record.artifactDir ?? null,
       });
       persist();
     },
@@ -237,6 +241,47 @@ export function createHostedAgentStore(storage: HostedStorage | null) {
       if (!record) return;
       records.set(sessionId, { ...record, terminalId });
       persist();
+    },
+    /**
+     * Records or updates the authoritative live conversation id and artifact
+     * directory reported by a SessionStart hook (such as Antigravity's
+     * `conversationId` + `artifactDirectoryPath`).
+     */
+    bindAgentMeta(meta: {
+      terminalId: string;
+      sessionId: string;
+      provider: AgentProvider;
+      repoPath: string;
+      startDir: string | null;
+      mode: PermissionMode | null;
+      artifactDir?: string | null;
+      startedAt?: number;
+    }): HostedAgent | null {
+      if (!isSessionId(meta.sessionId)) return null;
+      const sessionId = meta.sessionId.toLowerCase();
+      const terminalId = text(meta.terminalId, 128);
+      const repoPath = text(meta.repoPath, 4096);
+      if (!terminalId || !repoPath) return null;
+      for (const [existingId, record] of records.entries()) {
+        if (existingId !== sessionId && record.terminalId === terminalId) {
+          records.set(existingId, { ...record, terminalId: null });
+        }
+      }
+      const existing = records.get(sessionId);
+      const next: HostedAgent = {
+        sessionId,
+        provider: meta.provider === "agy" ? "agy" : "claude",
+        terminalId,
+        repoPath,
+        startDir: text(meta.startDir, 4096),
+        mode: isPermissionMode(meta.mode) ? meta.mode : (existing?.mode ?? null),
+        startedAt: existing?.startedAt ?? (typeof meta.startedAt === "number" && Number.isFinite(meta.startedAt) ? meta.startedAt : Date.now()),
+        endedSignal: null,
+        artifactDir: text(meta.artifactDir, 4096) ?? existing?.artifactDir ?? null,
+      };
+      records.set(sessionId, next);
+      persist();
+      return next;
     },
     /** Records how it ended: a signal name, or null for any other end. */
     ended(sessionId: string, signal: string | null) {

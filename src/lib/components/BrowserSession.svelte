@@ -25,14 +25,17 @@
    */
   import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
-  import { AlertCircle, ArrowLeft, ArrowRight, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { AlertCircle, ArrowLeft, ArrowRight, Camera, Crosshair, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
+  import { invoke } from "../ipc/invoke";
   import { pageZoom } from "../ui/uiScale";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { formatError } from "../ui/formatError";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
   import {
     browserIpc,
+    cropSnapshotToElementBase64,
+    formatPickedElementReference,
     isOccluded,
     lastAddress,
     normalizeAddress,
@@ -43,6 +46,7 @@
     sameBounds,
     samplePoints,
     toWindowPoints,
+    type BrowserSnapshotPreview,
     type HistoryStep,
     type PageEvent,
     type PaneBounds,
@@ -54,9 +58,10 @@
     onTitle,
     initialUrl,
     onUrl,
+    onSendToAgent,
   }: {
     tabId: string;
-    /** This tab's pane is the one (or one of the split two) on screen. */
+    /** This tab's pane is the one (or one of the split panes) on screen. */
     onscreen?: boolean;
     /** The page's title, for the tab strip. */
     onTitle?: (title: string) => void;
@@ -64,11 +69,17 @@
     initialUrl?: string;
     /** The address the page last loaded, for the tab (`setTabUrl`). */
     onUrl?: (url: string) => void;
+    /** Attaches a captured viewport PNG (`@path`) to the active coding agent. */
+    onSendToAgent?: (reference: string) => void;
   } = $props();
 
   let address = $state(lastAddress());
   let editing = $state(false);
   let loading = $state(false);
+  let capturing = $state(false);
+  let picking = $state(false);
+  let inspecting = $state(false);
+  let pickPreview = $state.raw<BrowserSnapshotPreview | null>(null);
   let error = $state<string | null>(null);
   let opened = $state(false);
   let occluded = $state(false);
@@ -79,7 +90,7 @@
   let disposed = false;
   let opening = false;
 
-  const shown = $derived(paneShown({ opened, onscreen, occluded, bounds }));
+  const shown = $derived(paneShown({ opened, onscreen, occluded, picking, bounds }));
 
   /**
    * Every command to this session's pane, in order. They are separate async
@@ -231,6 +242,7 @@
     if (!url) return;
     error = null;
     editing = false;
+    cancelPickElement();
     addressInput?.blur();
     if (opened) {
       await send(() => browserIpc.navigate(tabId, url));
@@ -255,8 +267,27 @@
   }
 
   function step(to: HistoryStep) {
+    cancelPickElement();
     if (opened) void send(() => browserIpc.go(tabId, to));
   }
+
+  function cancelPickElement() {
+    picking = false;
+    pickPreview = null;
+  }
+
+  $effect(() => {
+    if (!picking) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelPickElement();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  });
 
   function onAddressKey(event: KeyboardEvent) {
     if (event.key === "Escape") {
@@ -304,6 +335,81 @@
     }
   }
 
+  /** Captures a native WKWebView PNG screenshot and attaches `@path` to the active agent. */
+  async function snapshotToAgent() {
+    if (!opened || capturing || inspecting || !onSendToAgent) return;
+    capturing = true;
+    error = null;
+    try {
+      const pngPath = await browserIpc.snapshot(tabId);
+      const formattedPath = /\s/.test(pngPath) ? `"${pngPath}"` : pngPath;
+      onSendToAgent(`@${formattedPath} `);
+    } catch (cause) {
+      if (!disposed) error = `Could not capture snapshot: ${formatError(cause)}`;
+    } finally {
+      if (!disposed) capturing = false;
+    }
+  }
+
+  /** Freezes a snapshot overlay over the hidden WKWebView so clicking picks a DOM element for the agent. */
+  async function togglePickElement() {
+    if (!opened || capturing || inspecting || !onSendToAgent) return;
+    if (picking) {
+      cancelPickElement();
+      return;
+    }
+    capturing = true;
+    error = null;
+    try {
+      const preview = await browserIpc.snapshotPreview(tabId);
+      if (!disposed) {
+        pickPreview = preview;
+        picking = true;
+      }
+    } catch (cause) {
+      if (!disposed) error = `Could not start element picker: ${formatError(cause)}`;
+    } finally {
+      if (!disposed) capturing = false;
+    }
+  }
+
+  async function pickElementAt(event: MouseEvent) {
+    if (!picking || inspecting || !host || !pickPreview || !onSendToAgent) return;
+    const rect = host.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return;
+    const x = Math.min(rect.width, Math.max(0, event.clientX - rect.left));
+    const y = Math.min(rect.height, Math.max(0, event.clientY - rect.top));
+    const snapshot = pickPreview;
+    inspecting = true;
+    error = null;
+    try {
+      const picked = await browserIpc.inspectPoint(tabId, x, y, rect.width, rect.height);
+      const croppedBase64 = await cropSnapshotToElementBase64(snapshot.data_url, picked);
+      let imagePath = snapshot.path;
+      if (croppedBase64) {
+        try {
+          imagePath = await invoke<string>("cmd_terminal_save_clipboard_image", {
+            tabId,
+            pngBase64: croppedBase64,
+          });
+        } catch {
+          imagePath = snapshot.path;
+        }
+      }
+      if (!disposed) {
+        cancelPickElement();
+        onSendToAgent(formatPickedElementReference(imagePath, picked));
+      }
+    } catch (cause) {
+      if (!disposed) {
+        cancelPickElement();
+        error = `Could not inspect element: ${formatError(cause)}`;
+      }
+    } finally {
+      if (!disposed) inspecting = false;
+    }
+  }
+
   export function reveal() {
     schedule();
     if (!opened) addressInput?.focus();
@@ -341,6 +447,30 @@
       onkeydown={onAddressKey}
     />
     <button type="submit" class="gp-btn text-meta!" data-size="sm">{opened ? "Go" : "Open"}</button>
+    {#if onSendToAgent}
+      <button
+        type="button"
+        class="gp-icon-btn {picking ? 'text-accent bg-accent/15' : ''}"
+        aria-label="Pick element for agent"
+        aria-pressed={picking}
+        title={picking ? "Cancel element picker (Esc)" : "Click an element on the page to send its selector + crop to the active agent"}
+        data-testid="browser-pick-element"
+        disabled={!opened || capturing || inspecting}
+        onclick={() => void togglePickElement()}
+      >
+        {#if inspecting}<LoaderCircle size={13} class="animate-spin" />{:else}<Crosshair size={13} />{/if}
+      </button>
+      <button
+        type="button"
+        class="gp-icon-btn"
+        aria-label="Snapshot to agent"
+        title="Capture viewport screenshot and attach to active agent"
+        disabled={!opened || capturing || inspecting}
+        onclick={() => void snapshotToAgent()}
+      >
+        {#if capturing && !picking}<LoaderCircle size={13} class="animate-spin" />{:else}<Camera size={13} />{/if}
+      </button>
+    {/if}
     <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
   {#if error}
@@ -357,6 +487,25 @@
         <span>Open a local development server, like <code>localhost:3000</code> or just <code>5173</code>.</span>
         <span class="text-micro max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
       </div>
+    {:else if picking && pickPreview}
+      <button
+        type="button"
+        class="relative h-full w-full block p-0 m-0 border-0 bg-transparent cursor-crosshair select-none overflow-hidden"
+        aria-label="Click an element on the snapshot to send it to the active agent"
+        data-testid="browser-pick-overlay"
+        disabled={inspecting}
+        onclick={(event) => void pickElementAt(event)}
+      >
+        <img
+          src={pickPreview.data_url}
+          alt="Browser viewport for element inspection"
+          class="h-full w-full object-fill pointer-events-none"
+          draggable="false"
+        />
+        <span class="pointer-events-none absolute top-2 left-1/2 -translate-x-1/2 rounded-full border border-accent/35 bg-background/90 px-2.5 py-0.5 text-micro font-medium text-text shadow">
+          {inspecting ? "Inspecting element…" : "Click any element to send selector + crop to agent · Esc to cancel"}
+        </span>
+      </button>
     {:else if onscreen && occluded}
       <div class="h-full flex items-center justify-center text-meta text-textMuted" data-testid="browser-session-covered">
         The page is hidden while a menu or dialog is open.
