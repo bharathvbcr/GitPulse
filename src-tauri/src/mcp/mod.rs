@@ -623,7 +623,7 @@ tool_args! {
             1,
             ft::MAX_TASK_KEY,
         ),
-        status: Option<String> = Spec::one_of("Board column (default inbox)", &ft::STATUSES),
+        status: Option<String> = Spec::one_of("Board column (default backlog)", &ft::STATUSES),
         priority: Option<u8> = Spec::int(
             "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
             0,
@@ -3613,7 +3613,31 @@ fn ask_app_to_orchestrate(
     }
 }
 
+/// The tools whose `status` argument names a board column. An agent written
+/// before `inbox` was merged into `backlog` may still send the old name.
+const BOARD_STATUS_TOOLS: [&str; 2] = ["gitpulse_add_task", "gitpulse_list_tasks"];
+
+/// `arguments` with a retired board status read as the column it became.
+///
+/// The advertised enum no longer lists the old name, so the call is
+/// canonicalised before the schema looks at it, not loosened to accept it:
+/// nothing is advertised under the old name, and the handler never sees it.
+fn with_current_board_status<'a>(name: &str, arguments: &'a Value) -> std::borrow::Cow<'a, Value> {
+    if BOARD_STATUS_TOOLS.contains(&name) {
+        if let Some(status) = arguments.get("status").and_then(Value::as_str) {
+            let current = ft::current_status(status);
+            if current != status {
+                let mut canonical = arguments.clone();
+                canonical["status"] = json!(current);
+                return std::borrow::Cow::Owned(canonical);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(arguments)
+}
+
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
+    let arguments = &*with_current_board_status(name, arguments);
     // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
     // then reads the accepted call into the tool's struct, and refuses what the
     // schema cannot (a number that is not exactly an integer). Neither step
@@ -8215,6 +8239,70 @@ mod tests {
         );
     }
 
+    /// `inbox` was merged into `backlog`. An agent written before that still
+    /// sends it, and a call that worked yesterday must not start failing: the
+    /// old name is read as the new one, but never advertised.
+    #[test]
+    fn a_retired_inbox_status_is_accepted_stored_as_backlog_and_not_advertised() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+
+        let catalog = tools();
+        for tool in ["gitpulse_add_task", "gitpulse_list_tasks"] {
+            let schema = catalog.iter().find(|t| t["name"] == tool).unwrap();
+            assert_eq!(
+                schema["inputSchema"]["properties"]["status"]["enum"],
+                json!(["backlog", "ready", "in_progress", "review", "done"]),
+                "{tool}"
+            );
+            assert!(
+                !schema["inputSchema"]["properties"]["status"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("inbox"),
+                "{tool}"
+            );
+        }
+
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "task_id": "gp-old-agent", "title": "Filed by an old agent", "status": "inbox"}),
+        );
+        assert!(!error, "{added}");
+        assert_eq!(added["status"], "backlog", "{added}");
+        let (error, defaulted) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "task_id": "gp-no-status", "title": "No column named"}),
+        );
+        assert!(!error, "{defaulted}");
+        assert_eq!(defaulted["status"], "backlog", "{defaulted}");
+
+        for status in ["inbox", "backlog"] {
+            let (error, listed) = tool_json(
+                "gitpulse_list_tasks",
+                json!({"repo_path": repo, "status": status}),
+            );
+            assert!(!error, "{status}: {listed}");
+            assert_eq!(listed["returned"], 2, "{status}: {listed}");
+            for task in listed["tasks"].as_array().unwrap() {
+                assert_eq!(task["status"], "backlog", "{status}: {listed}");
+            }
+        }
+        let (error, fetched) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "gp-old-agent"}),
+        );
+        assert!(!error, "{fetched}");
+        assert_eq!(fetched["task"]["status"], "backlog", "{fetched}");
+
+        // The alias reads a name an agent once used; it does not loosen the enum.
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "title": "Nope", "status": "outbox"}),
+        );
+        assert!(error, "{refused}");
+    }
+
     /// The defect this replaced: `gitpulse_add_task` reported success and the
     /// task appeared on no board. So the assertion is made through the exact
     /// calls the board makes — `registerRepository`, then a repository-scoped
@@ -8468,6 +8556,69 @@ mod tests {
         (board, repository_id)
     }
 
+    /// A row the task store still holds as `inbox` (it is rewritten by the
+    /// store's own upgrade, which ships separately) is reported as `backlog`
+    /// by every read, and written back as `backlog` by an agent's edit.
+    ///
+    /// This puts an `inbox` row with the store as vendored today. When the store
+    /// stops accepting that status this `put` fails, which is the signal to
+    /// delete the test: the premise it exercises is gone.
+    #[test]
+    fn a_row_the_store_still_holds_as_inbox_is_reported_and_written_back_as_backlog() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, repository_id) = board_task(profile.path(), &repo, "some-other-card");
+        let id = intake::item_id(&repository_id, "gp-legacy-row");
+        board
+            .board_request(
+                "items.put",
+                &json!({
+                    "id": id, "request_id": "put-legacy-row", "expected_revision": 0,
+                    "title": "Filed before the merge", "status": "inbox",
+                    "repository_ids": [repository_id], "primary_repository_id": repository_id,
+                })
+                .to_string(),
+            )
+            .expect("the vendored store still accepts an inbox row");
+        let stored_status = |board: &crate::workbench::WorkbenchState| {
+            board
+                .board_request("items.get", &json!({"id": id}).to_string())
+                .unwrap()["item"]["status"]
+                .clone()
+        };
+        assert_eq!(
+            stored_status(&board),
+            "inbox",
+            "the premise: a stored inbox row"
+        );
+
+        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert!(!error, "{listed}");
+        let row = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["item_id"] == id.as_str())
+            .unwrap_or_else(|| panic!("the stored row is not listed: {listed}"));
+        assert_eq!(row["status"], "backlog", "{listed}");
+
+        let (error, fetched) = tool_json(
+            "gitpulse_get_task",
+            json!({ "repo_path": repo, "task_id": "gp-legacy-row" }),
+        );
+        assert!(!error, "{fetched}");
+        assert_eq!(fetched["task"]["status"], "backlog", "{fetched}");
+
+        // An edit that names no status keeps the card's, under the new name.
+        let (error, edited) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-legacy-row", "title": "Filed before the merge, edited", "overwrite": true }),
+        );
+        assert!(!error, "{edited}");
+        assert_eq!(edited["status"], "backlog", "{edited}");
+        assert_eq!(stored_status(&board), "backlog", "written back as inbox");
+    }
+
     /// The board an agent lists is the board the person sees: a task archived
     /// on it is not listed as live work unless the archive is asked for.
     #[test]
@@ -8713,7 +8864,7 @@ mod tests {
 
         for (arguments, expected) in [
             (
-                json!({"repo_path": repo, "task_id": id, "status": "inbox"}),
+                json!({"repo_path": repo, "task_id": id, "status": "backlog"}),
                 "status",
             ),
             (

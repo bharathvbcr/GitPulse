@@ -8,7 +8,7 @@
 export interface SubtaskDraft {
   title: string;
   description?: string;
-  status?: "inbox" | "backlog" | "ready" | "in_progress" | "review" | "done";
+  status?: "backlog" | "ready" | "in_progress" | "review" | "done";
   priority?: number;
   assignee?: string;
 }

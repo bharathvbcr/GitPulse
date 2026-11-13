@@ -110,7 +110,7 @@ the card is theirs: an overwrite that would change it is refused with
 | `title` | yes | One line, at most 300 characters. |
 | `task_id` | no | Letters, digits, `-`, `_`, `.`; at most 96 bytes. Defaults to `gp-` plus the title's slug. |
 | `description` | no | Markdown, at most 65,536 bytes including folded sections. |
-| `status` | no | `inbox` (default), `backlog`, `ready`, `in_progress`, `review`, `done`. |
+| `status` | no | `backlog` (default), `ready`, `in_progress`, `review`, `done`. |
 | `priority` | no | `0` urgent, `1` high, `2` normal (default), `3` low. |
 | `severity` | no | `none` (default), `low`, `medium`, `high`, `critical`. |
 | `kind` | no | Free text, at most 64 bytes; default `feature`. |

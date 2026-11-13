@@ -86,7 +86,7 @@ For anything longer:
    acceptance criteria and optional home workspace. They sit in the second
    column, beside the description, for a draft and a saved task alike.
 3. Save, then use **Board** or **List** to organize the same results. Statuses are
-   Inbox, Backlog, Ready, In progress, Review and Done.
+   Backlog, Ready, In progress, Review and Done.
 
 ### Choosing repositories
 
@@ -133,7 +133,7 @@ different decision from writing it. A new task has only the first pane and no
 tab strip.
 
 **View** above the board chooses the layout, how tightly cards pack, which of the
-six columns are on screen and which chips a card carries. The choices are saved
+five columns are on screen and which chips a card carries. The choices are saved
 per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
 currently off screen, and the board refuses to hide its last column. When tasks from

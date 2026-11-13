@@ -194,7 +194,7 @@ describe("Tier 3: Cross-Feature Combinations (Pairwise Coverage)", () => {
   it("Pair 7: E2E test harness validates normalized priority triage of 255 tasks across all statuses", () => {
     // Sample representation of the 255 tasks
     const tasksSample = [
-      { id: "ft-aa3086e6", rawPriority: 0, status: "inbox" }, // P0
+      { id: "ft-aa3086e6", rawPriority: 0, status: "backlog" }, // P0
       { id: "ft-f8a297ff", rawPriority: "critical", status: "review" }, // P0
       { id: "ft-7e812b3f", rawPriority: 1, status: "review" }, // P1
       { id: "ft-b4659067", rawPriority: "medium", status: "review" }, // P2

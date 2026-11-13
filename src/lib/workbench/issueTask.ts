@@ -353,7 +353,7 @@ export function issueToTaskDraft(
   return {
     title,
     kind,
-    status: options.status || "inbox",
+    status: options.status || "backlog",
     priority,
     severity,
     owner: null,
@@ -477,7 +477,7 @@ export async function batchCreateTasksFromIssues(
 
 /**
  * Loads all tasks associated with a repository across all statuses
- * (inbox, ready, in_progress, review, done), paginating until all
+ * (backlog, ready, in_progress, review, done), paginating until all
  * tasks are retrieved or maxTasks is reached.
  */
 export async function listAllRepositoryTasks(

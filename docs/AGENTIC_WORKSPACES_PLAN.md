@@ -67,7 +67,7 @@ they are historical provenance, not required locations for a fresh checkout.
   checklists, attachments, source links and parent/blocking/related/duplicate links.
 - Saved tasks require at least one repository and a primary repository; unlinked
   captures are drafts. Support per-repository objectives and optional home group.
-- Inbox, Backlog, Ready, In Progress, Review, Done. Keep run, verification, remote
+- Backlog, Ready, In Progress, Review, Done. Keep run, verification, remote
   issue and publication states separate. An agent cannot accept its own work.
 - Board/list, keyboard and accessible drag operations, bulk edits/undo, swimlanes,
   saved views, WIP limits, and Details/Plan/Context/Runs/Review inspector.

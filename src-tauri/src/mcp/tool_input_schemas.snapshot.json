@@ -621,9 +621,8 @@
         "type": "string"
       },
       "status": {
-        "description": "Board column (default inbox)",
+        "description": "Board column (default backlog)",
         "enum": [
-          "inbox",
           "backlog",
           "ready",
           "in_progress",
@@ -1754,7 +1753,6 @@
       "status": {
         "description": "Only this column",
         "enum": [
-          "inbox",
           "backlog",
           "ready",
           "in_progress",

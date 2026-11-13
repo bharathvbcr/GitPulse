@@ -8,7 +8,7 @@ import { selectionWire, type ModelSelection } from "./taskModel";
 import type { ProposalMethod } from "./proposals";
 import { isSessionId } from "../terminal/tabs";
 import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults";
-import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
+import { PERMISSION_MODES, asAgentProvider, asTaskStatus, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
 export type { WorkbenchChange, WorkbenchSubscriber } from "./changes";
@@ -428,7 +428,7 @@ export function workspaceCard(value: unknown): WorkspaceCard { const raw = objec
 export function workspace(value: unknown): Workspace { const raw = object(value); return { ...workspaceBase(raw), description: text(raw.description), repository_ids: strings(raw.repository_ids) }; }
 export function taskCard(value: unknown): TaskCard {
   const raw = object(value);
-  const status = STATUSES.find((s) => s === raw.status);
+  const status = asTaskStatus(raw.status);
   const priority = integer(raw.priority);
   const repositories = strings(raw.repository_ids);
   const primary = text(raw.primary_repository_id);
@@ -1224,12 +1224,12 @@ export interface SuggestParams { limit?: number; max_priority?: number; reposito
 export const MAX_SUGGESTIONS = 20;
 function suggestion(value: unknown): TaskSuggestion {
   const raw = object(value);
-  const priority = integer(raw.priority), status = text(raw.status);
+  const priority = integer(raw.priority), status = asTaskStatus(text(raw.status));
   // Manvi builds before the fix sent `null` for a task that earned no points; that is no signals, not a bad answer.
   const signals = raw.signals === null ? [] : raw.signals;
-  if (priority > 3 || !(STATUSES as readonly string[]).includes(status) || !Array.isArray(signals) || signals.length > 32) return invalid();
+  if (priority > 3 || !status || !Array.isArray(signals) || signals.length > 32) return invalid();
   return {
-    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status: status as TaskStatus, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
+    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
     reason: text(raw.reason),
     signals: signals.map((entry) => { const signal = object(entry); return { name: text(signal.name), points: Number.isFinite(signal.points) ? (signal.points as number) : invalid(), detail: text(signal.detail) }; }),
   };
@@ -1302,14 +1302,14 @@ export interface TaskOrganization {
 export interface OrganizeParams { repository_id?: string }
 function organizeChange(value: unknown): TaskOrganizeChange {
   const raw = object(value);
-  const from = integer(raw.from), to = integer(raw.to), revision = integer(raw.revision), status = text(raw.status);
-  if (from > 3 || to > 3 || revision <= 0 || !(STATUSES as readonly string[]).includes(status)) return invalid();
-  return { id: text(raw.id), title: text(raw.title), status: status as TaskStatus, revision, from, to, rule: text(raw.rule), reason: text(raw.reason) };
+  const from = integer(raw.from), to = integer(raw.to), revision = integer(raw.revision), status = asTaskStatus(text(raw.status));
+  if (from > 3 || to > 3 || revision <= 0 || !status) return invalid();
+  return { id: text(raw.id), title: text(raw.title), status, revision, from, to, rule: text(raw.rule), reason: text(raw.reason) };
 }
 function organizeOrder(value: unknown): TaskOrganizeOrder {
-  const raw = object(value), status = text(raw.status);
-  if (!(STATUSES as readonly string[]).includes(status)) return invalid();
-  return { status: status as TaskStatus, ids: strings(raw.ids) };
+  const raw = object(value), status = asTaskStatus(text(raw.status));
+  if (!status) return invalid();
+  return { status, ids: strings(raw.ids) };
 }
 /** The decoder `organizeTasks` applies. A reply that is not this shape is a protocol error. */
 export function taskOrganization(value: unknown): TaskOrganization {

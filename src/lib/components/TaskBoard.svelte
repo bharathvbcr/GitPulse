@@ -2025,7 +2025,7 @@
    * `quickAddDraft` refuses when no repository is linked, and the refusal names
    * the two ways out — the `^` marker, or the editor.
    */
-  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox", mode: QuickAddMode = "manual"): Promise<boolean> {
+  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "backlog", mode: QuickAddMode = "manual"): Promise<boolean> {
     if (busy || quickAdding) return false;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) {
@@ -2064,7 +2064,7 @@
   }
 
   /** Hand a typed quick-add line to the full editor rather than saving it. */
-  async function expandQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox") {
+  async function expandQuickAdd(parsed: QuickAddResult, status: TaskStatus = "backlog") {
     if (busy) return;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) { await createTask(status); return; }
@@ -2083,7 +2083,7 @@
     return parseQuickAddDue(word);
   }
 
-  async function createTask(status: TaskStatus = "inbox") {
+  async function createTask(status: TaskStatus = "backlog") {
     if (busy) return;
     // Every caller reads `creation` before offering this, so a refusal here is
     // a keyboard shortcut or a stale click — it still has to say why rather
@@ -2857,7 +2857,7 @@
           placeholder="Add a task — try: Fix retry loop !1 #ci @ada due:friday"
           mode={$interfaceStore.taskQuickAddAssist ? "assist" : "manual"}
           onMode={(next) => interfaceStore.setTaskQuickAddAssist(next === "assist")}
-          onSubmit={(parsed, mode) => createFromQuickAdd(parsed, "inbox", mode)}
+          onSubmit={(parsed, mode) => createFromQuickAdd(parsed, "backlog", mode)}
           onExpand={(parsed) => void expandQuickAdd(parsed)}
         />
       </div>
@@ -3193,7 +3193,7 @@
                   }
                 }}
               >
-                {#if !tab.draft}<span class="tab-pip" data-status={tab.status ?? "inbox"}></span>{/if}
+                {#if !tab.draft}<span class="tab-pip" data-status={tab.status ?? "backlog"}></span>{/if}
                 <span class="tab-title">{taskTabLabel(tab)}</span>
               </div>
               <button
@@ -3213,7 +3213,7 @@
       {#if session}
         {#key session.pane}
           <div id={TASK_EDITOR_PANE_ID} role="tabpanel" class="task-panel">
-            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={creation.seed.primaryRepositoryId} home={creation.seed.homeWorkspaceId} onSaved={onEditorSaved} onClose={onEditorClose} />
+            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "backlog"} {repositories} {workspaces} openTabs={openTabRefs} primary={creation.seed.primaryRepositoryId} home={creation.seed.homeWorkspaceId} onSaved={onEditorSaved} onClose={onEditorClose} />
           </div>
         {/key}
       {/if}

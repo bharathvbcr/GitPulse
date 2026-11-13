@@ -188,7 +188,7 @@ fn filed_task(input: FileInput) -> Result<(String, ExternalTask, Vec<String>), W
     Ok((repo_path, task, reviewed_related))
 }
 
-/// File one proposal on the board as an inbox task.
+/// File one proposal on the board as a backlog task.
 ///
 /// Outcomes (all `ok: true` except where nothing was filed):
 /// `filed`, `already_filed` (this proposal's card exists; a double click or a
@@ -298,7 +298,7 @@ struct ApplyInput {
 ///
 /// The one apply path: dc-store's `enhancements.accept` for a refinement
 /// appends the criteria, merges `duplicate_of` links and creates each split as
-/// an inbox task linked to this one as its parent, in one transaction, with the
+/// a backlog task linked to this one as its parent, in one transaction, with the
 /// proposal and task revisions checked. A task that moved since review is
 /// refused (`revision_conflict`) and nothing is written. The host's part is
 /// what the store leaves to its caller: the proposal must be of this
@@ -409,7 +409,7 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
     } else {
         0
     };
-    // A split becomes an inbox task, so it gets the check `add_task` gives any
+    // A split becomes a backlog task, so it gets the check `add_task` gives any
     // task: one that looks like open work is not created until the person has
     // seen those tasks and named them.
     if selected("split_into") {

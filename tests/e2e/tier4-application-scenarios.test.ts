@@ -124,7 +124,7 @@ describe("Tier 4: Real-World Application Scenarios (Scenarios 1–5)", () => {
     const rawBacklog = Array.from({ length: 2000 }, (_, i) => ({
       id: `task-${i}`,
       title: `Task #${i}: Work item title`,
-      status: i < 100 ? "inbox" : i < 1800 ? "review" : "done",
+      status: i < 100 ? "backlog" : i < 1800 ? "review" : "done",
       rawPriority: i % 4 === 0 ? "critical" : i % 4 === 1 ? "high" : i % 4 === 2 ? "medium" : "low",
       hasVerificationPassed: i === 10, // Only task-10 has passed evidence
     }));

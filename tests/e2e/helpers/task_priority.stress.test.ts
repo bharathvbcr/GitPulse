@@ -288,7 +288,7 @@ describe("Feature 13 Challenge 2: Optimistic Concurrency Control & Mutation Inva
     id: string;
     title: string;
     revision: number;
-    status: "inbox" | "ready" | "in_progress" | "review" | "done";
+    status: "backlog" | "ready" | "in_progress" | "review" | "done";
     logs: string;
     receipts: Map<string, { revision: number; status: string }>;
   }
@@ -307,7 +307,7 @@ describe("Feature 13 Challenge 2: Optimistic Concurrency Control & Mutation Inva
   class TaskStoreSimulation {
     private tasks: Map<string, SimulatedTask> = new Map();
 
-    createTask(id: string, initialRev = 1, status: SimulatedTask["status"] = "inbox"): SimulatedTask {
+    createTask(id: string, initialRev = 1, status: SimulatedTask["status"] = "backlog"): SimulatedTask {
       const task: SimulatedTask = {
         id,
         title: "Test task " + id,
@@ -441,7 +441,7 @@ describe("Feature 13 Challenge 2: Optimistic Concurrency Control & Mutation Inva
   it("2.3: High-concurrency race condition: 100 concurrent workers competing on revision R: exactly 1 wins, 99 fail closed", () => {
     const store = new TaskStoreSimulation();
     const initialRev = 5;
-    store.createTask("task-race", initialRev, "inbox");
+    store.createTask("task-race", initialRev, "backlog");
 
     const concurrency = 100;
     const workers = Array.from({ length: concurrency }, (_, i) => ({
@@ -477,7 +477,7 @@ describe("Feature 13 Challenge 2: Optimistic Concurrency Control & Mutation Inva
 
   it("2.4: 500 sequential chained mutations increment revision monotonically from 1 to 501", () => {
     const store = new TaskStoreSimulation();
-    store.createTask("task-chain", 1, "inbox");
+    store.createTask("task-chain", 1, "backlog");
 
     let currentRev = 1;
     const chainSteps = 500;
@@ -496,7 +496,7 @@ describe("Feature 13 Challenge 2: Optimistic Concurrency Control & Mutation Inva
 
   it("2.5: Idempotency with request_id prevents double-increment on lost response replay", () => {
     const store = new TaskStoreSimulation();
-    store.createTask("task-idem", 1, "inbox");
+    store.createTask("task-idem", 1, "backlog");
 
     const reqId = "client-req-uuid-12345";
 
@@ -841,7 +841,7 @@ describe("Feature 13 Challenge 4: Backlog Review Deliverable & Task State Parity
 // PART 5: PRODUCTION TASKBATCH OCC & CONCURRENCY STRESS HARNESS
 // ============================================================================
 describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress Harness", () => {
-  function makeSampleTask(id: string, revision = 1, status: TaskStatus = "inbox"): Task {
+  function makeSampleTask(id: string, revision = 1, status: TaskStatus = "backlog"): Task {
     return task({
       id,
       title: "Task " + id,
@@ -906,7 +906,7 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
 
   it("5.2: Production TaskBatch high-concurrency race condition: 100 workers competing on revision R: exactly 1 wins, 99 fail closed", async () => {
     const initialRev = 10;
-    let storedTask = makeSampleTask("task-occ-100", initialRev, "inbox");
+    let storedTask = makeSampleTask("task-occ-100", initialRev, "backlog");
 
     // Async storage IO with realistic event-loop jitter matching backend SQLite WAL OCC
     const storeIO = {
@@ -1029,7 +1029,7 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
   });
 
   it("5.4: 500 sequential chained mutations through production TaskBatch increment revision monotonically from 1 to 501", async () => {
-    let storedTask = makeSampleTask("task-chain-500", 1, "inbox");
+    let storedTask = makeSampleTask("task-chain-500", 1, "backlog");
 
     const storeIO = {
       read: async (id: string) => {
@@ -1074,11 +1074,11 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
 
   it("5.5: Multi-task batch isolates revision conflict: conflicting card fails, non-conflicting cards succeed", async () => {
     const tasksMap = new Map<string, Task>([
-      ["t1", makeSampleTask("t1", 1, "inbox")],
-      ["t2", makeSampleTask("t2", 1, "inbox")],
+      ["t1", makeSampleTask("t1", 1, "backlog")],
+      ["t2", makeSampleTask("t2", 1, "backlog")],
       ["t3", makeSampleTask("t3", 2, "ready")], // Store is already at revision 2!
-      ["t4", makeSampleTask("t4", 1, "inbox")],
-      ["t5", makeSampleTask("t5", 1, "inbox")],
+      ["t4", makeSampleTask("t4", 1, "backlog")],
+      ["t5", makeSampleTask("t5", 1, "backlog")],
     ]);
 
     const storeIO = {
@@ -1136,7 +1136,7 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
   });
 
   it("5.6: Out-of-order execution race: Batch B (rev 6) before Batch A (rev 5->6) fails closed; retrying after A succeeds", async () => {
-    let storedTask = makeSampleTask("task-race-order", 5, "inbox");
+    let storedTask = makeSampleTask("task-race-order", 5, "backlog");
 
     const storeIO = {
       read: async (id: string) => {
@@ -1196,7 +1196,7 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
   });
 
   it("5.7: TaskBatch.undo() generates atomic restore plan and cleanly reverts production store state", async () => {
-    let storedTask = makeSampleTask("task-undo", 1, "inbox");
+    let storedTask = makeSampleTask("task-undo", 1, "backlog");
 
     const storeIO = {
       read: async (id: string) => {
@@ -1238,7 +1238,7 @@ describe("Feature 13 Challenge 5: Production TaskBatch OCC & Concurrency Stress 
     const undoBatch = new TaskBatch(undoPlan!.cards, undoPlan!.action, storeIO);
     await undoBatch.run();
     expect(undoBatch.snapshot()[0].state).toBe("done");
-    expect(storedTask.status).toBe("inbox"); // Restored!
+    expect(storedTask.status).toBe("backlog"); // Restored!
     expect(storedTask.revision).toBe(3); // Monotonically incremented!
   });
 });

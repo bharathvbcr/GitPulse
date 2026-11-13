@@ -118,7 +118,7 @@ describe("issueTask adversarial stress testing", () => {
       expect(Number.isInteger(draft.priority)).toBe(true);
 
       // Invariant 6: Status is valid
-      expect(["inbox", "ready", "in_progress", "review", "done"]).toContain(draft.status);
+      expect(["backlog", "ready", "in_progress", "review", "done"]).toContain(draft.status);
 
       // Invariant 7: Acceptance criteria is non-empty array of strings
       expect(Array.isArray(draft.acceptance_criteria)).toBe(true);
@@ -141,7 +141,7 @@ describe("issueTask adversarial stress testing", () => {
       updated_at: 100,
       title: `[#${num}] Task for issue ${num}`,
       kind: "bug",
-      status: "inbox",
+      status: "backlog",
       priority: 1,
       severity: null,
       owner: null,
@@ -182,7 +182,7 @@ describe("issueTask adversarial stress testing", () => {
         updated_at: 100,
         title: "[#420] Substring match test",
         kind: "bug",
-        status: "inbox",
+        status: "backlog",
         priority: 1,
         severity: null,
         owner: null,
@@ -199,7 +199,7 @@ describe("issueTask adversarial stress testing", () => {
         updated_at: 100,
         title: "[#142] Another prefix test",
         kind: "bug",
-        status: "inbox",
+        status: "backlog",
         priority: 1,
         severity: null,
         owner: null,

@@ -28,7 +28,7 @@ import {
 
 function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
-    id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "inbox",
+    id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "backlog",
     priority: 1, severity: "high", owner: "Pat", due_at: 100, labels: ["ui", "drag", "extra"],
     repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
@@ -153,7 +153,7 @@ describe("hidden details and enhance gate", () => {
 describe("allLoadedCards", () => {
   it("deduplicates cards that appear if a walk revisits a page", () => {
     const cards = allLoadedCards({
-      inbox: { items: [card(), card({ id: "t2" })] },
+      backlog: { items: [card(), card({ id: "t2" })] },
       ready: { items: [card({ id: "t1", status: "ready" })] },
     });
     expect(cards.map((c) => c.id)).toEqual(["t1", "t2"]);
@@ -193,7 +193,7 @@ describe("reorderPlan", () => {
 
 describe("partitionLanes", () => {
   const label = (status: string) => status.toUpperCase();
-  const order = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as const;
+  const order = ["backlog", "ready", "in_progress", "review", "done"] as const;
   it("puts every card in exactly one lane, unassigned last, keeping card order", () => {
     const cards = [card({ id: "a", owner: "Zoe" }), card({ id: "b", owner: null }), card({ id: "c", owner: " Ada " }), card({ id: "d", owner: "Zoe" })];
     const lanes = partitionLanes(cards, "owner", label, order);
@@ -206,8 +206,8 @@ describe("partitionLanes", () => {
     expect(lanes.at(-1)?.label).toBe("No label");
   });
   it("orders status lanes by the board's status order, not by name", () => {
-    const lanes = partitionLanes([card({ id: "a", status: "review" }), card({ id: "b", status: "inbox" }), card({ id: "c", status: "ready" })], "status", label, order);
-    expect(lanes.map((lane) => lane.label)).toEqual(["INBOX", "READY", "REVIEW"]);
+    const lanes = partitionLanes([card({ id: "a", status: "review" }), card({ id: "b", status: "backlog" }), card({ id: "c", status: "ready" })], "status", label, order);
+    expect(lanes.map((lane) => lane.label)).toEqual(["BACKLOG", "READY", "REVIEW"]);
   });
 });
 
@@ -294,19 +294,19 @@ describe("applyOrganizedPriority", () => {
 describe("listRows", () => {
   const c = (id: string, status: TaskCard["status"], priority: number, due_at: number | null = null) => card({ id, status, priority, due_at });
   const columns = [
-    [c("inbox-low", "inbox", 3), c("inbox-urgent", "inbox", 0)],
+    [c("backlog-low", "backlog", 3), c("backlog-urgent", "backlog", 0)],
     [c("ready-high", "ready", 1), c("ready-normal", "ready", 2, 50)],
     [c("done-urgent", "done", 0, 10)],
   ];
   it("keeps the columns in order under board order", () => {
-    expect(listRows(columns, "board").map((x) => x.id)).toEqual(["inbox-low", "inbox-urgent", "ready-high", "ready-normal", "done-urgent"]);
+    expect(listRows(columns, "board").map((x) => x.id)).toEqual(["backlog-low", "backlog-urgent", "ready-high", "ready-normal", "done-urgent"]);
   });
   it("puts the most urgent row first across every status under priority order", () => {
-    expect(listRows(columns, "priority").map((x) => x.id)).toEqual(["done-urgent", "inbox-urgent", "ready-high", "ready-normal", "inbox-low"]);
+    expect(listRows(columns, "priority").map((x) => x.id)).toEqual(["done-urgent", "backlog-urgent", "ready-high", "ready-normal", "backlog-low"]);
   });
   it("draws nothing from no columns and leaves its input alone", () => {
     expect(listRows([], "priority")).toEqual([]);
-    expect(columns[0].map((x) => x.id)).toEqual(["inbox-low", "inbox-urgent"]);
+    expect(columns[0].map((x) => x.id)).toEqual(["backlog-low", "backlog-urgent"]);
   });
 });
 

@@ -18,7 +18,7 @@
  * an empty one.
  */
 
-import { STATUSES, STATUS_LABELS, asTaskStatus, type TaskStatus } from "../workbench/vocabulary";
+import { STATUSES, STATUS_LABELS, asTaskStatus, isLegacyStatus, type TaskStatus } from "../workbench/vocabulary";
 
 export type BoardLayout = "board" | "list";
 export type TaskDensity = "comfortable" | "compact";
@@ -91,10 +91,18 @@ export function sanitizeCardFields(value: unknown): TaskCardField[] {
 export function sanitizeHiddenStatuses(value: unknown): TaskStatus[] {
   if (!Array.isArray(value)) return [];
   const hidden = new Set<TaskStatus>();
+  const current = new Set<TaskStatus>();
+  const retired = new Set<TaskStatus>();
   for (const entry of value) {
     const status = asTaskStatus(entry);
-    if (status) hidden.add(status);
+    if (!status) continue;
+    (isLegacyStatus(entry) ? retired : current).add(status);
+    hidden.add(status);
   }
+  // A column a retired name was folded into holds what that name held too. A
+  // preference that hid only the retired column never asked to hide the other
+  // half, so it hides nothing rather than the cards the person chose to see.
+  for (const status of retired) if (!current.has(status)) hidden.delete(status);
   if (hidden.size >= STATUSES.length) return [];
   return STATUSES.filter((status) => hidden.has(status));
 }

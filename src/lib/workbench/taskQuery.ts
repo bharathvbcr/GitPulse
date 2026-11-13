@@ -34,7 +34,7 @@
  */
 
 import type { Repository, TaskCard, TaskStatus } from "./client";
-import { STATUSES, STATUS_LABELS } from "./vocabulary";
+import { STATUSES, STATUS_LABELS, asTaskStatus } from "./vocabulary";
 import { dayStartSec, dueInRange, dueState } from "./taskOrganize";
 import { PRIORITY_LABELS, parsePriority } from "./taskPriority";
 import { fold, STOPWORDS, words as lexiconWords } from "./taskLexicon";
@@ -136,7 +136,7 @@ function statusValue(value: string): TaskStatus | "open" | null {
   const v = value.toLowerCase().replace(/[\s-]+/g, "_");
   if (v === "open") return "open";
   if (v === "wip" || v === "inprogress" || v === "doing") return "in_progress";
-  return STATUSES.find((status) => status === v || STATUS_LABELS[status].toLowerCase().replace(/\s+/g, "_") === v) ?? null;
+  return asTaskStatus(v) ?? STATUSES.find((status) => STATUS_LABELS[status].toLowerCase().replace(/\s+/g, "_") === v) ?? null;
 }
 
 /** `urgent`/`p0`/`0` → "0" … `low`/`p3`/`3` → "3". */

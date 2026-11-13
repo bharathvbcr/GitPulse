@@ -13,7 +13,7 @@
  * draw. Sizes are bounded, so a runaway writer cannot grow the profile.
  */
 
-import { STATUSES, asTaskStatus, type TaskStatus } from "../workbench/vocabulary";
+import { STATUSES, asTaskStatus, isLegacyStatus, type TaskStatus } from "../workbench/vocabulary";
 import { emptyFacet, normalizePriority, type DueFilter, type TaskFacet } from "../workbench/taskOrganize";
 import {
   isBoardLayout,
@@ -85,7 +85,10 @@ export function sanitizeWipLimits(value: unknown): WipLimits {
   for (const [key, raw] of Object.entries(value)) {
     const status = asTaskStatus(key);
     const limit = sanitizeWipLimit(raw);
-    if (status && limit !== null) out[status] = limit;
+    if (!status || limit === null) continue;
+    // A limit written under a retired name yields to one the column already has.
+    if (isLegacyStatus(key) && out[status] !== undefined) continue;
+    out[status] = limit;
   }
   return out;
 }

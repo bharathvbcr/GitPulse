@@ -90,10 +90,20 @@ describe("saved views", () => {
     if (!saved.ok) throw new Error("not saved");
     expect(deleteView(saved.boards, "global", saved.view.id)).toEqual({});
   });
+  it("reads limits and hidden columns stored under the retired inbox name", () => {
+    expect(sanitizeWipLimits({ inbox: 4 })).toEqual({ backlog: 4 });
+    expect(sanitizeWipLimits({ inbox: 4, backlog: 9 })).toEqual({ backlog: 9 });
+    expect(sanitizeWipLimits({ backlog: 9, inbox: 4 })).toEqual({ backlog: 9 });
+    const boards = sanitizeBoards({
+      global: { wip: { inbox: 2, ready: 3 }, views: [{ id: "a", name: "Old", hiddenColumns: ["inbox", "done"] }] },
+    });
+    expect(boards.global?.wip).toEqual({ backlog: 2, ready: 3 });
+    expect(boards.global?.views[0]?.hiddenColumns).toEqual(["done"]);
+  });
   it("reads hostile storage into views the board can draw", () => {
     const boards = sanitizeBoards({
       global: { views: [
-        { id: "a", name: "Kept", layout: "list", swimlane: "label", hiddenColumns: ["inbox", "nope"], facet: { priority: "1", due: "never" }, search: 7 },
+        { id: "a", name: "Kept", layout: "list", swimlane: "label", hiddenColumns: ["backlog", "nope"], facet: { priority: "1", due: "never" }, search: 7 },
         { id: "a", name: "Same id" },
         { id: "b", name: "kept" },
         { id: "bad id!", name: "Bad" },
@@ -105,7 +115,7 @@ describe("saved views", () => {
     expect(Object.keys(boards)).toEqual(["global"]);
     const [view] = boards.global.views;
     expect(boards.global.views).toHaveLength(1);
-    expect(view).toMatchObject({ id: "a", name: "Kept", layout: "list", swimlane: "label", hiddenColumns: ["inbox"], search: "" });
+    expect(view).toMatchObject({ id: "a", name: "Kept", layout: "list", swimlane: "label", hiddenColumns: ["backlog"], search: "" });
     expect(view.facet).toEqual({ ...emptyFacet(), priority: 1 });
     expect(boards.global.wip).toEqual({ ready: 2 });
   });
@@ -126,7 +136,7 @@ describe("saved views", () => {
     expect(Object.keys(sanitizeBoards(many))).toHaveLength(MAX_BOARDS);
   });
   it("compares what a board shows, not how it was stored", () => {
-    expect(sameSnapshot(snapshot({ hiddenColumns: ["done", "inbox"] }), snapshot({ hiddenColumns: ["inbox", "done"] }))).toBe(true);
+    expect(sameSnapshot(snapshot({ hiddenColumns: ["done", "backlog"] }), snapshot({ hiddenColumns: ["backlog", "done"] }))).toBe(true);
     expect(sameSnapshot(snapshot({ search: "a" }), snapshot({ search: "b" }))).toBe(false);
     expect(sanitizeSnapshot(null)).toEqual(snapshot());
   });

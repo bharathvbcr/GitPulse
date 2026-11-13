@@ -1934,7 +1934,7 @@ if (params.has("check")) {
     const columnEl = status => root.querySelector(`[data-task-column="${status}"]`);
     viewToggle().click(); await settle();
     check("the view menu offers every column and card field",
-      [...viewMenu().querySelectorAll("[data-task-column-toggle]")].length === 6
+      [...viewMenu().querySelectorAll("[data-task-column-toggle]")].length === 5
       && [...viewMenu().querySelectorAll("[data-task-field-toggle]")].length === 5);
     const backlogCount = root.querySelectorAll('[data-task-column="backlog"] [data-task-card]').length;
     columnToggle("backlog").click(); await settle();
@@ -1949,7 +1949,7 @@ if (params.has("check")) {
     check("a hidden column reports the work it is hiding, with an exact count",
       Boolean(hiddenNote()) && hiddenNote().textContent.includes("hidden from this board")
       && backlogCount > 0 && hiddenCount === backlogCount);
-    for (const status of ["inbox","ready","in_progress","review","done"]) { columnToggle(status).click(); await settle(); }
+    for (const status of ["ready","in_progress","review","done"]) { columnToggle(status).click(); await settle(); }
     // `>= 1` passed whether the toggle refused or reset every column back on,
     // which is why the reset survived: exactly one column may still stand, and
     // the control that would remove it has to be visibly closed, not merely inert.
@@ -1960,20 +1960,20 @@ if (params.has("check")) {
       && Boolean(columnToggle("done").title)
       && root.querySelectorAll("[data-task-column]").length >= 1);
     check("every other column is still free to come back",
-      ["inbox","backlog","ready","in_progress","review"].every(status => columnToggle(status).disabled === false));
+      ["backlog","ready","in_progress","review"].every(status => columnToggle(status).disabled === false));
     viewMenu().querySelector('[data-task-field-toggle="repo"]').click(); await settle();
     check("card fields are a choice the card obeys",
       viewMenu().querySelector('[data-task-field-toggle="repo"]').getAttribute("aria-checked") === "false");
     button("Reset board view", viewMenu()).click(); await settle();
     check("reset restores every column and field",
-      root.querySelectorAll("[data-task-column]").length === 6 && !hiddenNote()
+      root.querySelectorAll("[data-task-column]").length === 5 && !hiddenNote()
       && [...viewMenu().querySelectorAll('[data-task-field-toggle][aria-checked="true"]')].length === 5);
     check("reset puts the board back to most urgent first",
       viewMenu().querySelector('[data-task-order-option="priority"]')?.getAttribute("aria-checked") === "true");
     // The keyboard and drag checks below move cards within a column.
     viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle();
     viewToggle().click(); await settle(); await untilGone(viewMenu);
-    check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
+    check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 5);
 
     // ---- The archive, and what it is willing to claim --------------------
     const archive = () => root.querySelector('[data-testid="task-archive"]');
@@ -2182,7 +2182,7 @@ if (params.has("check")) {
 
     archiveToggle().click(); await settle();
     check("the archive closes and leaves the board as it was",
-      !archive() && root.querySelectorAll("[data-task-column]").length === 6);
+      !archive() && root.querySelectorAll("[data-task-column]").length === 5);
 
     // ---- Archiving a task -------------------------------------------------
     // The report this block exists for: a panel called Archive, a Restore
@@ -3338,7 +3338,7 @@ if (params.has("check")) {
       check("the column heads, with counts and limits, are drawn once above the lanes",
         heads > 0 && lanes().every(lane => lane.querySelectorAll("[data-task-column]").length === heads));
       guardStep = `views: lane move from ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn}`;
-      const order = ["inbox", "backlog", "ready", "in_progress", "review", "done"];
+      const order = ["backlog", "ready", "in_progress", "review", "done"];
       const from = card("task-2").closest("[data-task-column]").dataset.taskColumn, to = order[order.indexOf(from) - 1];
       const before = writes.length;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
@@ -3468,7 +3468,7 @@ if (params.has("check")) {
           notice(51, "run_ci_passed", "Coding agent branch passed CI", { signal: { ...facts, source: "ci_local", kind: "ci_passed", conclusion: "success", workflow: "ci.local", url: null } }),
           notice(50, "run_quarantined", "Coding agent was quarantined"),
         ];
-        // (The board's Inbox *column* is also a section labelled "Inbox"; this is the notification inbox.)
+        // (This is the notification inbox, not a board column.)
         const toggle = root.querySelector('.gp-icon-btn[aria-label="Inbox"]');
         const inbox = () => root.querySelector('section.inbox[aria-label="Inbox"]');
         if (!inbox()) toggle.click();
@@ -3849,7 +3849,7 @@ if (params.has("check")) {
         const fromInput = () => root.querySelector('[data-testid="task-filter-due-from"]'), toInput = () => root.querySelector('[data-testid="task-filter-due-to"]');
         const searchText = () => root.querySelector("input#task-search")?.value ?? "";
         const names = () => [card("task-1"), card("task-2"), card("task-3"), card(plain)].map(Boolean);
-        check("the status select offers Any, Not done and every column", same([...statusPick().options].map(option => option.value), ["", "open", "inbox", "backlog", "ready", "in_progress", "review", "done"]) && statusPick().value === "");
+        check("the status select offers Any, Not done and every column", same([...statusPick().options].map(option => option.value), ["", "open", "backlog", "ready", "in_progress", "review", "done"]) && statusPick().value === "");
         // The first filter switches the board to the candidate set, which is read before it can draw.
         // Earlier checks have moved cards between columns: pick the column task-2 is in now.
         const column = tasks.find(task => task.id === "task-2").status;

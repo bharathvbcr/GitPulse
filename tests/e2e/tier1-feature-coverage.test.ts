@@ -1465,7 +1465,7 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
       const sampleDraft = {
         title: "Priority scale drift",
         kind: "bug",
-        status: "inbox" as const,
+        status: "backlog" as const,
         priority: 2,
         severity: null,
         owner: null,

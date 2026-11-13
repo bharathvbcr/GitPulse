@@ -974,19 +974,19 @@ describe("tasks board view preferences", () => {
 
   it("hides columns one at a time and brings them all back in one action", () => {
     interfaceStore.toggleTaskColumn("done");
-    interfaceStore.toggleTaskColumn("inbox");
-    expect(get(interfaceStore).taskHiddenColumns).toEqual(["inbox", "done"]);
-    interfaceStore.toggleTaskColumn("inbox");
+    interfaceStore.toggleTaskColumn("backlog");
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(["backlog", "done"]);
+    interfaceStore.toggleTaskColumn("backlog");
     expect(get(interfaceStore).taskHiddenColumns).toEqual(["done"]);
     interfaceStore.showAllTaskColumns();
     expect(get(interfaceStore).taskHiddenColumns).toEqual([]);
   });
 
   it("refuses the toggle that would leave the board with no columns", () => {
-    for (const status of ["inbox", "backlog", "ready", "in_progress", "review"] as const) {
+    for (const status of ["backlog", "ready", "in_progress", "review"] as const) {
       interfaceStore.toggleTaskColumn(status);
     }
-    const five = ["inbox", "backlog", "ready", "in_progress", "review"];
+    const five = ["backlog", "ready", "in_progress", "review"];
     expect(get(interfaceStore).taskHiddenColumns).toEqual(five);
     // Refused, and nothing else disturbed. This asserted `[]` before, which is
     // the storage repair leaking into a click: the reader unchecks one column
@@ -1093,6 +1093,27 @@ describe("tasks board view preferences", () => {
       storage.setItem("gitpulse_interface_prefs", JSON.stringify({ taskHiddenRepositories: "repo-0" }));
       vi.resetModules();
       expect(get((await import("../interfaceStore")).interfaceStore).taskHiddenRepositories).toEqual([]);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("loads stored board preferences that name the retired inbox column", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ taskHiddenColumns: ["inbox", "done"] }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      expect(get(reloaded).taskHiddenColumns).toEqual(["done"]);
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");

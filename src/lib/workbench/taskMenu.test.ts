@@ -18,7 +18,7 @@ import {
 
 function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
-    id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "inbox",
+    id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "backlog",
     priority: 2, severity: null, owner: null, due_at: null, labels: [],
     repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
@@ -70,22 +70,22 @@ describe("taskMenuItems", () => {
     expect(menuPageItems(items, "root").map((item) => item.id)).not.toContain("copy-agent");
     expect(menuPageItems(items, "copy").map((item) => item.id)).toContain("copy-agent");
     expect(ids).toContain("move-menu");
-    expect(ids).toContain("move-inbox");
+    expect(ids).toContain("move-backlog");
     expect(ids).toContain("priority-menu");
     expect(ids).toContain("priority-0");
     // Every value is listed. The one the task already has is marked and
     // disabled rather than omitted, so the menu keeps the same shape whichever
     // card it opened on — and the card's current value is readable from it.
     expect(items.find((item) => item.id === "move-ready")).toMatchObject({ checked: true, disabled: true });
-    expect(items.find((item) => item.id === "move-inbox")).toMatchObject({ checked: false, disabled: false });
+    expect(items.find((item) => item.id === "move-backlog")).toMatchObject({ checked: false, disabled: false });
     expect(items.find((item) => item.id === "priority-1")).toMatchObject({ checked: true, disabled: true });
     expect(items.find((item) => item.id === "priority-0")).toMatchObject({ checked: false });
     expect(ids).toContain("select-column");
     expect(ids).toContain("delete");
     expect(items.find((item) => item.id === "delete")?.danger).toBe(true);
     expect(items.find((item) => item.id === "enhance")?.hint).toBe("E");
-    expect(menuPageItems(items, "root").map((item) => item.id)).not.toContain("move-inbox");
-    expect(menuPageItems(items, "move").map((item) => item.id)).toContain("move-inbox");
+    expect(menuPageItems(items, "root").map((item) => item.id)).not.toContain("move-backlog");
+    expect(menuPageItems(items, "move").map((item) => item.id)).toContain("move-backlog");
     expect(submenuTitle("copy")).toBe("Copy");
     expect(submenuTitle("move")).toBe("Move to");
     expect(submenuTitle("root")).toBe("Task actions");
@@ -93,14 +93,14 @@ describe("taskMenuItems", () => {
 
   it("hides single-task actions for a multi-selection and still allows bulk delete", () => {
     const items = taskMenuItems({
-      cards: [card({ id: "a", status: "inbox" }), card({ id: "b", status: "done" })],
+      cards: [card({ id: "a", status: "backlog" }), card({ id: "b", status: "done" })],
     });
     const ids = items.map((item) => item.id);
     expect(ids).not.toContain("open");
     expect(ids).not.toContain("enhance");
     expect(ids).not.toContain("duplicate");
     expect(ids).toContain("move-menu");
-    expect(ids).toContain("move-inbox");
+    expect(ids).toContain("move-backlog");
     expect(ids).toContain("move-done");
     expect(ids).toContain("copy-menu");
     expect(ids).toContain("copy-agent");
@@ -233,10 +233,10 @@ describe("taskMenuItems", () => {
 describe("column flattening", () => {
   it("walks visible cards in status order and ignores duplicates", () => {
     const columns = {
-      inbox: { items: [card({ id: "a" }), card({ id: "skip" })] },
+      backlog: { items: [card({ id: "a" }), card({ id: "skip" })] },
       ready: { items: [card({ id: "a", status: "ready" }), card({ id: "b", status: "ready" })] },
     };
-    expect(flattenVisibleIds(columns, ["inbox", "ready"], (c) => c.id !== "skip")).toEqual(["a", "b"]);
+    expect(flattenVisibleIds(columns, ["backlog", "ready"], (c) => c.id !== "skip")).toEqual(["a", "b"]);
     expect(cardsById(columns, new Set(["b", "missing"])).map((c) => c.id)).toEqual(["b"]);
   });
 });
@@ -346,12 +346,12 @@ describe("agent handoff entry", () => {
 });
 
 describe("typeAheadIndex", () => {
-  const items = [{ label: "Inbox" }, { label: "Backlog" }, { label: "Ready" }, { label: "Review" }, { label: "Done" }];
+  const items = [{ label: "Backlog" }, { label: "In progress" }, { label: "Ready" }, { label: "Review" }, { label: "Done" }];
 
   it("jumps to the next item starting with the typed letter", () => {
-    expect(typeAheadIndex(items, "b", -1)).toBe(1);
+    expect(typeAheadIndex(items, "b", -1)).toBe(0);
     expect(typeAheadIndex(items, "R", -1)).toBe(2);
-    expect(typeAheadIndex(items, "in", -1)).toBe(0);
+    expect(typeAheadIndex(items, "in", -1)).toBe(1);
   });
 
   it("cycles through repeated matches instead of sticking on the first", () => {
@@ -369,7 +369,7 @@ describe("typeAheadIndex", () => {
     expect(typeAheadIndex(items, "", -1)).toBe(-1);
     expect(typeAheadIndex(items, "   ", 0)).toBe(-1);
     expect(typeAheadIndex([], "a", 0)).toBe(-1);
-    expect(typeAheadIndex(items, "b", Number.NaN)).toBe(1);
-    expect(typeAheadIndex(items, "b", -99)).toBe(1);
+    expect(typeAheadIndex(items, "b", Number.NaN)).toBe(0);
+    expect(typeAheadIndex(items, "b", -99)).toBe(0);
   });
 });

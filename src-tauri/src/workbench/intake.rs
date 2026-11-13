@@ -218,7 +218,7 @@ impl ExternalTask {
         let title = file_tasks::validate_title(&self.title)?;
         let status = match &self.status {
             Some(status) => file_tasks::normalize_status(status)?,
-            None => "inbox".into(),
+            None => "backlog".into(),
         };
         let priority = self.priority.unwrap_or(2);
         if priority > 3 {
@@ -592,7 +592,7 @@ pub(crate) fn get_item(store: &Store, id: &str) -> Result<Option<Value>, Workben
 
 /// For an update to an existing card: every field `task` left unset keeps
 /// the card's value instead of `item_fields`' default. Without this, folding a
-/// line of work into a person's card would move it back to inbox, reset its
+/// line of work into a person's card would move it back to backlog, reset its
 /// priority, drop its criteria and owner, and clear its logs.
 fn keep_unsent(fields: &mut Map<String, Value>, task: &ExternalTask, card: &Value) {
     let unsent = [
@@ -618,6 +618,9 @@ fn keep_unsent(fields: &mut Map<String, Value>, task: &ExternalTask, card: &Valu
         }
         if card[key].is_null() {
             fields.remove(key);
+        } else if key == "status" {
+            // Carried forward under the name the board uses now.
+            fields.insert(key.into(), shown_status(card));
         } else {
             fields.insert(key.into(), card[key].clone());
         }
@@ -1027,6 +1030,24 @@ pub(crate) struct Related {
     pub complete: bool,
 }
 
+/// A stored item's status as the board names it now: a row written before
+/// `inbox` was merged into `backlog` still says `inbox` until the store
+/// rewrites it, and nothing GitPulse reports may.
+pub(super) fn shown_status(item: &Value) -> Value {
+    match item["status"].as_str() {
+        Some(status) => json!(file_tasks::current_status(status)),
+        None => item["status"].clone(),
+    }
+}
+
+/// `item` with [`shown_status`] in place of its stored status.
+fn with_shown_status(mut item: Value) -> Value {
+    if item.get("status").is_some() {
+        item["status"] = shown_status(&item);
+    }
+    item
+}
+
 /// The board columns a task is still open in: every status but `done`.
 fn open_statuses() -> impl Iterator<Item = &'static str> {
     file_tasks::STATUSES
@@ -1105,7 +1126,7 @@ fn related_open_tasks(
                     scored.push((
                         score,
                         json!({
-                            "item_id": id, "title": title, "status": item["status"],
+                            "item_id": id, "title": title, "status": shown_status(item),
                             "revision": item["revision"],
                             "shared_words": shared_words, "shared_labels": shared_labels,
                         }),
@@ -1390,7 +1411,7 @@ fn add_task_once(
                 "item_id": placed.item_id,
                 "revision": item["revision"],
                 "title": item["title"],
-                "status": item["status"],
+                "status": shown_status(&item),
                 "priority": item["priority"],
                 "repository": repository_summary(repository),
                 "folded_into_description": {
@@ -1581,7 +1602,7 @@ pub(crate) fn list_tasks(
         .iter()
         .map(|item| {
             json!({
-                "item_id": item["id"], "title": item["title"], "status": item["status"],
+                "item_id": item["id"], "title": item["title"], "status": shown_status(item),
                 "priority": item["priority"], "severity": item["severity"], "kind": item["kind"],
                 "owner": item["owner"], "labels": item["labels"], "due_at": item["due_at"],
                 "revision": item["revision"], "updated_at": item["updated_at"],
@@ -1618,7 +1639,7 @@ pub(crate) fn get_task(
         "ok": true,
         "item_id": id,
         "repository": repository_summary(&repository),
-        "task": item,
+        "task": with_shown_status(item),
         "brief": brief["item"]["markdown"],
     }))
 }
@@ -1711,6 +1732,10 @@ fn resend(item: &Value, id: &str, revision: i64, request: &str) -> Map<String, V
         if !item[key].is_null() {
             input.insert(key.into(), item[key].clone());
         }
+    }
+    // A row the store still holds as `inbox` is written back as `backlog`.
+    if !item["status"].is_null() {
+        input.insert("status".into(), shown_status(item));
     }
     input.insert(
         "home_workspace_id".into(),
@@ -1847,8 +1872,8 @@ pub(crate) fn complete_task(
                 "outcome": outcome,
                 "item_id": id,
                 "title": item["title"],
-                "previous_status": previous,
-                "status": item["status"],
+                "previous_status": file_tasks::current_status(&previous),
+                "status": shown_status(item),
                 "revision": item["revision"],
                 "requested_status": requested,
                 "held_for_review": held.is_some(),
@@ -2339,7 +2364,7 @@ pub(crate) fn delete_task(
                 "outcome": outcome,
                 "item_id": id,
                 "title": item["title"],
-                "status": item["status"],
+                "status": shown_status(item),
                 "deleted": true,
                 "revision": item["revision"],
                 "reason_recorded": recorded,

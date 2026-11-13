@@ -69,7 +69,17 @@ describe("sanitizeHiddenStatuses", () => {
   });
 
   it("keeps status order and removes duplicates and unknown names", () => {
-    expect(sanitizeHiddenStatuses(["done", "inbox", "done", "archived"])).toEqual(["inbox", "done"]);
+    expect(sanitizeHiddenStatuses(["done", "backlog", "done", "archived"])).toEqual(["backlog", "done"]);
+  });
+
+  it("reads a hidden inbox as a hidden backlog only when backlog was hidden too", () => {
+    // Alone, it hid half of what the merged column holds: the person never
+    // asked to hide the other half, so nothing is hidden.
+    expect(sanitizeHiddenStatuses(["inbox"])).toEqual([]);
+    expect(sanitizeHiddenStatuses(["inbox", "done"])).toEqual(["done"]);
+    expect(sanitizeHiddenStatuses(["inbox", "backlog"])).toEqual(["backlog"]);
+    expect(sanitizeHiddenStatuses(["backlog", "inbox", "done"])).toEqual(["backlog", "done"]);
+    expect(sanitizeHiddenStatuses(["inbox", "ready", "in_progress", "review", "done"])).toEqual(["ready", "in_progress", "review", "done"]);
   });
 
   it("refuses a stored value that would leave the board with no columns", () => {
@@ -87,7 +97,7 @@ describe("toggleHiddenStatus", () => {
   it("adds and removes one column at a time", () => {
     expect(toggleHiddenStatus([], "done")).toEqual(["done"]);
     expect(toggleHiddenStatus(["done"], "done")).toEqual([]);
-    expect(toggleHiddenStatus(["done"], "inbox")).toEqual(["inbox", "done"]);
+    expect(toggleHiddenStatus(["done"], "backlog")).toEqual(["backlog", "done"]);
   });
 
   it("refuses the toggle that would hide the last visible column, without discarding the rest", () => {
@@ -177,8 +187,8 @@ describe("hiddenColumnReport", () => {
   });
 
   it("lists three or more hidden columns as a readable sentence", () => {
-    expect(hiddenColumnReport(["inbox", "review", "done"], { inbox: 1, review: 1, done: 1 })?.summary)
-      .toBe("3 tasks in Inbox, Review and Done");
+    expect(hiddenColumnReport(["backlog", "review", "done"], { backlog: 1, review: 1, done: 1 })?.summary)
+      .toBe("3 tasks in Backlog, Review and Done");
   });
 
   it("treats a negative or sub-task count as no work rather than inventing some", () => {

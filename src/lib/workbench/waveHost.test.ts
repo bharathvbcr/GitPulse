@@ -44,8 +44,8 @@ describe("Stop reaches the host's waits", () => {
 const answer = (over: Record<string, unknown> = {}) => taskSuggestions({
   ok: true, generated_at: 1, candidates: 2,
   suggestions: [
-    { rank: 1, id: "a", title: "A", status: "inbox", priority: 0, score: 9, reason: "", signals: [] },
-    { rank: 2, id: "b", title: "B", status: "inbox", priority: 1, score: 8, reason: "", signals: [] },
+    { rank: 1, id: "a", title: "A", status: "backlog", priority: 0, score: 9, reason: "", signals: [] },
+    { rank: 2, id: "b", title: "B", status: "backlog", priority: 1, score: 8, reason: "", signals: [] },
   ],
   blocked: [],
   excluded: { in_progress: 0, review: 0, duplicate: 0, blocked: 0, unread: 0, filtered: 0 },

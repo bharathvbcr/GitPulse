@@ -96,6 +96,21 @@ before that tag is pushed.
 
 ### Changed
 
+- **The Tasks board has five columns: Inbox is merged into Backlog.** New tasks
+  start in Backlog everywhere they started in Inbox: quick add, the task
+  editor, issues imported from GitHub, task briefs without a `status:` and
+  `gitpulse_add_task`.
+  - **Nothing you saved breaks.** A search that says `status:inbox`, a hidden
+    column, a column's work-in-progress limit, a saved view, a `status: inbox`
+    brief in `tasks/` and an older agent's `inbox` in `gitpulse_add_task` or
+    `gitpulse_list_tasks` are all read as Backlog. The tools no longer list
+    `inbox` as a choice. A hidden Inbox column no longer hides Backlog unless
+    Backlog was hidden too.
+  - The Tasks header's **Inbox** button (notifications) and the agent inbox are
+    different features and are unchanged.
+  - Moving tasks the task store still holds as `inbox` into Backlog is the
+    store's own upgrade, which ships separately.
+
 - **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
   are gone as pages; their content lives with the subject it acts on.
   - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or
