@@ -358,7 +358,7 @@ fn main() {
         let (even, odd) = (text.clone(), format!("X{}", &text[1..]));
         let mut turn = false;
         cases.push(Case::new(format!("save_edited_text {label}"), move || {
-            turn = !turn;
+            turn.toggle();
             let content = if turn { &odd } else { &even };
             sandbox_write_edited_text(&save_root, &name, content).expect("save");
             Sample::default().counter("bytes", content.len() as u64)

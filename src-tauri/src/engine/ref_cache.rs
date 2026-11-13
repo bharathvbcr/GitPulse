@@ -711,13 +711,9 @@ pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) fn eager<T>(f: impl FnOnce() -> T) -> T {
     RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            RACY_OVERRIDE.with(|cell| cell.set(None));
-        }
-    }
-    let _reset = Reset;
+    let _reset = std::mem::DropGuard::new((), |()| {
+        RACY_OVERRIDE.with(|cell| cell.set(None));
+    });
     f()
 }
 

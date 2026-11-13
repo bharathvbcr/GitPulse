@@ -4749,7 +4749,7 @@ fn is_shipped_venv_launcher(host: &std::path::Path, target: &std::path::Path) ->
 /// pointed at. This is what separates a virtualenv from `.venv/bin/python`
 /// aimed at `/bin/sh`.
 fn is_python_interpreter_name(name: &str) -> bool {
-    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let name = name.trim_suffix(".exe");
     if name == "python" || name == "python3" {
         return true;
     }
@@ -5433,7 +5433,7 @@ pub(crate) fn validate_manvi_paths(
     // resolves to a real file that has not been symlinked out of the tree.
     if program_is_repo_local(program_raw) {
         let normalized = program_raw.replace('\\', "/");
-        let relative = normalized.strip_prefix("./").unwrap_or(&normalized);
+        let relative = normalized.trim_prefix("./");
         // The virtualenv interpreter is validated on its own terms; every
         // other repository-local program must canonically resolve inside the
         // tree. Both fall through to the argument checks below.

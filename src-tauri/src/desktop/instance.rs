@@ -1273,14 +1273,10 @@ impl HandlerPool {
 
 fn accept_loop(listener: UnixListener, shared: Arc<Shared>, wake: &Wake) {
     let pool = HandlerPool::new(shared.clone());
-    struct Exited(Arc<Shared>, Arc<HandlerPool>);
-    impl Drop for Exited {
-        fn drop(&mut self) {
-            self.1.close();
-            self.0.accept_exited.store(true, Ordering::Release);
-        }
-    }
-    let _exited = Exited(shared.clone(), pool.clone());
+    let _exited = std::mem::DropGuard::new((shared.clone(), pool.clone()), |(shared, pool)| {
+        pool.close();
+        shared.accept_exited.store(true, Ordering::Release);
+    });
     while !shared.closing.load(Ordering::Acquire) {
         // No timeout: nothing here needs to run unless a connection arrives or
         // `Primary::shutdown` writes to the wake pipe.

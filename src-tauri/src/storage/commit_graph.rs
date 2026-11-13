@@ -513,11 +513,7 @@ fn graph_paths(info: &Path) -> Result<Option<GraphPaths>, (CommitGraphLayout, St
         Ok(Some(text)) => {
             // Git reads one hash and one newline per layer: a carriage return,
             // a blank line or padding is a chain it rejects.
-            let hashes: Vec<&str> = text
-                .strip_suffix('\n')
-                .unwrap_or(&text)
-                .split('\n')
-                .collect();
+            let hashes: Vec<&str> = text.trim_suffix('\n').split('\n').collect();
             if text.is_empty() {
                 return Err((
                     CommitGraphLayout::Split,

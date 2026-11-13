@@ -96,6 +96,33 @@ before that tag is pushed.
 
 ### Changed
 
+- **GitPulse builds on Rust 1.100.** Its own crates (`src-tauri`,
+  `crates/gitpulse-worktree`, `crates/git-status-parity`) declare
+  `rust-version = "1.100"`, an owner decision that replaces the unpinned floor.
+  The in-tree `src-tauri/framework/*` forks of third-party crates keep their own
+  `rust-version`. The vendored DevCouncil and MarkDev crates were re-vendored
+  from their 1.100 trees with `scripts/vendor-crates.mjs`. That refresh also
+    moved the vendored `dc-store` and `devmap-store` to `rusqlite` 0.41.1, so
+    GitPulse's own `rusqlite` (and the `gitpulse-worktree` dev-dependency) moved
+    from 0.40.2 to 0.41.1 with it, and `libsqlite3-sys` from 0.38.2 to 0.39.1,
+    as the line next to the dependency requires.
+  - **Cargo's new build-dir layout is handled.** cargo 1.100 no longer writes
+    `target/<profile>/deps/`; units live in `build/<pkg>/<hash>/{out,run,fingerprint}`.
+    The shared build cache (`gitpulse-rustc`) now finds its binary from a test
+    or bench binary in either layout, and its fixtures cover both. A cloned
+    `target/` rewrites a build script's recorded `run/stdout` and
+    `run/root-output` (it previously rewrote only the older `output` files, so a
+    1.100 clone kept the anchor's `OUT_DIR`), and treats `.cargo-build-lock` and
+    `.cargo-artifact-lock` as a build in progress. The Rust build-cache
+    integration test read `target/debug/deps` unconditionally and failed under 1.100;
+    it now reads the dep-info of whichever layout the build produced and fails
+    when it finds none.
+  - **Registry cooldown.** `.cargo/config.toml` sets
+    `[registry] global-min-publish-age = "3 days"`.
+  - **Language features.** `strip_prefix(..).unwrap_or(x)` sites became
+    `trim_prefix`/`trim_suffix`, `x = !x` became `x.toggle()`, and single-purpose
+    function-local drop guards became `std::mem::DropGuard`.
+
 - **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
   are gone as pages; their content lives with the subject it acts on.
   - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or

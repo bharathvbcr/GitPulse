@@ -671,16 +671,12 @@ fn accept_loop(
     wake: &crate::local_socket::Wake,
 ) {
     use std::os::unix::io::AsRawFd;
-    /// Counts the loop out only after its exit work, the unlink included.
-    struct Running(&'static State);
-    impl Drop for Running {
-        fn drop(&mut self) {
-            self.0.live_loops.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
     let state = state();
     state.live_loops.fetch_add(1, Ordering::SeqCst);
-    let _running = Running(state);
+    // Counts the loop out only after its exit work, the unlink included.
+    let _running = std::mem::DropGuard::new(state, |state| {
+        state.live_loops.fetch_sub(1, Ordering::SeqCst);
+    });
     // SAFETY: `getuid` reads this process's real user id and cannot fail.
     let own = unsafe { libc::getuid() };
     let path = listener

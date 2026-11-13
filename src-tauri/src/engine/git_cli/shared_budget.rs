@@ -1702,7 +1702,7 @@ mod tests {
     impl Write for FaultFile {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
             if self.interrupt {
-                self.pending_interrupt = !self.pending_interrupt;
+                self.pending_interrupt.toggle();
                 if self.pending_interrupt {
                     return Err(std::io::ErrorKind::Interrupted.into());
                 }

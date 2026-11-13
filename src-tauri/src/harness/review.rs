@@ -143,7 +143,7 @@ pub(crate) fn attempts_landed(
         if end.is_empty() || end.starts_with('^') {
             continue;
         }
-        let named = end.strip_prefix("refs/heads/").unwrap_or(end);
+        let named = end.trim_prefix("refs/heads/");
         if let Some(attempt) = attempts.iter().find(|a| a.branch == named) {
             push_unique(&mut landed, attempt);
             continue;

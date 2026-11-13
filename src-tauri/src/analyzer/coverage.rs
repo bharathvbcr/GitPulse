@@ -7709,7 +7709,7 @@ src/main.go:4.1,4.8 1 0
             for ch in command.chars() {
                 match ch {
                     '"' => {
-                        quoted = !quoted;
+                        quoted.toggle();
                         has_token = true;
                     }
                     c if c.is_whitespace() && !quoted => {

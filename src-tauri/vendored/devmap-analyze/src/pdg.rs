@@ -582,6 +582,7 @@ impl<'a> PdgBuilder<'a> {
     ///   handlers, normal and abrupt alike. Its tail continues normally if
     ///   anything entered normally, and continues outward (to an enclosing
     ///   `finally`, then exit) if anything entered abruptly.
+    #[allow(clippy::too_many_arguments)]
     fn build_try(
         &mut self,
         line: u32,

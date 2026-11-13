@@ -902,7 +902,7 @@ const HEAD_UNREADABLE: &str = "the worktree's head could not be read: ";
 /// The matcher itself is not loosened: text that merely quotes a refusal, or
 /// a path that carries one, is still not a deferral.
 pub(crate) fn stored_question_unasked(line: &str) -> bool {
-    git_question_unasked(line.strip_prefix(HEAD_UNREADABLE).unwrap_or(line))
+    git_question_unasked(line.trim_prefix(HEAD_UNREADABLE))
 }
 
 const NO_PARENT: &str = "the claimed commit is on the default branch and has no parent, so there is no earlier revision to diff against";

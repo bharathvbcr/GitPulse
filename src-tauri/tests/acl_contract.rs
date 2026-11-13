@@ -352,7 +352,7 @@ fn every_plugin_command_the_frontend_calls_is_granted_and_nothing_more() {
             .unwrap_or_default();
 
         for (command, file) in commands {
-            let where_ = file.strip_prefix(repo_root()).unwrap_or(file).display();
+            let where_ = file.trim_prefix(repo_root()).display();
             assert!(
                 known.contains(command),
                 "{where_} imports a {plugin} API that maps to command {command:?}, which the \

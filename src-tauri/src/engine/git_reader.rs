@@ -683,14 +683,10 @@ thread_local! {
 /// Runs `body` with `bound` set to `deadline` on this thread.
 #[cfg(test)]
 fn with_deadline<T>(bound: Bound, deadline: Duration, body: impl FnOnce() -> T) -> T {
-    struct Restore([Option<Duration>; BOUNDS]);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            DEADLINE_OVERRIDES.with(|cell| cell.set(self.0));
-        }
-    }
     let before = DEADLINE_OVERRIDES.with(std::cell::Cell::get);
-    let _restore = Restore(before);
+    let _restore = std::mem::DropGuard::new(before, |prev| {
+        DEADLINE_OVERRIDES.with(|cell| cell.set(prev));
+    });
     let mut next = before;
     next[bound as usize] = Some(deadline);
     DEADLINE_OVERRIDES.with(|cell| cell.set(next));
@@ -4801,10 +4797,7 @@ pub(crate) fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
 fn short_branch_name(refname: &str) -> (&str, bool) {
     match refname.strip_prefix("refs/remotes/") {
         Some(rest) => (rest, true),
-        None => (
-            refname.strip_prefix("refs/heads/").unwrap_or(refname),
-            false,
-        ),
+        None => (refname.trim_prefix("refs/heads/"), false),
     }
 }
 
@@ -5544,13 +5537,12 @@ fn history_chunk_size() -> usize {
 /// boundaries without a 5,000-commit fixture.
 #[cfg(test)]
 pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<usize>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CHUNK_OVERRIDE.with(|cell| cell.set(self.0));
-        }
-    }
-    let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    let _restore = std::mem::DropGuard::new(
+        CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))),
+        |prev| {
+            CHUNK_OVERRIDE.with(|cell| cell.set(prev));
+        },
+    );
     body()
 }
 
@@ -5577,13 +5569,12 @@ fn history_walk_cap() -> usize {
 /// without printing 64 MiB.
 #[cfg(test)]
 fn with_history_walk_cap<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<usize>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            WALK_CAP_OVERRIDE.with(|cell| cell.set(self.0));
-        }
-    }
-    let _restore = Restore(WALK_CAP_OVERRIDE.with(|cell| cell.replace(Some(bytes))));
+    let _restore = std::mem::DropGuard::new(
+        WALK_CAP_OVERRIDE.with(|cell| cell.replace(Some(bytes))),
+        |prev| {
+            WALK_CAP_OVERRIDE.with(|cell| cell.set(prev));
+        },
+    );
     body()
 }
 
@@ -6159,7 +6150,7 @@ pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<
 fn parse_ls_files_entries(raw: &str) -> Vec<String> {
     let mut unique: HashSet<&str> = HashSet::new();
     for entry in raw.split('\0') {
-        let entry = entry.strip_suffix('/').unwrap_or(entry);
+        let entry = entry.trim_suffix('/');
         if entry.is_empty()
             || entry == "."
             || entry == ".."
@@ -7137,7 +7128,7 @@ fn parse_commit_show(
     // The terminator after the body is followed by the newline that separates
     // the message from the diff; it belongs to neither.
     let records = parts.next().unwrap_or("");
-    let records = records.strip_prefix('\n').unwrap_or(records);
+    let records = records.trim_prefix('\n');
     let records = if cut.is_some() {
         drop_partial_numstat_tail(records)
     } else {

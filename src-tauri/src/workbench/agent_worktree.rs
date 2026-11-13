@@ -1266,16 +1266,22 @@ mod tests {
         })
     }
 
-    /// Writes a cargo-shaped `target/` of `files` files into `at`.
+    /// Writes a cargo-shaped `target/` of `files` files into `at`: even-numbered ones in
+    /// the layout of cargo <= 1.99 (`debug/deps/`), odd-numbered ones in that of
+    /// cargo >= 1.100 (`debug/build/<pkg>/<hash>/out/`), because a lane may have been
+    /// built by either and removing it must not depend on which.
     fn write_target(at: &Path, files: usize) {
         std::fs::create_dir_all(at.join("debug/deps")).unwrap();
         std::fs::create_dir_all(at.join("debug/incremental/crate-abc")).unwrap();
         for n in 0..files {
-            std::fs::write(
-                at.join(format!("debug/deps/libdep{n}.rlib")),
-                vec![b'r'; 4096],
-            )
-            .unwrap();
+            let rlib = if n % 2 == 0 {
+                at.join(format!("debug/deps/libdep{n}.rlib"))
+            } else {
+                let out = at.join(format!("debug/build/dep{n}/{n:016x}/out"));
+                std::fs::create_dir_all(&out).unwrap();
+                out.join(format!("libdep{n}-{n:016x}.rlib"))
+            };
+            std::fs::write(rlib, vec![b'r'; 4096]).unwrap();
         }
         std::fs::write(
             at.join("debug/incremental/crate-abc/s.bin"),

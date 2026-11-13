@@ -104,13 +104,9 @@ thread_local! {
 #[cfg(unix)]
 pub(crate) fn with_hook_timeout<T>(budget: Duration, body: impl FnOnce() -> T) -> T {
     HOOK_TIMEOUT_OVERRIDE.set(Some(budget));
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            HOOK_TIMEOUT_OVERRIDE.set(None);
-        }
-    }
-    let _reset = Reset;
+    let _reset = std::mem::DropGuard::new((), |()| {
+        HOOK_TIMEOUT_OVERRIDE.set(None);
+    });
     body()
 }
 

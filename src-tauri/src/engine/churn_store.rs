@@ -740,14 +740,10 @@ thread_local! {
 /// concurrent neighbour can move them. Removed when `body` returns or unwinds.
 #[cfg(test)]
 pub(crate) fn with_before_keep<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
-    struct Clear;
-    impl Drop for Clear {
-        fn drop(&mut self) {
-            BEFORE_KEEP.with(|hook| *hook.borrow_mut() = None);
-        }
-    }
     BEFORE_KEEP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _clear = Clear;
+    let _clear = std::mem::DropGuard::new((), |()| {
+        BEFORE_KEEP.with(|hook| *hook.borrow_mut() = None);
+    });
     body()
 }
 

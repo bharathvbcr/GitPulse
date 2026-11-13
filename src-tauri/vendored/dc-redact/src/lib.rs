@@ -807,7 +807,7 @@ fn declared_name(line: &str, sep: usize) -> Option<&str> {
     let key_start = line[..sep].trim_end().len() - key.len();
     let head = line[..key_start].trim_end();
     let head = head.trim_end_matches(['&', '*', '[', ']']).trim_end();
-    let head = head.strip_suffix(':').unwrap_or(head).trim_end();
+    let head = head.trim_suffix(':').trim_end();
     key_before(line, head.len()).or(Some(key))
 }
 
@@ -1349,8 +1349,8 @@ pub fn redact_secrets(text: &str) -> String {
     // `contains_secret` and left in place here.
     let mut out = String::with_capacity(text.len());
     for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = segment.trim_suffix('\n');
+        let line = line.trim_suffix('\r');
         out.push_str(&redact_line(line));
         out.push_str(&segment[line.len()..]);
     }

@@ -68,7 +68,7 @@ fn string_list(value: &Value, key: &str, cap: usize) -> Vec<String> {
 
 fn strip_glob(hint: &str) -> String {
     let text = normalize(hint.trim());
-    let text = text.strip_suffix("/*").unwrap_or(&text);
+    let text = text.trim_suffix("/*");
     text.trim().trim_matches('/').to_string()
 }
 

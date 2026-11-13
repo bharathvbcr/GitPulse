@@ -8283,7 +8283,7 @@ mod tests {
         let root = temp_repo_dir("atk-w1-alias");
         let anchor = root.join("anchor");
         seed_indexed_git_repo(&anchor);
-        let store = Store::open(&store_path(&anchor)).unwrap();
+        let store = Store::open(store_path(&anchor)).unwrap();
         let canon = anchor.canonicalize().unwrap();
         check_store_holds_key(
             &store,
@@ -8313,7 +8313,7 @@ mod tests {
         seed_indexed_git_repo(&anchor);
         let moved = root.join("anchor-moved");
         fs::rename(&anchor, &moved).unwrap();
-        let store = Store::open(&store_path(&moved)).unwrap();
+        let store = Store::open(store_path(&moved)).unwrap();
         let stored = store
             .stored_latest_generation_repo_root()
             .unwrap()

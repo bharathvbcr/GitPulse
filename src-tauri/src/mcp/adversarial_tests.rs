@@ -113,7 +113,7 @@ fn a_tool_response_never_exceeds_the_frame_around_the_boundary() {
                     let len = (center as isize + delta * 3).max(1) as usize;
                     let payload = json!({
                         "ok": true,
-                        "items": (0..40).map(|_| element.repeat(len)).collect::<Vec<_>>(),
+                        "items": Vec::from_fn(40, |_| element.repeat(len)),
                     });
                     let result = complete_tool_result(modern, payload, room);
                     let bytes = wire_bytes(id.clone(), result);

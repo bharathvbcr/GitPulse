@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn a_legacy_text_is_measured_escaped() {
         // Every quote in the payload doubles inside the text string.
-        let payload = json!({ "xs": (0..40).map(|_| "\"".repeat(2000)).collect::<Vec<_>>() });
+        let payload = json!({ "xs": Vec::from_fn(40, |_| "\"".repeat(2000)) });
         let fitted = fit(false, payload, 50_000).unwrap();
         assert!(
             escaped_len(&fitted.text) <= 50_000,
@@ -809,7 +809,7 @@ mod tests {
         // A numeric cursor over rows without an `id` cannot be moved either.
         let numeric = json!({
             "next_cursor": 40, "truncated": false,
-            "xs": (0..40).map(|_| json!({ "blob": "b".repeat(2000) })).collect::<Vec<_>>(),
+            "xs": Vec::from_fn(40, |_| json!({ "blob": "b".repeat(2000) })),
         });
         assert!(fit(true, numeric, 20_000).is_err());
         // Nor can an emptied page: it would leave a cursor naming no row.

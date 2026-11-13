@@ -2,6 +2,7 @@
 name = "gitpulse-worktree"
 version = "1.5.0"
 edition = "2021"
+rust-version = "1.100"
 description = "Standalone worktree & branch orchestrator and DevMap delta overlay compiler for parallel agentic lanes"
 license = "MIT"
 
@@ -30,7 +31,7 @@ serde_json = "1.0"
 [dev-dependencies]
 devmap-extract = { path = "../../src-tauri/vendored/devmap-extract", default-features = false }
 devmap-store = { path = "../../src-tauri/vendored/devmap-store", default-features = false }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tempfile = "3.27"
 
 [patch.crates-io]

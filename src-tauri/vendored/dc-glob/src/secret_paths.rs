@@ -138,12 +138,13 @@ mod tests {
     #[test]
     fn the_list_is_the_go_policy_list() {
         let go = go_secret_patterns();
-        assert!(go.len() >= 20, "read only {} Go patterns", go.len());
         let rust: Vec<String> = SECRET_PATH_PATTERNS.iter().map(|p| p.to_string()).collect();
-        assert_eq!(
-            rust, go,
-            "dc_glob::SECRET_PATH_PATTERNS drifted from policy.SecretPathPatterns"
-        );
+        // Failure names the drift and not the pattern list. The list is the
+        // secret-path policy, and formatting it into the assertion writes it
+        // to the test log.
+        if go.len() < 20 || rust != go {
+            panic!("dc_glob::SECRET_PATH_PATTERNS drifted from policy.SecretPathPatterns");
+        }
     }
 
     #[test]

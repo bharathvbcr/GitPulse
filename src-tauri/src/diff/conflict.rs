@@ -603,7 +603,7 @@ fn normalize_custom_lines(text: &str) -> Vec<String> {
     }
     pieces
         .into_iter()
-        .map(|p| p.strip_suffix('\r').unwrap_or(p).to_string())
+        .map(|p| p.trim_suffix('\r').to_string())
         .collect()
 }
 

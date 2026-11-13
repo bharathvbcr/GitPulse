@@ -992,7 +992,7 @@ fn parse_diff(diff: &str) -> (Vec<FileChange>, Tally, BTreeSet<String>, Vec<Stri
     let mut current: Option<Acc> = None;
 
     for raw in diff.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = raw.trim_suffix('\r');
         if let Some(rest) = line.strip_prefix("diff --git ") {
             finish(&mut current, &mut files, &mut tally);
             current = Some(start_header(rest));

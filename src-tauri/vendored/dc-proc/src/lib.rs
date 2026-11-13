@@ -1640,13 +1640,10 @@ pub mod test_hooks {
     /// child's bytes wait in the pipe meanwhile, so nothing is lost; only the
     /// time at which the tail is complete moves.
     pub fn with_stderr_drain_start_delay<R>(delay: Duration, body: impl FnOnce() -> R) -> R {
-        struct Restore(Duration);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                DRAIN_START_DELAY.with(|cell| cell.set(self.0));
-            }
-        }
-        let _restore = Restore(DRAIN_START_DELAY.with(|cell| cell.replace(delay)));
+        let _restore = std::mem::DropGuard::new(
+            DRAIN_START_DELAY.with(|cell| cell.replace(delay)),
+            |previous| DRAIN_START_DELAY.with(|cell| cell.set(previous)),
+        );
         body()
     }
 

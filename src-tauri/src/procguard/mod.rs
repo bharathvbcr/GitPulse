@@ -797,13 +797,9 @@ thread_local! {
 /// depending on the OS refusing it.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn with_band_hook<T>(hook: BandHook, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<BandHook>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BAND_HOOK_OVERRIDE.set(self.0);
-        }
-    }
-    let _restore = Restore(BAND_HOOK_OVERRIDE.replace(Some(hook)));
+    let _restore = std::mem::DropGuard::new(BAND_HOOK_OVERRIDE.replace(Some(hook)), |prev| {
+        BAND_HOOK_OVERRIDE.set(prev);
+    });
     body()
 }
 

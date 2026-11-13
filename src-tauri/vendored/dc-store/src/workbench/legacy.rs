@@ -272,12 +272,11 @@ pub(crate) fn retire(
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let outcome = (|| {
-        if workbench_ready {
-            if let Some(version) = work_meta_version(conn)? {
-                if version < WORKBENCH_SCHEMA {
-                    ensure_schema_within(conn, true)?;
-                }
-            }
+        if workbench_ready
+            && let Some(version) = work_meta_version(conn)?
+            && version < WORKBENCH_SCHEMA
+        {
+            ensure_schema_within(conn, true)?;
         }
         archive(store, workbench_ready)
     })()

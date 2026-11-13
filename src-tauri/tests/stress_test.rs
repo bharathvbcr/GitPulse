@@ -460,11 +460,7 @@ fn loc_counter_survives_adversarial_content() {
         // for the degenerate BOM-only file, where `str::lines()` reports one
         // line and the counter — correctly — reports none. Every other input
         // sees the two agree, so this still catches a lost or invented line.
-        let expected_lines = content
-            .strip_prefix('\u{feff}')
-            .unwrap_or(content)
-            .lines()
-            .count();
+        let expected_lines = content.trim_prefix('\u{feff}').lines().count();
         for lang in languages {
             let counts = LocCounter::count_for_language(content, lang);
             // The one invariant that must hold for every input: each line is

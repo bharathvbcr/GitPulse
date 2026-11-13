@@ -4010,6 +4010,62 @@ mod tests {
             .unwrap_or_else(|| panic!("{rel} is an artifact scope"))
     }
 
+    /// A Cargo `target/` is one artifact scope, read to its end, in either build-dir
+    /// layout: `debug/deps/<name>-<hash>` (cargo <= 1.99) or
+    /// `debug/build/<pkg>/<hash>/{out,run,fingerprint}/` (cargo >= 1.100, no `deps/`),
+    /// where the generic-looking `build` and `out` directories must not open child
+    /// scopes of their own and every byte must be counted once.
+    #[test]
+    fn a_cargo_target_is_one_complete_scope_in_both_build_dir_layouts() {
+        for (label, files) in [
+            (
+                "cargo<=1.99",
+                [
+                    "target/debug/deps/libserde-aa11.rlib",
+                    "target/debug/deps/serde-aa11.d",
+                    "target/debug/build/serde-bb22/out/private.rs",
+                    "target/debug/build/serde-bb22/output",
+                    "target/debug/.fingerprint/serde-aa11/lib-serde.json",
+                    "target/debug/libmine.rlib",
+                ],
+            ),
+            (
+                "cargo>=1.100",
+                [
+                    "target/debug/build/serde/aa11/out/libserde-aa11.rlib",
+                    "target/debug/build/serde/aa11/out/serde-aa11.d",
+                    "target/debug/build/serde/bb22/out/private.rs",
+                    "target/debug/build/serde/bb22/run/stdout",
+                    "target/debug/build/serde/aa11/fingerprint/lib-serde.json",
+                    "target/debug/libmine.rlib",
+                ],
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            for file in files {
+                write_file(&root.join(file), 10);
+            }
+            let mut budget = WalkBudget::new();
+            let collector = walk_artifacts(root, &mut budget);
+
+            let rels: Vec<String> = collector
+                .found
+                .iter()
+                .map(|f| f.rel.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                rels,
+                ["target"],
+                "{label}: build/ and out/ opened child scopes"
+            );
+            let target = scope(&collector, "target");
+            assert!(target.complete, "{label}: the tree was not read to its end");
+            assert_eq!(target.bytes, 10 * files.len() as u64, "{label}");
+            assert!(!budget.truncated, "{label}");
+        }
+    }
+
     /// An artifact tree past its own file allowance is refused, not trimmed and
     /// called clean. The allowance is injected rather than reached, because
     /// reaching it honestly would mean creating 600,000 files.

@@ -239,7 +239,7 @@ impl Markers {
     fn record_error(&mut self, root: &Path, path: &Path, error: impl std::fmt::Display) {
         self.unreadable_count += 1;
         if self.unreadable.len() < ERROR_SAMPLE_CAP {
-            let relative = path.strip_prefix(root).unwrap_or(path);
+            let relative = path.trim_prefix(root);
             let label = if relative.as_os_str().is_empty() {
                 ".".to_string()
             } else {
@@ -379,7 +379,7 @@ fn walk_markers_with_limits(
                 kind.is_file()
             };
             if regular {
-                found.record_file(entry.path().strip_prefix(root).unwrap_or(&entry.path()));
+                found.record_file(entry.path().trim_prefix(root));
             }
         }
     }

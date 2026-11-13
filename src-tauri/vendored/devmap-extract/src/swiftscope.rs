@@ -4006,7 +4006,7 @@ mod tests {
                 assert_eq!(head, nominal, "{shape} from parameter {param}");
             }
         } else {
-            let bare = head.strip_suffix('!').unwrap_or(head);
+            let bare = head.trim_suffix('!');
             assert_eq!(bare, local, "shape {shape} from {source}");
         }
     }
@@ -4020,10 +4020,7 @@ mod tests {
         assert_snapshot_shape(source, "Støre", "støre");
         let found = bound(source, "t");
         if let Some(ty) = ty_of(&found, "s") {
-            assert!(
-                !ty.chars().all(|c| c.is_ascii()),
-                "typed the local as ASCII {ty}"
-            );
+            assert!(!ty.is_ascii(), "typed the local as ASCII {ty}");
         }
     }
 
