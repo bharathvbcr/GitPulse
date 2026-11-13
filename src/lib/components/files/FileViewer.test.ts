@@ -227,6 +227,14 @@ describe("FileViewer", () => {
     expect(head).not.toMatch(/bg-surface|gp-section-edge/);
   });
 
+  it("gives the Live pulse card the same clear ground as the Explorer card beside it", () => {
+    const pulse = readFileSync(join(here, "LivePulseDashboard.svelte"), "utf8");
+    const body = pulse.slice(pulse.indexOf("</script>"));
+    const root = body.slice(body.indexOf("<div"), body.indexOf(">", body.indexOf("<div")) + 1);
+    expect(root).toContain("flex flex-col h-full");
+    expect(root).not.toMatch(/\bbg-surface(\/\d+)?\b/);
+  });
+
   it("draws the Live pulse column as a floating card that stretches with its row", () => {
     const host = source.slice(source.indexOf("{#if paneLayout.dashboardVisible}"), source.indexOf("<LivePulseDashboard"));
     expect(host).toContain("gp-float-card");

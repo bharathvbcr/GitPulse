@@ -4,6 +4,8 @@
   import EmptyState from "../EmptyState.svelte";
   import Skeleton from "../Skeleton.svelte";
   import { describeFailure } from "../../ui/copy/describeFailure";
+  import ListPreviewToggle from "../ListPreviewToggle.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
   import { Users, AlertTriangle, ShieldCheck, FileWarning, RefreshCw } from "@lucide/svelte";
 
   let {
@@ -22,8 +24,9 @@
     onRefresh?: () => void;
   } = $props();
 
-  /** Authors listed in the ownership breakdown; the rest are counted, not drawn. */
-  const AUTHORS_SHOWN = 8;
+  /** Which long lists the reader expanded; each opens on LIST_PREVIEW_ROWS rows. */
+  let authorsExpanded = $state(false);
+  let orphansExpanded = $state(false);
 
   /** Areas the sample never blamed: their authors are absent from every figure. */
   const unsampledAreas = $derived(
@@ -161,7 +164,7 @@
     <div class="flex flex-col gap-2.5">
       <h4 class="gp-label">Primary code ownership</h4>
       <div class="flex flex-col gap-2">
-        {#each knowledge.primary_authors.slice(0, AUTHORS_SHOWN) as author}
+        {#each previewSlice(knowledge.primary_authors, authorsExpanded, LIST_PREVIEW_ROWS) as author}
           <div class="flex flex-col gap-1 p-2 rounded-lg bg-background">
             <div class="flex items-center justify-between text-xs">
               <div class="flex items-center gap-2">
@@ -183,11 +186,7 @@
           </div>
         {/each}
       </div>
-      {#if knowledge.primary_authors.length > AUTHORS_SHOWN}
-        <p class="text-meta text-textMuted">
-          Showing {AUTHORS_SHOWN} of {knowledge.primary_authors.length} authors.
-        </p>
-      {/if}
+      <ListPreviewToggle total={knowledge.primary_authors.length} noun="authors" bind:expanded={authorsExpanded} />
     </div>
 
     <!-- Orphaned Files Table if present -->
@@ -208,7 +207,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each knowledge.orphaned_files as file}
+              {#each previewSlice(knowledge.orphaned_files, orphansExpanded, LIST_PREVIEW_ROWS) as file}
                 <tr class="hover:bg-surfaceHover/50 font-mono text-meta">
                   <td class="py-1.5 px-3 truncate max-w-xs text-textPrimary" title={file.path}>{file.path}</td>
                   <td class="py-1.5 px-3 text-textMuted font-sans">{file.primary_author}</td>
@@ -221,6 +220,7 @@
             </tbody>
           </table>
         </div>
+        <ListPreviewToggle total={knowledge.orphaned_files.length} noun="files" bind:expanded={orphansExpanded} />
       </div>
     {/if}
 

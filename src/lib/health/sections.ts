@@ -43,15 +43,8 @@ export interface HealthSectionSpec {
 // the pane's, at every width (DESIGN_LANGUAGE section 7a). It used to export two
 // `max-w-*` constants; they are retired, and healthComponents.test.ts pins that.
 
-/**
- * Rows a Health list shows before "Show all".
- *
- * One number for every list on the page, so sections line up and a reader
- * learns the shape once. Long enough that a typical finding list needs no
- * click; short enough that 200 outdated packages do not push the sections
- * below them off the page.
- */
-export const HEALTH_PREVIEW_ROWS = 8;
+// Rows a list shows before "Show all" is `LIST_PREVIEW_ROWS` in
+// `ui/previewList.ts`: one number for the whole app, not one per page.
 
 /**
  * Rendered order, findings first.

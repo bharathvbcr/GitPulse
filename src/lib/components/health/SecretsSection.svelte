@@ -53,14 +53,13 @@
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { keyedList } from "../../ui/eachKeys";
-  import { previewSlice } from "../../ui/previewList";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
   import EmptyState from "../EmptyState.svelte";
   import HealthSection from "./HealthSection.svelte";
-  import HealthPreviewToggle from "./HealthPreviewToggle.svelte";
+  import ListPreviewToggle from "../ListPreviewToggle.svelte";
   import HealthTable from "./HealthTable.svelte";
   import Skeleton from "../Skeleton.svelte";
   import { describeFailure } from "../../ui/copy/describeFailure";
-  import { HEALTH_PREVIEW_ROWS } from "../../health/sections";
   import type { SectionCount } from "../../health/counts";
   import type { HealthTone } from "../../health/summary";
   import {
@@ -139,7 +138,7 @@
   const findings = $derived(report?.findings ?? []);
   const chips = $derived(locationChips(findings));
   const shownRows = $derived(filterFindings(findings, filter));
-  const previewRows = $derived(previewSlice(shownRows, expanded, HEALTH_PREVIEW_ROWS));
+  const previewRows = $derived(previewSlice(shownRows, expanded, LIST_PREVIEW_ROWS));
   const sizes = $derived(groupSizes(findings));
   const headline = $derived(report ? verdict(report) : null);
   const cappedNote = $derived(report ? capNote(report) : null);
@@ -468,7 +467,7 @@
           </tr>
         {/each}
       </HealthTable>
-      <HealthPreviewToggle total={shownRows.length} noun="findings" bind:expanded />
+      <ListPreviewToggle total={shownRows.length} noun="findings" bind:expanded />
     {:else if report.ok && headline.tone === "ok"}
       <EmptyState
         icon={ShieldCheck}

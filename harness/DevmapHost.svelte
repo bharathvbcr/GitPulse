@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { runDevmapChecks, stressDevmap } from "./devmapChecks";
+  import { runDevmapChecks, runPanelChecks, stressDevmap } from "./devmapChecks";
   import { createChecks, type CheckRow } from "./checks";
   import { onMount } from "svelte";
   import CodeGraphCanvas from "../src/lib/components/CodeGraphCanvas.svelte";
@@ -25,7 +25,7 @@
   /** Run the runtime checks (or the stress pass) and return the rows. A failed
    * check ends the run with a row naming where it stopped, so the verdict never
    * reads as a shorter list of passes. */
-  async function runChecks(stress = false): Promise<{ rows: CheckRow[]; errors: string[] }> {
+  async function runChecks(suite: "runtime" | "stress" | "panel" = "runtime"): Promise<{ rows: CheckRow[]; errors: string[] }> {
     checking = true;
     const errors: string[] = [];
     const onError = (event: ErrorEvent) => errors.push(event.message);
@@ -34,9 +34,11 @@
     window.addEventListener("unhandledrejection", onRejection);
     const { results, check, stopped } = createChecks();
     try {
-      const summary = stress
+      const summary = suite === "stress"
         ? await stressDevmap(next => load = next, check)
-        : await runDevmapChecks(next => load = next, check, id => focusId = id);
+        : suite === "panel"
+          ? await runPanelChecksInStage(check)
+          : await runDevmapChecks(next => load = next, check, id => focusId = id);
       for (let i=0;i<3;i++) await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
       check("no unhandled runtime errors", () => errors.length === 0);
       verdict = summary;
@@ -49,6 +51,15 @@
     }
     return { rows: results, errors };
   }
+  /** The Code → Map panel is mounted over the canvas, in a stage of its own: the
+   * canvas checks above keep their DOM, and the panel's checks see only the stage. */
+  let stage: HTMLDivElement | undefined = $state();
+  async function runPanelChecksInStage(check: Parameters<typeof runPanelChecks>[1]): Promise<string> {
+    if (!stage) throw new Error("The panel stage is not mounted");
+    stage.style.visibility = "visible";
+    try { return await runPanelChecks(stage, check); }
+    finally { stage.style.visibility = "hidden"; }
+  }
   /** `?check=1&report=…` is how the regression gate drives a page: run both
    * suites (runtime, then the 5,000-node stress pass), publish every check of
    * each as its own row on the document element, and POST the page back. A
@@ -57,8 +68,8 @@
     const results: CheckRow[] = [];
     const errors: string[] = [];
     const verdicts: string[] = [];
-    for (const [suite, stress] of [["runtime checks", false], ["stress checks", true]] as const) {
-      const { rows, errors: suiteErrors } = await runChecks(stress);
+    for (const [suite, kind] of [["runtime checks", "runtime"], ["stress checks", "stress"], ["panel checks", "panel"]] as const) {
+      const { rows, errors: suiteErrors } = await runChecks(kind);
       for (const row of rows) results.push({ name: `${suite}: ${row.name}`, pass: row.pass });
       for (const message of suiteErrors) errors.push(`${suite}: ${message}`);
       verdicts.push(`${suite}: ${verdict}`);
@@ -80,7 +91,8 @@
 <div style="display:flex;gap:8px;align-items:center;padding:24px 20px 8px;background:#10151f;color:#9baac0;font:11px system-ui">
   <span style="flex:1">DevMap · browser verification</span>
   <button onclick={() => void runChecks()} disabled={checking || !show}>Run runtime checks</button>
-  <button onclick={() => void runChecks(true)} disabled={checking || !show}>Run stress checks</button>
+  <button onclick={() => void runChecks("stress")} disabled={checking || !show}>Run stress checks</button>
+  <button onclick={() => void runChecks("panel")} disabled={checking}>Run map panel checks</button>
   <span role="status" data-testid="runtime-verdict">{verdict}</span>
   <button onclick={() => themeStore.toggle()}>Toggle theme</button>
   <button onclick={() => { load = {available: true, kind: "code_graph", payload: {...fixture, nodes: fixture.nodes.map(n => ({...n, name: `Updated ${n.name}`}))}}; }}>Replace same-count payload</button>
@@ -88,3 +100,6 @@
   <span data-testid="opened-file">{opened}</span>
 </div>
 {#if show}<CodeGraphCanvas {load} focusNodeId={focusId} onOpenNode={(path) => opened = path} />{/if}
+<!-- A fixed stage for the Code → Map panel. It overlays the page and is hidden
+     until its suite runs; `visibility`, not `display`, so it keeps its layout. -->
+<div bind:this={stage} data-testid="panel-stage" style="position:fixed;left:0;top:0;width:1100px;height:700px;display:flex;flex-direction:column;visibility:hidden;z-index:30;background:rgb(var(--c-bg));overflow:hidden"></div>

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { parse } from "svelte/compiler";
 import { describe, expect, it } from "vitest";
 import { keyedList } from "../src/lib/ui/eachKeys";
+import { LIST_PREVIEW_ROWS, previewSlice } from "../src/lib/ui/previewList";
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -30,23 +31,25 @@ function templateKeys(file: string, iterable: string, scope: Record<string, unkn
   visit(parse(source, { modern: true }));
   expect(found, `Missing/ambiguous each block for ${file}: ${iterable}`).toHaveLength(1);
   const block = found[0];
-  const evaluate = new Function("keyedList", ...Object.keys(scope),
+  // The template may slice its rows for the collapsed preview; the real helper
+  // is in scope, and a case that needs every row passes its list expanded.
+  const evaluate = new Function("keyedList", "previewSlice", "LIST_PREVIEW_ROWS", ...Object.keys(scope),
     `return (${span(source, block.expression)}).map((${span(source, block.context)}, ${typeof block.index === "string" ? block.index : "__index"}) => (${span(source, block.key)}));`);
-  const keys: unknown = evaluate(keyedList, ...Object.values(scope));
+  const keys: unknown = evaluate(keyedList, previewSlice, LIST_PREVIEW_ROWS, ...Object.values(scope));
   if (!Array.isArray(keys)) throw new Error("Template did not produce keys");
   return keys;
 }
 
 describe("repeatable provider rows keep unique Svelte identities", () => {
   const cases: Array<{ file: string; iterable: string; scope: Record<string, unknown>; count: number }> = [
-    { file: "RepoMapPanel.svelte", iterable: "brokenDisplay.shown", scope: { brokenDisplay: { shown: [{ source: "A.md", target: "missing" }, { source: "A.md", target: "missing" }] } }, count: 2 },
-    { file: "RepoMapPanel.svelte", iterable: "docsHits", scope: { docsHits: [{ path: "A.md", line: 1, score: 1 }, { path: "A.md", line: 1, score: 1 }] }, count: 2 },
-    { file: "RepoMapPanel.svelte", iterable: "linkResult.links", scope: { linkResult: { links: Array.from({ length: 2 }, () => ({ from_repo: "a", from_file: "f", module_specifier: "x", to_repo: "b" })) } }, count: 2 },
+    { file: "RepoMapPanel.svelte", iterable: "brokenDisplay.shown", scope: { expandedLists: { broken: true }, brokenDisplay: { shown: [{ source: "A.md", target: "missing" }, { source: "A.md", target: "missing" }] } }, count: 2 },
+    { file: "RepoMapPanel.svelte", iterable: "docsHits", scope: { expandedLists: { hits: true }, docsHits: [{ path: "A.md", line: 1, score: 1 }, { path: "A.md", line: 1, score: 1 }] }, count: 2 },
+    { file: "RepoMapPanel.svelte", iterable: "linkResult.links", scope: { expandedLists: { links: true }, linkResult: { links: Array.from({ length: 2 }, () => ({ from_repo: "a", from_file: "f", module_specifier: "x", to_repo: "b" })) } }, count: 2 },
     { file: "files/MarkDevViewer.svelte", iterable: "backlinks", scope: { backlinks: [{ path: "A.md", line: 1, offset: 0 }, { path: "A.md", line: 1, offset: 20 }] }, count: 2 },
     { file: "OperationBanner.svelte", iterable: "operation.warnings", scope: { operation: { warnings: ["busy", "busy", "busy#1"] } }, count: 3 },
     { file: "GitHubPanel.svelte", iterable: "ciReport.steps", scope: { ciReport: { steps: [{ name: "check" }, { name: "check" }] } }, count: 2 },
     { file: "DeliveryTimeline.svelte", iterable: "keyedList(shown", scope: { shown: [{ id: "1", phase: "settled_ok" }, { id: "1", phase: "settled_bad" }] }, count: 2 },
-    { file: "StoragePanel.svelte", iterable: "report.reclaim", scope: { report: { reclaim: [{ category: "ab", label: "c" }, { category: "a", label: "bc" }, { category: "ab", label: "c" }] } }, count: 3 },
+    { file: "StoragePanel.svelte", iterable: "report.reclaim", scope: { expandedLists: { reclaim: true }, report: { reclaim: [{ category: "ab", label: "c" }, { category: "a", label: "bc" }, { category: "ab", label: "c" }] } }, count: 3 },
   ];
   for (const { file, iterable, scope, count } of cases) {
     it(`${file}: ${iterable} survives repeated identities without dropping rows`, () => {

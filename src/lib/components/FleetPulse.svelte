@@ -27,6 +27,8 @@
   import { describePulseCoverage, TREND_DAYS } from "../fleet/pulse";
   import { foldFleetLanguages } from "../fleet/languages";
   import { COMMIT_WINDOWS, DEFAULT_COMMIT_WINDOW } from "../fleet/types";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import FleetSparkline from "./FleetSparkline.svelte";
   import FleetLanguageBar from "./FleetLanguageBar.svelte";
 
@@ -56,6 +58,10 @@
     onWindow?: (days: number) => void;
     loading?: boolean;
   } = $props();
+
+  /** Which callout lists the reader expanded; each opens on LIST_PREVIEW_ROWS rows. */
+  let busiestExpanded = $state(false);
+  let dormantExpanded = $state(false);
 
   const coverage = $derived(describePulseCoverage(pulse));
   const languageStats = $derived(foldFleetLanguages(languages.stats));
@@ -195,7 +201,7 @@
           <span class="gp-label">Movers</span>
           {#if pulse.busiest.length > 0}
             <ul class="flex flex-col gap-0.5">
-              {#each pulse.busiest as repo (repo.path)}
+              {#each previewSlice(pulse.busiest, busiestExpanded, LIST_PREVIEW_ROWS) as repo (repo.path)}
                 <li>
                   <button
                     type="button"
@@ -210,6 +216,7 @@
                 </li>
               {/each}
             </ul>
+            <ListPreviewToggle total={pulse.busiest.length} noun="repositories" bind:expanded={busiestExpanded} />
           {:else}
             <p class="text-meta text-textMuted">Nothing committed in the window.</p>
           {/if}
@@ -225,7 +232,7 @@
                 Quiet for {pulse.windowDays}d
               </span>
               <ul class="flex flex-col gap-0.5">
-                {#each pulse.dormant as repo (repo.path)}
+                {#each previewSlice(pulse.dormant, dormantExpanded, LIST_PREVIEW_ROWS) as repo (repo.path)}
                   <li class="flex items-center gap-1">
                     <button
                       type="button"
@@ -249,6 +256,7 @@
                   </li>
                 {/each}
               </ul>
+              <ListPreviewToggle total={pulse.dormant.length} noun="repositories" bind:expanded={dormantExpanded} />
             </div>
           {/if}
         </div>

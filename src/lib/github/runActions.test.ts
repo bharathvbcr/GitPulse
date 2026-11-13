@@ -225,8 +225,8 @@ describe("useCompactRows", () => {
 });
 
 describe("run card preview length", () => {
-  it("shows three recent runs so the rail stays reachable", () => {
-    expect(RUN_PREVIEW_COUNT).toBe(3);
+  it("shows five recent runs, the same preview as every other list", () => {
+    expect(RUN_PREVIEW_COUNT).toBe(5);
     expect(RUN_PREVIEW_COUNT).toBeLessThan(COMPACT_ROW_THRESHOLD);
   });
 });

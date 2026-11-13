@@ -1,5 +1,7 @@
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { commitGraphHint } from "../health/commitGraph";
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
@@ -53,6 +55,20 @@
   import type { StorageLike } from "../repos/persist";
 
   let report = $state<StorageReport | null>(null);
+  /**
+   * Which long lists the reader expanded. Each opens on its first
+   * LIST_PREVIEW_ROWS rows and collapses again for the next repository; the
+   * headings keep the scan's own counts.
+   */
+  const COLLAPSED_LISTS = {
+    gaps: false,
+    reclaim: false,
+    artifacts: false,
+    largest: false,
+    worktrees: false,
+  };
+  let expandedLists = $state({ ...COLLAPSED_LISTS });
+  let listsFor = "";
   /** The header's one line: what the scan found, in three totals. */
   const summary = $derived(
     report
@@ -125,6 +141,10 @@
    * stops that retained report from reading as a current measurement.
    */
   function applySnapshot(repoPath: string, snap: MetricSnapshot<StorageReport>) {
+    if (repoPath !== listsFor) {
+      listsFor = repoPath;
+      expandedLists = { ...COLLAPSED_LISTS };
+    }
     report = snap.value;
     loading = snap.state === "loading";
     errorMsg = snap.state === "failed" && snap.value === null ? snap.error : null;
@@ -460,7 +480,7 @@
             <AlertTriangle size={11} class="text-warn" />
             Hygiene gaps ({hygieneGaps.length})
           </h3>
-          {#each hygieneGaps as artifact (artifact.path)}
+          {#each previewSlice(hygieneGaps, expandedLists.gaps, LIST_PREVIEW_ROWS) as artifact (artifact.path)}
             <div class="gp-notice" data-tone="warn">
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2">
@@ -501,6 +521,7 @@
               </div>
             </div>
           {/each}
+          <ListPreviewToggle total={hygieneGaps.length} noun="hygiene gaps" bind:expanded={expandedLists.gaps} />
         </section>
       {/if}
 
@@ -637,7 +658,7 @@
             {/if}
           </div>
           <div class="space-y-1">
-            {#each keyedList(report.reclaim, (item) => JSON.stringify([item.category, item.label])) as { item, key: renderKey } (renderKey)}
+            {#each keyedList(previewSlice(report.reclaim, expandedLists.reclaim, LIST_PREVIEW_ROWS), (item) => JSON.stringify([item.category, item.label])) as { item, key: renderKey } (renderKey)}
               <div class="rounded-xl bg-surface px-3 py-2 space-y-1">
                 <div class="flex items-baseline justify-between gap-3">
                   <span class="font-mono text-textPrimary truncate" title={item.label}>
@@ -663,6 +684,7 @@
               </div>
             {/each}
           </div>
+          <ListPreviewToggle total={report.reclaim.length} noun="reclaim candidates" bind:expanded={expandedLists.reclaim} />
         </section>
       {/if}
 
@@ -678,7 +700,7 @@
             Build &amp; cache directories ({report.artifacts.length})
           </h3>
           <div class="space-y-1">
-            {#each report.artifacts as artifact (artifact.path)}
+            {#each previewSlice(report.artifacts, expandedLists.artifacts, LIST_PREVIEW_ROWS) as artifact (artifact.path)}
               <div class="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-surface">
                 <span class="font-mono text-textPrimary truncate max-w-[40%]" title={artifact.path}>{artifact.path}</span>
                 <div class="flex-1 h-1.5 rounded-full bg-surfaceHover overflow-hidden min-w-16">
@@ -697,6 +719,7 @@
               </div>
             {/each}
           </div>
+          <ListPreviewToggle total={report.artifacts.length} noun="directories" bind:expanded={expandedLists.artifacts} />
         </section>
       {/if}
 
@@ -709,7 +732,7 @@
           <div class="gp-card overflow-hidden">
             <table class="w-full text-left">
               <tbody>
-                {#each report.largest_files as file (file.path)}
+                {#each previewSlice(report.largest_files, expandedLists.largest, LIST_PREVIEW_ROWS) as file (file.path)}
                   <tr class="even:bg-surfaceHover/40">
                     <td class="px-3 py-1.5 font-mono text-textPrimary truncate max-w-md" data-width-cap="a truncating path cell in a table, wider than a column but not the pane" title={file.path}>{file.path}</td>
                     <td class="px-3 py-1.5 font-mono text-textSecondary text-right whitespace-nowrap">{humanBytes(file.bytes)}</td>
@@ -718,6 +741,7 @@
               </tbody>
             </table>
           </div>
+          <ListPreviewToggle total={report.largest_files.length} noun="files" bind:expanded={expandedLists.largest} />
         </section>
       {/if}
 
@@ -730,7 +754,7 @@
           <div class="gp-card overflow-hidden">
             <table class="w-full text-left">
               <tbody>
-                {#each report.worktrees as worktree (worktree.path)}
+                {#each previewSlice(report.worktrees, expandedLists.worktrees, LIST_PREVIEW_ROWS) as worktree (worktree.path)}
                   <tr class="even:bg-surfaceHover/40">
                     <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={worktree.path}>{worktree.name}</td>
                     <td class="px-3 py-1.5 text-textSecondary">{worktree.branch ?? "detached"}</td>
@@ -742,6 +766,7 @@
               </tbody>
             </table>
           </div>
+          <ListPreviewToggle total={report.worktrees.length} noun="worktrees" bind:expanded={expandedLists.worktrees} />
         </section>
       {/if}
 

@@ -11,6 +11,17 @@
  */
 
 /**
+ * Rows every long list in the app shows before its "Show all N" control:
+ * report pages (Health, vulnerabilities, secrets, hygiene, storage), the
+ * GitHub rail, the delivery timeline and the code map.
+ *
+ * One number everywhere, so a reader learns the shape once and no section
+ * pushes the ones below it off the page. Draw the control with
+ * `ListPreviewToggle.svelte` and the rows with `previewSlice`.
+ */
+export const LIST_PREVIEW_ROWS = 5;
+
+/**
  * How many rows a collapsed list will actually draw.
  *
  * Zero, negative, and non-finite counts would otherwise collapse a real

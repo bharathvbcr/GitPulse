@@ -4,6 +4,7 @@ import {
   formatAuditCounts,
   formatAuditCoverage,
   normalizeSeverity,
+  severityLabel,
   toneLabel,
   updateKind,
 } from "./format";
@@ -260,5 +261,29 @@ describe("formatAuditCoverage", () => {
     expect(line).not.toContain("\n");
     expect(line).toContain("1 of 9 audited");
     expect(line).toContain("and 3 more");
+  });
+});
+
+describe("severityLabel", () => {
+  it("prints one case for the three vocabularies on the page", () => {
+    // GitHub says HIGH, the local audit says high, CodeQL says warning.
+    expect(severityLabel("HIGH")).toBe("High");
+    expect(severityLabel("high")).toBe("High");
+    expect(severityLabel(" Moderate ")).toBe("Moderate");
+    expect(severityLabel("warning")).toBe("Warning");
+  });
+
+  it("changes the case only: it keeps the source's own word", () => {
+    // normalizeSeverity maps warning to moderate for ranking; a label that did
+    // the same would show a word the reader cannot search for.
+    expect(severityLabel("warning")).not.toBe("Moderate");
+    expect(severityLabel("error")).toBe("Error");
+  });
+
+  it("calls a missing severity unranked, never a guess", () => {
+    expect(severityLabel("")).toBe("Unranked");
+    expect(severityLabel("   ")).toBe("Unranked");
+    expect(severityLabel(null)).toBe("Unranked");
+    expect(severityLabel(undefined)).toBe("Unranked");
   });
 });

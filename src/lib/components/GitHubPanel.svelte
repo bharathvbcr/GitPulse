@@ -73,12 +73,11 @@
     isWorkflowDispatchable,
     RUN_PREVIEW_COUNT,
     WORKFLOW_PREVIEW_COUNT,
-    expandLabel,
-    overflowsPreview,
     previewSlice,
     useCompactRows,
     workflowStateLabel,
   } from "../github/runActions";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { formatReleaseDate } from "../ops/model";
   import { pullRequestCreateUrl } from "../github/compareUrl";
   import {
@@ -1459,19 +1458,15 @@
                 </div>
               {/each}
             </div>
-            {#if overflowsPreview(workflows.workflows.length, WORKFLOW_PREVIEW_COUNT)}
-              <!-- Reports the fetched count, which is what this control can
-                   actually reveal. Whether the backend capped the listing is a
-                   separate fact, and the notice below still states it. -->
-              <button
-                type="button"
-                class="gp-btn mt-2 w-full" data-variant="ghost" data-size="sm"
-                aria-expanded={workflowsExpanded}
-                onclick={() => (workflowsExpanded = !workflowsExpanded)}
-              >
-                {expandLabel(workflows.workflows.length, workflowsExpanded, "workflows")}
-              </button>
-            {/if}
+            <!-- Reports the fetched count, which is what this control can
+                 actually reveal. Whether the backend capped the listing is a
+                 separate fact, and the notice below still states it. -->
+            <ListPreviewToggle
+              class="mt-2"
+              total={workflows.workflows.length}
+              noun="workflows"
+              bind:expanded={workflowsExpanded}
+            />
             {#if workflows.truncated}
               <div class="mt-2 text-warn text-meta">Showing {workflows.workflows.length} workflows; more exist.</div>
             {/if}
@@ -1629,20 +1624,16 @@
                 </div>
               {/each}
             </div>
-            {#if overflowsPreview(visibleRuns.length, RUN_PREVIEW_COUNT)}
-              <!-- Counts what this control can actually reveal: the runs left
-                   after the branch filter, not everything fetched. Whether the
-                   backend withheld older runs is a separate fact, and the
-                   notice below still states it. -->
-              <button
-                type="button"
-                class="gp-btn mt-2 w-full" data-variant="ghost" data-size="sm"
-                aria-expanded={runsExpanded}
-                onclick={() => (runsExpanded = !runsExpanded)}
-              >
-                {expandLabel(visibleRuns.length, runsExpanded, "runs")}
-              </button>
-            {/if}
+            <!-- Counts what this control can actually reveal: the runs left
+                 after the branch filter, not everything fetched. Whether the
+                 backend withheld older runs is a separate fact, and the
+                 notice below still states it. -->
+            <ListPreviewToggle
+              class="mt-2"
+              total={visibleRuns.length}
+              noun="runs"
+              bind:expanded={runsExpanded}
+            />
           {/if}
           {#if runsTruncated}
             <div class="mt-2 text-warn text-meta">Showing the {runs.length} most recent runs; older runs exist.</div>

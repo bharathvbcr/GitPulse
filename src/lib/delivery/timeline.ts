@@ -10,6 +10,7 @@
  * start time has an unknown duration, not a zero-second one; a bar with no
  * length is drawn as no bar rather than as an instant success.
  */
+import { LIST_PREVIEW_ROWS } from "../ui/previewList";
 import { isInFlight, isVerdict, type MonitorPhase } from "./phase";
 
 export interface TimelineRow {
@@ -50,12 +51,11 @@ export const MAX_LABEL_CHARS = 200;
  * Detail rows drawn before the reader asks for the rest.
  *
  * The outcome strip and the sample figures stay on the full listing: this
- * only decides how many duration rows are on screen. Three is short enough
- * that the rest of the CI rail stays reachable in a narrow column. Shared
- * with App Hosting rollouts through DeliveryTimeline, not a GitHub-only
- * constant — a second count is how "show all" would split in two.
+ * only decides how many duration rows are on screen. It is the app-wide
+ * `LIST_PREVIEW_ROWS`, shared with App Hosting rollouts through
+ * DeliveryTimeline — a second count is how "show all" would split in two.
  */
-export const TIMELINE_PREVIEW_COUNT = 3;
+export const TIMELINE_PREVIEW_COUNT = LIST_PREVIEW_ROWS;
 
 /**
  * How many characters a glance tile may show for identity.

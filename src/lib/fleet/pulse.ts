@@ -105,7 +105,11 @@ export interface FleetPulse {
   readonly mismatched: number;
   /** True when any counted window was itself capped: every count is a floor. */
   readonly partial: boolean;
-  /** Busiest repositories in the trend period, most recent activity first. */
+  /**
+   * Every active repository in the trend period, most recent activity first.
+   * The model does not cut the list; the card previews it and "Show all"
+   * reveals the rest.
+   */
   readonly busiest: readonly PulseContributor[];
   /** Open repositories with a readable window and nothing in it at all. */
   readonly dormant: readonly PulseContributor[];
@@ -129,8 +133,6 @@ const EMPTY_PULSE: FleetPulse = {
   dormant: [],
 };
 
-/** How many repositories a callout list names before it stops. */
-const CALLOUT_LIMIT = 3;
 
 /**
  * The window the majority of readable rows agree on.
@@ -264,8 +266,8 @@ export function fleetPulse(rows: readonly FleetRow[]): FleetPulse {
     unscanned,
     mismatched,
     partial,
-    busiest: busiest.slice(0, CALLOUT_LIMIT),
-    dormant: dormant.slice(0, CALLOUT_LIMIT),
+    busiest,
+    dormant,
   };
 }
 

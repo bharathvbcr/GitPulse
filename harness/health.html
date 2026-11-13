@@ -309,7 +309,7 @@
             !has(header(), "node 22") && has(section("packages"), "node 22"));
 
           // ---- The permission wall became a disclosure ----------------------
-          const disclosure = root.querySelector("details");
+          const disclosure = root.querySelector("[data-health-github-freshness]");
           check("the permission note is collapsed by default", () => !disclosure.open);
           // The defect was column height, so height is what is measured — not
           // whether a node exists. Four lines of prose at this type size is
@@ -365,7 +365,7 @@
             has(root, "reasons this is not a complete all-clear")
               || has(root, "reason this is not a complete all-clear"));
           check("the exact retained and observed counts are stated", () => {
-            root.querySelectorAll("details")[1].open = true;
+            root.querySelector("[data-health-caveats]").open = true;
             return has(root, "cargo ecosystem artifacts: retained 4 of 36");
           });
           check("the capped-coverage note points at a facet, not at 'above'", () =>
@@ -463,24 +463,24 @@
             has(section("vulnerabilities").querySelector("h3"), "showing"));
           // The heading states the scan's count; the list itself opens short.
           const previewRows = id => section(id).querySelectorAll("tbody tr").length;
-          const previewToggle = id => section(id).querySelector("[data-health-preview-toggle]");
+          const previewToggle = id => section(id).querySelector("[data-list-preview-toggle]");
           for (const [id, label] of [["vulnerabilities", "Show all 400 vulnerabilities"], ["outdated", "Show all 400 outdated packages"], ["dead-code", "Show all 250 candidates"]]) {
-            check(`a long ${id} list opens on its first 8 rows, with "${label}" beneath it`, () =>
-              previewRows(id) === 8 && has(previewToggle(id), label) && previewToggle(id).getAttribute("aria-expanded") === "false");
+            check(`a long ${id} list opens on its first 5 rows, with "${label}" beneath it`, () =>
+              previewRows(id) === 5 && has(previewToggle(id), label) && previewToggle(id).getAttribute("aria-expanded") === "false");
           }
-          check("the issue list opens on its first 8 issues, with Show all beneath it", () =>
-            section("issues").querySelectorAll(".gp-notice").length === 8
+          check("the issue list opens on its first 5 issues, with Show all beneath it", () =>
+            section("issues").querySelectorAll(".gp-notice").length === 5
               && has(previewToggle("issues"), "Show all 60 issues"));
           previewToggle("outdated").click();
           await tick();
           check("Show all reveals every row of that list, and only that list", () =>
             previewRows("outdated") === 400 && previewToggle("outdated").getAttribute("aria-expanded") === "true"
-              && previewRows("vulnerabilities") === 8);
+              && previewRows("vulnerabilities") === 5);
           check("an expanded large list still does not scroll sideways", () =>
             scroller().scrollWidth <= scroller().clientWidth + 1);
           previewToggle("outdated").click();
           await tick();
-          check("Show fewer collapses it again", () => previewRows("outdated") === 8);
+          check("Show fewer collapses it again", () => previewRows("outdated") === 5);
           check("the header still does not clip under a large report", () =>
             header().scrollWidth <= header().clientWidth + 1);
           check("the agent bar still renders and does not clip under a large report", () =>

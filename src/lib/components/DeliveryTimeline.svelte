@@ -26,7 +26,8 @@
    */
   import { CircleAlert, Radio, PauseCircle, GitCommitHorizontal } from "@lucide/svelte";
   import { keyedList } from "../ui/eachKeys";
-  import { expandLabel, overflowsPreview, previewSlice } from "../ui/previewList";
+  import { previewSlice } from "../ui/previewList";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { verdictRate } from "../delivery/transitions";
   import {
     barWidthPct,
@@ -202,8 +203,9 @@
 
     <!-- Glance tiles: verdict, duration, identity, SHA. The commit subject
          and the source's long state sentence stay on `title` so a collapsed
-         preview can be read in one look. Three columns match the preview
-         count; fewer runs shrink the grid rather than leaving empty cells. -->
+         preview can be read in one look. Three columns, so a five-row preview
+         is two short rows; fewer runs shrink the grid rather than leaving
+         empty cells. -->
     <div
       class="grid gap-1.5 min-w-0"
       style="grid-template-columns: repeat({glanceCols}, minmax(0, 1fr))"
@@ -264,18 +266,6 @@
       {/each}
     </div>
 
-    {#if overflowsPreview(rows.length, TIMELINE_PREVIEW_COUNT)}
-      <button
-        type="button"
-        class="gp-btn w-full"
-        data-variant="ghost"
-        data-size="sm"
-        data-delivery-expand
-        aria-expanded={expanded}
-        onclick={() => (expanded = !expanded)}
-      >
-        {expandLabel(rows.length, expanded, sampleNoun)}
-      </button>
-    {/if}
+    <ListPreviewToggle total={rows.length} noun={sampleNoun} bind:expanded />
   {/if}
 </div>

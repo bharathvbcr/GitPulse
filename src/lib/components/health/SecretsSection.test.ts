@@ -55,9 +55,9 @@ describe("SecretsSection", () => {
   });
 
   it("previews the findings table and keeps the cap disclosure", () => {
-    expect(source).toContain("previewSlice(shownRows, expanded, HEALTH_PREVIEW_ROWS)");
+    expect(source).toContain("previewSlice(shownRows, expanded, LIST_PREVIEW_ROWS)");
     expect(source).toContain("keyedList(previewRows, findingKey)");
-    expect(source).toContain("<HealthPreviewToggle total={shownRows.length}");
+    expect(source).toContain("<ListPreviewToggle total={shownRows.length}");
     // The heading count is Kingfisher's, not the preview's.
     expect(source).toContain("total: report.findings_total");
   });

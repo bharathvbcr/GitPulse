@@ -355,9 +355,9 @@
           // The last such control in the section: the duration timeline above the
           // cards has an expander of its own.
           const runExpander = () => $$("button", runsSection()).filter((el) => ["Show all 15 runs", "Show fewer"].includes(words(el))).at(-1);
-          check("runs preview three cards, with a collapsed expander", () =>
-            runTitles().length === 3 && runExpander()?.getAttribute("aria-expanded") === "false");
-          check("the duration timeline measures every run the filter admits, not the three cards", () =>
+          check("runs preview five cards, with a collapsed expander", () =>
+            runTitles().length === 5 && runExpander()?.getAttribute("aria-expanded") === "false");
+          check("the duration timeline measures every run the filter admits, not the five cards", () =>
             $$("[data-delivery-strip-seg]", runsSection()).length === 15);
           runExpander().click();
           await settle();
@@ -550,7 +550,7 @@
           await until(() => text().includes("PR 5"));
           check("a repository switch drops the filter, the branch narrowing, the expansions and all-releases", () =>
             $('input[aria-label="Filter pull requests"]', stage).value === "" && prCards() === 5 &&
-            button("this branch").getAttribute("aria-pressed") === "false" && wfRows().length === 5 && runTitles().length === 3 &&
+            button("this branch").getAttribute("aria-pressed") === "false" && wfRows().length === 5 && runTitles().length === 5 &&
             button("latest only").getAttribute("aria-pressed") === "true");
 
           // A switch to a repository whose context is cached shows that listing at

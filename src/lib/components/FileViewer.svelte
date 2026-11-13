@@ -79,6 +79,7 @@
   import {
     FILE_DASHBOARD_WIDTH,
     FILE_EDITOR_MIN_WIDTH,
+    FILE_SIDE_CARD_GUTTERS,
     resolveFilePaneLayout,
   } from "../files/filePaneLayout";
   import {
@@ -169,10 +170,9 @@
   }));
   // The tree may grow, but not into the editor's minimum — or the dashboard,
   // which stays a fixed rail beside it. Each side column is a floating card
-  // with a 6px margin either side, which the editor has to leave room for too.
-  const EXPLORER_CARD_GUTTERS = 12;
+  // whose margins the editor has to leave room for too.
   let explorerReserve = $derived(
-    FILE_EDITOR_MIN_WIDTH + EXPLORER_CARD_GUTTERS + (paneLayout.dashboardVisible ? FILE_DASHBOARD_WIDTH + EXPLORER_CARD_GUTTERS : 0),
+    FILE_EDITOR_MIN_WIDTH + FILE_SIDE_CARD_GUTTERS + (paneLayout.dashboardVisible ? FILE_DASHBOARD_WIDTH + FILE_SIDE_CARD_GUTTERS : 0),
   );
 
   let pathSegments = $derived.by(() => (activeTabPath ? activeTabPath.split("/") : []));

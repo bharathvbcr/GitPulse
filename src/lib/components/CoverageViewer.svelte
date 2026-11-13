@@ -90,6 +90,8 @@
   import EmptyState from "./EmptyState.svelte";
   import PageHeader from "./PageHeader.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
   import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -123,6 +125,15 @@
   let selectedScope = $state(false);
   let coverageRoot = $state<HTMLDivElement>();
   let languageStrip = $state<HTMLDivElement>();
+  /** The report files list in the aside opens on LIST_PREVIEW_ROWS and resets per repository. */
+  let artifactsExpanded = $state(false);
+  // A derived compares by value, so the reset runs on a repository switch and
+  // not on every repoStore publish (repoStoreEffects.contract.test.ts).
+  const artifactsRepo = $derived($repoStore.currentPath ?? "");
+  $effect(() => {
+    void artifactsRepo;
+    artifactsExpanded = false;
+  });
   const visibleFiles = $derived.by(() => filterCoverageFiles(report?.files ?? [], fileQuery, languageFilter, coverageFilter, fileSort));
   const filterLanguages = $derived.by(() => [...new Set(report?.files.map(file => file.language) ?? [])].sort());
   const selectedFile = $derived.by(() => report?.files.find(file => file.path.toLowerCase() === selectedPath?.toLowerCase()));
@@ -1927,7 +1938,7 @@
 
       {#if report && report.artifacts.length > 0}
         <div class="p-2 text-micro text-textMuted font-sans max-h-28 overflow-auto">
-          {#each report.artifacts as artifact, i (`${i}:${artifact.path}`)}
+          {#each previewSlice(report.artifacts, artifactsExpanded, LIST_PREVIEW_ROWS) as artifact, i (`${i}:${artifact.path}`)}
             <div class="truncate" title={artifact.skip_reason || artifact.format}>
               {artifact.path}
               <span class="text-faint">({artifact.format})</span>
@@ -1936,6 +1947,9 @@
               {/if}
             </div>
           {/each}
+        </div>
+        <div class="px-2 pb-2 empty:hidden">
+          <ListPreviewToggle total={report.artifacts.length} noun="coverage reports" bind:expanded={artifactsExpanded} />
         </div>
       {/if}
     </div>

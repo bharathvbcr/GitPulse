@@ -4,6 +4,8 @@
   import { createListenerTracker } from "../../dom/listenerTracker";
   import { ShieldCheck } from "@lucide/svelte";
   import EmptyState from "../EmptyState.svelte";
+  import ListPreviewToggle from "../ListPreviewToggle.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
   import { describeFailure } from "../../ui/copy/describeFailure";
   import {
     describeSender,
@@ -23,6 +25,7 @@
   let incidents = $state<TerminalIncident[]>([]);
   let loadError = $state<string | null>(null);
   let loaded = $state(false);
+  let expanded = $state(false);
 
   function failureLine(verb: string, object: string, cause: unknown): string {
     const failure = describeFailure({ verb, object }, cause);
@@ -61,7 +64,7 @@
   {/if}
   {#if incidents.length > 0}
     <ul class="space-y-1.5">
-      {#each incidents as incident (incident.id)}
+      {#each previewSlice(incidents, expanded, LIST_PREVIEW_ROWS) as incident (incident.id)}
         <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-meta">
           <div class="flex items-baseline justify-between gap-3 flex-wrap">
             <span class="font-medium text-textPrimary">
@@ -84,6 +87,7 @@
         </li>
       {/each}
     </ul>
+    <ListPreviewToggle total={incidents.length} noun="incidents" bind:expanded />
   {:else if loaded && !loadError}
     <EmptyState
       icon={ShieldCheck}

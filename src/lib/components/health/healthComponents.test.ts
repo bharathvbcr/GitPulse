@@ -275,3 +275,43 @@ describe("Health components fill the pane and share one link affordance", () => 
     }
   });
 });
+
+describe("HealthPanel — verdict first, identifiers truncated", () => {
+  const panel = readFileSync(join(here, "..", "HealthPanel.svelte"), "utf8");
+
+  it("puts the verdict ahead of the GitHub freshness line once a report is loaded", () => {
+    // The freshness disclosure used to open the scroll in every state. With a
+    // report it now follows the verdict card; before one exists it still leads.
+    const lead = panel.indexOf("{#if !report}\n      {@render githubFreshness()}");
+    const verdict = panel.indexOf("<HealthSummaryCard");
+    const after = panel.indexOf("{@render githubFreshness()}", verdict);
+    expect(lead).toBeGreaterThan(-1);
+    expect(verdict).toBeGreaterThan(lead);
+    expect(after).toBeGreaterThan(verdict);
+    expect(panel.match(/\{@render githubFreshness\(\)\}/g)).toHaveLength(2);
+  });
+
+  it("prints every severity chip through one case helper", () => {
+    expect(panel).toContain("severityLabel(alert.severity)");
+    expect(panel).toContain("severityLabel(vuln.severity)");
+    expect(panel).toContain("severityLabel(issue.severity)");
+    // `capitalize` leaves GitHub's "HIGH" alone, which is how one page showed
+    // HIGH, High and Warning.
+    expect(panel).not.toMatch(/gp-chip capitalize/);
+  });
+
+  it("truncates package names and paths and keeps the full text on a title", () => {
+    for (const cell of [
+      'title={alert.package}',
+      "title={vuln.name}",
+      "title={pkg.name}",
+      "title={sym.symbol_name}",
+      "title={sym.file_path}",
+      "title={where}",
+      "title={vulnWhere}",
+    ]) {
+      expect(panel, cell).toContain(cell);
+    }
+    expect(panel).toMatch(/font-mono text-textPrimary truncate" title=\{pkg\.name\}/);
+  });
+});

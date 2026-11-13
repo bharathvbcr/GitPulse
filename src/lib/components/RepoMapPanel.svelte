@@ -56,7 +56,8 @@
   import { beginGeneration } from "../async/guard";
   import { reportPanelError } from "../diagnostics/report";
   import { paneDetails } from "../diagnostics/paneCrash";
-  import { keyedList } from "../ui/eachKeys";
+  import { dedupePreserveOrder, keyedList } from "../ui/eachKeys";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
@@ -84,6 +85,7 @@
     formatCap,
     preferredDeadLists,
     roleSample,
+    unavailableAnalysisLabel,
     unwiredExclusionSummary,
   } from "../codeintel/repoMap";
   import {
@@ -102,6 +104,7 @@
     DevmapCliStatus,
     DevmapStatusPayload,
     GraphVizLoad,
+    RepoMapCapMeta,
     RepoMapDocument,
     RepoMapLoad,
     RepoMapSubsystem,
@@ -132,6 +135,8 @@
   import { formatError } from "../ui/formatError";
   import CodeGraphCanvas from "./CodeGraphCanvas.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
+  import PageBody from "./PageBody.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
@@ -190,8 +195,30 @@
   const boundStrip = (text: string | null | undefined): string | null =>
     text == null ? null : boundText(text, STRIP_MAX_CHARS);
 
+  /**
+   * Every long list on this page opens on its first {@link LIST_PREVIEW_ROWS}
+   * rows and reveals the rest through `ListPreviewToggle`. One record holds
+   * the open/closed state of all of them, so "back to collapsed" is a single
+   * assignment: it runs when the selected subsystem changes, when the
+   * repository changes, and (for the hits) when a new search answers.
+   */
+  type PreviewList =
+    | "important" | "entry" | "critical" | "tests" | "neighbors"
+    | "unwired" | "deadSymbols" | "unreachable"
+    | "hits" | "broken" | "links";
+  const collapsedLists = (): Record<PreviewList, boolean> => ({
+    important: false, entry: false, critical: false, tests: false, neighbors: false,
+    unwired: false, deadSymbols: false, unreachable: false,
+    hits: false, broken: false, links: false,
+  });
+  let expandedLists = $state<Record<PreviewList, boolean>>(collapsedLists());
+
   let load = $state<RepoMapLoad | null>(null);
   let cliStatus = $state<DevmapCliStatus | null>(null);
+  // True from the start of a reload until `cmd_devmap_status` answers (it has a
+  // 30 s deadline). The map paints first, so without this the strip read
+  // "unknown" for a status it simply had not received yet.
+  let statusLoading = $state(false);
   // Navigator selection is a tree row key, not an area string: two subsystems
   // can carry one area, and the tree merges them into one row.
   let selectedKey = $state<string | null>(null);
@@ -316,6 +343,7 @@
       areaRows.find((r) => r.subsystemIndex === 0) ??
       null,
   );
+  const selectedRowKey = $derived(selectedRow?.key ?? null);
   const selected = $derived.by((): RepoMapSubsystem | null => {
     if (!map || selectedRow?.subsystemIndex == null) return null;
     return map.subsystems[selectedRow.subsystemIndex] ?? null;
@@ -329,6 +357,45 @@
   );
   const deadLists = $derived(map ? preferredDeadLists(map) : null);
   const tests = $derived(selected ? roleSample(selected, "tests") : null);
+  const importantFiles = $derived(map ? dedupePreserveOrder(map.important_files ?? []) : []);
+  // Analyses the producer could not run: absent from the lists below, which
+  // would otherwise read "None in this sample" for something never checked.
+  // The unreachable-files list states its own absence beside itself, so it is
+  // not repeated here.
+  const unavailableAnalyses = $derived(
+    map
+      ? Object.entries(map.liveness_meta?.unavailable ?? {}).filter(
+          ([name]) => !(name === "unreachable_files" && map.liveness_unreachable_unreliable === true),
+        )
+      : [],
+  );
+  const degradedStatusReason = $derived.by((): string | null => {
+    const reason = statusPayload?.degraded_reason;
+    return typeof reason === "string" && reason.trim() !== "" ? boundStrip(reason) : null;
+  });
+  const overviewStats = $derived.by((): ReadonlyArray<{ label: string; value: string; title: string }> => {
+    if (!map) return [];
+    const meta = map.liveness_meta;
+    const stat = (label: string, cap: RepoMapCapMeta) => {
+      const value = formatCap(cap.shown, cap.total, cap.truncated);
+      const capped = cap.truncated || cap.shown < cap.total;
+      return {
+        label,
+        value,
+        title: capped ? `${label}: ${cap.shown} shown of ${cap.total}. The index caps what it lists.` : `${label}: ${value}`,
+      };
+    };
+    const languages = map.languages ?? [];
+    const languageList = languages.length > 0 ? languages.join(", ") : "None listed";
+    return [
+      stat("Subsystems", meta.subsystems),
+      stat("Entry roots", meta.entry_roots),
+      stat("Important files", meta.important_files),
+      stat("Unwired candidates", meta.unwired),
+      stat("Dead symbol candidates", meta.dead_symbol),
+      { label: "Languages", value: languageList, title: languageList },
+    ];
+  });
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
@@ -405,6 +472,7 @@
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     loading = true;
+    statusLoading = true;
     errorMsg = null;
     const request = mapRequests.next();
     const live = () => mapRequests.isCurrent(request) && currentRepo === repoPath;
@@ -426,6 +494,7 @@
         if (refreshView) reloadView(repoPath, mapView);
       },
       onStatus(statusResult) {
+        statusLoading = false;
         if (statusResult.status === "fulfilled") {
           cliStatus = statusResult.value;
         } else {
@@ -642,6 +711,8 @@
       cancelRequests();
       load = null;
       cliStatus = null;
+      statusLoading = false;
+      expandedLists = collapsedLists();
       selectedKey = null;
       treeFocusKey = null;
       treeFilter = "";
@@ -667,6 +738,28 @@
       loading = building = graphLoading = brokenLoading = docsSearching = linksLoading = false;
       // The view effect below owns the initial subview request.
       if (path) void reload(path, false);
+    });
+  });
+
+  // A list opened on one subsystem is closed again on the next, so a long
+  // listing never carries its expansion over to a different area. Keyed on the
+  // selected ROW, not `selectedKey`: the first subsystem is selected while
+  // `selectedKey` is still null.
+  $effect(() => {
+    // A primitive: `selectedRow` is rebuilt from the map on every index
+    // refresh, and a refresh that leaves the same subsystem selected must not
+    // close what the reader just opened.
+    void selectedRowKey;
+    untrack(() => {
+      expandedLists = collapsedLists();
+    });
+  });
+
+  // Hits answer one query; a new answer starts closed.
+  $effect(() => {
+    void searchedQuery;
+    untrack(() => {
+      expandedLists.hits = false;
     });
   });
 
@@ -824,6 +917,37 @@
   });
 </script>
 
+{#snippet pathList(paths: readonly string[], list: PreviewList, noun: string)}
+  <div class="space-y-1">
+    <ul class="space-y-0.5">
+      {#each previewSlice(paths, expandedLists[list], LIST_PREVIEW_ROWS) as path, i (`${path}#${i}`)}
+        <li>
+          <button
+            type="button"
+            class="gp-btn font-mono max-w-full"
+            title={path}
+            onclick={() => openFile(path)}
+          >
+            <span class="truncate">{path}</span>
+          </button>
+        </li>
+      {/each}
+    </ul>
+    <ListPreviewToggle total={paths.length} {noun} bind:expanded={expandedLists[list]} />
+  </div>
+{/snippet}
+
+{#snippet textList(rows: readonly string[], list: PreviewList, noun: string)}
+  <div class="space-y-1">
+    <ul class="space-y-0.5">
+      {#each previewSlice(rows, expandedLists[list], LIST_PREVIEW_ROWS) as row, i (`${row}#${i}`)}
+        <li class="font-mono text-meta text-textMuted truncate" title={row}>{row}</li>
+      {/each}
+    </ul>
+    <ListPreviewToggle total={rows.length} {noun} bind:expanded={expandedLists[list]} />
+  </div>
+{/snippet}
+
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
   <!-- Freshness strip from cmd_devmap_status -->
   <div
@@ -837,7 +961,7 @@
       <span
         class={statusPayload.is_fresh ? "text-ok" : "gp-chip"}
         data-tone={statusPayload.is_fresh ? undefined : "warn"}
-        title={statusPayload.is_fresh ? "The index matches the latest commit" : "The index is behind the latest commit"}
+        title={statusPayload.is_fresh ? "The index matches your files" : "The index no longer matches your files. Refresh the index to update it."}
       >
         {statusPayload.is_fresh ? "Fresh" : "Stale"}
       </span>
@@ -850,7 +974,7 @@
         <span>format {statusPayload.schema_version}</span>
       {/if}
       {#if statusPayload.node_count != null}
-        <span>{statusPayload.node_count} nodes · {statusPayload.edge_count ?? "?"} edges</span>
+        <span>{statusPayload.node_count.toLocaleString()} nodes · {statusPayload.edge_count?.toLocaleString() ?? "?"} edges</span>
       {/if}
       {#if coverageGapSummary(statusPayload)}
         <span class="gp-chip" data-tone="warn" title="Languages and files the index couldn't fully cover">
@@ -863,8 +987,10 @@
       <span class="text-warn">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "The code map tool isn't installed"}</span>
     {:else if load && !load.available}
       <span class="text-warn">{mapFailureText ?? boundStrip(load.reason) ?? "The code map isn't available"}</span>
+    {:else if statusLoading}
+      <span data-testid="map-status-pending">Checking index status…</span>
     {:else}
-      <span>Status unknown</span>
+      <span class="text-warn" data-testid="map-status-unknown">Couldn't read the index status.</span>
     {/if}
     <span class="ml-auto flex items-center gap-1.5">
       <button
@@ -997,7 +1123,7 @@
       <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} focusNodeId={mapView === "subsystems" ? focusNodeId : null} />
     </div>
   {:else if mapView === "docs"}
-    <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-4" data-testid="docs-panel">
+    <PageBody testId="docs-panel">
       {#if docsStatus}
         <p class="text-meta text-textMuted" role="status">
           {docsStatus.noteCount} note{docsStatus.noteCount === 1 ? "" : "s"} indexed
@@ -1049,11 +1175,12 @@
             <p class="mt-2 text-micro text-textMuted" data-testid="docs-hits-stale">Results for "{searchedQuery}"</p>
           {/if}
           <ul class="mt-2 space-y-1.5" class:opacity-60={hitsStale}>
-            {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
+            {#each keyedList(previewSlice(docsHits, expandedLists.hits, LIST_PREVIEW_ROWS), (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button
                   type="button"
-                  class="w-full text-left rounded-md px-2 py-1.5 hover:bg-surface/80"
+                  class="w-full text-left rounded-md px-2 py-1.5 hover:bg-surfaceHover/70"
+                  title="{hit.path}:{hit.line}"
                   onclick={() => openHit(hit)}
                 >
                   <span class="font-mono text-meta text-accent block truncate">{hit.path}:{hit.line}</span>
@@ -1063,10 +1190,13 @@
               </li>
             {/each}
           </ul>
+          <div class="mt-1.5">
+            <ListPreviewToggle total={docsHits.length} noun="hits" bind:expanded={expandedLists.hits} />
+          </div>
         {/if}
       </section>
 
-      <section aria-labelledby="docs-broken-heading" class="pt-3">
+      <section aria-labelledby="docs-broken-heading">
         <h3 id="docs-broken-heading" class="gp-label mb-1.5">
           Broken links
           {#if brokenSection === "list" || brokenSection === "empty"}
@@ -1086,26 +1216,30 @@
               {brokenDisplay.honesty}
             </p>
           {/if}
-          <ul class="space-y-0.5 max-h-64 overflow-y-auto">
-            {#each keyedList(brokenDisplay.shown, (link) => JSON.stringify([link.source, link.target])) as { item: link, key: renderKey } (renderKey)}
+          <ul class="space-y-0.5">
+            {#each keyedList(previewSlice(brokenDisplay.shown, expandedLists.broken, LIST_PREVIEW_ROWS), (link) => JSON.stringify([link.source, link.target])) as { item: link, key: renderKey } (renderKey)}
               <li class="text-meta">
                 <button
                   type="button"
                   class="gp-btn font-mono max-w-full"
+                  title={link.source}
                   onclick={() => openFile(link.source)}
                 >
                   <span class="truncate">{link.source}</span>
                 </button>
                 <span class="text-textMuted"> → </span>
-                <span class="font-mono text-textMuted">{link.target}</span>
+                <span class="font-mono text-textMuted break-all">{link.target}</span>
               </li>
             {/each}
           </ul>
+          <div class="mt-1.5">
+            <ListPreviewToggle total={brokenDisplay.shown.length} noun="broken links" bind:expanded={expandedLists.broken} />
+          </div>
         {/if}
       </section>
-    </div>
+    </PageBody>
   {:else if mapView === "links"}
-    <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-3" data-testid="link-candidates-panel">
+    <PageBody testId="link-candidates-panel">
       <header>
         <h3 class="gp-label">Cross-repository link candidates</h3>
         <p class="text-meta text-textMuted mt-0.5">
@@ -1124,9 +1258,9 @@
         <Skeleton variant="rect" count={2} height="2.75rem" />
       {:else if linkResult && linkResult.links.length > 0}
         <ul class="space-y-1.5">
-          {#each keyedList(linkResult.links, (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
-            <li class="rounded-md bg-surface/60 px-2 py-1.5 text-meta">
-              <div class="font-mono text-textPrimary truncate">
+          {#each keyedList(previewSlice(linkResult.links, expandedLists.links, LIST_PREVIEW_ROWS), (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
+            <li class="gp-card px-2 py-1.5 text-meta">
+              <div class="font-mono text-textPrimary truncate" title="[{link.from_repo}] {link.from_file}">
                 [{link.from_repo}] {link.from_file}
               </div>
               <div class="text-textMuted mt-0.5">
@@ -1142,16 +1276,19 @@
             </li>
           {/each}
         </ul>
+        <ListPreviewToggle total={linkResult.links.length} noun="link candidates" bind:expanded={expandedLists.links} />
       {/if}
-      <button
-        type="button"
-        class="gp-btn text-meta px-2 py-1"
-        disabled={linksLoading || !$repoStore.currentPath}
-        onclick={() => void reloadLinks()}
-      >
-        Refresh links
-      </button>
-    </div>
+      <div>
+        <button
+          type="button"
+          class="gp-btn text-meta px-2 py-1"
+          disabled={linksLoading || !$repoStore.currentPath}
+          onclick={() => void reloadLinks()}
+        >
+          Refresh links
+        </button>
+      </div>
+    </PageBody>
   {:else if loading && !map}
     <!-- The test id is how harness/diagnostics.html tells a panel still
          loading from one that has its map: the skeleton carries no text. -->
@@ -1191,7 +1328,7 @@
     <div class="flex-1 flex min-h-0">
       <!-- Subsystem tree: a floating card, its gutter coming from the card margin -->
       <nav
-        class="gp-float-card w-64 shrink-0 flex flex-col"
+        class="gp-float-card w-64 max-w-[40%] min-w-40 shrink-0 flex flex-col"
         data-repomap-subsystems-card
         aria-label="Subsystems"
       >
@@ -1268,13 +1405,97 @@
               </span>
             </div>
           {:else}
-            <p class="px-2 py-2 text-xs text-textMuted" role="status">No areas match "{treeFilter.trim()}".</p>
+            {#if areaRows.length === 0}
+              <p class="px-2 py-2 text-xs text-textMuted" role="status" data-testid="map-no-subsystems">
+                This map lists no subsystems{doc.liveness_meta.subsystems.dropped_no_area > 0
+                  ? `; ${doc.liveness_meta.subsystems.dropped_no_area} had no area and were dropped`
+                  : ""}. Build the index again to regenerate it.
+              </p>
+            {:else}
+              <p class="px-2 py-2 text-xs text-textMuted" role="status">No areas match "{treeFilter.trim()}".</p>
+            {/if}
           {/each}
         </div>
       </nav>
 
-      <!-- Detail -->
-      <div class="flex-1 min-w-0 overflow-y-auto p-3 space-y-4">
+      <!-- Detail: the page body, so spacing steps with the pane's own width -->
+      <PageBody class="flex-1 min-w-0" testId="map-detail">
+        {#if doc.graph_degraded}
+          <div class="gp-notice" data-tone="warn" role="status" data-testid="map-graph-degraded">
+            <div class="min-w-0 flex-1">
+              <span class="font-medium">The code map is degraded.</span>
+              {#if doc.graph_degraded_reason}{boundStrip(doc.graph_degraded_reason)}{/if}
+              Caller, unwired and dead-code lists below can be incomplete. Build the index again to regenerate it.
+            </div>
+          </div>
+        {/if}
+        {#if statusPayload && statusPayload.is_fresh === false}
+          <div class="gp-notice" data-tone="warn" role="status" data-testid="map-index-stale">
+            <div class="min-w-0 flex-1">
+              <span class="font-medium">The index is out of date.</span>
+              This map shows your files as of the last index build. Refresh the index to update it.
+              {#if (statusPayload.pending_count ?? 0) > 0}
+                {statusPayload.pending_count} pending {statusPayload.pending_count === 1 ? "update is" : "updates are"} not indexed yet.
+              {/if}
+              {#if degradedStatusReason}
+                <p class="mt-1 text-meta text-textMuted" data-testid="map-index-reason">{degradedStatusReason}</p>
+              {/if}
+            </div>
+          </div>
+        {:else if degradedStatusReason}
+          <!-- Current, but the index says it is not whole: a fresh index with a
+               reason must not read as clean. -->
+          <div class="gp-notice" data-tone="warn" role="status" data-testid="map-index-degraded">
+            <div class="min-w-0 flex-1">
+              <span class="font-medium">The index is degraded.</span>
+              It matches your files, but the code map can be incomplete.
+              <p class="mt-1 text-meta text-textMuted" data-testid="map-index-reason">{degradedStatusReason}</p>
+            </div>
+          </div>
+        {/if}
+        {#if unavailableAnalyses.length > 0}
+          <div class="gp-notice" data-tone="unknown" role="status" data-testid="map-unavailable">
+            <div class="min-w-0 flex-1">
+              <span class="font-medium">Couldn't check {unavailableAnalyses.map(([name]) => unavailableAnalysisLabel(name)).join(", ")}.</span>
+              Anything missing from those lists was not checked.
+              <ul class="mt-1 space-y-0.5 text-meta text-textMuted">
+                {#each unavailableAnalyses as [name, reason] (name)}
+                  <li class="break-words">{unavailableAnalysisLabel(name)}: {boundStrip(reason)}</li>
+                {/each}
+              </ul>
+            </div>
+          </div>
+        {/if}
+
+        <section aria-labelledby="map-overview" class="gp-card space-y-3 p-3" data-testid="map-overview">
+          <h2 id="map-overview" class="text-sm font-medium text-textPrimary">Overview</h2>
+          <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs @2xl:grid-cols-3">
+            {#each overviewStats as stat (stat.label)}
+              <div class="min-w-0">
+                <dt class="gp-label">{stat.label}</dt>
+                <dd class="m-0 truncate text-textPrimary" title={stat.title}>{stat.value}</dd>
+              </div>
+            {/each}
+          </dl>
+          <div>
+            <h3 id="map-important" class="gp-label mb-1">
+              Important files
+              <span class="font-normal ml-1">
+                {formatCap(
+                  doc.liveness_meta.important_files.shown,
+                  doc.liveness_meta.important_files.total,
+                  doc.liveness_meta.important_files.truncated,
+                )}
+              </span>
+            </h3>
+            {#if importantFiles.length === 0}
+              <p class="text-meta text-textMuted">None listed.</p>
+            {:else}
+              {@render pathList(importantFiles, "important", "files")}
+            {/if}
+          </div>
+        </section>
+
         {#if selected}
           {@const detailSummary = summaryWithoutArea(selected)}
           <header class="flex items-start justify-between gap-3">
@@ -1306,19 +1527,7 @@
             {#if selected.entry_points.length === 0}
               <p class="text-meta text-textMuted">None listed.</p>
             {:else}
-              <ul class="space-y-0.5">
-                {#each selected.entry_points as path, i (`${path}#${i}`)}
-                  <li>
-                    <button
-                      type="button"
-                      class="gp-btn font-mono max-w-full"
-                      onclick={() => openFile(path)}
-                    >
-                      <span class="truncate">{path}</span>
-                    </button>
-                  </li>
-                {/each}
-              </ul>
+              {@render pathList(selected.entry_points, "entry", "entry points")}
             {/if}
           </section>
 
@@ -1329,19 +1538,7 @@
             {#if selected.critical_files.length === 0}
               <p class="text-meta text-textMuted">None listed.</p>
             {:else}
-              <ul class="space-y-0.5">
-                {#each selected.critical_files as path, i (`${path}#${i}`)}
-                  <li>
-                    <button
-                      type="button"
-                      class="gp-btn font-mono max-w-full"
-                      onclick={() => openFile(path)}
-                    >
-                      <span class="truncate">{path}</span>
-                    </button>
-                  </li>
-                {/each}
-              </ul>
+              {@render pathList(selected.critical_files, "critical", "critical files")}
             {/if}
           </section>
 
@@ -1361,19 +1558,7 @@
                   : "No test role files in this area."}
               </p>
             {:else}
-              <ul class="space-y-0.5">
-                {#each tests.paths as path, i (`${path}#${i}`)}
-                  <li>
-                    <button
-                      type="button"
-                      class="gp-btn font-mono max-w-full"
-                      onclick={() => openFile(path)}
-                    >
-                      <span class="truncate">{path}</span>
-                    </button>
-                  </li>
-                {/each}
-              </ul>
+              {@render pathList(tests.paths, "tests", "test files")}
               {#if tests.truncated}
                 <p class="mt-1 text-micro text-warn">
                   Sample of {tests.paths.length}; {tests.total} total for this area.
@@ -1387,32 +1572,37 @@
               <h3 id="map-neighbors" class="gp-label mb-1">
                 Neighbors
               </h3>
-              <ul class="flex flex-wrap gap-1.5">
-                {#each selected.neighbors as neighbor, i (`${neighbor}#${i}`)}
-                  {@const neighborKey = neighborRowKey(areaRows, neighbor)}
-                  <li class="min-w-0 max-w-full">
-                    {#if neighborKey}
-                      <button
-                        type="button"
-                        class="gp-btn font-mono max-w-full"
-                        title="Select {neighbor} in the tree"
-                        onclick={() => selectKey(neighborKey)}
-                      >
-                        <span class="truncate">{neighbor}</span>
-                      </button>
-                    {:else}
-                      <span class="gp-chip font-mono text-textMuted" title="{neighbor} is not in this map's subsystem list">{neighbor}</span>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
+              <div class="space-y-1">
+                <ul class="flex flex-wrap gap-1.5">
+                  {#each previewSlice(selected.neighbors, expandedLists.neighbors, LIST_PREVIEW_ROWS) as neighbor, i (`${neighbor}#${i}`)}
+                    {@const neighborKey = neighborRowKey(areaRows, neighbor)}
+                    <li class="min-w-0 max-w-full">
+                      {#if neighborKey}
+                        <button
+                          type="button"
+                          class="gp-btn font-mono max-w-full"
+                          title="Select {neighbor} in the tree"
+                          onclick={() => selectKey(neighborKey)}
+                        >
+                          <span class="truncate">{neighbor}</span>
+                        </button>
+                      {:else}
+                        <span class="gp-chip font-mono text-textMuted" title="{neighbor} is not in this map's subsystem list">{neighbor}</span>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+                <ListPreviewToggle total={selected.neighbors.length} noun="neighbors" bind:expanded={expandedLists.neighbors} />
+              </div>
             </section>
           {/if}
         {/if}
 
-        <!-- Dead / unwired candidates (prefer over unreachable) -->
+        <!-- Dead / unwired candidates (prefer over unreachable). Repository-wide,
+             not part of the selected subsystem, and the heading says so. -->
         {#if deadLists}
-          <section class="pt-3 space-y-3" aria-label="Dead and unwired candidates">
+          <section class="space-y-3" aria-labelledby="map-repo-wide">
+            <h2 id="map-repo-wide" class="text-sm font-medium text-textPrimary">Across the repository</h2>
             <div>
               <h3 class="gp-label mb-1">
                 Unwired candidates
@@ -1425,21 +1615,13 @@
                 </span>
               </h3>
               {#if deadLists.unwired.length === 0}
-                <p class="text-meta text-textMuted">None in this sample.</p>
+                <p class="text-meta text-textMuted">
+                  {doc.liveness_meta.unwired.total > 0
+                    ? `Sample empty; the index lists ${doc.liveness_meta.unwired.total} unwired file(s).`
+                    : "None in this sample."}
+                </p>
               {:else}
-                <ul class="space-y-0.5 max-h-32 overflow-y-auto">
-                  {#each deadLists.unwired as path, i (`${path}#${i}`)}
-                    <li>
-                      <button
-                        type="button"
-                        class="font-mono text-meta text-textMuted hover:text-accent truncate max-w-full"
-                        onclick={() => openFile(path)}
-                      >
-                        {path}
-                      </button>
-                    </li>
-                  {/each}
-                </ul>
+                {@render pathList(deadLists.unwired, "unwired", "unwired files")}
               {/if}
               {#if unwiredExclusionSummary(doc.liveness_meta.unwired).length > 0}
                 <p class="mt-1 text-micro text-textMuted">
@@ -1459,13 +1641,13 @@
                 </span>
               </h3>
               {#if deadLists.deadSymbols.length === 0}
-                <p class="text-meta text-textMuted">None in this sample.</p>
+                <p class="text-meta text-textMuted">
+                  {doc.liveness_meta.dead_symbol.total > 0
+                    ? `Sample empty; the index lists ${doc.liveness_meta.dead_symbol.total} dead symbol candidate(s).`
+                    : "None in this sample."}
+                </p>
               {:else}
-                <ul class="space-y-0.5 max-h-40 overflow-y-auto">
-                  {#each deadLists.deadSymbols as id, i (`${id}#${i}`)}
-                    <li class="font-mono text-meta text-textMuted truncate" title={id}>{id}</li>
-                  {/each}
-                </ul>
+                {@render textList(deadLists.deadSymbols, "deadSymbols", "dead symbols")}
               {/if}
             </div>
             {#if deadLists.unreachableSuppressed}
@@ -1478,18 +1660,14 @@
                 <h3 class="gp-label mb-1">
                   Unreachable files (secondary)
                 </h3>
-                <ul class="space-y-0.5 max-h-24 overflow-y-auto">
-                  {#each deadLists.unreachable as path, i (`${path}#${i}`)}
-                    <li class="font-mono text-meta text-textMuted truncate">{path}</li>
-                  {/each}
-                </ul>
+                {@render textList(deadLists.unreachable, "unreachable", "unreachable files")}
               </div>
             {/if}
           </section>
         {/if}
 
         {#if doc.liveness_meta.entry_roots.truncated || doc.liveness_meta.subsystems.role_files_truncated}
-          <p class="text-micro text-textMuted pt-2">
+          <p class="text-micro text-textMuted">
             Caps:
             entry roots {formatCap(
               doc.liveness_meta.entry_roots.shown,
@@ -1513,7 +1691,7 @@
             )}
           </p>
         {/if}
-      </div>
+      </PageBody>
     </div>
   {/if}
   </div>

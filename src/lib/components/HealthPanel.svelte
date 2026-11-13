@@ -77,6 +77,7 @@
   import {
     dependabotBadgeClass as badgeClassFor,
     formatAuditCoverage,
+    severityLabel,
     toneLabel,
     updateKind,
   } from "../health/format";
@@ -85,9 +86,8 @@
   import EmptyState from "./EmptyState.svelte";
   import PageHeader from "./PageHeader.svelte";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
-  import { HEALTH_PREVIEW_ROWS } from "../health/sections";
   import PageBody from "./PageBody.svelte";
-  import { previewSlice } from "../ui/previewList";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import type { SecretsReport } from "../secrets/types";
   import { vulnerabilityEmptyMessage, type SectionCount } from "../health/counts";
   import { withoutTrailingPeriod } from "../format";
@@ -100,7 +100,7 @@
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
   import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
   import SecretsSection from "./health/SecretsSection.svelte";
-  import HealthPreviewToggle from "./health/HealthPreviewToggle.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
@@ -174,7 +174,7 @@
 
   /**
    * Which long lists the reader expanded. Every list opens on its first
-   * HEALTH_PREVIEW_ROWS rows, and collapses again for the next repository.
+   * LIST_PREVIEW_ROWS rows, and collapses again for the next repository.
    * The heading counts are untouched: they state what the scan saw, and the
    * toggle states what it can reveal.
    */
@@ -185,12 +185,13 @@
     issues: false,
     outdated: false,
     packages: false,
+    ecosystems: false,
     "dead-code": false,
   };
   type PreviewedList = keyof typeof COLLAPSED_LISTS;
   let expandedLists = $state({ ...COLLAPSED_LISTS });
   function previewed<T>(list: PreviewedList, rows: readonly T[]): T[] {
-    return previewSlice(rows, expandedLists[list], HEALTH_PREVIEW_ROWS);
+    return previewSlice(rows, expandedLists[list], LIST_PREVIEW_ROWS);
   }
   let copied = $state(false);
   let fixing = $state(false);
@@ -1015,17 +1016,14 @@
   {/snippet}
   {#snippet dependabotRows()}
     {#each keyedList(previewed("dependabot", dependabot?.alerts ?? []), (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
+      {@const where = `${alert.ecosystem}${alert.scope ? ` · ${alert.scope}` : ""}${alert.manifest_path ? ` · ${alert.manifest_path}` : ""}${alert.vulnerable_range ? ` · ${alert.vulnerable_range}` : ""}`}
       <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
+          <span class="gp-chip" data-kind="label" data-tone={severityTone(alert.severity)}>{severityLabel(alert.severity)}</span>
         </td>
         <td class="px-3 py-1.5">
-          <div class="font-mono text-textPrimary">{alert.package}</div>
-          <div class="text-micro text-textMuted">
-            {alert.ecosystem}{alert.scope ? ` · ${alert.scope}` : ""}
-            {#if alert.manifest_path} · {alert.manifest_path}{/if}
-            {#if alert.vulnerable_range} · {alert.vulnerable_range}{/if}
-          </div>
+          <div class="font-mono text-textPrimary truncate" title={alert.package}>{alert.package}</div>
+          <div class="text-micro text-textMuted truncate" title={where}>{where}</div>
         </td>
         <td class="px-3 py-1.5 text-textPrimary">
           {alert.title}
@@ -1051,21 +1049,16 @@
 
   {#snippet codeScanningRows()}
     {#each keyedList(previewed("code-scanning", codeScanning?.alerts ?? []), (alert) => `${alert.number}:${alert.rule_id}:${alert.path}:${alert.start_line}`) as { item: alert, key } (key)}
+      {@const location = alert.path ? `${alert.path}${alert.start_line > 0 ? `:${alert.start_line}` : ""}` : "—"}
       <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
+          <span class="gp-chip" data-kind="label" data-tone={severityTone(alert.severity)}>{severityLabel(alert.severity)}</span>
         </td>
         <td class="px-3 py-1.5">
-          <div class="font-mono text-textPrimary">{alert.rule_id || alert.rule_name || "rule"}</div>
+          <div class="font-mono text-textPrimary truncate" title={alert.rule_id || alert.rule_name}>{alert.rule_id || alert.rule_name || "rule"}</div>
           <div class="text-micro text-textMuted">{alert.title}</div>
         </td>
-        <td class="px-3 py-1.5 font-mono text-textMuted">
-          {#if alert.path}
-            {alert.path}{#if alert.start_line > 0}:{alert.start_line}{/if}
-          {:else}
-            —
-          {/if}
-        </td>
+        <td class="px-3 py-1.5 font-mono text-textMuted truncate" title={alert.path ? location : undefined}>{location}</td>
         <td class="px-3 py-1.5 text-textMuted">
           {alert.tool || "—"}{#if alert.tool_version} {alert.tool_version}{/if}
         </td>
@@ -1292,15 +1285,20 @@
     </div>
   {/if}
 
-  <PageBody>
-    <!-- Four lines of prose about GitHub CLI permissions used to be pinned at
-         the top of this scroll in every state, above every finding, forever.
-         It is the button's explanation, not the page's, so it is the button's
-         `aria-describedby` target and a one-line disclosure: the freshness —
-         the part a reader actually re-reads — stays on the visible summary
-         line, and the permission text is one click away rather than four
-         lines of column height on every visit. -->
+  <!-- Four lines of prose about GitHub CLI permissions used to be pinned at
+       the top of this scroll in every state, above every finding, forever.
+       It is the button's explanation, not the page's, so it is the button's
+       `aria-describedby` target and a one-line disclosure: the freshness —
+       the part a reader actually re-reads — stays on the visible summary
+       line, and the permission text is one click away rather than four
+       lines of column height on every visit.
+
+       With a report loaded it sits beneath the verdict, so the first thing in
+       the scroll answers "is this repository OK?"; before one exists (loading,
+       a failed scan) there is no verdict to put first and it leads. -->
+  {#snippet githubFreshness()}
     <details
+      data-health-github-freshness
       class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted"
     >
       <!-- `role="status"` belongs on the text, not on the `<summary>`: a
@@ -1324,6 +1322,12 @@
         Critical and high findings raise a warning.
       </p>
     </details>
+  {/snippet}
+
+  <PageBody>
+    {#if !report}
+      {@render githubFreshness()}
+    {/if}
     <!-- Non-fatal action failures render ahead of the state chain so they stay
          visible in every state instead of shadowing (or being shadowed by) the
          load-error branch. Same shape as GitHubPanel's actionError banner. -->
@@ -1355,6 +1359,7 @@
           <HealthSummaryCard {summary} rendered={renderedSections} />
         </HealthSection>
       {/if}
+      {@render githubFreshness()}
 
       {#if planError}
         <div role="alert" class="gp-notice" data-tone="danger">
@@ -1558,16 +1563,14 @@
         {:else}
           <HealthTable caption="Known vulnerabilities in this repository's dependencies" columns={VULNERABILITY_COLUMNS}>
             {#each keyedList(previewed("vulnerabilities", visibleVulns), (vuln) => `${vuln.ecosystem}:${vuln.name}:${vuln.range}:${vuln.title}`) as { item: vuln, key } (key)}
+              {@const vulnWhere = `${vuln.ecosystem}${vuln.is_direct ? " · direct" : " · transitive"}${vuln.range ? ` · ${vuln.range}` : ""}`}
               <tr class="align-top">
                 <td class="px-3 py-1.5">
-                  <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(vuln.severity)}>{vuln.severity}</span>
+                  <span class="gp-chip" data-kind="label" data-tone={severityTone(vuln.severity)}>{severityLabel(vuln.severity)}</span>
                 </td>
                 <td class="px-3 py-1.5">
-                  <div class="font-mono text-textPrimary">{vuln.name}</div>
-                  <div class="text-micro text-textMuted">
-                    {vuln.ecosystem}{vuln.is_direct ? " · direct" : " · transitive"}
-                    {#if vuln.range} · {vuln.range}{/if}
-                  </div>
+                  <div class="font-mono text-textPrimary truncate" title={vuln.name}>{vuln.name}</div>
+                  <div class="text-micro text-textMuted truncate" title={vulnWhere}>{vulnWhere}</div>
                 </td>
                 <td class="px-3 py-1.5 text-textPrimary">{vuln.title}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{vuln.fix_available}</td>
@@ -1583,7 +1586,7 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={visibleVulns.length}
             noun="vulnerabilities"
             bind:expanded={expandedLists.vulnerabilities}
@@ -1603,7 +1606,7 @@
               <div class="gp-notice flex-col" data-tone={issueNoticeTone(issue.severity)}>
                 <div class="flex items-center gap-2 min-w-0 w-full">
                   <AlertTriangle size={12} class="shrink-0" style="color: var(--gp-notice-ink)" aria-hidden="true" />
-                  <span class="font-medium capitalize text-micro shrink-0">{issue.severity}</span>
+                  <span class="font-medium text-micro shrink-0">{severityLabel(issue.severity)}</span>
                   <!-- A flex item has to be allowed to shrink before `truncate`
                        can clip it; without `min-w-0` it sizes to its content. -->
                   <span class="font-mono text-micro opacity-70 truncate min-w-0">{issue.code}</span>
@@ -1615,7 +1618,7 @@
               </div>
             {/each}
           </div>
-          <HealthPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
+          <ListPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
         {/if}
       </HealthSection>
 
@@ -1633,7 +1636,7 @@
             {#each keyedList(previewed("outdated", report.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
               {@const kind = updateKind(pkg.current, pkg.latest)}
               <tr>
-                <td class="px-3 py-1.5 font-mono text-textPrimary">{pkg.name}</td>
+                <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={pkg.name}>{pkg.name}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.current}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.wanted}</td>
                 <td class="px-3 py-1.5 font-mono {updateKindTextClass(kind)}">
@@ -1644,7 +1647,7 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={report.outdated.length}
             noun="outdated packages"
             bind:expanded={expandedLists.outdated}
@@ -1707,7 +1710,7 @@
               </div>
             {/each}
           </div>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={report.manifests.length}
             noun="package manifests"
             bind:expanded={expandedLists.packages}
@@ -1720,7 +1723,7 @@
                crates produced three lines of run-together file paths with no
                structure to scan. -->
           <dl class="pt-1 space-y-1.5">
-            {#each keyedList(report.ecosystems, (eco) => eco.family) as { item: eco, key } (key)}
+            {#each keyedList(previewed("ecosystems", report.ecosystems), (eco) => eco.family) as { item: eco, key } (key)}
               {@const shown = eco.manifests.slice(0, 4)}
               {@const seen = ecosystemArtifactTotal(eco)}
               <!-- `minmax(0,1fr)`, not `1fr`: a grid track's default minimum is
@@ -1742,6 +1745,11 @@
               </div>
             {/each}
           </dl>
+          <ListPreviewToggle
+            total={report.ecosystems.length}
+            noun="ecosystems"
+            bind:expanded={expandedLists.ecosystems}
+          />
         {/if}
       </HealthSection>
 
@@ -1815,8 +1823,8 @@
           <HealthTable caption="Symbols the code map found no reference to" columns={DEAD_CODE_COLUMNS}>
             {#each keyedList(previewed("dead-code", deadSymbols), (sym) => `${sym.file_path}:${sym.symbol_name}`) as { item: sym, key } (key)}
               <tr>
-                <td class="px-3 py-1.5 font-mono text-textPrimary font-medium">{sym.symbol_name}</td>
-                <td class="px-3 py-1.5 font-mono text-textMuted">{sym.file_path}</td>
+                <td class="px-3 py-1.5 font-mono text-textPrimary font-medium truncate" title={sym.symbol_name}>{sym.symbol_name}</td>
+                <td class="px-3 py-1.5 font-mono text-textMuted truncate" title={sym.file_path}>{sym.file_path}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{(sym.confidence * 100).toFixed(0)}%</td>
                 <td class="px-3 py-1.5 text-textMuted">
                   {#if sym.is_exempt}
@@ -1832,7 +1840,7 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={deadSymbols.length}
             noun="candidates"
             bind:expanded={expandedLists["dead-code"]}

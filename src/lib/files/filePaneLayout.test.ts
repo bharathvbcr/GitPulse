@@ -3,6 +3,7 @@ import {
   FILE_DASHBOARD_WIDTH,
   FILE_EDITOR_MIN_WIDTH,
   FILE_EXPLORER_WIDTH,
+  FILE_SIDE_CARD_GUTTERS,
   resolveFilePaneLayout,
 } from "./filePaneLayout";
 
@@ -23,7 +24,7 @@ describe("resolveFilePaneLayout", () => {
   });
 
   it("shows both requested rails only when their widths leave the editor minimum", () => {
-    const exactWideWidth = FILE_EXPLORER_WIDTH + FILE_DASHBOARD_WIDTH + FILE_EDITOR_MIN_WIDTH;
+    const exactWideWidth = FILE_EXPLORER_WIDTH + FILE_DASHBOARD_WIDTH + 2 * FILE_SIDE_CARD_GUTTERS + FILE_EDITOR_MIN_WIDTH;
     const input = {
       explorerRequested: true,
       dashboardRequested: true,
@@ -38,6 +39,29 @@ describe("resolveFilePaneLayout", () => {
       dashboardVisible: true,
       editorVisible: true,
     });
+  });
+
+  it("counts each side card's margins, so the editor keeps its minimum beside two floating cards", () => {
+    // Each side pane is a gp-float-card: 6px of margin on either side. At the
+    // bare sum of the widths, two cards would leave the editor 24px short.
+    const bareSum = FILE_EXPLORER_WIDTH + FILE_DASHBOARD_WIDTH + FILE_EDITOR_MIN_WIDTH;
+    const layout = resolveFilePaneLayout({
+      containerWidth: bareSum,
+      explorerRequested: true,
+      dashboardRequested: true,
+      preferredPane: "explorer",
+      compactPane: null,
+    });
+    expect(layout.mode).toBe("single");
+    expect(layout.dashboardVisible).toBe(false);
+    // One card at its bare width would leave the editor 12px short as well.
+    expect(resolveFilePaneLayout({
+      containerWidth: FILE_EXPLORER_WIDTH + FILE_EDITOR_MIN_WIDTH,
+      explorerRequested: true,
+      dashboardRequested: false,
+      preferredPane: "explorer",
+      compactPane: null,
+    }).explorerVisible).toBe(false);
   });
 
   it("honors the requested single-pane priority when either rail can fit", () => {
@@ -55,7 +79,7 @@ describe("resolveFilePaneLayout", () => {
     // The preferred dashboard cannot fit here, so fall back to the narrower
     // requested explorer instead of unnecessarily hiding every side pane.
     const explorerFallback = resolveFilePaneLayout({
-      containerWidth: FILE_EXPLORER_WIDTH + FILE_EDITOR_MIN_WIDTH,
+      containerWidth: FILE_EXPLORER_WIDTH + FILE_SIDE_CARD_GUTTERS + FILE_EDITOR_MIN_WIDTH,
       explorerRequested: true,
       dashboardRequested: true,
       preferredPane: "dashboard",
@@ -67,7 +91,7 @@ describe("resolveFilePaneLayout", () => {
 
   it("lets an explicitly selected wider pane replace the editor when only the narrower rail fits", () => {
     expect(resolveFilePaneLayout({
-      containerWidth: FILE_EXPLORER_WIDTH + FILE_EDITOR_MIN_WIDTH,
+      containerWidth: FILE_EXPLORER_WIDTH + FILE_SIDE_CARD_GUTTERS + FILE_EDITOR_MIN_WIDTH,
       explorerRequested: true,
       dashboardRequested: true,
       preferredPane: "dashboard",
@@ -81,7 +105,7 @@ describe("resolveFilePaneLayout", () => {
   });
 
   it("uses a full-workspace side pane when no fixed rail can coexist with the editor", () => {
-    const narrowWidth = FILE_EXPLORER_WIDTH + FILE_EDITOR_MIN_WIDTH - 1;
+    const narrowWidth = FILE_EXPLORER_WIDTH + FILE_SIDE_CARD_GUTTERS + FILE_EDITOR_MIN_WIDTH - 1;
     const base = {
       containerWidth: narrowWidth,
       explorerRequested: true,

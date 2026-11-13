@@ -19,6 +19,22 @@ export function normalizeSeverity(severity: string): AuditSeverity {
   return "info";
 }
 
+/**
+ * A source's own severity word, in one case.
+ *
+ * GitHub says "HIGH" where the local audit says "high" and CodeQL says
+ * "warning", so the same chip read "HIGH", "High" and "Warning" down one page.
+ * This changes only the case. It does not map one vocabulary onto another
+ * (`normalizeSeverity` does that, for ranking), so a word the reader may search
+ * for is still the word the source used. A missing severity is "Unranked",
+ * never a guess.
+ */
+export function severityLabel(severity: string | null | undefined): string {
+  const word = (severity ?? "").trim().toLowerCase();
+  if (word === "") return "Unranked";
+  return word.charAt(0).toUpperCase() + word.slice(1);
+}
+
 export type UpdateKind = "major" | "minor" | "patch" | "prerelease" | "same" | "unknown";
 
 interface ParsedSemver {

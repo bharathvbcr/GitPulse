@@ -187,10 +187,11 @@ export async function runHealthChecks(ctx) {
       return !!note && has(note, "uses the GitHub CLI, its credentials, and the network");
     });
     check("the freshness is a machine timestamp on the always-visible summary line", () => {
-      const time = root.querySelector("details summary time");
+      const summaryLine = root.querySelector("[data-health-github-freshness] summary");
+      const time = summaryLine?.querySelector("time");
       return !!time && new Date(time.getAttribute("datetime")).toISOString() === time.getAttribute("datetime")
-        && has(root.querySelector("details summary"), "last checked") && has(root.querySelector("details summary"), "may be cached")
-        && !!root.querySelector('details summary [role="status"]');
+        && has(summaryLine, "last checked") && has(summaryLine, "may be cached")
+        && !!summaryLine.querySelector('[role="status"]');
     });
     interfaceStore.setAutoScanGithubAlerts(false);
     mark = ipcLog.length;
@@ -366,9 +367,9 @@ export async function runHealthChecks(ctx) {
     await wait();
     check("secret findings raise the Health verdict and name the facet", () =>
       has(section("summary"), "Secrets 12 found"));
-    check("secret findings open on the first 8 rows", () =>
-      section("secrets").querySelectorAll("tbody tr").length === 8 && has(section("secrets"), "Show all 12 findings"));
-    section("secrets").querySelector("[data-health-preview-toggle]").click(); await tick();
+    check("secret findings open on the first 5 rows", () =>
+      section("secrets").querySelectorAll("tbody tr").length === 5 && has(section("secrets"), "Show all 12 findings"));
+    section("secrets").querySelector("[data-list-preview-toggle]").click(); await tick();
     check("Show all reveals every finding", () => section("secrets").querySelectorAll("tbody tr").length === 12);
     button("Fix with agent").click(); await wait();
     check("Fix with agent selects the secrets task and opens its prompt for review", () =>
