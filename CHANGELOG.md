@@ -11,8 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.99.0] - 2026-11-13
+
+The 2.0 beta. It ships as 1.99.0 because release and macOS bundle versions are
+plain numbers, so 2.0.0 sorts after it.
+
 ### Added
 
+- **Theme and Pulse card exports save through the system save panel.** You
+  pick the folder and name, the panel asks before replacing a file, and a write
+  that fails says why in one sentence.
+- **Long report lists open on their first five rows.** Health (vulnerabilities,
+  Dependabot, code scanning, issues, outdated and dead code, secrets, host load,
+  terminal incidents), Storage, Hygiene, the Pulse knowledge map, Fleet,
+  Coverage and the Map page's lists show five rows and a "Show all N" control.
+  Navigators stay fully listed: the Map's subsystem tree, file trees and the
+  sidebar's worktree list.
+- **The Map page opens on an overview** of size, caps and important files.
+  A degraded graph, a stale index and analyses that could not run are stated
+  plainly rather than reading as a complete map.
 - **The Diff view has the commit graph beside the diff.** The file rail gets a
   History tab (⌥H) that draws the Graph view's own lanes, refs and rows at rail
   size, so opening another commit or comparing two no longer means a trip to the
@@ -57,6 +74,10 @@ before that tag is pushed.
 
 ### Fixed
 
+- **Go to line works again.** Every Go threw "trim is not a function" and the
+  cursor never moved.
+- **The Code page keeps the editor's minimum width beside two floating cards,**
+  counting each card's margins.
 - **A commit clicked in HEAD moves or Suspects stays selected when the graph
   reloads without it.** A filter typed above the reflog, the page size or a
   watcher refresh dropped the clicked commit from the loaded graph and the
@@ -96,6 +117,13 @@ before that tag is pushed.
 
 ### Changed
 
+- **Panes and cards float.** Side panes and cards sit on the window as rounded
+  cards with their own margin, the darker separators between bands are gone, and
+  page layouts follow the pane's width rather than the window's.
+- **Health leads with its verdict,** severity chips share one casing, and long
+  package names, rule ids and paths truncate with the full text on hover.
+- **The Go helpers build on Go 1.27.4,** the version DevCouncil's orchestrator
+  module now requires.
 - **GitPulse builds on Rust 1.100.** Its own crates (`src-tauri`,
   `crates/gitpulse-worktree`, `crates/git-status-parity`) declare
   `rust-version = "1.100"`, an owner decision that replaces the unpinned floor.

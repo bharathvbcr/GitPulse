@@ -114,12 +114,7 @@ fn suggested_file_name(format: ExportFormat, suggested: &str) -> String {
         .collect();
     let cleaned = cleaned.trim();
     let suffix = format!(".{}", format.extension);
-    // ASCII lowercasing keeps byte offsets, so the slice stays on a boundary.
-    let stem = if cleaned.to_ascii_lowercase().ends_with(&suffix) {
-        &cleaned[..cleaned.len() - suffix.len()]
-    } else {
-        cleaned
-    };
+    let stem = crate::fs_entry::strip_suffix_ascii_ci(cleaned, &suffix).unwrap_or(cleaned);
     let stem = stem.trim().trim_start_matches('.').trim();
     let stem: String = stem.chars().take(MAX_SUGGESTED_STEM_CHARS).collect();
     let stem = stem.trim();
@@ -289,6 +284,10 @@ mod export_tests {
         assert_eq!(name(ExportKind::PulseCard, "card"), "card.svg");
         assert_eq!(name(ExportKind::PulseCard, "card.SVG"), "card.svg");
         assert_eq!(name(ExportKind::PulseCard, "card.json"), "card.json.svg");
+        // A multi-byte stem right before the extension: the cut must land on
+        // the character boundary in front of ".svg", not inside "é".
+        assert_eq!(name(ExportKind::PulseCard, "carte-é.SVG"), "carte-é.svg");
+        assert_eq!(name(ExportKind::PulseCard, "é"), "é.svg");
         assert_eq!(name(ExportKind::PulseCard, ""), "gitpulse-pulse-card.svg");
         assert_eq!(name(ExportKind::Theme, "  .json "), "gitpulse-theme.json");
         assert_eq!(
