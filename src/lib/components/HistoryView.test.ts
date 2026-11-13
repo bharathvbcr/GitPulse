@@ -53,17 +53,20 @@ describe("HistoryView", () => {
     expect(historyList).toMatch(/value: "suspects", *\n? *label: "Suspects"/);
   });
 
-  it("asks the suspects question in the context bar, and only on that list, where the field is not the commit filter", () => {
+  it("asks the suspects question inside the Suspects list, not in the context bar, so the bar holds one search field", () => {
     // A ranking is one answer; narrowing it by text would reorder nothing and
     // hide rows whose rank still counts. So on Suspects the view bar's field
     // stops being the commit filter (it registers no filter there, and the
-    // standing "Commits:" chip is withheld) and the question takes the
-    // context bar, rather than both applying at once.
+    // standing "Commits:" chip is withheld). The question lives in the list's
+    // own header strip, so the bar does not show two search fields.
     expect(history).toContain('const asksSuspects = $derived(section === "graph" && list === "suspects")');
     const bar = history.slice(history.indexOf("<ViewContextBar"), history.indexOf("</ViewContextBar>"));
-    expect(bar.indexOf("{#if asksSuspects}")).toBeGreaterThan(-1);
-    expect(bar.indexOf("<SuspectsQueryBar />")).toBeGreaterThan(bar.indexOf("{#if asksSuspects}"));
+    expect(bar).toContain("<SettingSegment");
+    expect(bar).not.toContain("SuspectsQueryBar");
+    expect(bar).not.toContain("{#if asksSuspects}");
     expect(bar).not.toContain("<FilterBar");
+    expect(history).not.toContain("SuspectsQueryBar from");
+    expect(history).not.toContain("<SuspectsQueryBar");
     const filter = history.slice(history.indexOf('registerPageSearch("history:graph"') - 200, history.indexOf('registerPageSearch("history:graph"'));
     expect(filter).toContain("if (asksSuspects) return;");
     const standing = history.slice(history.indexOf('registerStandingFilter("history"'));

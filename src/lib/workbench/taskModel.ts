@@ -120,13 +120,13 @@ export function explainEnhancementFailure(text: string): EnhancementFailureAdvic
   }
   if (lower.includes("busy")) {
     return {
-      guidance: "Manvi is busy with another suggestion. Wait, then retry.",
+      guidance: "Manvi is busy with another suggestion. Wait, then try again.",
       action: "wait",
     };
   }
   if (lower.includes("timeout") || lower.includes("unavailable") || lower.includes("still starting")) {
     return {
-      guidance: "Manvi is still starting; retry.",
+      guidance: "Manvi is still starting; try again.",
       action: "retry",
     };
   }

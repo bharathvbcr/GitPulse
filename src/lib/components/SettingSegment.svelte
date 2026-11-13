@@ -10,16 +10,19 @@
     options,
     value,
     onselect,
+    size = "default",
   }: {
     /** Group name for screen readers, e.g. "Theme appearance". */
     ariaLabel: string;
     options: readonly { value: T; label: string; title?: string }[];
     value: T;
     onselect?: (next: T) => void;
+    /** "sm" sets the labels in metadata type for a control inside a field or a narrow rail. */
+    size?: "default" | "sm";
   } = $props();
 </script>
 
-<div class="gp-segmented" role="group" aria-label={ariaLabel}>
+<div class="gp-segmented" role="group" aria-label={ariaLabel} data-size={size === "sm" ? "sm" : undefined}>
   {#each options as option (option.value)}
     <button
       type="button"

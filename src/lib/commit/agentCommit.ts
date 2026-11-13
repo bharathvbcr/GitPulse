@@ -11,6 +11,7 @@ import {
   type PromptLauncher,
 } from "../terminal/launchRequests";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
+import { describeError } from "../ui/copy/describeFailure";
 
 export const AGENT_COMMIT_NO_REPO = "Open a repository before asking an agent to commit.";
 export const AGENT_COMMIT_CONFLICTS = "Resolve merge conflicts before asking an agent to commit.";
@@ -211,7 +212,7 @@ export async function launchAgentCommit(
   } catch (err: unknown) {
     return {
       ok: false,
-      error: err instanceof Error ? err.message : String(err),
+      error: describeError(err, "agent-commit"),
     };
   }
 }

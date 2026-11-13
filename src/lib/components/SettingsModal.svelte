@@ -832,9 +832,9 @@
                     </div>
                     <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
                       <SettingToggle
-                        label="Manvi status in the title bar"
-                        description="Policy and local-model status in the title bar."
-                        ariaLabel="Show Manvi status in the title bar"
+                        label="Manvi status"
+                        description="Policy and local-model status: in the status bar on a repository, in the title bar on Fleet, Agents and Tasks."
+                        ariaLabel="Show Manvi status"
                         checked={$interfaceStore.showHarnessBadges}
                         onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
                       />
@@ -955,7 +955,7 @@
                     <div data-setting="diff-syntax" hidden={!shown("diff-syntax")}>
                       <SettingToggle
                         label="Syntax highlighting"
-                        description="Language colouring inside diff rows. Turning it off makes very large diffs cheaper to scroll."
+                        description="Language coloring inside diff rows. Turning it off makes very large diffs cheaper to scroll."
                         ariaLabel="Open diffs with syntax highlighting on"
                         checked={$interfaceStore.diffSyntaxHighlight}
                         onchange={(next) => interfaceStore.setDiffSyntaxHighlight(next)}

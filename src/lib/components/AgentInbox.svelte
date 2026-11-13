@@ -1079,7 +1079,7 @@
   <!-- Split Pane: Threads & Detail -->
   <div class="inbox-body">
     <!-- Thread List Pane -->
-    <aside class="threads-pane" aria-label="Conversation threads">
+    <aside class="threads-pane gp-float-card" aria-label="Conversation threads">
       {#if filteredThreads.length > 0 && selectedKeys.size === 0}
         <div class="threads-pane-tools">
           <button
@@ -1755,7 +1755,6 @@
     width: 320px;
     flex-shrink: 0;
     overflow-y: auto;
-    background: rgb(var(--c-bg) / 0.35);
   }
 
   .threads-list {

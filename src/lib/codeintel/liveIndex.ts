@@ -30,6 +30,7 @@ import { createPacedQueue, type BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { maybeRefreshDevmap } from "./client";
 import type { DevmapBuildOutcome, LiveRefreshDecision, LiveRefreshOutcome } from "./types";
+import { describeError } from "../ui/copy/describeFailure";
 
 /**
  * Mirror of Rust `build_is_echo_or_failure` for the *publication* half:
@@ -199,7 +200,7 @@ export function createLiveIndex(opts?: {
       forgetRetries(repoPath);
       patch(repoPath, {
         phase: "failed", decision: null,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: describeError(error, "code-map"),
         refreshing: false, updatedAt: Date.now(), stage: null,
       });
     },

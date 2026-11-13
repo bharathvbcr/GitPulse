@@ -5,6 +5,7 @@ import { memoryStorage } from "../../repos/persist";
 import { cancelPrompt, completePrompt, isPromptOpen, askText, promptError, promptState } from "../modalStore";
 import type { FilterState } from "../filterStore";
 import { gitActionCount } from "../../desktop/exitGuard";
+import { INTERNAL_ERROR_COPY } from "../../ui/copy/describeFailure";
 
 /**
  * Adversarial review of the repoStore mutation contract (ft-1629347b).
@@ -320,5 +321,33 @@ describe("attack 4: prompts", () => {
     expect(await asked).toBeNull();
     expect(isPromptOpen()).toBe(false);
     expect(get(promptState)).toBeNull();
+  });
+});
+
+describe("attack 5: a runtime fault in the page is not shown verbatim", () => {
+  it("an open whose resolve throws a TypeError names a fault inside GitPulse, not the raw message", async () => {
+    const store = makeStore(
+      makeInvoke({
+        cmd_resolve_repo: async () => {
+          throw new TypeError("Cannot read properties of undefined (reading \x27invoke\x27)");
+        },
+      }),
+    );
+    expect(await store.openRepo("/r/a")).toBe(false);
+    const shown = get(store).error ?? "";
+    expect(shown).toBe(INTERNAL_ERROR_COPY);
+    expect(shown).not.toContain("Cannot read properties");
+  });
+
+  it("a backend refusal still reads as the backend said it", async () => {
+    const store = makeStore(
+      makeInvoke({
+        cmd_resolve_repo: async () => {
+          throw new Error("not a git repository: /r/a");
+        },
+      }),
+    );
+    expect(await store.openRepo("/r/a")).toBe(false);
+    expect(get(store).error ?? "").toContain("not a git repository");
   });
 });

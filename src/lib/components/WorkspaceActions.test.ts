@@ -158,11 +158,18 @@ describe("a fetch-all sweep", () => {
     expect(source).toMatch(/<span class="sr-only" role="status" aria-live="polite" aria-atomic="true">\{sweepLine \?\? ""\}<\/span>/);
   });
 
-  it("collapses the Fetch all and status labels to icons below 1100px, keeping their names", () => {
-    expect(source.match(/max-\[1099px\]:sr-only/g)?.length).toBeGreaterThanOrEqual(3);
-    expect(source).toContain('aria-label="Fetch all"');
+  it("collapses the status labels to icons below 1100px, keeping their names", () => {
+    expect(source.match(/max-\[1099px\]:sr-only/g)?.length).toBeGreaterThanOrEqual(2);
     expect(source).toContain('aria-label={wip.allClear ? "All clean" : `${wip.repos.length} with work`}');
-    expect(source).toContain('title="Fetch every open repository.');
+  });
+
+  it("draws Fetch all as an icon at every width, named by its tooltip and accessible name", () => {
+    const fetch = source.slice(source.indexOf('onclick={() => void run("fetch")}') - 120, source.indexOf("</button>", source.indexOf('onclick={() => void run("fetch")}')));
+    expect(fetch).toContain('class="gp-icon-btn shrink-0"');
+    expect(fetch).toContain('aria-label="Fetch all"');
+    expect(fetch).toContain('title="Fetch all: fetch every open repository.');
+    expect(fetch).toContain('<span class="sr-only">Fetch all</span>');
+    expect(fetch).not.toContain("max-[1099px]:sr-only");
   });
 
   it("keeps the panel on the menu layer", () => {

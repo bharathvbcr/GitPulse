@@ -91,19 +91,20 @@ describe("TerminalDock", () => {
     const stop = source.indexOf("function handleSeparatorKey(");
     expect(start).toBeGreaterThan(-1);
     const drag = source.slice(start, stop);
-    const move = drag.slice(drag.indexOf("const move = "), drag.indexOf("const end = "));
-    expect(move).toContain("dragHeight = clampTerminalDockHeight(");
+    // The capture / move / end / cancel plumbing and the clamp are ui/paneHeight's
+    // (its test pins them); the dock's part is what the callbacks do with a height.
+    expect(drag).toContain("startPaneDrag(event, startHeight, TERMINAL_DOCK_BOUNDS, {");
+    const move = drag.slice(drag.indexOf("onHeight:"), drag.indexOf("onEnd:"));
+    expect(move).toContain("dragHeight = px");
     expect(move).not.toContain("interfaceStore.");
-    const end = drag.slice(drag.indexOf("const end = "));
+    const end = drag.slice(drag.indexOf("onEnd:"));
     expect(end).toContain("commitDragHeight();");
-    expect(drag).toContain('handle.addEventListener("pointerup", end);');
-    expect(drag).toContain('handle.addEventListener("pointercancel", end);');
     // The rendered height follows the pending drag value while one exists.
     expect(source).toContain("fitTerminalDockHeight(dragHeight, containerHeight)");
     // Keyboard nudges still write straight through.
     const keys = source.slice(stop);
-    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight + TERMINAL_DOCK_RESIZE_STEP)");
-    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight - TERMINAL_DOCK_RESIZE_STEP)");
+    expect(keys).toContain("nudgedPaneHeight(event.key, currentHeight, TERMINAL_DOCK_RESIZE_STEP)");
+    expect(keys).toContain("interfaceStore.setTerminalDockHeight(next)");
   });
 });
 

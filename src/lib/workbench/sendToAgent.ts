@@ -66,7 +66,7 @@ export function routeTitle(route: AgentSendPreview["route"]): string {
     case "mailbox": return "Live session";
     case "resume": return "Resume the conversation";
     case "managed": return "Managed follow-up";
-    case "unavailable": return "Cannot be sent";
+    case "unavailable": return "Can't be sent";
   }
 }
 

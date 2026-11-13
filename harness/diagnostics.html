@@ -417,6 +417,16 @@
     await click("Show all");
     check("Show all lists the entries the filter hid",target.textContent.includes("Harness filtered warning")&&!target.textContent.includes("hidden by this filter"));
     diagnostics.clear();
+    // Interleaved repeats of two failures fold into two group cards, not five.
+    for (const message of ["Group canary A","Group canary B","Group canary A","Group canary B","Group canary A"]) diagnostics.error("group-canary",message);
+    host.show("blame");await settle();host.show("diagnostics");await settle();
+    const groupCount = text => target.textContent.split(text).length-1;
+    check("interleaved repeats render as one card per failure with a count",groupCount("Group canary A")===1&&groupCount("Group canary B")===1&&target.textContent.includes("×3")&&target.textContent.includes("×2"),target.textContent.slice(0,400));
+    const disclosure=()=>[...target.querySelectorAll("button[aria-expanded]")].find(b=>b.textContent.includes("×3"));
+    check("a grouped card is a closed disclosure listing no occurrences yet",disclosure()?.getAttribute("aria-expanded")==="false"&&!target.querySelector('[aria-label="Occurrences"]'));
+    disclosure()?.click();await settle();
+    check("opening the disclosure lists each recorded run",disclosure()?.getAttribute("aria-expanded")==="true"&&target.querySelectorAll('[aria-label="Occurrences"] li').length>=1);
+    diagnostics.clear();
     await settle();
     check("an empty ring still says nothing was recorded",target.textContent.includes("No frontend diagnostics recorded"));
     // Capture the platform's real ResizeObserver loop ErrorEvent before

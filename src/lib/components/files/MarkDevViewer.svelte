@@ -18,6 +18,7 @@
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import type { LineEnding } from "../../files/types";
   import { formatError } from "../../ui/formatError";
+  import { describeError } from "../../ui/copy/describeFailure";
   import { copyText } from "../../desktop/clipboard";
   import {
     renderMarkDevMarkdown,
@@ -186,7 +187,7 @@
     try {
       await openInDefaultApp(repo, filePath);
     } catch (err) {
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     }
   }
 
@@ -238,7 +239,7 @@
 
 <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
   <!-- MarkDev Integrated Header Toolbar -->
-  <div class="relative shrink-0 bg-surface/80 select-none" data-tip-place="above">
+  <div class="relative shrink-0 select-none" data-tip-place="above">
     <div bind:this={markdevBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
     <!-- Left: MarkDev Brand & Outline Toggle -->
@@ -372,7 +373,8 @@
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
     <!-- Outline / TOC Drawer -->
     {#if showOutline && outline.length > 0}
-      <div class="w-56 shrink-0 h-full bg-surface/50 p-3 overflow-y-auto gp-scroll select-none">
+      <div class="gp-float-card w-56 shrink-0 flex flex-col select-none" data-markdev-outline-card>
+      <div class="flex-1 min-h-0 p-3 overflow-y-auto gp-scroll">
         <div class="gp-label mb-2 flex items-center gap-1.5">
           <Sparkles size={11} class="text-accent" />
           <span>Document outline</span>
@@ -391,6 +393,7 @@
             </button>
           {/each}
         </div>
+      </div>
       </div>
     {/if}
 

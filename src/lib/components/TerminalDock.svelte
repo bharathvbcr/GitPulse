@@ -11,6 +11,7 @@
   import { worktreeSetupNotices } from "../branches/types";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import {
+    TERMINAL_DOCK_BOUNDS,
     TERMINAL_DOCK_MAX_HEIGHT,
     TERMINAL_DOCK_MIN_HEIGHT,
     TERMINAL_DOCK_RESIZE_STEP,
@@ -25,6 +26,7 @@
   import { requestReveal } from "../files/revealRequests";
   import { observeResize } from "../dom/observeResize";
   import { motionExitMs } from "../motion/tokens";
+  import { nudgedPaneHeight, startPaneDrag } from "../ui/paneHeight";
   import { panelModes } from "../ui/panelMode";
   import { LAYERS } from "../ui/layers";
   import { floatingPanelDismiss } from "../ui/panelDismiss";
@@ -200,7 +202,7 @@
     );
     if (!outcome.ok) {
       if (outcome.refused) {
-        reportFailure(outcome, "Could not create isolated worktree");
+        reportFailure(outcome, "Couldn't create the isolated worktree");
         return { ok: false, error: null };
       }
       return { ok: false, error: outcome.error ?? "it did not complete." };
@@ -249,37 +251,22 @@
   });
 
   function startDrag(event: PointerEvent) {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    const startY = event.clientY;
     const startHeight = height;
+    // The capture, the inverted delta and the clamp are ui/paneHeight's, shared
+    // with the commit details pane; the release commits what the drag showed.
+    const started = startPaneDrag(event, startHeight, TERMINAL_DOCK_BOUNDS, {
+      onHeight: (px) => (dragHeight = px),
+      onEnd: () => {
+        commitDragHeight();
+        dragging = false;
+      },
+    });
+    if (!started) return;
     // Collapsing out of the expanded state starts the drag from what was on
     // screen; like every other drag height, it reaches the store on release.
     dragHeight = expanded ? clampTerminalDockHeight(startHeight) : null;
     expanded = false;
     dragging = true;
-
-    // Pointer capture, not window listeners: a drag that leaves the window
-    // still ends on pointerup, and nothing else on the page sees the moves.
-    const handle = event.currentTarget as HTMLElement;
-    handle.setPointerCapture(event.pointerId);
-
-    const move = (moveEvent: PointerEvent) => {
-      // Dragging up grows the dock, so the delta is inverted. Clamped exactly
-      // as the store would clamp it, so the release commits what was shown.
-      dragHeight = clampTerminalDockHeight(startHeight + (startY - moveEvent.clientY));
-    };
-    const end = () => {
-      commitDragHeight();
-      dragging = false;
-      handle.releasePointerCapture(event.pointerId);
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", end);
-      handle.removeEventListener("pointercancel", end);
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", end);
-    handle.addEventListener("pointercancel", end);
   }
 
   /** One store write per drag, not one per pointermove. */
@@ -291,14 +278,11 @@
 
   function handleSeparatorKey(event: KeyboardEvent) {
     const currentHeight = height;
-    if (expanded && (event.key === "ArrowUp" || event.key === "ArrowDown")) expanded = false;
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      interfaceStore.setTerminalDockHeight(currentHeight + TERMINAL_DOCK_RESIZE_STEP);
-    } else if (event.key === "ArrowDown") {
-      event.preventDefault();
-      interfaceStore.setTerminalDockHeight(currentHeight - TERMINAL_DOCK_RESIZE_STEP);
-    }
+    const next = nudgedPaneHeight(event.key, currentHeight, TERMINAL_DOCK_RESIZE_STEP);
+    if (next === null) return;
+    if (expanded) expanded = false;
+    event.preventDefault();
+    interfaceStore.setTerminalDockHeight(next);
   }
 
   onDestroy(() => {
@@ -345,7 +329,7 @@
     ></div>
 
     {#if hostedTabs.length === 0}
-    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 bg-surface/60 select-none">
+    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 select-none">
       <SquareTerminal size={12} class="text-accent shrink-0" />
       <span class="text-meta font-medium text-textPrimary">Terminal</span>
       <div class="flex-1"></div>

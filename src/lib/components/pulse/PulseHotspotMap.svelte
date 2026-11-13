@@ -75,7 +75,7 @@
 
 <div class="gp-card p-4 flex flex-col gap-4">
   <!-- Header & risk summary -->
-  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+  <div class="flex flex-col @xl:flex-row @xl:items-center justify-between gap-3">
     <div class="min-w-0">
       <div class="flex items-center gap-2">
         <Flame size={18} class="text-warn" />

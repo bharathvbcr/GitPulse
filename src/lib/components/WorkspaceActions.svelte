@@ -197,16 +197,17 @@
         {/if}
       </div>
     {:else}
+      <!-- Icon only, at every width: the tooltip says what it does and the
+           accessible name stays "Fetch all", so the tab strip keeps the room. -->
       <button
         type="button"
-        class="gp-btn"
-        data-size="sm"
+        class="gp-icon-btn shrink-0"
         onclick={() => void run("fetch")}
-        title="Fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
+        title="Fetch all: fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
         aria-label="Fetch all"
       >
-        <CloudDownload size={11} />
-        <span class="max-[1099px]:sr-only">Fetch all</span>
+        <CloudDownload size={14} aria-hidden="true" />
+        <span class="sr-only">Fetch all</span>
       </button>
     {/if}
 

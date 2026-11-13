@@ -116,7 +116,7 @@
       <PulseStaleNotice {error} {measuredAt} />
     {/if}
     <!-- Headline half-life card -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-3 rounded-lg bg-surfaceHover/40">
+    <div class="flex flex-col @xl:flex-row @xl:items-center justify-between gap-4 p-3 rounded-lg bg-surfaceHover/40">
       <div>
         <span class="gp-label">Repository code half-life</span>
         <div class="flex items-baseline gap-2 mt-1">
@@ -146,7 +146,7 @@
       </div>
 
       <!-- Cohorts legend grid -->
-      <div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-2">
+      <div class="grid grid-cols-2 @3xl:grid-cols-5 gap-2 mt-2">
         {#each cohorts as cohort (cohort.key)}
           <div class="p-2 rounded bg-surfaceHover/40">
             <div class="flex items-center gap-1.5 text-textPrimary text-xs font-semibold">

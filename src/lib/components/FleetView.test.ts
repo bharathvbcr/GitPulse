@@ -518,7 +518,7 @@ describe("FleetPulse", () => {
     const { body } = render(FleetPulsePanel, {
       props: { pulse: fleetPulse(rows), languages: fleetLanguageMix(rows), open: false },
     });
-    expect(body).toContain("Fleet Pulse");
+    expect(body).toContain("Fleet pulse");
     // The header keeps the headline count even collapsed, so folding the panel
     // away never hides what it measured.
     expect(body).toContain("commits · last 30d");

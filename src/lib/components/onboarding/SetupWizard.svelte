@@ -5,6 +5,7 @@
    */
   import { X, Download, Check, ChevronRight, Clipboard, Terminal } from "@lucide/svelte";
   import { invoke } from "../../ipc/invoke";
+  import { describeError } from "../../ui/copy/describeFailure";
   import { LAYERS } from "../../ui/layers";
   import {
     cancelInstall,
@@ -100,7 +101,7 @@
       repoStore.setTerminalOpen(true);
       copyNote = "Running in Terminal → Console.";
     } catch (e) {
-      copyNote = String(e);
+      copyNote = describeError(e, "setup-wizard");
     }
   }
 
@@ -286,7 +287,7 @@
               {#if $wizard.preset === "devmap"}
                 In-app Install uses GitPulse’s ladder (PATH, prebuilt, cargo, checkout). Copy or run the command to install from the documented scripts instead.
               {:else}
-                Analysis and full DevCouncil install in Terminal. In-app Install stays DevMap-only.
+                Analysis and full DevCouncil install in Terminal. In-app Install covers only the code map (DevMap).
               {/if}
             </p>
             <p class="font-mono text-micro text-textMuted break-all leading-snug">{installSpec.command}</p>

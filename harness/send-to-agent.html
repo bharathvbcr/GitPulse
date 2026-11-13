@@ -130,8 +130,8 @@
       scenario = { ...scenario, route: "unavailable", reason: "Claude Code has no saved conversation for this attempt." };
       type(row, "Try again");
       await wait(() => calls.previews.length === 1 && settled(row)(), "the unavailable preview");
-      check("An attempt nothing can reach says why, in the host's words", () => route(row).dataset.route === "unavailable" && route(row).textContent.includes("Cannot be sent") && q(row(), "send-to-agent-reason").textContent === scenario.reason);
-      check("…and offers no way to send", () => confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Cannot be sent");
+      check("An attempt nothing can reach says why, in the host's words", () => route(row).dataset.route === "unavailable" && route(row).textContent.includes("Can't be sent") && q(row(), "send-to-agent-reason").textContent === scenario.reason);
+      check("…and offers no way to send", () => confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Can't be sent");
       confirmBtn(row).click(); await sleep(200);
       check("…and pressing the disabled button sends nothing", () => calls.sends.length === 0);
 

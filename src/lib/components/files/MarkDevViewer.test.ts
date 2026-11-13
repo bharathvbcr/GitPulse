@@ -61,7 +61,7 @@ describe("MarkDevViewer", () => {
     // old `${repo}/${filePath}` literal would match the comment that explains
     // it, so the positive form is the honest check.)
     expect(source).toContain("openInDefaultApp(repo, filePath)");
-    expect(source).toContain("repoStore.setError(formatError(err))");
+    expect(source).toContain('repoStore.setError(describeError(err, "repo"))');
   });
 
   it("copies the source and reports a failed copy", () => {

@@ -53,6 +53,7 @@
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import FirebasePanel from "./FirebasePanel.svelte";
   import OutgoingCommitReview from "./OutgoingCommitReview.svelte";
+  import PageBody from "./PageBody.svelte";
   import IssueTaskActions from "./IssueTaskActions.svelte";
   import ReleasePublish from "./ReleasePublish.svelte";
   import { freshnessStore } from "../provenance/store";
@@ -101,6 +102,7 @@
   import { describeFailure } from "../ui/copy/describeFailure";
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import Skeleton from "./Skeleton.svelte";
   import DeliveryTimeline from "./DeliveryTimeline.svelte";
   import { crossfade } from "svelte/transition";
@@ -901,37 +903,33 @@
   }
 </script>
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs font-sans p-4 overflow-auto">
-  <div class="flex items-start justify-between gap-3 mb-3">
-    <div class="min-w-0">
-      <h2 class="flex items-center gap-2 text-sm font-semibold text-textPrimary min-w-0">
-        <FolderGit2 size={16} class="text-accent shrink-0" />
-        Remote
-        {#if ctx?.owner}
-          {#if ctx.html_url}
-            <button
-              type="button"
-              class="text-textMuted font-mono font-normal truncate hover:text-accent"
-              onclick={() => ctx && openExternal(ctx.html_url)}
-              title="Open {ctx.owner}/{ctx.repo} on GitHub"
-            >
-              {ctx.owner}/{ctx.repo}
-            </button>
-          {:else}
-            <span class="text-textMuted font-mono font-normal truncate">{ctx.owner}/{ctx.repo}</span>
-          {/if}
+<div class="flex-1 flex flex-col bg-background h-full text-xs font-sans">
+  <PageHeader title="Remote">
+    {#snippet meta()}
+      {#if ctx?.owner}
+        {#if ctx.html_url}
+          <button
+            type="button"
+            class="text-meta text-textMuted font-mono truncate hover:text-accent"
+            onclick={() => ctx && openExternal(ctx.html_url)}
+            title="Open {ctx.owner}/{ctx.repo} on GitHub"
+          >
+            {ctx.owner}/{ctx.repo}
+          </button>
+        {:else}
+          <span class="text-meta text-textMuted font-mono truncate">{ctx.owner}/{ctx.repo}</span>
         {/if}
-      </h2>
+      {/if}
       <!-- How old what is on screen is. A listing carrying no timestamp reads
            as current however long it has been sitting there. -->
       {#if fetchedAgo}
-        <p class="mt-1 text-micro text-textMuted font-mono">fetched {fetchedAgo}</p>
+        <span class="text-micro text-textMuted font-mono">fetched {fetchedAgo}</span>
       {/if}
       {#if backgroundError}
-        <p class="mt-1 text-meta text-warn" role="status">{backgroundError}</p>
+        <span class="min-w-0 truncate text-meta text-warn" role="status" title={backgroundError}>{backgroundError}</span>
       {/if}
-    </div>
-    <div class="flex flex-wrap items-center justify-end gap-1.5 shrink-0">
+    {/snippet}
+    {#snippet actions()}
       {#if prCreateUrl}
         <button
           type="button"
@@ -969,19 +967,20 @@
           Refresh
         </span>
       </button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
+  <PageBody>
   <!-- The local pipeline's own result. It used to be a full-width banner at
        the top of the page that pushed every listing down and could not be put
        away; it is a card the reader folds up or dismisses when done with it. -->
   {#if ciRunning}
-    <div class="mb-3 p-3 rounded-xl border border-edge bg-surface text-textMuted text-xs max-w-xl">
+    <div class="p-3 rounded-xl border border-edge bg-surface text-textMuted text-xs">
       Running this repository's CI pipeline locally (type-check, tests, build, fmt, clippy, cargo test)…
     </div>
   {:else if ciError}
-    <div class="gp-notice mb-3! max-w-xl" data-tone="danger" role="alert">{ciError}</div>
+    <div class="gp-notice" data-tone="danger" role="alert">{ciError}</div>
   {:else if ciReport}
-    <div class="mb-3 rounded-xl border border-edge bg-surface max-w-4xl">
+    <div class="rounded-xl border border-edge bg-surface">
       <div class="flex items-center justify-between gap-3 px-3 pt-3 {ciReportOpen ? 'pb-1' : 'pb-1'}">
         <button
           type="button"
@@ -1033,7 +1032,7 @@
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="{ciStepClass(step.status)} shrink-0 w-14">{step.status}</span>
                   <span class="truncate text-textPrimary">{step.name}</span>
-                  <span class="truncate font-mono text-micro text-textMuted hidden md:inline">{step.command}</span>
+                  <span class="truncate font-mono text-micro text-textMuted hidden @2xl:inline">{step.command}</span>
                 </span>
                 <span class="shrink-0 text-meta text-textMuted font-mono">{(step.duration_ms / 1000).toFixed(1)}s</span>
               </summary>
@@ -1075,14 +1074,14 @@
   <OutgoingCommitReview />
 
   {#if (loading && !ctx) || (workflowsLoading && !workflows)}
-    <div class="space-y-4 max-w-4xl">
+    <div class="space-y-4">
       <Skeleton variant="card" count={2} />
       <div class="space-y-2 pt-2">
         <Skeleton variant="text" count={4} height="2.5rem" />
       </div>
     </div>
   {:else if ctx?.error}
-    <div class="gp-notice max-w-xl" data-tone="unknown" role="status">
+    <div class="gp-notice" data-tone="unknown" role="status">
       <div class="min-w-0 flex-1">
         <div>Couldn't read the remote.</div>
         <div>{ctx.error}</div>
@@ -1100,7 +1099,7 @@
     {@const c = ctx}
     {#if actionNotice || actionError}
       <div
-        class="gp-notice mb-4! max-w-3xl flex-col! gap-0!"
+        class="gp-notice flex-col! gap-0!"
         data-tone={actionError ? "danger" : "ok"}
       >
         <!-- Both when both are true: a merge that went through and a reload that
@@ -1110,7 +1109,7 @@
       </div>
     {/if}
     {#if (ctx.warnings?.length ?? 0) > 0}
-      <div class="gp-notice mb-4! max-w-3xl flex-col! gap-1!" data-tone="warn">
+      <div class="gp-notice flex-col! gap-1!" data-tone="warn">
         {#each ctx.warnings as warning}
           <div>{warning}</div>
         {/each}
@@ -1123,8 +1122,8 @@
          the runs they produce by a row. The pull requests, which are what a
          reader acts on, get the wide column; everything about CI sits
          together in the rail. -->
-    <div class="grid grid-cols-1 xl:grid-cols-3 gap-5 items-start">
-      <div class="xl:col-span-2 space-y-5 min-w-0">
+    <div class="grid grid-cols-1 @4xl:grid-cols-3 gap-5 items-start">
+      <div class="@4xl:col-span-2 space-y-5 min-w-0">
         <section>
           <div class="flex items-center justify-between gap-3 mb-2">
             <h3 class="gp-label">Open pull requests</h3>
@@ -1358,7 +1357,7 @@
               action={{ label: "Clear filter", onClick: () => (issueQuery = "") }}
             />
           {:else}
-            <div class="grid gap-2 md:grid-cols-2">
+            <div class="grid gap-2 @2xl:grid-cols-2">
               {#each visibleIssues as issue (issue.number)}
                 <div class="gp-card p-3.5 flex items-start justify-between gap-3 transition-colors hover:border-accent/35">
                   <div class="min-w-0">
@@ -1741,4 +1740,5 @@
       </div>
     </div>
   {/if}
+  </PageBody>
 </div>

@@ -133,7 +133,7 @@ export interface WorkbenchError {
 }
 
 export const ATTENTION_TITLES = {
-  run_exited: "Coding agent exited", run_failed: "Coding agent failed to start",
+  run_exited: "Coding agent exited", run_failed: "Coding agent couldn't start",
   run_exit_failed: "Coding agent exited with an error",
   run_unresolved: "Coding agent outcome needs attention",
   enhancement_ready: "Task enhancement ready to review", enhancement_failed: "Task enhancement failed",
@@ -142,7 +142,7 @@ export const ATTENTION_TITLES = {
   // A host watcher's CI result on an agent's branch (dc-store `signals.record`). They are `run` targets with a
   // `run_` kind because every reader holds the closed set run|enhancement|decision and requires the prefix.
   run_ci_passed: "Coding agent branch passed CI", run_ci_failed: "Coding agent branch failed CI",
-  run_ci_cancelled: "Coding agent branch CI was cancelled",
+  run_ci_cancelled: "Coding agent branch CI was canceled",
 } as const;
 /** Where a CI result was observed. */
 export const CI_SOURCES = ["github", "ci_local"] as const;

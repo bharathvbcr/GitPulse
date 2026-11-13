@@ -178,7 +178,7 @@ export function evidenceTitle(evidence: string): string {
   if (evidence === "body_changed")
     return "The commit changed the body of a symbol the symptom reaches.";
   if (evidence === "moved_only")
-    return "The commit moved these lines without changing the body — a reformat or a move, not a behaviour change on its own.";
+    return "The commit moved these lines without changing the body — a reformat or a move, not a behavior change on its own.";
   return "Whether the body changed couldn't be established. Not the same as unchanged.";
 }
 

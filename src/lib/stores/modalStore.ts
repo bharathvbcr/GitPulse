@@ -1,4 +1,5 @@
 import { get, writable } from "svelte/store";
+import { describeError } from "../ui/copy/describeFailure";
 
 export interface PromptBaseOptions {
   title: string;
@@ -114,7 +115,7 @@ export function completePrompt(value: string | boolean | null): void {
     try {
       problem = current.options.validate?.(value) ?? null;
     } catch (err: unknown) {
-      problem = `This answer couldn't be checked: ${err instanceof Error ? err.message : String(err)}`;
+      problem = `This answer couldn't be checked: ${describeError(err, "modal")}`;
     }
     if (problem !== null) {
       promptError.set(problem);

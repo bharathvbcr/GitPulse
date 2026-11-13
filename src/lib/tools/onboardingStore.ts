@@ -27,6 +27,7 @@ import {
 
 import type { DevcouncilPreset } from "./devcouncilInstall";
 import { formatError } from "../ui/formatError";
+import { describeError } from "../ui/copy/describeFailure";
 
 export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "done";
 
@@ -102,7 +103,7 @@ export async function refreshToolsStatus(): Promise<ToolsStatus | null> {
     loadError.set(null);
     return next;
   } catch (e) {
-    loadError.set(String(e));
+    loadError.set(describeError(e, "setup"));
     return null;
   }
 }
@@ -113,7 +114,7 @@ export async function refreshToolConfig(): Promise<ToolConfigView | null> {
     config.set(next);
     return next;
   } catch (e) {
-    loadError.set(String(e));
+    loadError.set(describeError(e, "setup"));
     return null;
   }
 }
@@ -178,7 +179,7 @@ async function loadLadderAndPreflight(tool: ExternalTool) {
     if (ticket !== ladderTicket) return;
     preflight.set(nextPreflight);
   } catch (e) {
-    if (ticket === ladderTicket) loadError.set(String(e));
+    if (ticket === ladderTicket) loadError.set(describeError(e, "setup"));
   }
 }
 
@@ -219,10 +220,10 @@ export async function runInstall(tool: ExternalTool, rung?: InstallRung | null) 
       command: "",
       exit_code: null,
       stdout: "",
-      stderr: String(e),
+      stderr: describeError(e, "setup"),
       timed_out: false,
       cancelled: false,
-      reason: String(e),
+      reason: describeError(e, "setup"),
     });
   } finally {
     installing.set(null);

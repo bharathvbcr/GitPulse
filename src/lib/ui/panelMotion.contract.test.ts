@@ -40,7 +40,7 @@ describe("lane D motion vocabulary in app.css", () => {
       expect(frames, name).not.toMatch(/\b(width|height|margin|padding|top|left|bottom|filter|box-shadow|backdrop-filter)\s*:/);
     }
     expect(css).toContain("animation: gp-dock-slide-in var(--gp-dur-slow)");
-    expect(css).toContain("animation: gp-dock-slide-out var(--gp-dock-exit-ms, 70ms)");
+    expect(css).toContain("animation: gp-dock-slide-out var(--gp-dock-exit-ms, var(--gp-dur-instant))");
     expect(css).toContain("animation: gp-dock-in var(--gp-dur-base)");
   });
 });

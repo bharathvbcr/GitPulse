@@ -144,7 +144,9 @@ const option=(label)=>[...(toggle()?.querySelectorAll("button")??[])].find(b=>b.
 const table=()=>preview.querySelector("table");
 const entry=(selector)=>[...preview.querySelectorAll("tbody tr")].find(r=>r.textContent.includes(selector));
 const inspect=(selector)=>entry(selector)?.querySelector('button[aria-label^="Inspect"]');
-const details=()=>preview.querySelector(".h-64");
+// The commit details pane is resizable, so its height is inline rather than a
+// class; it is found by its own hook.
+const details=()=>preview.querySelector("[data-commit-pane]");
 const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
 const symptomField=()=>preview.querySelector('input[aria-label="Symptom symbol"]');
 // The commit filter is the view bar's search field (42689867), which Graph's
@@ -275,8 +277,7 @@ const type=(input,value)=>{input.value=value;input.dispatchEvent(new Event("inpu
  const hadFilter=Boolean(filterField());
  option("Suspects").click();
  await until(()=>symptomField()&&preview.querySelector('[aria-label="Regression suspects"]'),"suspects question and its lazy list");
- check("the suspects question replaces the commit filter: the view bar's field stops filtering commits",()=>hadFilter&&!filterField()&&get(repoStore).historyList==="suspects");
- check("before a run the list asks its question rather than claiming no suspects",()=>text().includes("Which commit broke it?")&&!text().includes("Nothing in the cone"));
+ check("the suspects question replaces the commit filter: the view bar's field stops filtering commits",()=>hadFilter&&!filterField()&&get(repoStore).historyList==="suspects"); check("before a run the list asks its question rather than claiming no suspects",()=>text().includes("Which commit broke it?")&&!text().includes("Nothing in the cone"));
  check("the details pane stays under the suspects list",()=>details()&&details().textContent.includes(ORPHAN.slice(0,8)));
  type(symptomField(),"parser::parse");
  await tick();

@@ -10,6 +10,7 @@ import { resetForegroundFocus } from "../../runtime/foreground";
 import type { FilterState } from "../filterStore";
 import { interfaceStore } from "../interfaceStore";
 import { diagnostics } from "../../diagnostics/diagnostics";
+import { INTERNAL_ERROR_COPY } from "../../ui/copy/describeFailure";
 import { promptState, completePrompt, cancelPrompt } from "../modalStore";
 import { autoInit } from "../../codeintel/autoInit";
 import * as workspaceSync from "../../codeintel/workspaceSync";
@@ -642,6 +643,19 @@ describe("repoStore.setError", () => {
     expect(spy).toHaveBeenNthCalledWith(1, "repo", "boom");
     expect(spy).toHaveBeenNthCalledWith(2, "repo", "boom");
     expect(get(store).error).toBe("boom");
+  });
+});
+
+describe("repoStore.setError and the internal-error sentence", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("shows the internal-error sentence but does not log it as a fault of its own", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    const spy = vi.spyOn(diagnostics, "error");
+    store.setError(INTERNAL_ERROR_COPY);
+    expect(get(store).error).toBe(INTERNAL_ERROR_COPY);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 

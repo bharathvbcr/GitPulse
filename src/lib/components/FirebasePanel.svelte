@@ -532,7 +532,7 @@
 {#snippet qualification(walkIncomplete: string, what: string)}
   {@const folded = summarizeWalkIncomplete([walkIncomplete]) ?? walkIncomplete}
   {@const lead = firstClause(walkIncomplete)}
-  <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
+  <div class="gp-notice mb-2 text-meta" data-tone="warn">
     <div class="min-w-0 flex-1">
       <span class="font-medium">{what} is incomplete</span>
       {#if lead}<span class="opacity-90"> — {lead}</span>{/if}
@@ -585,11 +585,11 @@
       <!-- Amber: a missing CLI is a configuration gap, not a fault. The reason
            distinguishes "not installed" from "installed where a windowed launch
            cannot see it", because those have different remedies. -->
-      <div class="gp-notice max-w-xl" data-tone="warn">
+      <div class="gp-notice" data-tone="warn">
         {status.cli.reason ?? "The Firebase CLI is not available."}
       </div>
     {:else if status.projects.length === 0}
-      <div class="gp-notice max-w-xl" data-tone="warn">
+      <div class="gp-notice" data-tone="warn">
         No project alias is configured in .firebaserc, so there is nothing to query.
       </div>
     {:else}
@@ -597,7 +597,7 @@
         <!-- `.firebaserc` is repository content, so its alias count is not
              ours to assume. A capped picker that looks complete would hide the
              very project the reader came to select. -->
-        <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
+        <div class="gp-notice mb-2 text-meta" data-tone="warn">
           .firebaserc names more project aliases than are listed here. This is not complete
           coverage of the file.
         </div>
@@ -608,7 +608,7 @@
              this checkout is wired to deploy to them, and the backends listing
              below still answers. Said plainly so an empty listing is not read as
              a broken panel. -->
-        <div class="mb-2 text-meta text-textMuted max-w-xl">
+        <div class="gp-prose mb-2 text-meta text-textMuted">
           firebase.json carries no <span class="font-mono">apphosting</span> key, so this
           checkout is not configured to deploy to App Hosting. Backends that already exist
           on the project are still listed below.
@@ -684,7 +684,7 @@
       <!-- Said before either button is pressed, not after. The CLI enables the
            App Hosting API when it is off, and that is a change to the user's
            Google Cloud project, not a read. -->
-      <p class="mb-3 text-meta text-textMuted max-w-xl">
+      <p class="gp-prose mb-3 text-meta text-textMuted">
         Listing backends or rollouts runs the Firebase CLI as your signed-in Google account.
         If the App Hosting API is not enabled on
         <span class="font-mono">{selectedProjectId || "the project"}</span>,
@@ -695,17 +695,17 @@
         <!-- Amber, and never silence. Without this the panel would simply have
              no rollout button and no reason, which reads as a feature nobody
              built rather than one this CLI does not expose. -->
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           {rolloutListing.reason ?? "This Firebase CLI does not expose rollout listing."}
         </div>
       {/if}
 
       {#if backendsError}
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           Backend listing unavailable: {backendsError}
         </div>
       {:else if backends && !backends.checked}
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           Backend listing did not run: {backends.error ?? "no reason was reported"}
         </div>
       {:else if backendsLoading && !backends}
@@ -732,14 +732,14 @@
       {/if}
 
       {#if rolloutsError}
-        <div class="gp-notice max-w-xl" data-tone="warn">
+        <div class="gp-notice" data-tone="warn">
           Rollout listing unavailable: {rolloutsError}
         </div>
       {:else if rollouts && !rollouts.checked}
         <!-- `checked` is what separates "we could not ask" from "we asked and
              this backend has never deployed". Only the second may render as an
              empty listing. -->
-        <div class="gp-notice max-w-xl" data-tone="unknown">
+        <div class="gp-notice" data-tone="unknown">
           <div class="min-w-0 flex-1">Rollout listing did not run: {rollouts.error ?? "no reason was reported"}</div>
           <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={rolloutsLoading} onclick={() => void loadRollouts()}>Rescan</button>
         </div>
@@ -910,13 +910,13 @@
           {#if deployProblem && deploySha.trim().length > 0}
             <!-- The reason, not just a disabled button: an unexplained refusal
                  is the kind people work around by pasting something else. -->
-            <p class="mt-2 text-meta text-warn max-w-xl">
+            <p class="gp-prose mt-2 text-meta text-warn">
               {deployProblem}
             </p>
           {/if}
 
           {#if deployArmed}
-            <div class="gp-notice mt-2 max-w-xl text-meta" data-tone="danger">
+            <div class="gp-notice mt-2 text-meta" data-tone="danger">
               <div class="min-w-0 flex-1">
                 This starts a build of <span class="font-mono">{shortSha(deploySha.trim())}</span>
                 and moves production traffic on
@@ -930,11 +930,11 @@
           {/if}
 
           {#if deployError}
-            <div class="gp-notice mt-2 max-w-xl" data-tone="danger">
+            <div class="gp-notice mt-2" data-tone="danger">
               Rollout was not created: {deployError}
             </div>
           {:else if deployOutcome}
-            <div class="gp-notice mt-2 max-w-xl" data-tone="ok">
+            <div class="gp-notice mt-2" data-tone="ok">
               <div class="min-w-0 flex-1">
                 Rollout started for <span class="font-mono">{shortSha(deployOutcome.git_commit)}</span>
                 on <span class="font-mono">{deployOutcome.backend_id}</span>.

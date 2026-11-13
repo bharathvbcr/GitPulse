@@ -135,7 +135,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
   import { themeStore } from "../stores/themeStore";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
   import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
   import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
@@ -409,9 +409,9 @@
       if (onOpenSnippetSplit?.(artifact.title, artifact.content)) {
         return;
       }
-      warning = "Could not open agent plan beside this terminal.";
+      warning = "Couldn't open the agent plan beside this terminal.";
     } catch (err) {
-      warning = `Could not open agent plan: ${formatError(err)}`;
+      warning = `Couldn't open the agent plan: ${describeError(err, "terminal")}`;
     }
   }
 
@@ -533,13 +533,13 @@
           await terminalLaunchRequests.requestBrowser(repoPath, resolved.url);
           return;
         } catch (err) {
-          warning = `${resolved.url} opened in your browser: a browser session couldn't (${formatError(err)}).`;
+          warning = `${resolved.url} opened in your browser: a browser session couldn't (${describeError(err, "terminal")}).`;
         }
       }
       try {
         await openExternal(resolved.url);
       } catch (err) {
-        warning = `Couldn't open ${resolved.url}. ${formatError(err)}`;
+        warning = `Couldn't open ${resolved.url}. ${describeError(err, "terminal")}`;
       }
       return;
     }
@@ -865,7 +865,7 @@
    */
   const acks = createAckCoalescer((sessionId, bytes) => {
     void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
-      if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
+      if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${describeError(err, "terminal")}`, true);
     });
   });
 
@@ -888,7 +888,7 @@
       term.write(bytes, written);
     },
     onError(err) {
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     },
   });
 
@@ -904,7 +904,7 @@
       rafWrites.enqueue(bytes, written);
     },
     onError(err) {
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     },
   });
 
@@ -920,7 +920,7 @@
       });
     } catch (err) {
       acknowledgeOutput(token.sessionId, token.release());
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     }
   }
 
@@ -1356,7 +1356,7 @@
     else if (status === "starting") noteAttempt(runId, "starting", `Starting ${launcherLabel(launcher)}…`);
     else if (status === "error" && !nativeSessionId) {
       // The lifecycle stringifies the rejection; its "Error: " says nothing.
-      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "The terminal failed to start.";
+      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "Couldn't start the terminal.";
       queueMicrotask(() => {
         if (nativeSessionId || get(terminalSessions).some((record) => record.key === tabId)) return;
         noteAttempt(runId, "failed", cause);
@@ -1426,7 +1426,7 @@
     try {
       await openTaskForRun(linkedRunId);
     } catch (cause) {
-      toastStore.error(`This attempt's task couldn't be opened: ${formatError(cause)}`);
+      toastStore.error(`This attempt's task couldn't be opened: ${describeError(cause, "terminal")}`);
     }
   }
 
@@ -1468,13 +1468,13 @@
       return false;
     }
     const ok = await copyText(last.output);
-    warning = ok ? null : "Could not copy last command output.";
+    warning = ok ? null : "Couldn't copy the last command output.";
     return ok;
   }
 
   export async function exportOutput() {
     try { await invoke<boolean>("cmd_terminal_export", { data: retainedOutput() }); }
-    catch (err) { if (!disposed) warning = formatError(err); }
+    catch (err) { if (!disposed) warning = describeError(err, "terminal"); }
   }
 
   export function serializeVisualOutput(): string {
@@ -1730,7 +1730,7 @@
           insertText(formatted, { focus: true });
         })
         .catch((err) => {
-          if (!disposed) warning = `Could not paste clipboard image: ${formatError(err)}`;
+          if (!disposed) warning = `Couldn't paste the clipboard image: ${describeError(err, "terminal")}`;
         });
     };
     /**
@@ -2233,7 +2233,7 @@
         // 5s (e.g. a modal was open), keep manual [Deliver] on screen.
       }, 5_000);
     } catch (err: unknown) {
-      if (!fromAutoWake && !disposed) warning = formatError(err);
+      if (!fromAutoWake && !disposed) warning = describeError(err, "terminal");
     } finally {
       peerDelivering = false;
     }
@@ -2494,7 +2494,7 @@
          the height go (inline style beats h-8); every other row stays fixed. -->
     <div
       data-terminal-status
-      class="shrink-0 min-w-0 bg-surface/60 flex items-center gap-2 px-4 h-8"
+      class="shrink-0 min-w-0 flex items-center gap-2 px-4 h-8"
       style:height={error && !spawning ? "auto" : undefined}
       style:min-height={error && !spawning ? "2rem" : undefined}
       style:padding-block={error && !spawning ? "0.25rem" : undefined}

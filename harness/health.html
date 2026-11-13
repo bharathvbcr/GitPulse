@@ -235,7 +235,7 @@
       const button = name => [...root.querySelectorAll("button")]
         .find(node => (node.getAttribute("aria-label") || node.textContent.trim()).includes(name));
       const section = id => root.querySelector(`[data-health-section="${id}"]`);
-      const scroller = () => root.querySelector(".overflow-auto");
+      const scroller = () => root.querySelector("[data-page-body]");
       const header = () => root.querySelector(".gp-header");
       const agentBar = () => root.querySelector('[aria-label="Send a health task to a coding agent"]');
       const rescan = async next => {

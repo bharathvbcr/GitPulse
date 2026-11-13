@@ -90,7 +90,6 @@
   await settle();
 
   const pane = () => $("#pane");
-  const row = () => $("#row");
   const sidebar = () => $("aside.gp-sidebar");
   const panel = () => $("[data-sidebar-panel]");
   const rail = () => $("[data-sidebar-rail-slot]");
@@ -207,6 +206,9 @@
       return sidebar().getAnimations().length === 0 && layout.length === 0;
     });
     check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
+    // The workspace beside the 44 px rail, gutters included: an open overlay
+    // panel must leave it exactly this wide.
+    const railPaneWidth = width(pane());
     clickBtn('button[aria-label="Expand sidebar"]');
     await tick();
     const expand = await traceToggle();
@@ -223,7 +225,7 @@
     check("the mode toggle persists overlay", () => get(panelModes).sidebar === "overlay");
     check("overlay keeps a 44 px rail in the column and floats the panel", () => !!rail() && Math.round(width(rail())) === 44 && !!panel());
     const overlayPaneWidth = width(pane());
-    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - (width(row()) - 44)) < 2);
+    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - railPaneWidth) < 2);
     check("the panel floats over the workspace and wins the hit test", () => {
       const p = panel().getBoundingClientRect();
       const hit = document.elementFromPoint(p.left + p.width / 2, p.top + p.height / 2);

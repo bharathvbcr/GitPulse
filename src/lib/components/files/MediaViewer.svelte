@@ -8,7 +8,7 @@
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
   import type { LineEnding } from "../../files/types";
-  import { formatError } from "../../ui/formatError";
+  import { describeError } from "../../ui/copy/describeFailure";
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
   import CodeViewer from "./CodeViewer.svelte";
   import LazyMount from "../LazyMount.svelte";
@@ -94,7 +94,7 @@
     const repo = effectiveRepoPath;
     if (!repo) return;
     void openInDefaultApp(repo, filePath).catch((err) =>
-      repoStore.setError(formatError(err)),
+      repoStore.setError(describeError(err, "repo")),
     );
   }
 </script>
@@ -103,7 +103,7 @@
   <!-- Image Viewer Surface -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-none">
     <!-- Image Top Bar Controls -->
-    <div class="relative shrink-0 bg-surface/70 select-none" data-tip-place="above">
+    <div class="relative shrink-0 select-none" data-tip-place="above">
       <div bind:this={imageBar} class="gp-header-scroll">
         <div class="flex items-center justify-between gap-2 px-3 py-2 min-w-max w-full">
       <div class="flex items-center gap-2 shrink-0">
@@ -200,7 +200,7 @@
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text">
-    <div class="relative shrink-0 bg-surface/70 select-none" data-tip-place="above">
+    <div class="relative shrink-0 select-none" data-tip-place="above">
       <div bind:this={binaryBar} class="gp-header-scroll">
         <div class="flex items-center justify-between gap-2 px-3 py-2 min-w-max w-full">
       <div class="flex items-center gap-2 shrink-0">

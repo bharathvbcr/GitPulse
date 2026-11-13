@@ -387,7 +387,7 @@
 {#snippet expanded()}
     <!-- Repository header. Opening another repository is the title bar's
          "Open" (decision D3, HEADER_SPEC §9): the sidebar no longer repeats it. -->
-    <div class="p-3 flex items-center justify-between bg-surfaceHover/30 gap-1">
+    <div class="p-3 flex items-center justify-between gap-1">
       <div class="flex items-center gap-2 truncate">
         <FolderGit2 size={15} class="text-accent shrink-0" />
         <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No repository"}>

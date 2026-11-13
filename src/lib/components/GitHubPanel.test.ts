@@ -21,10 +21,11 @@ describe("GitHubPanel", () => {
   it("renders header and action buttons", () => {
     const { body } = render(GitHubPanel);
     // The heading names the section the reader clicked. Which forge this is
-    // stays legible from the mark and the owner/repo link beside it, both of
-    // which need a context this render has not got.
+    // stays legible from the owner/repo link beside it, which needs a context
+    // this render has not got. The bar is the shared PageHeader, which carries
+    // no icon on any page, so the mark is no longer asserted here.
     expect(body).toContain("Remote");
-    expect(body).toContain("lucide-folder-git-2");
+    expect(body).toContain("data-page-header");
     expect(body).toContain("Run CI locally");
     expect(body).toContain("Refresh");
   });

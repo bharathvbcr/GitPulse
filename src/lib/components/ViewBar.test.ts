@@ -56,14 +56,26 @@ describe("ViewBar", () => {
     expect(source).toContain("interfaceStore.setAgentsOpen(true);");
   });
 
+  /** The opening tags of the repository-only groups, in source order. */
+  const repoOnlyTags = (body: string) => body.match(/<div\b[^>]*data-viewbar-repo-only[^>]*>/g) ?? [];
+
   it("keeps every control live on the repository surface, with no surface name", () => {
     const body = bar();
     expect(body).not.toContain("data-viewbar-surface");
-    expect(body).not.toMatch(/data-viewbar-controls[^>]*\binert\b/);
-    expect(body).not.toContain("invisible");
+    const groups = repoOnlyTags(body);
+    expect(groups).toHaveLength(3);
+    for (const tag of groups) {
+      expect(tag).not.toMatch(/\binert\b/);
+      expect(tag).not.toMatch(/\shidden(=|\s|>)/);
+    }
+    expect(body).toContain('data-page-search="palette"');
+    expect(body).toContain("Search this repository");
   });
 
-  it("under a global surface stays mounted, its controls inert and hidden, the surface named", () => {
+  // Rewritten: this pinned that under Fleet, Agents and Tasks the WHOLE row
+  // was inert and invisible. Now only the repository-only groups are; the
+  // search field stays live as the repository palette.
+  it("under a global surface stays mounted, its repository-only controls inert and hidden, the surface named, the search field live", () => {
     for (const [surface, label] of [["fleet", "Fleet"], ["agents", "Agents"], ["tasks", "Tasks"]] as const) {
       interfaceStore.setGlobalSurface(surface);
       const body = bar();
@@ -71,9 +83,30 @@ describe("ViewBar", () => {
       expect(body).toContain('aria-label="Views"');
       expect(body).toContain("data-viewbar-controls");
       expect(body).toMatch(new RegExp(`data-viewbar-surface="${surface}"[^>]*>${label}<`));
-      expect(/<div\b[^>]*data-viewbar-controls[^>]*>/.exec(body)?.[0]).toMatch(/\binert\b/);
-      expect(/<div\b[^>]*data-viewbar-controls[^>]*>/.exec(body)?.[0]).toContain("invisible");
+      const row = /<div\b[^>]*data-viewbar-controls[^>]*>/.exec(body)?.[0] ?? "";
+      expect(row).not.toMatch(/\binert\b/);
+      expect(row).not.toContain("invisible");
+      const groups = repoOnlyTags(body);
+      expect(groups).toHaveLength(3);
+      for (const tag of groups) {
+        expect(tag).toMatch(/\binert\b/);
+        expect(tag).toMatch(/\shidden(=|\s|>)/);
+      }
+      // The field is outside every hidden group, and it is the palette,
+      // whatever page the last active tab was on.
+      expect(body).toContain('id="gitpulse-page-search"');
+      expect(body).toContain('data-page-search="palette"');
+      expect(body.indexOf("data-viewbar-repo-only")).toBeLessThan(body.indexOf('id="gitpulse-page-search"'));
+      // It names the repository it searches.
+      expect(body).toContain("Search view-bar: commands, / files, @ branches, # commits");
+      expect(body).toContain('aria-label="Search view-bar"');
     }
+  });
+
+  it("fades only the repository-only groups, and does not fade the field", () => {
+    expect(source).toContain("data-viewbar-repo-only");
+    expect(source).toContain("swapRow(el, show");
+    expect(source).not.toMatch(/swapRow\(controls/);
   });
 
   it("is not rendered by App on the welcome screen", () => {

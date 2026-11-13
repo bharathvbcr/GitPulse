@@ -51,6 +51,7 @@ import type { BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { initializeDevcouncil } from "./client";
 import type { InitReport } from "./types";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** Coalesce the scope churn of a tab switch before touching the filesystem. */
 export const AUTO_INIT_DEBOUNCE_MS = 250;
@@ -229,7 +230,7 @@ export function createAutoInit(opts?: {
         }
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = describeError(error, "code-map");
       // Do not record the signature: a failure must be retried when the scope
       // next changes rather than remembered as done.
       patch(activeKey, { error: message, running: false });

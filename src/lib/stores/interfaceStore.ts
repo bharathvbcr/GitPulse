@@ -30,6 +30,7 @@ import {
   clampTerminalDockHeight,
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
+import { clampPaneHeight, COMMIT_PANE_BOUNDS } from "../ui/paneHeight";
 import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
 import {
   APPEARANCE_DEFAULTS,
@@ -319,6 +320,8 @@ export interface InterfacePrefs extends AppearancePrefs {
    */
   /** Dock height in CSS pixels, clamped on read; the user drags to resize. */
   terminalDockHeight: number;
+  /** Commit details pane height in CSS pixels, clamped on read; the user drags to resize. */
+  commitPaneHeight: number;
   terminalFontSize: number;
   /**
    * Rows of history a shell terminal keeps, and the (smaller) amount an agent
@@ -481,6 +484,7 @@ const DEFAULTS: InterfacePrefs = {
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
+  commitPaneHeight: COMMIT_PANE_BOUNDS.fallback,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
   terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
   terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
@@ -677,6 +681,11 @@ function readPrefs(): InterfacePrefs {
         typeof parsed.terminalDockHeight === "number"
           ? clampTerminalDockHeight(parsed.terminalDockHeight)
           : DEFAULTS.terminalDockHeight,
+      // Same rule as the dock height: validated on read as well as on write.
+      commitPaneHeight:
+        typeof parsed.commitPaneHeight === "number"
+          ? clampPaneHeight(parsed.commitPaneHeight, COMMIT_PANE_BOUNDS)
+          : DEFAULTS.commitPaneHeight,
       seenCoachMarks:
         parsed.seenCoachMarks && typeof parsed.seenCoachMarks === "object"
           ? parsed.seenCoachMarks
@@ -961,6 +970,8 @@ function createInterfaceStore() {
     setTerminalLauncher: (launcher: SessionKind) => patch({ terminalLauncher: SESSION_TYPES.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
+    setCommitPaneHeight: (px: number) =>
+      patch({ commitPaneHeight: clampPaneHeight(px, COMMIT_PANE_BOUNDS) }),
     setCheckForUpdates: (enabled: boolean) =>
       // Turning the check off also clears the dismissal, so re-enabling it
       // later reports honestly instead of staying silent about a version

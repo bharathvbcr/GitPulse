@@ -11,7 +11,7 @@
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import { reportPanelError } from "../diagnostics/report";
-  import { formatError } from "../ui/formatError";
+  import { formatError, formatErrorRaw } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { readBackgroundDocument } from "../runtime/foreground";
 
@@ -135,12 +135,12 @@
       alive = false;
       epoch++;
       stopTimer();
-      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", formatError(e)));
+      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", formatErrorRaw(e)));
     };
   });
 </script>
 
-<section class="gp-card space-y-4 max-w-4xl p-4" aria-label="Repository hygiene">
+<section class="gp-card space-y-4 p-4" aria-label="Repository hygiene">
   <div class="flex items-start justify-between gap-3">
     <div>
       <h3 class="flex items-center gap-2 text-sm font-semibold text-textPrimary"><ShieldCheck size={16} /> Repository hygiene</h3>

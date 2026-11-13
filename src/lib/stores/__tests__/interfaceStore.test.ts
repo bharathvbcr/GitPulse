@@ -926,6 +926,32 @@ it("reads stored terminal scrollback clamped, and ignores a corrupt one", async 
   }
 });
 
+it("persists the commit pane height clamped on set, and validates it on read", async () => {
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ commitPaneHeight: 99_999 }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    const first = (await import("../interfaceStore")).interfaceStore;
+    expect(get(first).commitPaneHeight).toBe(1600);
+    first.setCommitPaneHeight(10);
+    expect(get(first).commitPaneHeight).toBe(140);
+    first.setCommitPaneHeight(Number.NaN);
+    expect(get(first).commitPaneHeight).toBe(256);
+    first.setCommitPaneHeight(320.4);
+    first.flush();
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).commitPaneHeight).toBe(320);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ commitPaneHeight: "tall" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).commitPaneHeight).toBe(256);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("reloads terminal preferences and rejects corrupt stored values", async () => {
   const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
   const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalFontSize: 20, terminalLauncher: "manvi" }) });

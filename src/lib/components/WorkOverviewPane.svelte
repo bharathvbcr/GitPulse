@@ -86,7 +86,7 @@
          had as its own section, so resolving is unchanged; Overview follows. -->
     <section id={WORK_CONFLICTS_ID} tabindex="-1" aria-label="Conflicts" class="work-conflicts shrink-0 flex flex-col">
       {#if !live}
-        <div class="flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted">
+        <div class="flex items-center gap-2 px-4 py-1.5 text-meta text-textMuted">
           <span>Retained conflict drafts</span>
           <button type="button" class="gp-btn ml-auto" onclick={() => (reviewingDrafts = false)}>
             Hide
@@ -100,7 +100,7 @@
          the why is in Policy activity, a collapsed disclosure below the rows.
          One line and one door, only while that verdict is the latest. -->
     <div
-      class="shrink-0 flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted"
+      class="shrink-0 flex items-center gap-2 px-4 py-1.5 text-meta text-textMuted"
       data-testid="work-blocked-verdict"
       role="status"
     >
@@ -112,7 +112,7 @@
   {/if}
   {#if !showEditor && retainedDrafts > 0}
     <div
-      class="shrink-0 flex items-center gap-2 px-4 py-1.5 bg-surface/40 text-meta text-textMuted"
+      class="shrink-0 flex items-center gap-2 px-4 py-1.5 text-meta text-textMuted"
       data-testid="work-retained-drafts"
     >
       <span>
@@ -125,7 +125,7 @@
   {/if}
   <section
     aria-label="Overview"
-    class="flex flex-col {showEditor ? 'shrink-0 bg-surface/20' : 'flex-1 min-h-0'}"
+    class="flex flex-col {showEditor ? 'shrink-0' : 'flex-1 min-h-0'}"
   >
     <WorkView />
   </section>

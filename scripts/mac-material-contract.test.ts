@@ -759,11 +759,15 @@ describe("macOS material", () => {
     expect(missing).toEqual([]);
   });
 
-  it("lets native liquid blur through the status bar the same way as other chrome", () => {
+  it("draws the status bar on the window's ground, as the two top rows are", () => {
     // Same cover the Resolve pane used: a near-opaque fill (or a promoted
     // compositor layer) makes the window material look like it "did not
     // work". The status bar is chrome, so it must not grow its own CSS
-    // filter either — that is the float-tier rule above.
+    // filter either — that is the float-tier rule above. It also paints no
+    // band: `bg-surface` made it a darker strip across the foot of every page,
+    // so macOS clears the fill in a rule of its own (not `gp-repo-tabs`, which
+    // the harnesses and tests match as the top rows) and other platforms wear
+    // `bg-background`.
     const source = readFileSync(
       new URL("../src/lib/components/StatusBar.svelte", import.meta.url),
       "utf8",
@@ -771,18 +775,23 @@ describe("macOS material", () => {
     const footer = source.match(/<footer[\s\S]*?class="([^"]+)"/)?.[1];
     const tokens = footer?.split(/\s+/) ?? [];
     expect(tokens).toContain("gp-glass");
-    expect(tokens).toContain("bg-surface");
-    expect(tokens.some((token) => token.startsWith("bg-surface/"))).toBe(false);
+    expect(tokens).toContain("gp-status-bar");
+    expect(tokens).toContain("bg-background");
+    expect(tokens.some((token) => token.startsWith("bg-surface"))).toBe(false);
     expect(tokens).not.toContain("gp-gpu");
+    expect(css).toMatch(/html\.macos \.gp-glass\.gp-status-bar \{\s*background-color: transparent;\s*\}/);
+    expect(css).toMatch(/html\.macos \.gp-glass\.gp-status-bar \{\s*background-image: none;\s*box-shadow: none;\s*\}/);
   });
 
-  it("draws the sidebar and workspace as rounded cards with no gutter", () => {
+  it("floats the sidebar and workspace as rounded cards on a small gutter", () => {
     // Both panes take their margin and radius from the same two tokens, so
     // the gap between them matches the gap around them and the corners
-    // agree. The gutter is zero: any band of shell hue around the panes was
-    // reported as wasted space.
+    // agree. The gutter is what makes them float on the window's ground (with
+    // none, each card's top edge met the chrome as a line), and it stays
+    // small: a wide band of shell hue was reported as wasted space.
     const tokens = css.match(/html\.macos \{\s*--gp-pane-gutter:\s*(\d+)px;\s*--gp-pane-radius:\s*(\d+)px;/);
-    expect(Number(tokens?.[1])).toBe(0);
+    expect(Number(tokens?.[1])).toBeGreaterThan(0);
+    expect(Number(tokens?.[1])).toBeLessThanOrEqual(8);
     expect(Number(tokens?.[2])).toBeGreaterThan(0);
     const workspace = css.match(/html\.macos \.gp-workspace \{([^}]+)\}/)?.[1];
     expect(workspace).toMatch(/margin:\s*var\(--gp-pane-gutter\);/);
@@ -793,22 +802,31 @@ describe("macOS material", () => {
     expect(sidebar).toMatch(/height:\s*auto;/);
   });
 
-  it("paints the repository strip denser than shared chrome so tab labels stay readable", () => {
-    const rule = css.match(
-      /html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/,
-    );
-    expect(rule?.[1]).toMatch(/background-color:\s*rgb\(var\(--c-surface\) \/ 0\.78\)/);
+  it("draws the header rows on the window's own ground, with no fill, so the panes float under them", () => {
+    // Retired: a denser surface fill (0.78) with a drop shadow under the band.
+    // Over every page it read as a separator. The rows now paint nothing and
+    // show the shell, whose veil is denser than the workspace plate, so tab
+    // labels keep at least the page's own contrast.
+    const rule = css.match(/html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/)?.[1];
+    expect(rule).toMatch(/background-color:\s*transparent/);
+    const veil = (block: string) => Number(block.match(/--mac-shell-veil:\s*([\d.]+)/)?.[1]);
+    const plate = (block: string) => Number(block.match(/--mac-plate-fill:\s*rgb\([^/]+\/\s*calc\(([\d.]+)/)?.[1]);
+    const dark = css.slice(css.indexOf("--mac-shell-veil: 0.55") - 2000, css.indexOf("--mac-shell-veil: 0.55") + 2000);
+    expect(veil(dark)).toBeGreaterThan(plate(dark));
     const reduced = css.slice(css.indexOf("@media (prefers-reduced-transparency: reduce)"));
     expect(reduced).toMatch(
-      /html\.macos \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
+      /html\.macos \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-bg\)\)/,
     );
+    // No sheen, edge or shadow on either row: nothing marks where the chrome ends.
+    const joined = [...css.matchAll(/html\.macos \.gp-glass\.gp-repo-tabs \{([^}]+)\}/g)].map((m) => m[1]);
+    expect(joined.some((body) => /background-image:\s*none/.test(body) && /box-shadow:\s*none/.test(body))).toBe(true);
+    expect(css).not.toMatch(/\.gp-repo-tabs \+ \.gp-glass\.gp-repo-tabs/);
   });
 
-  it("gives both header rows that same dense fill, and the Reduce Transparency override keyed on the attribute", () => {
-    // The tabs moved up into the title bar, so the title bar carries the
-    // 0.78 fill (not the thin 40% chrome fill) and the view bar, which now
-    // holds 13px section labels, takes it too. One selector serves both rows,
-    // so the reduced-transparency rules below cover both with no second list.
+  it("gives both header rows that same fill, and the Reduce Transparency override keyed on the attribute", () => {
+    // One selector serves both rows (the title bar with the tabs and the view
+    // bar), so the reduced-transparency rules below cover both with no second
+    // list.
     const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
     const viewBar = readFileSync(new URL("../src/lib/components/ViewBar.svelte", import.meta.url), "utf8");
     const header = app.slice(app.indexOf("<header"), app.indexOf("<header") + 400);
@@ -816,7 +834,7 @@ describe("macOS material", () => {
     expect(viewBar).toMatch(/class="[^"]*\bgp-glass\b[^"]*\bgp-repo-tabs\b/);
     expect(viewBar).toMatch(/<nav[^>]*\bdata-viewbar\b/s);
     expect(css).toMatch(
-      /html\.macos\[data-transparency="reduced"\] \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-surface\)\)/,
+      /html\.macos\[data-transparency="reduced"\] \.gp-glass\.gp-repo-tabs \{[^}]*background-color:\s*rgb\(var\(--c-bg\)\)/,
     );
     // Neither row paints its own backdrop filter: they are always-on chrome.
     for (const source of [header, viewBar]) {

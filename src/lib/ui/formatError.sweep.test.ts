@@ -47,11 +47,19 @@ const RAW_ERROR_STRINGIFY = /\bString\(\s*(err|reason|error|e)\b/;
 // raw String(err) satisfies none of them.
 const FORMATTER_SEAM = [
   { marker: "formatError(", importNeedle: "ui/formatError" },
+  // The verbatim renderer, for text that goes to a log rather than a screen.
+  { marker: "formatErrorRaw(", importNeedle: "ui/formatError" },
   { marker: "reportPanelError(", importNeedle: "diagnostics/report" },
   { marker: "formatDiagnosticFailure(", importNeedle: "diagnostics/diagnostics" },
+  // The on-screen variant: `formatError` plain copy for a runtime fault,
+  // `formatDiagnosticFailure` for what the backend said (diagnostics/report.ts).
+  { marker: "formatDisplayFailure(", importNeedle: "diagnostics/report" },
   // User-facing failure copy: the reason is `formatError(err)`, flattened
   // and capped (ui/copy/describeFailure.ts), so it is the same seam.
   { marker: "describeFailure(", importNeedle: "ui/copy/describeFailure" },
+  // The same file's `describeError(err)`: `formatError` for what the backend
+  // said, plain copy plus a Diagnostics entry for a runtime fault.
+  { marker: "describeError(", importNeedle: "ui/copy/describeFailure" },
 ] as const;
 
 function routesThroughFormatter(source: string): boolean {

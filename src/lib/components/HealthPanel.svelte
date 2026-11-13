@@ -83,8 +83,10 @@
   import { issueNoticeTone, roleTone, severityTone, updateKindTextClass } from "./health/tone";
   import { describeFailure } from "../ui/copy/describeFailure";
   import EmptyState from "./EmptyState.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
-  import { HEALTH_CONTENT_WIDTH, HEALTH_PREVIEW_ROWS, HEALTH_PROSE_WIDTH } from "../health/sections";
+  import { HEALTH_PREVIEW_ROWS } from "../health/sections";
+  import PageBody from "./PageBody.svelte";
   import { previewSlice } from "../ui/previewList";
   import type { SecretsReport } from "../secrets/types";
   import { vulnerabilityEmptyMessage, type SectionCount } from "../health/counts";
@@ -992,7 +994,7 @@
   <!-- The local scan failed. When an earlier report of this repository is still
        on screen the banner says so, so its findings are not read as current. -->
   {#snippet scanFailureBanner()}
-    <div role="alert" class="gp-notice flex-wrap items-center justify-between {HEALTH_PROSE_WIDTH}" data-tone="danger">
+    <div role="alert" class="gp-notice flex-wrap items-center justify-between" data-tone="danger">
       <span class="min-w-0 wrap-break-word"
         ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
       >
@@ -1116,10 +1118,8 @@
     <SecretsSection bind:report={secretsReport} tone={facetTone("secrets")} onagent={sendSecretsToAgent} />
   {/snippet}
 
-  <div class="gp-header justify-between gap-3">
-    <div class="flex items-center gap-2 min-w-0">
-      <ShieldAlert size={16} class="text-accent shrink-0" />
-      <span class="font-semibold text-textPrimary shrink-0">Health</span>
+  <PageHeader title="Health">
+    {#snippet meta()}
       <!-- One verdict, from one owner, instead of the five `truncate` spans
            this row used to carry. Those rendered as "58 outd… · Dependabot 0
            … · Code scanning unav…" — the summary was unreadable at exactly
@@ -1152,8 +1152,8 @@
           · Code scanning {openCodeScanningCount}{codeScanning?.truncated ? "+" : ""}
         </span>
       {/if}
-    </div>
-    <div class="flex items-center gap-2 shrink-0">
+    {/snippet}
+    {#snippet actions()}
       <button
         type="button"
         aria-describedby="dependabot-permission-note"
@@ -1204,8 +1204,8 @@
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Scan local
       </button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   <!-- A row of its own, allowed to wrap: the header above is checked for
        clipping at 1280px and has no room for two selects and three buttons.
@@ -1215,14 +1215,14 @@
     <div
       role="group"
       aria-label="Send a health task to a coding agent"
-      class="px-4 py-1.5 bg-surface/40 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-meta"
+      class="px-4 py-1.5 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-meta"
     >
       <Terminal size={13} class="shrink-0 text-textMuted" />
       <span class="shrink-0 text-textMuted">Agent</span>
-      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40">
+      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40" data-width-cap="a single select, sized to its option labels">
         {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
       </select>
-      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44">
+      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44" data-width-cap="a single select, sized to its option labels">
         {#each HEALTH_AGENT_ACTIONS as action (action.id)}<option value={action.id}>{action.label}</option>{/each}
       </select>
       <button
@@ -1292,7 +1292,7 @@
     </div>
   {/if}
 
-  <div class="flex-1 overflow-auto p-4 space-y-5">
+  <PageBody>
     <!-- Four lines of prose about GitHub CLI permissions used to be pinned at
          the top of this scroll in every state, above every finding, forever.
          It is the button's explanation, not the page's, so it is the button's
@@ -1301,7 +1301,7 @@
          line, and the permission text is one click away rather than four
          lines of column height on every visit. -->
     <details
-      class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted {HEALTH_PROSE_WIDTH}"
+      class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted"
     >
       <!-- `role="status"` belongs on the text, not on the `<summary>`: a
            summary is an interactive disclosure control and cannot also be a
@@ -1328,13 +1328,13 @@
          visible in every state instead of shadowing (or being shadowed by) the
          load-error branch. Same shape as GitHubPanel's actionError banner. -->
     {#if actionError}
-      <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+      <div role="status" class="gp-notice" data-tone="warn">
         <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
     {#if loading && !report}
-      <div class="space-y-4 {HEALTH_CONTENT_WIDTH}">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="space-y-4">
+        <div class="grid grid-cols-1 @2xl:grid-cols-3 gap-3">
           <Skeleton variant="card" count={3} />
         </div>
         <div class="space-y-2 pt-2">
@@ -1357,7 +1357,7 @@
       {/if}
 
       {#if planError}
-        <div role="alert" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="danger">
+        <div role="alert" class="gp-notice" data-tone="danger">
           <div class="min-w-0 flex-1">
             <span class="font-medium">{PLAN_FAILED}</span>
             {planError}
@@ -1533,10 +1533,10 @@
           </div>
         {/snippet}
         {#if auditCensus}
-          <p class="text-textMuted {HEALTH_PROSE_WIDTH}" data-testid="audit-coverage">{auditCensus}.</p>
+          <p class="text-textMuted" data-testid="audit-coverage">{auditCensus}.</p>
         {/if}
         {#if !report.npm_cli_present && report.manifests.length > 0}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</div>
           </div>
         {:else if visibleVulns.length === 0}
@@ -1547,7 +1547,7 @@
           {:else}
             <!-- An audit that did not finish, or never ran, is not "none": the
                  unknown tone is drawn dashed so it cannot pass for a clean one. -->
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div role="status" class="gp-notice" data-tone="unknown">
               <div class="min-w-0 flex-1">
                 {auditsRan
                   ? `Local audit incomplete${gap ? ` (${gap})` : ""}; no all-clear is available.`
@@ -1598,7 +1598,7 @@
         {#if report.issues.length === 0}
           <EmptyState icon={ShieldCheck} title="No repository configuration issues were reported by this scan." compact />
         {:else}
-          <div class="space-y-1.5 {HEALTH_PROSE_WIDTH}">
+          <div class="space-y-1.5">
             {#each keyedList(previewed("issues", report.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
               <div class="gp-notice flex-col" data-tone={issueNoticeTone(issue.severity)}>
                 <div class="flex items-center gap-2 min-w-0 w-full">
@@ -1624,7 +1624,7 @@
           {#if report.npm_cli_present}
             <EmptyState icon={Package} title="No outdated npm packages reported." compact />
           {:else}
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div role="status" class="gp-notice" data-tone="unknown">
               <div class="min-w-0 flex-1">Outdated checks need npm on PATH.</div>
             </div>
           {/if}
@@ -1675,7 +1675,7 @@
             compact
           />
         {:else}
-          <div class="grid gap-2 md:grid-cols-2">
+          <div class="grid gap-2 @2xl:grid-cols-2">
             {#each keyedList(previewed("packages", report.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
               <!-- Grid items default to `min-width: auto`, so a long manifest
                    path widens its column instead of wrapping inside it. -->
@@ -1772,7 +1772,7 @@
             </p>
           </div>
         {:else if codegraph}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+          <div role="status" class="gp-notice" data-tone="warn">
             <div class="min-w-0 flex-1">
               No code map for this repository — impact edges, symbol search and dead-code
               detection have nothing to read.
@@ -1782,7 +1782,7 @@
             </div>
           </div>
         {:else}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Code map status has not been read for this repository.</div>
           </div>
         {/if}
@@ -1795,7 +1795,7 @@
         caveat={deadCodeCaveat}
       >
         {#if codegraph?.available && !deadSymbolsAvailable}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">
               Dead-code check couldn't run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
               That is not the same as finding no unreferenced symbols.
@@ -1803,7 +1803,7 @@
           </div>
         {:else if deadSymbolsAvailable && deadSymbols.length === 0 && !deadSymbolsIncomplete}
           {#if deadSymbolsTruncated}
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+            <div role="status" class="gp-notice" data-tone="warn">
               <div class="min-w-0 flex-1">
                 The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear.
               </div>
@@ -1838,7 +1838,7 @@
             bind:expanded={expandedLists["dead-code"]}
           />
         {:else}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">No dead-code result for this repository yet.</div>
           </div>
         {/if}
@@ -1855,5 +1855,5 @@
     {:else}
       <EmptyState icon={FolderOpen} title="Open a repository to scan dependency health" />
     {/if}
-  </div>
+  </PageBody>
 </div>

@@ -346,7 +346,7 @@
 
       // ---- where things are -----------------------------------------------------
       const sidebar = () => $("aside.gp-sidebar");
-      const statusBar = () => $('footer[aria-label="Repository Status Bar"]');
+      const statusBar = () => $('footer[aria-label="Repository status bar"]');
       const branchList = () => $('[role="tree"][aria-label="Branches"]');
       const worktreesPanel = () => {
         const label = $$("span").find((el) => el.children.length === 0 && /^Worktrees \(\d+\)$/.test(text(el)));
@@ -464,7 +464,7 @@
             // The first-run command-palette hint goes through its own dismiss
             // (the store the × button calls), and the shot waits for its exit.
             interfaceStore.dismissCoachMark("coach-palette");
-            await sleepUntil(() => !$('[role="tooltip"][aria-label="Command Palette"]'), 3000);
+            await sleepUntil(() => !$('[role="tooltip"][aria-label="Command palette"]'), 3000);
             if (words.includes("light")) document.documentElement.classList.replace("dark", "light");
             if (words.includes("fullscreen")) document.documentElement.setAttribute("data-fullscreen", "");
             // `tabs` opens four more repositories (the fixture answers any path
@@ -630,7 +630,25 @@
           await settle();
           type(await need("the worktree path input", worktreePath), "/tmp/alpha-new-worktree");
           (await need("the include-unstaged checkbox", includeUnstaged)).click();
+          // The filters above shrink the sidebar's lists, and the scroller's clamp
+          // to its new height lands as a scroll event some frames later. The agent
+          // menu below closes on any outside scroll (as it should for a person),
+          // so it is opened only once the sidebar has been still for a while.
+          let lastSidebarScroll = performance.now();
+          const markSidebarScroll = () => { lastSidebarScroll = performance.now(); };
+          scroller.addEventListener("scroll", markSidebarScroll);
+          await sleepUntil(() => performance.now() - lastSidebarScroll > 400, 5000);
+          scroller.removeEventListener("scroll", markSidebarScroll);
           repoStore.commitDraft.set("alpha draft");
+          // The agent menu closes on any outside scroll or a window resize, so a
+          // failure below names what moved while it was meant to stay open.
+          const moved = [];
+          const describeTarget = (target) => target === document || target === window ? "document"
+            : `${target.tagName?.toLowerCase() ?? "?"}${target.id ? `#${target.id}` : ""}.${String(target.className ?? "").split(/\s+/).slice(0, 3).join(".")}`;
+          const noteScroll = (event) => moved.push(`scroll ${describeTarget(event.target)} to ${Math.round(event.target.scrollTop ?? 0)} of ${Math.round((event.target.scrollHeight ?? 0) - (event.target.clientHeight ?? 0))}`);
+          const noteResize = () => moved.push(`resize ${innerWidth}x${innerHeight}`);
+          window.addEventListener("scroll", noteScroll, true);
+          window.addEventListener("resize", noteResize);
           (await need("the agent commit menu trigger", agentTrigger)).click();
           await settle();
           type(await need("the agent note input", agentNote), "note about alpha");
@@ -639,10 +657,26 @@
           const row = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
           row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
           await settle();
-          hardCheck("alpha's leftovers are all in place before the switch", () =>
-            fileFilter().value === "src/alpha" && scroller.scrollTop > 100 && branchFilter().value === "feat" &&
-            createInput()?.value === "feat/half-typed" && worktreePath()?.value === "/tmp/alpha-new-worktree" &&
-            includeUnstaged().checked && agentPanel() && langPanel() && contextMenu() && textarea().value === "alpha draft");
+          // Named one by one, so a failure says which leftover never landed
+          // rather than only that one of ten did not.
+          const leftovers = {
+            "file filter": () => fileFilter()?.value === "src/alpha",
+            "sidebar scroll": () => scroller.scrollTop > 100,
+            "branch filter": () => branchFilter()?.value === "feat",
+            "half-typed branch": () => createInput()?.value === "feat/half-typed",
+            "worktree path": () => worktreePath()?.value === "/tmp/alpha-new-worktree",
+            "include-unstaged": () => includeUnstaged()?.checked === true,
+            "agent menu": () => !!agentPanel(),
+            "language panel": () => !!langPanel(),
+            "context menu": () => !!contextMenu(),
+            "commit draft": () => textarea()?.value === "alpha draft",
+          };
+          window.removeEventListener("scroll", noteScroll, true);
+          window.removeEventListener("resize", noteResize);
+          const missing = Object.entries(leftovers).filter(([, present]) => !present())
+            .map(([name]) => (name === "agent menu" && moved.length ? `agent menu, after ${[...new Set(moved)].join("; ")}` : name));
+          hardCheck(`alpha's leftovers are all in place before the switch${missing.length ? ` (missing: ${missing.join(", ")})` : ""}`, () =>
+            missing.length === 0);
 
           const releaseBetaWorktrees = hold("cmd_list_worktrees", BETA);
           await switchTo(BETA);
@@ -728,6 +762,36 @@
           check("the view-tab guide tooltip paints its schematic", () => !!guideTab && !!$(GUIDE_ART) && $$(`${GUIDE_ART} *`).length > 3);
           guideTab?.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
 
+          // A file path has no spaces, so a bubble that wraps only at spaces
+          // draws it as one unbreakable line past its own border. Hover an
+          // anchor titled with a long path and require every glyph to lie
+          // inside the bubble, and the bubble inside the window.
+          const LONG_PATH = "src/lib/components/files/deeply/nested/directory/structure/that/keeps/going/FileTreePanelWithAVeryLongName.svelte";
+          const pathAnchor = document.createElement("span");
+          pathAnchor.textContent = "long path anchor";
+          pathAnchor.title = LONG_PATH;
+          pathAnchor.style.cssText = "position:fixed;left:8px;top:200px";
+          document.body.append(pathAnchor);
+          pathAnchor.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          // Other bubbles (a coach mark) also carry role="tooltip": pick the one
+          // showing this path, never the first in the document.
+          const pathTip = () => $$('[role="tooltip"]').find((el) => text(el) === LONG_PATH) ?? null;
+          await sleepUntil(() => pathTip()?.classList.contains("opacity-100") === true, 3000);
+          check("a long path tooltip wraps inside its bubble and the window", () => {
+            const tip = pathTip();
+            if (!tip) return false;
+            const box = tip.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(tip);
+            const drawn = range.getBoundingClientRect();
+            return tip.scrollWidth <= tip.clientWidth
+              && drawn.right <= box.right + 0.5 && drawn.left >= box.left - 0.5
+              && box.left >= 0 && box.right <= window.innerWidth;
+          });
+          pathAnchor.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
+          pathAnchor.remove();
+          await sleepUntil(() => !pathTip(), 3000);
+
           // The shortcuts sheet exists to say what each chord does, so a
           // description that is clipped (one line, ellipsis) defeats it. At the
           // regression viewport every description must be drawn in full: its
@@ -765,7 +829,7 @@
               last: text(last).slice(0, 40),
             };
           };
-          const shortcutsEnd = await scrollEnd($('[role="dialog"][aria-label="Keyboard Shortcuts"]'));
+          const shortcutsEnd = await scrollEnd($('[role="dialog"][aria-label="Keyboard shortcuts"]'));
           check(`the shortcuts sheet scrolls to a whole last row, and fades the edge that still hides rows (${JSON.stringify(shortcutsEnd)})`, () =>
             shortcutsEnd.found && shortcutsEnd.overflows && shortcutsEnd.atEnd && shortcutsEnd.lastInside
             && shortcutsEnd.fadeAtTop === "y-end" && !shortcutsEnd.fadeAtEnd.includes("end"));
@@ -949,10 +1013,15 @@
             // The controls fade out over the 70ms exit before they are hidden.
             for (let i = 0; i < 40 && getComputedStyle(controls()).visibility !== "hidden"; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             const underBox = row2.getBoundingClientRect();
-            check("header: under Fleet row 2 stays mounted at the same height, its controls inert and hidden, the surface named", () =>
+            // Rewritten: this pinned the WHOLE row inert and hidden under Fleet. Now
+            // only the repository-only groups are; the search field stays live.
+            const repoOnly = () => $$("[data-viewbar-repo-only]", row2);
+            check("header: under Fleet row 2 stays mounted at the same height, its repository-only controls inert and hidden, the surface named, the search field live", () =>
               row2.isConnected && Math.abs(underBox.height - row2Box.height) < 0.5 && Math.abs(underBox.top - row2Box.top) < 0.5 &&
-              controls().inert === true && getComputedStyle(controls()).visibility === "hidden" &&
-              text($('[data-viewbar-surface="fleet"]', row2)) === "Fleet");
+              !controls().inert && repoOnly().length === 3 &&
+              repoOnly().every((el) => el.inert === true && getComputedStyle(el).display === "none") &&
+              text($('[data-viewbar-surface="fleet"]', row2)) === "Fleet" &&
+              !$("[data-page-search]", row2).closest("[inert]") && $("[data-page-search]", row2).getBoundingClientRect().width > 0);
             check("header: the Workspace tablist has one selected tab, Fleet, and Fleet is the one roving stop", () => {
               const tabs = $$('[role="tab"]', workspace[0]);
               return tabs.filter((el) => el.getAttribute("aria-selected") === "true").map((el) => el.dataset.surfaceTab).join() === "fleet" &&
@@ -964,17 +1033,18 @@
             for (let i = 0; i < 40 && $("[data-viewbar-surface]", row2); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
             check("header: back on the repository, row 2 is live again and the surface name is gone", () =>
               !controls().inert && !$("[data-viewbar-surface]", row2));
-            // Rows 1 and 2 are one band of glass. Each used to draw its own edges, so
-            // where they met row 1's bottom shade and drop shadow sat on row 2's top
-            // sheen: a line across the window. The page stamps html.macos, where the
-            // glass is drawn, so this cannot pass by not applying.
-            check("header: rows 1 and 2 join with no seam: row 1 keeps only its top sheen, row 2 has no top sheen, neither a diagonal gradient", () => {
-              const layers = (el) => getComputedStyle(el).boxShadow.split(/,(?![^(]*\))/).map((s) => s.trim());
-              const top = layers(row1), below = layers(row2);
-              return document.documentElement.classList.contains("macos") &&
-                top.length === 1 && /0px 1px 0px 0px inset/.test(top[0]) &&
-                !below.some((s) => /0px 1px 0px 0px inset/.test(s)) && below.some((s) => /0px -1px 0px 0px inset/.test(s)) &&
-                getComputedStyle(row1).backgroundImage === "none" && getComputedStyle(row2).backgroundImage === "none";
+            // Rows 1 and 2 are drawn on the window's own ground, the same ground
+            // the sidebar and workspace cards float on. A fill, sheen, shade or
+            // drop shadow on either row made the chrome a band across the top of
+            // every page. The page stamps html.macos, where the glass is drawn,
+            // so this cannot pass by not applying.
+            check("header: rows 1 and 2 sit on the window's ground: no fill, no sheen, no edge, no shadow", () => {
+              const bare = (el) => {
+                const style = getComputedStyle(el);
+                return style.boxShadow === "none" && style.backgroundImage === "none" &&
+                  /^rgba\(0, 0, 0, 0\)$|^transparent$/.test(style.backgroundColor);
+              };
+              return document.documentElement.classList.contains("macos") && bare(row1) && bare(row2);
             });
             // Row 2's search is one field for every page (search/pageSearch.svelte.ts):
             // History's graph filters commits through it, its Diff section finds in
@@ -1126,6 +1196,50 @@
             await sleepUntil(() => !$("[data-page-palette]"), 3000);
             check("search: Escape closes the results, empties the field and leaves it", () =>
               !$("[data-page-palette]") && fieldInput().value === "" && document.activeElement !== fieldInput());
+
+            // ---- the field under Fleet, Agents and Tasks ---------------------------
+            // The same field stays on the host-wide surfaces as the repository
+            // palette, never as the hidden page's filter or find, and says which
+            // repository it searches. Its text is whole at whatever width it has.
+            {
+              const { FOCUS_PAGE_SEARCH_EVENT } = await import("../src/lib/views/commitFilter.ts");
+              const tabBefore = get(repoStore).activeTab;
+              const repoName = (get(repoStore).currentPath ?? "").split("/").filter(Boolean).pop() ?? "";
+              const placeholderFits = () => {
+                const input = fieldInput();
+                const style = getComputedStyle(input);
+                const context = document.createElement("canvas").getContext("2d");
+                context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+                const room = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+                return context.measureText(input.placeholder).width <= room + 1;
+              };
+              // History's graph has a provider (the commit filter): the page the
+              // field would become on the repository surface.
+              repoStore.setActiveTab("history", "graph");
+              await sleepUntil(() => field()?.dataset.pageSearch === "filter", 5000);
+              for (const surface of ["fleet", "agents", "tasks"]) {
+                interfaceStore.setGlobalSurface(surface);
+                await sleepUntil(() => getComputedStyle($("[data-viewbar-repo-only]", row2)).display === "none", 5000);
+                await sleepUntil(() => field()?.dataset.pageSearch === "palette", 5000);
+                check(`search: under ${surface} the field is the repository palette, not History's commit filter, and says which repository`, () =>
+                  field().dataset.pageSearch === "palette" && fieldInput().getAttribute("aria-label") === `Search ${repoName}` &&
+                  new RegExp(`^Search (${repoName})?`).test(fieldInput().placeholder) && !$("[data-find-status]", row2));
+                check(`search: under ${surface} the field is not clipped to a stub: its placeholder is whole words and fits`, () =>
+                  /^Search\b/.test(fieldInput().placeholder) && placeholderFits() && field().getBoundingClientRect().width >= 96);
+                window.dispatchEvent(new CustomEvent(FOCUS_PAGE_SEARCH_EVENT));
+                await settle();
+                check(`search: under ${surface} the focus event focuses the field`, () => document.activeElement === fieldInput());
+                fieldInput().blur();
+              }
+              interfaceStore.setGlobalSurface("repository");
+              // The surface's name leaves row 2 with a fade, so it is waited
+              // out rather than read in the same frame.
+              await sleepUntil(() => field()?.dataset.pageSearch === "filter" && !$("[data-viewbar-surface]", row2), 5000);
+              check("search: back on the repository the field is History's commit filter again", () =>
+                field().dataset.pageSearch === "filter" && !$("[data-viewbar-surface]", row2));
+              repoStore.setActiveTab(tabBefore);
+              await settle();
+            }
 
             // ---- the glance: four facts from reads already made -------------------
             // A stash, a fetch over a day old, a pull request a panel read for this
@@ -1404,13 +1518,13 @@
           // The sidebar used to be rebuilt per repository, which cleared a crash
           // caused by one repository's data. It is not rebuilt now, so its
           // failure view resets the pane when the repository changes.
-          const paneFailedText = () => $$("span").some((el) => text(el) === "Pane failed to render");
+          const paneFailedText = () => $$("span").some((el) => text(el) === "Couldn't render this pane.");
           await repoStore.openRepo(GAMMA, { activate: false });
           await switchTo(GAMMA);
           await sleepUntil(() => !sidebar() && paneFailedText(), 5000);
           check("a repository whose branch list cannot be drawn fails the sidebar pane", () => !sidebar() && paneFailedText());
           check("…and only the sidebar: the status bar and the workspace are still up", () =>
-            statusBar() && $("main.gp-workspace") && $$("span").filter((el) => text(el) === "Pane failed to render").length === 1);
+            statusBar() && $("main.gp-workspace") && $$("span").filter((el) => text(el) === "Couldn't render this pane.").length === 1);
           await switchTo(ALPHA);
           await sleepUntil(() => sidebar() && !paneFailedText(), 5000);
           check("switching to another repository brings the sidebar back", () => !!sidebar() && !paneFailedText());

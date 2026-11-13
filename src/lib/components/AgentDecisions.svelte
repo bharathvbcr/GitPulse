@@ -21,7 +21,7 @@
     const copy = describeFailure({ verb, object }, cause);
     return copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline;
   }
-  const labels = { pending: "Needs review", decided: "Decision saved · delivery pending", dispatching: "Delivery attempted · awaiting provider confirmation", resolved: "Provider confirmed resolution", cancelled: "Request cancelled" };
+  const labels = { pending: "Needs review", decided: "Decision saved · delivery pending", dispatching: "Delivery attempted · awaiting provider confirmation", resolved: "Provider confirmed resolution", cancelled: "Request canceled" };
   async function refresh(more = false) {
     if (loading || busy || pending || disposed || !active) return;
     loading = true;

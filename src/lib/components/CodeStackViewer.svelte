@@ -43,6 +43,7 @@
   import { describeFailure } from "../ui/copy/describeFailure";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import PageBody from "./PageBody.svelte";
 
   /**
    * The stacked-branch page.
@@ -286,8 +287,8 @@
   });
 </script>
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs font-sans p-4 overflow-auto">
-  <div class="flex items-start justify-between gap-3 mb-3">
+<PageBody class="bg-background h-full font-sans text-xs" bodyClass="min-h-full">
+  <div class="flex items-start justify-between gap-3">
     <div class="min-w-0">
       <h2 class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
         <Layers size={16} class="text-accent" />
@@ -316,18 +317,18 @@
   </div>
 
   {#if restackProgress}
-    <div class="gp-notice mb-3! max-w-3xl items-center text-meta" data-tone="info" role="status">
+    <div class="gp-notice items-center text-meta" data-tone="info" role="status">
       <RefreshCw size={13} class="animate-spin shrink-0 text-accent" />
       <span>Updating stack — {restackProgress}</span>
     </div>
   {/if}
 
   {#if restackError}
-    <div role="alert" class="gp-notice mb-3! max-w-3xl" data-tone="danger">{restackError}</div>
+    <div role="alert" class="gp-notice" data-tone="danger">{restackError}</div>
   {/if}
 
   {#if loadError}
-    <div role="alert" class="gp-notice mb-3! max-w-3xl items-center justify-between gap-3" data-tone="danger">
+    <div role="alert" class="gp-notice items-center justify-between gap-3" data-tone="danger">
       <span class="min-w-0 truncate" title={loadError}>{describeFailure({ verb: "load", object: "the stack" }, loadError).headline} {loadError}</span>
       <button onclick={() => loadStack()} disabled={isLoading || restackingKey !== null} class="gp-btn shrink-0" data-size="sm">
         <RefreshCw size={12} class={isLoading ? "animate-spin" : ""} />
@@ -337,14 +338,14 @@
   {/if}
 
   {#if unresolvedNotice}
-    <div data-testid="stack-unresolved" class="gp-notice mb-3! max-w-3xl text-meta" data-tone="warn">
+    <div data-testid="stack-unresolved" class="gp-notice text-meta" data-tone="warn">
       <CircleAlert size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
       <span>{unresolvedNotice}</span>
     </div>
   {/if}
 
   {#if behindRows.length > 0}
-    <div class="gp-notice mb-3! max-w-3xl text-meta" data-tone="warn">
+    <div class="gp-notice text-meta" data-tone="warn">
       <CircleAlert size={14} class="shrink-0 mt-px" style="color: var(--gp-notice-ink)" />
       <span>
         {behindRows.length} branch{behindRows.length === 1 ? "" : "es"} here {behindRows.length === 1
@@ -356,7 +357,7 @@
   {/if}
 
   {#if rows.length > 0}
-    <div class="max-w-3xl">
+    <div>
       <ul class="space-y-1.5">
         {#each rows as row, i (`${i}:${row.node.branch_name}`)}
           {@const node = row.node}
@@ -496,7 +497,7 @@
       </p>
     </div>
   {:else if isLoading}
-    <Skeleton variant="card" count={2} class="max-w-3xl" />
+    <Skeleton variant="card" count={2} />
     <p class="sr-only">Loading stack hierarchy…</p>
   {:else if !loadError}
     <div class="flex-1 flex">
@@ -509,7 +510,7 @@
   {/if}
 
   {#if unplaced.length > 0}
-    <div class="mt-4 max-w-3xl">
+    <div>
       <h3 class="gp-label mb-1.5">
         On no stack ({unplaced.length})
       </h3>
@@ -532,4 +533,4 @@
       </div>
     </div>
   {/if}
-</div>
+</PageBody>

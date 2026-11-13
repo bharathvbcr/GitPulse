@@ -21,6 +21,8 @@
   import { storageMetric } from "../metrics/repoMetrics";
   import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
   import { createCopyFlash } from "../desktop/clipboard";
+  import PageHeader from "./PageHeader.svelte";
+  import PageBody from "./PageBody.svelte";
   import Skeleton from "./Skeleton.svelte";
   import EmptyState from "./EmptyState.svelte";
   import { describeFailure, unknownState } from "../ui/copy/describeFailure";
@@ -51,6 +53,12 @@
   import type { StorageLike } from "../repos/persist";
 
   let report = $state<StorageReport | null>(null);
+  /** The header's one line: what the scan found, in three totals. */
+  const summary = $derived(
+    report
+      ? `${humanBytes(report.totals.grand_bytes)} total · ${humanBytes(report.totals.git_dir_bytes)} git · ${humanBytes(report.totals.build_artifacts_bytes + report.totals.cache_artifacts_bytes)} artifacts`
+      : undefined,
+  );
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
   let staleNote = $state<string | null>(null);
@@ -339,16 +347,9 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
-  <div class="gp-header">
-    <div class="flex items-center gap-2 min-w-0 flex-1">
-      <HardDrive size={16} class="text-accent shrink-0" />
-      <span class="shrink-0 text-sm font-semibold text-textPrimary">Storage</span>
+  <PageHeader title="Storage" description={summary}>
+    {#snippet meta()}
       {#if report}
-        <span class="text-textMuted truncate">
-          {humanBytes(report.totals.grand_bytes)} total
-          · {humanBytes(report.totals.git_dir_bytes)} git
-          · {humanBytes(report.totals.build_artifacts_bytes + report.totals.cache_artifacts_bytes)} artifacts
-        </span>
         {#if report.scan.truncated}
           <span class="gp-chip shrink-0" data-tone="warn" data-kind="label">Partial scan</span>
         {/if}
@@ -362,8 +363,8 @@
           </span>
         {/if}
       {/if}
-    </div>
-    <div class="gp-header-actions">
+    {/snippet}
+    {#snippet actions()}
       {#if report}
         <button
           type="button"
@@ -380,13 +381,13 @@
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Rescan
       </button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
-  <div class="flex-1 overflow-auto p-4 space-y-5">
+  <PageBody>
     {#if loading && !report}
-      <div class="space-y-4 max-w-4xl">
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div class="space-y-4">
+        <div class="grid grid-cols-2 @2xl:grid-cols-4 gap-2">
           <Skeleton variant="card" count={4} />
         </div>
         <div class="space-y-2 pt-2">
@@ -394,7 +395,7 @@
         </div>
       </div>
     {:else if errorMsg && failure}
-      <div class="gp-notice max-w-2xl" data-tone="danger" role="alert">
+      <div class="gp-notice" data-tone="danger" role="alert">
         <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
         <div class="min-w-0 flex-1">
           <p class="font-medium">{failure.headline}</p>
@@ -408,8 +409,8 @@
       </div>
     {:else if report}
       <!-- Overview -->
-      <section class="space-y-3 max-w-4xl">
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <section class="space-y-3">
+        <div class="grid grid-cols-2 @2xl:grid-cols-4 gap-2">
           <div class="gp-card p-3">
             <div class="gp-label">Total</div>
             <div class="text-base font-semibold text-textPrimary">{humanBytes(report.totals.grand_bytes)}</div>
@@ -454,7 +455,7 @@
 
       <!-- Hygiene gaps -->
       {#if hygieneGaps.length > 0}
-        <section class="space-y-2 max-w-4xl">
+        <section class="gp-page-section">
           <h3 class="gp-label flex items-center gap-1.5">
             <AlertTriangle size={11} class="text-warn" />
             Hygiene gaps ({hygieneGaps.length})
@@ -504,12 +505,12 @@
       {/if}
 
       <!-- Git internals -->
-      <section class="space-y-2 max-w-4xl">
+      <section class="gp-page-section">
         <h3 class="gp-label flex items-center gap-1.5">
           <FolderTree size={11} />
           Git internals · {humanBytes(report.git.total_bytes)}
         </h3>
-        <div class="gp-card overflow-hidden max-w-4xl">
+        <div class="gp-card overflow-hidden">
           <table class="w-full text-left">
             <tbody>
               <tr class="even:bg-surfaceHover/40">
@@ -610,7 +611,7 @@
         than folded into a number the repository cannot actually deliver.
       -->
       {#if report.reclaim.length > 0}
-        <section class="space-y-2 max-w-4xl">
+        <section class="gp-page-section">
           <h3 class="gp-label flex items-center gap-1.5">
             <Trash2 size={11} />
             Reclaim audit ({report.reclaim_summary.item_count})
@@ -671,7 +672,7 @@
 
       <!-- Build & cache dirs -->
       {#if report.artifacts.length > 0}
-        <section class="space-y-2 max-w-4xl">
+        <section class="gp-page-section">
           <h3 class="gp-label flex items-center gap-1.5">
             <Boxes size={11} />
             Build &amp; cache directories ({report.artifacts.length})
@@ -701,16 +702,16 @@
 
       <!-- Largest files -->
       {#if report.largest_files.length > 0}
-        <section class="space-y-2 max-w-4xl">
+        <section class="gp-page-section">
           <h3 class="gp-label">
             Largest working-tree files ({report.largest_files.length}, ≥10 MB)
           </h3>
-          <div class="gp-card overflow-hidden max-w-4xl">
+          <div class="gp-card overflow-hidden">
             <table class="w-full text-left">
               <tbody>
                 {#each report.largest_files as file (file.path)}
                   <tr class="even:bg-surfaceHover/40">
-                    <td class="px-3 py-1.5 font-mono text-textPrimary truncate max-w-md" title={file.path}>{file.path}</td>
+                    <td class="px-3 py-1.5 font-mono text-textPrimary truncate max-w-md" data-width-cap="a truncating path cell in a table, wider than a column but not the pane" title={file.path}>{file.path}</td>
                     <td class="px-3 py-1.5 font-mono text-textSecondary text-right whitespace-nowrap">{humanBytes(file.bytes)}</td>
                   </tr>
                 {/each}
@@ -722,11 +723,11 @@
 
       <!-- Linked worktrees -->
       {#if report.worktrees.length > 0}
-        <section class="space-y-2 max-w-4xl">
+        <section class="gp-page-section">
           <h3 class="gp-label">
             Linked worktrees ({report.worktrees.length})
           </h3>
-          <div class="gp-card overflow-hidden max-w-4xl">
+          <div class="gp-card overflow-hidden">
             <table class="w-full text-left">
               <tbody>
                 {#each report.worktrees as worktree (worktree.path)}
@@ -745,7 +746,7 @@
       {/if}
 
       <!-- Branch weight -->
-      <section class="space-y-2 max-w-4xl">
+      <section class="gp-page-section">
         <h3 class="gp-label flex items-center gap-1.5">
           <GitBranch size={11} />
           Branch weight
@@ -788,7 +789,7 @@
       </section>
 
       <!-- Usage history -->
-      <section class="space-y-2 max-w-4xl pb-4">
+      <section class="gp-page-section">
         <div class="flex items-center justify-between">
           <h3 class="gp-label flex items-center gap-1.5">
             <Clock size={11} />
@@ -863,5 +864,5 @@
         hint="Open a repository to measure its disk usage."
       />
     {/if}
-  </div>
+  </PageBody>
 </div>

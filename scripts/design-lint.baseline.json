@@ -102,6 +102,11 @@
       "name": "unused-gp-class",
       "total": 0,
       "files": {}
+    },
+    "19": {
+      "name": "page-width-cap",
+      "total": 0,
+      "files": {}
     }
   }
 }

@@ -49,7 +49,7 @@
   import type { TerminalRunResult } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import TerminalSession from "./TerminalSession.svelte";
   import BrowserSession from "./BrowserSession.svelte";
   import TerminalFilePane from "./TerminalFilePane.svelte";
@@ -829,7 +829,7 @@
     const sep = trimmedRepo.includes("\\") ? "\\" : "/";
     const lastSep = Math.max(trimmedRepo.lastIndexOf("/"), trimmedRepo.lastIndexOf("\\"));
     if (lastSep <= 0) {
-      sessionError = "Could not resolve parent directory for sibling worktree.";
+      sessionError = "Couldn't resolve the parent directory for the sibling worktree.";
       return;
     }
     const parentDir = trimmedRepo.slice(0, lastSep);
@@ -843,9 +843,9 @@
       if (!outcome.ok) {
         if (outcome.error) {
           if (visible && repoPath && sameRepo(repoPath, baseRepo, pathOpts)) {
-            sessionError = `Could not create isolated worktree: ${outcome.error}`;
+            sessionError = `Couldn't create the isolated worktree: ${outcome.error}`;
           } else {
-            toastStore.error(`Could not create isolated worktree: ${outcome.error}`);
+            toastStore.error(`Couldn't create the isolated worktree: ${outcome.error}`);
           }
         }
         return;
@@ -875,7 +875,7 @@
         splitRoot = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
       }
     } catch (err) {
-      sessionError = `Could not create isolated worktree: ${formatError(err)}`;
+      sessionError = `Couldn't create the isolated worktree: ${describeError(err, "terminal")}`;
     } finally {
       creatingWorktreePreset = false;
     }
@@ -1065,7 +1065,7 @@
     try {
       await openTaskForRun(runId);
     } catch (cause) {
-      sessionError = `That session's task couldn't be opened: ${formatError(cause)}`;
+      sessionError = `That session's task couldn't be opened: ${describeError(cause, "terminal")}`;
     }
   }
 
@@ -1116,7 +1116,7 @@
     try {
       await closeWithConfirmation(session);
     } catch (error: unknown) {
-      sessionError = formatError(error);
+      sessionError = describeError(error, "terminal");
     }
   }
 
@@ -1143,7 +1143,7 @@
       try {
         await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
       } catch (error: unknown) {
-        sessionError = formatError(error);
+        sessionError = describeError(error, "terminal");
         return;
       }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
@@ -1416,7 +1416,7 @@
       try {
         await sessions[child.id]?.close();
       } catch (error: unknown) {
-        sessionError = formatError(error);
+        sessionError = describeError(error, "terminal");
         continue;
       }
       if (tabState.tabs.some((candidate) => candidate.id === child.id)) {
@@ -2052,7 +2052,7 @@
         verdict: response.policy ?? null,
       });
     } catch (err) {
-      const errMessage = formatError(err);
+      const errMessage = describeError(err, "terminal");
       executions = executions.map((e) =>
         e.id === entryId ? { ...e, running: false, error: errMessage } : e,
       );
@@ -2134,7 +2134,7 @@
 <!-- Justified: keyboard events bubble from the region's interactive controls; the region itself is not a focus stop. -->
 <div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Terminal" onkeydown={handlePanelKey}>
   <!-- Header Bar -->
-  <div class="px-3 py-1.5 bg-surface/60 flex flex-wrap gap-2 items-center shrink-0">
+  <div class="px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0">
     <div class="flex flex-1 items-center gap-2 min-w-0">
       <Terminal size={14} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
@@ -2383,7 +2383,7 @@
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0 bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0"
       class:hidden={mode !== "shell"}
       data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
     >
@@ -2647,7 +2647,7 @@
             class="gp-menu-item text-textMuted"
             data-testid="terminal-preset-worktree-agent"
             disabled={!repoPath || !onCreateAgentWorktree || creatingWorktreePreset || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
-            title="Provision a fresh sibling Git worktree (CoW caches + DevMap) and open an agent + live diff split inside it"
+            title="Provision a fresh sibling Git worktree (CoW caches + the code map) and open an agent + live diff split inside it"
             onclick={() => void openWorktreeAgentPreset()}
           >
             Isolated Worktree Agent Split…
@@ -3057,7 +3057,7 @@
   </div>
 
   <!-- Input Bar -->
-  <div class="p-3 bg-surface shrink-0 space-y-2">
+  <div class="p-3 shrink-0 space-y-2">
     {#if validationError}
       <div class="gp-notice mx-0! mt-0! flex items-center gap-1.5" data-tone="danger">
         <AlertCircle size={13} class="shrink-0" />

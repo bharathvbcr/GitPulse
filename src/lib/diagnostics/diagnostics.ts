@@ -1,5 +1,5 @@
 import { writable, type Readable } from "svelte/store";
-import { formatError } from "../ui/formatError";
+import { formatErrorRaw, setProgrammingErrorSink } from "../ui/formatError";
 import { browserStorage, type StorageLike } from "../repos/persist";
 import { escapeRegExp } from "../text/lineSearch";
 import { isProductDisabledMessage } from "../health/githubAlerts";
@@ -33,6 +33,13 @@ export interface DiagnosticEntry {
   readonly id: number;
   /** Epoch milliseconds of the most recent occurrence. */
   readonly at: number;
+  /**
+   * Epoch milliseconds of the first occurrence folded into this entry.
+   *
+   * Optional because the ring is persisted: an entry written before this field
+   * existed knows only its latest time, and reads as first seen at `at`.
+   */
+  readonly firstAt?: number;
   readonly severity: DiagnosticSeverity;
   /** Short tag naming where the entry came from ("console", "pane-crash", …). */
   readonly source: string;
@@ -636,7 +643,7 @@ export function redactDiagnosticText(value: string): string {
 /** Formats untrusted thrown values without allowing a hostile getter to fail diagnostics. */
 export function formatDiagnosticFailure(detail: unknown): string {
   try {
-    return enrichSvelteRuntimeMessage(redactDiagnosticText(formatError(detail)));
+    return enrichSvelteRuntimeMessage(redactDiagnosticText(formatErrorRaw(detail)));
   } catch {
     return "Unknown error";
   }
@@ -770,6 +777,11 @@ export function diagnosticFingerprint(message: string): string {
   return key;
 }
 
+/** When an entry's first occurrence happened; entries saved before `firstAt` existed read as `at`. */
+function entryFirstAt(entry: DiagnosticEntry): number {
+  return typeof entry.firstAt === "number" && entry.firstAt <= entry.at ? entry.firstAt : entry.at;
+}
+
 function sameOccurrence(a: DiagnosticEntry, b: DiagnosticEntry): boolean {
   return a.severity === b.severity
     && a.source === b.source
@@ -800,6 +812,7 @@ function coalesceConsecutive(entries: DiagnosticEntry[]): DiagnosticEntry[] {
     out[out.length - 1] = {
       ...newer,
       count: Math.min(Number.MAX_SAFE_INTEGER, newer.count + older.count),
+      firstAt: Math.min(entryFirstAt(newer), entryFirstAt(older)),
       ...(varied ? { varied: true as const } : {}),
     };
     changed = true;
@@ -1015,6 +1028,8 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
     source: clampMessage(redactDiagnosticText(record.source)),
     message: clampMessage(redactDiagnosticText(record.message)),
     count,
+    ...(typeof record.firstAt === "number" && Number.isFinite(record.firstAt) && record.firstAt <= record.at
+      ? { firstAt: record.firstAt } : {}),
     ...(version ? { version } : {}),
     ...(typeof record.buildId === "string" && record.buildId.trim()
       ? { buildId: redactDiagnosticText(record.buildId).slice(0, 96) } : {}),
@@ -1177,8 +1192,9 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       nextId = entries.length;
     }
     nextId += 1;
+    const occurredAt = now();
     entries = [
-      { id: nextId, at: now(), severity, source: safeSource, message, count: 1, version: APP_VERSION, buildId },
+      { id: nextId, at: occurredAt, firstAt: occurredAt, severity, source: safeSource, message, count: 1, version: APP_VERSION, buildId },
       ...entries,
     ];
     headKey = key;
@@ -1224,6 +1240,10 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 /** App-wide singleton; safe to import from stores and components alike. */
 export const diagnostics: DiagnosticsStore = createDiagnostics();
 flushOnPageHide(() => diagnostics.flush());
+// `formatError` swaps a runtime fault for plain copy and cannot import this
+// module (it is imported here), so the raw error reaches the ring through a
+// sink registered at module init.
+setProgrammingErrorSink((source, err) => diagnostics.error(source, err));
 
 /**
  * Render entries as a plain-text report for pasting into an issue or handing
@@ -1301,6 +1321,104 @@ export function formatDiagnosticTime(at: number, now: number = Date.now()): stri
   return date.toDateString() === reference.toDateString()
     ? time
     : `${date.toLocaleDateString()} ${time}`;
+}
+
+/** "22:01:12 – 22:08:37", or one time when the span is a single instant. */
+export function formatDiagnosticRange(first: number, last: number, now: number = Date.now()): string {
+  const from = formatDiagnosticTime(first, now);
+  const to = formatDiagnosticTime(last, now);
+  return from === to ? to : `${from} – ${to}`;
+}
+
+/** A git object id or similar: 7+ hex characters holding at least one digit and one letter a-f. */
+const HEX_RUN = /\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}\b/gi;
+const TRAILING_PUNCTUATION = /[\s.!?:;,]+$/;
+
+/**
+ * The text two occurrences must share to be one group in the panel.
+ *
+ * Starts from {@link diagnosticFingerprint} (timestamps, UUIDs, durations,
+ * addresses, temp paths), then collapses whitespace, masks long hex runs
+ * (object ids) and drops trailing punctuation. Plain numbers, paths, exit
+ * codes and names are left alone, so two different failures stay two groups.
+ */
+export function normalizeDiagnosticMessage(message: string): string {
+  return diagnosticFingerprint(message)
+    .replace(/\s+/g, " ")
+    .replace(HEX_RUN, "⟨hex⟩")
+    .replace(TRAILING_PUNCTUATION, "")
+    .trim();
+}
+
+/** Every occurrence of one failure: same severity, source, build and normalised message. */
+export interface DiagnosticGroup {
+  /** Stable across new occurrences, so a list keyed by it keeps its open state. */
+  readonly key: string;
+  readonly severity: DiagnosticSeverity;
+  readonly source: string;
+  /** The newest occurrence's text. */
+  readonly message: string;
+  /** Total occurrences across every folded entry. */
+  readonly count: number;
+  readonly firstAt: number;
+  readonly lastAt: number;
+  readonly version?: string;
+  readonly buildId?: string;
+  /** True when any occurrence's text differed from the one shown. */
+  readonly varied: boolean;
+  /** The recorded runs of this failure, newest first. */
+  readonly entries: readonly DiagnosticEntry[];
+}
+
+/**
+ * Group a newest-first entry list by failure, most recently seen group first.
+ *
+ * Live coalescing only folds a repeat that directly follows its twin, so an
+ * error storm interleaved with another failure leaves many entries of one
+ * failure; this is the same fold applied across the whole list. Entries are
+ * never dropped: every input entry lands in exactly one group.
+ */
+export function groupDiagnostics(entries: readonly DiagnosticEntry[]): DiagnosticGroup[] {
+  const groups = new Map<string, DiagnosticEntry[]>();
+  for (const entry of entries) {
+    const key = [
+      entry.severity,
+      entry.source,
+      entry.version ?? "",
+      entry.buildId ?? "",
+      normalizeDiagnosticMessage(entry.message),
+    ].join("\u0000");
+    const members = groups.get(key);
+    if (members) members.push(entry);
+    else groups.set(key, [entry]);
+  }
+  const out: DiagnosticGroup[] = [];
+  for (const [key, members] of groups) {
+    const ordered = [...members].sort((a, b) => b.at - a.at || b.id - a.id);
+    const newest = ordered[0];
+    out.push({
+      key,
+      severity: newest.severity,
+      source: newest.source,
+      message: newest.message,
+      count: Math.min(
+        Number.MAX_SAFE_INTEGER,
+        ordered.reduce((total, entry) => total + entry.count, 0),
+      ),
+      firstAt: Math.min(...ordered.map(entryFirstAt)),
+      lastAt: newest.at,
+      ...(newest.version !== undefined ? { version: newest.version } : {}),
+      ...(newest.buildId !== undefined ? { buildId: newest.buildId } : {}),
+      varied: ordered.some((entry) => entry.varied === true || entry.message !== newest.message),
+      entries: ordered,
+    });
+  }
+  return out.sort((a, b) => b.lastAt - a.lastAt || b.entries[0].id - a.entries[0].id);
+}
+
+/** The first-seen time of one recorded run, for a group's occurrence list. */
+export function diagnosticEntryFirstAt(entry: DiagnosticEntry): number {
+  return entryFirstAt(entry);
 }
 
 /** The slices of window/console the global installer needs. */

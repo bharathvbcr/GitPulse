@@ -11,6 +11,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
+  import { describeError } from "../ui/copy/describeFailure";
   import Checkbox from "./Checkbox.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { worktreeSetupNotices, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
@@ -509,7 +510,7 @@
     try {
       trusted = await repoStore.trustRepo(targetPath);
     } catch (cause) {
-      return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't remove the worktree", epoch);
+      return showFailure({ ok: false, cause, error: describeError(cause, "worktrees") }, "Couldn't remove the worktree", epoch);
     }
     if (!trusted) return;
     // The trust prompt can sit open while the reader goes elsewhere: the
@@ -587,7 +588,7 @@
       try {
         trusted = await repoStore.trustRepo(wt.path);
       } catch (cause) {
-        return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't merge the worktree", epoch);
+        return showFailure({ ok: false, cause, error: describeError(cause, "worktrees") }, "Couldn't merge the worktree", epoch);
       }
       if (!trusted) return;
       // The trust prompt can sit open while the reader goes elsewhere. The

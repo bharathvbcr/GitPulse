@@ -71,10 +71,14 @@ describe("RepoTabBar", () => {
     expect(open).toBeGreaterThan(zone);
     expect(menu).toBeGreaterThan(open);
     expect(actions).toBeGreaterThan(menu);
-    const zoneTag = source.slice(source.lastIndexOf("<div", zone), source.indexOf("></div>", zone));
-    expect(zoneTag).toContain("min-w-12");
+    const zoneTag = source.slice(source.lastIndexOf("<div", zone), source.indexOf(">", zone));
+    expect(zoneTag).toContain("min-w-6");
     expect(zoneTag).toContain("flex-1");
     expect(zoneTag).toContain("data-tauri-drag-region");
+    // The gap is marked by the same hairline as the surfaces/repositories
+    // break, and the hairline takes no pointer events so the zone still drags.
+    const rule = source.slice(source.indexOf("data-drag-zone>", zone), source.indexOf("</div>", zone));
+    expect(rule).toMatch(/class="gp-separator pointer-events-none[^"]*"[^>]*data-drag-zone-rule/);
     const openTag = source.slice(source.lastIndexOf("<button", open), source.indexOf("\n    >", open));
     expect(openTag).not.toContain("ml-auto");
     expect(openTag).toContain("shrink-0");

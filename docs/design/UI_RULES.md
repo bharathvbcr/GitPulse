@@ -58,6 +58,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 | 14 | Banned terms in UI strings (§3): `BANNED_UI_TERMS` in `src/lib/ui/copy/vocabulary.ts`, checked in the same `.svelte` user-copy positions as rule 13: markup text, display attributes (`title`, `aria-label`, `placeholder`, `alt`, `label`, `data-tip`) and string literals inside `{…}`. Not checked: `<script>` strings, `.ts` files, `src/lib/ui/copy/` itself. The linter header lists the exact positions and the blind spots. The retired verbs (`RETIRED_VERB_TERMS`) and voice checks (`VOICE_TERMS`) are separate lists, added to the lint in Wave 2 once each view has cleared them. | The glossary word |
 | 15 | An animated class missing from the reduced-motion lists, or a translucent surface missing from the reduced-transparency block | Add it to **both** lists in the same commit. The paired tests pin them equal |
 | 16 | A `gp-separator` directly under a section heading | The heading already separates its group: put `mb-2` on the heading row. A separator that divides one group from the next (a menu group, a heading that follows it) is fine |
+| 19 | A `max-w-*` cap on page content (a notice, banner or card held to `max-w-2xl`/`4xl`), (the lint reads the caps; `src/lib/ui/pageLayout.contract.test.ts` pins that migrated pages use no `sm:`/`md:`/`lg:`/`xl:` viewport breakpoint for layout) | Page content fills its pane: `PageBody` (`gp-page` + `gp-page-body`), `gp-page-section`, `gp-page-grid` for cards, `gp-prose` for running text, `@2xl:`/`@4xl:` container variants for columns (DESIGN_LANGUAGE 7a). A single select or truncating cell that must stay narrow says why with `data-width-cap="<reason>"` on the element. Modals, tooltips, toasts, menus, `EmptyState` prose and markdown reading width keep their caps (the lint reads page components only) |
 
 ## 2. Use this, never that
 
@@ -76,6 +77,7 @@ Status: **proposed 2026-11-09, not yet adopted.** These rules become binding whe
 | Dialog / sheet | `gp-scrim` + `gp-card` + `focusTrap` + `backdropFade`/`cardScale` in **and** out (→ `Dialog.svelte`) | a dialog without an outro, `rounded-3xl` |
 | Toast | `ToastContainer` on `LAYERS.TOAST` | literal `fly`/`fade` timings |
 | Panel header | `gp-header` (title and actions slots, tonal step) | `border-b` headers, hand-picked `px-3 py-2` |
+| Page content area | `PageBody.svelte` (`gp-page` + `gp-page-body`), then `gp-page-section`, `gp-page-grid`, `gp-prose` | `flex-1 overflow-auto p-4 space-y-5` scrollers, `max-w-*` columns, `mx-auto` centring |
 | List row | `gp-row` (`--gp-row-h` from density) | per-list padding recipes |
 | Nothing exists yet | `EmptyState.svelte` (title says what would be here, hint says how it comes to exist) | ad-hoc "No …" text |
 | Couldn't determine | `gp-notice` with tone `unknown` and the reason, plus a Rescan action | `EmptyState`, a green tick, or "0". **A check that could not run never looks like one that passed** |
