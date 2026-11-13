@@ -46,6 +46,19 @@ describe("PulseExportModal component", () => {
     expect(source).toContain("clearTimeout(copyTimer)");
   });
 
+  it("saves through the native save seam and shows what happened", () => {
+    expect(source).toContain('from "../../desktop/saveFile"');
+    expect(source).not.toContain("createObjectURL");
+    // A failed save is an alert in the footer; a save or a requested download is a status.
+    expect(source).toContain('role={saveNote.tone === "danger" ? "alert" : "status"}');
+    expect(source).toMatch(/saveNote = \{ tone: "danger", text: copy\.detail/);
+    // Closing or reopening the dialog clears the last result.
+    expect(source).toMatch(/function resetCopyState\(\) \{[\s\S]*saveNote = null;[\s\S]*saveRun \+= 1;/);
+    // A save that lands after a close or a newer save is dropped, on success and on failure.
+    expect(source).toContain("const run = ++saveRun;");
+    expect(source.match(/if \(run !== saveRun\) return;/g)).toHaveLength(2);
+  });
+
   it("wears the shared button grammar", () => {
     expect(source).toContain('class="gp-btn" data-size="md"');
     expect(source).toContain('data-variant="primary"');

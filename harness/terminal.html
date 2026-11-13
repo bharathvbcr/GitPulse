@@ -104,7 +104,7 @@
           case "cmd_terminal_ack":
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
-          case "cmd_terminal_export": return true;
+          case "cmd_save_export": return args.fileName;
           case "cmd_terminal_write":
             report.writes++;
             lastWriteId = args.sessionId;

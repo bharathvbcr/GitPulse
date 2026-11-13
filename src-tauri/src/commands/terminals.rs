@@ -296,27 +296,6 @@ pub async fn cmd_terminal_backend(
     .await
 }
 
-/// Exports user-selected terminal output through the native save dialog.
-#[tauri::command(async)]
-pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {
-    if data.len() > 16 * 1024 * 1024 {
-        return Err("Terminal export exceeds 16 MiB".into());
-    }
-    let Some(file) = rfd::AsyncFileDialog::new()
-        .set_title("Export retained terminal output")
-        .set_file_name("terminal-output.txt")
-        .add_filter("Text", &["txt"])
-        .save_file()
-        .await
-    else {
-        return Ok(false);
-    };
-    file.write(data.as_bytes())
-        .await
-        .map_err(|e| format!("Could not export terminal output: {e}"))?;
-    Ok(true)
-}
-
 /// Releases rendered output bytes so the PTY reader can continue.
 ///
 /// In-process it runs inline, unlike the commands above: it is a map lookup
