@@ -1405,7 +1405,10 @@
                 // The edge eases in (the field's border-color transition).
                 await sleepUntil(() => !!box && getComputedStyle(box).borderTopColor === focusEdge, 1000);
                 const style = box ? getComputedStyle(box) : null;
-                seen.push({ name, focused: document.activeElement === input, edge: style?.borderTopColor, shadow: style?.boxShadow });
+                // `windowFocus`: WebKit matches `:focus` only in a focused,
+                // active page, so a runner window that never became key shows
+                // the resting edge with the input still the active element.
+                seen.push({ name, focused: document.activeElement === input, windowFocus: document.hasFocus(), edge: style?.borderTopColor, shadow: style?.boxShadow });
                 input?.blur();
               }
               check("focus: a focused text field leans its edge toward the accent (--field-focus-edge) and draws no halo", () => {
