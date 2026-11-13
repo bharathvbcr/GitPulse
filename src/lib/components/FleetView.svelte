@@ -686,7 +686,7 @@
   onkeydown={onGridKeydown}
 >
   <!-- Header band: the one sentence, then the totals. -->
-  <header class="shrink-0 bg-surface px-4 py-3 flex flex-col gap-3">
+  <header class="shrink-0 px-4 py-3 flex flex-col gap-3">
     <div class="flex items-start gap-3">
       <div class="flex items-center gap-2 min-w-0 flex-1">
         <LayoutGrid size={16} class="text-accent shrink-0" />
@@ -761,7 +761,7 @@
   />
 
   <!-- Toolbar: filter, search, and the four scans that cost something. -->
-  <div class="shrink-0 bg-surface px-4 py-2 flex flex-wrap items-center gap-2">
+  <div class="shrink-0 px-4 py-2 flex flex-wrap items-center gap-2">
     <div class="flex items-center gap-1" role="group" aria-label="Filter repositories">
       <button
         type="button"

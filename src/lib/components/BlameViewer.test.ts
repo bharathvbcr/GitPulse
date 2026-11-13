@@ -40,7 +40,7 @@ describe("BlameViewer source contracts", () => {
     expect(source).not.toContain("<FileTreePanel");
     const viewer = readFileSync(join(here, "FileViewer.svelte"), "utf8");
     const row = viewer.slice(viewer.indexOf("flex-1 flex min-h-0 overflow-hidden relative"));
-    const column = row.indexOf("<FileTreeColumn reserve={explorerReserve}>");
+    const column = row.indexOf("<FileTreeColumn");
     expect(column).toBeGreaterThan(-1);
     expect(row.indexOf('<LazyView load={loadBlame} name="Blame" />')).toBeGreaterThan(column);
   });

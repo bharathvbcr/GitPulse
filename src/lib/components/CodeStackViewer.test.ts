@@ -136,7 +136,9 @@ describe("CodeStackViewer accessibility", () => {
   it("keeps banner text readable in light theme", () => {
     // The tone is a role, resolved per theme by the notice itself, not a
     // palette pair that has to be remembered for light mode.
-    expect(source).toContain('class="gp-notice mb-3! max-w-3xl" data-tone="danger"');
+    expect(source).toContain('class="gp-notice" data-tone="danger"');
+    // Page content fills the pane (DESIGN_LANGUAGE 7a): no fixed measure on a banner.
+    expect(source).not.toMatch(/gp-notice[^"]*max-w-/);
     expect(source).not.toMatch(/text-rose-|dark:text-/);
   });
 

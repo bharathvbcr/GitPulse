@@ -41,7 +41,8 @@ import { invoke } from "../ipc/invoke";
 import type { CoverageReport } from "../coverage/types";
 import { isMarkdownOrNote, type LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";
-import { formatDiagnosticFailure, reportPanelError } from "../diagnostics/report";
+import { formatDisplayFailure, reportPanelError } from "../diagnostics/report";
+import { INTERNAL_ERROR_COPY } from "../ui/formatError";
 import { createMetric, createMetricRegistry, type Metric } from "./freshness";
 import { dependsOnStorage, dependsOnWorktreeContent } from "../repos/changeScope";
 
@@ -68,8 +69,13 @@ const REPORTERS = {
 
 function failureWiring(source: keyof typeof REPORTERS) {
   return {
-    formatError: (err: unknown) => formatDiagnosticFailure(err),
+    // Shown on the panel, so a runtime fault reads as plain copy; its raw text
+    // is already in Diagnostics, recorded by the formatter under this source.
+    formatError: (err: unknown) => formatDisplayFailure(err, source),
     onFailure: (_repoPath: string, message: string) => {
+      // The plain copy is not a fault of its own: logging it would add a
+      // second, contentless entry beside the raw one.
+      if (message === INTERNAL_ERROR_COPY) return;
       REPORTERS[source](message);
     },
   };

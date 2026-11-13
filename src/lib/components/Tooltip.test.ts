@@ -24,6 +24,14 @@ describe("Tooltip beside an open popup", () => {
   });
 });
 
+describe("Tooltip text wrapping", () => {
+  it("breaks a word with no spaces, such as a file path, inside the bubble's max width", () => {
+    const textBubble = source.match(/'max-w-xs [^']*'/)?.[0] ?? "";
+    expect(textBubble).toContain("whitespace-pre-line");
+    expect(textBubble).toContain("[overflow-wrap:anywhere]");
+  });
+});
+
 describe("Tooltip destination guides", () => {
   it("renders ViewGuideCard when the anchor carries data-tip-guide", () => {
     expect(source).toContain("destinationGuide");

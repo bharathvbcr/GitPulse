@@ -9,7 +9,7 @@
   import { offerBranchUndo } from "../repos/branchUndo";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import LazyMount from "./LazyMount.svelte";
@@ -499,7 +499,7 @@
       if (raw) createName = raw.replace(/^[#`]+/, "").replace(/[`]+$/, "");
     } catch (err) {
       if (!tabScope.isCurrent(epoch)) return;
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     } finally {
       // A switch already cleared the flag; a stale request must not clear the
       // new repository's own in-flight one.

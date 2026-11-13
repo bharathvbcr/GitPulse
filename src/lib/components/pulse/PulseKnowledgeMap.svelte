@@ -98,7 +98,7 @@
     {#if error}
       <PulseStaleNotice {error} {measuredAt} />
     {/if}
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+    <div class="grid grid-cols-1 @xl:grid-cols-3 gap-3">
       <!-- Bus Factor Card -->
       <div class="p-3 rounded-lg bg-background flex flex-col justify-between">
         <div class="flex items-center justify-between text-textMuted text-xs">

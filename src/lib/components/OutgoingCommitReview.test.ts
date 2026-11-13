@@ -54,7 +54,7 @@ describe("outgoingState: when the card shows", () => {
 
   it("is unknown without a branch row, and says whether the list is loading, failed or just empty", () => {
     expect(outgoingState(null, { loading: true, error: null })).toMatchObject({ kind: "unknown", reason: expect.stringContaining("Still reading") });
-    expect(outgoingState(null, { loading: false, error: "boom" })).toMatchObject({ kind: "unknown", reason: expect.stringContaining("could not be read") });
+    expect(outgoingState(null, { loading: false, error: "boom" })).toMatchObject({ kind: "unknown", reason: expect.stringContaining("couldn't be read") });
     expect(outgoingState(null, settled)).toMatchObject({ kind: "unknown", reason: expect.stringContaining("No branch is checked out") });
   });
 

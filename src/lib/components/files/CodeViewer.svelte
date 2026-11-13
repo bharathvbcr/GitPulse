@@ -19,7 +19,7 @@
     usesTreeSitter,
   } from "../../diff/highlight";
   import { copyText } from "../../desktop/clipboard";
-  import { formatError } from "../../ui/formatError";
+  import { describeError } from "../../ui/copy/describeFailure";
   import { askConfirm } from "../../stores/modalStore";
   import { createAsyncGuard } from "../../async/guard";
   import {
@@ -368,7 +368,7 @@
       saveSuccess = true;
       setTimeout(() => (saveSuccess = false), 2000);
     } catch (err: unknown) {
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     } finally {
       if (filePath === path && editorGeneration === generation) isSaving = false;
     }
@@ -544,7 +544,7 @@
     open above the bar so they do not cover the file.
   -->
   <div
-    class="relative shrink-0 gp-section-edge bg-surface/80 select-none"
+    class="relative shrink-0 gp-section-edge select-none"
     data-tip-place="above"
   >
     <div bind:this={actionBar} class="gp-header-scroll">
@@ -714,7 +714,7 @@
   </div>
 
   {#if goToLineOpen}
-    <div class="relative shrink-0 bg-surface select-none">
+    <div class="relative shrink-0 select-none">
       <div bind:this={goToBar} class="gp-header-scroll">
         <div class="flex items-center gap-2 px-3 py-2 min-w-max">
       <span class="text-xs text-textMuted shrink-0">Go to line (1–{rawLines.length}):</span>
@@ -819,7 +819,7 @@
   </div>
 
   <!-- Bottom Status Bar -->
-  <div class="relative shrink-0 gp-section-edge bg-surface/90 text-micro font-mono text-textMuted select-none">
+  <div class="relative shrink-0 gp-section-edge text-micro font-mono text-textMuted select-none">
     <div bind:this={statusBar} class="gp-header-scroll">
       <div class="flex items-center justify-between gap-3 px-3 py-1 min-w-max w-full">
     <div class="flex items-center gap-3 shrink-0">

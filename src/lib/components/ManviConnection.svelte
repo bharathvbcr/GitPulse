@@ -75,7 +75,7 @@
   }
 </script>
 
-<div class="space-y-4">
+<div class="@container space-y-4">
   <!-- Policy connection -->
   <section id={manviSectionId("harness")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between gap-2">
@@ -169,7 +169,7 @@
       </p>
     </div>
 
-    <div class="grid gap-2 sm:grid-cols-2">
+    <div class="grid gap-2 @xl:grid-cols-2">
       <div class="rounded-xl bg-background p-3 space-y-1">
         <div class="flex items-center gap-2 text-textPrimary font-medium">
           <SquareTerminal size={13} class="text-textMuted" />
@@ -198,7 +198,7 @@
       </div>
     </div>
 
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+    <div class="grid grid-cols-2 @xl:grid-cols-4 gap-2">
       <button
         class="gp-btn justify-start"
         disabled={!$repoStore.currentPath}

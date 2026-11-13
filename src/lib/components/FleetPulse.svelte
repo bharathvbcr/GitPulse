@@ -83,8 +83,8 @@
 </script>
 
 <section
-  class="shrink-0 px-4 py-2.5"
-  aria-label="Fleet Pulse"
+  class="@container shrink-0 px-4 py-2.5"
+  aria-label="Fleet pulse"
   data-testid="fleet-pulse"
 >
   <div class="flex items-center gap-2">
@@ -97,7 +97,7 @@
     >
       {#if open}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
       <Activity size={12} class="text-accent" />
-      <span class="text-meta font-semibold">Fleet Pulse</span>
+      <span class="text-meta font-semibold">Fleet pulse</span>
     </button>
 
     {#if pulse.counted > 0}
@@ -158,7 +158,7 @@
         {coverage || "No commit history has been read yet."}
       </p>
     {:else}
-      <div class="mt-2 grid gap-3 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+      <div class="mt-2 grid gap-3 @4xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <!-- The chart, and the one sentence that qualifies it. -->
         <div class="gp-card rounded-lg px-3 py-2 flex flex-col gap-1.5 min-w-0">
           <div class="flex items-baseline gap-2 flex-wrap">

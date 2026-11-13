@@ -507,7 +507,7 @@
     {/if}
   {:else}
     <div class="resolve-workspace">
-      <aside class="file-rail" aria-label="Conflicted files">
+      <aside class="file-rail gp-float-card" aria-label="Conflicted files">
         <div class="rail-heading"><span>Files to resolve</span><span>{conflictedFiles.length}</span></div>
         <label class="file-search"><Search size={13} /><input type="search" placeholder="Filter files…" aria-label="Filter conflicted files" bind:value={fileFilter} /></label>
         <nav class="file-list" aria-label="Choose a conflicted file">
@@ -651,7 +651,7 @@
   .recovery-list pre { max-height: 140px; }
   .staged-review { flex: 1; min-height: 160px; overflow: auto; }
   .resolve-workspace { display: flex; flex: 1; min-height: 0; }
-  .file-rail { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 16px 10px; background: var(--mac-fill-surface, rgb(var(--c-surface))); }
+  .file-rail { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 16px 10px; }
   .rail-heading { display: flex; justify-content: space-between; padding: 0 6px 12px; font-size: var(--text-meta); font-weight: 600; color: rgb(var(--c-text-muted)); }
   .file-search { display: flex; align-items: center; gap: 7px; margin: 0 3px 12px; padding: 7px 8px; border: 1px solid var(--gp-edge); border-radius: var(--gp-r-full); color: rgb(var(--c-text-muted)); }
   .file-search input { width: 100%; min-width: 0; background: transparent; outline: none; font-size: var(--text-meta); }

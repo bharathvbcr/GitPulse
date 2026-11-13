@@ -4,6 +4,7 @@ import { searchSymbols, searchWorkspaceSymbols, listWorkspaceRepos } from "../co
 import type { CodeintelSymbolHit, WorkspaceFederatedHit, WorkspaceRepoEntry } from "../codeintel/types";
 import { boundText, boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
 import type { PaletteMode } from "./model";
+import { describeError } from "../ui/copy/describeFailure";
 
 export interface SearchResult {
   files: readonly string[];
@@ -40,7 +41,7 @@ export function scheduleSearch(request: SearchRequest, publish: (result: SearchR
   };
   publish({ ...emptySearch(), loading: true });
   const debounce = setTimeout(async () => {
-    deadline = setTimeout(() => finish({ ...emptySearch(), failed: true, note: "Search timed out. Retry when the repository is ready." }), SEARCH_TIMEOUT_MS);
+    deadline = setTimeout(() => finish({ ...emptySearch(), failed: true, note: "Search timed out. Try again when the repository is ready." }), SEARCH_TIMEOUT_MS);
     try {
       const result = emptySearch();
       if (request.mode === "files") result.files = await deps.files(request.repoPath);
@@ -79,7 +80,7 @@ export function scheduleSearch(request: SearchRequest, publish: (result: SearchR
       }
       finish(result);
     } catch (error) {
-      finish({ ...emptySearch(), failed: true, note: `Search failed: ${error instanceof Error ? error.message : String(error)}` });
+      finish({ ...emptySearch(), failed: true, note: `Couldn't search: ${describeError(error, "palette:search")}` });
     }
   }, SEARCH_DELAY_MS);
   return () => { guard.cancel(); clearTimeout(debounce); clearTimeout(deadline); };

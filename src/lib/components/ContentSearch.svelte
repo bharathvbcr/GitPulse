@@ -30,7 +30,7 @@
    * answer says "partial" and why, never just a count.
    */
   import { Search, X } from "@lucide/svelte";
-  import { tick, untrack } from "svelte";
+  import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import { formatError } from "../ui/formatError";
@@ -38,7 +38,7 @@
   import { cancelCodeintelQuery, newCodeintelCancelToken } from "../codeintel/client";
   import { describeSearchReport, groupByFile } from "../search/contentSearch";
   import { requestReveal } from "../files/revealRequests";
-  import { consumeSearchFocus, explorerLens, setEditorLens } from "../files/explorerLens";
+  import { setEditorLens } from "../files/explorerLens";
   import type { ContentMatch, ContentSearchOptions, ContentSearchReport } from "../search/types";
   import EmptyState from "./EmptyState.svelte";
 
@@ -53,22 +53,27 @@
      */
     onOpen,
     onSelectMatch,
+    pattern = $bindable(""),
   }: {
     repoPath?: string | null;
     onOpen?: (path: string) => void;
     onSelectMatch?: (path: string, line: number | null, column: number | null) => void;
+    /**
+     * The query. The field it is typed in belongs to the host — Explorer's one
+     * search field in Contents mode — so this panel holds only its options,
+     * the Search button and the results.
+     */
+    pattern?: string;
   } = $props();
 
   const effectiveRepoPath = $derived(repoPath ?? $currentRepoPath);
 
-  let pattern = $state("");
   let fixedStrings = $state(true);
   let ignoreCase = $state(true);
   let revision = $state("");
   // Replaced wholesale by each answer, never edited in place.
   let report = $state.raw<ContentSearchReport | null>(null);
   let error = $state<string | null>(null);
-  let patternInput: HTMLInputElement | undefined = $state();
   let running = $state(false);
   let inflight: AsyncGuard | null = null;
   let token: string | null = null;
@@ -81,7 +86,8 @@
     token = null;
   }
 
-  async function run() {
+  /** Runs the search for the current pattern; the host's field calls it on Enter. */
+  export async function run() {
     const repo = effectiveRepoPath;
     if (!repo || !pattern) return;
     stop();
@@ -170,33 +176,17 @@
     if (repo) untrack(() => searchMemo.set(repo, memo));
   });
 
-  // The box takes focus when someone asked to search — the toggle, the
-  // palette — and never merely because Explorer mounted with Search up,
-  // which would pull focus out of the editor. `tick` first: the request
-  // usually arrives while the rail is still hidden.
-  $effect(() => {
-    if (!$explorerLens.searchFocusPending || !patternInput) return;
-    untrack(() => {
-      if (!consumeSearchFocus()) return;
-      void tick().then(() => patternInput?.focus());
-    });
-  });
-
   $effect(() => () => stop());
 </script>
 
-<!-- Laid out for Explorer's rail (about 288px, resizable): the query gets
-     its own full-width row, and the options wrap under it rather than
-     squeezing the box. -->
-<div class="flex-1 flex flex-col min-h-0 min-w-0 bg-surface/50 text-xs" data-content-search>
+<!-- Laid out for Explorer's rail (about 288px, resizable): the revision and
+     Search button share a row, and the options wrap under it rather than
+     squeezing the box. The query itself is typed in Explorer's field above. -->
+<div class="flex-1 flex flex-col min-h-0 min-w-0 text-xs" data-content-search>
   <form
-    class="px-2 pt-2 pb-1.5 gp-section-edge bg-surface/30 flex flex-col gap-1.5 shrink-0"
+    class="px-2 pt-2 pb-1.5 gp-section-edge flex flex-col gap-1.5 shrink-0"
     onsubmit={(event) => { event.preventDefault(); void run(); }}
   >
-    <label class="relative w-full">
-      <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
-      <input class="gp-field w-full pl-7! font-mono" type="search" placeholder="Search file contents" aria-label="Search file contents" bind:value={pattern} bind:this={patternInput} />
-    </label>
     <div class="flex items-center gap-1.5 min-w-0">
       <input class="gp-field flex-1 min-w-0 font-mono" placeholder="Revision (optional)" aria-label="Revision to search" bind:value={revision} />
       {#if running}

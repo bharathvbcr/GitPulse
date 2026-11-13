@@ -12,7 +12,7 @@ import {
  * listing, the renderer drain) on a host that answers them late. The backend's
  * own kill takes up to ~10 s on a loaded host (the arithmetic is in
  * `inputQueue.ts`), so a frontend bound near 5 s turned a close that worked
- * into "Close failed; use Sessions to retry".
+ * into "Close failed; use Sessions to try again".
  */
 
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
@@ -68,7 +68,7 @@ function keeper() {
 }
 
 describe("a close on a slow host", () => {
-  it("a kill that answers at 6 s is a successful close, not 'Close failed; use Sessions to retry'", async () => {
+  it("a kill that answers at 6 s is a successful close, not 'Close failed; use Sessions to try again'", async () => {
     // The reported defect, with nothing else asserted: the backend's kill
     // (hangup grace, reap, cleanup poll) takes 2.6 to 3.5 s routinely and up to
     // ~10 s under load, and the frontend gave up at 5 s.

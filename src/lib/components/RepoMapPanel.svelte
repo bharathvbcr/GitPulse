@@ -827,7 +827,7 @@
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
   <!-- Freshness strip from cmd_devmap_status -->
   <div
-    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 bg-surface/60 px-3 py-2 text-meta text-textMuted"
+    class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-meta text-textMuted"
     role="status"
   >
     {#if loading && !map}
@@ -1188,10 +1188,11 @@
     {/if}
   {:else}
     {@const doc = map as RepoMapDocument}
-    <div class="flex-1 flex min-h-0 gap-2 p-2">
-      <!-- Subsystem tree -->
+    <div class="flex-1 flex min-h-0">
+      <!-- Subsystem tree: a floating card, its gutter coming from the card margin -->
       <nav
-        class="w-64 shrink-0 flex flex-col min-h-0 rounded-xl bg-surface/60"
+        class="gp-float-card w-64 shrink-0 flex flex-col"
+        data-repomap-subsystems-card
         aria-label="Subsystems"
       >
         <div class="shrink-0 space-y-2 px-2.5 pt-2.5 pb-2">

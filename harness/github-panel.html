@@ -470,7 +470,7 @@
           filterStore.clear();
 
           // ---- external links --------------------------------------------------
-          button("New pull request", $("h2", stage).parentElement.parentElement).click();
+          button("New pull request", $("[data-page-header]", stage)).click();
           await settle();
           check("New pull request opens GitHub's compare form through the canonical opener", () =>
             opened.at(-1)?.startsWith("https://github.com/acme/app/compare/main...") && windowOpens.length === 0);

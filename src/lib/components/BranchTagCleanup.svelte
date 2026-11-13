@@ -314,7 +314,7 @@
         <div class="gp-notice" data-tone="info" role="status">{notice}</div>
       {/if}
 
-      <div class="grid gap-4 xl:grid-cols-2">
+      <div class="grid gap-4 @4xl:grid-cols-2">
         <section class="gp-card p-4">
           <div class="mb-3 flex items-center justify-between">
             <div>

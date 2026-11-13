@@ -31,7 +31,7 @@ describe("describeSearchReport", () => {
       expect(text).toContain("partial");
       expect(text).toContain("more matches may exist");
     }
-    expect(describeSearchReport(report({ truncated: true, truncated_reason: "cancelled" }))).toContain("cancelled");
+    expect(describeSearchReport(report({ truncated: true, truncated_reason: "cancelled" }))).toContain("canceled");
     // A reason this build does not know is still a partial answer.
     expect(describeSearchReport(report({ truncated: true, truncated_reason: "new_reason" }))).toContain(
       "partial: the search stopped early",

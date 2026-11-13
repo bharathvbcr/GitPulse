@@ -167,7 +167,7 @@ describe("runBoundedSerial and deleteTasks", () => {
     expect(result.deleted).toEqual([]);
     expect(result.failed[0]?.retryable).toBe(true);
     expect(result.failed[0]?.code).toBe("transport_error");
-    await expect(bounded(new Promise(() => {}), 10, "Delete timed out. Retry to confirm its result.")).rejects.toMatchObject({ code: "transport_error" });
+    await expect(bounded(new Promise(() => {}), 10, "Delete timed out. Try again to confirm its result.")).rejects.toMatchObject({ code: "transport_error" });
   });
 });
 
@@ -248,7 +248,7 @@ describe("restoreTasks and restoreSummary", () => {
 
   it("names a hung restore as a restore, not a delete", async () => {
     const result = await restoreTasks([task()], () => new Promise<void>(() => {}), { newID, timeout: 10 });
-    expect(result.failed[0]?.message).toBe("Restore timed out. Retry to confirm its result.");
+    expect(result.failed[0]?.message).toBe("Restore timed out. Try again to confirm its result.");
   });
 
   it("says when nothing was restored", () => {

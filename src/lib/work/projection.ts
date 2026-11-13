@@ -611,11 +611,24 @@ export function insightSummary(projection: WorkProjection): WorkInsightSummary {
   };
 }
 
-/** One sentence naming what could not be read, or empty when all of it could. */
+/**
+ * One sentence naming what could not be read, or empty when all of it could.
+ * Sources that failed for the same reason share it: five reads that all hit
+ * one fault (the bridge missing, say) name the reason once after all five,
+ * rather than printing the same sentence five times.
+ */
 export function degradedSummary(sources: WorkSources): string {
-  const failed = Object.entries(sources)
-    .filter(([, state]) => !(state as WorkSourceState).ok)
-    .map(([name, state]) => `${name} (${(state as WorkSourceState).detail || "no reason given"})`);
-  if (failed.length === 0) return "";
-  return `This screen is incomplete: ${failed.join("; ")}.`;
+  const order: readonly (keyof WorkSources)[] = ["tasks", "worktrees", "github", "ledger", "grants"];
+  const byReason = new Map<string, string[]>();
+  for (const name of order) {
+    const state = sources[name];
+    if (state.ok) continue;
+    const reason = state.detail || "no reason given";
+    const names = byReason.get(reason);
+    if (names) names.push(name);
+    else byReason.set(reason, [name]);
+  }
+  if (byReason.size === 0) return "";
+  const parts = [...byReason].map(([reason, names]) => `${names.join(", ")} (${reason})`);
+  return `This screen is incomplete: ${parts.join("; ")}.`;
 }

@@ -20,6 +20,7 @@ import type {
   CommitGraphWritePlan,
 } from "../storage/types";
 import type { Guarded } from "../stores/harnessStore";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** States in which a write would improve the graph; the button exists only then. */
 const OFFERED: readonly CommitGraphState[] = ["missing", "stale", "no_bloom"];
@@ -69,7 +70,7 @@ export interface CommitGraphWriteFlow extends Readable<CommitGraphWriteStep> {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return describeError(error, "commit-graph-write");
 }
 
 export function createCommitGraphWriteFlow(options: {

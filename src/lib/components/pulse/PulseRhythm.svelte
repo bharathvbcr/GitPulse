@@ -21,7 +21,7 @@
   );
 </script>
 
-<div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+<div class="grid grid-cols-2 @xl:grid-cols-4 gap-3">
   <!-- Current Streak -->
   <div class="gp-card p-3.5 flex flex-col justify-between">
     <div class="flex items-center justify-between mb-1">

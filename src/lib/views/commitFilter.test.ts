@@ -46,20 +46,23 @@ describe("commit-search chord", () => {
     // chord meant three things depending on the pane. The field is one control
     // now and the page decides what it does, so ownership no longer asks which
     // view or section is showing.
-    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: true, defaultPrevented: false })).toBe(true);
+    expect(fieldOwnsFindChord({ hasRepository: true, defaultPrevented: false })).toBe(true);
   });
 
   it("leaves the chord alone where the field is not on screen", () => {
-    // No repository: row 2 has no field. Fleet, Agents or Tasks: row 2 is
-    // inert under the surface's name, so focusing it would land on a hidden
-    // control.
-    expect(fieldOwnsFindChord({ hasRepository: false, onRepositorySurface: true, defaultPrevented: false })).toBe(false);
-    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: false, defaultPrevented: false })).toBe(false);
+    // No repository: row 2 has no field.
+    expect(fieldOwnsFindChord({ hasRepository: false, defaultPrevented: false })).toBe(false);
+  });
+
+  it("hands the chord to the field under Fleet, Agents and Tasks too", () => {
+    // Row 2 keeps the field there (as the repository palette), so the surface
+    // no longer decides; this used to pin that those surfaces did not own it.
+    expect(fieldOwnsFindChord({ hasRepository: true, defaultPrevented: false })).toBe(true);
   });
 
   it("leaves a chord another pane already took", () => {
     // The terminal's own find marks ⌘F handled; the field must not steal it.
-    expect(fieldOwnsFindChord({ hasRepository: true, onRepositorySurface: true, defaultPrevented: true })).toBe(false);
+    expect(fieldOwnsFindChord({ hasRepository: true, defaultPrevented: true })).toBe(false);
   });
 
   it("sends native Search Commits to History's graph, where the field filters commits", () => {

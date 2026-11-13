@@ -39,6 +39,7 @@
 
 <script lang="ts">
   import { motionMs } from "../motion/tokens";
+  import { describeError } from "../ui/copy/describeFailure";
   import { springEasing } from "../ui/transitions";
   import Skeleton from "./Skeleton.svelte";
 
@@ -113,7 +114,7 @@
       },
       (error: unknown) => {
         if (cancelled) return;
-        failure = error instanceof Error ? error.message : String(error);
+        failure = describeError(error, "lazy-view");
       },
     );
     return () => {

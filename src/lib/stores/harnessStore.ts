@@ -2,7 +2,7 @@ import { writable, get } from "svelte/store";
 import { invoke, readIpcError } from "../ipc/invoke";
 import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
 import { clean } from "../terminal/sessionActivity";
-import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
+import { formatDisplayFailure } from "../diagnostics/report";
 import { mergeEvents } from "../ledger/projection";
 import {
   ledgerStatus,
@@ -268,6 +268,15 @@ function retainHarnessError(
   return incoming;
 }
 
+/**
+ * The reason a status read failed, as the Manvi chip's tooltip prints it. A
+ * runtime fault in this page is replaced by plain copy and recorded in
+ * Diagnostics; anything else keeps the redacted text it always had.
+ */
+function statusFailure(detail: unknown): string {
+  return formatDisplayFailure(detail, "manvi");
+}
+
 function unavailableHarness(
   current: HarnessStatus | null,
   detail: unknown,
@@ -278,7 +287,7 @@ function unavailableHarness(
     protocol: current?.protocol ?? 0,
     posture: current?.posture ?? "",
     ops: [],
-    error: formatDiagnosticFailure(detail),
+    error: statusFailure(detail),
     error_code: "status_unavailable",
   };
 }
@@ -735,7 +744,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         ...s,
         isProbing: false,
         harness: unavailableHarness(s.harness, err),
-        error: formatDiagnosticFailure(err),
+        error: statusFailure(err),
       }));
       return null;
     }
@@ -806,7 +815,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
             recording: false,
             path: bucket.ledger?.path ?? "",
             dropped: bucket.ledger?.dropped ?? 0,
-            error: formatDiagnosticFailure(e),
+            error: statusFailure(e),
             error_code: "read_failed",
           }),
         }),
@@ -873,7 +882,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         update((s) => ({
           ...s,
           harness: unavailableHarness(s.harness, err),
-          error: formatDiagnosticFailure(err),
+          error: statusFailure(err),
         }));
       }
       return probeAi(token);
@@ -894,7 +903,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         update((s) => ({
           ...s,
           harness: unavailableHarness(s.harness, err),
-          error: formatDiagnosticFailure(err),
+          error: statusFailure(err),
         }));
       }
       return probeAi(token);
@@ -1030,7 +1039,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
             reflog_entries: 0,
             refused_outside_corpus: 0,
             truncated: false,
-            error: formatDiagnosticFailure(e),
+            error: statusFailure(e),
           },
         }));
       }

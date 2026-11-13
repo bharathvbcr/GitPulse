@@ -1,3 +1,12 @@
+<script module lang="ts">
+  /**
+   * The startup probe runs once per app session, not once per mount: the badge
+   * moves between the status bar and the title bar as the surface changes, and
+   * each move is a fresh mount that must not repeat the loopback sweep.
+   */
+  let startupProbed = false;
+</script>
+
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
@@ -14,8 +23,18 @@
   import { openManviFocus } from "../ui/openManviFocus";
   import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert } from "@lucide/svelte";
 
-  /** Whether the Manvi menu is open. Bindable so a host (or a test) can open it. */
-  let { open = $bindable(false) }: { open?: boolean } = $props();
+  /**
+   * Whether the Manvi menu is open, bindable so a host (or a test) can open it,
+   * and which presentation shows. "full" is the status-bar pill: the "Manvi"
+   * label, the model face on wide windows, and a menu that opens upward.
+   * "compact" is the title-bar chip for surfaces with no status bar: the shield
+   * and the alert only, the same accessible name and tooltip, a menu that opens
+   * downward.
+   */
+  let { open = $bindable(false), variant = "full" }: {
+    open?: boolean;
+    variant?: "full" | "compact";
+  } = $props();
 
   const instanceId = $props.id();
   let chipEl = $state<HTMLButtonElement | null>(null);
@@ -24,6 +43,8 @@
   onMount(() => {
     // One probe at startup: the sweep is a handful of loopback connections and
     // a handshake, and the answer decides what the commit box can offer.
+    if (startupProbed) return;
+    startupProbed = true;
     void harnessStore.refresh();
   });
 
@@ -45,12 +66,18 @@
   }
 
   /**
-   * Anchored under the chip and right-aligned to it, since the cluster sits at
-   * the window's right. Escape returns focus to the chip; the chip counts as
+   * Right-aligned to the chip, since it sits at the window's right: under it
+   * from the title bar, above it from the status bar, where below is off the
+   * bottom of the window (the popover flips if the preferred side cannot hold
+   * the menu). Escape returns focus to the chip; the chip counts as
    * inside, or its own pointerdown would close the menu before its click.
    */
   const menuPopover = $derived({
-    anchor: { kind: "element" as const, element: chipEl, gap: 6, align: "end" as const },
+    anchor: { kind: "element" as const, element: chipEl,
+      gap: 6,
+      place: variant === "full" ? ("above" as const) : ("below" as const),
+      align: "end" as const,
+    },
     dismiss: {
       inside: "[data-manvi-menu], [data-manvi-chip]",
       escape: "capture" as const,
@@ -100,7 +127,7 @@
     ? "Refreshing local models"
     : $harnessStore.error ? "Try local model discovery again" : "Refresh local models");
   /**
-   * Closed title-bar label. A failed model check reads "Failed"; the icon
+   * Closed chip label. A failed model check reads "Failed"; the icon
    * button beside it is the retry. The failure sentence stays on the tooltip.
    */
   let closedFace = $derived(
@@ -204,11 +231,12 @@
 {/snippet}
 
 {#if $interfaceStore.showHarnessBadges}
-<div class="flex items-center gap-1.5" data-testid="manvi-titlebar-status">
+<div class="flex items-center gap-1.5" data-testid="manvi-status" data-variant={variant}>
   <!-- One chip for Manvi: its tone is the permission mode, so connected,
        unavailable, "a rule fired" and "not probed yet" stay distinct states.
-       The model face joins it on wide windows (1440px and up); below 1100px
-       only the shield stays, and the accessible name keeps "Manvi" and the
+       In the full variant the model face joins it on wide windows (1440px and
+       up) and below 1100px only the shield stays; the compact variant is always
+       the shield, and the accessible name keeps "Manvi" and the
        state. A failed model check keeps its alert icon on the chip. -->
   <button
     bind:this={chipEl}
@@ -219,7 +247,7 @@
     aria-haspopup="menu"
     aria-expanded={open}
     data-manvi-chip
-    class="gp-chip min-h-6 shrink-0 cursor-pointer gap-1.5"
+    class="gp-chip {variant === "full" ? "min-h-5" : "min-h-6"} shrink-0 cursor-pointer gap-1.5"
     data-tone={harnessTone}
   >
     {#if permissionMode === "connected"}
@@ -229,11 +257,13 @@
     {:else}
       <ShieldAlert size={12} />
     {/if}
-    <span class="font-medium max-[1099px]:sr-only">Manvi</span>
+    <span class={variant === "full" ? "font-medium max-[1099px]:sr-only" : "sr-only"}>Manvi</span>
     {#if modelAttention}
       <CircleAlert size={12} class="shrink-0 text-danger" aria-hidden="true" />
     {/if}
-    <span class="hidden min-w-0 max-w-40 truncate text-textMuted min-[1440px]:inline" aria-hidden="true">{closedFace}</span>
+    {#if variant === "full"}
+      <span class="hidden min-w-0 max-w-40 truncate text-textMuted min-[1440px]:inline" aria-hidden="true">{closedFace}</span>
+    {/if}
   </button>
 
   <!-- Screen readers get the model state whether or not the menu is open. -->

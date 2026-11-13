@@ -1,11 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { formatError } from "../formatError";
+import { readFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { diagnostics } from "../../diagnostics/diagnostics";
+import { IpcError } from "../../ipc/invoke";
+import { formatError, formatErrorRaw } from "../formatError";
 import {
   DETAIL_MAX_CHARS,
+  INTERNAL_ERROR_COPY,
   OBJECT_MAX_CHARS,
   confirmDestructive,
+  describeError,
   describeFailure,
   failureLine,
+  mirrorUserFacingError,
   toOneLine,
   unknownState,
 } from "./describeFailure";
@@ -68,7 +74,6 @@ describe("describeFailure detail", () => {
     const shapes: unknown[] = [
       "clone failed",
       new Error("db locked"),
-      new TypeError("not a function"),
       { message: "rpc failed", code: -1 },
       { code: -1, kind: "io" },
       { b: 2, a: 1 },
@@ -282,5 +287,83 @@ describe("failureLine", () => {
     for (const reason of [undefined, null, "", "  \n "]) {
       expect(failureLine("Couldn't delete the tag", reason)).toBe("Couldn't delete the tag. It did not complete.");
     }
+  });
+});
+
+describe("describeError and runtime faults", () => {
+  const RAW = "Cannot read properties of undefined (reading 'invoke')";
+
+  function recorded(): readonly string[] {
+    let entries: readonly { message: string }[] = [];
+    diagnostics.subscribe((next) => { entries = next; })();
+    return entries.map((entry) => entry.message);
+  }
+
+  beforeEach(() => diagnostics.clear());
+  afterEach(() => diagnostics.clear());
+
+  it("never returns a JavaScript runtime fault verbatim, and records it in Diagnostics", () => {
+    for (const fault of [new TypeError(RAW), new ReferenceError("x is not defined"), new RangeError("Invalid array length"), new SyntaxError("Unexpected token")]) {
+      diagnostics.clear();
+      const text = describeError(fault, "test-source");
+      expect(text).toBe(INTERNAL_ERROR_COPY);
+      expect(text).not.toContain(fault.message);
+      expect(recorded().some((message) => message.includes(fault.message))).toBe(true);
+    }
+  });
+
+  it("leaves what the backend said alone and records nothing", () => {
+    expect(describeError("clone failed")).toBe("clone failed");
+    expect(describeError(new Error("db locked"))).toBe("db locked");
+    expect(describeError(new IpcError("unclassified", "File not found: a.ts"))).toBe("File not found: a.ts");
+    expect(describeError({ message: "rpc failed", code: -1 })).toBe("rpc failed");
+    expect(recorded()).toEqual([]);
+  });
+
+  it("keeps formatErrorRaw verbatim, so logs and Diagnostics still see the fault", () => {
+    expect(formatErrorRaw(new TypeError(RAW))).toBe(RAW);
+    expect(recorded()).toEqual([]);
+  });
+
+  it("formatError is safe by default and records the fault in Diagnostics exactly once", () => {
+    const fault = new TypeError(RAW);
+    expect(formatError(fault)).toBe(INTERNAL_ERROR_COPY);
+    expect(recorded().filter((message) => message.includes(RAW))).toHaveLength(1);
+    // The same error rendered again, or through describeError, adds nothing.
+    expect(formatError(fault)).toBe(INTERNAL_ERROR_COPY);
+    expect(describeError(fault, "test-source")).toBe(INTERNAL_ERROR_COPY);
+    expect(recorded().filter((message) => message.includes(RAW))).toHaveLength(1);
+  });
+
+  it("describeError records a fresh fault once, not once per layer", () => {
+    describeError(new TypeError(RAW), "test-source");
+    expect(recorded().filter((message) => message.includes(RAW))).toHaveLength(1);
+    diagnostics.clear();
+    describeFailure({ verb: "open", object: "the terminal" }, new TypeError(RAW));
+    expect(recorded().filter((message) => message.includes(RAW))).toHaveLength(1);
+  });
+
+  it("mirrors a user-facing message into Diagnostics but never the internal-error sentence", () => {
+    mirrorUserFacingError("repo:operation", "clone failed");
+    mirrorUserFacingError("repo:operation", INTERNAL_ERROR_COPY);
+    expect(recorded()).toEqual(["clone failed"]);
+    // The raw cause is still recorded once, by describeError itself.
+    const shown = describeError(new TypeError(RAW), "ui");
+    mirrorUserFacingError("repo:operation", shown);
+    expect(recorded().filter((message) => message.includes(RAW))).toHaveLength(1);
+    expect(recorded().some((message) => message.includes(INTERNAL_ERROR_COPY))).toBe(false);
+  });
+
+  it("App's repo:operation forwarder mirrors through the same guard, not diagnostics.error", () => {
+    const app = readFileSync(new URL("../../../App.svelte", import.meta.url), "utf8");
+    expect(app).toContain('mirrorUserFacingError("repo:operation", err)');
+    expect(app).not.toContain('diagnostics.error("repo:operation"');
+  });
+
+  it("describeFailure keeps its headline and replaces only the fault's reason", () => {
+    const copy = describeFailure({ verb: "open", object: "the terminal" }, new TypeError(RAW));
+    expect(copy.headline).toBe("Couldn't open the terminal.");
+    expect(copy.detail).toBe(INTERNAL_ERROR_COPY);
+    expect(JSON.stringify(copy)).not.toContain("reading 'invoke'");
   });
 });

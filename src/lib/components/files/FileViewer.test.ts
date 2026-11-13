@@ -219,6 +219,28 @@ describe("FileViewer", () => {
     expect(source).toContain("{#if paneLayout.dashboardVisible}");
   });
 
+  it("draws the Code page's bar on the page's ground, with no band fill or edge line", () => {
+    const bar = source.slice(source.lastIndexOf("<div", source.indexOf("data-file-view-bar")), source.indexOf(">", source.indexOf("data-file-view-bar")));
+    expect(bar).not.toMatch(/bg-surface|gp-section-edge/);
+    const pulse = readFileSync(join(here, "LivePulseDashboard.svelte"), "utf8");
+    const head = pulse.slice(pulse.indexOf('<div class="flex items-center justify-between px-3 py-2.5'), pulse.indexOf(">", pulse.indexOf('<div class="flex items-center justify-between px-3 py-2.5')));
+    expect(head).not.toMatch(/bg-surface|gp-section-edge/);
+  });
+
+  it("draws the Live pulse column as a floating card that stretches with its row", () => {
+    const host = source.slice(source.indexOf("{#if paneLayout.dashboardVisible}"), source.indexOf("<LivePulseDashboard"));
+    expect(host).toContain("gp-float-card");
+    expect(host).toContain("data-live-pulse-card");
+    // The card's margin plus `h-full` would overflow the row; it stretches instead.
+    expect(host).not.toContain("h-full");
+    const css = readFileSync(new URL("../../../app.css", import.meta.url), "utf8");
+    const card = css.slice(css.indexOf("@utility gp-float-card {"), css.indexOf("}", css.indexOf("@utility gp-float-card {")));
+    expect(card).toContain("margin: var(--gp-pane-gutter, 6px);");
+    expect(card).toContain("border-radius: var(--gp-r-pane);");
+    expect(card).toContain("box-shadow: var(--shadow-card);");
+    expect(card).toContain("overflow: hidden;");
+  });
+
   it("keeps the preferred side pane repository-scoped across view remounts", () => {
     expect(source).toContain("preferredSidePane: FileSidePane;");
     expect(source).toContain("preferredSidePane,\n    });");

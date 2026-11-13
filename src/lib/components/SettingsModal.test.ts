@@ -136,7 +136,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="switch"');
     expect(body).toContain('aria-label="Show the language mix in the status bar"');
-    expect(body).toContain('aria-label="Show Manvi status in the title bar"');
+    expect(body).toContain('aria-label="Show Manvi status"');
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
@@ -199,8 +199,8 @@ describe("SettingsModal layout options", () => {
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
     expect(layout).toContain('aria-label="Show the language mix in the status bar"');
-    expect(layout).toContain('aria-label="Show Manvi status in the title bar"');
-    expect(prose(layout)).toContain("Policy and local-model status in the title bar.");
+    expect(layout).toContain('aria-label="Show Manvi status"');
+    expect(prose(layout)).toContain("Policy and local-model status: in the status bar on a repository, in the title bar on Fleet, Agents and Tasks.");
   });
 
   it("says a hidden status bar still comes back for anything that needs attention", () => {

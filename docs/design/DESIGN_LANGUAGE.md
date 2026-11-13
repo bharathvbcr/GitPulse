@@ -168,6 +168,30 @@ Density → CSS vars on `html[data-density]`:
 
 Ownership: **one global density**, stored in `interfaceStore.density`, replacing `densityStore` (which today is a two-value `spacious|compact` typed by `canvas/GraphRenderer` [verified densityStore.ts:2–3]). GraphRenderer and `TaskDensity` (`ui/taskView`) become *consumers* of `--gp-density`/`data-density` with their own mapping tables (the graph's row heights are canvas numbers, so it reads `--gp-row-h` through `themeFromCss` like it reads colors). Row heights that today are "not CSS" (brief) move to the vars; `sidebar/metrics.ts` keeps `contain-intrinsic-size` per row kind but derives from `--gp-row-h`. `gp-cv-row`'s static 30px fallback [verified app.css:1465] becomes `var(--gp-header-h)`.
 
+### 7a. Page width: content is fluid and fills its pane
+
+A page's content (notices, banners, cards, tables, sections) takes the whole width of the page body. It is never held in a narrow column by a fixed `max-w-*` with dead space beside it, because the pane it sits in is a different width in a split, a full-width tab and a maximized window, and a cap chosen for one is wrong for the others. What changes with width is spacing and column count, through the shared primitives in `src/app.css`:
+
+| Utility | What it is |
+|---|---|
+| `gp-page` | The page's scroll area and **width container** (`container: gp-page / inline-size`), full width. Its own inline size is what every `@md:`/`@xl:` variant and `@container` rule inside a page reads, so a layout follows the pane, never the window. |
+| `gp-page-body` | The padded column inside `gp-page`. Padding and the gap between sections step up with the container (a container cannot query itself, so these are two elements; `PageBody.svelte` renders both). |
+| `gp-page-section` | A full-width section or card stack. No cap. |
+| `gp-page-grid` | A list of cards: one column when narrow, one more each time the pane has room for another `--gp-page-col` (default 18rem; set `[--gp-page-col:14rem]` for smaller tiles). `auto-fit`, so a short list still spans the pane. |
+| `gp-prose` | The one measure: 72ch, for long running text only (several sentences). Never a card, a notice, a table or a row of controls. |
+
+Steps, on the container's own width (`--gp-pad` is the density floor):
+
+| Step | Pane width | Padding | Gap between sections |
+|---|---|---|---|
+| compact | below 40rem | `--gp-pad` (8 / 12 / 16 by density) | `--gp-pad` |
+| regular | 40rem and up | `--gp-space-4` (16) | `--gp-space-5` (20) |
+| wide | 72rem and up | `--gp-space-6` (24) | `--gp-space-6` (24) |
+
+For columns a page needs a count it cannot get from `gp-page-grid` (a fixed four tiles that should be two or four across, a main column and a rail), use Tailwind's container variants, which read the nearest container: `grid-cols-2 @2xl:grid-cols-4`, `@4xl:grid-cols-3`. Never `sm:`/`md:`/`lg:`/`xl:` for page layout: those read the window, and a pane in a narrow window (or a split) then stays one column while it has the room. A component that is mounted outside any page body (a Settings section, a fleet strip) makes itself a container with `@container` on its root. If a JS decision is genuinely needed, observe the element's own width as `src/lib/ui/headerSlots.ts` does, never `window.innerWidth`.
+
+A fixed cap is allowed only for: a modal or dialog, a tooltip, toast, popover or menu, `EmptyState` prose, markdown reading width, a single input or select, and a truncating cell. In a page component each of those says so with `data-width-cap="<reason>"` on the element (design-lint rule 19). `max-w-full`, `max-w-none` and a percentage of the parent are not caps.
+
 ---
 
 ## 8. Motion
@@ -239,6 +263,7 @@ Owner column = where the one implementation lives. Every row's "don't" is a lint
 | **Dialog / sheet** | `gp-scrim` + `gp-card` + `focusTrap` (exist) → `Dialog.svelte` shell with title/body/footer slots; **sheet** = same shell anchored to an edge, slides with transform | md 480 / lg 720 / full-height sheet | enter 320 / exit 70; **every dialog has an out-transition** | one blur per dialog | `rounded-3xl`; missing outro |
 | **Toast** | `Toast.svelte` (exists) on `LAYERS.TOAST` (new, 65) | `tone` | auto-dismiss 6 s, pause on hover | one action max | literal durations |
 | **Panel header** | `gp-header` (§7) | with/without title, with actions slot | — | tone step, no line | `border-b` |
+| **Page body** | `PageBody.svelte` (`gp-page` + `gp-page-body`, §7a); `gp-page-section`, `gp-page-grid`, `gp-prose` inside | — | — | fills the pane, spacing steps with the pane's width | `max-w-*` on a notice or card, `p-4 space-y-5` scrollers, `sm:`/`md:`/`xl:` layout |
 | **List row** | `gp-row` | `data-selected`, `data-active` | hover `surface-hover`, selected = accent/12 fill + accent text | 28px default | per-list hover recipes |
 | **Empty state** | `EmptyState.svelte` (exists; 19 files) | compact/regular, optional action | — | **only for "nothing exists"** | ad-hoc "No …" text; using it for "could not scan" (that is `gp-notice` tone `unknown`) |
 | **Skeleton** | `Skeleton.svelte` (exists) | text/rect/circle/card/tree-row/code-lines | 300 ms delay, 400 ms min hold | for >~1 s loads | `animate-spin` + "Loading…" as the default (spinner only inside a button or a chip) |

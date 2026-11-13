@@ -529,7 +529,7 @@
   class="h-full w-full flex flex-col min-h-0 min-w-0 bg-background text-xs font-sans overflow-hidden"
   data-terminal-file-pane={tabId}
 >
-  <div class="shrink-0 flex items-center justify-between gap-1.5 px-2 h-8 bg-surface/60 select-none">
+  <div class="shrink-0 flex items-center justify-between gap-1.5 px-2 h-8 select-none">
     <div class="flex items-center gap-1.5 min-w-0">
       <button
         type="button"
@@ -673,7 +673,7 @@
 
   <div class="flex-1 min-h-0 flex overflow-hidden">
     {#if explorerOpen && onscreen}
-      <div class="w-56 max-w-[45%] shrink-0 h-full bg-surface/40 min-h-0 overflow-hidden">
+      <div class="gp-float-card w-56 max-w-[45%] shrink-0" data-terminal-file-explorer-card>
         <ExplorerRail
           {repoPath}
           selectedFile={filePath ?? null}
@@ -711,7 +711,7 @@
             </div>
           {/if}
           {#if diffSource === "staged" && diffLines.length > 0}
-            <div class="shrink-0 px-2.5 py-1 bg-surface/50 text-textMuted text-micro">
+            <div class="shrink-0 px-2.5 py-1 text-textMuted text-micro">
               Showing staged diff (working tree matches index).
             </div>
           {/if}
@@ -796,7 +796,7 @@
         <div class="h-full w-full flex flex-col min-h-0 overflow-hidden">
           {#if quickLensSymbol && filePath && !activeBlob.is_binary && !activeBlob.is_image}
             <div
-              class="shrink-0 flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/50 text-micro"
+              class="shrink-0 flex items-center justify-between gap-2 px-2.5 py-1 text-micro"
               data-testid="terminal-file-quick-lens"
             >
               <div class="flex items-center gap-1.5 min-w-0 overflow-x-auto">

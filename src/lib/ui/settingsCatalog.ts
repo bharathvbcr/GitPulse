@@ -291,8 +291,8 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   {
     id: "harness-badges",
     section: "layout",
-    label: "Manvi status in the title bar",
-    keywords: "manvi policy checks harness local model chips status badges title bar header hide show toolbar agents",
+    label: "Manvi status",
+    keywords: "manvi policy checks harness local model chips status badges title bar status bar footer header hide show toolbar agents",
   },
   {
     id: "view-visibility",

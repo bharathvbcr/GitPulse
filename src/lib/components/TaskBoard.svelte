@@ -41,6 +41,7 @@
   import { cardMatchesQuery, dueRangeFilter, parseTaskQuery, queryChips, queryControlValue, queryHas, removeQueryTerm, repositoryMatches, setQueryControl, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import PageHeader from "./PageHeader.svelte";
   import TaskSearchField from "./TaskSearchField.svelte";
   import { applyOrganizedPriority, cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, priorityOrderNote, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
@@ -2557,7 +2558,7 @@
 {#snippet scopeRail(overlay: boolean)}
   <!-- Justified: the keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
+  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:gp-float-card={!overlay} class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
     {#if overlay && !railNarrow}
       <div class="nav-heading gp-label nav-dock">Task scopes<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dock the task scopes beside the board" title="Dock the task scopes beside the board" onclick={dockRail}><PanelLeft size={12} /></button></div>
     {/if}
@@ -2663,18 +2664,20 @@
     {/if}
   {/if}
   <main class="board-main">
-    <header class="gp-glass gp-surface-header">
-      <div class="heading">
+    <PageHeader {title} level={1}>
+      {#snippet leading()}
         {#if !repositoryPath}
           <button bind:this={railToggleEl} type="button" class="gp-icon-btn" data-nav-toggle data-testid="task-nav-toggle" aria-expanded={railDocked || railOpen} aria-controls="task-scope-rail" aria-label={railDocked ? "Hide task scopes" : "Show task scopes"} title={railDocked ? "Hide task scopes" : "Show task scopes"} onclick={toggleRail}><PanelLeft size={13} /></button>
         {/if}
-        <h1 class="gp-surface-title">{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+      {/snippet}
+      {#snippet meta()}
+        {#if !loading && initialized}<span class="text-meta font-medium text-textMuted">{total}</span>{/if}
         {#if inProgressCount > 0}<span class="gp-chip" data-kind="label" data-tone="accent">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
              the boards for every task and for its workspaces. -->
         {#if repositoryPath}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
-      </div>
-      <div class="actions">
+      {/snippet}
+      {#snippet actions()}
         <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repository:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
@@ -2713,8 +2716,8 @@
             <span class="hint" data-testid="task-create-hint">{creation.blocked ?? creation.caveat}</span>
           {/if}
         {/if}
-      </div>
-    </header>
+      {/snippet}
+    </PageHeader>
     {#if initialized && (showFilters || filtering)}
       <div class="facets" aria-label="Organize tasks">
         <select class="gp-select" aria-label="Filter by priority" bind:value={facet.priority}>
@@ -3244,9 +3247,9 @@
      is for the overlay below, because only that one floats over the board. */
   /* `gp-glass` paints only on macOS and its rule is more specific than this
      fill, so the overlay is glass there and the same solid surface elsewhere. */
-  .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
+  .navigator{width:188px;flex-shrink:0;padding:10px 8px;overflow:auto}
   .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
-  .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
+  .navigator.is-overlay{background:var(--mac-fill-surface,rgb(var(--c-surface)));width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
   .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;position:relative;text-align:left;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
   .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
@@ -3284,11 +3287,8 @@
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-pick{padding:0 8px}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
-  /* The header's box and the title's type are the shared gp-surface-header
-     and gp-surface-title (app.css), so Tasks and Agents read as one chrome. */
-  h1{display:flex;align-items:baseline;gap:8px}
-  h1 span{font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
-  .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  /* The header is the shared PageHeader, so every page reads as one chrome. */
+  .facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
   .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs)}
   .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:var(--gp-r-md)}
@@ -3339,7 +3339,6 @@
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}
   .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.35)}
-  .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
   .open-mark{flex-shrink:0;margin-top:2px}
   /* Agents working on the card's task; warn when one needs the reader, as in the task's Agents pane.
      The host carries the hooks (testid, data-tone, data-asking) and draws nothing; the chip inside is the mark. */

@@ -1,3 +1,4 @@
+import { describeError } from "../ui/copy/describeFailure";
 /**
  * The one subscription to the host's `workbench-changed` event.
  *
@@ -53,7 +54,7 @@ function readChange(payload: unknown): WorkbenchChange {
 export function createWorkbenchChanges(deps: WorkbenchChangesDeps) {
   const now = deps.now ?? (() => Date.now());
   const echoWindowMs = deps.echoWindowMs ?? ECHO_WINDOW_MS;
-  const explain = deps.explain ?? ((cause: unknown) => (cause instanceof Error ? cause.message : String(cause)));
+  const explain = deps.explain ?? ((cause: unknown) => (describeError(cause, "workbench")));
   const subscribers = new Set<WorkbenchSubscriber>();
   let stop: (() => void) | null = null;
   /** A listen in flight; bumped on teardown so a late answer is released instead of kept. */

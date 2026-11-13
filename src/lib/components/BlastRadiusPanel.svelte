@@ -106,7 +106,7 @@
     </button>
 
     {#if open}
-      <div class="flex flex-col gap-2 bg-surface/40 px-2.5 py-2">
+      <div class="flex flex-col gap-2 px-2.5 py-2">
         <div class="flex items-baseline justify-between gap-2">
           <span class="gp-label">{title}</span>
           {#if blast.available}
@@ -184,7 +184,7 @@
             class="text-micro text-warn"
             title={boundedJoin(cancelledSeeds.map((s) => s.seed), 12)}
           >
-            {cancelledSeeds.length} file(s) cancelled before the walk finished — the hops above are a
+            {cancelledSeeds.length} file(s) canceled before the walk finished — the hops above are a
             partial answer, not an unindexed map.
           </p>
         {/if}

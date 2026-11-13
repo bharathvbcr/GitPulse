@@ -1,16 +1,19 @@
 <script lang="ts">
   /**
-   * The Suspects list's question, in History's context bar where the commit
-   * filter sits for the other two lists.
+   * The Suspects list's question, in the list's own header strip (see
+   * `SuspectsList`), so the view bar keeps its single page search field.
    *
    * The filter does not apply here: the ranking is one answer whose scores
    * are comparable only within it, so narrowing it by text would hand the
    * reader a list whose order means something it does not. ⌘F, which focuses
    * the view bar's search field (the commit filter) on the other lists,
    * focuses the symptom field instead (findChordTarget in views/commitFilter).
+   *
+   * The submit is an action, not a search box: it ranks commits, so it is a
+   * primary button with a verb (UI_RULES §3) and no magnifier.
    */
   import { tick } from "svelte";
-  import { Loader2, Search } from "@lucide/svelte";
+  import { Loader2 } from "@lucide/svelte";
   import { currentRepoPath } from "../stores/repoStore";
   import {
     suspectsQuery,
@@ -87,12 +90,10 @@
     title="How many call edges out from the symptom to walk (1–{MAX_SUSPECT_CONE_DEPTH})"
     class="gp-field h-7 w-14 shrink-0 font-mono text-meta tabular-nums"
   />
-  <button type="submit" class="gp-btn h-7 shrink-0" disabled={!canRun}>
+  <button type="submit" class="gp-btn h-7 shrink-0" data-variant="primary" disabled={!canRun}>
     {#if $suspectsQuery.loading}
       <Loader2 size={13} class="animate-spin" />
-    {:else}
-      <Search size={13} />
     {/if}
-    <span>Find suspects</span>
+    <span>Rank suspects</span>
   </button>
 </form>

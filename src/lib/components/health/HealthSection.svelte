@@ -1,6 +1,5 @@
 <script lang="ts">
   import {
-    HEALTH_CONTENT_WIDTH,
     healthSection,
     healthSectionDomId,
     healthSectionHeadingId,
@@ -66,7 +65,7 @@
     aria-labelledby={headingId}
     aria-describedby={`${headingId}-desc`}
     data-health-section={id}
-    class="scroll-mt-2 space-y-2 focus:outline-hidden {HEALTH_CONTENT_WIDTH}"
+    class="scroll-mt-2 space-y-2 focus:outline-hidden"
   >
     <span id={`${headingId}-desc`} class="sr-only">{spec.summary}</span>
     <div class="flex items-center justify-between gap-3 flex-wrap">

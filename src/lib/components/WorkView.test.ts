@@ -304,16 +304,21 @@ describe("WorkView deep links", () => {
     expect(source).toContain("{#if showPolicyActivity}");
   });
 
-  it("sits flush with the section pane above the heading and below the last block", () => {
-    // Block-axis padding on the scroller is a band of the pane's background
-    // between the section tabs and the heading, and again under the last
-    // block. Inline padding stays so the bands still inset from the sides.
+  it("sits flush with the section pane above the header and ends with gp-page's buffer below the last block", () => {
+    // The page header (PageHeader) sits flush under the section tabs; the
+    // blocks start one gap step under it. Under the last block the scroller
+    // keeps the buffer every page has (gp-page's padding-block-end), so the
+    // last section is not flush against the status bar -- this used to pin
+    // "nothing pads under the last block", which is the defect. Inline padding
+    // stays so the bands still inset from the sides.
     const ruleStart = source.indexOf(".work-overview {");
     const rule = source.slice(ruleStart, source.indexOf("}", ruleStart));
-    expect(rule).toContain("padding-block: 0");
-    expect(rule).not.toMatch(/(^|\n)\s*padding\s*:/);
+    expect(rule).toContain("padding-block-start: var(--gp-space-2)");
+    expect(rule).not.toMatch(/(^|\n)\s*padding(?:-block)?\s*:/);
+    expect(rule).not.toContain("padding-block-end");
     const markupStart = source.indexOf('class="work-overview');
     const markup = source.slice(markupStart, source.indexOf(">", markupStart));
+    expect(markup).toMatch(/\bgp-page\b/);
     expect(markup).not.toMatch(/\b(?:p|py|pt|pb)-\d/);
   });
 });

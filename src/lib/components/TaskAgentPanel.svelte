@@ -195,7 +195,7 @@
     "Trusting": ["trust", "the checkout"],
     "Opening conversation": ["open", "the conversation"],
     "Stopping": ["stop", "the agent"],
-    "Cancelling": ["cancel", "the preparation"],
+    "Canceling": ["cancel", "the preparation"],
     "Resuming": ["resume", "the run"],
     "Releasing": ["release", "the checkout"],
     "Reading output": ["read", "the output"],
@@ -464,7 +464,7 @@
     });
   }
   function cancel(run: TaskRun) {
-    return act(run, { label: "Cancelling", mutates: false }, async () => {
+    return act(run, { label: "Canceling", mutates: false }, async () => {
       const saved = await cancelTaskRun(run);
       // Withdrawn everywhere this window was starting it: the request, the
       // watch that would have toasted its start, and what its row said.

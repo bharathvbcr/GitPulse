@@ -29,6 +29,20 @@ describe("CommandPalette", () => {
     expect(source).not.toContain("repoStore.checkoutBranch(branch.name)");
   });
 
+  // The view bar's field is on Fleet, Agents and Tasks too. Running a file,
+  // branch, commit or symbol there must bring the repository page back; the
+  // single hook is run(), keyed by the mode the result was listed under, and it
+  // fires only after the action succeeded.
+  it("brings the repository page back after a file, branch, commit or symbol result runs", () => {
+    expect(source).toContain("const lands = modeLandsOnRepositoryPage(mode);");
+    const action = source.indexOf("const result = await command.action();");
+    const failure = source.indexOf("if (failure) {", action);
+    const land = source.indexOf("if (lands) showRepositoryPage();", action);
+    expect(action).toBeGreaterThan(-1);
+    expect(land).toBeGreaterThan(failure);
+    expect(source).toContain('interfaceStore.setGlobalSurface("repository")');
+  });
+
   it("exposes Settings and MCP setup as commands", () => {
     expect(source).toContain('id: "settings"');
     expect(source).toContain('id: "mcp_setup"');

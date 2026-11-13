@@ -5,6 +5,7 @@ import {
   type DiagnosticsStore,
 } from "./diagnostics";
 import type { PersistedLog } from "./types";
+import { formatError, INTERNAL_ERROR_COPY, isProgrammingError, markProgrammingErrorRecorded } from "../ui/formatError";
 
 /**
  * One seam between panel-level caught errors and the persistent diagnostics
@@ -46,6 +47,17 @@ export interface ReporterOptions {
 export { formatDiagnosticFailure };
 
 /**
+ * The text a screen shows for a failure that `formatDiagnosticFailure` would
+ * otherwise render raw. A runtime fault in this page (TypeError and the like)
+ * becomes `INTERNAL_ERROR_COPY`, with the raw fault recorded in Diagnostics
+ * under `source`; anything else keeps the redacted text. Use this, not
+ * `formatDiagnosticFailure`, wherever the string is shown rather than logged.
+ */
+export function formatDisplayFailure(err: unknown, source: string): string {
+  return isProgrammingError(err) ? formatError(err, source) : formatDiagnosticFailure(err);
+}
+
+/**
  * Builds a reporter against an injected sink (unit-testable, mirroring
  * `installGlobalDiagnostics`). The returned reporter records `err` and
  * RETURNS the human-readable banner text.
@@ -55,10 +67,18 @@ export function createReporter(
 ): (source: PanelSource, err: unknown, opts?: ReporterOptions) => string {
   return (source, err, opts = {}) => {
     // One safe formatter owns hostile thrown values and credential redaction.
+    // It renders the fault's own text (raw): this string is for the log.
     const message = formatDiagnosticFailure(err);
     if ((opts.severity ?? "warning") === "error") sink.error(source, message);
     else sink.warn(source, message);
-    return message;
+    // The log keeps the raw text; the banner does not show a runtime fault in
+    // this page (a TypeError and the like) verbatim, since it names our code,
+    // not the repository, and the reader can do nothing with it.
+    if (!isProgrammingError(err)) return message;
+    // The fault is in the log now; a `formatError(err)` beside this call must
+    // not add a second entry for it.
+    markProgrammingErrorRecorded(err);
+    return INTERNAL_ERROR_COPY;
   };
 }
 

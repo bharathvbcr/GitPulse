@@ -215,7 +215,7 @@
     </div>
 
     {#if host && snap}
-      <dl class="grid grid-cols-2 md:grid-cols-4 gap-2" data-testid="host-load-readings">
+      <dl class="grid grid-cols-2 @2xl:grid-cols-4 gap-2" data-testid="host-load-readings">
         <div><dt class="text-textMuted">Swap used</dt><dd class="text-textPrimary">{describeReading(host.swap_used, bytes)} of {describeReading(host.swap_total, bytes)}</dd></div>
         <div><dt class="text-textMuted">Compressor</dt><dd class="text-textPrimary">{describeReading(host.compressed_bytes, bytes)}{snap.compressor_thrash ? " · thrashing" : ""}</dd></div>
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>

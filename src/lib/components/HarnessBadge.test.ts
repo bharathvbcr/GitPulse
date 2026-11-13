@@ -196,6 +196,28 @@ describe("HarnessBadge chip", () => {
     expect(body).toMatch(/class="hidden[^"]*min-\[1440px\]:inline"[^>]*>Automatic · chat</);
   });
 
+  it("compact is the shield alone: no label, no model face, the same name, and a downward menu", () => {
+    const state = writable({
+      ...get(harnessStore),
+      harness: harnessStatus({ available: true }),
+      ai: ready,
+      preferred: null,
+    });
+    vi.spyOn(harnessStore, "subscribe").mockImplementation(state.subscribe);
+    const full = render(HarnessBadge, { props: { open: false } }).body;
+    const compact = render(HarnessBadge, { props: { variant: "compact", open: false } }).body;
+    expect(full).toContain('data-variant="full"');
+    expect(full).toContain("min-[1440px]:inline");
+    expect(compact).toContain('data-variant="compact"');
+    expect(compact).not.toContain("min-[1440px]:inline");
+    expect(compact).not.toContain("max-[1099px]:sr-only");
+    expect(compact).toContain('<span class="sr-only">Manvi</span>');
+    // Same accessible name and tooltip as the full pill.
+    expect(chipTag(compact)).toContain('aria-label="Manvi, policy checks connected"');
+    expect(chipTag(compact)).toContain(chipTag(full).match(/title="[^"]*"/)?.[0] ?? "no title");
+    expect(source).toContain('place: variant === "full" ? ("above" as const) : ("below" as const)');
+  });
+
   it("keeps the live model status rendered while the menu is closed", () => {
     const body = renderState({ ai: ready }, false);
     expect(body).toMatch(/id="[^"]+-model-status" class="sr-only" role="status"/);
@@ -365,9 +387,11 @@ describe("HarnessBadge model options", () => {
       join(dirname(fileURLToPath(import.meta.url)), "../../App.svelte"),
       "utf8",
     );
-    expect(app).toMatch(/\{#if \$interfaceStore\.showHarnessBadges\}\s*<HarnessBadge \/>/);
+    expect(app).toMatch(
+      /\{#if \$interfaceStore\.showHarnessBadges && !manviInStatusBar\}\s*<HarnessBadge variant="compact" \/>/,
+    );
     const ungated = app.replace(
-      /\{#if \$interfaceStore\.showHarnessBadges\}[\s\S]*?\{\/if\}/,
+      /\{#if \$interfaceStore\.showHarnessBadges && !manviInStatusBar\}[\s\S]*?\{\/if\}/,
       "",
     );
     expect(ungated).not.toMatch(/<HarnessBadge(?:\s|\/>)/);
@@ -377,7 +401,7 @@ describe("HarnessBadge model options", () => {
     expect(body).not.toContain("MANVI");
     expect(body).not.toContain("data-manvi-face");
     expect(body).not.toContain('aria-label="Local model"');
-    expect(body).not.toContain('data-testid="manvi-titlebar-status"');
+    expect(body).not.toContain('data-testid="manvi-status"');
   });
 
   it("distinguishes discovery in progress from an empty or failed result", () => {

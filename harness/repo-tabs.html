@@ -852,7 +852,9 @@
               .map((el) => el.getBoundingClientRect().right));
             return scroller().scrollWidth <= scroller().clientWidth + 1
               // The zone follows the list, is wide, and drags...
-              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 48 && zone.hasAttribute("data-tauri-drag-region")
+              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 24 && zone.hasAttribute("data-tauri-drag-region")
+              // ...is marked by a hairline that does not take the drag away...
+              && !!zone.querySelector("[data-drag-zone-rule]") && getComputedStyle(zone.querySelector("[data-drag-zone-rule]")).pointerEvents === "none"
               // ...Open sits right of the zone, its menu arrow against it...
               && openBox.left >= zoneBox.right - 1 && menuBtn.getBoundingClientRect().left >= openBox.right - 8
               // ...and the last control sits at the bar's own right edge.

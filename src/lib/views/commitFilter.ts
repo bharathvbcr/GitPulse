@@ -64,13 +64,13 @@ export function isCommitSearchChord(e: {
 
 /**
  * ⌘F belongs to the view bar's field whenever the field is on screen: a
- * repository is open and the repository surface (not Fleet, Agents or Tasks)
- * is showing. A key another handler already took is not the field's.
+ * repository is open. The field is on Fleet, Agents and Tasks too (as the
+ * repository palette there), so the surface does not decide. A key another
+ * handler already took is not the field's.
  */
 export function fieldOwnsFindChord(state: {
   hasRepository: boolean;
-  onRepositorySurface: boolean;
   defaultPrevented: boolean;
 }): boolean {
-  return state.hasRepository && state.onRepositorySurface && !state.defaultPrevented;
+  return state.hasRepository && !state.defaultPrevented;
 }

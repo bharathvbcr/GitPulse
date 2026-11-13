@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
-import { formatError } from "../ui/formatError";
+import { formatError, formatErrorRaw } from "../ui/formatError";
 import { diagnostics, type DiagnosticsStore } from "../diagnostics/diagnostics";
 import type { VisualCommitRow, LaneConnection } from "../canvas/GraphRenderer";
 import {
@@ -666,7 +666,7 @@ export function createGraphStore(
       // content. The pane is told (status "error", with the reason and a
       // Retry) instead of showing a commit with zero changed files, and a
       // breadcrumb still goes to the diagnostics ring.
-      reportFailure("graph-details", `${repoPath}/${commitId}: ${formatError(err)}`);
+      reportFailure("graph-details", `${repoPath}/${commitId}: ${formatErrorRaw(err)}`);
       if (stillWanted()) {
         record({
           selectedCommitDetails: null,
@@ -701,7 +701,7 @@ export function createGraphStore(
     } catch (err) {
       // Not a verdict: the pane says the signature was not checked, never
       // that the commit is unsigned.
-      reportFailure("graph-signature", `${repoPath}/${commitId}: ${formatError(err)}`);
+      reportFailure("graph-signature", `${repoPath}/${commitId}: ${formatErrorRaw(err)}`);
       check = null;
     }
     if (!isCurrent(repoPath, token)) return;
@@ -1028,7 +1028,7 @@ export function createGraphStore(
         // no trace at all. Visible failures keep their banner as the one
         // breadcrumb; double-reporting them would only duplicate it.
         if (visiblePath !== repoPath) {
-          reportFailure("graph-load", `graph load failed for ${repoPath}: ${formatError(err)}`);
+          reportFailure("graph-load", `graph load failed for ${repoPath}: ${formatErrorRaw(err)}`);
         }
         if (visiblePath === repoPath) {
           update((s) => ({

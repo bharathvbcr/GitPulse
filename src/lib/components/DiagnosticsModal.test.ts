@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import DiagnosticsModal, {
   classifyBackendDiagnostics,
+  groupDomId,
   hiddenByFilterNotice,
   isCurrentBackendLoad,
 } from "./DiagnosticsModal.svelte";
@@ -86,6 +87,50 @@ describe("DiagnosticsModal", () => {
 
     expect(body).not.toContain("differing");
     diagnostics.clear();
+  });
+});
+
+describe("DiagnosticsModal grouping", () => {
+  it("renders interleaved repeats as one group card with a count and a disclosure", () => {
+    diagnostics.clear();
+    diagnostics.error("repo", "Cannot read properties of undefined (reading 'invoke')");
+    diagnostics.error("pane-crash", "graph blew up");
+    diagnostics.error("repo", "Cannot read properties of undefined (reading 'invoke')");
+    diagnostics.error("pane-crash", "graph blew up");
+    diagnostics.error("repo", "Cannot read properties of undefined (reading 'invoke')");
+
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body.split("Cannot read properties of undefined").length - 1).toBe(1);
+    expect(body.split("graph blew up").length - 1).toBe(1);
+    expect(body).toContain("×3");
+    expect(body).toContain("×2");
+    // The grouped card is a disclosure, closed until asked for.
+    expect(body).toMatch(/<button[^>]*aria-expanded="false"[^>]*aria-controls="diagnostic-occurrences-/);
+    expect(body).not.toContain('aria-label="Occurrences"');
+    diagnostics.clear();
+  });
+
+  it("gives a lone occurrence a plain card with no disclosure", () => {
+    diagnostics.clear();
+    diagnostics.error("repo", "clone failed");
+
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body).toContain("clone failed");
+    expect(body).not.toContain("aria-expanded");
+    diagnostics.clear();
+  });
+
+  it("wires the disclosure to its occurrence list from the template", () => {
+    expect(source).toContain("aria-expanded={open}");
+    expect(source).toContain("groupDiagnostics(");
+    expect(source).toContain("{#each group.entries as entry (entry.id)}");
+  });
+
+  it("derives a DOM-safe id from a group key", () => {
+    expect(groupDomId("error\u0000repo\u0000\u0000\u0000a b")).toMatch(/^[0-9a-z]+$/);
+    expect(groupDomId("a")).not.toBe(groupDomId("b"));
   });
 });
 

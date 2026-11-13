@@ -27,6 +27,7 @@ import { supportsManaged } from "./vocabulary";
 import { createWavePersister, findActiveWave, type WaveTaskApi } from "./waveStore";
 import { resumeWave, startWave, type Held, type HeldRead, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
 import type { TaskSuggestions } from "./client";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** `work.verify.task` can take minutes; a verdict still `running` after this is reported as such, never trusted. */
 const VERIFY_WAIT_MS = 20 * 60_000;
@@ -75,7 +76,7 @@ async function checkoutFor(repositoryId: string): Promise<string> {
   const repository = await getRepository(repositoryId);
   const tabs = get(repoStore).openTabs.map((tab) => ({ path: tab.path, label: tab.label }));
   const path = normalizeCheckout(preferredCheckout(checkoutCandidates(repositoryId, [repository], tabs, { caseInsensitive: isCaseInsensitiveFs() })));
-  if (!path) throw new Error("No working checkout of this repository is open, so a wave has nowhere to launch from.");
+  if (!path) throw new Error("No working checkout of this repository is open, so a wave has nowhere to start from.");
   return path;
 }
 
@@ -148,7 +149,7 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       } catch (cause) {
         // A stop ends the wave; any other failure is claims not read, said in the note.
         if (signal.aborted) throw cause;
-        return { held: [], unreadable: cause instanceof Error ? cause.message : String(cause) };
+        return { held: [], unreadable: describeError(cause, "wave") };
       }
     },
     launch: async (taskId, ids, signal) => {

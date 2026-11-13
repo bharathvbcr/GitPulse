@@ -326,6 +326,22 @@ describe("the honesty invariant", () => {
     expect(degradedSummary(p.sources)).toContain("gh is not installed");
   });
 
+  it("names a reason shared by several sources once, after all of them", () => {
+    const fault = "Something went wrong inside GitPulse. Details are in Diagnostics.";
+    const summary = degradedSummary(
+      sources({
+        tasks: { ok: false, present: true, detail: fault },
+        worktrees: { ok: false, present: true, detail: fault },
+        github: { ok: false, present: true, detail: "gh is not installed" },
+        ledger: { ok: false, present: true, detail: fault },
+      }),
+    );
+    expect(summary).toBe(
+      `This screen is incomplete: tasks, worktrees, ledger (${fault}); github (gh is not installed).`,
+    );
+    expect(summary.split(fault)).toHaveLength(2);
+  });
+
   it("is not degraded merely because a source is absent", () => {
     // A repository with no DevCouncil store is the ordinary case. Reporting it
     // as a failure would make the warning meaningless everywhere it matters.

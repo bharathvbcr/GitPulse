@@ -1651,7 +1651,7 @@
        reflowing its own text at EVERY width. Each item here still refuses to
        wrap internally. -->
   <div
-    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 bg-surface/60 px-3 py-1.5 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1.5 font-sans"
   >
     {#if languagePath}
       <LanguageLogo filePath={languagePath} size={15} class="shrink-0" />
@@ -1764,7 +1764,7 @@
        reason: at a 420px pane the controls measured 694px wide and the
        layout toggles ran off an edge no scrollbar reaches. -->
   <div
-    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 bg-surface/30 px-3 py-1 font-sans"
+    class="flex shrink-0 select-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1 font-sans"
   >
     {#if !railOpen && hasRail}
       <button
@@ -2019,7 +2019,7 @@
       <!-- Where you are, when the file's own header has scrolled away. -->
       {#if currentSection && !showingImage && !showEmpty && !pending && !diffError && (outline.files.length > 1 || currentHunk)}
         <div
-          class="flex shrink-0 select-none items-center gap-2 bg-surfaceHover/60 px-3 py-0.5 font-sans text-micro text-textMuted"
+          class="flex shrink-0 select-none items-center gap-2 px-3 py-0.5 font-sans text-micro text-textMuted"
         >
           {#if currentSection.path}
             <span class="min-w-0 truncate font-medium text-textPrimary/80">{currentSection.path}</span>

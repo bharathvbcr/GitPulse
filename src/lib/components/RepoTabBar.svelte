@@ -1697,7 +1697,7 @@
         tour: "tasks",
       })}
     {#if !hideTabStrip}
-      <div class="gp-separator m-0! h-3.5! w-0.5! shrink-0" aria-hidden="true"></div>
+      <div class="gp-separator m-0! h-3.5! w-0.5! shrink-0 bg-textMuted/35!" aria-hidden="true"></div>
       <div class="relative min-w-0 max-w-full shrink self-stretch">
       <div
         bind:this={scroller}
@@ -1757,11 +1757,17 @@
       </div>
     {/if}
 
-    <!-- The window-drag zone (E3). `min-w-12` is the 48px floor: the free
+    <!-- The window-drag zone (E3). `min-w-6` is its 24px floor: the free
          space belongs to the strip until it is gone, but never below this, so
-         the window can always be grabbed. A bare drag-region attribute starts
-         a drag only on a direct hit, so nothing clickable is affected. -->
-    <div class="h-full min-w-12 flex-1 self-stretch" data-tauri-drag-region data-drag-zone></div>
+         the window can always be grabbed. A hairline at its start marks where
+         the repositories end and the global cluster begins, the same mark as
+         between the surfaces and the repositories, so the gap reads as a
+         divider rather than empty chrome. The hairline takes no pointer
+         events, so the whole zone still drags. A bare drag-region attribute
+         starts a drag only on a direct hit, so nothing clickable is affected. -->
+    <div class="flex h-full min-w-6 flex-1 items-center self-stretch pl-2.5" data-tauri-drag-region data-drag-zone>
+      <div class="gp-separator pointer-events-none m-0! h-3.5! w-0.5! shrink-0 bg-textMuted/35!" aria-hidden="true" data-drag-zone-rule></div>
+    </div>
 
     <!-- Open is pinned to the right of the title row, the first control of the
          right-hand cluster, so its position never shifts as tabs open and

@@ -38,18 +38,10 @@ export interface HealthSectionSpec {
   summary: string;
 }
 
-/**
- * One content width for every section.
- *
- * The panel previously mixed `max-w-2xl`, `3xl`, `4xl` and `5xl` across
- * sibling sections, so the right edge stepped in and out down the page and
- * nothing lined up with anything. The widest thing here is a five-column
- * table, so that is the width, and it is stated once.
- */
-export const HEALTH_CONTENT_WIDTH = "max-w-5xl";
-
-/** Narrower measure for running prose, which is unreadable at full width. */
-export const HEALTH_PROSE_WIDTH = "max-w-3xl";
+// Width: the panel has no content measure of its own. It sits in `PageBody`
+// (`gp-page`), so every section and notice fills the pane and the right edge is
+// the pane's, at every width (DESIGN_LANGUAGE section 7a). It used to export two
+// `max-w-*` constants; they are retired, and healthComponents.test.ts pins that.
 
 /**
  * Rows a Health list shows before "Show all".

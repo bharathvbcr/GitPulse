@@ -262,7 +262,7 @@ export function handoffGate(input: {
   model?: ModelOverride;
 }): HandoffGate {
   if (input.busy) return { ok: false, reason: "A launch is already in progress." };
-  if (input.dirty) return { ok: false, reason: "Save your task edits before launching an agent." };
+  if (input.dirty) return { ok: false, reason: "Save your task edits before running an agent." };
   if (!normalizeCheckout(input.checkout)) {
     return { ok: false, reason: "Choose the working checkout this agent should run in." };
   }

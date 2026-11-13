@@ -3912,15 +3912,17 @@ if (params.has("check")) {
         }
       } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
 
-      // The navigator is a docked rail (a tonal step, no outline, no glass), moves by keyboard,
+      // The navigator is a floating card beside the board (a hairline, the pane radius, no
+      // band fill, no glass), moves by keyboard,
       // and gives the board its width back — collapsed or narrow — as an overlay opened from the toolbar.
       const appBox = document.getElementById("app");
       try {
         step = "navigator rail";
         const nav = scopesNav();
         const style = getComputedStyle(nav);
-        check("the docked navigator is a rail: no outline, no corner radius, no glass",
-          style.borderTopWidth === "0px" && style.borderTopLeftRadius === "0px" && !nav.classList.contains("gp-glass"));
+        check("the docked navigator is a floating card: a hairline, the pane radius, no band fill, no glass",
+          style.borderTopWidth === "1px" && parseFloat(style.borderTopLeftRadius) >= 8
+            && style.backgroundColor === "rgba(0, 0, 0, 0)" && !nav.classList.contains("gp-glass"));
         const toggle = () => root.querySelector('[data-testid="task-nav-toggle"]');
         const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
         const press = (el, key, init = {}) => el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));

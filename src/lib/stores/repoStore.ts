@@ -1,7 +1,8 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, readable, writable, type Readable } from "svelte/store";
 import { invalidateSharedReads, invoke, ipcErrorKind } from "../ipc/invoke";
-import { formatError } from "../ui/formatError";
+import { formatErrorRaw } from "../ui/formatError";
+import { describeError, mirrorUserFacingError } from "../ui/copy/describeFailure";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
 import { confirmTerminalLoss } from "../repos/terminalLoss";
@@ -591,7 +592,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           if (applied && noticed) {
             diagnostics.warn(
               "repo",
-              `git status for ${path} failed ${failures} polls in a row; the file list may be stale: ${formatError(error)}`,
+              `git status for ${path} failed ${failures} polls in a row; the file list may be stale: ${formatErrorRaw(error)}`,
             );
           }
         }
@@ -630,7 +631,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       } catch (error) {
         // git answered; a subscriber or listener threw while the answer was
         // being published. That is not a status that stopped answering.
-        diagnostics.warn("repo", `publishing the status of ${path} failed: ${formatError(error)}`);
+        diagnostics.warn("repo", `publishing the status of ${path} failed: ${formatErrorRaw(error)}`);
       }
     } finally {
       if (pollRuns.get(sessionId) === run) pollRuns.delete(sessionId);
@@ -1498,7 +1499,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     try {
       granted = resolvedFields(id, await resolvePath(trustedPath));
     } catch (err: unknown) {
-      const message = formatError(err);
+      const message = describeError(err, "repo");
       applyToSession(id, live.generation, {
         isLoading: false,
         error: message,
@@ -1669,7 +1670,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
-      const message = formatError(err);
+      const message = describeError(err, "repo");
       applyToSession(id, generation, {
         isLoading: false,
         error: message,
@@ -2041,7 +2042,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     setError: (error: string | null) => {
       // Every user-facing error funnels through here; mirror it into the
       // diagnostics log so the banner's dismissal never loses it.
-      if (error) diagnostics.error("repo", error);
+      if (error) mirrorUserFacingError("repo", error);
       const session = activeSession();
       // Publishing an unchanged error retriggers every $repoStore subscriber,
       // including App's forwarding $effect that calls setError to clear —
@@ -2145,7 +2146,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       try {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
-        const message = formatError(err);
+        const message = describeError(err, "repo");
         const refused = repositoryTrustRefused(err);
         if (refused && !extras.deferTrust) {
           try {
@@ -2153,14 +2154,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             if (!trustedPath) return false;
             resolved = await resolvePath(trustedPath);
           } catch (trustError: unknown) {
-            internal = { ...internal, workspaceError: formatError(trustError) };
+            internal = { ...internal, workspaceError: describeError(trustError, "repo") };
             publish();
             return false;
           }
         } else if (refused) {
           deferredTrustMessage = message;
         } else if (!extras.allowBroken) {
-          internal = { ...internal, workspaceError: formatError(err) };
+          internal = { ...internal, workspaceError: describeError(err, "repo") };
           publish();
           return false;
         }
@@ -2360,7 +2361,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await store.openRepo(folder);
         }
       } catch (err: unknown) {
-        internal = { ...internal, workspaceError: formatError(err) };
+        internal = { ...internal, workspaceError: describeError(err, "repo") };
         publish();
       }
     },
@@ -2378,7 +2379,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         await invokeFn("cmd_revoke_repository_trust", { repoPath: session.path });
         await store.closeTab(id);
       } catch (error: unknown) {
-        store.setError(formatError(error));
+        store.setError(describeError(error, "repo"));
       }
     },
     activateTab: async (id: string, extras: { force?: boolean } = {}) => {
@@ -3723,7 +3724,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       try {
         saveAutoFetchPrefs(autoFetchPrefs);
       } catch (error) {
-        diagnostics.warn("autoFetch", `couldn't save auto-fetch settings: ${formatError(error)}`);
+        diagnostics.warn("autoFetch", `couldn't save auto-fetch settings: ${formatErrorRaw(error)}`);
       }
     },
     /**
@@ -3748,7 +3749,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         },
         fetch: (path) => autoFetchRepo(path),
         onError: (path, error) =>
-          diagnostics.warn("autoFetch", `auto-fetch of ${path} failed: ${formatError(error)}`),
+          diagnostics.warn("autoFetch", `auto-fetch of ${path} failed: ${formatErrorRaw(error)}`),
       });
       return createAdaptiveTimer(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
     },
@@ -3788,7 +3789,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return output === undefined ? { ok: true, policy } : { ok: true, policy, output };
       } catch (err: unknown) {
         harnessStore.recordAction({ repoPath: path, kind: "issue-report", label, ok: false });
-        return { ok: false, error: formatError(err) };
+        return { ok: false, error: describeError(err, "repo") };
       }
     },
     publishRelease: async (tag: string, message: string) =>
@@ -4153,7 +4154,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // a caller that must react to a refusal — the commit box keeping the
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
-      const error = formatError(err);
+      const error = describeError(err, "repo");
       harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
       if (opts.expected?.(err)) return { ok: false, error, cause: err, surfaced: false };
       applyToSession(session.id, generation, { error });

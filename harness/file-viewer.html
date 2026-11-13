@@ -246,16 +246,22 @@ const type = async value => { const area = textarea(); area.value = value; area.
   // --- Explorer's Search rail ----------------------------------------------
   // Search used to be a section of Code that replaced the editor; it is the
   // Explorer column's other pane now, so a hit opens beside its results.
-  const searchToggle = () => host.querySelector("[data-search-toggle]");
+  // One field in Explorer: its Names | Contents segment is the mode switch,
+  // and its aria-label follows the mode.
+  const modeButton = label => [...host.querySelectorAll('[aria-label="Search in"] button')].find(el => el.textContent.trim() === label);
   const rail = () => host.querySelector("[data-explorer-rail]");
   const searchBox = () => host.querySelector('input[aria-label="Search file contents"]');
-  const searchRailIsUp = () => searchToggle()?.getAttribute("aria-pressed") === "true";
-  check("Explorer offers a Search toggle beside its own", () => searchToggle()?.getAttribute("aria-pressed") === "false");
+  const searchRailIsUp = () => modeButton("Contents")?.getAttribute("aria-pressed") === "true";
+  check("Explorer has no separate content-search toggle", () => !host.querySelector("[data-search-toggle]"));
+  check("its one search field offers Names and Contents, on Names", () =>
+    modeButton("Names")?.getAttribute("aria-pressed") === "true" && modeButton("Contents")?.getAttribute("aria-pressed") === "false" &&
+    host.querySelectorAll('input[aria-label="Filter files"]').length === 1);
   check("and opens on the file tree", () => rail()?.dataset.explorerRail === "files" && !!host.querySelector('[role="tree"]'));
-  searchToggle().click(); await tick();
+  modeButton("Contents").click(); await tick();
   await until(() => searchBox() && document.activeElement === searchBox(), "the search box takes focus");
-  check("the toggle swaps the tree for content search and focuses its box", () =>
-    rail().dataset.explorerRail === "search" && searchToggle().getAttribute("aria-pressed") === "true" && document.activeElement === searchBox());
+  check("Contents swaps the tree for content search and focuses the same field", () =>
+    rail().dataset.explorerRail === "search" && searchRailIsUp() && document.activeElement === searchBox() &&
+    !host.querySelector('input[aria-label="Filter files"]'));
   // The save checks above leave the file open in edit mode with a draft.
   const editorShown = () => Boolean(textarea() || button("Edit"));
   const draftBefore = textarea()?.value ?? null;
@@ -263,10 +269,11 @@ const type = async value => { const area = textarea(); area.value = value; area.
   const treeWhileSearching = host.querySelector('[role="tree"]');
   check("the tree is hidden, not torn down, so its folds and filter survive", () =>
     Boolean(treeWhileSearching) && treeWhileSearching.closest(".hidden") !== null);
-  const searchPane = searchBox().closest("[data-content-search]");
+  const searchPane = host.querySelector("[data-content-search]");
   check("the search form fits the rail without widening it", () => searchPane.scrollWidth <= searchPane.clientWidth + 1);
+  check("the field and its segment fit the rail", () => { const r = rail(); return r.scrollWidth <= r.clientWidth + 1; });
   searchBox().value = "two"; searchBox().dispatchEvent(new Event("input", { bubbles: true })); await tick();
-  searchPane.querySelector("form").requestSubmit();
+  searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await tick();
   await until(() => host.querySelector("[data-search-match]"), "a search hit is listed");
   check("a search from the rail runs against the repository", () => searches.length === 1 && searches[0].pattern === "two");
   lens.setEditorLens("blame"); await tick();
@@ -275,8 +282,11 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(() => host.textContent.includes("Ln 2, Col 1"), "the hit lands on its line");
   check("and lands on that line, with the results still up beside it", () =>
     host.textContent.includes("Ln 2, Col 1") && Boolean(host.querySelector("[data-search-match]")));
-  searchToggle().click(); await tick();
-  check("toggling again brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
+  searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
+  check("Escape clears the query first and stays in Contents", () => searchBox()?.value === "" && rail().dataset.explorerRail === "search");
+  searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
+  check("a second Escape on the empty field returns to Names", () => rail().dataset.explorerRail === "files" && modeButton("Names").getAttribute("aria-pressed") === "true");
+  check("Names brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
   lens.showExplorerRail("search"); lens.showExplorerRail("files"); await tick(); await wait();
   check("a search request that was never shown leaves the editor's focus alone", () => document.activeElement !== searchBox());
   lens.consumeSearchFocus();
@@ -328,7 +338,7 @@ const type = async value => { const area = textarea(); area.value = value; area.
   // again announces nothing, so the hit must open through the tree's handler.
   check("(setup) the hit names the file already selected", () => get(repoStore).selectedFilePath === file);
   searchBox().value = "two"; searchBox().dispatchEvent(new Event("input", { bubbles: true })); await tick();
-  searchBox().closest("form").requestSubmit();
+  searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await tick();
   await until(() => host.querySelector("[data-search-match]"), "a compact search hit is listed");
   host.querySelector("[data-search-match]").click(); await tick();
   await until(() => editorShown(), "the editor comes forward");

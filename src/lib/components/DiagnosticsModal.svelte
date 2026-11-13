@@ -39,6 +39,13 @@
     return `No ${wanted} recorded. ${total} other ${total === 1 ? "entry" : "entries"} hidden by this filter.`;
   }
 
+  /** A group key as a DOM id fragment: the key holds NULs and message text. */
+  export function groupDomId(key: string): string {
+    let hash = 5381;
+    for (let i = 0; i < key.length; i += 1) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
+    return hash.toString(36);
+  }
+
   /** A response belongs to the currently visible opening of the dialog. */
   export function isCurrentBackendLoad(
     generation: number,
@@ -55,8 +62,10 @@
     APP_VERSION,
     diagnostics,
     diagnosticPersistenceLabel,
+    diagnosticEntryFirstAt,
+    formatDiagnosticRange,
     formatDiagnosticReport,
-    formatDiagnosticTime,
+    groupDiagnostics,
     redactDiagnosticText,
     staleBuildNote,
     type DiagnosticEntry,
@@ -78,7 +87,7 @@
     withPersistedLogSection,
   } from "../diagnostics/report";
   import { unreadablePersistedLog, type PersistedLog } from "../diagnostics/types";
-  import { TriangleAlert, CircleAlert, ClipboardCopy, Trash2, Activity, Check } from "@lucide/svelte";
+  import { TriangleAlert, CircleAlert, ChevronDown, ClipboardCopy, Trash2, Activity, Check } from "@lucide/svelte";
 
   let {
     isOpen = false,
@@ -117,11 +126,15 @@
     };
   });
 
-  let visibleEntries = $derived(
-    ($diagnostics as readonly DiagnosticEntry[]).filter(
-      (entry) => filter === "all" || entry.severity === filter,
+  let visibleGroups = $derived(
+    groupDiagnostics(
+      ($diagnostics as readonly DiagnosticEntry[]).filter(
+        (entry) => filter === "all" || entry.severity === filter,
+      ),
     ),
   );
+  /** Which groups have their occurrence list open, by group key. */
+  let expanded = $state<Record<string, boolean>>({});
   let hiddenNotice = $derived(hiddenByFilterNotice(filter, $diagnostics.length));
   let errorCount = $derived(
     ($diagnostics as readonly DiagnosticEntry[]).reduce(
@@ -407,48 +420,80 @@
         <div class="px-1 pt-1 gp-label">
           Frontend diagnostics
         </div>
-        {#each visibleEntries as entry (entry.id)}
+        {#each visibleGroups as group (group.key)}
+          {@const open = expanded[group.key] === true}
+          {@const tone = group.severity === "error" ? "text-danger" : "text-warn"}
           <div
-            class="rounded-xl border px-3 py-2 {entry.severity === 'error'
+            class="rounded-xl border px-3 py-2 {group.severity === 'error'
               ? 'border-danger/35 bg-danger/5'
               : 'border-warn/35 bg-warn/5'}"
           >
-            <div class="flex items-center gap-2 mb-1">
-              {#if entry.severity === "error"}
+            {#snippet head()}
+              {#if group.severity === "error"}
                 <CircleAlert size={12} class="text-danger shrink-0" />
               {:else}
                 <TriangleAlert size={12} class="text-warn shrink-0" />
               {/if}
-              <span
-                class="text-micro font-semibold {entry.severity === 'error'
-                  ? 'text-danger'
-                  : 'text-warn'}"
-              >{entry.severity}</span>
-              <span class="px-1.5 py-px rounded-sm bg-surfaceHover text-micro text-textMuted font-mono">{entry.source}</span>
+              <span class="text-micro font-semibold {tone}">{group.severity}</span>
+              <span class="px-1.5 py-px rounded-sm bg-surfaceHover text-micro text-textMuted font-mono">{group.source}</span>
               <!-- Only entries that did not come from the running build are
                    marked, so the badge means something when it appears: the
                    ring is persisted, so a log can outlive the build that
                    wrote it and describe a bug that is already fixed. -->
-              {#if staleBuildNote(entry.version, APP_VERSION)}
+              {#if staleBuildNote(group.version, APP_VERSION)}
                 <span
                   class="px-1.5 py-px rounded-sm bg-warn/15 text-micro text-warn/90 font-mono shrink-0"
-                  title="Recorded by {entry.version ?? 'an earlier build'}; this app is running {APP_VERSION}."
-                >{entry.version ?? "older build"}</span>
+                  title="Recorded by {group.version ?? 'an earlier build'}; this app is running {APP_VERSION}."
+                >{group.version ?? "older build"}</span>
               {/if}
-              <span class="text-micro text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticTime(entry.at)}</span>
-              <!-- Repeats are grouped by fingerprint, so occurrences can
+              <span class="text-micro text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticRange(group.firstAt, group.lastAt)}</span>
+              <!-- Occurrences are grouped by normalised message, so they can
                    differ in per-run detail. Saying so keeps the counter from
                    reading as N verbatim copies of the text below it. -->
-              {#if entry.count > 1}
+              {#if group.count > 1}
                 <span
                   class="px-1.5 py-px rounded-full bg-surfaceHover text-micro font-semibold text-textPrimary shrink-0"
-                  title={entry.varied
-                    ? `${entry.count} occurrences; they were not identical — the most recent is shown.`
-                    : `${entry.count} identical occurrences.`}
-                >×{entry.count}{entry.varied ? " differing" : ""}</span>
+                  title={group.varied
+                    ? `${group.count} occurrences; they were not identical — the most recent is shown.`
+                    : `${group.count} identical occurrences.`}
+                >×{group.count}{group.varied ? " differing" : ""}</span>
               {/if}
-            </div>
-            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0">{entry.message}</pre>
+            {/snippet}
+            {#if group.count > 1}
+              <button
+                type="button"
+                class="flex w-full items-center gap-2 mb-1 text-left cursor-pointer"
+                aria-expanded={open}
+                aria-controls={`diagnostic-occurrences-${groupDomId(group.key)}`}
+                title={open ? "Hide each occurrence" : "Show each occurrence"}
+                onclick={() => (expanded = { ...expanded, [group.key]: !open })}
+              >
+                {@render head()}
+                <ChevronDown size={12} class="shrink-0 text-textMuted transition-transform {open ? 'rotate-180' : ''}" />
+              </button>
+            {:else}
+              <div class="flex items-center gap-2 mb-1">
+                {@render head()}
+              </div>
+            {/if}
+            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0">{group.message}</pre>
+            {#if open}
+              <ul
+                id={`diagnostic-occurrences-${groupDomId(group.key)}`}
+                aria-label="Occurrences"
+                class="mt-2 space-y-1 rounded-lg bg-background/60 px-2 py-1.5 list-none"
+              >
+                {#each group.entries as entry (entry.id)}
+                  <li class="text-micro text-textMuted">
+                    <span class="font-mono">{formatDiagnosticRange(diagnosticEntryFirstAt(entry), entry.at)}</span>
+                    {#if entry.count > 1}<span class="font-semibold text-textPrimary"> ×{entry.count}</span>{/if}
+                    {#if entry.message !== group.message}
+                      <pre class="mt-0.5 whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0 select-text">{entry.message}</pre>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </div>
         {:else}
           <div class="py-10 text-center text-textMuted flex flex-col items-center gap-3" role="status">

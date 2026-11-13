@@ -8,7 +8,7 @@
   import { harnessStore } from "../stores/harnessStore";
   import { CLAUDE_MODELS } from "../workbench/taskModel";
   import { claudeKey, claudeKeyProblem } from "../workbench/claudeKey";
-  import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
+  import { formatDisplayFailure } from "../diagnostics/report";
 
   let choice = $derived($harnessStore.manviClaude);
   /** null until the Keychain has answered. */
@@ -22,7 +22,7 @@
       keySaved = await claudeKey.status();
       error = null;
     } catch (err: unknown) {
-      error = formatDiagnosticFailure(err);
+      error = formatDisplayFailure(err, "manvi");
     }
   }
 
@@ -37,7 +37,7 @@
       await action();
       await refresh();
     } catch (err: unknown) {
-      error = formatDiagnosticFailure(err);
+      error = formatDisplayFailure(err, "manvi");
     } finally {
       working = false;
     }

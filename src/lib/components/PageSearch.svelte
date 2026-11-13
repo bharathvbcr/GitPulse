@@ -13,6 +13,14 @@
    *   branches, "#" commits, ":" symbols, "%" repositories, "?" help): results
    *   drop down under the field from the palette's own engine, loaded the
    *   first time they are needed.
+   * - Under Fleet, Agents and Tasks it is always that palette, for the
+   *   repository whose tab was last active, and says which. Running a file,
+   *   branch, commit or symbol result there brings the repository page back
+   *   (the palette's own seam, `modeLandsOnRepositoryPage`).
+   *
+   * The text it shows follows its own measured width, not the window's
+   * (`search/fieldCopy.ts`): the long hint where it fits whole, then the
+   * subject, then just "Search", and the shortcut hint goes first.
    *
    * Where the page has a search, what is typed is that search, literally:
    * `#include`, `// TODO`, `@param` or `:root` in a file, `#123` in the commit
@@ -22,7 +30,7 @@
    *
    * Each page keeps its own query, so a diff's find text never becomes the
    * commit filter on a section switch. Focus never repaints the pill; the
-   * caret marks it. ⌘F focuses it from anywhere on the repository surface.
+   * caret marks it. ⌘F focuses it on every surface that has a repository open.
    */
   import { onMount } from "svelte";
   import { ChevronDown, ChevronUp, Search, X } from "@lucide/svelte";
@@ -32,11 +40,13 @@
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { activeSectionFor } from "../views/viewRegistry";
-  import { FOCUS_PAGE_SEARCH_EVENT } from "../views/commitFilter";
+  import { FOCUS_PAGE_SEARCH_EVENT, FOCUS_SUSPECTS_SYMPTOM_EVENT } from "../views/commitFilter";
   import { MAX_QUERY_LENGTH } from "../palette/modes";
   import { pageScope, pageSearchFor, standingFilterFor } from "../search/pageSearch.svelte";
-
-  const REPOSITORY_PLACEHOLDER = "Search this repository: commands, / files, @ branches, # commits";
+  import { paletteFieldCopy } from "../search/fieldCopy";
+  import { interfaceStore } from "../stores/interfaceStore";
+  import { displayName } from "../repos/paths";
+  import { createResizeObservation } from "../dom/observeResize";
 
   let input: HTMLInputElement | undefined = $state();
   let pill: HTMLDivElement | undefined = $state();
@@ -44,9 +54,15 @@
   /** The palette's text, on a page with no search of its own. */
   let paletteText = $state("");
   let activeOption = $state<string | undefined>(undefined);
+  /** The pill's content width once measured; null until then (and on the server). */
+  let pillWidth = $state<number | null>(null);
 
+  // Under Fleet, Agents or Tasks no page is on screen to search: the field is
+  // the repository palette there, whatever section the last active tab was on,
+  // so a hidden History's commit filter or a hidden diff's find never takes it.
+  const onRepository = $derived($interfaceStore.globalSurface === "repository");
   const scope = $derived(pageScope($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections)));
-  const provider = $derived(pageSearchFor(scope));
+  const provider = $derived(onRepository ? pageSearchFor(scope) : undefined);
   const inPalette = $derived(!provider);
   const value = $derived(inPalette ? paletteText : (provider?.query() ?? ""));
   const cardOpen = $derived(focused && inPalette);
@@ -54,10 +70,16 @@
   const filter = $derived(provider?.kind === "filter" && !inPalette ? provider : null);
   /** History's commit filter also narrows its Diff section: shown there, not hidden. */
   const standing = $derived(
-    provider?.kind !== "filter" ? standingFilterFor($repoStore.activeTab) : null,
+    onRepository && provider?.kind !== "filter" ? standingFilterFor($repoStore.activeTab) : null,
   );
   const chip = $derived(filter?.chip?.() ?? standing);
-  const label = $derived(inPalette ? "Search this repository" : (provider?.label ?? "Search this repository"));
+  // The repository the palette searches is the one whose tab was last active;
+  // off the repository surface the field says which that is.
+  const subject = $derived(
+    onRepository ? "this repository" : $repoStore.currentPath ? displayName($repoStore.currentPath) : null,
+  );
+  const copy = $derived(paletteFieldCopy({ subject, width: pillWidth }));
+  const label = $derived(inPalette ? copy.label : (provider?.label ?? copy.label));
 
   // The palette's chunk loads the first time the card has to open: the view
   // bar is in the entry chunk, the palette is not.
@@ -119,8 +141,23 @@
       input?.focus();
       input?.select();
     };
+    // The page's Suspects question asks for ⌘F by its own event. Off the
+    // repository surface that page is not on screen, so the chord is the field's.
+    const takeFromHiddenPage = () => {
+      if (!onRepository) take();
+    };
     window.addEventListener(FOCUS_PAGE_SEARCH_EVENT, take);
-    return () => window.removeEventListener(FOCUS_PAGE_SEARCH_EVENT, take);
+    window.addEventListener(FOCUS_SUSPECTS_SYMPTOM_EVENT, takeFromHiddenPage);
+    const resize = createResizeObservation((entries) => {
+      const width = entries.at(-1)?.contentRect.width;
+      if (typeof width === "number") pillWidth = Math.round(width);
+    });
+    if (pill) resize.observe(pill);
+    return () => {
+      window.removeEventListener(FOCUS_PAGE_SEARCH_EVENT, take);
+      window.removeEventListener(FOCUS_SUSPECTS_SYMPTOM_EVENT, takeFromHiddenPage);
+      resize.disconnect();
+    };
   });
 </script>
 
@@ -152,7 +189,7 @@
     aria-controls={cardOpen ? "page-palette-listbox" : undefined}
     aria-autocomplete="list"
     aria-activedescendant={cardOpen ? activeOption : undefined}
-    placeholder={inPalette ? REPOSITORY_PLACEHOLDER : provider?.placeholder}
+    placeholder={inPalette ? copy.placeholder : provider?.placeholder}
     class="min-w-0 flex-1 bg-transparent px-1.5 text-textPrimary outline-hidden placeholder:text-faint"
     id="gitpulse-page-search"
   />
@@ -174,7 +211,7 @@
   {/if}
   {#if value}
     <button type="button" class="gp-icon-btn shrink-0" onclick={clear} title="Clear" aria-label="Clear search"><X size={13} /></button>
-  {:else if !focused}
+  {:else if !focused && copy.showKeycap}
     <span class="gp-keycap mr-1.5 shrink-0 text-micro!" aria-hidden="true">{shortcutTextLabel("⌘F", $hostPlatform.os)}</span>
   {/if}
 </div>

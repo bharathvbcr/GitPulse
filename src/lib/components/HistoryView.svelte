@@ -20,7 +20,6 @@
   import DiffViewer from "./DiffViewer.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import SettingSegment from "./SettingSegment.svelte";
-  import SuspectsQueryBar from "./SuspectsQueryBar.svelte";
   import { suspectsQuery } from "../codeintel/suspectsQuery";
   // The lists Graph can draw above the commit details. "HEAD moves" is the
   // reflog and "Suspects" the regression ranking, each once its own section;
@@ -66,8 +65,8 @@
 
   // The view bar's search field. On Graph's Commits and HEAD moves lists it is
   // the commit filter; the Diff section's viewer (mounted inside this scope)
-  // makes it a find instead. The Suspects list asks its question in the
-  // context bar (SuspectsQueryBar), so there the field has nothing of its own
+  // makes it a find instead. The Suspects list asks its question in its own
+  // header (SuspectsQueryBar), so there the field has nothing of its own
   // and searches the repository; ⌘F goes to the symptom (findChordTarget).
   providePageSearchScope("history:diff");
   $effect(() => {
@@ -102,8 +101,8 @@
 <div class="flex-1 flex flex-col min-h-0">
   {#if section === "graph"}
     <!-- Graph's three lists. The commit filter that used to sit beside them is
-         the view bar's search field now; the Suspects list's question stays
-         here, because a ranking is one answer, not a list text narrows. -->
+         the view bar's search field now; the Suspects list's question lives in
+         that list, so the bar holds exactly one search field. -->
     <ViewContextBar label="Graph list">
       <SettingSegment
         ariaLabel="Graph list"
@@ -111,9 +110,6 @@
         value={list}
         onselect={(next) => repoStore.setHistoryList(next)}
       />
-      {#if asksSuspects}
-        <SuspectsQueryBar />
-      {/if}
     </ViewContextBar>
   {/if}
   <ViewSectionPanel {view} {section}>
