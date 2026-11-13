@@ -94,6 +94,32 @@ export function consumeReveal(path: string, now: number = Date.now()): RevealReq
   return current;
 }
 
+/**
+ * The 1-based line a go-to-line field asks for in a file of `lineCount` lines,
+ * or null when it names none.
+ *
+ * `value` is whatever the field bound: a `type="number"` input gives a number,
+ * or null once it is cleared, never text, so this takes both shapes rather
+ * than assuming a string. Only a whole number of 1 or more counts; anything
+ * else is refused, not rounded. A line past the end lands on the last line,
+ * the same as a reveal request.
+ */
+export function goToLineTarget(value: unknown, lineCount: number): number | null {
+  if (lineCount < 1) return null;
+  let line: number;
+  if (typeof value === "number") {
+    line = value;
+  } else if (typeof value === "string") {
+    const text = value.trim();
+    if (!/^\d+$/.test(text)) return null;
+    line = Number(text);
+  } else {
+    return null;
+  }
+  if (!Number.isInteger(line) || line < 1) return null;
+  return Math.min(line, lineCount);
+}
+
 /** Drops any pending request. For teardown and tests. */
 export function clearReveal(): void {
   pending.set(null);

@@ -40,7 +40,7 @@
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
-  import { consumeReveal, revealRequest } from "../../files/revealRequests";
+  import { consumeReveal, goToLineTarget, revealRequest } from "../../files/revealRequests";
   import type { LineEnding } from "../../files/types";
 
   let {
@@ -117,7 +117,7 @@
   let searchInputEl: HTMLInputElement | undefined = $state();
 
   let goToLineOpen = $state(false);
-  let targetLineInput = $state("");
+  let targetLineInput = $state<number | null>(null);
 
   let scrollTop = $state(0);
 
@@ -285,14 +285,13 @@
   }
 
   function handleGoToLine() {
-    const num = parseInt(targetLineInput.trim(), 10);
-    if (!isNaN(num) && num >= 1 && num <= rawLines.length) {
-      selectedLine = num;
-      selectedLineEnd = null;
-      scrollToLine(num - 1);
-      goToLineOpen = false;
-      targetLineInput = "";
-    }
+    const num = goToLineTarget(targetLineInput, rawLines.length);
+    if (num === null) return;
+    selectedLine = num;
+    selectedLineEnd = null;
+    scrollToLine(num - 1);
+    goToLineOpen = false;
+    targetLineInput = null;
   }
 
   function handleLineClick(lineNum: number, event: MouseEvent) {

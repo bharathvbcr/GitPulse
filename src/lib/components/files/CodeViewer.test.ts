@@ -42,6 +42,15 @@ describe("CodeViewer", () => {
     expect(source).toContain("handleGoToLine");
   });
 
+  it("reads the go-to-line field through goToLineTarget, never as text", () => {
+    // The field is `type="number"`, so `bind:value` yields a number or null.
+    // Calling `.trim()` on it threw "trim is not a function" on every Go.
+    const handler = source.slice(source.indexOf("function handleGoToLine()"), source.indexOf("function handleLineClick("));
+    expect(handler).toContain("goToLineTarget(targetLineInput, rawLines.length)");
+    expect(handler).not.toContain(".trim()");
+    expect(source).toContain("let targetLineInput = $state<number | null>(null);");
+  });
+
   it("supports inline editing and file saving via cmd_write_file_content", () => {
     expect(source).toContain("isEditing");
     expect(source).toContain("startEdit");

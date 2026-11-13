@@ -3,6 +3,7 @@ import { get } from "svelte/store";
 import {
   clearReveal,
   consumeReveal,
+  goToLineTarget,
   requestReveal,
   revealRequest,
   MAX_REVEAL_LINE,
@@ -75,5 +76,43 @@ describe("reveal requests", () => {
     requestReveal("src/a.ts", 3, null, 1_000);
     clearReveal();
     expect(consumeReveal("src/a.ts", 1_000)).toBeNull();
+  });
+});
+
+describe("go-to-line target", () => {
+  it("takes the number a number input binds", () => {
+    // `<input type="number" bind:value>` hands over a number, not text: the
+    // old handler called `.trim()` on it and threw on every Go.
+    expect(goToLineTarget(42, 100)).toBe(42);
+  });
+
+  it("takes typed text, trimmed", () => {
+    expect(goToLineTarget(" 7 ", 100)).toBe(7);
+  });
+
+  it("treats a cleared field as nothing to go to", () => {
+    // A number input that is emptied binds null, not "".
+    expect(goToLineTarget(null, 100)).toBeNull();
+    expect(goToLineTarget(undefined, 100)).toBeNull();
+    expect(goToLineTarget("", 100)).toBeNull();
+    expect(goToLineTarget("   ", 100)).toBeNull();
+  });
+
+  it("refuses what is not a whole line number", () => {
+    expect(goToLineTarget(0, 100)).toBeNull();
+    expect(goToLineTarget(-3, 100)).toBeNull();
+    expect(goToLineTarget(2.5, 100)).toBeNull();
+    expect(goToLineTarget(Number.NaN, 100)).toBeNull();
+    expect(goToLineTarget("12abc", 100)).toBeNull();
+    expect(goToLineTarget("1e3", 100)).toBeNull();
+  });
+
+  it("clamps a line past the end to the last line, as a reveal does", () => {
+    expect(goToLineTarget(500, 100)).toBe(100);
+    expect(goToLineTarget(Number.POSITIVE_INFINITY, 100)).toBeNull();
+  });
+
+  it("has nowhere to go in an empty file", () => {
+    expect(goToLineTarget(1, 0)).toBeNull();
   });
 });
