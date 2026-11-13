@@ -125,7 +125,7 @@ fn main() {
     let mut stack_turn = false;
     let cases = vec![
         Case::new("graph default page 5k (S4-04)", || {
-            graph_turn = !graph_turn;
+            graph_turn.toggle();
             touch(&graph, graph_turn);
             let started = std::time::Instant::now();
             let (rows, _) = graph_page(&graph);
@@ -137,7 +137,7 @@ fn main() {
         Case::new(
             "stack refresh 20 branches beyond the window (S4-03)",
             || {
-                stack_turn = !stack_turn;
+                stack_turn.toggle();
                 touch(&stack, stack_turn);
                 let started = std::time::Instant::now();
                 let (nodes, parented) = stack_refresh(&stack);

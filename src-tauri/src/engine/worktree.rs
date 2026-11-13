@@ -672,14 +672,7 @@ fn parse_worktree_porcelain_z(raw: &str) -> Vec<ParsedWorktree> {
         };
         match key {
             "HEAD" => entry.head = value.to_string(),
-            "branch" => {
-                entry.branch = Some(
-                    value
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(value)
-                        .to_string(),
-                )
-            }
+            "branch" => entry.branch = Some(value.trim_prefix("refs/heads/").to_string()),
             "detached" => entry.is_detached = true,
             "bare" => entry.is_bare = true,
             "locked" => entry.is_locked = true,

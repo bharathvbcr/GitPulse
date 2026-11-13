@@ -2320,13 +2320,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":true,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
 
         let path = repo.path().to_string_lossy().into_owned();
         let mut builds = 0u32;
@@ -2432,13 +2428,9 @@ exit 2
     fn productive_edit_storm_builds_at_most_once_per_rest_window() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2529,13 +2521,9 @@ exit 2
     fn a_timed_out_build_pauses_automatic_indexing_and_says_the_index_is_too_slow() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2623,13 +2611,9 @@ exit 2
     fn a_build_that_cannot_run_waits_like_a_failed_one() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2662,13 +2646,9 @@ exit 2
     fn start_refresh_answers_before_the_build_and_the_next_ask_collects_it() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2744,13 +2724,9 @@ exit 2
     fn start_refresh_answers_before_a_hung_status_probe_and_collects_it_once() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2833,13 +2809,9 @@ exit 2
     fn adversarial_hung_30s_status_probe_returns_within_grace_and_does_not_block_ipc() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2922,13 +2894,9 @@ exit 2
     fn a_probe_answer_is_reused_briefly_unless_it_could_not_run_or_a_build_intervened() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository("#!/bin/sh\nexit 2\n");
         let path = repo.path().to_string_lossy().into_owned();
 
@@ -2987,13 +2955,9 @@ exit 2
     fn only_a_few_status_probes_run_at_once() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let bound = cli::bind_test_binary("/gitpulse-test/no-such-devmap");
         let release = bound.set_status_delayed(
             cli::available_status(r#"{"is_fresh":true,"schema_outdated":false}"#),
@@ -3020,14 +2984,10 @@ exit 2
     fn a_panicking_detached_build_frees_the_slot_and_records_a_failure() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-                crate::supervisor::note_recovered("devmap-live-build");
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+            crate::supervisor::note_recovered("devmap-live-build");
+        });
         let path = "/gitpulse-test/panicking-detached-build".to_string();
         let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
         assert!(
@@ -3091,13 +3051,9 @@ exit 2
     fn a_settled_detached_build_records_its_outcome_and_frees_the_slot() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = "/gitpulse-test/settled-detached-build".to_string();
         let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
         let settle = LiveSettle {
@@ -3329,13 +3285,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let first = maybe_refresh(&path, true);
         assert_eq!(first.decision, LiveRefreshDecision::Refresh);
@@ -3390,13 +3342,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let first = maybe_refresh(&path, true);
         assert_eq!(first.decision, LiveRefreshDecision::Refresh);
@@ -3442,13 +3390,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         // The two payloads the stub used to serve from a file it re-read on every
         // spawn. Stated directly, so what changes between the two calls is the
@@ -3545,13 +3489,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
 
         // The store this repository does not have yet. The stub used to derive
@@ -3649,13 +3589,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
 
         bound.set_status(cli::available_status(

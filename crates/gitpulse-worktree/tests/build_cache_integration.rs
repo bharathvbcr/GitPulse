@@ -756,18 +756,84 @@ fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runti
         "1379:live-asset"
     );
 
-    // Verify no `.d` file in `wt_b/target/debug/deps` leaks either `sym-anchor` or `real-anchor`!
-    for entry in fs::read_dir(wt_b.join("target/debug/deps")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|s| s.to_str()) == Some("d") {
-            let text = fs::read_to_string(&path).unwrap();
-            assert!(
-                !text.contains("sym-anchor") && !text.contains("real-anchor"),
-                "leaked Worktree A path into Worktree B dep-info {}:\n{text}",
-                path.display()
-            );
+    // Verify no `.d` file under `wt_b/target/debug` leaks either `sym-anchor` or `real-anchor`!
+    // The dep-info files live in `deps/` (cargo <= 1.99) or in each unit's
+    // `build/<pkg>/<hash>/out/` (cargo >= 1.100); `dep_info_files` reads whichever the
+    // toolchain that ran this build produced and refuses to return nothing, so a layout
+    // this test does not know cannot turn the loop below into a no-op.
+    let dep_infos = dep_info_files(&wt_b.join("target/debug"));
+    for path in &dep_infos {
+        let text = fs::read_to_string(path).unwrap();
+        assert!(
+            !text.contains("sym-anchor") && !text.contains("real-anchor"),
+            "leaked Worktree A path into Worktree B dep-info {}:\n{text}",
+            path.display()
+        );
+    }
+    assert!(
+        dep_infos.iter().any(
+            |p| p.file_name().and_then(|n| n.to_str()) == Some("combo_app.d")
+                || p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("combo_app-") && n.ends_with(".d"))
+        ),
+        "the build produced no dep-info for combo_app itself: {dep_infos:?}"
+    );
+}
+
+/// Every rustc dep-info (`.d`) file a cargo build left under `profile_dir`
+/// (`target/<profile>`), for either build-dir layout:
+///
+/// * cargo <= 1.99: `profile_dir/deps/*.d`
+/// * cargo >= 1.100: `profile_dir/build/<pkg>/<hash>/out/*.d` (there is no `deps/`)
+///
+/// Panics when neither layout's directory exists or when no `.d` file is found: a build
+/// that ran must leave dep-info, and an unreadable directory must fail the test rather
+/// than pass it vacuously.
+fn dep_info_files(profile_dir: &Path) -> Vec<PathBuf> {
+    fn d_files_in(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("d") {
+                out.push(path);
+            }
         }
     }
+
+    let legacy = profile_dir.join("deps");
+    let build = profile_dir.join("build");
+    let mut found = Vec::new();
+    let mut layouts = 0;
+    if legacy.is_dir() {
+        layouts += 1;
+        d_files_in(&legacy, &mut found);
+    }
+    if build.is_dir() {
+        for pkg in fs::read_dir(&build).unwrap() {
+            let pkg = pkg.unwrap().path();
+            if !pkg.is_dir() {
+                continue;
+            }
+            for unit in fs::read_dir(&pkg).unwrap() {
+                let out = unit.unwrap().path().join("out");
+                if out.is_dir() {
+                    layouts += 1;
+                    d_files_in(&out, &mut found);
+                }
+            }
+        }
+    }
+    assert!(
+        layouts > 0,
+        "{} holds neither `deps/` (cargo <= 1.99) nor `build/<pkg>/<hash>/out/` (cargo >= 1.100)",
+        profile_dir.display()
+    );
+    assert!(
+        !found.is_empty(),
+        "no `.d` dep-info under {}",
+        profile_dir.display()
+    );
+    found
 }
 
 #[test]

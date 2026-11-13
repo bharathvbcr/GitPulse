@@ -494,8 +494,7 @@ fn normalise_url(url: &str) -> String {
     let lowered = without_user.to_ascii_lowercase();
     let trimmed = lowered.trim_end_matches('/');
     trimmed
-        .strip_suffix(".git")
-        .unwrap_or(trimmed)
+        .trim_suffix(".git")
         .trim_end_matches('/')
         .to_string()
 }

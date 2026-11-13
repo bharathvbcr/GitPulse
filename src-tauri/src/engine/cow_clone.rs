@@ -17,7 +17,7 @@
 //!
 //! Cargo's `target/` is cloned only by a real clone (never byte-copied: a
 //! byte copy of a build directory costs the disk the clone was meant to
-//! save), only while no anchor build holds its `.cargo-lock`, and with the
+//! save), only while no anchor build holds a cargo lock (`.cargo-lock`, and in cargo >= 1.100 `.cargo-build-lock` / `.cargo-artifact-lock`), and with the
 //! anchor's absolute paths in recorded build-script output rewritten to the
 //! clone's. Registry and git crates' fingerprints carry no workspace path,
 //! so the worktree reuses their compiled artifacts; path crates rebuild.
@@ -87,7 +87,7 @@ pub const STANDARD_CACHE_DIRS: &[&str] = &["node_modules", ".turbo", CARGO_TARGE
 
 /// Cargo's build directory. Cloned only when every file can be cloned (APFS
 /// `clonefile`, or FICLONE on each file), never byte-copied; skipped, with
-/// the reason reported, while an anchor build holds a `.cargo-lock` in it.
+/// the reason reported, while an anchor build holds a cargo lock in it (see `CARGO_LOCK_FILES`).
 pub const CARGO_TARGET_DIR: &str = "target";
 
 /// Profile directories (`target/debug`, `target/release`, ...) whose
@@ -699,13 +699,10 @@ fn byte_copy_forced() -> bool {
 /// cross-device FICLONE).
 #[cfg(test)]
 pub(crate) fn with_forced_byte_copy<T>(body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORCE_BYTE_COPY.with(|cell| cell.set(self.0));
-        }
-    }
-    let _restore = Restore(FORCE_BYTE_COPY.with(|cell| cell.replace(true)));
+    let _restore =
+        std::mem::DropGuard::new(FORCE_BYTE_COPY.with(|cell| cell.replace(true)), |prev| {
+            FORCE_BYTE_COPY.with(|cell| cell.set(prev));
+        });
     body()
 }
 
@@ -1100,8 +1097,14 @@ fn count_dir_stats(
     Ok((files, bytes))
 }
 
-/// Takes, without waiting, every `<target>/<profile>/.cargo-lock` the anchor
-/// has — the lock cargo holds for a whole build of that profile — so no
+/// The lock files cargo keeps in a profile directory. cargo <= 1.99 has only
+/// `.cargo-lock`; cargo >= 1.100 also keeps `.cargo-build-lock` (build directory) and
+/// `.cargo-artifact-lock` (final artifacts) beside it. A build holds whichever its cargo
+/// uses, so every one that exists is taken: a lock nobody holds costs nothing.
+const CARGO_LOCK_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
+/// Takes, without waiting, every `<target>/<profile>/<lock>` of [`CARGO_LOCK_FILES`] the
+/// anchor has — the locks cargo holds for a whole build of that profile — so no
 /// anchor build writes the tree while it is cloned. Released when the files
 /// drop. A profile with no lock file has no build to wait for.
 fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, CommandError> {
@@ -1116,25 +1119,27 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, CommandError> 
             ).into());
         }
         let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", target.display()))?;
-        let lock_path = profile.path().join(".cargo-lock");
-        let file = match fs::File::open(&lock_path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            // A profile entry that is a file, not a directory.
-            Err(_) if !profile.path().is_dir() => continue,
-            Err(e) => return Err(format!("Cannot open '{}': {e}", lock_path.display()).into()),
-        };
-        match file.try_lock() {
-            Ok(()) => held.push(file),
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "anchor build in progress ('{}' is locked)",
-                    lock_path.display()
-                )
-                .into())
-            }
-            Err(fs::TryLockError::Error(e)) => {
-                return Err(format!("Cannot lock '{}': {e}", lock_path.display()).into())
+        for lock_name in CARGO_LOCK_FILES {
+            let lock_path = profile.path().join(lock_name);
+            let file = match fs::File::open(&lock_path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // A profile entry that is a file, not a directory.
+                Err(_) if !profile.path().is_dir() => continue,
+                Err(e) => return Err(format!("Cannot open '{}': {e}", lock_path.display()).into()),
+            };
+            match file.try_lock() {
+                Ok(()) => held.push(file),
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "anchor build in progress ('{}' is locked)",
+                        lock_path.display()
+                    )
+                    .into())
+                }
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(format!("Cannot lock '{}': {e}", lock_path.display()).into())
+                }
             }
         }
     }
@@ -1174,8 +1179,13 @@ fn rewrite_build_outputs(
         }
         let scripts =
             fs::read_dir(&build).map_err(|e| format!("Cannot read '{}': {e}", build.display()))?;
-        for (index, script) in scripts.enumerate() {
-            if index >= MAX_BUILD_SCRIPTS {
+        // One budget for both layouts: every directory visited under `build/` counts,
+        // whether it is a `<pkg>-<hash>` unit (cargo <= 1.99) or a `<pkg>` and its
+        // `<hash>` children (cargo >= 1.100).
+        let mut visited = 0usize;
+        for script in scripts {
+            visited += 1;
+            if visited > MAX_BUILD_SCRIPTS {
                 return Err(format!(
                     "'{}' holds more than {MAX_BUILD_SCRIPTS} entries",
                     build.display()
@@ -1184,18 +1194,76 @@ fn rewrite_build_outputs(
             }
             let script = script.map_err(|e| format!("Cannot list '{}': {e}", build.display()))?;
             let script_path = script.path();
-            for name in ["output", "root-output"] {
-                rewrite_one_output(&script_path.join(name), replacements)?;
-            }
-            let out_dir = script_path.join("out");
-            if out_dir
+            // cargo <= 1.99: `build/<pkg>-<hash>/{output,root-output,out}`.
+            rewrite_script_unit(&script_path, &["output", "root-output"], replacements)?;
+            // cargo >= 1.100: `build/<pkg>/<hash>/{run/stdout,run/root-output,out}`, where
+            // only a unit that has a `run/` directory is a build-script run. The other
+            // units hold compiled crates (`out/*.rlib`, `*.rmeta`, `*.d`), which are
+            // binary or paths cargo never reads back, and are left untouched rather
+            // than read in full.
+            let is_dir = script_path
                 .symlink_metadata()
                 .map(|m| m.file_type().is_dir())
-                .unwrap_or(false)
-            {
-                rewrite_out_tree_text_files(&out_dir, replacements)?;
+                .unwrap_or(false);
+            // A cargo <= 1.99 build-script directory (it has `out` or `output`) is already
+            // handled above, and what is under its `out/` is the script's own business: a
+            // generated `run/` there is not a cargo 1.100 unit.
+            let is_legacy_unit = ["out", "output", "root-output"]
+                .iter()
+                .any(|name| script_path.join(name).symlink_metadata().is_ok());
+            if !is_dir || is_legacy_unit {
+                continue;
+            }
+            let units = fs::read_dir(&script_path)
+                .map_err(|e| format!("Cannot read '{}': {e}", script_path.display()))?;
+            for unit in units {
+                visited += 1;
+                if visited > MAX_BUILD_SCRIPTS {
+                    return Err(format!(
+                        "'{}' holds more than {MAX_BUILD_SCRIPTS} entries",
+                        build.display()
+                    )
+                    .into());
+                }
+                let unit =
+                    unit.map_err(|e| format!("Cannot list '{}': {e}", script_path.display()))?;
+                let unit_path = unit.path();
+                let is_run_unit = unit_path
+                    .join("run")
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_dir())
+                    .unwrap_or(false);
+                if is_run_unit {
+                    rewrite_script_unit(
+                        &unit_path,
+                        &["run/stdout", "run/root-output"],
+                        replacements,
+                    )?;
+                }
             }
         }
+    }
+    Ok(())
+}
+
+/// Rewrites the recorded output files `outputs` (relative to `unit`) and the generated
+/// text under `unit/out`, for one build-script run. A path that does not exist is
+/// skipped, so the same call serves a directory of either cargo layout.
+fn rewrite_script_unit(
+    unit: &Path,
+    outputs: &[&str],
+    replacements: &[(&str, &str)],
+) -> Result<(), CommandError> {
+    for name in outputs {
+        rewrite_one_output(&unit.join(name), replacements)?;
+    }
+    let out_dir = unit.join("out");
+    if out_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        rewrite_out_tree_text_files(&out_dir, replacements)?;
     }
     Ok(())
 }
@@ -2158,6 +2226,146 @@ mod tests {
                 original.contains(anchor_target.to_str().unwrap()),
                 "the anchor's own was rewritten"
             );
+        }
+    }
+
+    /// The anchor's `target/` as cargo >= 1.100 lays it out: no `deps/`; every unit has
+    /// `build/<pkg>/<hash>/`, and a build-script run's recorded output is in `run/`
+    /// (`stdout`, `stderr`, `root-output`) beside its `out/`. Returns the same tuple as
+    /// [`anchor_with_cargo_target`], with the run unit's directory relative to `target/`.
+    fn anchor_with_cargo_1_100_target() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        let unit = PathBuf::from("debug/build/ring/0f3a9c11");
+        let unit_dir = anchor.join("target").join(&unit);
+        let out = unit_dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(unit_dir.join("run")).unwrap();
+        fs::create_dir_all(unit_dir.join("fingerprint")).unwrap();
+        fs::write(out.join("libring_core.a"), "archive").unwrap();
+        let out_text = out.to_str().unwrap();
+        fs::write(
+            unit_dir.join("run/stdout"),
+            format!(
+                "cargo:rustc-link-lib=static=ring_core\ncargo:rustc-link-search=native={out_text}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(unit_dir.join("run/root-output"), out_text).unwrap();
+        fs::write(unit_dir.join("run/stderr"), "").unwrap();
+        // A compiled crate's unit: binary artifacts under `out/`, which are not read.
+        let lib_out = anchor.join("target/debug/build/serde/aa11bb22/out");
+        fs::create_dir_all(&lib_out).unwrap();
+        fs::write(lib_out.join("libserde-aa11bb22.rlib"), "rlib").unwrap();
+        fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
+        fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
+        assert!(
+            !anchor.join("target/debug/deps").exists(),
+            "this fixture is the layout with no deps/"
+        );
+        (main, parent, anchor, worktree, unit)
+    }
+
+    /// The 1.100 counterpart of the test above: the recorded output is
+    /// `run/stdout` and `run/root-output` under `build/<pkg>/<hash>/`, and a clone that
+    /// left them alone would hand cargo the anchor's `OUT_DIR` for a build script it
+    /// will never rerun.
+    #[test]
+    fn a_cloned_cargo_1_100_target_records_its_own_paths_not_the_anchors() {
+        let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
+        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+        let anchor_target = anchor.join("target");
+        let worktree_target = worktree.join("target");
+        assert!(worktree_target
+            .join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib")
+            .is_file());
+        for name in ["run/stdout", "run/root-output"] {
+            let cloned = fs::read_to_string(worktree_target.join(&unit).join(name)).unwrap();
+            assert_eq!(
+                cloned.matches(anchor_target.to_str().unwrap()).count(),
+                0,
+                "{name} still names the anchor: {cloned}"
+            );
+            assert!(
+                cloned.contains(worktree_target.join(&unit).join("out").to_str().unwrap()),
+                "{name}: {cloned}"
+            );
+            let original = fs::read_to_string(anchor_target.join(&unit).join(name)).unwrap();
+            assert!(
+                original.contains(anchor_target.to_str().unwrap()),
+                "the anchor's own {name} was rewritten"
+            );
+        }
+        // The compiled crate's artifacts are cloned byte for byte, not rewritten.
+        assert_eq!(
+            fs::read(worktree_target.join("debug/build/serde/aa11bb22/out/libserde-aa11bb22.rlib"))
+                .unwrap(),
+            b"rlib"
+        );
+    }
+
+    /// A cargo <= 1.99 script directory is not scanned for 1.100 units: a build script
+    /// may generate any tree under its own `out/`, including a `run/stdout` that is not
+    /// UTF-8, and that must neither be mistaken for a recorded output nor fail the clone.
+    #[test]
+    fn a_generated_run_directory_under_a_legacy_out_dir_is_not_a_cargo_1_100_unit() {
+        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+        let generated = anchor.join("target").join(&script).join("out/run");
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(generated.join("stdout"), b"\xff\xfe").unwrap();
+        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+        assert_eq!(
+            fs::read(worktree.join("target").join(&script).join("out/run/stdout")).unwrap(),
+            b"\xff\xfe"
+        );
+    }
+
+    /// An unrewritable `run/stdout` fails the clone whole, exactly as an unrewritable
+    /// `output` does in the older layout.
+    #[test]
+    fn an_unrewritable_cargo_1_100_build_output_fails_the_target_clone_whole() {
+        let (_main, _parent, anchor, worktree, unit) = anchor_with_cargo_1_100_target();
+        fs::write(
+            anchor.join("target").join(&unit).join("run/stdout"),
+            b"cargo:x=\xff\n",
+        )
+        .unwrap();
+        let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+            .expect_err("an output that could not be rewritten was cloned");
+        assert!(error.contains("target"), "{error}", error = error.message());
+        assert!(!worktree.join("target").exists());
+        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+    }
+
+    /// cargo >= 1.100 keeps `.cargo-build-lock` and `.cargo-artifact-lock` beside
+    /// `.cargo-lock`. A build holding either one is a build in progress.
+    #[test]
+    fn a_cargo_1_100_build_lock_marks_the_anchor_build_in_progress() {
+        for lock_name in CARGO_LOCK_FILES {
+            let (_main, _parent, anchor, worktree, _unit) = anchor_with_cargo_1_100_target();
+            let lock_path = anchor.join("target/debug").join(lock_name);
+            fs::write(&lock_path, "").unwrap();
+            let held = File::open(&lock_path).unwrap();
+            held.lock().unwrap();
+            let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
+            held.unlock().unwrap();
+            let error = synced.expect_err("a target/ under a held lock must be skipped");
+            assert!(
+                error.contains("anchor build in progress") && error.contains(lock_name),
+                "{lock_name}: {error}",
+                error = error.message()
+            );
+            assert!(!worktree.join("target").exists(), "{lock_name}");
+
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+                .expect("released, the next sync clones it");
+            assert!(worktree.join("target/debug/build/ring").is_dir());
         }
     }
 

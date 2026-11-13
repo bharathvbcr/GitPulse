@@ -238,7 +238,7 @@ pub fn parse_priority(raw: &str) -> Result<u8, String> {
         [b @ b'0'..=b'3'] => Some(b - b'0'),
         _ => None,
     };
-    let parsed = digit(lower.strip_prefix('p').unwrap_or(&lower))
+    let parsed = digit(lower.trim_prefix('p'))
         .or_else(|| priority_name(&lower))
         .or_else(|| {
             let (number, rest) = lower.split_once(" (")?;
@@ -493,8 +493,7 @@ fn list(
 /// Parse a brief from file content.
 pub fn parse_brief(content: &str) -> Result<TaskBrief, String> {
     let text = content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
+        .trim_prefix('\u{feff}')
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     if text.contains('\0') {

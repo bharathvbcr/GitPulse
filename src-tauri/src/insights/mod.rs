@@ -2662,7 +2662,7 @@ struct BinaryStatus {
 
 /// `gitpulse-mcp`, or the target-triple build Tauri names it (`gitpulse-mcp-<triple>`).
 fn looks_like_binary(name: &str, stem: &str) -> bool {
-    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let name = name.trim_suffix(".exe");
     name == stem
         || name
             .strip_prefix(stem)

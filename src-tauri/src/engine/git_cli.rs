@@ -3302,14 +3302,10 @@ pub fn current_admission_name() -> &'static str {
 /// the one decision about whether work may be starved, so it drives the
 /// thread's scheduling class as well as the children's ([`runs_in_background_band`]).
 pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T {
-    struct Restore(Admission);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            ADMISSION.set(self.0);
-        }
-    }
     let previous = ADMISSION.replace(class);
-    let _restore = Restore(previous);
+    let _restore = std::mem::DropGuard::new(previous, |prev| {
+        ADMISSION.set(prev);
+    });
     let _qos = (class == Admission::Background && previous != Admission::Background)
         .then(crate::pools::UtilityScope::enter);
     // User-facing work nested in a background scope gets the thread's own
@@ -3347,13 +3343,9 @@ pub(crate) fn current_spawn_source() -> &'static str {
 /// never user data), restoring the previous source on return, error and
 /// unwinding. The innermost scope wins.
 pub(crate) fn with_spawn_source<T>(source: &'static str, body: impl FnOnce() -> T) -> T {
-    struct Restore(&'static str);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            SPAWN_SOURCE.set(self.0);
-        }
-    }
-    let _restore = Restore(SPAWN_SOURCE.replace(source));
+    let _restore = std::mem::DropGuard::new(SPAWN_SOURCE.replace(source), |prev| {
+        SPAWN_SOURCE.set(prev);
+    });
     body()
 }
 
@@ -3368,14 +3360,10 @@ thread_local! {
 /// asking for one still does not want their typing to wait behind it.
 /// Admission is untouched, so the gate still admits it as its caller's class.
 pub(crate) fn with_background_band<T>(body: impl FnOnce() -> T) -> T {
-    struct Leave;
-    impl Drop for Leave {
-        fn drop(&mut self) {
-            BAND_FORCED.set(BAND_FORCED.get() - 1);
-        }
-    }
     BAND_FORCED.set(BAND_FORCED.get() + 1);
-    let _leave = Leave;
+    let _leave = std::mem::DropGuard::new((), |()| {
+        BAND_FORCED.set(BAND_FORCED.get() - 1);
+    });
     body()
 }
 
@@ -3423,13 +3411,9 @@ fn runs_in_background_band(class: Admission) -> bool {
 /// at once, restoring the thread's previous setting on return and unwinding.
 #[cfg(test)]
 pub(crate) fn with_background_budget_wait<T>(awaits: bool, body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            AWAITS_BUDGET.set(self.0);
-        }
-    }
-    let _restore = Restore(AWAITS_BUDGET.replace(awaits));
+    let _restore = std::mem::DropGuard::new(AWAITS_BUDGET.replace(awaits), |prev| {
+        AWAITS_BUDGET.set(prev);
+    });
     body()
 }
 
@@ -3471,21 +3455,16 @@ pub(crate) fn mark_user_action(repo_path: &str) {
 pub(crate) fn run_command_scope<T>(
     body: impl FnOnce() -> Result<T, CommandError>,
 ) -> Result<T, CommandError> {
-    struct Scope {
-        previous: Admission,
-        previous_repo: Option<PathBuf>,
-    }
-    impl Drop for Scope {
-        fn drop(&mut self) {
-            ADMISSION.set(self.previous);
-            let previous = self.previous_repo.take();
-            MARKED_REPO.with(|slot| *slot.borrow_mut() = previous);
-        }
-    }
-    let _scope = Scope {
-        previous: ADMISSION.replace(Admission::Reactive),
-        previous_repo: MARKED_REPO.with(|slot| slot.borrow_mut().take()),
-    };
+    let _scope = std::mem::DropGuard::new(
+        (
+            ADMISSION.replace(Admission::Reactive),
+            MARKED_REPO.with(|slot| slot.borrow_mut().take()),
+        ),
+        |(previous, previous_repo)| {
+            ADMISSION.set(previous);
+            MARKED_REPO.with(|slot| *slot.borrow_mut() = previous_repo);
+        },
+    );
     let result = body();
     if current_admission() != Admission::Interactive {
         return result;
@@ -5348,13 +5327,9 @@ thread_local! {
 /// later; older gits ignore an unknown variable, which is why a read that must
 /// not fetch also refuses a partial clone up front instead of relying on this).
 pub(crate) fn without_lazy_fetch<T>(body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            NO_LAZY_FETCH.set(self.0);
-        }
-    }
-    let _restore = Restore(NO_LAZY_FETCH.replace(true));
+    let _restore = std::mem::DropGuard::new(NO_LAZY_FETCH.replace(true), |prev| {
+        NO_LAZY_FETCH.set(prev);
+    });
     body()
 }
 
@@ -5445,13 +5420,9 @@ fn keeping_deadline_prefix() -> bool {
 /// machine load.
 #[cfg(test)]
 pub(crate) fn with_forced_spawn_failure<T>(body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORCE_SPAWN_FAILURE.set(self.0);
-        }
-    }
-    let _restore = Restore(FORCE_SPAWN_FAILURE.replace(true));
+    let _restore = std::mem::DropGuard::new(FORCE_SPAWN_FAILURE.replace(true), |prev| {
+        FORCE_SPAWN_FAILURE.set(prev);
+    });
     body()
 }
 
@@ -5461,13 +5432,9 @@ pub(crate) fn with_forced_spawn_failure<T>(body: impl FnOnce() -> T) -> T {
 /// machine load.
 #[cfg(test)]
 pub(crate) fn with_forced_deferral<T>(body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORCE_DEFERRAL.set(self.0);
-        }
-    }
-    let _restore = Restore(FORCE_DEFERRAL.replace(true));
+    let _restore = std::mem::DropGuard::new(FORCE_DEFERRAL.replace(true), |prev| {
+        FORCE_DEFERRAL.set(prev);
+    });
     body()
 }
 
@@ -5476,15 +5443,10 @@ pub(crate) fn with_forced_deferral<T>(body: impl FnOnce() -> T) -> T {
 /// of a computation and let the rest answer.
 #[cfg(test)]
 pub(crate) fn with_forced_spawn_failure_of<T>(arg: &str, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<String>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            FORCED_FAILURE_ARG.with(|slot| *slot.borrow_mut() = previous);
-        }
-    }
     let previous = FORCED_FAILURE_ARG.with(|slot| slot.borrow_mut().replace(arg.to_string()));
-    let _restore = Restore(previous);
+    let _restore = std::mem::DropGuard::new(previous, |previous| {
+        FORCED_FAILURE_ARG.with(|slot| *slot.borrow_mut() = previous);
+    });
     body()
 }
 
@@ -5513,14 +5475,10 @@ pub(crate) fn with_forced_spawn_failure_then<T>(
     hook: impl Fn() + 'static,
     body: impl FnOnce() -> T,
 ) -> T {
-    struct Clear;
-    impl Drop for Clear {
-        fn drop(&mut self) {
-            FORCED_FAILURE_HOOK.with(|slot| slot.borrow_mut().take());
-        }
-    }
     FORCED_FAILURE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _clear = Clear;
+    let _clear = std::mem::DropGuard::new((), |()| {
+        FORCED_FAILURE_HOOK.with(|slot| slot.borrow_mut().take());
+    });
     with_forced_spawn_failure(body)
 }
 

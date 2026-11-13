@@ -3839,9 +3839,7 @@ fn require_force_if_includes(
         .message
         .as_deref()
         .unwrap_or("no version was reported");
-    let detail = detail
-        .strip_prefix("Git could not be checked yet: ")
-        .unwrap_or(detail);
+    let detail = detail.trim_prefix("Git could not be checked yet: ");
     if is_deferred_under_load(detail) {
         return Err(detail.to_string().into());
     }

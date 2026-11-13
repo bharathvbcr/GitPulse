@@ -259,10 +259,7 @@ pub(crate) fn parse_kingfisher_json(
 /// the same release; the header prints "Kingfisher <version>" itself.
 pub(super) fn clean_version(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    let bare = trimmed
-        .strip_prefix("kingfisher ")
-        .unwrap_or(trimmed)
-        .trim();
+    let bare = trimmed.trim_prefix("kingfisher ").trim();
     if bare.is_empty() || bare.chars().any(char::is_control) {
         return None;
     }

@@ -1193,8 +1193,8 @@ pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<De
 /// Whether `path` has an empty, `.` or `..` component (a leading or trailing
 /// separator does not count), which [`lexical`] resolves.
 fn has_dot_components(path: &str) -> bool {
-    let body = path.strip_prefix('/').unwrap_or(path);
-    let body = body.strip_suffix('/').unwrap_or(body);
+    let body = path.trim_prefix('/');
+    let body = body.trim_suffix('/');
     !body.is_empty() && body.split('/').any(|c| matches!(c, "" | "." | ".."))
 }
 

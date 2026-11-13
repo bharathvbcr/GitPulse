@@ -453,13 +453,9 @@ mod tests {
 
         clear_socket_cache();
         let _bound = bind_test_endpoint(endpoint.clone());
-        struct ResetCache;
-        impl Drop for ResetCache {
-            fn drop(&mut self) {
-                clear_socket_cache();
-            }
-        }
-        let _reset = ResetCache;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_socket_cache();
+        });
 
         let first = socket_path(dir.path()).expect("first");
         let second = socket_path(dir.path()).expect("second");

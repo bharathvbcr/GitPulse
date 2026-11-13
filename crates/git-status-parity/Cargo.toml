@@ -2,6 +2,7 @@
 name = "git-status-parity"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
 description = "Throwaway spike: is gix's in-process status correct against `git status --porcelain=v1 -u -z`, and cheaper per scan? Deleted in the commit that adopts gix into src-tauri."
 license = "MIT"
 publish = false

@@ -39,13 +39,10 @@ thread_local! {
 /// the real append path. The previous clock is restored even if `f` panics.
 #[cfg(test)]
 pub(crate) fn with_test_clock<T>(ms: u64, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<u64>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TEST_CLOCK.with(|clock| clock.set(self.0));
-        }
-    }
-    let _restore = Restore(TEST_CLOCK.with(|clock| clock.replace(Some(ms))));
+    let _restore =
+        std::mem::DropGuard::new(TEST_CLOCK.with(|clock| clock.replace(Some(ms))), |prev| {
+            TEST_CLOCK.with(|clock| clock.set(prev));
+        });
     f()
 }
 

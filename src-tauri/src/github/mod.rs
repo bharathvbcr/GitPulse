@@ -430,7 +430,7 @@ pub fn parse_github_remote_url(url: &str) -> Option<GitHubRepoRef> {
     for (scheme, strip_port) in SCHEMES {
         if lower.starts_with(scheme) {
             let remainder = trim_git_suffix(trimmed[scheme.len()..].trim().trim_end_matches('/'));
-            let remainder = remainder.strip_prefix("git@").unwrap_or(remainder);
+            let remainder = remainder.trim_prefix("git@");
             return split_owner_repo(remainder, strip_port);
         }
     }

@@ -2709,18 +2709,14 @@ mod test_apps {
 
     /// Registers `profile` for `repo` until the returned guard drops.
     pub(crate) fn register(repo: &Path, profile: &Path) -> impl Drop {
-        struct Unregister(PathBuf);
-        impl Drop for Unregister {
-            fn drop(&mut self) {
-                APPS.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retain(|(repo, _)| *repo != self.0);
-            }
-        }
         APPS.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((repo.to_path_buf(), profile.to_path_buf()));
-        Unregister(repo.to_path_buf())
+        std::mem::DropGuard::new(repo.to_path_buf(), |registered| {
+            APPS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(repo, _)| *repo != registered);
+        })
     }
 }
 

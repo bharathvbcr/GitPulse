@@ -2073,13 +2073,9 @@ exit 2
         perms.set_mode(0o755);
         fs::set_permissions(&bin, perms).unwrap();
         let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_preview_debounces();
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_preview_debounces();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let mut available = 0u32;
         let mut debounced = 0u32;

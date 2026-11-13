@@ -735,7 +735,7 @@ fn incoming_hunk(content: &str, old: &str, head_diff: &str) -> Result<OldSideHun
     };
     let first = line_of(at)?;
     // A trailing newline ends the last line rather than starting another.
-    let body = old.strip_suffix('\n').unwrap_or(old);
+    let body = old.trim_suffix('\n');
     let last = line_of(at + body.len())?.max(first);
 
     let headers = parse_diff_headers(head_diff)?;

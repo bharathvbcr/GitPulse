@@ -127,8 +127,7 @@ fn no_production_code_spawns_outside_the_gated_seam() {
             continue;
         }
         let rel = file
-            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-            .unwrap_or(file)
+            .trim_prefix(env!("CARGO_MANIFEST_DIR"))
             .to_string_lossy()
             .replace('\\', "/");
         let text = std::fs::read_to_string(file).expect("read source");
@@ -250,11 +249,7 @@ fn every_command_spawn_is_banned_outside_the_locked_seams() {
             .filter(|line| line.trim_start().starts_with(EXEMPTION))
             .count();
         if count > 0 {
-            let rel = file
-                .strip_prefix(&root)
-                .unwrap_or(file)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = file.trim_prefix(&root).to_string_lossy().replace('\\', "/");
             exemptions.insert(rel, count);
         }
     }
@@ -289,8 +284,7 @@ fn pty_creation_runs_under_the_inheritance_lock() {
             continue;
         }
         let rel = file
-            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-            .unwrap_or(file)
+            .trim_prefix(env!("CARGO_MANIFEST_DIR"))
             .to_string_lossy()
             .replace('\\', "/");
         let text = std::fs::read_to_string(file).expect("read source");
@@ -372,8 +366,7 @@ fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
             continue;
         }
         let rel = file
-            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-            .unwrap_or(file)
+            .trim_prefix(env!("CARGO_MANIFEST_DIR"))
             .to_string_lossy()
             .replace('\\', "/");
         let text = std::fs::read_to_string(file).expect("read source");
@@ -847,12 +840,7 @@ fn test_only_module_files_resolve_by_the_compilers_rules() {
     let test_only = test_only_files(&root, &files);
     let rel: BTreeSet<String> = test_only
         .iter()
-        .map(|f| {
-            f.strip_prefix(&root)
-                .unwrap_or(f)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
+        .map(|f| f.trim_prefix(&root).to_string_lossy().replace('\\', "/"))
         .collect();
     for expected in [
         "lappi/tests.rs",

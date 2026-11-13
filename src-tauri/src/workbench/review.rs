@@ -46,14 +46,8 @@ thread_local! {
 /// Points [`store`] at `path` on this thread until the guard drops.
 #[cfg(test)]
 pub(crate) fn use_test_profile(path: &std::path::Path) -> impl Drop {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
     TEST_PROFILE.with(|slot| *slot.borrow_mut() = Some(path.to_path_buf()));
-    Reset
+    std::mem::DropGuard::new((), |()| TEST_PROFILE.with(|slot| *slot.borrow_mut() = None))
 }
 
 /// The newest run whose recorded branch is `refs/heads/<branch>`, held or

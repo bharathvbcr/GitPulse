@@ -2100,10 +2100,7 @@ fn auditable_config_path(repo: &Path, locks: &[String]) -> Option<String> {
 }
 
 fn repo_relative(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    path.trim_prefix(repo).to_string_lossy().replace('\\', "/")
 }
 
 /// Audits pinned requirements files with `pip-audit --no-deps`.
@@ -2885,7 +2882,7 @@ fn user_registry(userconfig: &Path) -> Option<String> {
 /// with no `=` is a key set to true; `;` and `#` start a comment line and
 /// `[section]` headers carry no key.
 fn parse_npmrc(text: &str) -> Vec<(String, String)> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_prefix('\u{feff}');
     text.split(['\r', '\n'])
         .map(str::trim)
         .filter(|line| {
@@ -2906,7 +2903,7 @@ fn parse_npmrc(text: &str) -> Vec<(String, String)> {
                     break;
                 }
             }
-            let key = key.strip_suffix("[]").unwrap_or(key);
+            let key = key.trim_suffix("[]");
             (
                 key.trim().to_ascii_lowercase(),
                 value.trim().trim_matches(['"', '\'']).to_string(),
