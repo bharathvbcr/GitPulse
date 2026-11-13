@@ -2775,7 +2775,7 @@ fn is_generated_path(path: &str) -> bool {
 fn parse_line_anchor(anchor: &str) -> Option<(u32, u32)> {
     let rest = anchor.strip_prefix('L')?;
     let (first, last) = match rest.split_once('-') {
-        Some((a, b)) => (a, b.strip_prefix('L').unwrap_or(b)),
+        Some((a, b)) => (a, b.trim_prefix('L')),
         None => (rest, rest),
     };
     let first: u32 = first.parse().ok()?;
@@ -2785,7 +2785,7 @@ fn parse_line_anchor(anchor: &str) -> Option<(u32, u32)> {
 
 /// `Store::latest_file` as `(["Store"], "latest_file")`.
 fn split_written(written: &str) -> (Vec<String>, String) {
-    let body = written.strip_suffix("()").unwrap_or(written);
+    let body = written.trim_suffix("()");
     let mut segments: Vec<String> = body
         .split("::")
         .flat_map(|part| part.split('.'))

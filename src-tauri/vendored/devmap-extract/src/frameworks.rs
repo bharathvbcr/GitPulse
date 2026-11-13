@@ -530,7 +530,7 @@ fn regex_group_template(inner: &[char]) -> String {
 /// inventing a template for a pattern this pass cannot read would claim a shape
 /// the app does not serve.
 fn django_regex_to_template(pattern: &str) -> String {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    let body = pattern.trim_prefix('^');
     let body = body
         .strip_suffix('$')
         .or_else(|| body.strip_suffix("\\Z"))

@@ -23,14 +23,6 @@ thread_local! {
     static FRESHNESS_INTERLEAVE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-struct InterleaveGuard;
-
-impl Drop for InterleaveGuard {
-    fn drop(&mut self) {
-        FRESHNESS_INTERLEAVE_ACTIVE.with(|active| active.set(false));
-    }
-}
-
 /// Run `hook` after [`Store::query_source_freshness`] has observed an empty
 /// queue and before it clones the verdict cache. Production never sets it.
 /// A hook that calls `query_source_freshness` again does not re-enter itself.
@@ -1414,7 +1406,9 @@ impl Store {
                 }
             });
             if entered {
-                let _guard = InterleaveGuard;
+                let _guard = std::mem::DropGuard::new((), |()| {
+                    FRESHNESS_INTERLEAVE_ACTIVE.with(|active| active.set(false));
+                });
                 hook(self);
             }
         }
@@ -2405,16 +2399,12 @@ mod freshness_race {
 
     #[test]
     fn an_enqueue_under_root_clears_the_cache() {
-        struct DirGuard(std::path::PathBuf);
-        impl Drop for DirGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
         let store = seeded();
         let root =
             std::env::temp_dir().join(format!("devmap-fresh-under-root-{}", std::process::id()));
-        let _dir = DirGuard(root.clone());
+        let _dir = std::mem::DropGuard::new(root.clone(), |dir| {
+            let _ = std::fs::remove_dir_all(dir);
+        });
         let rel = "src/odd 'quote' 名前.rs";
         std::fs::create_dir_all(root.join("src")).expect("src");
         std::fs::write(root.join(rel), b"fn x() {}\n").expect("file");

@@ -4,6 +4,7 @@ version = "1.5.0"
 description = "High-performance native Git desktop client, code intelligence engine, and task workspace"
 authors = ["GitPulse Team"]
 edition = "2021"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/bharathvbcr/GitPulse"
 keywords = ["git", "git-client", "tauri", "devtools", "local-first"]
@@ -103,7 +104,7 @@ log = "0.4"
 #
 # Kept on the same line as vendored `dc-store` / `devmap-store` (do not bump here
 # without re-vendoring those crates against the same rusqlite line).
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 # Vendored copies, under `vendored/`, so a lone checkout of GitPulse builds.
 # These crates are owned by Manvi and DevCouncil; nothing here edits them.

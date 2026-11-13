@@ -111,10 +111,7 @@ struct Source {
 fn section(id: &str, item: &Value) -> String {
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut meta = vec![
-        format!(
-            "status {}",
-            file_tasks::current_status(item["status"].as_str().unwrap_or("backlog"))
-        ),
+        format!("status {}", item["status"].as_str().unwrap_or("backlog")),
         format!("priority {}", item["priority"].as_i64().unwrap_or(2)),
         one_line(item["kind"].as_str().unwrap_or("feature")),
     ];
@@ -880,7 +877,7 @@ fn merge_core(
         "outcome": if !ok { "partial" } else if wrote { "merged" } else { "unchanged" },
         "item_id": target_id,
         "title": shown["title"],
-        "status": shown_status(shown),
+        "status": shown["status"],
         "priority": shown["priority"],
         "severity": shown["severity"],
         "due_at": shown["due_at"],

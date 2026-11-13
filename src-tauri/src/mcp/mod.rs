@@ -8556,69 +8556,6 @@ mod tests {
         (board, repository_id)
     }
 
-    /// A row the task store still holds as `inbox` (it is rewritten by the
-    /// store's own upgrade, which ships separately) is reported as `backlog`
-    /// by every read, and written back as `backlog` by an agent's edit.
-    ///
-    /// This puts an `inbox` row with the store as vendored today. When the store
-    /// stops accepting that status this `put` fails, which is the signal to
-    /// delete the test: the premise it exercises is gone.
-    #[test]
-    fn a_row_the_store_still_holds_as_inbox_is_reported_and_written_back_as_backlog() {
-        let (dir, profile, repo) = task_fixture();
-        crate::test_support::trust_repo(dir.path());
-        let (board, repository_id) = board_task(profile.path(), &repo, "some-other-card");
-        let id = intake::item_id(&repository_id, "gp-legacy-row");
-        board
-            .board_request(
-                "items.put",
-                &json!({
-                    "id": id, "request_id": "put-legacy-row", "expected_revision": 0,
-                    "title": "Filed before the merge", "status": "inbox",
-                    "repository_ids": [repository_id], "primary_repository_id": repository_id,
-                })
-                .to_string(),
-            )
-            .expect("the vendored store still accepts an inbox row");
-        let stored_status = |board: &crate::workbench::WorkbenchState| {
-            board
-                .board_request("items.get", &json!({"id": id}).to_string())
-                .unwrap()["item"]["status"]
-                .clone()
-        };
-        assert_eq!(
-            stored_status(&board),
-            "inbox",
-            "the premise: a stored inbox row"
-        );
-
-        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
-        assert!(!error, "{listed}");
-        let row = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|task| task["item_id"] == id.as_str())
-            .unwrap_or_else(|| panic!("the stored row is not listed: {listed}"));
-        assert_eq!(row["status"], "backlog", "{listed}");
-
-        let (error, fetched) = tool_json(
-            "gitpulse_get_task",
-            json!({ "repo_path": repo, "task_id": "gp-legacy-row" }),
-        );
-        assert!(!error, "{fetched}");
-        assert_eq!(fetched["task"]["status"], "backlog", "{fetched}");
-
-        // An edit that names no status keeps the card's, under the new name.
-        let (error, edited) = tool_json(
-            "gitpulse_add_task",
-            json!({ "repo_path": repo, "task_id": "gp-legacy-row", "title": "Filed before the merge, edited", "overwrite": true }),
-        );
-        assert!(!error, "{edited}");
-        assert_eq!(edited["status"], "backlog", "{edited}");
-        assert_eq!(stored_status(&board), "backlog", "written back as inbox");
-    }
-
     /// The board an agent lists is the board the person sees: a task archived
     /// on it is not listed as live work unless the archive is asked for.
     #[test]

@@ -224,7 +224,7 @@ fn a_real_profile_upgrades_to_the_current_schema_and_keeps_everything_it_held() 
 
     // The board holds everything else, each task once, none of it archived.
     let mut board = BTreeMap::new();
-    for status in ["inbox", "backlog", "ready", "in_progress", "review", "done"] {
+    for status in ["backlog", "ready", "in_progress", "review", "done"] {
         let (cards, total) = list_all(&host, json!({"status": status, "archived": false}));
         assert_eq!(
             total as usize,

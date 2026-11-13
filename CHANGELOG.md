@@ -108,8 +108,18 @@ before that tag is pushed.
     Backlog was hidden too.
   - The Tasks header's **Inbox** button (notifications) and the agent inbox are
     different features and are unchanged.
-  - Moving tasks the task store still holds as `inbox` into Backlog is the
-    store's own upgrade, which ships separately.
+  - **The task profile moves one way to workbench schema 16.** The vendored
+    dc-store (DevCouncil `b32d2862`) rewrites every task held as `inbox` to
+    `backlog` the first time it opens the profile, archived and deleted tasks
+    and their history included, without spending a revision. A host built
+    against workbench schema 15 refuses the upgraded profile, so rebuild
+    GitPulse, Manvi and DevCouncil from the same dc-store and reinstall
+    `gitpulse-mcp` and `gitpulse-hook` before any of them opens it. An agent run
+    brief written before the upgrade keeps the `Status: inbox` it was handed,
+    and a run prepared but not yet started at upgrade time must be prepared
+    again.
+  - The re-vendor carries DevCouncil's toolchain move: the vendored crates use
+    Rust 1.100 APIs, so `rust-version` is 1.100 and rusqlite is 0.41.1.
 
 - **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
   are gone as pages; their content lives with the subject it acts on.

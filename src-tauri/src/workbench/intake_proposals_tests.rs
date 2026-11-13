@@ -247,12 +247,8 @@ fn an_accepted_refinement_goes_through_the_stored_proposal_and_keeps_what_was_th
             .unwrap()
             .unwrap();
         assert_eq!(split["title"], *title);
-        // The store creates a split with its own default status: `inbox` until
-        // the store's upgrade lands, `backlog` after. Both are the Backlog column.
-        assert_eq!(
-            crate::tasks::file_tasks::current_status(split["status"].as_str().unwrap()),
-            "backlog"
-        );
+        // The store creates a split with its own default status.
+        assert_eq!(split["status"], "backlog");
         assert_eq!(split["links"][0]["kind"], "parent");
         assert_eq!(split["links"][0]["item_id"], id.as_str());
     }

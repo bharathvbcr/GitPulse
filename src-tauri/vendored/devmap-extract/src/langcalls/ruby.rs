@@ -161,7 +161,7 @@ fn ruby_callee_name(method: Node, source: &str) -> Option<String> {
         return None;
     }
     let text = get_node_text(method, source);
-    let core = text.strip_suffix(['?', '!']).unwrap_or(text.as_str());
+    let core = text.trim_suffix(['?', '!']);
     is_callee_identity(core).then_some(text)
 }
 
