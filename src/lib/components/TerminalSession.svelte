@@ -149,6 +149,7 @@
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
+  import { saveExport } from "../desktop/saveFile";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
@@ -1473,7 +1474,7 @@
   }
 
   export async function exportOutput() {
-    try { await invoke<boolean>("cmd_terminal_export", { data: retainedOutput() }); }
+    try { await saveExport({ kind: "terminal_output", fileName: "terminal-output.txt", data: retainedOutput() }); }
     catch (err) { if (!disposed) warning = describeError(err, "terminal"); }
   }
 

@@ -3,6 +3,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { themeStore } from "../stores/themeStore";
   import { copyText } from "../desktop/clipboard";
+  import { saveExport } from "../desktop/saveFile";
   import { describeFailure } from "../ui/copy/describeFailure";
   import {
     MAX_THEME_FILE_BYTES,
@@ -69,27 +70,24 @@
     return exportCurrentTheme($interfaceStore, theme, exportName.trim() === "" ? "My theme" : exportName);
   }
 
-  function exportFile() {
+  async function exportFile() {
     failure = null;
+    status = "";
     const result = currentExport();
     if (!result.ok) {
       fail("export", "the theme", result.reason);
       return;
     }
     try {
-      const url = URL.createObjectURL(new Blob([result.json], { type: "application/json" }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = result.fileName;
-      document.body.append(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      // A download request is all this can know. The webview decides whether a file
-      // lands, so the status does not claim one did; Copy JSON is the sure path.
-      status = `Requested a download of ${result.fileName}. If no file appears, use Copy JSON.`;
+      const outcome = await saveExport({ kind: "theme", fileName: result.fileName, data: result.json });
+      // A cancelled save panel is the person's choice, not a failure: say nothing.
+      if (outcome.status === "saved") status = `Saved ${outcome.fileName}.`;
+      // Without a native shell a download request is all this can know, so the
+      // status does not claim a file landed; Copy JSON is the sure path.
+      else if (outcome.status === "requested")
+        status = `Requested a download of ${outcome.fileName}. If no file appears, use Copy JSON.`;
     } catch (error) {
-      failure = describeFailure({ verb: "export", object: "the theme" }, error);
+      failure = describeFailure({ verb: "save", object: "the theme" }, error);
     }
   }
 
