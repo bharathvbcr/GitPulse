@@ -53,7 +53,10 @@ describe("PulseExportModal component", () => {
     expect(source).toContain('role={saveNote.tone === "danger" ? "alert" : "status"}');
     expect(source).toMatch(/saveNote = \{ tone: "danger", text: copy\.detail/);
     // Closing or reopening the dialog clears the last result.
-    expect(source).toMatch(/function resetCopyState\(\) \{[\s\S]*saveNote = null;/);
+    expect(source).toMatch(/function resetCopyState\(\) \{[\s\S]*saveNote = null;[\s\S]*saveRun \+= 1;/);
+    // A save that lands after a close or a newer save is dropped, on success and on failure.
+    expect(source).toContain("const run = ++saveRun;");
+    expect(source.match(/if \(run !== saveRun\) return;/g)).toHaveLength(2);
   });
 
   it("wears the shared button grammar", () => {

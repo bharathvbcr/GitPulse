@@ -31,12 +31,15 @@
 
   // What the last Download did: saved, requested (no native shell) or why it failed.
   let saveNote = $state<{ tone: "ok" | "danger"; text: string } | null>(null);
+  // Which save the footer may still report on; bumped by every save and every reset.
+  let saveRun = 0;
 
   function resetCopyState() {
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = undefined;
     copyState = "idle";
     saveNote = null;
+    saveRun += 1;
   }
 
   $effect(() => {
@@ -59,17 +62,23 @@
 
   async function downloadSvg() {
     saveNote = null;
+    // A result that lands after the dialog closed (or after a later save began)
+    // belongs to nothing on screen, so it is dropped rather than shown on the
+    // next open.
+    const run = ++saveRun;
     try {
       const outcome = await saveExport({
         kind: "pulse_card",
         fileName: `${options.repoName || "gitpulse"}-pulse-card.svg`,
         data: svgContent,
       });
+      if (run !== saveRun) return;
       // A cancelled save panel is the person's choice, not a failure: say nothing.
       if (outcome.status === "saved") saveNote = { tone: "ok", text: `Saved ${outcome.fileName}.` };
       else if (outcome.status === "requested")
         saveNote = { tone: "ok", text: `Requested a download of ${outcome.fileName}. If no file appears, use Copy SVG.` };
     } catch (error) {
+      if (run !== saveRun) return;
       const copy = describeFailure({ verb: "save", object: "the card" }, error);
       saveNote = { tone: "danger", text: copy.detail ? `${copy.headline} ${copy.detail}` : copy.headline };
     }

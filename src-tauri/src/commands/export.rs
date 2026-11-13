@@ -16,6 +16,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use super::off_thread;
+use crate::ipc_error::{CommandError, IpcError};
+
 /// The most text one export may carry. Retained terminal output is the
 /// largest real export; a theme or a card is a few kilobytes.
 pub(crate) const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
@@ -157,13 +160,16 @@ fn write_failure(path: &Path, error: &std::io::Error) -> String {
 /// Opens the native save panel for one export and writes the text where the
 /// person chose. `Ok(Some(name))` is the saved file's name; `Ok(None)` is a
 /// cancelled panel, which writes nothing and is not an error.
+///
+/// The write runs on the blocking pool through [`off_thread`], the seam every
+/// command's file and process work goes through.
 #[tauri::command(async)]
 pub async fn cmd_save_export(
     kind: ExportKind,
     file_name: String,
     data: String,
-) -> Result<Option<String>, String> {
-    let plan = plan_export(kind, &file_name, data.len())?;
+) -> Result<Option<String>, IpcError> {
+    let plan = plan_export(kind, &file_name, data.len()).map_err(IpcError::from)?;
     let Some(handle) = rfd::AsyncFileDialog::new()
         .set_title(plan.format.title)
         .set_file_name(&plan.file_name)
@@ -178,9 +184,7 @@ pub async fn cmd_save_export(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| plan.file_name.clone());
-    tauri::async_runtime::spawn_blocking(move || write_export(&path, data.as_bytes()))
-        .await
-        .map_err(|error| format!("The save of {saved_name} did not finish ({error})."))??;
+    off_thread(move || write_export(&path, data.as_bytes()).map_err(CommandError::from)).await?;
     Ok(Some(saved_name))
 }
 
