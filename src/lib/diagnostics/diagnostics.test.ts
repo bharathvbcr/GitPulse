@@ -234,6 +234,8 @@ describe("createDiagnostics", () => {
       "ya" + "29.AHES6ZRN3-HlhAPya30GnW_bHSb_QtAS08i85nHq39HE3C2LTrCARA",
       "ya" + "29.dr.AbCDeFg-123456789abcdefghijKLMNOP",
       "1/" + "/xEoDL4iW3cxlI7yDbSRFYNG01kVKM2C-259HOF2aQbI",
+      "GOC" + "SPX-FAKEfake-Secret_notReal01234",
+      "GOC" + "SPX-FAKEfake-Secret_notReal0",
     ];
     for (const token of tokens) {
       for (const line of [token, `Authorization: Bearer ${token}`, `token (${token}).`]) {

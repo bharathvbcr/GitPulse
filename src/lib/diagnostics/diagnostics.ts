@@ -115,6 +115,7 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
   { prefix: "AIza", minLength: 30 },
   { prefix: "ya29.", minLength: 30 },
   { prefix: "1//", minLength: 40, urlSafeBody: true },
+  { prefix: "GOCSPX-", minLength: 30 },
   { prefix: "AKIA", minLength: 20, alphanumericBody: true },
   { prefix: "ASIA", minLength: 20, alphanumericBody: true },
   { prefix: "xai-", minLength: 20 },
