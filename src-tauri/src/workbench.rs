@@ -26,8 +26,10 @@ pub(crate) mod intake;
 mod lineage;
 pub(crate) mod managed_run;
 pub(crate) mod notifications;
+mod github_sync;
 mod organize;
 pub(crate) mod process_birth;
+mod queue_driver;
 mod receipts;
 mod reconcile;
 pub(crate) mod retention;
@@ -280,6 +282,8 @@ impl WorkbenchState {
         // Startup only, not every capacity sweep: each candidate costs an
         // open-file scan, and a launch must not wait on that.
         reconcile::reclaim_expired(self);
+        github_sync::sweep_delivering_on_startup(self);
+        queue_driver::sweep_expired_queues(self);
         released
     }
 
@@ -548,6 +552,15 @@ impl WorkbenchState {
                 // `cmd_workbench_relink_repository`. The raw method would take
                 // a renderer's word for which directory a repository is.
                 | "repositories.relink"
+                | "queue.enqueue"
+                | "queue.verify"
+                | "github_sync.observe"
+                | "outbox.claim"
+                | "outbox.sweep_restart"
+                | "outbox.mark_unknown"
+                | "outbox.preflight"
+                | "outbox.complete"
+                | "outbox.fail"
         ) {
             return Err(WorkbenchError::new(
                 "host_only",
@@ -556,6 +569,18 @@ impl WorkbenchState {
         }
         if method == "runs.prepare_terminal" {
             return terminal_launch::prepare(self, input);
+        }
+        if method == "queue.enqueue_host" {
+            return queue_driver::enqueue_host(self, input);
+        }
+        if method == "queue.verify_combined" {
+            return queue_driver::verify_combined(self, input);
+        }
+        if method == "github_sync.poll" {
+            return github_sync::poll(self, input);
+        }
+        if method == "outbox.deliver" {
+            return github_sync::deliver(self, input);
         }
         if method == "runs.prepare_managed" {
             return terminal_launch::prepare_managed(self, input);
@@ -1131,7 +1156,7 @@ fn worker_error(profile: &Path, error: crate::harness::HarnessError) -> Workbenc
     }
 }
 
-fn query(store: &Store, method: &str, input: &str) -> Result<Value, WorkbenchError> {
+pub(super) fn query(store: &Store, method: &str, input: &str) -> Result<Value, WorkbenchError> {
     let response = store.workbench_request(method, input)?;
     serde_json::from_str(&response)
         .map_err(|e| WorkbenchError::new("protocol_error", e.to_string()))

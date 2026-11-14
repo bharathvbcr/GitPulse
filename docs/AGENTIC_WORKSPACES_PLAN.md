@@ -170,8 +170,8 @@ they are historical provenance, not required locations for a fresh checkout.
 
 | Area | Current evidence | Remaining |
 |---|---|---|
-| Workspaces and boards | Manvi profile storage and Go host API; GitPulse lazy native adapter, persistent workspace editor, multi-repository task editor and global/workspace/repository boards implemented. Four native tests passed, including real Git worktree/clone identity checks. Browser interaction verified task edits, shared membership, scoped counts and persistence through reload | Task fields the store cannot hold yet (checklists, attachments, source and task links, per-repository objectives — see QUALIFICATION.md), unavailable-checkout detection and remote-only repositories, swimlanes/saved views/WIP limits, and native installed-app qualification. Shipped 2026-10-07: multi-select with bulk status/label/archive, undo (a deferred window for deletion), board/list keyboard operation, tab-group import, group reorder, an editable home workspace and `repositories.relink` for a moved or re-cloned checkout |
-| Manvi intelligence and orchestration | Durable proposals, field locks, editable suggestions preserving original model text, selected acceptance/undo and worker ownership implemented. Schema four adds transactional on-save queueing and preparation through the existing proposal slot/quota. The worker now wakes after text saves, resumes prepared work after restart, and exposes profile settings/status in GitPulse. Nine real-store browser checks passed, including automatic generation after Save and persisted Stop | Complete semantic quality evaluation, context/planning/orchestration and installed native qualification |
+| Workspaces and boards | Manvi profile storage and Go host API; GitPulse lazy native adapter, persistent workspace editor, multi-repository task editor and global/workspace/repository boards implemented. Schema 17 adds durable task readiness (`items.readiness` with cycle checking), `work_queue`, `work_issue_sync` proposals (poll, field-lock-aware accept/dismiss) and opt-in confirmed durable `work_outbox` delivery with crash recovery (`github_sync.rs`, `githubSync.ts`, `github/mod.rs`). Four native tests passed, including real Git worktree/clone identity checks. Browser interaction verified task edits, shared membership, scoped counts and persistence through reload | Checklists, attachments, remaining task/source link and queue/outbox/GitHub-sync UI controls, per-repository objectives (see QUALIFICATION.md), unavailable-checkout detection and remote-only repositories, swimlanes/saved views/WIP limits, and native installed-app qualification. Shipped 2026-10-07: multi-select with bulk status/label/archive, undo (a deferred window for deletion), board/list keyboard operation, tab-group import, group reorder, an editable home workspace and `repositories.relink` for a moved or re-cloned checkout |
+| Manvi intelligence and orchestration | Durable proposals, field locks, editable suggestions preserving original model text, selected acceptance/undo and worker ownership implemented. Schema four adds transactional on-save queueing and preparation through the existing proposal slot/quota. Schema 17 and GitPulse host orchestration add the cross-repository execution queue (`queue_driver.rs`, `workQueue.ts`: canonical `repository_id` lease ordering, 2–4 concurrency cap, 45m active / 2h elapsed timeouts, combined verification with `manual_per_repository` publication) and DAG readiness launch gating (`terminal_launch.rs`, `readiness.ts`, `waveLaunch.ts`, `waveHost.ts`). The worker now wakes after text saves, resumes prepared work after restart, and exposes profile settings/status in GitPulse. Nine real-store browser checks passed, including automatic generation after Save and persisted Stop | Complete semantic quality evaluation (`ft-8d992fb6` Part 2), grounding with citations and prioritization models/UI, queue/sync desktop UI panels, and installed native qualification |
 | Agent supervision and review | Canonical versioned briefs, durable attempts and checkout/branch checks; Runs panel launches private-file briefs through the existing PTY manager. Schema eight adds durable permission/question bindings, one-use delivery claims and an inspector that distinguishes saved decisions from provider confirmation. Schema nine adds managed Codex with verified configuration, native process activation, durable callback delivery and output. The real read-only native/provider path and 28 browser handoff/review checks pass | Real-account approvals and remaining callback types, managed Claude, launch-time fencing, code review, crash recovery and installed-app qualification |
 | Native notifications | Schema seven adds settings, quiet hours, scoped mutes and durable delivery/activation records to the schema-six inbox. GitPulse implements the macOS adapter, opt-in preferences and recovered current/stale task review; eight canonical store tests, twenty frontend tests, two native boundary tests and nineteen real-store browser checks verify these paths | Installed OS delivery/activation (including the banner Snooze and withdrawal built 2026-10-07), callback crash-window qualification, producers blocked on other workflows, other platforms and native resource measurements. [Native adapter contract](NATIVE_NOTIFICATIONS_ADAPTER.md) |
 | Performance | Indexed scope counts, bounded body projection and shared FTS hit sets implemented; 93 store tests pass. [Normal and stress benchmarks](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/AGENTIC_WORKSPACES_BENCHMARK.md) completed with 10k/100k tasks and 100,110 initial events each. Normal scoped search is 14.18/36.77 ms p95; edits are 3.151/2.693 ms for normal/stress | Stress broad global/workspace search is 484.5/527.8 ms p95 and misses the 100 ms target. Profile large matching sets and metadata reads; native rendering, cold/warm navigation, idle CPU/memory and eight-hour soak remain |
@@ -205,8 +205,10 @@ branches can both claim, so the queue and outbox take the rung after schema 11.
 **Sequencing agreed with the user, 2026-10-07:**
 1. Merge schema 11 into DevCouncil `main` and re-vendor it into GitPulse.
    *Done.*
-2. Build schema 12 (queue and outbox) on top of it.
-3. Build the GitPulse readiness gate and GitHub sync.
+2. Build schema 12+ (implemented as workbench schema 17: queue, issue sync and outbox) on top of it.
+   *Done.* Merged in DevCouncil `dc-store` (`work_queue`, `work_queue_members`, `work_issue_sync`, `work_outbox`, `items.readiness`) and re-vendored into GitPulse.
+3. Build the GitPulse readiness gate, cross-repository queue driver and GitHub two-way sync/outbox host+client modules.
+   *Done for backend/client orchestration; desktop UI panels and end-to-end Manvi-sidecar installed qualification remain.*
 
 The re-vendor changed what Done means in GitPulse: schema 11 turns `archived`
 into a flag that is independent of status, so Done stays on the board until a
@@ -286,14 +288,13 @@ reads both.
     index. It also adds a check that refuses a parent being its own
     descendant, checklists, `archived` and `completed_at`. The brief renders
     links in both directions.
-  - *Verified from that commit's diff:* `runs.prepare` does **not** consult
-    `blocks`. Its only run change is `model_choice`. So storage exists but
-    launch ordering does not.
-- *Remaining for this card:* readiness, meaning every `blocks` predecessor is
-  Done, enforced ahead of `runs.prepare` and shown on the card, plus a
-  `blocks` cycle check if schema 11 lacks one. Prioritization and grounding
-  with citations depend on the links and on evidence capture (section 3), so
-  they come after the links.
+  - *Verified from that commit's diff:* `runs.prepare` previously did **not** consult `blocks`.
+- *Updated in schema 17 + GitPulse host/client:* readiness (open `blocks`
+  predecessors and optional open subtasks, plus `blocks` cycle rejection in
+  `dc-store`) is enforced in `runs.prepare`, `terminal_launch::prepare_kind`,
+  and `waveLaunch.ts`/`waveHost.ts` ahead of scope matching. Prioritization
+  and grounding with citations (`ft-8d992fb6` Part 2 / planning UI) remain
+  open.
 
 ### Design: launching and reading agent runs from outside the app (2026-11-02)
 

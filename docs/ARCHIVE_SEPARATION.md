@@ -20,7 +20,7 @@ cannot leave this record naming a commit that is no longer the vendored one). Th
 (below), and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.
 
-Schema version is **16**. The 11 → 12 rung only adds refinement proposals
+Schema version is **17**. The 11 → 12 rung only adds refinement proposals
 (`kind`, and an `acceptance_criteria` lock) and moves the version; the 12 → 13
 rung only moves it too, fencing the short request receipts (a retry rebuilds its
 response from the event, which a schema 12 host would not do); the 13 → 14 rung
