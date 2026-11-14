@@ -21,7 +21,13 @@
   } from "../harness/availability";
   import { MANVI_FOCUS_TARGETS, manviFocusHint, type ManviFocusId } from "../ui/manviFocus";
   import { openManviFocus } from "../ui/openManviFocus";
-  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert } from "@lucide/svelte";
+  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert, Cloud } from "@lucide/svelte";
+  import {
+    claudeKey,
+    claudeCredentialProblem,
+    claudeModelLabel,
+    type ClaudeCredentialStatus,
+  } from "../workbench/claudeKey";
 
   /**
    * Whether the Manvi menu is open, bindable so a host (or a test) can open it,
@@ -59,9 +65,57 @@
     openManviFocus(target);
   }
 
+  /**
+   * Manvi on Claude ("cloud"): the pill shows that instead of local-model
+   * discovery, which then concerns only GitPulse's own AI features. The
+   * credential is asked for while cloud is selected and again when the menu
+   * opens, so a fix made in Settings or with `anthropic-account` shows up.
+   */
+  let manviClaude = $derived($harnessStore.manviClaude);
+  let onCloud = $derived(Boolean(manviClaude));
+  let cloudCredential = $state<ClaudeCredentialStatus | null>(null);
+  let cloudReadError = $state<string | null>(null);
+  let cloudToken = 0;
+  async function loadCloudCredential() {
+    const token = ++cloudToken;
+    try {
+      const status = await claudeKey.status();
+      if (token !== cloudToken) return;
+      cloudCredential = status;
+      cloudReadError = null;
+    } catch (err: unknown) {
+      if (token !== cloudToken) return;
+      cloudCredential = null;
+      cloudReadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  $effect(() => {
+    if (onCloud) void loadCloudCredential();
+  });
+  /** Unknown until answered: no alert is raised on a credential not yet read. */
+  let cloudProblem = $derived(
+    !onCloud ? null
+      : cloudReadError ? `Couldn't check the Claude credential. ${cloudReadError}`
+        : cloudCredential ? claudeCredentialProblem(cloudCredential) : null,
+  );
+  let cloudAccount = $derived(cloudCredential?.account ?? null);
+  let cloudModel = $derived(manviClaude ? claudeModelLabel(manviClaude.model) : "");
+  let cloudStatus = $derived(
+    !manviClaude ? ""
+      : cloudReadError ? `Manvi is set to cloud (${manviClaude.model}). ${cloudProblem}`
+      : cloudProblem ? `Manvi is set to cloud (${manviClaude.model}) but cannot run: ${cloudProblem}`
+        : cloudAccount
+          ? `Manvi uses cloud: ${manviClaude.model}, billed to Anthropic account ${cloudAccount.name}${
+            cloudAccount.workspace ? ` (workspace ${cloudAccount.workspace})` : ""}.`
+          : cloudCredential?.keySaved
+            ? `Manvi uses cloud: ${manviClaude.model}, billed to the key saved in GitPulse.`
+            : `Manvi uses cloud: ${manviClaude.model}. Checking its credential…`,
+  );
+
   /** Focus moves into the menu on open so the keyboard lands on the model list. */
   function toggleMenu() {
     open = !open;
+    if (open && onCloud) void loadCloudCredential();
     if (open) void tick().then(() => menuEl?.querySelector<HTMLElement>("select")?.focus());
   }
 
@@ -109,7 +163,10 @@
     !$harnessStore.isProbing && !$harnessStore.error && ai?.ready && ai.selected &&
     (!preferred || (preferred.base_url === ai.selected.base_url && preferred.model === ai.selected.model)),
   ));
-  let modelAttention = $derived(!$harnessStore.isProbing && Boolean($harnessStore.error || (ai && !modelReady)));
+  /** Local discovery's own trouble, shown on the local model row. */
+  let localAttention = $derived(!$harnessStore.isProbing && Boolean($harnessStore.error || (ai && !modelReady)));
+  /** The pill's alert: what Manvi runs on is unusable. On cloud that is the credential, not local discovery. */
+  let modelAttention = $derived(onCloud ? Boolean(cloudProblem) : localAttention);
   let modelStatus = $derived(
     $harnessStore.isProbing
       ? preferred ? `Checking ${preferred.model}…` : "Refreshing local models…"
@@ -130,7 +187,7 @@
    * Closed chip label. A failed model check reads "Failed"; the icon
    * button beside it is the retry. The failure sentence stays on the tooltip.
    */
-  let closedFace = $derived(
+  let localFace = $derived(
     $harnessStore.isProbing
       ? "Checking…"
       : $harnessStore.error
@@ -143,8 +200,10 @@
               ? "No models"
               : "Not checked",
   );
-  /** The Automatic choice. When it is selected, its label is the closed face. */
-  let automaticOption = $derived(preferred ? "Automatic" : closedFace);
+  /** The pill's face: "Cloud · <model>" while Manvi is on Claude, else the local model. */
+  let closedFace = $derived(onCloud ? `Cloud · ${cloudModel}` : localFace);
+  /** The Automatic choice. When it is selected, its label is the local face. */
+  let automaticOption = $derived(preferred ? "Automatic" : localFace);
   let discoveryNote = $derived(
     endpoints.some((endpoint) => endpoint.models.length > 0)
       ? ""
@@ -164,6 +223,8 @@
   let modelTone = $derived(
     $harnessStore.error && !$harnessStore.isProbing ? "text-danger" : modelReady ? "text-accent" : "text-textMuted",
   );
+  /** What screen readers and the tooltip hear about the model Manvi uses. */
+  let manviModelStatus = $derived(onCloud ? cloudStatus : modelStatus);
 
   /** The chip's accessible name keeps "Manvi" and the state when only the shield shows. */
   let harnessStateWord = $derived(
@@ -177,7 +238,7 @@
   let verdictInline = $derived(verdict?.status === "blocked" || verdict?.status === "unchecked");
 
   let chipTitle = $derived(
-    `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\n${modelStatus}`,
+    `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\n${manviModelStatus}`,
   );
   let openManviTitle = $derived(reachableFor("harness") ? manviFocusHint("harness") : unreachableHint);
 
@@ -262,12 +323,22 @@
       <CircleAlert size={12} class="shrink-0 text-danger" aria-hidden="true" />
     {/if}
     {#if variant === "full"}
-      <span class="hidden min-w-0 max-w-40 truncate text-textMuted min-[1440px]:inline" aria-hidden="true">{closedFace}</span>
+      {#if onCloud}
+        <span class="inline-flex min-w-0 items-center gap-1 text-textMuted" aria-hidden="true" data-manvi-cloud>
+          <Cloud size={12} class="shrink-0" />
+          <span class="max-[1099px]:sr-only">Cloud</span>
+          <span class="hidden max-w-32 truncate min-[1440px]:inline">· {cloudModel}</span>
+        </span>
+      {:else}
+        <span class="hidden min-w-0 max-w-40 truncate text-textMuted min-[1440px]:inline" aria-hidden="true">{closedFace}</span>
+      {/if}
+    {:else if onCloud}
+      <Cloud size={12} class="shrink-0 text-textMuted" aria-hidden="true" />
     {/if}
   </button>
 
   <!-- Screen readers get the model state whether or not the menu is open. -->
-  <span id="{instanceId}-model-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{modelStatus}</span>
+  <span id="{instanceId}-model-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{manviModelStatus}</span>
 
   {#if verdict && verdictInline}
     {@render verdictButton(true)}
@@ -285,7 +356,39 @@
       aria-label="Manvi and local model"
     >
       <div role="none" class="flex flex-col gap-1.5 p-1.5">
-        <p class="gp-label px-1">Local model</p>
+        {#if manviClaude}
+          <p class="gp-label px-1">Manvi's model</p>
+          <div role="none" class="flex items-start gap-2 px-1" data-manvi-cloud-row title={cloudStatus}>
+            <Cloud size={12} class="mt-0.5 shrink-0 {cloudProblem ? "text-danger" : "text-accent"}" aria-hidden="true" />
+            <div role="none" class="min-w-0">
+              <div class="truncate">Cloud · {manviClaude.model}</div>
+              <div class="truncate text-textMuted">
+                {#if cloudProblem}
+                  <span class="text-danger">{cloudProblem}</span>
+                {:else if cloudAccount}
+                  Account {cloudAccount.name}{cloudAccount.workspace ? ` · ${cloudAccount.workspace}` : ""}
+                {:else if cloudCredential?.keySaved}
+                  Key saved in GitPulse
+                {:else}
+                  Checking the credential…
+                {/if}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            role="menuitem"
+            onclick={() => openManvi("model")}
+            disabled={!reachableFor("model")}
+            title={manviFocusHint("model")}
+            class="gp-menu-item disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent"
+          >
+            <Sparkles size={12} class="text-textMuted" />
+            <span>Change Manvi's model</span>
+          </button>
+          <span class="gp-menu-sep" role="separator"></span>
+        {/if}
+        <p class="gp-label px-1">{manviClaude ? "Local model · GitPulse AI" : "Local model"}</p>
         <div role="none" class="flex items-center gap-1.5">
           <!-- Native selection supplies keyboard navigation, typeahead and
                dismissal. The select stays for the model list, but it is drawn
@@ -294,13 +397,13 @@
                failure sentence is the tooltip. -->
           <div class="relative min-w-0 flex-1 focus-within:outline-2 focus-within:-outline-offset-2 focus-within:outline-accent">
             <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 {modelTone}" aria-hidden="true">
-              {#if modelAttention}
+              {#if localAttention}
                 <CircleAlert size={12} />
               {:else}
                 <Sparkles size={12} />
               {/if}
             </span>
-            <span aria-hidden="true" data-manvi-face={closedFace} class="gp-select block truncate pl-7 pr-5">{closedFace}</span>
+            <span aria-hidden="true" data-manvi-face={localFace} class="gp-select block truncate pl-7 pr-5">{localFace}</span>
             <select
               aria-label="Local model"
               aria-describedby="{instanceId}-model-status"

@@ -87,6 +87,15 @@ const ALLOWED: &[(&str, &str)] = &[
          table shows it, and `capture_command` has no stdin. Not git",
     ),
     (
+        "src/harness/anthropic_account.rs",
+        "Manvi's `anthropic-account which --json`, which names the registry \
+         account and workspace without touching the Keychain: its single \
+         `Command` runs with `env_clear()` and HOME pinned, and is handed to \
+         `git_cli::run_bounded_capped` with a 10s timeout and a 16 KiB cap. \
+         `exec_prefix` only adds arguments to the sidecar's own `Command`, \
+         which `procguard::spawn` starts. Not git",
+    ),
+    (
         "src/engine/worktree_hooks.rs",
         "repository hook commands (`sh -c` / `cmd /C`) with the repository's \
          own env, run only after `repository_trust::require`. Each `Command` is \

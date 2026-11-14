@@ -1326,9 +1326,25 @@ fn not_installed_message() -> String {
 pub(crate) enum ModelSelection {
     /// A model on an OpenAI-compatible server on this machine.
     Local { base_url: String, model: String },
-    /// A Claude model through Anthropic's API, billed to the key saved in the
-    /// Keychain (see [`super::claude_key`]).
+    /// A Claude model through Anthropic's API, billed to the account the
+    /// machine's `anthropic-account` registry chooses (see
+    /// [`super::anthropic_account`]), or else to the key saved in GitPulse's
+    /// Keychain entry (see [`super::claude_key`]).
     Claude { model: String },
+}
+
+/// How a Claude-selected `manvi serve` gets its one credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeCredential {
+    /// The key saved in GitPulse's own Keychain entry, set as
+    /// [`CLAUDE_KEY_ENV`]. Used only when the machine has no
+    /// `~/.anthropic-accounts` registry.
+    Key(String),
+    /// The registry's chosen account. `manvi` is launched through
+    /// `anthropic-account exec`, which reads that account's key and sets it
+    /// with the workspace id of the same organisation, then execs `manvi`.
+    /// GitPulse never sees the key.
+    Account { program: PathBuf, home: PathBuf },
 }
 
 /// Whether a harness's own account of what it withholds from its children
@@ -1339,7 +1355,7 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
         && withheld.is_some_and(|names| names.iter().any(|name| name == CLAUDE_KEY_ENV))
 }
 
-/// The Claude key for a spawn of `binary`, or why it may not have one.
+/// The Claude credential for a spawn of `binary`, or why it may not have one.
 ///
 /// Manvi runs a model-driven tool loop in a repository the user may not trust,
 /// and everything that loop starts (git and its hooks, verifiers, coding
@@ -1347,7 +1363,12 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
 /// version --json` before the process exists, so the promise is checked first
 /// and the key read only once it holds. The handshake checks it again from the
 /// running process.
-fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
+///
+/// A machine with an `~/.anthropic-accounts` registry gets its chosen account
+/// (key and workspace together); a registry that cannot be read is an error,
+/// never a quiet fall back to GitPulse's own key, which may belong to another
+/// organisation.
+fn claude_credential_for(binary: &str) -> Result<ClaudeCredential, HarnessError> {
     let mut probe = Command::new(binary);
     probe.args(["version", "--json"]).env_clear();
     for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
@@ -1385,14 +1406,28 @@ fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
              so GitPulse will not give it your Claude API key. Update Manvi."
         )));
     }
+    match super::anthropic_account::detect() {
+        super::anthropic_account::Detection::Found { program, home, .. } => {
+            return Ok(ClaudeCredential::Account { program, home })
+        }
+        super::anthropic_account::Detection::Broken(why) => {
+            return Err(HarnessError::Unavailable(format!(
+                "Manvi is set to use Claude, but the Anthropic account registry could not be \
+                 read: {why}"
+            )))
+        }
+        super::anthropic_account::Detection::Absent => {}
+    }
     let keychain = super::claude_key::Keychain::system().map_err(HarnessError::Unavailable)?;
     keychain
         .load()
         .map_err(|e| HarnessError::Unavailable(e.into_message()))?
+        .map(ClaudeCredential::Key)
         .ok_or_else(|| {
             HarnessError::Unavailable(
-                "Manvi is set to use Claude, but no Claude API key is saved. Add one in the \
-                 Manvi pane, or switch Manvi back to a local model."
+                "Manvi is set to use Claude, but no Claude API key is saved and no \
+                 ~/.anthropic-accounts registry is set up. Add a key in the Manvi pane, or \
+                 switch Manvi back to a local model."
                     .into(),
             )
         })
@@ -1479,16 +1514,28 @@ fn sidecar_ambient_env(
 /// The `manvi serve` invocation, built separately so its environment can be
 /// asserted without starting a sidecar.
 ///
-/// `claude_key` is set only for a Claude selection, after [`claude_key_for`]
-/// has checked the binary's promise; it is the one credential this child is
-/// ever given.
+/// `claude` is set only for a Claude selection, after
+/// [`claude_credential_for`] has checked the binary's promise; it is the one
+/// credential this child is ever given. For a registry account the command is
+/// `anthropic-account exec ... -- <binary>`, which becomes `<binary>` under the
+/// same pid.
 fn sidecar_command(
     binary: &str,
     dir: &Path,
     selection: Option<&ModelSelection>,
-    claude_key: Option<&str>,
+    claude: Option<&ClaudeCredential>,
 ) -> Command {
-    let mut command = Command::new(binary);
+    let mut command = match (selection, claude) {
+        (
+            Some(ModelSelection::Claude { .. }),
+            Some(ClaudeCredential::Account { program, home }),
+        ) => {
+            let mut wrapped = Command::new(program);
+            super::anthropic_account::exec_prefix(&mut wrapped, home, binary);
+            wrapped
+        }
+        _ => Command::new(binary),
+    };
     command.env_clear();
     for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
         command.env(name, value);
@@ -1536,8 +1583,9 @@ fn sidecar_command(
                 .env_remove("MANVI_LLM_LOCAL_BASE_URL")
                 .env_remove("MANVI_LLM_LOCAL_MODEL");
             // Without it Manvi answers "no credential for anthropic", which is
-            // the honest failure; the caller never gets here without one.
-            if let Some(key) = claude_key {
+            // the honest failure; the caller never gets here without one. A
+            // registry account's key is set by `anthropic-account exec`.
+            if let Some(ClaudeCredential::Key(key)) = claude {
                 command.env(CLAUDE_KEY_ENV, key);
             }
         }
@@ -1582,12 +1630,12 @@ fn spawn_with_profile(
     let binary =
         resolve_binary().ok_or_else(|| HarnessError::NotInstalled(resolve_binary_absence()))?;
 
-    let claude_key = match selection {
-        Some(ModelSelection::Claude { .. }) => Some(claude_key_for(&binary)?),
+    let claude = match selection {
+        Some(ModelSelection::Claude { .. }) => Some(claude_credential_for(&binary)?),
         _ => None,
     };
     let dir = scratch_dir()?;
-    let mut command = sidecar_command(&binary, &dir, selection, claude_key.as_deref());
+    let mut command = sidecar_command(&binary, &dir, selection, claude.as_ref());
     if let Some(profile) = profile {
         let store = crate::tool_install::components::verified_store_binary();
         attach_workbench(&mut command, &dir, profile, store.as_deref());
@@ -1663,7 +1711,7 @@ fn spawn_with_profile(
         },
         shutting_down,
     };
-    handshake_sidecar(sidecar, claude_key.is_some())
+    handshake_sidecar(sidecar, claude.is_some())
 }
 
 /// The handshake every connection makes, over a pipe or a socket: `hello`, the
@@ -1689,7 +1737,7 @@ fn handshake_sidecar(
             hello.protocol, PROTOCOL_VERSION
         )));
     }
-    // The probe in `claude_key_for` asked the binary on disk; this asks the
+    // The probe in `claude_credential_for` asked the binary on disk; this asks the
     // process that actually holds the key. Returning drops `sidecar`, which
     // stops the child.
     if holds_claude_key
@@ -1835,7 +1883,18 @@ fn spawn_hosted(
 ) -> Result<Sidecar, HostedFailure> {
     use hosted::Reach;
     plan.paths.prepare().map_err(HostedFailure::Fallback)?;
-    let wanted = hosted::fingerprint(selection);
+    // A Claude server is also told apart by the credential it was started
+    // with, so one still holding the in-app key (or another account) is
+    // replaced rather than reused once the registry names a different one.
+    // Keeps the `claude|` prefix `attach` reads to know the server holds a key.
+    let wanted = match selection {
+        Some(ModelSelection::Claude { .. }) => format!(
+            "{}|{}",
+            hosted::fingerprint(selection),
+            super::anthropic_account::credential_label(&super::anthropic_account::detect())
+        ),
+        _ => hosted::fingerprint(selection),
+    };
     let binary = resolve_binary();
     // Twice: the second pass starts the server that replaced one which held
     // nothing and was out of date.
@@ -1863,16 +1922,16 @@ fn spawn_hosted(
                         return Err(HostedFailure::Fallback(why))
                     }
                 }
-                let claude_key = match selection {
+                let claude = match selection {
                     Some(ModelSelection::Claude { .. }) => Some(
-                        claude_key_for(&binary)
+                        claude_credential_for(&binary)
                             .map_err(|e| HostedFailure::Fallback(e.message()))?,
                     ),
                     _ => None,
                 };
                 let store = crate::tool_install::components::verified_store_binary();
                 let mut command =
-                    sidecar_command(&binary, &plan.paths.dir, selection, claude_key.as_deref());
+                    sidecar_command(&binary, &plan.paths.dir, selection, claude.as_ref());
                 attach_workbench(&mut command, &plan.paths.dir, profile, store.as_deref());
                 command
                     .arg("--listen")
@@ -3988,7 +4047,8 @@ done
             model: "qwen3.8:27b-mlx".into(),
         };
         // A key handed in alongside a local selection must not ride along.
-        let with = sidecar_command("manvi", dir.path(), Some(&selection), Some("sk-ant-stray"));
+        let stray = ClaudeCredential::Key("sk-ant-stray".into());
+        let with = sidecar_command("manvi", dir.path(), Some(&selection), Some(&stray));
         let envs: std::collections::HashMap<_, _> = with
             .get_envs()
             .map(|(k, v)| (k.to_owned(), v.map(|value| value.to_owned())))
@@ -4048,12 +4108,8 @@ done
         let selection = ModelSelection::Claude {
             model: "claude-sonnet-5-5".into(),
         };
-        let command = sidecar_command(
-            "manvi",
-            dir.path(),
-            Some(&selection),
-            Some("sk-ant-api03-fixture"),
-        );
+        let key = ClaudeCredential::Key("sk-ant-api03-fixture".into());
+        let command = sidecar_command("manvi", dir.path(), Some(&selection), Some(&key));
         let envs: std::collections::HashMap<_, _> = command
             .get_envs()
             .map(|(k, v)| {
@@ -4081,6 +4137,72 @@ done
                 "unexpected credential-shaped variable {name}"
             );
         }
+    }
+
+    /// A registry account launches `manvi` through `anthropic-account exec`
+    /// with one organisation, and GitPulse itself adds no credential: the key
+    /// and its workspace are set by the launcher, from the same account.
+    #[test]
+    fn a_registry_account_wraps_manvi_in_anthropic_account_exec_and_adds_no_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let selection = ModelSelection::Claude {
+            model: "claude-sonnet-5-5".into(),
+        };
+        let account = ClaudeCredential::Account {
+            program: PathBuf::from("/opt/bin/anthropic-account"),
+            home: PathBuf::from("/Users/someone"),
+        };
+        let command = sidecar_command(
+            "/opt/bin/manvi",
+            dir.path(),
+            Some(&selection),
+            Some(&account),
+        );
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/bin/anthropic-account")
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..8],
+            [
+                "exec",
+                "--no-fallback",
+                "--repo",
+                "/Users/someone",
+                "--",
+                "/opt/bin/manvi",
+                "serve",
+                "--posture"
+            ]
+        );
+        for (name, value) in command.get_envs() {
+            let upper = name.to_string_lossy().to_ascii_uppercase();
+            if upper.starts_with("ANTHROPIC_") || upper.ends_with("_KEY") {
+                assert!(value.is_none(), "GitPulse set credential-shaped {upper}");
+            }
+        }
+        let value = |key: &str| {
+            command
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            value("MANVI_LLM_PROVIDER_DEFAULT").as_deref(),
+            Some("anthropic")
+        );
+
+        // A local selection never goes through the launcher, whatever is passed.
+        let local = ModelSelection::Local {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "m".into(),
+        };
+        let plain = sidecar_command("/opt/bin/manvi", dir.path(), Some(&local), Some(&account));
+        assert_eq!(plain.get_program(), std::ffi::OsStr::new("/opt/bin/manvi"));
     }
 
     #[test]
@@ -4136,7 +4258,7 @@ done
             let binary = dir.path().join(name);
             std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let error = claude_key_for(binary.to_str().unwrap()).unwrap_err();
+            let error = claude_credential_for(binary.to_str().unwrap()).unwrap_err();
             assert!(
                 error.message().contains("does not promise"),
                 "{name}: {}",

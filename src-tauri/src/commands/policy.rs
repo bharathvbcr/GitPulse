@@ -189,11 +189,40 @@ pub async fn cmd_harness_reconnect() -> crate::harness::HarnessStatus {
     .unwrap_or_else(|e| harness_join_failure(e.to_string()))
 }
 
-/// Whether a Claude API key is saved for Manvi. The key itself never crosses
-/// into the webview.
+/// Where a Claude-selected Manvi gets its credential, for the Manvi card.
+/// Neither key crosses into the webview; the account name, its workspace id
+/// and the reason it was chosen are not secrets.
+#[derive(Debug, serde::Serialize)]
+pub struct ClaudeCredentialStatus {
+    /// Whether GitPulse's own Keychain entry holds a key.
+    pub key_saved: bool,
+    /// The `~/.anthropic-accounts` account Manvi will bill. When set it is
+    /// used instead of the saved key.
+    pub account: Option<crate::harness::anthropic_account::Account>,
+    /// Why a registry that exists could not be read. Manvi will not start on
+    /// Claude until it is fixed, rather than fall back to the saved key.
+    pub account_error: Option<String>,
+}
+
+/// Which credential Manvi would use for Claude: the machine's
+/// `anthropic-account` registry when there is one, else GitPulse's saved key.
 #[tauri::command(async)]
-pub async fn cmd_claude_key_status() -> Result<bool, IpcError> {
-    off_thread(|| crate::harness::claude_key::Keychain::system()?.present()).await
+pub async fn cmd_claude_key_status() -> Result<ClaudeCredentialStatus, IpcError> {
+    off_thread(|| {
+        use crate::harness::anthropic_account::{detect, Detection};
+        let (account, account_error) = match detect() {
+            Detection::Absent => (None, None),
+            Detection::Found { account, .. } => (Some(account), None),
+            Detection::Broken(why) => (None, Some(why)),
+        };
+        let key_saved = crate::harness::claude_key::Keychain::system()?.present()?;
+        Ok(ClaudeCredentialStatus {
+            key_saved,
+            account,
+            account_error,
+        })
+    })
+    .await
 }
 
 /// Saves the Claude API key Manvi uses when Claude is its model, replacing

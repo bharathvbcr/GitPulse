@@ -175,7 +175,7 @@
         }),
         cmd_host_load_settings: () => ({ enabled: true, govern_launches: false }),
         // Settings -> Agents holds the Claude key row (LocalModelServers): no key saved.
-        cmd_claude_key_status: () => false,
+        cmd_claude_key_status: () => ({ key_saved: false, account: null, account_error: null }),
         // The store's own defaults in the wire shape, so this answer cannot drift from them.
         cmd_agent_defaults: async () => {
           const { DEFAULT_AGENT_DEFAULTS_VIEW: view } = await import("../src/lib/stores/agentDefaultsStore.ts");
