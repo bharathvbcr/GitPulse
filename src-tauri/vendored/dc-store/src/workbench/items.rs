@@ -19,6 +19,10 @@ const MAX_LINKS: usize = 64;
 /// how far it is followed looking for a cycle. Deeper than any board a person
 /// maintains; a new parent link that would pass it is refused.
 const MAX_PARENT_DEPTH: i64 = 256;
+/// Maximum chain depth for `blocks` dependency links when checking cycles.
+const MAX_BLOCKS_DEPTH: i64 = 256;
+const MAX_READINESS_BATCH: usize = 200;
+const MAX_READINESS_SCOPED: usize = 500;
 /// A task's outbound links as `(kind, target id)`, in request order.
 pub(super) type Links = Vec<(String, String)>;
 pub(super) const LINK_KINDS: &[&str] = &["parent", "blocks", "related", "duplicate_of"];
@@ -217,6 +221,51 @@ pub(super) fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
             )));
         }
     }
+    // Check newly added `blocks` links for dependency cycles and chain depth.
+    // Walking backward into `id` never touches `id`'s replaced outbound rows,
+    // and stopping forward recursion once `id` is reached avoids traversing them.
+    for target in links
+        .iter()
+        .filter(|(kind, _)| kind == "blocks")
+        .map(|(_, target)| target)
+    {
+        let existing: bool = input.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_item_links WHERE item_id=?1 AND kind='blocks' AND target_id=?2)",
+            params![id, target],
+            |r| r.get(0),
+        )?;
+        if existing {
+            continue;
+        }
+        let (cycle, below): (bool, i64) = input.conn.query_row(
+            "WITH RECURSIVE forward(id,depth) AS (
+                SELECT ?1,0
+                UNION SELECT l.target_id,forward.depth+1 FROM work_item_links l JOIN forward ON l.item_id=forward.id
+                 WHERE l.kind='blocks' AND forward.id<>?2 AND forward.depth<?3
+             ) SELECT coalesce(max(id=?2),0),max(depth) FROM forward",
+            params![target, id, MAX_BLOCKS_DEPTH],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if cycle {
+            return Err(Error::invalid(
+                "that blocks link would create a dependency cycle",
+            ));
+        }
+        let above: i64 = input.conn.query_row(
+            "WITH RECURSIVE backward(id,depth) AS (
+                SELECT ?1,0
+                UNION SELECT l.item_id,backward.depth+1 FROM work_item_links l JOIN backward ON l.target_id=backward.id
+                 WHERE l.kind='blocks' AND backward.depth<?2
+             ) SELECT max(depth) FROM backward",
+            params![id, MAX_BLOCKS_DEPTH],
+            |r| r.get(0),
+        )?;
+        if above + below + 2 > MAX_BLOCKS_DEPTH {
+            return Err(Error::invalid(format!(
+                "the blocks dependency chain is deeper than {MAX_BLOCKS_DEPTH} tasks"
+            )));
+        }
+    }
     Ok(Some(links))
 }
 
@@ -280,4 +329,243 @@ pub(super) fn refuse_live_restore(conn: &rusqlite::Connection, id: &str) -> Resu
         });
     }
     Ok(())
+}
+
+/// Summary of an open linked task blocking or nested under a candidate task.
+pub(super) struct LinkedTaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+fn query_linked_tasks(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    task_id: &str,
+) -> Result<Vec<LinkedTaskSummary>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map([task_id], |row| {
+        Ok(LinkedTaskSummary {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            status: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Live non-done tasks that have a `'blocks'` link targeting `task_id`.
+pub(super) fn open_blockers(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<LinkedTaskSummary>> {
+    query_linked_tasks(
+        conn,
+        "SELECT blocker.id, blocker.title, blocker.status
+         FROM work_item_links l
+         JOIN work_items blocker ON blocker.id = l.item_id
+         WHERE l.target_id = ?1 AND l.kind = 'blocks' AND blocker.deleted = 0 AND blocker.status <> 'done'
+         ORDER BY blocker.position, blocker.id",
+        task_id,
+    )
+}
+
+/// Live non-done tasks that `task_id` blocks via outbound `'blocks'` links.
+fn open_blocking(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<LinkedTaskSummary>> {
+    query_linked_tasks(
+        conn,
+        "SELECT target.id, target.title, target.status
+         FROM work_item_links l
+         JOIN work_items target ON target.id = l.target_id
+         WHERE l.item_id = ?1 AND l.kind = 'blocks' AND target.deleted = 0 AND target.status <> 'done'
+         ORDER BY target.position, target.id",
+        task_id,
+    )
+}
+
+/// Live non-done child tasks whose `'parent'` link targets `task_id`.
+pub(super) fn open_subtasks(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<LinkedTaskSummary>> {
+    query_linked_tasks(
+        conn,
+        "SELECT child.id, child.title, child.status
+         FROM work_item_links l
+         JOIN work_items child ON child.id = l.item_id
+         WHERE l.target_id = ?1 AND l.kind = 'parent' AND child.deleted = 0 AND child.status <> 'done'
+         ORDER BY child.position, child.id",
+        task_id,
+    )
+}
+
+fn task_readiness_json(conn: &rusqlite::Connection, task_id: &str) -> Result<String> {
+    let blocked_by = open_blockers(conn, task_id)?;
+    let blocking = open_blocking(conn, task_id)?;
+    let open_children = open_subtasks(conn, task_id)?;
+    let total_subtask_count: i64 = conn.query_row(
+        "SELECT count(*) FROM work_item_links l JOIN work_items child ON child.id = l.item_id WHERE l.target_id = ?1 AND l.kind = 'parent' AND child.deleted = 0",
+        [task_id],
+        |r| r.get(0),
+    )?;
+    let ready = blocked_by.is_empty();
+    let ready_with_subtasks = ready && open_children.is_empty();
+    let reason = if !ready {
+        "blocked_by_tasks"
+    } else if !open_children.is_empty() {
+        "open_subtasks"
+    } else {
+        "ready"
+    };
+    let encode_list = |items: &[LinkedTaskSummary]| -> Result<String> {
+        let mut arr = "[]".to_string();
+        for item in items {
+            arr = conn.query_row(
+                "SELECT json_insert(?1,'$[#]',json_object('id',?2,'title',?3,'status',?4))",
+                params![arr, item.id, item.title, item.status],
+                |r| r.get(0),
+            )?;
+        }
+        Ok(arr)
+    };
+    let blocked_json = encode_list(&blocked_by)?;
+    let blocking_json = encode_list(&blocking)?;
+    let open_subtasks_json = encode_list(&open_children)?;
+    let open_count = i64::try_from(open_children.len()).unwrap_or(i64::MAX);
+    Ok(conn.query_row(
+        "SELECT json_object('id',?1,'ready',json(CASE WHEN ?2 THEN 'true' ELSE 'false' END),'ready_with_subtasks',json(CASE WHEN ?3 THEN 'true' ELSE 'false' END),'readiness_reason',?4,'blocked_by',json(?5),'blocking',json(?6),'open_subtasks',json(?7),'open_subtask_count',?8,'total_subtask_count',?9)",
+        params![
+            task_id,
+            ready,
+            ready_with_subtasks,
+            reason,
+            blocked_json,
+            blocking_json,
+            open_subtasks_json,
+            open_count,
+            total_subtask_count
+        ],
+        |r| r.get(0),
+    )?)
+}
+
+/// Compute task readiness (`blocked_by`, `blocking`, `open_subtasks`) for a
+/// single task (`id`) or a batch (`ids`, `workspace_id`, `repository_id`).
+pub(super) fn readiness(input: &Input<'_>) -> Result<String> {
+    input.fields(&["id", "ids", "workspace_id", "repository_id"])?;
+    let single = input.optional_id("id")?;
+    let has_ids = input.kind("ids")?.is_some();
+    let workspace_id = input.optional_id("workspace_id")?;
+    let repository_id = input.optional_id("repository_id")?;
+    let modes = usize::from(single.is_some())
+        + usize::from(has_ids)
+        + usize::from(workspace_id.is_some())
+        + usize::from(repository_id.is_some());
+    if modes != 1 {
+        return Err(Error::invalid(
+            "give exactly one of id, ids, workspace_id, or repository_id",
+        ));
+    }
+    if let Some(id) = single {
+        let exists: bool = input.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND deleted=0)",
+            [&id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::missing());
+        }
+        let body = task_readiness_json(input.conn, &id)?;
+        return Ok(input.conn.query_row(
+            "SELECT json_object('ok',json('true'),'item',json(?1))",
+            [body],
+            |r| r.get(0),
+        )?);
+    }
+    let mut target_ids = Vec::new();
+    let mut truncated = false;
+    if has_ids {
+        let raw_ids = input.strings("ids", MAX_READINESS_BATCH + 1, 128, true)?;
+        if raw_ids.len() > MAX_READINESS_BATCH {
+            return Err(Error::invalid(format!(
+                "ids accepts at most {MAX_READINESS_BATCH} entries"
+            )));
+        }
+        let mut seen = HashSet::new();
+        for tid in raw_ids {
+            if !tid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                return Err(Error::invalid("ids contains an invalid identifier"));
+            }
+            if !seen.insert(tid.clone()) {
+                continue;
+            }
+            let exists: bool = input.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND deleted=0)",
+                [&tid],
+                |r| r.get(0),
+            )?;
+            if exists {
+                target_ids.push(tid);
+            }
+        }
+    } else if let Some(ws) = workspace_id {
+        let mut stmt = input.conn.prepare(
+            "SELECT DISTINCT t.id FROM (
+                SELECT id FROM work_items WHERE home_workspace_id=?1 AND deleted=0
+                UNION
+                SELECT ir.item_id FROM work_workspace_repositories wr
+                JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id
+                WHERE wr.workspace_id=?1
+             ) sel JOIN work_items t ON t.id=sel.id WHERE t.deleted=0
+             ORDER BY t.position, t.id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ws, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)], |r| {
+            r.get::<_, String>(0)
+        })?;
+        for row in rows {
+            if target_ids.len() >= MAX_READINESS_SCOPED {
+                truncated = true;
+                break;
+            }
+            target_ids.push(row?);
+        }
+    } else if let Some(repo) = repository_id {
+        let mut stmt = input.conn.prepare(
+            "SELECT t.id FROM work_item_repositories ir
+             JOIN work_items t ON t.id=ir.item_id
+             WHERE ir.repository_id=?1 AND t.deleted=0
+             ORDER BY t.position, t.id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![repo, i64::try_from(MAX_READINESS_SCOPED + 1).unwrap_or(501)], |r| {
+            r.get::<_, String>(0)
+        })?;
+        for row in rows {
+            if target_ids.len() >= MAX_READINESS_SCOPED {
+                truncated = true;
+                break;
+            }
+            target_ids.push(row?);
+        }
+    }
+    let mut encoded = Vec::with_capacity(target_ids.len());
+    for tid in &target_ids {
+        encoded.push(task_readiness_json(input.conn, tid)?);
+    }
+    let joined = format!("[{}]", encoded.join(","));
+    let total = i64::try_from(target_ids.len()).unwrap_or(i64::MAX);
+    Ok(input.conn.query_row(
+        "SELECT json_object('ok',json('true'),'items',json(?1),'total',?2,'truncated',json(CASE WHEN ?3 THEN 'true' ELSE 'false' END))",
+        params![joined, total, truncated],
+        |r| r.get(0),
+    )?)
 }

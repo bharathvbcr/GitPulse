@@ -9,6 +9,7 @@ import { withDeadline } from "../async/deadline";
 import { getCollisionRisk } from "../insights/client";
 import type { CollisionRisk } from "../insights/types";
 import { invoke } from "../ipc/invoke";
+import { checkTasksReadiness } from "./readiness";
 import { kindLabel, type RepoOperation } from "../repos/operation";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -150,6 +151,15 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
         // A stop ends the wave; any other failure is claims not read, said in the note.
         if (signal.aborted) throw cause;
         return { held: [], unreadable: describeError(cause, "wave") };
+      }
+    },
+    readiness: async (ids, signal) => {
+      try {
+        return await stoppable(checkTasksReadiness(ids), signal);
+      } catch (cause) {
+        if (signal.aborted) throw cause;
+        const error = describeError(cause, "wave");
+        return new Map(ids.map((id) => [id, { ok: false as const, error }]));
       }
     },
     launch: async (taskId, ids, signal) => {

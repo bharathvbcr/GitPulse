@@ -24,6 +24,8 @@ const CLAIMS: &str = "('runs.claim','notifications.claim','decisions.claim')";
 /// Runs that can still change or spawn work; every revision of one is kept.
 const LIVE_RUN: &str = "('prepared','starting','running','unresolved')";
 const OPEN_DECISION: &str = "('pending','decided','dispatching')";
+const LIVE_QUEUE: &str = "('queued','leased','verifying')";
+const ACTIVE_OUTBOX: &str = "('pending','delivering','outcome_unknown','conflict')";
 
 pub(super) fn compact(input: &Input<'_>, now: i64) -> Result<String> {
     input.fields(&[
@@ -111,7 +113,13 @@ pub(super) fn compact(input: &Input<'_>, now: i64) -> Result<String> {
            AND NOT EXISTS(SELECT 1 FROM work_decisions d WHERE v.entity_type='decision'
                              AND d.id=v.entity_id AND d.state IN {OPEN_DECISION})
            AND NOT EXISTS(SELECT 1 FROM work_runs u WHERE v.entity_type='run'
-                             AND u.id=v.entity_id AND u.state IN {LIVE_RUN})"
+                             AND u.id=v.entity_id AND u.state IN {LIVE_RUN})
+           AND NOT EXISTS(SELECT 1 FROM work_queue q WHERE v.entity_type='queue'
+                             AND q.id=v.entity_id AND q.state IN {LIVE_QUEUE})
+           AND NOT EXISTS(SELECT 1 FROM work_outbox o WHERE v.entity_type='outbox'
+                             AND o.id=v.entity_id AND o.state IN {ACTIVE_OUTBOX})
+           AND NOT EXISTS(SELECT 1 FROM work_issue_sync s WHERE v.entity_type='issue_sync'
+                             AND s.id=v.entity_id AND json_type(s.body,'$.pending_proposal') IS NOT NULL)"
     );
     let revisions_eligible: i64 = conn.query_row(
         &format!("SELECT count(*) {revision_rule}"),

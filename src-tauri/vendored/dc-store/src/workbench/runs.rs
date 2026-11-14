@@ -50,6 +50,22 @@ pub(super) fn active_on_repository(
     )?)
 }
 
+/// Whether a specific working tree checkout has an active, prepared, or unresolved run.
+pub(super) fn has_active_checkout(
+    conn: &rusqlite::Connection,
+    repository_id: &str,
+    git_dir: &str,
+    now: i64,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND {ACTIVE})"
+        ),
+        params![now, repository_id, git_dir],
+        |r| r.get(0),
+    )?)
+}
+
 fn refuse(code: &'static str, message: &str) -> Error {
     Error {
         code,
@@ -441,7 +457,7 @@ fn snapshot(input: &Input<'_>, task_id: &str, revision: i64) -> Result<String> {
         .query_row("SELECT json_extract(?1,'$.item')", [response], |r| r.get(0))?)
 }
 
-fn absolute_path(input: &Input<'_>, key: &str) -> Result<String> {
+pub(super) fn absolute_path(input: &Input<'_>, key: &str) -> Result<String> {
     let path = input.required_text(key, 4096)?;
     if !std::path::Path::new(&path).is_absolute() {
         return Err(Error::invalid(format!(
@@ -471,6 +487,9 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "kind",
         "max_active_runs",
         "model_choice",
+        "require_subtasks_done",
+        "queue_id",
+        "member_id",
     ])?;
     if revision != 1 {
         return Err(refuse(
@@ -518,6 +537,14 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ));
     }
     let model_choice = model_choice(input)?;
+    let require_subtasks_done = input.boolean("require_subtasks_done", false)?;
+    let queue_id = input.optional_id("queue_id")?;
+    let member_id = input.optional_id("member_id")?;
+    if queue_id.is_some() != member_id.is_some() {
+        return Err(Error::invalid(
+            "queue_id and member_id must be provided together",
+        ));
+    }
     let bypass = input.boolean("acknowledge_bypass", false)?;
     if (mode == "bypass") != bypass {
         return Err(Error::invalid(
@@ -550,6 +577,32 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         ));
     }
     let brief = snapshot(input, &task_id, source_revision)?;
+    let blockers = super::items::open_blockers(input.conn, &task_id)?;
+    if !blockers.is_empty() {
+        let summary = blockers
+            .iter()
+            .map(|b| format!("{} ({})", b.id, b.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(refuse(
+            "task_blocked",
+            &format!("task {task_id} is blocked by open task(s): {summary}"),
+        ));
+    }
+    if require_subtasks_done {
+        let open_subtasks = super::items::open_subtasks(input.conn, &task_id)?;
+        if !open_subtasks.is_empty() {
+            let summary = open_subtasks
+                .iter()
+                .map(|s| format!("{} ({})", s.id, s.status))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(refuse(
+                "subtasks_incomplete",
+                &format!("task {task_id} has incomplete subtask(s): {summary}"),
+            ));
+        }
+    }
     let linked: bool = input.conn.query_row("SELECT EXISTS(SELECT 1 FROM json_each(?1,'$.repositories') WHERE json_extract(value,'$.id')=?2 AND json_extract(value,'$.revision')=?3)",params![brief,repository_id,repository_revision],|r|r.get(0))?;
     if !linked {
         return Err(refuse(
@@ -568,18 +621,21 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "the supplied Git common directory does not match the registered repository",
         ));
     }
+    let claimed_queue = queue_id.as_deref().zip(member_id.as_deref());
+    super::queue::verify_run_lease(
+        input.conn,
+        &repository_id,
+        &git_dir,
+        &task_id,
+        claimed_queue,
+        now,
+    )?;
     // One agent per working tree, not per repository. Linked worktrees share
     // the repository's common directory but each has its own `git_dir`, index
     // and HEAD, so two agents in two worktrees cannot touch each other's files
     // — while two in one checkout would. Keying on the repository serialized
     // every task in it, worktrees included.
-    let busy: bool = input.conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND json_extract(body,'$.git_dir')=?3 AND {ACTIVE})"
-        ),
-        params![now, repository_id, git_dir],
-        |r| r.get(0),
-    )?;
+    let busy = has_active_checkout(input.conn, &repository_id, &git_dir, now)?;
     if busy {
         return Err(refuse(
             "checkout_busy",
@@ -610,6 +666,9 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "INSERT INTO work_run_inputs(run_id,brief) VALUES(?1,?2)",
         params![id, brief],
     )?;
+    if let Some((qid, mid)) = claimed_queue {
+        super::queue::attach_run(input.conn, qid, mid, id, now)?;
+    }
     Ok(())
 }
 
