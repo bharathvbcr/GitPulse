@@ -22,15 +22,38 @@ struct SecretPattern {
     prefix: &'static str,
     /// Minimum length of the whole token, including the prefix.
     min_len: usize,
-    /// Whether everything after the prefix must be letters and digits.
-    ///
-    /// It exists for the short, ambiguous prefixes. `sk-` occurs inside
-    /// ordinary English and ordinary identifiers — `task-`, `disk-`, `risk-`
-    /// all contain it — and a length floor alone would turn a long enough
-    /// kebab-case name into a reported credential. The vendors whose keys are
-    /// a flat alphanumeric body can say so, and then the shape does the work
-    /// the prefix cannot.
-    alphanumeric_body: bool,
+    /// Which characters everything after the prefix must be written in.
+    body: Body,
+}
+
+/// The characters a key's body is written in, after its prefix.
+///
+/// It exists for the short, ambiguous prefixes. `sk-` occurs inside ordinary
+/// English and ordinary identifiers — `task-`, `disk-`, `risk-` all contain it
+/// — and a length floor alone would turn a long enough kebab-case name into a
+/// reported credential. The vendors whose keys are a narrower alphabet than a
+/// token run can say so, and then the shape does the work the prefix cannot.
+#[derive(Clone, Copy)]
+enum Body {
+    /// Any key character ([`is_key_char`]).
+    Any,
+    /// Letters and digits only.
+    Alphanumeric,
+    /// Letters, digits, `-` and `_`: the URL-safe base64 alphabet without
+    /// padding. A `/` or a `.` in the run means a path or a URL, not a key.
+    UrlSafe,
+}
+
+impl Body {
+    fn admits(self, body: &str) -> bool {
+        match self {
+            Body::Any => true,
+            Body::Alphanumeric => body.bytes().all(|b| b.is_ascii_alphanumeric()),
+            Body::UrlSafe => body
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        }
+    }
 }
 
 impl SecretPattern {
@@ -65,11 +88,7 @@ impl SecretPattern {
                     // A period closing a sentence is not part of the key.
                     let end = start + content[start..token_end].trim_end_matches('.').len();
                     let token = &content[start..end];
-                    if token.len() < self.min_len
-                        || (self.alphanumeric_body
-                            && !token[self.prefix.len()..]
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric()))
+                    if token.len() < self.min_len || !self.body.admits(&token[self.prefix.len()..])
                     {
                         return None;
                     }
@@ -167,37 +186,37 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "anthropic api key",
         prefix: "sk-ant-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "openai project api key",
         prefix: "sk-proj-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe live key",
         prefix: "sk_live_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe test key",
         prefix: "sk_test_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe restricted test key",
         prefix: "rk_test_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe restricted live key",
         prefix: "rk_live_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // OpenAI admin keys: the Admin API Keys reference's create example returns
     // a value beginning `sk-admin-`
@@ -208,7 +227,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openai admin api key",
         prefix: "sk-admin-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // OpenRouter: `sk-or-v1-` plus 64 hex characters, 73 in all. The format is
     // read off the key examples on
@@ -218,7 +237,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openrouter api key",
         prefix: "sk-or-v1-",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Last of the `sk` family, because it is a prefix of the ones above and the
     // scan stops at its first match. The floor is high — a legacy OpenAI key is
@@ -228,7 +247,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openai api key",
         prefix: "sk-",
         min_len: 45,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     // Stripe endpoint signing secret: "a signing secret beginning with
     // `whsec_`" (https://docs.stripe.com/webhooks). No length is stated.
@@ -236,61 +255,101 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "stripe webhook signing secret",
         prefix: "whsec_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "xai api key",
         prefix: "xai-",
         min_len: 20,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "google api key",
         prefix: "AIza",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
+    },
+    // Google OAuth 2.0 access token. Google's Compute Engine guide prints one
+    // as `ya29.AHES6ZRN3-…` (59 characters) and its IAM downscoping guide as
+    // `ya29.dr.AbCDeFg-…`, so the body carries dots and is left open; the
+    // prefix is Google's alone:
+    // https://docs.cloud.google.com/compute/docs/access/authenticate-workloads
+    // https://docs.cloud.google.com/iam/docs/create-downscoped-short-lived-credentials
+    // Google states no alphabet, only that an access token is at most 2048
+    // bytes (https://developers.google.com/identity/protocols/oauth2), so a
+    // narrower body would risk refusing a real token and passing it whole.
+    SecretPattern {
+        name: "google oauth access token",
+        prefix: "ya29.",
+        min_len: 30,
+        body: Body::Any,
+    },
+    // Google OAuth 2.0 refresh token, printed as `1//xEoDL4iW3cxlI7yDbSRFYNG01k…`
+    // (46 characters) in https://developers.google.com/identity/protocols/oauth2/native-app.
+    // `1//` is also a URL's or a path's `…1//…` and Python's floor division,
+    // so the body must be URL-safe (no `/` or `.`) and the floor sits above a
+    // `1//`-prefixed UUID.
+    SecretPattern {
+        name: "google oauth refresh token",
+        prefix: "1//",
+        min_len: 40,
+        body: Body::UrlSafe,
+    },
+    // Google OAuth 2.0 client secret: `GOCSPX-` and a URL-safe body. Google
+    // publishes the prefix only by example and states no length: its codelab
+    // shows `"client_secret": "GOCSPX-abcd1234-…"`, a 26-character body, in
+    // https://codelabs.developers.google.com/generate_creatives_google_ads.
+    // Secret scanners expect a 28-character body, 35 characters in all
+    // (GitLab's secret-detection rule is `GOCSPX-[a-zA-Z0-9_-]{28}`). The floor
+    // of 30, a 23-character body, sits under both, and the body is left open,
+    // because a real secret refused by either check is a secret passed whole.
+    SecretPattern {
+        name: "google oauth client secret",
+        prefix: "GOCSPX-",
+        min_len: 30,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github personal access token",
         prefix: "ghp_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github oauth token",
         prefix: "gho_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github app server token",
         prefix: "ghs_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github app user token",
         prefix: "ghu_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github refresh token",
         prefix: "ghr_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github pat",
         prefix: "github_pat_",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab personal access token",
         prefix: "glpat-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // GitLab token prefixes, from the table at
     // https://docs.gitlab.com/security/tokens/ . The page states no length or
@@ -299,104 +358,104 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "gitlab deploy token",
         prefix: "gldt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab runner authentication token",
         prefix: "glrt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab runner registration-created token",
         prefix: "glrtr-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab oauth application secret",
         prefix: "gloas-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab ci job token",
         prefix: "glcbt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab trigger token",
         prefix: "glptt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab feed token",
         prefix: "glft-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab incoming mail token",
         prefix: "glimt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab agent for kubernetes token",
         prefix: "glagent-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab workspace token",
         prefix: "glwt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab scim token",
         prefix: "glsoat-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab feature flags client token",
         prefix: "glffct-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack bot token",
         prefix: "xoxb-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack user token",
         prefix: "xoxp-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack workspace token",
         prefix: "xoxa-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack app-level token",
         prefix: "xapp-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // The URL is the credential: whoever has it can post to the channel.
     SecretPattern {
         name: "slack incoming webhook",
         prefix: "https://hooks.slack.com/services/",
         min_len: 60,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // `SG.` + 22 + `.` + 43. The floor is the whole shape, so `SG.` in prose
     // never reaches it.
@@ -404,37 +463,37 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "sendgrid api key",
         prefix: "SG.",
         min_len: 69,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "shopify access token",
         prefix: "shpat_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify custom app token",
         prefix: "shpca_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify private app token",
         prefix: "shppa_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify shared secret",
         prefix: "shpss_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "aws access key id",
         prefix: "AKIA",
         min_len: 20,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     // Temporary credentials, and no less dangerous for it: an ASIA key plus its
     // session token is the same access as a long-lived one for as long as it
@@ -443,19 +502,19 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "aws temporary access key id",
         prefix: "ASIA",
         min_len: 20,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "huggingface token",
         prefix: "hf_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "npm access token",
         prefix: "npm_",
         min_len: 36,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // PyPI API token: `pypi-` and a base64 macaroon; the secret-reporting
     // docs give the pattern as `pypi-[A-Za-z0-9-_]{85,}`, 90 bytes with the
@@ -464,7 +523,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "pypi api token",
         prefix: "pypi-",
         min_len: 90,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // DigitalOcean: `dop_v1_` personal access token, `doo_v1_` OAuth access
     // token, `dor_v1_` OAuth refresh token
@@ -475,19 +534,19 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "digitalocean personal access token",
         prefix: "dop_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "digitalocean oauth access token",
         prefix: "doo_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "digitalocean oauth refresh token",
         prefix: "dor_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Replicate: "40-character strings that always start with `r8_`"
     // (https://replicate.com/docs/topics/security/api-tokens).
@@ -495,7 +554,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "replicate api token",
         prefix: "r8_",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Linear: personal API keys `lin_api_` and OAuth tokens `lin_oauth_`, from
     // the changelog entry that introduced the prefixes so GitHub could scan for
@@ -504,13 +563,13 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "linear api key",
         prefix: "lin_api_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "linear oauth token",
         prefix: "lin_oauth_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Notion: new Public API tokens begin `ntn_` in place of `secret_` since
     // 2024-09-25 (https://developers.notion.com/page/changelog). Notion advises
@@ -521,13 +580,13 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "notion api token",
         prefix: "ntn_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "private key block",
         prefix: "-----BEGIN",
         min_len: 20,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
 ];
 
@@ -1487,6 +1546,55 @@ mod redaction_tests {
         assert!(!contains_secret("cargo build --release"));
         assert_ne!(redact_secrets(key), key);
         assert_eq!(redact_secrets("cargo build"), "cargo build");
+    }
+
+    /// Google's OAuth tokens, in the shapes Google's own documentation prints
+    /// them, with `FAKE` bodies of the same length and alphabet. A CLI that
+    /// talks to Google — `gcloud`, `firebase` — can echo one in an error or a
+    /// debug line, and with no JSON key beside it nothing named it a
+    /// credential.
+    #[test]
+    fn google_oauth_tokens_are_found_and_redacted() {
+        let access = concat!(
+            "ya",
+            "29.FAKE6fakeT-okenNotReal0123_abcDEF_ghIJ01k85nHq39HE3C2LTrFAKE"
+        );
+        let downscoped = concat!("ya", "29.dr.FAKEfak-123456789abcdefghijKLMNOP");
+        let refresh = concat!("1/", "/FAKEfakeRefreshTokenNotReal01k-259FAKEfake");
+        for (token, name) in [
+            (access, "google oauth access token"),
+            (downscoped, "google oauth access token"),
+            (refresh, "google oauth refresh token"),
+        ] {
+            for line in [
+                token.to_string(),
+                format!("Authorization: Bearer {token}"),
+                format!("refresh={token}; next"),
+                format!("token ({token})."),
+            ] {
+                assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{line}");
+                let out = redact_secrets(&line);
+                assert!(!out.contains(token), "{out}");
+            }
+        }
+    }
+
+    /// `1//` is a short prefix, and a path or URL contains it: the refresh
+    /// token's body is letters, digits, `-` and `_`, so a run with a `/` or a
+    /// `.` in it is not one, and neither is anything under the floor.
+    #[test]
+    fn a_double_slash_path_is_not_a_google_refresh_token() {
+        for ordinary in [
+            "curl http://127.0.0.1//api/v1/projects/scholarlm/backends/list?page=2",
+            "gs://bucket-1//some/long/object/key/that/keeps/going/for/a/while",
+            "x = n1//2 + 1//3",
+            "print(total // 1//len(items_in_the_very_long_named_collection))",
+            concat!("id 1/", "/0f8fad5b-d9cb-469f-a165-70867728950e"),
+            "file:///Users/me/1//Library/Application Support/Something/Longer",
+        ] {
+            assert_eq!(find_secret(ordinary), None, "{ordinary}");
+            assert_eq!(redact_secrets(ordinary), ordinary, "{ordinary}");
+        }
     }
 
     /// Each context detector on the literal it exists for, and on the
