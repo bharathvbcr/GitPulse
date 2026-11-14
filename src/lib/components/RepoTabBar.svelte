@@ -29,6 +29,27 @@
     ListChecks,
     SquareTerminal,
     BellRing,
+    PinOff,
+    ArrowLeftToLine,
+    ArrowRightToLine,
+    FolderPlus,
+    FolderInput,
+    FolderMinus,
+    FolderTree,
+    Copy,
+    CopyX,
+    ShieldOff,
+    PanelRightClose,
+    ChevronsDownUp,
+    ChevronsUpDown,
+    Eye,
+    EyeOff,
+    ListCollapse,
+    UnfoldVertical,
+    FoldVertical,
+    Pencil,
+    Ungroup,
+    RotateCcw,
   } from "@lucide/svelte";
   import { askConfirm, askText, isPromptOpen } from "../stores/modalStore";
   import {
@@ -200,11 +221,6 @@
   const ungroupedTabs = $derived(
     $repoStore.openTabs.filter((t) => !normalizeGroupName(t.group)),
   );
-
-  function isTabInCollapsedGroup(tab: { group?: string | null }): boolean {
-    const group = normalizeGroupName(tab.group);
-    return group !== null && collapsedGroupSet.has(group);
-  }
 
   function inheritedColorNote(group: string | null | undefined): string | null {
     const color = lookupGroupColor($repoStore.groupColors, normalizeGroupName(group));
@@ -398,9 +414,15 @@
 
   async function promptSetGroup(tabId: string, currentGroup?: string | null) {
     closeMenu();
+    // The tab menu no longer lists a "Move to group" row per group, so the
+    // prompt names the existing ones: typing one joins it.
+    const others = distinctGroupNames.filter((group) => group !== currentGroup);
+    const shown = others.slice(0, 5).join(", ");
+    const more = others.length > 5 ? ` and ${others.length - 5} more` : "";
+    const existing = others.length > 0 ? ` Existing groups: ${shown}${more}.` : "";
     const next = await askText({
       title: currentGroup ? "Change group" : "Add to group",
-      message: "Enter group name for this repository tab (leave blank to ungroup):",
+      message: `Enter group name for this repository tab (leave blank to ungroup):${existing}`,
       placeholder: "e.g. backend, frontend, tools",
       initialValue: currentGroup ?? "",
       confirmLabel: currentGroup ? "Update group" : "Set group",
@@ -2032,7 +2054,8 @@
       style="z-index: {LAYERS.MENU}"
     >
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
-        {tab.pinned ? "Unpin" : "Pin"} tab
+        {#if tab.pinned}<PinOff size={12} class="shrink-0 text-textMuted" />{:else}<Pin size={12} class="shrink-0 text-textMuted" />{/if}
+        <span>{tab.pinned ? "Unpin" : "Pin"} tab</span>
       </button>
       {@render colorChoices(
         "Tab color",
@@ -2042,30 +2065,9 @@
           : null,
         (color) => repoStore.setTabColor(tab.id, color),
       )}
-      <button
-        role="menuitem"
-        class="gp-menu-item {canMoveLeft ? '' : 'opacity-40 pointer-events-none'}"
-        aria-disabled={!canMoveLeft}
-        onclick={() => {
-          if (!canMoveLeft) return;
-          moveFocusedTabBy(tab.id, -1);
-          closeMenu();
-        }}
-      >
-        Move left
-      </button>
-      <button
-        role="menuitem"
-        class="gp-menu-item {canMoveRight ? '' : 'opacity-40 pointer-events-none'}"
-        aria-disabled={!canMoveRight}
-        onclick={() => {
-          if (!canMoveRight) return;
-          moveFocusedTabBy(tab.id, 1);
-          closeMenu();
-        }}
-      >
-        Move right
-      </button>
+      <span class="gp-menu-sep" aria-hidden="true"></span>
+      <!-- One step left or right is Ctrl+Shift+←/→, the palette, or a drag;
+           only the jumps to either end live here. -->
       <button
         role="menuitem"
         class="gp-menu-item {canMoveLeft ? '' : 'opacity-40 pointer-events-none'}"
@@ -2076,7 +2078,8 @@
           closeMenu();
         }}
       >
-        Move to start
+        <ArrowLeftToLine size={12} class="shrink-0 text-textMuted" />
+        <span>Move to start</span>
       </button>
       <button
         role="menuitem"
@@ -2088,19 +2091,12 @@
           closeMenu();
         }}
       >
-        Move to end
+        <ArrowRightToLine size={12} class="shrink-0 text-textMuted" />
+        <span>Move to end</span>
       </button>
-      <span class="gp-menu-sep" aria-hidden="true"></span>
-      <button role="menuitem" class="gp-menu-item" onclick={() => void copyPath(tab.path)}>
-        Copy path
-      </button>
-      <button role="menuitem" class="gp-menu-item" onclick={() => {
-        const id = tab.id;
-        closeMenu();
-        void repoStore.revokeTrust(id);
-      }}>
-        Revoke repository trust…
-      </button>
+      <!-- This menu holds only actions on this one tab. Whole-group actions
+           (collapse, rename, close the group) live on the group head's menu;
+           strip-wide ones (group by folder, collapse all, open) on the strip's. -->
       <span class="gp-menu-sep" aria-hidden="true"></span>
       {#if tab.group}
         <button role="menuitem" class="gp-menu-item" onclick={() => {
@@ -2109,151 +2105,51 @@
           closeMenu();
           void promptSetGroup(id, grp);
         }}>
-          Change group… ({tab.group})
+          <FolderInput size={12} class="shrink-0 text-textMuted" />
+          <span class="truncate">Change group… ({tab.group})</span>
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => {
           repoStore.setTabGroup(tab.id, null);
           closeMenu();
         }}>
-          Remove from group
+          <FolderMinus size={12} class="shrink-0 text-textMuted" />
+          <span>Remove from group</span>
         </button>
-        {#if isTabInCollapsedGroup(tab)}
-          <button role="menuitem" class="gp-menu-item" onclick={() => {
-            repoStore.setGroupCollapsed(tab.group!, false);
-            setGroupExplicitlyExpanded(tab.group!, true);
-            closeMenu();
-          }}>
-            Expand group "{tab.group}"
-          </button>
-        {:else}
-          <button role="menuitem" class="gp-menu-item" onclick={() => {
-            repoStore.setGroupCollapsed(tab.group!, true);
-            closeMenu();
-          }}>
-            Collapse group "{tab.group}"
-          </button>
-        {/if}
-        {@const tabGrpHeader = groupHeadersByName.get(tab.group)}
-        {#if tabGrpHeader && !tabGrpHeader.isCollapsed && tabGrpHeader.collapsedInactiveCount === 0}
-          <button role="menuitem" class="gp-menu-item" onclick={() => {
-            setGroupInactiveCollapsed(tab.group!, true);
-            closeMenu();
-          }}>
-            Collapse inactive tabs in "{tab.group}"
-          </button>
-        {:else if tabGrpHeader && tabGrpHeader.collapsedInactiveCount > 0}
-          <button role="menuitem" class="gp-menu-item" onclick={() => {
-            setGroupExplicitlyExpanded(tab.group!, true);
-            closeMenu();
-          }}>
-            Expand all tabs in "{tab.group}"
-          </button>
-        {/if}
-        {#if tabGrpHeader && tabGrpHeader.terminalCount > 0}
-          <button
-            role="menuitem"
-            class="gp-menu-item"
-            onclick={() => {
-              interfaceStore.toggleCollapseInactiveIncludeShells();
-              closeMenu();
-            }}
-          >
-            {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
-          </button>
-        {/if}
       {:else}
         <button role="menuitem" class="gp-menu-item" onclick={() => {
           const id = tab.id;
           closeMenu();
           void promptSetGroup(id);
         }}>
-          Add to group…
-        </button>
-      {/if}
-      {#if distinctGroupNames.length > 0}
-        {#each distinctGroupNames as grp}
-          {#if grp !== tab.group}
-            <button role="menuitem" class="gp-menu-item" onclick={() => {
-              repoStore.setTabGroup(tab.id, grp);
-              closeMenu();
-            }}>
-              Move to group "{grp}"
-            </button>
-          {/if}
-        {/each}
-      {/if}
-      <button role="menuitem" class="gp-menu-item" onclick={() => {
-        repoStore.groupByParentFolder();
-        closeMenu();
-      }}>
-        Group all by parent folder
-      </button>
-      {#if $repoStore.openTabs.some((t) => t.group)}
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          repoStore.ungroupTabs();
-          closeMenu();
-        }}>
-          Ungroup all repositories
-        </button>
-      {/if}
-      {#if distinctGroupNames.length > 0}
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          repoStore.collapseInactiveGroups();
-          closeMenu();
-        }}>
-          Collapse inactive groups
-        </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
-          closeMenu();
-        }}>
-          {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
-        </button>
-        <button
-          role="menuitem"
-          class="gp-menu-item"
-          onclick={() => {
-            interfaceStore.toggleCollapseInactiveIncludeShells();
-            closeMenu();
-          }}
-        >
-          {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
-        </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          repoStore.collapseAllGroups();
-          closeMenu();
-        }}>
-          Collapse all groups
-        </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => {
-          repoStore.expandAllGroups();
-          closeMenu();
-        }}>
-          Expand all groups
-        </button>
-      {/if}
-      {#if tab.group}
-        <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => {
-          const g = tab.group!;
-          const count = groupHeadersByName.get(g)?.tabCount ?? 1;
-          closeMenu();
-          void confirmCloseGroup(g, count);
-        }}>
-          Close group "{tab.group}"…
+          <FolderPlus size={12} class="shrink-0 text-textMuted" />
+          <span>Add to group…</span>
         </button>
       {/if}
       <span class="gp-menu-sep" aria-hidden="true"></span>
+      <button role="menuitem" class="gp-menu-item" onclick={() => void copyPath(tab.path)}>
+        <Copy size={12} class="shrink-0 text-textMuted" />
+        <span>Copy path</span>
+      </button>
+      <button role="menuitem" class="gp-menu-item" onclick={() => {
+        const id = tab.id;
+        closeMenu();
+        void repoStore.revokeTrust(id);
+      }}>
+        <ShieldOff size={12} class="shrink-0 text-textMuted" />
+        <span>Revoke repository trust…</span>
+      </button>
+      <span class="gp-menu-sep" aria-hidden="true"></span>
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTab(tab.id); closeMenu(); }}>
-        Close
+        <X size={12} class="shrink-0 text-textMuted" />
+        <span>Close</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeOtherTabs(tab.id); closeMenu(); }}>
-        Close others
+        <CopyX size={12} class="shrink-0 text-textMuted" />
+        <span>Close others</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTabsToTheRight(tab.id); closeMenu(); }}>
-        Close tabs to the right
-      </button>
-      <button role="menuitem" class="gp-menu-item" onclick={() => { onOpen?.(); closeMenu(); }}>
-        <FolderOpen size={11} /> Open repository…
+        <PanelRightClose size={12} class="shrink-0 text-textMuted" />
+        <span>Close tabs to the right</span>
       </button>
     </div>
   {/if}
@@ -2296,7 +2192,8 @@
           closeGroupMenu();
         }}
       >
-        {groupHeader.isCollapsed || groupHeader.collapsedInactiveCount > 0 ? "Expand group" : "Collapse group"}
+        {#if groupHeader.isCollapsed || groupHeader.collapsedInactiveCount > 0}<ChevronsUpDown size={12} class="shrink-0 text-textMuted" />{:else}<ChevronsDownUp size={12} class="shrink-0 text-textMuted" />{/if}
+        <span>{groupHeader.isCollapsed || groupHeader.collapsedInactiveCount > 0 ? "Expand group" : "Collapse group"}</span>
       </button>
       {#if groupHeader.isCollapsed}
         <button
@@ -2308,7 +2205,8 @@
             closeGroupMenu();
           }}
         >
-          Collapse inactive tabs
+          <EyeOff size={12} class="shrink-0 text-textMuted" />
+          <span>Collapse inactive tabs</span>
         </button>
       {:else if groupHeader.collapsedInactiveCount === 0}
         <button
@@ -2319,7 +2217,8 @@
             closeGroupMenu();
           }}
         >
-          Collapse inactive tabs
+          <EyeOff size={12} class="shrink-0 text-textMuted" />
+          <span>Collapse inactive tabs</span>
         </button>
       {:else}
         <button
@@ -2330,7 +2229,8 @@
             closeGroupMenu();
           }}
         >
-          Expand all tabs in group
+          <Eye size={12} class="shrink-0 text-textMuted" />
+          <span>Expand all tabs in group</span>
         </button>
       {/if}
       {#if groupHeader.terminalCount > 0}
@@ -2342,7 +2242,8 @@
             closeGroupMenu();
           }}
         >
-          {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+          <SquareTerminal size={12} class="shrink-0 text-textMuted" />
+          <span>{$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}</span>
         </button>
       {/if}
       <button
@@ -2353,7 +2254,8 @@
           closeGroupMenu();
         }}
       >
-        Collapse inactive groups
+        <ListCollapse size={12} class="shrink-0 text-textMuted" />
+        <span>Collapse inactive groups</span>
       </button>
       <button
         role="menuitem"
@@ -2363,7 +2265,8 @@
           closeGroupMenu();
         }}
       >
-        {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in all groups"}
+        {#if $interfaceStore.collapseInactiveGroupTabs}<Eye size={12} class="shrink-0 text-textMuted" />{:else}<EyeOff size={12} class="shrink-0 text-textMuted" />{/if}
+        <span>{$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in all groups"}</span>
       </button>
       <button
         role="menuitem"
@@ -2373,7 +2276,8 @@
           closeGroupMenu();
         }}
       >
-        Expand all groups
+        <UnfoldVertical size={12} class="shrink-0 text-textMuted" />
+        <span>Expand all groups</span>
       </button>
       <button
         role="menuitem"
@@ -2383,7 +2287,8 @@
           closeGroupMenu();
         }}
       >
-        Collapse all groups
+        <FoldVertical size={12} class="shrink-0 text-textMuted" />
+        <span>Collapse all groups</span>
       </button>
       <button
         role="menuitem"
@@ -2394,7 +2299,8 @@
           void promptRenameGroup(g);
         }}
       >
-        Rename group…
+        <Pencil size={12} class="shrink-0 text-textMuted" />
+        <span>Rename group…</span>
       </button>
       <button
         role="menuitem"
@@ -2404,7 +2310,8 @@
           closeGroupMenu();
         }}
       >
-        Ungroup repositories
+        <Ungroup size={12} class="shrink-0 text-textMuted" />
+        <span>Ungroup repositories</span>
       </button>
       {#if ungroupedTabs.length > 0}
         <button
@@ -2417,7 +2324,8 @@
             closeGroupMenu();
           }}
         >
-          Add open ungrouped repositories ({ungroupedTabs.length})
+          <FolderPlus size={12} class="shrink-0 text-textMuted" />
+          <span>Add open ungrouped repositories ({ungroupedTabs.length})</span>
         </button>
       {/if}
       <span class="gp-menu-sep" aria-hidden="true"></span>
@@ -2427,7 +2335,8 @@
           class="gp-menu-item text-danger hover:text-danger"
           onclick={() => void confirmCloseOtherGroups(groupHeader.group)}
         >
-          Close other groups…
+          <CopyX size={12} class="shrink-0" />
+          <span>Close other groups…</span>
         </button>
       {/if}
       <button
@@ -2440,7 +2349,8 @@
           void confirmCloseGroup(g, count);
         }}
       >
-        Close group repositories…
+        <X size={12} class="shrink-0" />
+        <span>Close group repositories…</span>
       </button>
     </div>
   {/if}
@@ -2538,75 +2448,19 @@
           setExpanded(target, open);
         }}
       >
-        {info.isExpanded ? "Fold into one tab" : "Show each checkout as a tab"}
+        <Layers size={12} class="shrink-0 text-textMuted" />
+        <span>{info.isExpanded ? "Fold into one tab" : "Show each checkout as a tab"}</span>
       </button>
       {#if info.tabCount > 1}
         <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => { const target = info; void confirmCloseCheckouts(target, target.current.id); }}>
-          Close other worktrees…
+          <CopyX size={12} class="shrink-0" />
+          <span>Close other worktrees…</span>
         </button>
       {/if}
       <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => { const target = info; void confirmCloseCheckouts(target, null); }}>
-        Close all {info.tabCount} checkouts…
+        <X size={12} class="shrink-0" />
+        <span>Close all {info.tabCount} checkouts…</span>
       </button>
-      {#if info.group}
-        <span class="gp-menu-sep" aria-hidden="true"></span>
-        {@const stackGrpHeader = groupHeadersByName.get(info.group)}
-        {#if stackGrpHeader && !stackGrpHeader.isCollapsed && stackGrpHeader.collapsedInactiveCount === 0}
-          <button
-            role="menuitem"
-            class="gp-menu-item"
-            onclick={() => {
-              setGroupInactiveCollapsed(info.group!, true);
-              closeMenu();
-            }}
-          >
-            Collapse inactive tabs in "{info.group}"
-          </button>
-        {:else if stackGrpHeader && stackGrpHeader.collapsedInactiveCount > 0}
-          <button
-            role="menuitem"
-            class="gp-menu-item"
-            onclick={() => {
-              setGroupExplicitlyExpanded(info.group!, true);
-              closeMenu();
-            }}
-          >
-            Expand all tabs in "{info.group}"
-          </button>
-        {/if}
-        {#if stackGrpHeader && stackGrpHeader.terminalCount > 0}
-          <button
-            role="menuitem"
-            class="gp-menu-item"
-            onclick={() => {
-              interfaceStore.toggleCollapseInactiveIncludeShells();
-              closeMenu();
-            }}
-          >
-            {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
-          </button>
-        {/if}
-        <button
-          role="menuitem"
-          class="gp-menu-item"
-          onclick={() => {
-            repoStore.collapseInactiveGroups();
-            closeMenu();
-          }}
-        >
-          Collapse inactive groups
-        </button>
-        <button
-          role="menuitem"
-          class="gp-menu-item"
-          onclick={() => {
-            interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
-            closeMenu();
-          }}
-        >
-          {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
-        </button>
-      {/if}
     </div>
   {/if}
 {/if}
@@ -2625,11 +2479,13 @@
     style="z-index: {LAYERS.MENU}"
   >
     <button role="menuitem" class="gp-menu-item" onclick={() => { onOpen?.(); closeStripMenu(); }}>
-      <FolderOpen size={11} /> Open repository…
+      <FolderOpen size={12} class="shrink-0 text-textMuted" />
+      <span>Open repository…</span>
     </button>
     {#if $repoStore.lastClosed.length > 0}
       <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.reopenLastClosed(); closeStripMenu(); }}>
-        Reopen closed repository ({displayName($repoStore.lastClosed[0])})
+        <RotateCcw size={12} class="shrink-0 text-textMuted" />
+        <span>Reopen closed repository ({displayName($repoStore.lastClosed[0])})</span>
       </button>
     {/if}
     <span class="gp-menu-sep" aria-hidden="true"></span>
@@ -2638,10 +2494,12 @@
       class="gp-menu-item"
       onclick={() => { interfaceStore.setStackWorktreeTabs(!$interfaceStore.stackWorktreeTabs); closeStripMenu(); }}
     >
-      {$interfaceStore.stackWorktreeTabs ? "Give every worktree its own tab" : "Stack worktrees of one repository"}
+      <Layers size={12} class="shrink-0 text-textMuted" />
+      <span>{$interfaceStore.stackWorktreeTabs ? "Give every worktree its own tab" : "Stack worktrees of one repository"}</span>
     </button>
     <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.groupByParentFolder(); closeStripMenu(); }}>
-      Group all by parent folder
+      <FolderTree size={12} class="shrink-0 text-textMuted" />
+      <span>Group all by parent folder</span>
     </button>
     {#if distinctGroupNames.length > 0}
       <button
@@ -2652,7 +2510,8 @@
           closeStripMenu();
         }}
       >
-        {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
+        {#if $interfaceStore.collapseInactiveGroupTabs}<Eye size={12} class="shrink-0 text-textMuted" />{:else}<EyeOff size={12} class="shrink-0 text-textMuted" />{/if}
+        <span>{$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}</span>
       </button>
       <button
         role="menuitem"
@@ -2662,25 +2521,31 @@
           closeStripMenu();
         }}
       >
-        {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+        <SquareTerminal size={12} class="shrink-0 text-textMuted" />
+        <span>{$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.collapseInactiveGroups(); closeStripMenu(); }}>
-        Collapse inactive groups
+        <ListCollapse size={12} class="shrink-0 text-textMuted" />
+        <span>Collapse inactive groups</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.expandAllGroups(); closeStripMenu(); }}>
-        Expand all groups
+        <UnfoldVertical size={12} class="shrink-0 text-textMuted" />
+        <span>Expand all groups</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.collapseAllGroups(); closeStripMenu(); }}>
-        Collapse all groups
+        <FoldVertical size={12} class="shrink-0 text-textMuted" />
+        <span>Collapse all groups</span>
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.ungroupTabs(); closeStripMenu(); }}>
-        Ungroup all repositories
+        <Ungroup size={12} class="shrink-0 text-textMuted" />
+        <span>Ungroup all repositories</span>
       </button>
     {/if}
     {#if $repoStore.openTabs.length > 0}
       <span class="gp-menu-sep" aria-hidden="true"></span>
       <button role="menuitem" class="gp-menu-item text-danger hover:text-danger" onclick={() => void confirmCloseAllTabs()}>
-        Close all repositories…
+        <X size={12} class="shrink-0" />
+        <span>Close all repositories…</span>
       </button>
     {/if}
   </div>

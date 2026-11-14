@@ -541,21 +541,46 @@ describe("RepoTabBar", () => {
       }
     });
 
-    it("includes collapse inactive options and shell controls in right-click menus", () => {
-      // Tab right-click menu (data-repo-menu)
-      expect(source).toContain("data-repo-menu");
-      expect(source).toContain('Collapse inactive tabs in "{tab.group}"');
-      expect(source).toContain("Collapse tabs with active shells");
-      expect(source).toContain("Keep tabs with active shells visible");
+    it("keeps group and strip actions on their own menus, off the tab's", () => {
+      const block = (start: string, end: string) => {
+        const from = source.indexOf(start);
+        const to = source.indexOf(end, from);
+        expect(from).toBeGreaterThan(-1);
+        expect(to).toBeGreaterThan(from);
+        return source.slice(from, to);
+      };
+      const tabMenu = block("{#if menu}", "{#if groupMenu}");
+      const groupMenu = block("{#if groupMenu}", "{#if stackMenu}");
+      const stackMenu = block("{#if stackMenu}", "{#if stripMenu}");
+      const stripMenu = source.slice(source.indexOf("{#if stripMenu}"));
 
-      // Group head right-click menu (data-group-menu)
-      expect(source).toContain("data-group-menu");
-      expect(source).toContain("Collapse inactive tabs");
-      expect(source).toContain("Expand all tabs in group");
+      // The tab menu acts on one tab only.
+      for (const label of ["Pin", "Move to start", "Move to end", "Add to group…", "Change group…", "Remove from group",
+        "Copy path", "Revoke repository trust…", "Close others", "Close tabs to the right"]) {
+        expect(tabMenu).toContain(label);
+      }
+      for (const label of ["Move left", "Move right", "Move to group", "Collapse", "Expand", "Ungroup",
+        "Group all by parent folder", "active shells", "Close group", "Open repository…"]) {
+        expect(tabMenu).not.toContain(label);
+      }
+      expect(tabMenu.match(/role="menuitem"/g)?.length ?? 0).toBeLessThanOrEqual(12);
 
-      // Strip background right-click menu (data-strip-menu)
-      expect(source).toContain("data-strip-menu");
-      expect(source).toContain("Collapse inactive tabs in groups");
+      // Its stacked-tab switcher lists checkouts, not group controls.
+      expect(stackMenu).not.toContain("Collapse inactive");
+      expect(stackMenu).not.toContain("active shells");
+
+      // The group head owns the group's collapse controls and shell toggle.
+      expect(groupMenu).toContain("data-group-menu");
+      expect(groupMenu).toContain("Collapse inactive tabs");
+      expect(groupMenu).toContain("Expand all tabs in group");
+      expect(groupMenu).toContain("Collapse tabs with active shells");
+      expect(groupMenu).toContain("Keep tabs with active shells visible");
+
+      // The strip background owns the strip-wide ones.
+      expect(stripMenu).toContain("data-strip-menu");
+      expect(stripMenu).toContain("Collapse inactive tabs in groups");
+      expect(stripMenu).toContain("Group all by parent folder");
+      expect(stripMenu).toContain("Open repository…");
     });
   });
 });
