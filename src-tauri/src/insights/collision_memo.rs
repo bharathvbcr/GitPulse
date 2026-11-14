@@ -341,7 +341,13 @@ impl CollisionMemo {
             };
             let read = changed_paths_since(path, None, not_before)?;
             oldest.fetch_max(read.age.as_millis() as u64, Ordering::Relaxed);
-            Ok((read.paths, read.truncated))
+            let mut paths = read.paths;
+            crate::engine::worktree::fold_status_paths_for_focus(
+                std::path::Path::new(path),
+                focus,
+                &mut paths,
+            );
+            Ok((paths, read.truncated))
         };
         let live = live_in(observation, &list);
         (

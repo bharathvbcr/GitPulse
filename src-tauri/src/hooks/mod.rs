@@ -6904,6 +6904,151 @@ done
         assert!(asks(&output), "{:?}", output.render());
     }
 
+    /// S3-08. Two siblings each hold a new untracked `new/dir/x.rs`: the
+    /// repo-wide item path is the file (`new/dir/x.rs`), not `new/`, and a
+    /// third worktree where `new/dir/x.rs` is also untracked-dirty gets an `Ask`
+    /// naming both siblings.
+    #[cfg(unix)]
+    #[test]
+    fn two_worktrees_with_new_untracked_nested_file_name_the_file_and_ask_in_a_third() {
+        let farm = farm_bound(false, false, 2);
+        for wt in &farm.sibling_dirs {
+            let dir = wt.join("new/dir");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.rs"), "fn x() {}\n").unwrap();
+        }
+        let risk = insights::collision_risk(&farm.repo);
+        assert!(risk.ok, "{}", risk.error);
+        let paths: Vec<&str> = risk.items.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"new/dir/x.rs") && !paths.contains(&"new/"),
+            "expected file path, got {paths:?}"
+        );
+
+        let local_dir = Path::new(&farm.repo).join("new/dir");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::write(local_dir.join("x.rs"), "fn x_local() {}\n").unwrap();
+
+        let output = guard_here(&edit_call(
+            &farm.repo,
+            &format!("{}/new/dir/x.rs", farm.repo),
+        ));
+        assert!(asks(&output), "{:?}", output.render());
+        let reason = reason_of(&output);
+        assert!(
+            reason.contains("sibling-0") && reason.contains("sibling-1"),
+            "expected both siblings in reason: {reason}"
+        );
+    }
+
+    /// S3-09. With 40 overlapping files, the repo-wide items cap cuts at 32
+    /// (`truncated: true`), while asking the hook about the 40th file still
+    /// returns `Ask`.
+    #[cfg(unix)]
+    #[test]
+    fn forty_overlapping_files_still_ask_for_the_fortieth_in_the_hook() {
+        let farm = farm_bound(false, false, 1);
+        for n in 0..40usize {
+            let name = format!("f{n:02}.txt");
+            std::fs::write(Path::new(&farm.repo).join(&name), format!("here {n}\n")).unwrap();
+            std::fs::write(farm.sibling_dirs[0].join(&name), format!("there {n}\n")).unwrap();
+        }
+        let risk = insights::collision_risk(&farm.repo);
+        assert!(risk.ok, "{}", risk.error);
+        assert_eq!(risk.items.len(), 32);
+        assert!(risk.truncated);
+
+        let output = guard_here(&edit_call(&farm.repo, &format!("{}/f39.txt", farm.repo)));
+        assert!(asks(&output), "{:?}", output.render());
+        assert!(
+            reason_of(&output).contains("sibling-0"),
+            "{}",
+            reason_of(&output)
+        );
+    }
+
+    /// Folded 2026-10-14 (end-to-end hook): when party B has dirty edits in
+    /// `foo` and this worktree's existing dirty edits are in `bar`, an incoming
+    /// `Edit` into `baz` stays a disjoint notice, whereas an incoming `Edit`
+    /// into `foo` escalates to `Ask` naming `foo`.
+    #[cfg(unix)]
+    #[test]
+    fn an_incoming_edit_into_another_partys_dirty_symbol_asks_even_when_our_dirty_edits_are_elsewhere()
+    {
+        use crate::test_support::git_in;
+        let farm = farm_bound(false, false, 1);
+        let main_dir = Path::new(&farm.repo);
+        let sib_dir = &farm.sibling_dirs[0];
+        let base = concat!(
+            "fn foo() {\n",
+            "    let a = 1;\n",
+            "    let a2 = a + 1;\n",
+            "}\n",
+            "fn bar() {\n",
+            "    let b = 2;\n",
+            "    let b2 = b + 1;\n",
+            "}\n",
+            "fn baz() {\n",
+            "    let c = 3;\n",
+            "    let c2 = c + 1;\n",
+            "}\n",
+        );
+        std::fs::create_dir_all(main_dir.join("src")).unwrap();
+        std::fs::write(main_dir.join("src/lib.rs"), base).unwrap();
+        git_in(main_dir, &["add", "src/lib.rs"]);
+        git_in(main_dir, &["commit", "-q", "-m", "add lib.rs"]);
+        let head_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(main_dir)
+            .output()
+            .unwrap();
+        assert!(head_out.status.success());
+        let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        git_in(sib_dir, &["merge", "--ff-only", &head]);
+
+        let syms: &[crate::codeintel::tests::SeedSymbol<'_>] = &[
+            ("lib.rs", "src/lib.rs::", "File", 1, 12),
+            ("foo", "src/lib.rs::foo", "Function", 1, 4),
+            ("bar", "src/lib.rs::bar", "Function", 5, 8),
+            ("baz", "src/lib.rs::baz", "Function", 9, 12),
+        ];
+        crate::codeintel::tests::seed_file_symbols(main_dir, &head, "src/lib.rs", base, syms);
+        crate::codeintel::tests::seed_file_symbols(sib_dir, &head, "src/lib.rs", base, syms);
+
+        // Party B dirties `foo`; this party dirties `bar`.
+        std::fs::write(sib_dir.join("src/lib.rs"), base.replace("let a = 1;", "let a = 9;"))
+            .unwrap();
+        std::fs::write(
+            main_dir.join("src/lib.rs"),
+            base.replace("let b = 2;", "let b = 9;"),
+        )
+        .unwrap();
+
+        let target_file = format!("{}/src/lib.rs", farm.repo);
+        let mut disjoint_call = edit_call(&farm.repo, &target_file);
+        disjoint_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
+            "    let c = 3;".to_string(),
+        ]));
+        let disjoint = guard_here(&disjoint_call);
+        assert!(
+            !asks(&disjoint) && !disjoint.is_silent(),
+            "disjoint incoming edit should return a notice, not Ask or silent: {:?}",
+            disjoint.render()
+        );
+
+        let mut shared_call = edit_call(&farm.repo, &target_file);
+        shared_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
+            "    let a = 1;".to_string(),
+        ]));
+        let shared = guard_here(&shared_call);
+        assert!(asks(&shared), "shared incoming edit must ask: {:?}", shared.render());
+        assert!(
+            reason_of(&shared).contains("foo"),
+            "expected shared symbol `foo` in reason: {}",
+            reason_of(&shared)
+        );
+    }
+
     /// The cost of placing the incoming edit is paid only by an edit another
     /// worktree contends, and an uncontended one spends what it always did.
     #[cfg(unix)]

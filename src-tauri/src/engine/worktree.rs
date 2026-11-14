@@ -1285,11 +1285,12 @@ fn volume_ignores_case(repo: &Path) -> bool {
     }
 }
 
-/// The proper ancestors of `path` that are nested repositories in `repo`
-/// (a submodule, or any directory with its own `.git`). A status of the file
-/// inside one reports nothing, because the superproject sees only the gitlink
-/// row, so the gitlink is asked about as well.
-fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
+/// Proper ancestors of `path` in `repo` that prevent Git from descending to
+/// `path`: a nested repository (`.git` entry inside the ancestor) or a
+/// non-directory entry (file or symlink where `path` expects a parent
+/// directory). Pathspec-limited status of `path` emits nothing for those, so
+/// the blocker itself must be queried as well.
+fn blocking_ancestors(repo: &Path, path: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut prefix = String::new();
     let mut parts = path.split('/').peekable();
@@ -1301,11 +1302,57 @@ fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
             prefix.push('/');
         }
         prefix.push_str(part);
-        if repo.join(&prefix).join(".git").exists() {
+        let candidate = repo.join(&prefix);
+        let is_non_dir =
+            std::fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir());
+        if is_non_dir || candidate.join(".git").exists() {
             found.push(prefix.clone());
         }
     }
     found
+}
+
+/// Folds status entries in `paths` that represent `focus` in `repo` onto
+/// `focus` itself so callers matching by exact path see:
+/// - case-variant spellings on case-insensitive volumes,
+/// - descendant files when the other worktree has an untracked directory at
+///   `focus` (e.g. `focus/inner.txt`), and
+/// - blocking ancestor entries when the other worktree holds a file, symlink,
+///   or nested repository / submodule along `focus`'s parent prefix.
+pub(crate) fn fold_status_paths_for_focus(repo: &Path, focus: &str, paths: &mut Vec<String>) {
+    let clean_focus = focus.trim_end_matches('/');
+    if clean_focus.is_empty() {
+        return;
+    }
+    let ignore_case = volume_ignores_case(repo);
+    let eq_seg = |a: &str, b: &str| {
+        if ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let has_dir_prefix = |full: &str, dir: &str| {
+        !dir.is_empty()
+            && full.len() > dir.len()
+            && full.as_bytes().get(dir.len()) == Some(&b'/')
+            && full.is_char_boundary(dir.len())
+            && eq_seg(&full[..dir.len()], dir)
+    };
+    for entry in paths.iter_mut() {
+        let clean_entry = entry.trim_end_matches('/');
+        if clean_entry.is_empty() {
+            continue;
+        }
+        if eq_seg(clean_entry, clean_focus)
+            || has_dir_prefix(clean_entry, clean_focus)
+            || has_dir_prefix(clean_focus, clean_entry)
+        {
+            *entry = focus.to_string();
+        }
+    }
+    let mut seen = std::collections::HashSet::with_capacity(paths.len());
+    paths.retain(|p| seen.insert(p.clone()));
 }
 
 /// Why a status that never started did not.
@@ -1468,9 +1515,9 @@ pub fn changed_paths_only(
         return Err(format!("worktree path is not a directory: {}", repo.display()).into());
     }
     let ignore_case = volume_ignores_case(&repo);
-    let nested = nested_repository_ancestors(&repo, path);
+    let ancestors = blocking_ancestors(&repo, path);
     let mut asked: Vec<&str> = vec![path];
-    asked.extend(nested.iter().map(String::as_str));
+    asked.extend(ancestors.iter().map(String::as_str));
     let stdout = spawn_porcelain(
         &repo,
         deadline,
@@ -1480,22 +1527,10 @@ pub fn changed_paths_only(
         }),
     )?;
     let (mut paths, truncated) = bounded_status_paths(stdout.as_bytes());
-    // A row for the file under another spelling of its name, or for the nested
-    // repository that contains it, is a row for this file: the caller matches
-    // rows by the path it asked about.
-    for entry in &mut paths {
-        let same = |other: &str| {
-            if ignore_case {
-                entry.eq_ignore_ascii_case(other)
-            } else {
-                entry == other
-            }
-        };
-        if same(path) || nested.iter().any(|ancestor| same(ancestor)) {
-            *entry = path.to_string();
-        }
-    }
-    paths.dedup();
+    // A row for another case spelling, a descendant under an untracked
+    // directory, or an ancestor blocking descent (file, symlink, submodule) is
+    // a row for this file: the caller matches rows by the path it asked about.
+    fold_status_paths_for_focus(&repo, path, &mut paths);
     Ok((paths, truncated))
 }
 
@@ -8694,19 +8729,30 @@ some-future-field whatever
         assert_eq!(paths, ["new/dir/x.rs", "new/y.rs"]);
     }
 
-    /// S3-08. A tree of untracked files far past the path cap stays within it,
-    /// and says it was cut.
+    /// S3-08. A 100k-file untracked tree stays within the path cap, reports
+    /// `truncated: true`, and still lets a path-scoped check past the cap find
+    /// a late path without truncation.
     #[test]
     fn a_huge_untracked_tree_stays_within_the_path_cap_and_says_it_was_cut() {
         let repo = dirty_repo();
-        let dir = repo.path().join("gen");
-        std::fs::create_dir_all(&dir).unwrap();
-        for n in 0..(MAX_CHANGED_PATHS * 8) {
-            std::fs::write(dir.join(format!("f{n:05}.txt")), "").unwrap();
+        let root = repo.path().join("gen");
+        for d in 0..1_000usize {
+            let sub = root.join(format!("d{d:04}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            let first = sub.join("f000.txt");
+            std::fs::write(&first, "").unwrap();
+            for f in 1..100usize {
+                std::fs::hard_link(&first, sub.join(format!("f{f:03}.txt"))).unwrap();
+            }
         }
-        let (paths, truncated) = changed_paths_within(repo.path().to_str().unwrap(), None).unwrap();
+        let repo_str = repo.path().to_str().unwrap();
+        let (paths, truncated) = changed_paths_within(repo_str, None).unwrap();
         assert_eq!(paths.len(), MAX_CHANGED_PATHS);
         assert!(truncated);
+        assert_eq!(
+            changed_paths_only(repo_str, "gen/d0999/f099.txt", None).unwrap(),
+            (vec!["gen/d0999/f099.txt".to_string()], false)
+        );
     }
 
     /// The path-limited read is limited to exactly that path: glob characters
