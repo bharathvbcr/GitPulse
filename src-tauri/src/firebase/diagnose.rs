@@ -1113,4 +1113,46 @@ Error: Unable to obtain permissions for firebase-debug.log
         );
         assert!(unasked.reason.is_some());
     }
+
+    /// The credentials the Google tooling behind `firebase` hands out, bare:
+    /// no JSON key and no `Bearer` beside them, as a debug line or an error
+    /// quoting a request prints them. Prefixes and lengths follow Google's
+    /// documented shapes; the bodies are fake. Each literal is split so no
+    /// scanner reads a whole token in this file.
+    #[test]
+    fn a_bare_google_oauth_credential_never_reaches_the_record() {
+        let access = concat!("ya", "29.FAKE-access-token-body-for-the-firebase-test_0123");
+        let refresh = concat!("1/", "/FAKE-refresh-token-body-for-the-firebase-test_42");
+        let client_secret = concat!("GOC", "SPX-FAKE-client-secret-body_0123456");
+        let spawn = FirebaseSpawn::new(
+            "firebase".into(),
+            vec![
+                "apphosting:backends:list".into(),
+                "--token".into(),
+                refresh.into(),
+            ],
+            PathBuf::from("/repo"),
+            Duration::from_secs(1),
+        );
+        let (_, attempt) = run_recorded(&spawn, |_| {
+            Ok(output(
+                &format!("[debug] using access token {access}"),
+                &format!(
+                    "Error: refresh {refresh} was rejected (token {access}, client {client_secret})."
+                ),
+                1,
+            ))
+        });
+        let record = serde_json::to_string(&attempt).expect("the record serializes");
+        for token in [access, refresh, client_secret] {
+            assert!(
+                !record.contains(token),
+                "a credential reached the record: {record}"
+            );
+        }
+        assert!(
+            record.contains("chars)"),
+            "the redaction says what it withheld: {record}"
+        );
+    }
 }
