@@ -71,9 +71,27 @@ plain numbers, so 2.0.0 sorts after it.
 - **`.worktreeinclude`** is honoured by every worktree GitPulse creates. It can
   copy `.env`-style files; [Security](docs/SECURITY.md) says why that is
   accepted.
+- **The Firebase panel explains a failure and lets you copy it.** A failed
+  Firebase CLI call names its state with the next step: the CLI could not
+  start, a local file was refused, not signed in, wrong account, a missing
+  permission (with the role when the error names one), an API that is off, the
+  CLI missing, the network, or unknown. *Copy diagnostics* copies the CLI
+  version, the active account and project, the recent command output and the
+  classified error, with credentials redacted, and a debug view shows the same.
+  Only the active account is included, never the other accounts you have signed
+  in with.
 
 ### Fixed
 
+- **The Firebase panel no longer fails with "Unable to obtain permissions".**
+  This was not a Google Cloud permission. The Firebase CLI writes
+  `firebase-debug.log` into the folder it starts in, before it reads any
+  command, and GitPulse started it in `/`, where it cannot write. Each run now
+  keeps its debug log in its own temporary folder, removed afterwards, so the
+  log no longer lands in `/` or in your repository.
+- **A Firebase deploy that times out or loses the network is reported as an
+  unknown outcome.** It says to check the Firebase console before deploying
+  again, never "try again", because a second create deploys twice.
 - **Go to line works again.** Every Go threw "trim is not a function" and the
   cursor never moved.
 - **The Code page keeps the editor's minimum width beside two floating cards,**
@@ -252,6 +270,15 @@ plain numbers, so 2.0.0 sorts after it.
     selector, sha, action or message, and the header says how many of the
     loaded entries match. The branch chip does not apply, since this is HEAD's
     log.
+
+### Security
+
+- **Bare Google OAuth credentials are redacted.** Access tokens (`ya29.`),
+  refresh tokens (`1//`) and client secrets (`GOCSPX-`) are now recognised by
+  their prefix alone, with no `access_token=` or `Bearer` beside them. That
+  covers copied diagnostics, ledger records and everything else that goes
+  through the shared redaction table, which is re-vendored from DevCouncil
+  d9c7a512. This only widens what is redacted.
 
 ## [1.5.0] - 2026-11-03
 
