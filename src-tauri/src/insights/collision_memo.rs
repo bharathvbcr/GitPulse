@@ -360,8 +360,17 @@ impl CollisionMemo {
     }
 }
 
-/// The key a repository's memory is kept under: its canonical path.
+/// The key a repository's memory is kept under: its common git directory when
+/// trusted (so linked worktrees share the family's listing memo), or its
+/// canonical path otherwise. Trust is validated before resolving the common
+/// directory so an untrusted path cannot collide with a trusted slot.
 pub(super) fn memo_key(repo_path: &str) -> String {
+    if let Ok(repo) = crate::engine::git_cli::validate_repo(repo_path) {
+        if let Ok(common) = crate::engine::git_cli::resolve_git_common_dir(&repo) {
+            return common.to_string_lossy().into_owned();
+        }
+        return repo.to_string_lossy().into_owned();
+    }
     std::fs::canonicalize(repo_path)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| repo_path.to_string())
