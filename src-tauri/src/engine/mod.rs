@@ -16,6 +16,7 @@ mod merge_tree_adversarial_tests;
 mod merge_tree_tests;
 pub mod object_quarantine;
 pub mod portless;
+pub mod process;
 pub mod provenance;
 pub mod ref_cache;
 pub mod remotes;

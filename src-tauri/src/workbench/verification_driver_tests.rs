@@ -1277,7 +1277,7 @@ fn rev_parses_in(repo: &std::path::Path) -> usize {
     }
     spellings
         .iter()
-        .flat_map(|path| crate::engine::git_cli::spawn_log::spawns_in(path))
+        .flat_map(|path| crate::engine::process::spawn_log::spawns_in(path))
         .filter(|argv| argv.iter().any(|arg| arg == "rev-parse"))
         .count()
 }
@@ -1305,7 +1305,7 @@ fn repeated_head_and_base_reads_of_an_unchanged_worktree_launch_git_at_most_once
         (head, base)
     });
     assert_ne!(head, base);
-    let spawned = crate::engine::git_cli::spawn_log::spawns_in(repo.path());
+    let spawned = crate::engine::process::spawn_log::spawns_in(repo.path());
     let head_reads = spawned
         .iter()
         .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
@@ -1324,7 +1324,7 @@ fn repeated_head_and_base_reads_of_an_unchanged_worktree_launch_git_at_most_once
 /// shows who is spending instead of an anonymous `git rev-parse`.
 #[test]
 fn verification_head_reads_are_attributed_in_the_gate_report() {
-    use crate::engine::git_cli::rev_parse_launches_from;
+    use crate::engine::process::rev_parse_launches_from;
     let _held = crate::engine::ref_cache::retention();
     let repo = crate::test_support::git_repo();
     let git = |args: &[&str]| crate::test_support::git_in(repo.path(), args);
@@ -1343,7 +1343,7 @@ fn verification_head_reads_are_attributed_in_the_gate_report() {
 /// the only thing that can attribute it.
 #[test]
 fn verification_base_reads_are_attributed_in_the_gate_report() {
-    use crate::engine::git_cli::rev_parse_launches_from;
+    use crate::engine::process::rev_parse_launches_from;
     use crate::workbench::verification_driver::VERIFICATION_BASE_SOURCE;
     let _held = crate::engine::ref_cache::retention();
     let repo = crate::test_support::git_repo();
@@ -1489,7 +1489,7 @@ fn a_head_moved_by_update_ref_within_the_same_tick_is_seen() {
 
 /// Children `git rev-parse --verify HEAD^{commit}` has started in `worktree`.
 fn head_reads(worktree: &std::path::Path) -> usize {
-    crate::engine::git_cli::spawn_log::spawns_in(worktree)
+    crate::engine::process::spawn_log::spawns_in(worktree)
         .iter()
         .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
         .count()

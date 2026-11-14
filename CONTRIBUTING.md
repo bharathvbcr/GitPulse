@@ -483,10 +483,12 @@ subtly wrong:
 
 **1. Rust core — the only thing that touches the system.**
 No frontend code shells out, reads a file, or opens a socket. Every such operation is
-a `cmd_*` handler. `engine/git_cli.rs` is the canonical owner of process execution: it
-strips ambient `GIT_*` configuration, disables terminal prompts and interactive
-credential helpers, and bounds both output size and wall-clock time. New code that
-runs a process goes **through** it, not beside it.
+a `cmd_*` handler. `engine/process/` is the canonical owner of process execution
+(`run_bounded_capped`, `capture_command`, admission gate, deadlines, and child env
+pinning), while `engine/git_cli.rs` owns git invocations through it: stripping ambient
+`GIT_*` configuration, disabling terminal prompts and interactive credential helpers,
+and bounding both output size and wall-clock time. New code that runs a process goes
+**through** `engine/process/` (or `engine/git_cli.rs` for git), not beside it.
 
 **2. The IPC seam — narrow, typed, and verified.**
 A command is added in four places, in this order: implement in
@@ -527,8 +529,8 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 ## 6. Coding Standards
 
 1. **One canonical owner.** Do not stand up a second registry, utility, or command
-   path beside an existing one. Extend the view registry, the command handlers, and
-   `git_cli` rather than duplicating them.
+   path beside an existing one. Extend the view registry, the command handlers,
+   `engine::process`, and `git_cli` rather than duplicating them.
 2. **Strict IPC contracts.** See §4 and §5. `bun run check:ipc` must report zero drift.
 3. **Async hygiene.** Use `createAsyncGuard` for component-level async work.
 4. **No unchecked casts.** No `any`, no loose casts. Model every IPC payload with a

@@ -17,13 +17,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::engine::git_cli::{canonicalize_plain, git_text, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::{compute_default_base, default_base, GitReader};
 use crate::engine::git_writer::{
     checked_out_branches, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
     BranchDeleteJournal,
 };
 use crate::engine::object_quarantine::{merge_tree_candidate, merge_tree_resolved, MergeCandidate};
+use crate::engine::process::canonicalize_plain;
 use crate::ledger::Outcome;
 
 /// Largest backup file restore or listing will read. A branch costs about a
@@ -1870,7 +1871,7 @@ mod tests {
             names.push(name);
         }
 
-        let spawned = || crate::engine::git_cli::spawn_log::spawns_in(&repo);
+        let spawned = || crate::engine::process::spawn_log::spawns_in(&repo);
         let before = spawned().len();
         let result = clean_branches(repo.to_str().unwrap(), &names, false, true);
         let used: Vec<Vec<String>> = spawned()[before..].to_vec();

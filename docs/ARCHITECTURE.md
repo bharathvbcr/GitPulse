@@ -321,7 +321,7 @@ sequenceDiagram
 
 ### Subsystem Responsibilities
 
-Finite subprocesses share `engine/git_cli.rs::run_observed`: admission, execution
+Finite subprocesses share `engine/process/runner.rs::run_observed`: admission, execution
 and Git lock retries consume one command budget. Unix owns nonblocking stdin,
 stdout and stderr on the waiting thread; the blocking-platform fallback retains
 bounded shared output and keeps its admission permit until every worker exits.

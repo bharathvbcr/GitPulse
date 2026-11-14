@@ -5,6 +5,7 @@
 
 use super::*;
 use std::ffi::{OsStr, OsString};
+use std::process::Command;
 
 fn surviving(inherited: &[(&str, &str)]) -> Vec<String> {
     let mut cmd = Command::new("true");

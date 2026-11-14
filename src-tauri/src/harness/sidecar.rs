@@ -1057,7 +1057,7 @@ pub fn resolve_binary_uncached() -> Option<String> {
             return Some(candidate.display().to_string());
         }
     }
-    crate::engine::git_cli::find_external_tool(bin_name)
+    crate::engine::process::find_external_tool(bin_name)
 }
 
 /// Why [`resolve_binary`] returned `None` — broken override vs absent.
@@ -1312,7 +1312,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<
 /// hand-written list of search locations goes stale the moment one is added;
 /// deriving it means the message cannot disagree with the search.
 fn not_installed_message() -> String {
-    let searched = crate::engine::git_cli::external_tool_fallback_dirs()
+    let searched = crate::engine::process::external_tool_fallback_dirs()
         .iter()
         .map(|dir| dir.display().to_string())
         .collect::<Vec<_>>()
@@ -1354,7 +1354,7 @@ fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
         probe.env(name, value);
     }
     probe.current_dir(std::env::temp_dir());
-    let run = crate::engine::git_cli::run_bounded_capped(
+    let run = crate::engine::process::run_bounded_capped(
         probe,
         "manvi version",
         Duration::from_secs(10),
@@ -1514,7 +1514,7 @@ fn sidecar_command(
         let path_var = std::env::var_os("PATH");
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
         if let Some(child_path) =
-            crate::engine::git_cli::extended_child_path(path_var.as_deref(), home.as_deref())
+            crate::engine::process::extended_child_path(path_var.as_deref(), home.as_deref())
         {
             command.env("PATH", child_path);
         }
@@ -1720,7 +1720,7 @@ pub(crate) fn serve_usage(binary: &str, deadline: Duration) -> Result<String, St
         command.env(name, value);
     }
     command.current_dir(std::env::temp_dir());
-    let run = crate::engine::git_cli::run_bounded_capped(
+    let run = crate::engine::process::run_bounded_capped(
         command,
         "manvi serve --help",
         deadline,
@@ -3845,7 +3845,7 @@ done
             .and_then(|(_, value)| value)
             .expect("sidecar must be handed an extended PATH");
         let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
-        for fallback in crate::engine::git_cli::external_tool_fallback_dirs() {
+        for fallback in crate::engine::process::external_tool_fallback_dirs() {
             assert!(
                 entries.contains(&fallback),
                 "sidecar PATH must reach {}: {entries:?}",
@@ -4594,7 +4594,7 @@ while IFS= read -r line; do handle "$line" & done
     #[test]
     fn not_installed_message_names_every_searched_directory() {
         let msg = not_installed_message();
-        let dirs = crate::engine::git_cli::external_tool_fallback_dirs();
+        let dirs = crate::engine::process::external_tool_fallback_dirs();
         assert!(
             !dirs.is_empty(),
             "an empty search list would make this assertion vacuous"

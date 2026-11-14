@@ -37,7 +37,7 @@ pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let repo = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
+    let repo = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
     crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
     crate::test_support::trust_repo(&repo);
     fs::write(
@@ -518,7 +518,7 @@ fn shared_cache_commands_pin_scope_and_preserve_downloads() {
         assert!(invocation(id, &path, home).is_err());
     }
     let temp = tempfile::tempdir().unwrap();
-    let home = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
+    let home = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
     assert!(managed_cache_path(&home, &home).is_err());
     fs::create_dir_all(home.join("Library/Caches/go-build")).unwrap();
     assert!(managed_cache_path(&home.join("Library/Caches/go-build"), &home).is_ok());
@@ -547,7 +547,7 @@ fn installed_go_cleans_only_the_reviewed_temporary_cache() {
         ("GOSUMDB", "off"),
         ("CGO_ENABLED", "0"),
     ];
-    let build = crate::engine::git_cli::capture_command(
+    let build = crate::engine::process::capture_command(
         "go",
         &["build", "-o", "fixture-app", "main.go"],
         Some(&repo),
@@ -684,7 +684,7 @@ fn an_unrelated_build_tool_process_does_not_block_cleanup() {
 #[test]
 fn discovery_does_not_walk_repository_source_trees() {
     let root = tempfile::tempdir().unwrap();
-    let base = crate::engine::git_cli::canonicalize_plain(root.path()).unwrap();
+    let base = crate::engine::process::canonicalize_plain(root.path()).unwrap();
     for r in 0..6 {
         let repo = base.join(format!("repo{r}"));
         crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
@@ -727,7 +727,7 @@ fn a_symlinked_cache_root_is_an_error_not_zero_bytes() {
 fn a_partial_removal_says_entries_were_already_removed() {
     let temp = tempfile::tempdir().unwrap();
     // Removal refuses symlinked hops, and the OS temp dir sits behind one.
-    let dir = crate::engine::git_cli::canonicalize_plain(temp.path())
+    let dir = crate::engine::process::canonicalize_plain(temp.path())
         .unwrap()
         .join("target");
     fs::create_dir(&dir).unwrap();

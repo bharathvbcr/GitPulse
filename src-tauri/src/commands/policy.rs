@@ -28,7 +28,7 @@ pub(super) fn guard(
 ) -> Result<crate::harness::PolicyVerdict, String> {
     // Every mutation passes here, and only mutations: the user clicked
     // something, so the spawn gate must not defer it behind refresh traffic.
-    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::engine::process::mark_user_action(repo_path);
     crate::harness::guard_command(repo_path, argv)
 }
 
@@ -42,7 +42,7 @@ pub(super) fn guard_file(
     file_path: &str,
     op: &str,
 ) -> Result<crate::harness::PolicyVerdict, String> {
-    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::engine::process::mark_user_action(repo_path);
     crate::harness::guard_file(repo_path, file_path, op)
 }
 
@@ -54,7 +54,7 @@ pub(super) fn guard_files(
     file_paths: &[&str],
     op: &str,
 ) -> Result<Vec<crate::harness::PolicyVerdict>, String> {
-    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::engine::process::mark_user_action(repo_path);
     crate::harness::guard_files(repo_path, file_paths, op)
 }
 

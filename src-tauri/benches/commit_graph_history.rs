@@ -279,7 +279,7 @@ fn run(repo: &Path, argv: &[String]) -> String {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("commit_graph_history");
     let temp = tempfile::tempdir().expect("temp dir");
 

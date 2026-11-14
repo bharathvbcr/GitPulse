@@ -108,7 +108,7 @@ mod imp {
     const SHORT_TMP: &str = "/tmp";
 
     pub fn main() {
-        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("idle_wakeups");
         let window = if report.opts.smoke {
             Duration::from_millis(1500)

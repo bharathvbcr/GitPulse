@@ -1,6 +1,6 @@
 use super::super::collision_memo::TTL as MEMO_TTL;
 use super::*;
-use crate::engine::git_cli::spawn_log::spawns_in;
+use crate::engine::process::spawn_log::spawns_in;
 use crate::test_support::{git_in, git_repo};
 
 /// A repository with one commit and `count` linked worktrees, each dirty in a
@@ -542,7 +542,7 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
 /// (`gitpulse-mcp` is a background process), not at the UI's priority.
 #[test]
 fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
-    use crate::engine::git_cli::spawn_log::classed_spawns_in;
+    use crate::engine::process::spawn_log::classed_spawns_in;
     let farm = farm(2, false);
     let answer = serve(&farm.repo).expect("the app reads");
     assert!(answer.worktrees.is_some());
@@ -556,7 +556,7 @@ fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
     for (argv, class) in classes {
         assert_eq!(
             class,
-            crate::engine::git_cli::Admission::Background,
+            crate::engine::process::Admission::Background,
             "{argv:?} ran at the UI's priority"
         );
     }

@@ -1,5 +1,5 @@
 //! Every production subprocess must go through the gated seam in
-//! `engine::git_cli`.
+//! `engine::process` (and git commands through `engine::git_cli`).
 //!
 //! The descriptor budget is only a budget for what passes through the gate.
 //! A `Command::new` written anywhere else spawns outside it, and a workspace
@@ -26,8 +26,12 @@ use std::path::{Path, PathBuf};
 /// Files permitted to construct a `Command` directly, and why.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "src/engine/process/env.rs",
+        "the process seam's command builder (`build_capture_command_in`): pins git environment for tools that shell out to git",
+    ),
+    (
         "src/engine/git_cli.rs",
-        "the seam itself: it owns the gate, the timeout and the output caps",
+        "the git seam (`git_command_with_env`): delegates execution through `engine::process`",
     ),
     (
         "src/harness/sidecar.rs",
@@ -55,7 +59,7 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "src/tool_install/mod.rs",
         "optional-tools install ladder (cargo/go/curl and binary probes). These \
-         are not git; every `Command` is handed to `git_cli::run_bounded_capped` \
+         are not git; every `Command` is handed to `process::run_bounded_capped` \
          so the timeout and stdout/stderr caps still apply. Holding a gate \
          permit for a multi-minute `cargo install` would starve every git call",
     ),
@@ -67,13 +71,13 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "src/devmap/cli.rs",
         "devmap binary invocation for map builds/queries; builds a `Command` \
-         then hands it to `git_cli::run_bounded_capped`",
+         then hands it to `process::run_bounded_capped`",
     ),
     (
         "src/tool_install/components.rs",
         "DevCouncil component discovery, the same probe ladder as \
          `tool_install/mod.rs`: its single `Command` is handed to \
-         `git_cli::run_bounded_capped` with a 5s timeout and a 64 KiB cap, and \
+         `process::run_bounded_capped` with a 5s timeout and a 64 KiB cap, and \
          it runs in `std::env::temp_dir()` so a version probe can never read a \
          repository. Not git, and a gate permit held across a probe of every \
          optional component would starve the git calls behind it",
@@ -81,7 +85,7 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "src/harness/claude_key.rs",
         "the Keychain, through `/usr/bin/security`: its single `Command` is \
-         handed to `git_cli::run_bounded_capped` with a 60s timeout and a 16 KiB \
+         handed to `process::run_bounded_capped` with a 60s timeout and a 16 KiB \
          cap. Built here rather than through `capture_command` because the key \
          must travel on stdin (`security -i`), never in argv where the process \
          table shows it, and `capture_command` has no stdin. Not git",
@@ -90,14 +94,14 @@ const ALLOWED: &[(&str, &str)] = &[
         "src/engine/worktree_hooks.rs",
         "repository hook commands (`sh -c` / `cmd /C`) with the repository's \
          own env, run only after `repository_trust::require`. Each `Command` is \
-         handed to `git_cli::run_bounded_capped` with a 15-minute deadline and a \
+         handed to `process::run_bounded_capped` with a 15-minute deadline and a \
          1 MiB cap; it was `child.output()`, unbounded",
     ),
     (
         "src/secrets/run.rs",
         "the kingfisher secret scanner: `scrubbed_command` builds a `Command` \
          with `env_clear()` and a scrubbed environment, which the git seam's \
-         helpers cannot express, then hands it to `git_cli::run_bounded_capped` \
+         helpers cannot express, then hands it to `process::run_bounded_capped` \
          with the scan and version deadlines and a stdout cap",
     ),
 ];
@@ -145,10 +149,10 @@ fn no_production_code_spawns_outside_the_gated_seam() {
 
     assert!(
         offenders.is_empty(),
-        "these spawn outside `engine::git_cli`, so they are not covered by the \
-         descriptor gate, the timeout or the output caps: {offenders:?}\n\
-         Route them through `git`, `git_text`, `git_captured` or \
-         `capture_command`, or add the file to ALLOWED with the reason.",
+        "these spawn outside `engine::process` / `engine::git_cli`, so they are not covered by \
+         the descriptor gate, the timeout or the output caps: {offenders:?}\n\
+         Route them through `engine::git_cli` (`git`, `git_text`, `git_captured`) or \
+         `engine::process` (`capture_command`, `run_bounded_capped`), or add the file to ALLOWED with the reason.",
     );
 
     // A pass has to be able to say what it looked at: an allowlist that has
@@ -169,38 +173,60 @@ fn no_production_code_spawns_outside_the_gated_seam() {
     );
 }
 
-/// A git child's environment is decided in one place. `engine::git_cli` builds
-/// a `Command` in exactly two production spots — `git_command_with_env` for git
-/// itself and `build_capture_command_in` for tools that shell out to git — and
-/// both call `pin_git_environment`. A third `Command::new` there would be a
-/// spawn that skips the pinned config, the stripped redirects and the locale,
-/// so the count is asserted, and each builder is asserted to call the owner.
+/// A git child's environment is decided in one place. Production code builds
+/// a pinned `Command` in exactly two spots — `git_command_with_env` in
+/// `engine::git_cli` for git itself and `build_capture_command_in` in
+/// `engine::process::env` for tools that shell out to git — and both call
+/// `pin_git_environment`. A third `Command::new` there would be a spawn that
+/// skips the pinned config, the stripped redirects and the locale, so each
+/// count is asserted, and each builder is asserted to call the owner.
 #[test]
 fn every_git_child_is_built_by_the_two_pinned_builders() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/engine/git_cli.rs");
-    let text = std::fs::read_to_string(&file).expect("read git_cli.rs");
-    let production = strip_test_items(&text);
-    assert!(
-        production.len() > 1000,
-        "read only {} production lines of git_cli.rs",
-        production.len()
-    );
-    let constructions: Vec<usize> = production
-        .iter()
-        .filter(|(_, line)| line.contains("Command::new") && !line.trim_start().starts_with("//"))
-        .map(|(n, _)| *n)
-        .collect();
-    assert_eq!(
-        constructions.len(),
-        2,
-        "git_cli.rs builds a Command at lines {constructions:?}; every git child must come from \
-         git_command_with_env or build_capture_command_in, which pin the environment"
-    );
-    let calls = production
-        .iter()
-        .filter(|(_, line)| line.contains("pin_git_environment(&mut cmd)"))
-        .count();
-    assert_eq!(calls, 2, "each builder must call pin_git_environment once");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let specs = [
+        ("src/engine/git_cli.rs", 1000usize, "git_command_with_env"),
+        (
+            "src/engine/process/env.rs",
+            500usize,
+            "build_capture_command_in",
+        ),
+    ];
+    let mut total_constructions = 0usize;
+    let mut total_calls = 0usize;
+    for (rel, min_lines, builder) in specs {
+        let file = manifest.join(rel);
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let production = strip_test_items(&text);
+        assert!(
+            production.len() > min_lines,
+            "read only {} production lines of {rel}",
+            production.len()
+        );
+        let constructions: Vec<usize> = production
+            .iter()
+            .filter(|(_, line)| {
+                line.contains("Command::new") && !line.trim_start().starts_with("//")
+            })
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            constructions.len(),
+            1,
+            "{rel} builds a Command at lines {constructions:?}; expected only {builder}"
+        );
+        let calls = production
+            .iter()
+            .filter(|(_, line)| line.contains("pin_git_environment(&mut cmd)"))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "{rel}: {builder} must call pin_git_environment once"
+        );
+        total_constructions += constructions.len();
+        total_calls += calls;
+    }
+    assert_eq!(total_constructions, 2);
+    assert_eq!(total_calls, 2);
 }
 
 /// Creating a process, or a descriptor that is about to be made `FD_CLOEXEC`,
@@ -860,6 +886,8 @@ fn test_only_module_files_resolve_by_the_compilers_rules() {
         "lib.rs",
         "bin/gitpulsed.rs",
         "engine/git_cli.rs",
+        "engine/process/mod.rs",
+        "engine/process/env.rs",
     ] {
         assert!(!rel.contains(production), "{production} is production code");
     }

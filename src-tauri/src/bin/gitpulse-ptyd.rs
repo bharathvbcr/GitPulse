@@ -88,7 +88,7 @@ fn parse(argv: &[String]) -> Parsed {
 fn main() {
     // From the per-user spawn budget every GitPulse process shares, before any
     // spawn builds the gate.
-    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
+    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
     // Two descriptors per terminal, for every terminal the user has open.

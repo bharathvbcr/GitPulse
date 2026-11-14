@@ -366,7 +366,7 @@ fn a_gate_refusal_is_a_comparison_failure_not_a_landed_false() {
     let tip = repo.commit("feature work", "feature.txt");
     repo.git(&["checkout", "main"]);
     repo.commit("main work", "main.txt");
-    let answer = crate::engine::git_cli::with_forced_spawn_failure(|| {
+    let answer = crate::engine::process::with_forced_spawn_failure(|| {
         landed(repo.as_str(), &tip, Some("main"))
     });
     assert_eq!(answer.landed, None, "{answer:?}");

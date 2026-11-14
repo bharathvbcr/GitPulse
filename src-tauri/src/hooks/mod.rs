@@ -6456,7 +6456,7 @@ done
     #[cfg(unix)]
     fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<usize> {
         dirs.iter()
-            .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+            .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
             .collect()
     }
 
@@ -6484,7 +6484,7 @@ done
             .iter()
             .zip(marks)
             .flat_map(|(dir, mark)| {
-                crate::engine::git_cli::spawn_log::spawns_in(dir)[*mark..].to_vec()
+                crate::engine::process::spawn_log::spawns_in(dir)[*mark..].to_vec()
             })
             .collect();
         let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);

@@ -110,7 +110,7 @@ fn merge(repo: &Repo, lane: &Path) -> MergeTeardownResult {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("worktree_teardown");
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("fixture");

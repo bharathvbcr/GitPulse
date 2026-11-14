@@ -759,8 +759,8 @@ fn before_keep_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::git_cli::spawn_log;
     use crate::engine::git_reader::{BranchStatsReport, GitReader};
+    use crate::engine::process::{self, spawn_log};
     use crate::test_support::{git_in, trust_repo};
     use std::sync::Arc;
 
@@ -770,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Not `canonicalize`: its `\\?\` spelling is not one git resolves
         // `core.attributesFile` and the other paths below through.
-        let repo = git_cli::canonicalize_plain(dir.path()).unwrap();
+        let repo = process::canonicalize_plain(dir.path()).unwrap();
         git_in(&repo, &["init", "-q", "-b", "main"]);
         git_in(&repo, &["config", "user.email", "t@example.invalid"]);
         git_in(&repo, &["config", "user.name", "t"]);

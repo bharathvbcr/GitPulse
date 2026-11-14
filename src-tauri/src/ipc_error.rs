@@ -42,7 +42,7 @@
 //! The kind list is mirrored by `IPC_ERROR_KINDS` in `src/lib/ipc/invoke.ts`
 //! and pinned against it by `scripts/enum-variant-contract.test.ts`.
 
-use crate::engine::git_cli::{self, Admission, RunError};
+use crate::engine::process::{self, Admission, RunError};
 use crate::ledger::LedgerError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -391,7 +391,7 @@ pub(crate) fn run_command<T, E: Into<CommandError>>(
     run_command_as(None, body)
 }
 
-/// Runs one command body ([`git_cli::run_command_scope`]) and types its error.
+/// Runs one command body ([`crate::engine::process::run_command_scope`]) and types its error.
 ///
 /// The kind is the one the error carries (see [`CommandError`]), so nothing is
 /// remembered on the pool thread between commands. `command` is the command's
@@ -403,9 +403,9 @@ pub(crate) fn run_command_as<T, E: Into<CommandError>>(
 ) -> Result<T, IpcError> {
     let replay_safe = command.is_some_and(|name| REPLAY_SAFE_READS.contains(&name));
     let mut user_action = false;
-    let result = git_cli::run_command_scope(|| {
+    let result = process::run_command_scope(|| {
         let result = body().map_err(Into::into);
-        user_action = git_cli::current_admission() == Admission::Interactive;
+        user_action = process::current_admission() == Admission::Interactive;
         result
     });
     result.map_err(|error| error.into_ipc(replay_safe, user_action))

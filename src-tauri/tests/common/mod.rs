@@ -37,7 +37,7 @@ use std::process::Command;
 /// Order-independent and idempotent. Not for the suites that measure the gate
 /// itself (`tests/process_admission.rs` lists them).
 pub fn unmetered_spawns() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
 }
 
 /// Runs `git` in `cwd` and asserts it succeeded.

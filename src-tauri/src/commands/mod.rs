@@ -9,7 +9,6 @@ use crate::diff::conflict_session::{
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
-use crate::engine::git_cli::read_cancel::ReadScope;
 use crate::engine::git_cli::{
     git_text, resolve_repo, sandbox_create, sandbox_overwrite_edited_text,
     sandbox_save_edited_text, validate_repo, FileWriteError, ResolvedRepo, SavedFile,
@@ -24,6 +23,7 @@ use crate::engine::git_writer::{
     CloneProgress, GitIdentity, IdentityScope, IndexAction, MergeMode, RebaseStep,
     StashSaveOptions,
 };
+use crate::engine::process::read_cancel::ReadScope;
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, OperationAction, RemoteChange,
     RemoteList, RepoOperation, ResetMode, StashAction, SubmoduleChange, SubmoduleList,
@@ -167,8 +167,8 @@ where
 /// open repository; they are admitted by `git_cli` one child process at a time,
 /// but until then each held a pool thread asleep, and a burst of them could
 /// leave none for the commands a person is waiting on.
-fn pool_limit(class: crate::engine::git_cli::Admission) -> Option<usize> {
-    use crate::engine::git_cli::Admission;
+fn pool_limit(class: crate::engine::process::Admission) -> Option<usize> {
+    use crate::engine::process::Admission;
     match class {
         Admission::Interactive | Admission::Reactive => None,
         Admission::Background => Some(2),
@@ -183,7 +183,7 @@ where
     F: FnOnce() -> Result<T, CommandError> + Send + 'static,
     T: Send + 'static,
 {
-    use crate::engine::git_cli::Admission;
+    use crate::engine::process::Admission;
     static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     let permits = PERMITS.get_or_init(|| {
         tokio::sync::Semaphore::new(
@@ -195,7 +195,7 @@ where
         .acquire()
         .await
         .map_err(|_| "background work is shutting down".to_string())?;
-    off_thread(move || crate::engine::git_cli::with_background_processes(body)).await
+    off_thread(move || crate::engine::process::with_background_processes(body)).await
 }
 
 #[cfg(test)]

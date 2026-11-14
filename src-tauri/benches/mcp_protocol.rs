@@ -126,7 +126,7 @@ fn protocol_case(name: &'static str, method: &'static str, params: Value) -> Cas
 fn main() {
     // First statement: the production spawn gate (192-spawn burst, then 8/s)
     // would otherwise be what the git-spawning rows time.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
 
     let mut report = Report::new("mcp_protocol");
     let protocol_rounds = report.opts.samples(PROTOCOL_ROUNDS);

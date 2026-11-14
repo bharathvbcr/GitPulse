@@ -191,7 +191,7 @@ impl SharedBudget {
         self.take_at_leveled(floor, burst, per_sec, now_ns).0
     }
 
-    fn take_at_leveled(
+    pub(super) fn take_at_leveled(
         &self,
         floor: u32,
         burst: u32,
@@ -571,12 +571,24 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn wall_ns() -> u64 {
+pub(super) fn wall_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
         // Before 1970: anchor at zero; the backwards-clock clamp handles it.
         .unwrap_or(0)
+}
+
+/// A record in this file's layout but stamped `version`, as a binary of
+/// another layout would leave it, holding `tokens`.
+#[cfg(test)]
+pub(super) fn stamped(version: u32, tokens: u32, at_ns: u64) -> Vec<u8> {
+    let mut record = vec![0u8; RECORD_LEN];
+    record[0..4].copy_from_slice(&MAGIC);
+    record[4..8].copy_from_slice(&version.to_le_bytes());
+    record[8..12].copy_from_slice(&tokens.to_le_bytes());
+    record[16..24].copy_from_slice(&at_ns.to_le_bytes());
+    record
 }
 
 #[cfg(test)]
@@ -623,17 +635,6 @@ mod tests {
         // though B itself has spent nothing.
         assert_eq!(b.take_at(2, 8, 1, now), Take::Denied);
         assert_eq!(b.take_at(0, 8, 1, now), Take::Granted);
-    }
-
-    /// A record in this file's layout but stamped `version`, as a binary of
-    /// another layout would leave it, holding `tokens`.
-    fn stamped(version: u32, tokens: u32, at_ns: u64) -> Vec<u8> {
-        let mut record = vec![0u8; RECORD_LEN];
-        record[0..4].copy_from_slice(&MAGIC);
-        record[4..8].copy_from_slice(&version.to_le_bytes());
-        record[8..12].copy_from_slice(&tokens.to_le_bytes());
-        record[16..24].copy_from_slice(&at_ns.to_le_bytes());
-        record
     }
 
     fn write_private(path: &Path, bytes: &[u8]) {

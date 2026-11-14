@@ -599,7 +599,7 @@ mod tests {
         assert!(none.submodules.is_empty());
 
         let refused =
-            crate::engine::git_cli::with_forced_spawn_failure_of("submodule", || list(path));
+            crate::engine::process::with_forced_spawn_failure_of("submodule", || list(path));
         assert!(refused.is_err(), "a refused status read listed {refused:?}");
 
         std::fs::write(

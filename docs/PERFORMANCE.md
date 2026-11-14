@@ -1560,7 +1560,7 @@ two git features on? **Owner decision, unchanged by this spike:** GitPulse never
 writes repo config and never passes `-c core.untrackedCache` or
 `-c core.fsmonitor`. Two reasons stand independent of the numbers:
 
-* every git child runs with `GIT_OPTIONAL_LOCKS=0` (`engine/git_cli.rs`), which
+* every git child runs with `GIT_OPTIONAL_LOCKS=0` (`engine/process/env.rs` and `engine/git_cli.rs`), which
   stops `git status` from refreshing the index, and the untracked cache is a
   feature of the index, so `-c core.untrackedCache=true` could neither help nor
   persist;
@@ -2935,7 +2935,7 @@ How to read the new field: the periodic gate line now ends with the call sites b
 
     WARN [spawn_gate] reactive admitted=... | background shed=... | top: git rev-parse=N git worktree=... | rev-parse by: verification_gate.current_head=A graph.refs.detached_head=B unattributed=C rest=D
 
-- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `git_cli::with_spawn_source`, never a path or ref name.
+- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `process::with_spawn_source`, never a path or ref name.
 - `unattributed` is a launch whose caller set no source. The share that is unattributed is the share still not accounted for; tag the biggest caller next.
 - At most 32 distinct sources are kept; beyond that, new ones count under `other`.
 - The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.

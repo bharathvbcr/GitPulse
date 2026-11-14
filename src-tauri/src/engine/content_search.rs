@@ -8,9 +8,8 @@
 //! the caller stops the child the same way and is reported as `cancelled`,
 //! never as "no more matches".
 
-use crate::engine::git_cli::{
-    self, validate_repo, BoundedRun, Incomplete, OutputStream, ProcessObserver,
-};
+use crate::engine::git_cli::{self, validate_repo};
+use crate::engine::process::{BoundedRun, Incomplete, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

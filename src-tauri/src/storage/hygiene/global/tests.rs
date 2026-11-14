@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 fn fixture() -> (tempfile::TempDir, Arc<Cleaner>, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
+    let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
     let code = root.join("code");
     fs::create_dir(&code).unwrap();
     let cleaner = Arc::new(Cleaner::new(root.join("state")));
@@ -143,7 +143,7 @@ fn discovery_deduplicates_overlapping_roots_preserves_exclusions_and_finds_close
 #[test]
 fn discovery_accepts_a_repo_whose_validate_repo_root_is_verbatim() {
     let (_temp, _cleaner, root) = fixture();
-    let walked = crate::engine::git_cli::canonicalize_plain(&repo(&root, "a")).unwrap();
+    let walked = crate::engine::process::canonicalize_plain(&repo(&root, "a")).unwrap();
     let validated = crate::engine::git_cli::validate_repo(walked.to_str().unwrap()).unwrap();
     #[cfg(windows)]
     {
@@ -458,7 +458,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("execution-state"),
     );
@@ -962,7 +962,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("mixed-state"),
     );
@@ -1141,7 +1141,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("inside-state"),
     );
@@ -1295,7 +1295,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("truncated-state"),
     );
@@ -1451,7 +1451,7 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("all-unread-state"),
     );

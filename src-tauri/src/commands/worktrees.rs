@@ -442,15 +442,15 @@ pub(super) fn worktree_ai_summary(
     // three absent the summary used to say "Worktree clean". A read that
     // produced no answer fails the summary instead, with its own cause —
     // a deferral keeps its marker, so the call is asked again later.
-    let failures = crate::engine::git_cli::process_failures();
+    let failures = crate::engine::process::process_failures();
     let diff_stat = crate::engine::worktree::measure_diff_stat(wt);
     let repo = crate::engine::validate_repo(repo_path).ok();
     let divergence = repo
         .as_ref()
         .and_then(|r| crate::engine::worktree::measure_main_divergence(r, branch));
     let log_out = git_text(wt, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
-    if crate::engine::git_cli::process_failures() != failures {
-        return Err(crate::engine::git_cli::last_process_failure()
+    if crate::engine::process::process_failures() != failures {
+        return Err(crate::engine::process::last_process_failure()
             .unwrap_or_else(|| "a git read for the worktree summary produced no answer".into()));
     }
     let last_msg = log_out.trim();
@@ -554,7 +554,7 @@ pub async fn cmd_inbox_post(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let effective_kind = kind.as_deref().unwrap_or("ask");
         let effective_body =
             if let Some(title_str) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -611,7 +611,7 @@ pub async fn cmd_worktree_send_message(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let effective_kind = kind.as_deref().unwrap_or("note");
         let message = crate::engine::agent_bus::post_thread_message(
             &repo_path,
@@ -641,7 +641,7 @@ pub async fn cmd_inbox_withdraw(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let message =
             crate::engine::agent_bus::withdraw_ask(&repo_path, &from_agent, &thread_key, &reason)?;
         Ok(InboxMessageReceipt {

@@ -16,8 +16,9 @@ use crate::analyzer::ConventionalCommitParser;
 use crate::engine::deadbranch::{
     classify_merge, is_ancestry_merged, needs_tree_check, tree_merge_checks, TreeMerge,
 };
-use crate::engine::git_cli::{git_captured, git_text, validate_repo, BoundedRun};
+use crate::engine::git_cli::{git_captured, git_text, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::process::BoundedRun;
 use crate::engine::{BranchInfo, GitReader};
 
 const COMMIT_REVIEW_LIMIT: usize = 500;
@@ -1422,7 +1423,7 @@ mod tests {
         let dir = many_branches(count);
         let p = dir.path();
         let canonical = std::fs::canonicalize(p).unwrap();
-        let log = || crate::engine::git_cli::spawn_log::spawns_in(&canonical);
+        let log = || crate::engine::process::spawn_log::spawns_in(&canonical);
         let before = log().len();
         let plan = branch_cleanup_plan(p.to_str().unwrap()).unwrap();
         let used: Vec<Vec<String>> = log()[before..].to_vec();

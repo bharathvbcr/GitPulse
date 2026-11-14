@@ -1,7 +1,7 @@
 use crate::analyzer::deps::severity_rank;
-use crate::engine::git_cli::{
-    capture_command, classify_tool_probe, git_text, run_command_in, validate_repo, CapturedOutput,
-    ToolProbe,
+use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::process::{
+    capture_command, classify_tool_probe, run_command_in, CapturedOutput, ToolProbe,
 };
 use crate::ipc_error::CommandError;
 pub mod actions;
@@ -536,18 +536,18 @@ static GH_PROBES: crate::tool_capability::BinaryProbeCache<ToolProbe> =
 /// What `gh --version` says about the GitHub CLI. No working directory, so a
 /// not-found can only mean the program (see [`is_spawn_not_found`]).
 ///
-/// [`is_spawn_not_found`]: crate::engine::git_cli::is_spawn_not_found
+/// [`is_spawn_not_found`]: crate::engine::process::is_spawn_not_found
 pub(crate) fn probe_gh_cli() -> ToolProbe {
     // Every GitHub call asks this first — the live run poll included — and the
     // answer changes only when the `gh` binary does, so it is kept per binary.
     // Only a `Present` answer is kept: a shed or failed probe is asked again.
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let path = crate::engine::git_cli::extended_child_path(
+    let path = crate::engine::process::extended_child_path(
         std::env::var_os("PATH").as_deref(),
         home.as_deref(),
     );
     let program =
-        crate::engine::git_cli::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
+        crate::engine::process::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
     GH_PROBES.get_or_probe(&program, || {
         let probe = classify_tool_probe(
             "gh",
@@ -855,7 +855,7 @@ fn bounded_error(message: String) -> String {
     if message.len() <= MAX_GH_ERROR_BYTES {
         return message;
     }
-    crate::engine::git_cli::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
+    crate::engine::process::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
 }
 
 fn run_gh(
@@ -2989,7 +2989,7 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         // Only `gh --version` is refused; the remote is still read.
         let (runs, context, dependabot, scanning, workflows) =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || {
+            crate::engine::process::with_forced_spawn_failure_of("--version", || {
                 (
                     load_workflow_runs_report(path),
                     load_github_context(path),
@@ -4862,7 +4862,7 @@ mod tests {
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         GH_PROBES.clear();
         let probes = || {
-            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (_, labels) = crate::engine::process::spawn_labels_during(|| {
                 for _ in 0..5 {
                     assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
                 }
@@ -4897,7 +4897,7 @@ mod tests {
         // Another test's probe, as it would leave the cache.
         assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
         let refused =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", probe_gh_cli);
+            crate::engine::process::with_forced_spawn_failure_of("--version", probe_gh_cli);
         assert!(
             matches!(refused, ToolProbe::NotRun(_)),
             "a refused `gh --version` was answered from the cache: {refused:?}"

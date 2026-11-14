@@ -601,7 +601,7 @@ fn a_linked_worktree_of_a_moved_repository_records_into_the_taken_over_ledger() 
         ],
     );
     trust_repo(&linked);
-    let linked = crate::engine::git_cli::canonicalize_plain(&linked).unwrap();
+    let linked = crate::engine::process::canonicalize_plain(&linked).unwrap();
     let linked = linked.to_string_lossy().into_owned();
     let file = corpus.edit(&linked);
     let out = with_transcript_root(corpus.dir.path(), || ingest_transcripts_into(&new, &linked));

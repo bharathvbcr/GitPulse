@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::engine::git_cli::run_bounded_capped;
+use crate::engine::process::run_bounded_capped;
 
 /// The variable Manvi's Anthropic adapter reads its key from. Also the name
 /// the spawned harness must promise to withhold from its own children.

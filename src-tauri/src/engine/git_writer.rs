@@ -1,10 +1,13 @@
 use crate::engine::git_cli::{
     git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
-    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
-    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+    git_with_timeout, is_transient_git_lock_error, resolve_git_common_dir, sandbox_join,
+    validate_repo,
 };
 use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
+use crate::engine::process::{
+    is_deferred_under_load, is_slot_wait_timeout, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+};
 use crate::ipc_error::CommandError;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
@@ -1617,7 +1620,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             ],
             &input,
         )
-        .map(crate::engine::git_cli::text_from_bytes)
+        .map(crate::engine::process::text_from_bytes)
     }
 
     /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
@@ -2478,15 +2481,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
             }
             // A deadline is a finished run that git did not: its message is
             // the same sentence a timeout error carries.
-            Ok(crate::engine::git_cli::BoundedRun {
-                incomplete: Some(crate::engine::git_cli::Incomplete::Deadline { message, .. }),
+            Ok(crate::engine::process::BoundedRun {
+                incomplete: Some(crate::engine::process::Incomplete::Deadline { message, .. }),
                 ..
             }) => (Err(with_lock(message).into()), "timed_out"),
             Ok(run) if run.success => (Ok(finished(false, started)), "written"),
             Ok(run) => (
                 Err(with_lock(format!(
                     "git commit-graph write failed: {}",
-                    crate::engine::git_cli::byte_tail(&run.stderr, 400).trim()
+                    crate::engine::process::byte_tail(&run.stderr, 400).trim()
                 ))
                 .into()),
                 "failed",
@@ -2495,12 +2498,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
             // spawned, and the person's stop is the answer, not a failure.
             Err(error)
                 if stop.load(std::sync::atomic::Ordering::SeqCst)
-                    && !crate::engine::git_cli::is_timed_out(error.message()) =>
+                    && !crate::engine::process::is_timed_out(error.message()) =>
             {
                 (Ok(finished(true, started)), "cancelled")
             }
             Err(error) => {
-                let journal = if crate::engine::git_cli::is_timed_out(error.message()) {
+                let journal = if crate::engine::process::is_timed_out(error.message()) {
                     "timed_out"
                 } else {
                     "failed"
@@ -3235,7 +3238,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     )
                 )) {
             Some(
-                super::git_cli::canonicalize_plain(source_path)
+                super::process::canonicalize_plain(source_path)
                     .map_err(|error| format!("Cannot resolve local clone source: {error}"))?,
             )
         } else {
@@ -3452,7 +3455,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
             dest.display()
         )
     })?;
-    let parent_canonical = crate::engine::git_cli::canonicalize_plain(parent).map_err(|e| {
+    let parent_canonical = crate::engine::process::canonicalize_plain(parent).map_err(|e| {
         format!(
             "Cannot resolve clone destination parent '{}': {}",
             parent.display(),
@@ -3469,7 +3472,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
                 )
                 .into());
             }
-            let actual = crate::engine::git_cli::canonicalize_plain(dest).map_err(|e| {
+            let actual = crate::engine::process::canonicalize_plain(dest).map_err(|e| {
                 format!(
                     "Cannot resolve clone destination '{}': {}",
                     dest.display(),
@@ -3805,7 +3808,8 @@ const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"
 fn require_force_if_includes(
     preflight: &crate::engine::git_cli::GitPreflight,
 ) -> Result<(), CommandError> {
-    use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
+    use crate::engine::git_cli::{supports, GitPreflightStatus};
+    use crate::engine::process::is_deferred_under_load;
     if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
         return Ok(());
     }
@@ -6357,7 +6361,7 @@ mod tests {
             // Spawns of fetch/pull/push fail loudly here, so an Err that names
             // the target and is not a spawn failure proves git never ran it.
             let forced = |arg: &str, body: &dyn Fn() -> Result<String, CommandError>| {
-                crate::engine::git_cli::with_forced_spawn_failure_of(arg, body)
+                crate::engine::process::with_forced_spawn_failure_of(arg, body)
             };
             let results: Vec<(&str, Result<String, CommandError>)> = vec![
                 (
@@ -6898,7 +6902,7 @@ mod tests {
 
     /// Every `git config --get` child recorded for `repo` so far.
     fn config_get_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--get")
@@ -6944,7 +6948,7 @@ mod tests {
 
     /// Every `git config --list` child recorded for `repo` so far.
     fn config_list_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--list")
@@ -7762,7 +7766,7 @@ mod tests {
                 .count()
         };
 
-        let (staged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (staged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()))
         });
         assert_eq!(staged_result.expect("stage").1, 300);
@@ -7773,7 +7777,7 @@ mod tests {
         );
         assert_eq!(staged(&dir), 300);
 
-        let (unstaged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (unstaged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Unstage, |_| Ok(()))
         });
         assert_eq!(unstaged_result.expect("unstage").1, 300);
@@ -7814,7 +7818,7 @@ mod tests {
             for file in &files {
                 std::fs::write(dir.path().join(file), "x\n").unwrap();
             }
-            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
                 GitWriter::stage_files_attributed(&path, &files)
             });
             assert_eq!(outcomes.len(), count);
@@ -7837,7 +7841,7 @@ mod tests {
         for gone in [3usize, 17, 39] {
             std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         for (index, outcome) in outcomes.iter().enumerate() {
@@ -7867,7 +7871,7 @@ mod tests {
         let dir = init_repo_with_commit();
         let path = repo_path(&dir);
         let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_err));
@@ -7933,7 +7937,7 @@ mod tests {
         for file in &files {
             std::fs::write(dir.path().join(file), "x\n").unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
@@ -7956,7 +7960,7 @@ mod tests {
         }
         let lock = dir.path().join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         std::fs::remove_file(&lock).unwrap();
@@ -8229,7 +8233,7 @@ mod bound_to_checked_state {
         commit_file(p, "b.txt");
         let c3 = commit_file(p, "c.txt");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_rebase_sequence(
                 p.to_str().unwrap(),
                 &c1,
@@ -8261,7 +8265,7 @@ mod bound_to_checked_state {
         commit_file(p, "m.txt");
         let main_tip = rev(p, "main");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_restack(p, "feature", "main", &main_tip)
         });
 

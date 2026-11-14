@@ -52,7 +52,7 @@ fn terminals(dir: &Path) -> TerminalSessions {
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])

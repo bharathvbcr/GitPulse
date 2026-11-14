@@ -4,13 +4,17 @@
 
 use super::read_cancel::{self, ReadScope, CANCELLED_MESSAGE};
 use super::*;
-use crate::ipc_error::IpcErrorKind;
+use crate::ipc_error::{CommandError, IpcErrorKind};
 use crate::procguard::LockedSpawn;
 use crate::test_support::{coverage_relaxed, process_alive, wait_gone, wait_until};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// How long a cancelled child may take to leave: the ask, the grace
 /// ([`crate::procguard::CHILD_GRACE`]) and a margin, relaxed under coverage.
-fn gone_within() -> Duration {
+pub(crate) fn gone_within() -> Duration {
     coverage_relaxed(GONE_WITHIN_BASE)
 }
 
@@ -76,7 +80,7 @@ fn the_rigs_read_deadline_is_one_the_runner_accepts() {
 /// time, as `ps` reports it, on one line. Written by the child, so the start
 /// time is the child's and not whichever process holds the pid by the time the
 /// test looks.
-const RECORD_SELF: &str = r#"echo "$$ $(ps -o lstart= -p $$)""#;
+pub(crate) const RECORD_SELF: &str = r#"echo "$$ $(ps -o lstart= -p $$)""#;
 
 /// What `ps` says about when `pid` started, if it is running.
 fn started_at(pid: u32) -> Option<String> {
@@ -101,7 +105,7 @@ fn recorded_children(file: &Path) -> Vec<(u32, String)> {
 }
 
 /// The pids a test's scripts have written to `file` so far.
-fn recorded(file: &Path) -> Vec<u32> {
+pub(crate) fn recorded(file: &Path) -> Vec<u32> {
     recorded_children(file)
         .into_iter()
         .map(|(pid, _)| pid)
@@ -112,7 +116,7 @@ fn recorded(file: &Path) -> Vec<u32> {
 /// A child is only ever signalled if it is still the process that recorded
 /// itself: its start time has to match the one it wrote down, so a pid that was
 /// reused by a stranger is left alone.
-struct Reaper(PathBuf);
+pub(crate) struct Reaper(pub(crate) PathBuf);
 
 impl Drop for Reaper {
     fn drop(&mut self) {
@@ -173,7 +177,7 @@ impl Rig {
             let _in = scope.enter();
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", script.as_str()]).current_dir(&cwd);
-            run_read_shared(cmd, "cancel-test", read_deadline(), 4096, gate)
+            super::run_read_shared_with(cmd, "cancel-test", read_deadline(), 4096, gate)
         })
     }
 
@@ -245,65 +249,6 @@ fn a_sole_waiters_read_is_cancelled_and_its_child_is_killed() {
         asked.elapsed() < gone_within(),
         "the cancel took {:?}",
         asked.elapsed()
-    );
-}
-
-/// Through the real runner: the cancelled read is an error, so no caller
-/// parses its partial output, and `ref_cache` has nothing to keep.
-#[cfg(unix)]
-#[test]
-fn a_cancelled_git_read_is_an_error_and_never_an_answer() {
-    for (shared, id) in [(true, "rc-git-shared"), (false, "rc-git-own")] {
-        let repo = crate::test_support::git_repo();
-        let dir = tempfile::TempDir::new().unwrap();
-        let pids = dir.path().join("pids");
-        let _reaper = Reaper(pids.clone());
-        // An alias that runs a shell: a slow git command the test controls.
-        let alias = format!(
-            "alias.rcslow=!{RECORD_SELF} >> '{}'; echo partial; exec sleep 60",
-            pids.display()
-        );
-        let path = repo.path().to_path_buf();
-        let reader = thread::spawn(move || {
-            let scope = ReadScope::open(Some(id));
-            let _in = scope.enter();
-            let args = ["-c", alias.as_str(), "rcslow"];
-            if shared {
-                git_text_shared(&path, &args).map(|text| (text, None))
-            } else {
-                git_text_capped(&path, &args, 4096)
-            }
-        });
-        assert!(
-            wait_until(Duration::from_secs(10), || !recorded(&pids).is_empty()),
-            "the git child never started"
-        );
-        let pid = recorded(&pids)[0];
-        assert!(read_cancel::cancel(id));
-        let outcome = reader.join().unwrap();
-        let error = outcome.expect_err("a cancelled read must not return its partial output");
-        assert_eq!(error.message(), CANCELLED_MESSAGE, "shared={shared}");
-        assert_eq!(error.kind(), IpcErrorKind::ReadCancelled, "shared={shared}");
-        assert!(wait_gone(pid, gone_within()), "shared={shared}: pid {pid}");
-    }
-}
-
-/// A fallback after a failed read must not spawn for a caller who has gone.
-#[cfg(unix)]
-#[test]
-fn a_cancelled_request_starts_no_further_child() {
-    let repo = crate::test_support::git_repo();
-    let scope = ReadScope::open(Some("rc-no-more"));
-    let _in = scope.enter();
-    assert!(read_cancel::cancel("rc-no-more"));
-    let (outcome, spawned) =
-        spawn_labels_during(|| git_text(repo.path(), &["status", "--porcelain"]));
-    let refused = outcome.unwrap_err();
-    assert_eq!(refused.message(), CANCELLED_MESSAGE);
-    assert_eq!(refused.kind(), IpcErrorKind::ReadCancelled);
-    assert!(
-        spawned.is_empty(),
-        "spawned for a cancelled request: {spawned:?}"
     );
 }
 
@@ -570,11 +515,11 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
         );
         assert!(read_cancel::cancel("rc-queued"));
     });
-    let before = PROCESS_FAILURES.get();
+    let before = process_failures();
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", rig.script("queued", "echo ran").as_str()])
         .current_dir(&rig.cwd);
-    let outcome = run_read_shared(cmd, "queued-test", read_deadline(), 4096, rig.gate);
+    let outcome = run_read_shared_with(cmd, "queued-test", read_deadline(), 4096, rig.gate);
     canceller.join().unwrap();
     let error = outcome.expect_err("a cancelled read does not run");
     assert_eq!(
@@ -584,7 +529,7 @@ fn a_read_cancelled_while_it_queues_is_a_cancellation_and_not_a_process_failure(
     );
     assert_eq!(error.kind(), IpcErrorKind::ReadCancelled);
     assert_eq!(
-        PROCESS_FAILURES.get(),
+        process_failures(),
         before,
         "a cancel was counted as a failure"
     );
@@ -644,62 +589,4 @@ fn another_observers_cancel_keeps_its_wire_kind() {
             .map(|e| e.kind()),
         Some(IpcErrorKind::ReadCancelled)
     );
-}
-
-/// A history window is read as one long walk cut into chunks. Cancelled at that
-/// walk, it keeps nothing in `ref_cache` and leaves no state for the next
-/// call: a later call walks again and returns the whole window.
-#[cfg(unix)]
-#[test]
-fn a_cancelled_history_read_ahead_keeps_nothing_and_leaks_nothing_into_the_next_call() {
-    use crate::engine::git_reader::{with_history_chunk, GitReader};
-    use crate::graph::RefScope;
-    let repo = crate::test_support::git_repo();
-    for n in 0..12 {
-        crate::test_support::git_in(
-            repo.path(),
-            &["commit", "--allow-empty", "-q", "-m", &format!("c{n}")],
-        );
-    }
-    let path = repo.path().to_str().unwrap().to_string();
-    let window =
-        |path: &str| GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named);
-    crate::engine::ref_cache::eager(|| {
-        with_history_chunk(3, || {
-            // The window's first walk is cancelled as it starts, by the caller
-            // leaving: the hook is the caller's abort landing at that spawn.
-            let scope = ReadScope::open(Some("rc-readahead"));
-            let outcome = {
-                let _in = scope.enter();
-                with_forced_spawn_failure_then(
-                    || {
-                        read_cancel::cancel("rc-readahead");
-                    },
-                    || window(&path),
-                )
-            };
-            assert!(
-                outcome.is_err(),
-                "the cancelled window must not return rows"
-            );
-            drop(scope);
-
-            // Nothing was kept: the same window, asked again, walks.
-            let (again, walks) = spawn_labels_during(|| window(&path));
-            let rows = again.expect("a later call is a fresh read");
-            assert_eq!(rows.len(), 10, "the whole window comes back");
-            assert!(
-                walks.iter().any(|label| label == "git log"),
-                "an answer was kept from the cancelled read: {walks:?}"
-            );
-
-            // And what that call kept is whole: asked a third time, it is served.
-            let (third, walks) = spawn_labels_during(|| window(&path));
-            assert_eq!(third.unwrap().len(), rows.len());
-            assert!(
-                !walks.iter().any(|label| label == "git log"),
-                "the control: a complete window is kept ({walks:?})"
-            );
-        })
-    });
 }

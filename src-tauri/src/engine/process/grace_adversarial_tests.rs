@@ -3,6 +3,9 @@
 //! `ask_and_drain` / `stop_and_reap_waiting`.
 
 use super::*;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn sh(script: &str, args: &[&Path]) -> Command {
     let mut cmd = Command::new("sh");

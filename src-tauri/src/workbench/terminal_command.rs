@@ -3,7 +3,7 @@
 
 use super::claude_hook;
 use super::WorkbenchError;
-use crate::engine::git_cli::{
+use crate::engine::process::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
 };
 use crate::ipc_error::CommandError;
@@ -2074,7 +2074,7 @@ mod tests {
         let program = bin.to_str().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let spawns = |program: &str| {
-            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (_, labels) = crate::engine::process::spawn_labels_during(|| {
                 // The verdict is not the point (the fake advertises no flags);
                 // how many children were started to reach it is.
                 let _ = super::check(program, cwd, "claude", "ask", &opts(true, None));
