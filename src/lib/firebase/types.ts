@@ -70,12 +70,77 @@ export interface FirebaseProjectAlias {
   project_id: string;
 }
 
+/**
+ * The distinct ways a Firebase call fails, each with its own next step.
+ *
+ * `cli_startup` is the one the 2.0 beta needed: an installed CLI that crashed
+ * before reaching Google ("Unable to obtain permissions for
+ * firebase-debug.log"). It is neither a missing CLI nor a missing IAM role, and
+ * rendering it as either sends the reader to the wrong fix.
+ */
+export type FirebaseFailureKind =
+  | "cli_missing"
+  | "cli_startup"
+  /** A Node file-system refusal (EACCES/EPERM/EROFS) on this machine. */
+  | "local_files"
+  | "not_signed_in"
+  | "wrong_account"
+  | "missing_permission"
+  | "api_disabled"
+  | "network"
+  | "unknown";
+
+/**
+ * A classified failure. `permission`, `role` and `api` are set only when the
+ * CLI's own message names them — never guessed from the command.
+ */
+export interface FirebaseFailure {
+  kind: FirebaseFailureKind;
+  title: string;
+  next_step: string;
+  permission: string | null;
+  role: string | null;
+  api: string | null;
+}
+
+/**
+ * One `firebase` invocation as it actually ran, redacted in Rust before it
+ * crossed IPC. `exit_code` is null exactly when no exit was observed (the
+ * child never started, or was killed at the deadline); `spawn_error` says
+ * which.
+ */
+export interface FirebaseAttempt {
+  argv: string[];
+  cwd: string;
+  started_at_ms: number;
+  duration_ms: number;
+  exit_code: number | null;
+  stdout_tail: string;
+  stderr_tail: string;
+  spawn_error: string | null;
+}
+
+/**
+ * Who the Firebase CLI is signed in as for this repository's folder.
+ * `checked: false` means the CLI could not be asked — not that nobody is
+ * signed in.
+ */
+export interface FirebaseAccount {
+  checked: boolean;
+  email: string | null;
+  reason: string | null;
+}
+
 /** Whether the `firebase` CLI answered, and why not when it did not. */
 export interface FirebaseCliProbe {
   present: boolean;
   program: string;
   version: string | null;
   reason: string | null;
+  /** Why the CLI could not be used, classified; null when it answered. */
+  failure: FirebaseFailure | null;
+  /** What the probe ran and what came back. */
+  attempt: FirebaseAttempt | null;
 }
 
 /**
@@ -90,6 +155,8 @@ export interface FirebaseCapability {
   available: boolean;
   checked: boolean;
   reason: string | null;
+  /** The help invocation that answered the question, when one ran. */
+  attempt: FirebaseAttempt | null;
 }
 
 /** Wire shape of `cmd_firebase_status` — computed from files, never the network. */
@@ -153,6 +220,12 @@ interface FirebaseListing {
   unreachable: string[];
   walk_incomplete: string | null;
   error: string | null;
+  /** `error`, classified into a state with a next step; null on success. */
+  failure: FirebaseFailure | null;
+  /** Every `firebase` invocation this report made, in order, redacted. */
+  attempts: FirebaseAttempt[];
+  /** Asked only after a failure where the account changes the next step. */
+  account: FirebaseAccount | null;
 }
 
 /** Wire shape of `cmd_firebase_rollouts`. */
@@ -182,4 +255,12 @@ export interface RolloutCreateOutcome {
   git_commit: string;
   created: boolean;
   unconfirmed: string | null;
+  /**
+   * Why the CLI refused, when `created` is false. A refused deploy is
+   * returned, not thrown, so it can be classified and copied like a listing.
+   */
+  error: string | null;
+  failure: FirebaseFailure | null;
+  attempts: FirebaseAttempt[];
+  account: FirebaseAccount | null;
 }

@@ -28,6 +28,25 @@ describe("FirebasePanel", () => {
   // preselected from a choice; an unreadable .firebaserc is reported; a
   // commit absent from this checkout is marked. What stays is what the
   // fixture does not reach.
+  // Behaviour (click, clipboard contents, refused copy) is driven in
+  // harness/firebase.html. What stays here is the wiring a rendered page
+  // cannot attribute: that the view and the copy read the same formatter, and
+  // that the copy action sits outside every state branch.
+  it("shows and copies diagnostics from one formatter, in every state", () => {
+    expect(source).toContain("const diagnosticsPreview = $derived(formatFirebaseDiagnostics(diagnosticsInput(null)))");
+    expect(source).toContain("diagnosticsFlash.copy(formatFirebaseDiagnostics(diagnosticsInput(Date.now())))");
+    const block = source.indexOf("data-firebase-diagnostics");
+    // After the last state branch closes, so no state can hide it.
+    expect(block).toBeGreaterThan(source.lastIndexOf("{/if}\n  {/if}\n"));
+    expect(source).toContain("{#if status || statusError}");
+  });
+
+  it("renders a classified failure before the bare reason, for the CLI and both listings", () => {
+    expect(source).toContain('{@render failureNotice("Firebase CLI unavailable", status.cli.failure');
+    expect(source).toContain('{@render failureNotice("Backend listing did not run", backends.failure');
+    expect(source).toContain('{@render failureNotice("Rollout listing did not run", rollouts.failure');
+  });
+
   it("reports a listing error and an unreadable firebase.json on their own", () => {
     expect(source).toContain("{#if rolloutsError}");
     expect(source).toContain("{#if status.firebasejson_error}");

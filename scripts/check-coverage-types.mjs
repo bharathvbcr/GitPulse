@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 117 contracts over
- * 296 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 118 contracts over
+ * 299 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -218,6 +218,11 @@ export const CONTRACTS = Object.freeze([
   // render as "nothing is deployed" rather than as an error.
   { label: "firebase", rustPath: rust("firebase", "mod.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseStatus", "FirebaseCliProbe", "FirebaseProjectAlias", "FirebaseCapability"] },
   { label: "firebase-apphosting", rustPath: rust("firebase", "apphosting.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseRolloutsReport", "FirebaseBackendsReport", "RolloutInfo", "RolloutCommit", "BackendInfo", "RolloutCreateOutcome"] },
+  // What a Firebase call did and why it failed, as the panel's diagnostics and
+  // "Copy diagnostics" read it. `kind` drives the failure notice and
+  // `exit_code: null` is "no exit observed", so a rename in either would turn
+  // a classified failure into an unlabelled one.
+  { label: "firebase-diagnose", rustPath: rust("firebase", "diagnose.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseFailure", "FirebaseAttempt", "FirebaseAccount"] },
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "code-scanning", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["CodeScanningReport", "CodeScanningAlertInfo"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },

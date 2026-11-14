@@ -228,6 +228,29 @@ describe("createDiagnostics", () => {
     }
   });
 
+  it("redacts a bare Google OAuth token and leaves a double-slash path alone", () => {
+    // Shapes from Google's docs, split so no source line is itself a token.
+    const tokens = [
+      "ya" + "29.AHES6ZRN3-HlhAPya30GnW_bHSb_QtAS08i85nHq39HE3C2LTrCARA",
+      "ya" + "29.dr.AbCDeFg-123456789abcdefghijKLMNOP",
+      "1/" + "/xEoDL4iW3cxlI7yDbSRFYNG01kVKM2C-259HOF2aQbI",
+    ];
+    for (const token of tokens) {
+      for (const line of [token, `Authorization: Bearer ${token}`, `token (${token}).`]) {
+        const out = redactDiagnosticText(line);
+        expect(out, line).not.toContain(token);
+        expect(redactDiagnosticText(out)).toBe(out);
+      }
+    }
+    for (const ordinary of [
+      "curl http://127.0.0.1//api/v1/projects/scholarlm/backends/list?page=2",
+      "gs://bucket-1//some/long/object/key/that/keeps/going/for/a/while",
+      "id 1/" + "/0f8fad5b-d9cb-469f-a165-70867728950e",
+    ]) {
+      expect(redactDiagnosticText(ordinary)).toBe(ordinary);
+    }
+  });
+
   it("fails closed when structured JSON reaches the serialized nesting cap", () => {
     const secret = "opaque-boundary-auth";
     let payload: unknown = `Authorization: Bearer ${secret}`;

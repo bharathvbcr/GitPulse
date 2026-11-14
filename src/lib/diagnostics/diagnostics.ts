@@ -92,6 +92,9 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
   prefix: string;
   minLength: number;
   alphanumericBody?: boolean;
+  /** dc-redact's `Body::UrlSafe`: letters, digits, `-` and `_`. A `/` or a
+   *  `.` inside the run means a path or a URL, not a key. */
+  urlSafeBody?: boolean;
 }[] = [
   { prefix: "sk-ant-", minLength: 24 },
   { prefix: "sk-proj-", minLength: 24 },
@@ -110,6 +113,8 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
   { prefix: "npm_", minLength: 36 },
   { prefix: "hf_", minLength: 30 },
   { prefix: "AIza", minLength: 30 },
+  { prefix: "ya29.", minLength: 30 },
+  { prefix: "1//", minLength: 40, urlSafeBody: true },
   { prefix: "AKIA", minLength: 20, alphanumericBody: true },
   { prefix: "ASIA", minLength: 20, alphanumericBody: true },
   { prefix: "xai-", minLength: 20 },
@@ -118,9 +123,17 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
 
 // The vocabulary is fixed for this build. Construct matchers once; global
 // String.replace resets lastIndex before each scan, including nested calls.
+// A URL-safe body is read the way dc-redact reads it: the run of key characters
+// (letters, digits, `-_./+=`) less any trailing periods must be URL-safe, so
+// the token ends where that run ends and nothing but periods may follow it.
 const DIAGNOSTIC_SECRET_MATCHERS = DIAGNOSTIC_SECRET_PREFIXES.map(spec => ({
   ...spec,
-  matcher: new RegExp(`(^|[^A-Za-z0-9_])(${escapeRegExp(spec.prefix)}[^\\s"',;]*)`, "g"),
+  matcher: new RegExp(
+    spec.urlSafeBody
+      ? `(^|[^A-Za-z0-9_])(${escapeRegExp(spec.prefix)}[A-Za-z0-9_-]*)(?=\\.*(?:[^A-Za-z0-9_./+=-]|$))`
+      : `(^|[^A-Za-z0-9_])(${escapeRegExp(spec.prefix)}[^\\s"',;]*)`,
+    "g",
+  ),
 }));
 
 /**
