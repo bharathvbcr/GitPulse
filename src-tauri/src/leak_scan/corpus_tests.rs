@@ -415,7 +415,7 @@ pub(super) fn benign() -> Vec<String> {
         "-----BEGIN CERTIFICATE-----".into(),
         "-----BEGIN PUBLIC KEY-----".into(),
         format!("sha256 = \"{}\"", r.take(HEX, 64)),
-        format!("  \"version\": \"4.17.21\", \"resolved\": \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\""),
+        "  \"version\": \"4.17.21\", \"resolved\": \"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz\"".into(),
         format!("cache-key: {}-{}", r.take(LOWER, 8), r.take(HEX, 40)),
         "The scanner reads every added line and names the shape it found, never the value.".into(),
         "fn risk_score(task: &Task) -> u32 { task.disk_usage / 1024 }".into(),
