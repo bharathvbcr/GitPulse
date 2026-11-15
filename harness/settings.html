@@ -498,7 +498,7 @@
             ["swap", "Swap used", "refuse", "0.5", "0.75", "x memory", "Slow background work at", "Refuse launches at"],
             ["compressor_segments", "Memory compressor", "refuse", "0.6", "0.8", "of limit", "Slow background work at", "Refuse launches at"],
             ["load", "CPU load", "shed", "3", "6", "per CPU", "Slow background work at", "Refuse launches at"],
-            ["disk", "Free disk space", "refuse", "20", "10", "GiB free", "Slow background work below", "Refuse launches below"],
+            ["disk", "Free disk space", "refuse", "32", "16", "GiB free", "Slow background work below", "Refuse launches below"],
           ];
           for (const [id, label, mode, elevated, severe, unit, elevatedLabel, severeLabel] of EXPECT) {
             const text = flatText(input(id));
@@ -521,16 +521,20 @@
           await pickMode("swap", "shed");
           check("changing Swap to slow-down saves exactly that input", H.attempts.length === 1 && Object.keys(H.attempts[0]).join() === "settings"
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.5, severe_at: 0.75 })
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 10 })
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 16 })
+            && lastSave().thresholds.disk_auto === true
             && lastSave().enabled === true && lastSave().govern_launches === true && lastSave().hook_mode === "enforce");
           check("a slow-down input disables its refuse threshold and offers a reset", thresholdField("swap", "severe_at").disabled && Boolean(resetButton("swap")));
           // A threshold change carries the other threshold and the mode through.
           await typeThreshold("swap", "elevated_at", "0.4");
           check("editing Swap's slow-down level saves 0.4 and keeps 0.75 and the mode", H.attempts.length === 2
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
+          check("the disk floors say they are automatic until a number is set", Boolean(document.querySelector('[data-testid="host-load-input-disk-auto"]')));
           await typeThreshold("disk", "severe_at", "5");
-          check("editing Free disk's refuse level saves 5 and keeps 20", H.attempts.length === 3
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 })
+          check("editing Free disk's refuse level saves 5, keeps 32 and takes both floors off automatic", H.attempts.length === 3
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 5 })
+            && lastSave().thresholds.disk_auto === false
+            && Boolean(document.querySelector('[data-testid="host-load-input-disk-explicit"]'))
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
           await pickMode("load", "off");
           check("turning CPU load off saves it and hides its thresholds", H.attempts.length === 4 && lastSave().thresholds.load.mode === "off"
@@ -553,7 +557,7 @@
           check("a non-numeric threshold is refused with a sentence", inputError("compressor_segments").includes("both thresholds must be numbers"));
           await typeThreshold("compressor_segments", "severe_at", "1.5");
           check("a threshold above the input's maximum is refused with a sentence", inputError("compressor_segments").includes("at most 1 of limit"));
-          await typeThreshold("disk", "severe_at", "30");
+          await typeThreshold("disk", "severe_at", "40");
           check("a disk refuse level above its slow-down level is refused", inputError("disk").includes("must not be above the slow-down level"));
           check("none of the refused values reached the backend", H.attempts.length === before && thresholdField("disk", "severe_at").value === "5");
 
@@ -571,7 +575,9 @@
           await pickGate("Advise");
           check("choosing Advise saves hook_mode advise and nothing else changed", H.attempts.length === attempts + 1 && lastSave().hook_mode === "advise"
             && lastSave().enabled === true && lastSave().govern_launches === true
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 }));
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 5 })
+            && lastSave().thresholds.disk_auto === false
+            && JSON.stringify(lastSave().thresholds.disk_guard) === JSON.stringify({ fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 }, coverage: { mode: "refuse", headroom_gib: 60 } }));
           check("Advise reads as the selected choice", gateShown() === "Advise");
           H.failNext = "the settings file is read-only";
           await pickGate("Off");

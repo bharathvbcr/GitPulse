@@ -10,6 +10,7 @@
 import { humanBytes } from "../storage/format";
 import type {
   Binding,
+  DiskFill,
   GovernorPulse,
   Advisory,
   GovernorReport,
@@ -244,6 +245,25 @@ export function refusalNotice(governor: GovernorPulse): string {
   return `Refusing agent launches for ${minutes} min under ${cause}; ${largest}.`;
 }
 
+/** A fill rate in bytes a minute: "2.7 GB/min". */
+export function fillRateLabel(bytesPerMin: number): string {
+  return `${humanBytes(bytesPerMin)}/min`;
+}
+
+/**
+ * Where the disk is heading, for Health: "Disk filling: 2.7 GB/min, about
+ * 11 min until the 16 GB floor." Says so when the floor is already reached.
+ */
+export function diskFillLine(fill: DiskFill): string {
+  const rate = fillRateLabel(fill.rate_bytes_per_min);
+  const floor = humanBytes(fill.floor_bytes);
+  if (fill.eta_min <= 0) {
+    return `Disk filling: ${rate}, free space is at the ${floor} floor.`;
+  }
+  const minutes = fill.eta_min < 1 ? "under 1" : `about ${Math.round(fill.eta_min)}`;
+  return `Disk filling: ${rate}, ${minutes} min until the ${floor} floor.`;
+}
+
 /** The binding resource as a phrase after "under", for the refusal notice. */
 function bindingCause(binding: Binding | null): string {
   switch (binding) {
@@ -255,6 +275,8 @@ function bindingCause(binding: Binding | null): string {
       return "heavy swap use";
     case "low_disk":
       return "low disk space";
+    case "disk_filling":
+      return "disk space filling fast";
     case "thermal":
       return "heat";
     case "cpu_load":
@@ -278,6 +300,8 @@ export function bindingLabel(binding: Binding | null): string {
       return "swap";
     case "low_disk":
       return "low disk";
+    case "disk_filling":
+      return "disk filling";
     case "thermal":
       return "heat";
     case "cpu_load":

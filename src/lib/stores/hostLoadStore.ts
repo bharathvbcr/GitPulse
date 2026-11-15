@@ -135,6 +135,8 @@ export interface Snapshot {
   memguard_pid: number;
   orphans: number;
   tick: TickStats;
+  /** Bytes of free disk lost per minute, as the writer measured it. */
+  disk_fill_rate?: Reading<number>;
   /**
    * The app's held governor verdict, for readers with no history (the hook,
    * `gitpulse-mcp`). One tick behind the readings: the sampler publishes, then
@@ -242,6 +244,7 @@ export type Binding =
   | "compressor_segments"
   | "swap"
   | "low_disk"
+  | "disk_filling"
   | "thermal"
   | "cpu_load"
   | "battery";
@@ -259,6 +262,8 @@ export type Reason =
 export interface Shed {
   background: boolean;
   reactive: boolean;
+  /** What put the host in the tier that sheds; null when nothing is shed. */
+  cause: Binding | null;
 }
 
 export interface GovernorVerdict {
@@ -302,9 +307,23 @@ export type Advisory =
   | { reason: "disk_unknown" }
   | { reason: "several"; items: Advisory[] };
 
+/** `sysload::DiskFill`: where the disk is heading. */
+export interface DiskFill {
+  /** Bytes of free space lost per minute. */
+  rate_bytes_per_min: number;
+  /** Minutes until free space reaches the severe floor at that rate; 0 when it is there. */
+  eta_min: number;
+  free_bytes: number;
+  floor_bytes: number;
+  /** The tier the projection alone reaches, before the rule's mode caps it. */
+  tier: Tier;
+}
+
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {
   verdict: GovernorVerdict;
+  /** Present while the fill-rate rule is on and the projection is at least elevated. */
+  disk_fill?: DiskFill | null;
   refusing_for_s: number | null;
   notice: boolean;
   largest_foreign: number | null;
@@ -340,6 +359,8 @@ export interface TraceRecord {
   compressed_bytes: number | null;
   load_1m: number | null;
   free_disk: number | null;
+  /** Bytes of free space lost per minute, or null when it was not measured. */
+  disk_fill_rate?: number | null;
   launched_sessions: number | null;
   observed_sessions: number | null;
   largest_foreign: number | null;
@@ -422,6 +443,25 @@ export interface ModeRule {
   mode: InputMode;
 }
 
+/** `sysload::HorizonRule`: how soon the disk is projected to reach its severe floor. */
+export interface HorizonRule {
+  mode: InputMode;
+  elevated_within_min: number;
+  severe_within_min: number;
+}
+
+/** `sysload::HeadroomRule`: the free space a coverage build needs before it starts. */
+export interface HeadroomRule {
+  mode: InputMode;
+  headroom_gib: number;
+}
+
+/** `sysload::DiskGuard`: the disk guards beyond the level. */
+export interface DiskGuard {
+  fill: HorizonRule;
+  coverage: HeadroomRule;
+}
+
 /** `sysload::Thresholds`: every input the governor decides on besides pressure. */
 export interface Thresholds {
   swap: Rule;
@@ -429,7 +469,11 @@ export interface Thresholds {
   load: Rule;
   thermal: ModeRule;
   battery: ModeRule;
+  /** While `disk_auto`, the numbers are the automatic floors shown, not stored. */
   disk: Rule;
+  /** Whether the disk floors follow physical memory (swap shares the free-space pool). */
+  disk_auto: boolean;
+  disk_guard: DiskGuard;
 }
 
 /** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
@@ -455,7 +499,27 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   thermal: { mode: "shed" },
   battery: { mode: "off" },
   disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+  disk_auto: true,
+  disk_guard: {
+    fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 },
+    coverage: { mode: "refuse", headroom_gib: 60 },
+  },
 };
+
+/**
+ * Whether the settings equal the defaults, as the backend stores them. The
+ * automatic disk floors are shown as numbers for this computer's memory, so
+ * while they are automatic only the disk mode is compared, never its numbers.
+ */
+export function thresholdsAreDefault(thresholds: Thresholds): boolean {
+  const base = DEFAULT_THRESHOLDS;
+  const disk = (value: Thresholds) =>
+    value.disk_auto ? { auto: true, mode: value.disk.mode } : { auto: false, ...value.disk };
+  return (
+    JSON.stringify({ ...thresholds, disk: disk(thresholds) }) ===
+    JSON.stringify({ ...base, disk: disk(base) })
+  );
+}
 
 /** The event the app's sampler emits after every tick. */
 export const HOST_LOAD_PULSE_EVENT = "host-load-pulse";

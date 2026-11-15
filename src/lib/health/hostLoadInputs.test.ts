@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { hostLoadStatusFixture } from "../../../harness/hostLoadFixture";
 import { bindingLabel, governorLine, refusalNotice, statusChip } from "./hostLoad";
-import { INPUT_SPECS, MODE_LABELS, liveReading, ruleProblem, specOf } from "./hostLoadInputs";
+import {
+  GUARD_SPECS,
+  INPUT_SPECS,
+  MODE_LABELS,
+  coverageProblem,
+  fillProblem,
+  liveReading,
+  ruleProblem,
+  specOf,
+} from "./hostLoadInputs";
 import { DEFAULT_THRESHOLDS, type Binding, type GovernorPulse, type HostLoadPulse } from "../stores/hostLoadStore";
 
 const GIB = 2 ** 30;
@@ -82,7 +91,7 @@ describe("every binding has words", () => {
       reason: "pressure",
       tier: "severe",
       binding: "swap",
-      shed: { background: true, reactive: true },
+      shed: { background: true, reactive: true, cause: null },
       message: "swap used is 0.83x physical memory (53.4 GiB of 64.0 GiB), at or above 0.75x: agent launches are refused until it clears",
     };
     expect(governorLine(report)).toContain("swap used is 0.83x physical memory");
@@ -91,7 +100,9 @@ describe("every binding has words", () => {
 
 describe("the input rows", () => {
   it("has one row per governor input, each findable by its own settings id", () => {
-    expect(INPUT_SPECS.map((spec) => spec.id)).toEqual(Object.keys(DEFAULT_THRESHOLDS));
+    expect(INPUT_SPECS.map((spec) => spec.id)).toEqual(
+      Object.keys(DEFAULT_THRESHOLDS).filter((key) => key !== "disk_auto" && key !== "disk_guard"),
+    );
     expect(new Set(INPUT_SPECS.map((spec) => spec.settingId)).size).toBe(INPUT_SPECS.length);
     expect(MODE_LABELS).toEqual({
       off: "Off",
@@ -132,5 +143,34 @@ describe("the input rows", () => {
     broken.host.memsize = { status: "value", value: 0 };
     broken.host.swap_used = { status: "value", value: 5 };
     expect(liveReading("swap", broken)).toBe("unreadable");
+  });
+});
+
+describe("the disk guards", () => {
+  it("has one row per guard, each findable by its own settings id", () => {
+    expect(Object.keys(GUARD_SPECS)).toEqual(Object.keys(DEFAULT_THRESHOLDS.disk_guard));
+    expect(GUARD_SPECS.fill.settingId).toBe("host-load-disk-fill");
+    expect(GUARD_SPECS.coverage.settingId).toBe("host-load-disk-coverage");
+  });
+
+  it("starts protective: refuse, 30 and 10 minutes, 60 GiB, automatic disk floors", () => {
+    expect(DEFAULT_THRESHOLDS.disk_guard).toEqual({
+      fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 },
+      coverage: { mode: "refuse", headroom_gib: 60 },
+    });
+    expect(DEFAULT_THRESHOLDS.disk_auto).toBe(true);
+  });
+
+  it("refuses the same bad guards the backend does", () => {
+    const fill = DEFAULT_THRESHOLDS.disk_guard.fill;
+    expect(fillProblem(fill)).toBeNull();
+    expect(fillProblem({ ...fill, severe_within_min: 45 })).toMatch(/must not be longer/);
+    expect(fillProblem({ ...fill, elevated_within_min: Number.NaN })).toMatch(/numbers/);
+    expect(fillProblem({ ...fill, severe_within_min: 0 })).toMatch(/above 0/);
+    expect(fillProblem({ ...fill, elevated_within_min: 20_000 })).toMatch(/at most/);
+    const coverage = DEFAULT_THRESHOLDS.disk_guard.coverage;
+    expect(coverageProblem(coverage)).toBeNull();
+    expect(coverageProblem({ ...coverage, headroom_gib: 0 })).toMatch(/above 0/);
+    expect(coverageProblem({ ...coverage, headroom_gib: Number.NaN })).toMatch(/above 0/);
   });
 });

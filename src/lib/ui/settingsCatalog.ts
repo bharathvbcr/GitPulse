@@ -442,7 +442,19 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "host-load-disk",
     section: "agents",
     label: "Host load: free disk space",
-    keywords: "host load disk space free full storage low gib refuse launches slow background governor threshold",
+    keywords: "host load disk space free full storage low gib refuse launches slow background governor threshold swap memory automatic floor",
+  },
+  {
+    id: "host-load-disk-fill",
+    section: "agents",
+    label: "Host load: disk filling fast",
+    keywords: "host load disk filling fast fill rate falling minutes until full projection coverage build output refuse launches slow background governor horizon",
+  },
+  {
+    id: "host-load-disk-coverage",
+    section: "agents",
+    label: "Host load: coverage build headroom",
+    keywords: "host load coverage build headroom cargo llvm-cov instrumented output free disk refuse command gate hook gib",
   },
   {
     id: "manvi-policy",

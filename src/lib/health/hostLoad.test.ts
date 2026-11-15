@@ -3,7 +3,10 @@ import type { GovernorReport, HostLoadPulse, MemguardHealth } from "../stores/ho
 import {
   admissionLine,
   bytes,
+  bindingLabel,
   describeReading,
+  diskFillLine,
+  fillRateLabel,
   formatAge,
   governorLine,
   memguardLine,
@@ -37,7 +40,7 @@ const pulse = (over: Partial<HostLoadPulse> = {}): HostLoadPulse => ({
 const report = (over: Partial<GovernorReport["verdict"]> = {}, rest: Partial<GovernorReport> = {}): GovernorReport => ({
   verdict: {
     admit: true,
-    shed: { background: false, reactive: false },
+    shed: { background: false, reactive: false, cause: null },
     reason: "healthy",
     tier: "clear",
     binding: null,
@@ -220,7 +223,7 @@ describe("the governor's lines", () => {
     const shedding = report({
       reason: "elevated",
       tier: "elevated",
-      shed: { background: true, reactive: false },
+      shed: { background: true, reactive: false, cause: null },
       binding: "memory_pressure",
       message: "memory pressure warn (kernel level 2): background work is shed, launches are admitted",
       warnings: ["stale 45s: governing on the last-known level"],
@@ -228,7 +231,7 @@ describe("the governor's lines", () => {
     expect(governorLine(shedding)).toBe(
       "Shedding background work: memory pressure warn (kernel level 2): background work is shed, launches are admitted (stale 45s: governing on the last-known level).",
     );
-    expect(governorLine(report({ shed: { background: true, reactive: true }, reason: "pressure" }))).toMatch(
+    expect(governorLine(report({ shed: { background: true, reactive: true, cause: null }, reason: "pressure" }))).toMatch(
       /^Shedding background and reactive work/,
     );
   });
@@ -279,5 +282,32 @@ describe("the governor's lines", () => {
     expect(
       statusChip(pulse({ level: "critical", pressure: "critical", governor: { ...gov, admit: false, overridden: true, shed_background: true, shed_reactive: true } }))?.text,
     ).toBe("Memory: critical · shedding");
+  });
+});
+
+describe("the disk fill line", () => {
+  const GIB = 2 ** 30;
+  const fill = (over: Partial<Parameters<typeof diskFillLine>[0]> = {}) => ({
+    rate_bytes_per_min: 2.7 * GIB,
+    eta_min: 10.7,
+    free_bytes: 45 * GIB,
+    floor_bytes: 16 * GIB,
+    tier: "elevated" as const,
+    ...over,
+  });
+
+  it("says the rate and the minutes until the floor", () => {
+    expect(diskFillLine(fill())).toBe("Disk filling: 2.70 GB/min, about 11 min until the 16.0 GB floor.");
+    expect(fillRateLabel(0.5 * GIB)).toBe("512 MB/min");
+  });
+
+  it("says under a minute, and when the floor is already reached", () => {
+    expect(diskFillLine(fill({ eta_min: 0.4 }))).toContain("under 1 min until");
+    expect(diskFillLine(fill({ eta_min: 0 }))).toBe("Disk filling: 2.70 GB/min, free space is at the 16.0 GB floor.");
+  });
+
+  it("names the binding in the status words", () => {
+    expect(bindingLabel("disk_filling")).toBe("disk filling");
+    expect(bindingLabel("low_disk")).toBe("low disk");
   });
 });

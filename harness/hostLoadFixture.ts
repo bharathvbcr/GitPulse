@@ -21,7 +21,7 @@ export function hostLoadStatusFixture(): HostLoadStatus {
     governor: {
       verdict: {
         admit: true,
-        shed: { background: false, reactive: false },
+        shed: { background: false, reactive: false, cause: null },
         reason: "healthy",
         tier: "clear",
         binding: null,
@@ -106,7 +106,13 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
       load: { mode: "shed", elevated_at: 3, severe_at: 6 },
       thermal: { mode: "shed" },
       battery: { mode: "off" },
-      disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+      // The automatic floors for a 64 GiB computer, as the backend shows them.
+      disk: { mode: "refuse", elevated_at: 32, severe_at: 16 },
+      disk_auto: true,
+      disk_guard: {
+        fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 },
+        coverage: { mode: "refuse", headroom_gib: 60 },
+      },
     },
   };
 }

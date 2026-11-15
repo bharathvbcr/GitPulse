@@ -92,6 +92,7 @@
   import LappiSettings from "./LappiSettings.svelte";
   import HostLoadSetting from "./HostLoadSetting.svelte";
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
+  import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -122,6 +123,8 @@
     "host-load-thermal",
     "host-load-battery",
     "host-load-disk",
+    "host-load-disk-fill",
+    "host-load-disk-coverage",
   ] as const;
   // The host-load input id behind the compressor row: a stored threshold key, not copy.
   const COMPRESSOR_INPUT = "compressor_segments" as const;
@@ -1217,6 +1220,12 @@
                   </div>
                   <div data-setting="host-load-disk" hidden={!shown("host-load-disk")}>
                     <HostLoadInputSetting input="disk" active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="host-load-disk-fill" hidden={!shown("host-load-disk-fill")}>
+                    <HostLoadDiskGuardSetting guard="fill" active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="host-load-disk-coverage" hidden={!shown("host-load-disk-coverage")}>
+                    <HostLoadDiskGuardSetting guard="coverage" active={isOpen && activeSection === "agents"} />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["mcp-plugin"])}>
