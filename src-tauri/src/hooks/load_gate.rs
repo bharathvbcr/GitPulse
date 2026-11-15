@@ -96,6 +96,117 @@ pub(super) struct Gathered {
     /// Where the loop breaker keeps its markers.
     pub state_dir: PathBuf,
     pub now: SystemTime,
+    /// What the lease wrapper does for a build in this session.
+    pub lease: LeaseSource,
+}
+
+/// Where the facts about the build lease come from.
+#[derive(Debug, Clone)]
+pub(super) enum LeaseSource {
+    /// Read from the lease directory and the environment, once a leased build
+    /// is found.
+    Live,
+    /// Handed in, for tests.
+    Fixed(LeaseFacts),
+}
+
+/// What the hook says about a leased build besides its load.
+#[derive(Debug, Clone, Default)]
+pub(super) struct LeaseFacts {
+    /// Leases are on and this platform has them. Off says nothing at all.
+    pub on: bool,
+    /// Why this session's builds do not go through the wrapper, or `None` when
+    /// they do.
+    pub not_gated: Option<String>,
+    /// Who holds the slots when every one is held.
+    pub full: Option<String>,
+}
+
+#[cfg(unix)]
+fn live_lease_facts(input: &HookInput, availability: &Availability) -> LeaseFacts {
+    use crate::sysload::lease::{self, capacity, Dir, Load, Own};
+    let settings = crate::tool_config::host_load_leases();
+    let config = crate::tool_config::default_config_dir();
+    let on = settings.mode == crate::tool_config::LeaseMode::On;
+    if !on {
+        return LeaseFacts::default();
+    }
+    let gated = std::env::var_os(super::lease_wrapper::BIN_ENV).is_some()
+        || config
+            .as_deref()
+            .is_some_and(|c| super::lease_wrapper::session_has_path(c, &input.session_id));
+    let not_gated = (!gated).then(|| {
+        "this session's PATH does not start with GitPulse's lease folder (GITPULSE_LEASE_BIN is not set, and the session-start hook did not add it); start the session from GitPulse, or keep GitPulse's session-start hook enabled".to_string()
+    });
+    let full = (|| {
+        let dir = Dir::open(&lease::lease_dir(config.as_deref()?)).ok()?;
+        let load = match availability {
+            Availability::Verdict { verdict, .. } => Load::Verdict(*verdict),
+            Availability::Unavailable(why) => Load::Unknown(why.clone()),
+        };
+        let cap = capacity(settings.slots, &load);
+        let board = dir.board(&Own::default());
+        if !board.unreadable.is_empty() || board.holders.len() < cap.slots as usize {
+            return None;
+        }
+        let who: Vec<String> = board
+            .holders
+            .iter()
+            .take(4)
+            .map(|h| match &h.record {
+                Some(r) => format!("{} in {} (pid {})", r.label, r.cwd, h.pid),
+                None => format!("pid {}", h.pid),
+            })
+            .collect();
+        Some(who.join("; "))
+    })();
+    LeaseFacts {
+        on,
+        not_gated,
+        full,
+    }
+}
+
+#[cfg(not(unix))]
+fn live_lease_facts(_input: &HookInput, _availability: &Availability) -> LeaseFacts {
+    LeaseFacts::default()
+}
+
+/// The lines about a leased build: once per session that it is not gated, and
+/// every time that it will queue.
+fn lease_lines(
+    input: &HookInput,
+    heavy: &Hit,
+    availability: &Availability,
+    g: &Gathered,
+) -> Vec<String> {
+    if !heavy.row.lease {
+        return Vec::new();
+    }
+    let facts = match &g.lease {
+        LeaseSource::Fixed(facts) => facts.clone(),
+        LeaseSource::Live => live_lease_facts(input, availability),
+    };
+    if !facts.on {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    if let Some(why) = &facts.not_gated {
+        match first_notice(g, input, why) {
+            Notice::Repeat => {}
+            notice => lines.push(format!(
+                "GitPulse did NOT lease-gate this build ({}): {why}. Builds in this session are not queued behind other sessions' builds.{}",
+                heavy.label,
+                notice.suffix()
+            )),
+        }
+    }
+    if let Some(who) = &facts.full {
+        lines.push(format!(
+            "Every build slot is held ({who}), so this will queue; give the Bash call a 600000 ms timeout or run it in the background."
+        ));
+    }
+    lines
 }
 
 /// The one line the SessionStart brief carries about host load, read from the
@@ -162,12 +273,19 @@ pub(super) fn gather_live() -> Gathered {
         availability,
         state_dir: marker_dir(),
         now: SystemTime::now(),
+        lease: LeaseSource::Live,
     };
     if mode == HostLoadHookMode::Off {
         return live(Availability::Unavailable(String::new()), false);
     }
     let exempt = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|label| !label.is_empty());
-    let availability = match crate::tool_config::default_config_dir() {
+    live(availability_live(), exempt)
+}
+
+/// The app's held verdict as a reader may act on it, read from the published
+/// snapshot: what the command gate and the lease wrapper both ask.
+pub(super) fn availability_live() -> Availability {
+    match crate::tool_config::default_config_dir() {
         None => {
             Availability::Unavailable("there is no per-user config directory (HOME unset)".into())
         }
@@ -176,8 +294,7 @@ pub(super) fn gather_live() -> Gathered {
             let (report, snapshot) = crate::sysload::report(&path, crate::sysload::Clock::now());
             availability_of(&report, snapshot.as_ref())
         }
-    };
-    live(availability, exempt)
+    }
 }
 
 /// What a sensor report and its snapshot allow the hook to act on.
@@ -247,16 +364,27 @@ fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) ->
         return advise_rows(classified, &g.availability);
     };
     match &g.availability {
-        Availability::Unavailable(why) => match first_notice(g, input, why) {
-            Notice::Repeat => HookOutput::silent(),
-            notice => advice(&format!(
-                "GitPulse did NOT load-check this heavy command ({}): {why}. The host may be \
-                 overloaded; run it once, not alongside other builds{}.{}",
-                heavy.label,
-                cap_sentence(heavy),
-                notice.suffix()
-            )),
-        },
+        Availability::Unavailable(why) => {
+            let mut lines = lease_lines(input, heavy, &g.availability, g);
+            match first_notice(g, input, why) {
+                Notice::Repeat => {}
+                notice => lines.insert(
+                    0,
+                    format!(
+                        "GitPulse did NOT load-check this heavy command ({}): {why}. The host may be \
+                         overloaded; run it once, not alongside other builds{}.{}",
+                        heavy.label,
+                        cap_sentence(heavy),
+                        notice.suffix()
+                    ),
+                ),
+            }
+            if lines.is_empty() {
+                HookOutput::silent()
+            } else {
+                advice(&lines.join("\n"))
+            }
+        }
         Availability::Verdict {
             verdict,
             state,
@@ -271,9 +399,17 @@ fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) ->
                 cap_sentence(heavy)
             )];
             lines.extend(row_advice(classified));
+            lines.extend(lease_lines(input, heavy, &g.availability, g));
             advice(&lines.join("\n"))
         }
-        Availability::Verdict { .. } => HookOutput::silent(),
+        Availability::Verdict { .. } => {
+            let lines = lease_lines(input, heavy, &g.availability, g);
+            if lines.is_empty() {
+                HookOutput::silent()
+            } else {
+                advice(&lines.join("\n"))
+            }
+        }
     }
 }
 

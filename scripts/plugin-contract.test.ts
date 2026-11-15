@@ -216,6 +216,20 @@ describe("plugin hooks", () => {
     }
   });
 
+  it("advertises the build-lease wrapper on the --version line without declaring it a hook", () => {
+    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"), "utf8");
+    const modes = source.match(/pub const BINARY_MODES: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
+    expect([...modes.matchAll(/"([a-z-]+)"/g)].map((m) => m[1])).toEqual(["lease"]);
+    // `identity()` is what `--version` prints: it must put the modes on the
+    // subcommand line the doctor reads.
+    const identity = source.slice(source.indexOf("pub fn identity()"));
+    expect(identity.slice(0, 400)).toContain("BINARY_MODES");
+    // It is not a hook: no manifest may ask the host to run it, or a host that
+    // sent it would start a build wrapper with no command to wrap.
+    const hooks = readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8");
+    expect(hooks).not.toMatch(/gitpulse-hook\s+lease/);
+  });
+
   it("invokes the same binary this repo builds, with a real subcommand", () => {
     // The MCP manifest resolves `gitpulse-mcp` off PATH for the same reason a
     // published plugin must: the client runs the installed server, not a path

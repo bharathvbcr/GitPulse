@@ -304,6 +304,78 @@ fn parse_record(bytes: &[u8]) -> Option<Record> {
         .map(Record::bounded)
 }
 
+/// The programs the app links into [`bin_dir`].
+pub const LINKED_PROGRAMS: [&str; 2] = ["cargo", "go"];
+
+/// `PATH` with `bin` first, once: an entry already there is moved to the
+/// front, never duplicated.
+pub fn path_with_bin_first(bin: &Path, existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let mut entries: Vec<PathBuf> = vec![bin.to_path_buf()];
+    if let Some(existing) = existing {
+        entries.extend(std::env::split_paths(existing).filter(|entry| entry != bin));
+    }
+    std::env::join_paths(&entries).unwrap_or_else(|_| bin.as_os_str().to_os_string())
+}
+
+/// What a session GitPulse launches is given so its builds go through the
+/// wrapper: `PATH` led by [`bin_dir`] and `GITPULSE_LEASE_BIN`. `None` for a
+/// value means "remove it": a stale one inherited from a parent GitPulse must
+/// not claim a gate this session does not have. Nothing is added unless the
+/// links exist, so a session is never pointed at a folder with nothing in it.
+pub fn launch_env(
+    config_dir: Option<&Path>,
+    existing_path: Option<&std::ffi::OsStr>,
+    enabled: bool,
+) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    let bin = config_dir.map(bin_dir);
+    let usable = enabled
+        && bin.as_deref().is_some_and(|bin| {
+            LINKED_PROGRAMS
+                .iter()
+                .all(|p| bin.join(p).symlink_metadata().is_ok())
+        });
+    match (usable, bin) {
+        (true, Some(bin)) => vec![
+            ("PATH", Some(path_with_bin_first(&bin, existing_path))),
+            ("GITPULSE_LEASE_BIN", Some(bin.into_os_string())),
+        ],
+        _ => vec![("GITPULSE_LEASE_BIN", None)],
+    }
+}
+
+/// Makes `<config>/lease-bin/{cargo,go}` symlinks to `hook`, replacing a
+/// wrong or missing one by rename so a build never finds the folder half made.
+/// `Err` says what could not be done; links already right are left alone.
+#[cfg(unix)]
+pub fn ensure_links(config_dir: &Path, hook: &Path) -> Result<(), String> {
+    let bin = bin_dir(config_dir);
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| format!("cannot create {}: {e}", config_dir.display()))?;
+    crate::hooks::advisory_once::private_dir(&bin)
+        .map_err(|why| format!("cannot use {}: {why}", bin.display()))?;
+    if !hook.is_file() {
+        return Err(format!(
+            "{} does not exist, so there is nothing for the cargo and go links to point at",
+            hook.display()
+        ));
+    }
+    for name in LINKED_PROGRAMS {
+        let link = bin.join(name);
+        if std::fs::read_link(&link).is_ok_and(|target| target == hook) {
+            continue;
+        }
+        let tmp = bin.join(format!(".{name}.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(hook, &tmp)
+            .map_err(|e| format!("cannot link {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &link).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot replace {}: {e}", link.display())
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub use unix::{Dir, Grant, Own, Ticket};
 

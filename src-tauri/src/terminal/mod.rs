@@ -3059,6 +3059,23 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
             None => cmd.env_remove(name),
         }
     }
+    // An agent CLI's builds go through the build-lease wrapper: its PATH
+    // starts with the app's `lease-bin` links. A plain shell tab is a person's
+    // own and is not gated.
+    if launcher_kind(&resolved).is_some() {
+        let existing = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+        let enabled =
+            crate::tool_config::host_load_leases().mode == crate::tool_config::LeaseMode::On;
+        let config = crate::tool_config::default_config_dir();
+        for (name, value) in
+            crate::sysload::lease::launch_env(config.as_deref(), existing.as_deref(), enabled)
+        {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            }
+        }
+    }
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }

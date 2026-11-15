@@ -116,6 +116,28 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+/// Makes the `cargo` and `go` links an agent's PATH starts with
+/// (`sysload::lease::bin_dir`), pointing at the `gitpulse-hook` beside this
+/// executable. A failure is logged and shown by Health ("not gated"); the
+/// builds then run unleased, never blocked.
+#[cfg(unix)]
+fn install_lease_links() {
+    let Some(config) = tool_config::default_config_dir() else {
+        log::warn!(target: "leases", "no per-user config directory; build leases have no links");
+        return;
+    };
+    let hook = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("gitpulse-hook")));
+    let Some(hook) = hook else {
+        log::warn!(target: "leases", "cannot locate gitpulse-hook; build leases have no links");
+        return;
+    };
+    if let Err(error) = sysload::lease::ensure_links(&config, &hook) {
+        log::warn!(target: "leases", "build lease links not installed: {error}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // First: tauri builds its default async runtime on the first use of any
@@ -332,6 +354,8 @@ pub fn run() {
             // that). A second GitPulse beside this one loses the snapshot's
             // writer election and reads instead.
             start_host_load_sampler(app.handle());
+            #[cfg(unix)]
+            install_lease_links();
             alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
             workbench::agy_plugin::apply_from_settings();
             crate::tool_install::set_app_handle(app.handle().clone());

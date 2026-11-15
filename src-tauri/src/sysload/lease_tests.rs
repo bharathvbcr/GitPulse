@@ -155,6 +155,90 @@ fn a_session_is_named_by_its_terminal_then_its_run_then_its_agent_then_its_paren
     );
 }
 
+#[test]
+fn the_lease_folder_leads_the_agent_path_once() {
+    use std::ffi::OsStr;
+    let bin = Path::new("/c/lease-bin");
+    let joined = |p: &std::ffi::OsString| {
+        std::env::split_paths(p)
+            .map(|e| e.display().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        joined(&path_with_bin_first(bin, Some(OsStr::new("/usr/bin:/bin")))),
+        ["/c/lease-bin", "/usr/bin", "/bin"]
+    );
+    // Already there, but not first (a login shell put the shim ahead of it):
+    // moved to the front, not repeated.
+    assert_eq!(
+        joined(&path_with_bin_first(
+            bin,
+            Some(OsStr::new("/home/x/.claude-bin:/c/lease-bin:/bin"))
+        )),
+        ["/c/lease-bin", "/home/x/.claude-bin", "/bin"]
+    );
+    assert_eq!(joined(&path_with_bin_first(bin, None)), ["/c/lease-bin"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_launched_session_is_pointed_at_the_links_only_when_they_exist_and_leases_are_on() {
+    use std::ffi::OsStr;
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path();
+    let names = |v: &[(&'static str, Option<std::ffi::OsString>)]| {
+        v.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    };
+    // No links yet: nothing is added, and a stale marker is removed.
+    let none = launch_env(Some(config), Some(OsStr::new("/bin")), true);
+    assert_eq!(none, [("GITPULSE_LEASE_BIN", None)]);
+    let hook = temp.path().join("gitpulse-hook");
+    std::fs::write(&hook, "x").unwrap();
+    ensure_links(config, &hook).unwrap();
+    let env = launch_env(Some(config), Some(OsStr::new("/bin")), true);
+    assert_eq!(names(&env), ["PATH", "GITPULSE_LEASE_BIN"]);
+    let path = env[0].1.clone().unwrap();
+    assert_eq!(
+        std::env::split_paths(&path).next().unwrap(),
+        bin_dir(config)
+    );
+    // Switched off, or no config directory: nothing is promised.
+    assert_eq!(
+        launch_env(Some(config), None, false),
+        [("GITPULSE_LEASE_BIN", None)]
+    );
+    assert_eq!(launch_env(None, None, true), [("GITPULSE_LEASE_BIN", None)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_links_are_made_repaired_by_rename_and_refused_without_a_hook_to_point_at() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path();
+    let hook = temp.path().join("gitpulse-hook");
+    let missing = ensure_links(config, &hook).unwrap_err();
+    assert!(missing.contains("does not exist"), "{missing}");
+    std::fs::write(&hook, "x").unwrap();
+    ensure_links(config, &hook).unwrap();
+    let cargo = bin_dir(config).join("cargo");
+    assert_eq!(std::fs::read_link(&cargo).unwrap(), hook);
+    assert_eq!(
+        std::fs::read_link(bin_dir(config).join("go")).unwrap(),
+        hook
+    );
+    // A link to an older install, and a plain file where a link belongs.
+    std::fs::remove_file(&cargo).unwrap();
+    std::os::unix::fs::symlink("/old/gitpulse-hook", &cargo).unwrap();
+    let go = bin_dir(config).join("go");
+    std::fs::remove_file(&go).unwrap();
+    std::fs::write(&go, "not a link").unwrap();
+    ensure_links(config, &hook).unwrap();
+    assert_eq!(std::fs::read_link(&cargo).unwrap(), hook);
+    assert_eq!(std::fs::read_link(&go).unwrap(), hook);
+    let leftovers = std::fs::read_dir(bin_dir(config)).unwrap().count();
+    assert_eq!(leftovers, 2, "no temporary link is left behind");
+}
+
 #[cfg(unix)]
 mod disk {
     use super::*;

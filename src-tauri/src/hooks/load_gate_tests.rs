@@ -38,6 +38,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         availability,
         state_dir: dir.join("state"),
         now: SystemTime::now(),
+        lease: LeaseSource::Fixed(LeaseFacts::default()),
     }
 }
 
@@ -977,4 +978,89 @@ fn a_notice_that_cannot_be_counted_is_said_every_time() {
         );
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+fn with_lease(mut g: Gathered, facts: LeaseFacts) -> Gathered {
+    g.lease = LeaseSource::Fixed(facts);
+    g
+}
+
+#[test]
+fn a_leased_build_in_a_session_without_the_wrapper_is_told_so_once_and_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = with_lease(
+        gathered(verdict(Tier::Clear, None, true), dir.path()),
+        LeaseFacts {
+            on: true,
+            not_gated: Some(
+                "this session's PATH does not start with GitPulse's lease folder".into(),
+            ),
+            full: None,
+        },
+    );
+    let first = context(&judged("cargo build", &g));
+    assert!(
+        first.contains("did NOT lease-gate this build (cargo build)"),
+        "{first}"
+    );
+    assert!(
+        first.contains("PATH does not start with GitPulse's lease folder"),
+        "{first}"
+    );
+    assert!(
+        first.contains("will not repeat for this session"),
+        "{first}"
+    );
+    // The same session, the same reason: said once.
+    assert!(judged("cargo test", &g).is_silent());
+    // A different session is told again.
+    let mut other = call("cargo build");
+    other.session_id = "00000000-aaaa-4bbb-8ccc-000000000000".into();
+    assert!(context(&judge(&other, || g.clone())).contains("did NOT lease-gate"));
+    // A command with no lease row (a package script) and a session with leases
+    // switched off are told nothing.
+    assert!(judged("npm test", &g).is_silent());
+    let off = with_lease(
+        gathered(verdict(Tier::Clear, None, true), dir.path()),
+        LeaseFacts {
+            on: false,
+            not_gated: Some("x".into()),
+            full: Some("y".into()),
+        },
+    );
+    assert!(judged("cargo build", &off).is_silent());
+}
+
+#[test]
+fn a_heavy_command_with_every_slot_held_is_told_it_will_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let facts = LeaseFacts {
+        on: true,
+        not_gated: None,
+        full: Some("cargo test in /w/a (pid 41); cargo build in /w/b (pid 42)".into()),
+    };
+    for availability in [
+        verdict(Tier::Clear, None, true),
+        verdict(Tier::Elevated, Some(Binding::Swap), true),
+        Availability::Unavailable("no snapshot".into()),
+    ] {
+        let out = judged(
+            "cargo build",
+            &with_lease(gathered(availability, dir.path()), facts.clone()),
+        );
+        let text = context(&out);
+        assert!(
+            text.contains("Every build slot is held (cargo test in /w/a (pid 41)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("600000 ms timeout or run it in the background"),
+            "{text}"
+        );
+        assert_eq!(decision_of(&out), None, "a queue is never a refusal");
+    }
+    // A refusal stays a refusal and does not grow a queue line it cannot use.
+    let refused = judged("cargo build", &with_lease(severe(dir.path()), facts));
+    assert_eq!(decision_of(&refused), Some(PermissionDecision::Deny));
+    assert!(!reason(&refused).contains("slot is held"));
 }
