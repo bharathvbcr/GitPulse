@@ -62,8 +62,8 @@ in Health. That signal is re-checked on the live process before it is sent
 | 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
 | 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
 | 1c | Shedding GitPulse's own background and reactive work | Implemented (see Admission and shedding) |
-| 1d | Leases and the priority queue ("time slots") | Not started |
-| 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases, `gitpulse_system_load`, launch-environment caps and `CLAUDE_ENV_FILE` caps are not |
+| 1d | Leases and the priority queue ("time slots"), and idle-session advice and parking | Implemented (see Build leases and idle sessions). The shim cutover is the owner's |
+| 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
 | 4 | Tree-sum supervisor and launched-orphan stop, advise by default | Not started |
@@ -662,6 +662,166 @@ loop marker: 464 and 746 µs [427 to 879]. The session brief's added line: 25 µ
 is the cost to look at; this stage is not measurable against it, and no
 end-to-end speed claim is made. The session brief's end-to-end time before and
 after was **not** measured: that needs a second, pre-change hook binary.
+
+## Build leases and idle sessions (card 1d)
+
+### Why
+
+On 2026-10-17 four to seven release builds from separate agent worktrees
+starved the window server. On 2026-11-14 sixteen runs queued for two slots of
+a shell shim while the host was healthy. The shim (`~/.claude-bin/cargo`) sees
+neither the session a build belongs to, nor the governor's verdict, nor who is
+waiting. `sysload::lease` owns that state and `gitpulse-hook` is the program a
+build goes through.
+
+### The lease
+
+A heavy `cargo` or `go` command takes one of N slots and holds it until the
+build's own process exits. State is under `<config>/GitPulse/leases/`:
+
+- `slot-1` to `slot-16`: lock files. The holder takes a POSIX record lock
+  (`fcntl F_SETLK`) on its slot and then `exec`s the build, so the build
+  process owns the lock. A record lock is not inherited by a child, so a
+  daemon a build leaves behind cannot keep the slot, and the kernel frees it
+  when the process dies, crashes included. There are 16 files for at most 8
+  slots so that a build that overflowed still has a file to hold.
+- `slot-N.json`: display only (tmp then rename). **A record without a lock is
+  never a holder; a lock without a record is a holder shown as "pid X,
+  unknown".**
+- `queue/<mono_ns>-<pid>.json`: a waiter's ticket, locked by the waiter. A
+  ticket nobody locks is dead and any reader deletes it.
+- `paths/leasepath-<session>` and `leasemiss-*` markers (see below).
+
+Service order is `(priority, slots the session already holds, enqueue time,
+pid)`, with priority GitPulse terminal, then task run, then observed session.
+A waiter takes a free slot only when its rank is below the number of free
+slots. The board reads the queue before the slots and a grant re-counts after
+it takes a file, releasing if it went over, so a race can only under-grant.
+
+A process that holds a lock loses it by closing *any* descriptor for that
+file. The code never reopens its own slot or ticket, and tests that need a held
+slot hold it from another process.
+
+### How many slots
+
+`host_load_leases.slots` (default 4, 1 to 8), then the governor's published
+verdict:
+
+| Verdict | Slots |
+|---|---|
+| Clear | the setting |
+| Elevated | `max(1, setting / 2)` |
+| Severe, or launches not admitted | none: nothing new is granted |
+| Not readable | the setting, and the wrapper says "slots not lowered for load: <why>" |
+
+A build that waited `wait_max_s` (default 1800) runs anyway ("overflow"),
+unless the verdict refuses, in which case it keeps waiting until `wait_hard_s`
+(default 14400) and then exits 75 with nothing built.
+
+### The wrapper
+
+`gitpulse-hook` run as `cargo` or `go` (symlinks the app keeps in
+`<config>/GitPulse/lease-bin`, maintained by `sysload::lease::ensure_links`),
+or `gitpulse-hook lease -- <program> ...`. It runs before the hook's own start
+deadline. It leases a `cargo` verb that compiles or tests (build, check,
+clippy, test, bench, doc, rustc, rustdoc, fix, install, nextest, llvm-cov,
+mutants, fuzz, miri, and the short aliases) and `go build` and `go test`. It
+never leases `cargo run`, `clean`, `fmt`, `metadata`, `tree` or `help`, `go
+run`, `env`, `mod` or `version`, a nested call (`GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD`), a `mac_heavy` job
+(`MAC_HEAVY_LABEL`), or anything with `host_load_leases.mode` off.
+
+A leased build gets `GITPULSE_LEASE_HELD=<slot>`, `CARGO_SLOT_HELD=gitpulse-lease`
+(so the owner's shim does not queue it a second time), and, unless the caller
+set one, `CARGO_BUILD_JOBS=max(2, cpus / slots)`. Incremental compilation stays
+on. `host_load_leases.incremental_off` (default false) sets `CARGO_INCREMENTAL=0`
+for leased builds; nothing is deleted.
+
+**A build the wrapper cannot lease still runs, and says so.** A lease directory
+it cannot use, or a verdict it cannot read, prints "did NOT lease this build:
+<why>" and writes a `leasemiss-` marker; Health counts markers from the last 15
+minutes. Health also counts running `cargo` and `go` processes that hold no
+slot ("N cargo processes hold no slot"), or says it could not count them.
+
+### How a session reaches the wrapper
+
+- GitPulse terminal and task-run PTYs for an agent launcher get `lease-bin`
+  first on `PATH` and `GITPULSE_LEASE_BIN` (`sysload::lease::launch_env`).
+- An observed Claude session gets `export PATH="<lease-bin>:$PATH"` appended to
+  `$CLAUDE_ENV_FILE` by the SessionStart hook, and a `leasepath-<session>`
+  record is kept. The command gate says once per session when builds are not
+  gated, and, when every slot is held, "Every build slot is held (...)" with
+  the ways forward.
+
+Session key: `terminal:<GITPULSE_TERMINAL_SESSION>`, `run:<GITPULSE_RUN_ID>`,
+`agent:<pid>-<start>` (the nearest agent ancestor), or `process:<ppid>-<start>`.
+
+### Health, Settings, the terminal pill
+
+Health, under Host load: **Build slots** (the effective count and why, holders
+with age, the queue, builds that ran unleased, running builds that hold no
+slot, a missing wrapper link) and **Idle sessions**. Settings, under Host load:
+Queue or Off, the slot count, and "Turn incremental compilation off for leased
+builds". The terminal pill's menu names a session in the queue ("Waiting for a
+build slot (2nd)"); when the queue cannot be read it says nothing rather than
+guess.
+
+Settings are stored as the top-level `host_load_leases` and `host_load_idle`
+keys of `tools.json`, only where a field differs from its default, read
+leniently per field (an invalid block falls back to defaults and costs no
+other setting).
+
+### Idle sessions and Park
+
+A session is **idle** only when all of these hold; any one that cannot be read
+makes it **not known**, never idle:
+
+1. the agent reported that it is waiting (a standing hook event, Ask or
+   Finished) for at least `host_load_idle.idle_after_s` (default 900);
+2. its whole process tree used under 5% of one core over the last tick (a
+   first tick, or an unreadable member, is unknown);
+3. where GitPulse holds the PTY, the terminal has been quiet for the same time;
+4. it holds no build slot and is not queued.
+
+A PTY that is quiet is not enough, and neither is a low CPU reading: an agent
+that is thinking silently reports no waiting state. Codex, observed sessions
+and sessions with no hook reports are always "not known".
+
+**Park** closes a GitPulse-launched Claude session's terminal and keeps its
+conversation so the existing reopen offer ("Resume") brings it back. It is not
+SIGSTOP. It is offered once a session has been idle for
+`host_load_idle.park_after_s` (default 3600); it is a click in Health, then a
+native system dialog that page script cannot answer, with the session checked
+again before the dialog and after it. It is **not reachable over MCP** and
+nothing is parked on its own. An observed session is never parked, and Codex
+cannot be resumed from GitPulse, so neither is offered.
+
+### Owner action: the shim cutover
+
+GitPulse does not edit `~/.claude-bin/cargo`, `~/.zshenv` or any other file
+outside its own config. Until the owner puts `<config>/GitPulse/lease-bin`
+ahead of `~/.claude-bin` on `PATH` (or has the shim delegate to
+`gitpulse-hook lease -- cargo`), builds from a shell GitPulse did not start are
+gated by the shim's own slots and not by this. `bun run mcp:doctor` has a
+`lease:` row. It asks a login shell which `cargo` it runs with the lease folder
+put first on `PATH`, the way an agent's `PATH` is set, so a profile that
+prepends another folder shows: `gated` (that is the wrapper), `shadowed by
+<path>` (another `cargo` comes first; this never reads as ok) or `absent` (the
+links do not exist yet). A login shell that could not be run is `unverifiable`,
+not ok.
+
+### Not verified
+
+- `$CLAUDE_ENV_FILE`: the documented behaviour (SessionStart hooks may append
+  `export` lines that later Bash commands see) is what the code relies on. It
+  has not been exercised against a live Claude session here.
+- The doctor's login-shell probe assumes the shell's `PATH` reflects what an
+  agent's Bash tool sees; Claude's own shell snapshot ordering was not checked.
+- Linux and Windows: the lease code is `cfg(unix)`; nothing was run there.
+- `quiet_ms` comes from the in-process terminal host. A `gitpulse-ptyd` host
+  that predates it reports none, so those sessions are "not known".
+- The idle thresholds (900 s, 3600 s, 5% of a core) are a starting guess, not
+  measured against real sessions.
+- No automatic reclaim of build caches and no automatic park exist.
 
 ## Health and the status bar
 
