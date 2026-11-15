@@ -11,18 +11,32 @@
 //! could not be read all refuse the commit with the reason. Only a person, in
 //! the commit view, can let a refused commit through ([`Policy::HumanOverride`]).
 
-use super::{note_scan_completed, parse_patch, parse_raw, RawEntry, SkipReason, Tally, ENGINE};
-use crate::engine::git_cli::{git, git_with_stdin};
+use super::{
+    note_scan_completed, parse_patch, parse_raw, BlobLines, RawEntry, SkipReason, Tally, ENGINE,
+};
+use crate::engine::git_cli::{
+    git, git_observed, git_with_stdin, OutputStream, ProcessObserver, DEFAULT_TIMEOUT,
+    MAX_DRAINED_OUTPUT_BYTES,
+};
 use crate::ipc_error::{CommandError, IpcErrorKind};
 use std::path::Path;
 use std::time::Instant;
 
-/// Largest staged binary blob read. Larger ones are skipped, and the skip
-/// refuses the commit like a finding does.
-pub const MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024;
-/// Bytes of binary blobs read per scan. Kept under the runner's 64 MiB
-/// output cap so the batch read itself cannot overflow.
-pub const BLOB_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
+/// Largest staged binary blob read in the one shared `cat-file --batch`.
+/// Larger blobs are streamed one at a time instead.
+pub const BATCH_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+/// Bytes of binary blobs read in the shared batch. Kept under the runner's
+/// 64 MiB output cap so the batch itself cannot overflow; blobs past it are
+/// streamed.
+pub const BATCH_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
+/// Bytes of binary blobs streamed per scan, never held in memory: at the
+/// engine's ~26 MB/s measured on a loaded host, about ten seconds. A blob
+/// past what is left is skipped, and the skip refuses the commit like a
+/// finding does.
+pub const STREAM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+// One streamed blob's cap is its size plus one, so the whole budget must fit
+// what the runner lets a draining read declare.
+const _: () = assert!(STREAM_BUDGET_BYTES < MAX_DRAINED_OUTPUT_BYTES as u64);
 
 /// Options every diff here runs with, so a user's diff configuration cannot
 /// change what the scan reads: no external diff driver, no textconv filter,
@@ -129,7 +143,9 @@ fn scan_blobs(repo: &Path, blobs: &[&RawEntry], tally: &mut Tally) -> Result<(),
         ));
     }
     let mut wanted: Vec<&RawEntry> = Vec::new();
-    let mut budget = BLOB_BUDGET_BYTES;
+    let mut streamed: Vec<(&RawEntry, u64)> = Vec::new();
+    let mut batch_left = BATCH_BUDGET_BYTES;
+    let mut stream_left = STREAM_BUDGET_BYTES;
     for (entry, line) in blobs.iter().zip(lines) {
         let text = String::from_utf8_lossy(line);
         let mut parts = text.split(' ');
@@ -139,18 +155,25 @@ fn scan_blobs(repo: &Path, blobs: &[&RawEntry], tally: &mut Tally) -> Result<(),
         };
         let size: Option<u64> = size.parse().ok();
         match (oid == entry.dst_oid, kind, size) {
-            (true, "blob", Some(size)) if size > MAX_BLOB_BYTES => {
+            (true, "blob", Some(size)) if size <= BATCH_BLOB_BYTES && size <= batch_left => {
+                batch_left -= size;
+                wanted.push(entry);
+            }
+            (true, "blob", Some(size)) if size <= stream_left => {
+                stream_left -= size;
+                streamed.push((entry, size));
+            }
+            (true, "blob", Some(size)) if size > STREAM_BUDGET_BYTES => {
                 tally.skip(&entry.path, SkipReason::Oversized, Some(size));
             }
-            (true, "blob", Some(size)) if size > budget => {
-                tally.skip(&entry.path, SkipReason::BudgetExhausted, Some(size));
-            }
             (true, "blob", Some(size)) => {
-                budget -= size;
-                wanted.push(entry);
+                tally.skip(&entry.path, SkipReason::BudgetExhausted, Some(size));
             }
             _ => tally.skip(&entry.path, SkipReason::Unreadable, size),
         }
+    }
+    for (entry, size) in streamed {
+        stream_blob(repo, entry, size, tally);
     }
     if wanted.is_empty() {
         return Ok(());
@@ -186,6 +209,55 @@ fn scan_blobs(repo: &Path, blobs: &[&RawEntry], tally: &mut Tally) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// Feeds a streamed blob's bytes to the line splitter as git writes them, so
+/// the run keeps none of them.
+struct StreamedBlob<'a> {
+    lines: BlobLines<'a>,
+    read: u64,
+}
+
+impl ProcessObserver for StreamedBlob<'_> {
+    fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if matches!(stream, OutputStream::Stdout) {
+            self.read += bytes.len() as u64;
+            self.lines.feed(bytes);
+        }
+    }
+
+    fn drains_stdout(&self) -> bool {
+        true
+    }
+}
+
+/// Scan one staged blob of `size` bytes as `git cat-file blob` writes it.
+/// Anything short of the whole blob, read to a clean exit, is a skip: the
+/// lines that did arrive are still scanned and their hits kept, but the blob
+/// does not count as covered.
+fn stream_blob(repo: &Path, entry: &RawEntry, size: u64, tally: &mut Tally) {
+    // One byte over the declared size, so a stream longer than git said is
+    // seen as such rather than cut to fit.
+    let cap = usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    let mut blob = StreamedBlob {
+        lines: BlobLines::new(tally, &entry.path),
+        read: 0,
+    };
+    let run = git_observed(
+        repo,
+        &["cat-file", "blob", &entry.dst_oid],
+        DEFAULT_TIMEOUT,
+        cap,
+        &mut blob,
+    );
+    let read = blob.read;
+    blob.lines.finish();
+    let whole = matches!(&run, Ok(run) if run.success && run.incomplete.is_none()) && read == size;
+    if !whole {
+        tally.skip(&entry.path, SkipReason::Unreadable, Some(size));
+    }
 }
 
 /// Who may let a refused commit through.

@@ -193,32 +193,16 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "bin5m.dat");
 
-    // Sparse 65 MiB file (> MAX_WORKING_TREE_BYTES): git commits it fine
-    // (zeros compress away), but the blob reader must refuse via stat BEFORE
-    // reading — Err with the size-limit message, never an OOM or panic.
+    // Sparse 65 MiB file (> MAX_WORKING_TREE_BYTES): committing is fine
+    // (zeros compress away, and the commit gate's secret scan streams a
+    // staged blob this size rather than holding it), but the blob reader must
+    // refuse via stat BEFORE reading — Err with the size-limit message, never
+    // an OOM or panic.
     let big = File::create(repo.path().join("big.bin")).unwrap();
     big.set_len(65 * 1024 * 1024).unwrap();
     drop(big);
-    // GitPulse's own commit path refuses it: the secret scan reads at most
-    // 8 MiB of one staged blob, and a blob it could not read is a counted
-    // skip that blocks the commit rather than one that passes unexamined.
-    let refused = GitWriter::commit_files(path, "big", &["big.bin".to_string()])
-        .expect_err("an unscannable staged blob blocks the commit");
-    assert!(
-        refused.contains("Commit blocked by the secret scan")
-            && refused.contains("could not be scanned")
-            && refused.contains("big.bin"),
-        "expected the scan's oversize refusal, got: {}",
-        refused.message()
-    );
-    assert_eq!(
-        GitReader::head_id(path).unwrap(),
-        commit,
-        "nothing was committed"
-    );
-    // The reader cap is what this test is about, so commit with git itself.
-    git_in(repo.path(), &["add", "big.bin"]);
-    git_in(repo.path(), &["commit", "-q", "-m", "big"]);
+    GitWriter::commit_files(path, "big", &["big.bin".to_string()])
+        .expect("a clean 65 MiB blob is scanned and committed");
     let started = Instant::now();
     let err = GitReader::get_file_blob(path, "big.bin", None).unwrap_err();
     assert!(

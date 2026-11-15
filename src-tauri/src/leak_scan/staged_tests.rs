@@ -1,7 +1,9 @@
 //! The commit gate against real repositories: what it blocks, what it lets
 //! through, and that a scan which could not finish never reads as clean.
 
-use super::staged::{scan_staged, Policy, MAX_BLOB_BYTES};
+use super::staged::{
+    scan_staged, Policy, BATCH_BLOB_BYTES, BATCH_BUDGET_BYTES, STREAM_BUDGET_BYTES,
+};
 use super::tests::{aws_key_id, github_pat};
 use super::{scans_completed, SkipReason};
 use crate::engine::git_writer::GitWriter;
@@ -161,20 +163,116 @@ fn a_binary_file_is_read_from_the_index() {
     assert!(GitWriter::commit(&path_of(&dir), "data", false).is_err());
 }
 
+/// A binary of `len` zero bytes (one NUL-filled "line"), with `tail` appended.
+fn binary_with_tail(len: usize, tail: &str) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    bytes.extend_from_slice(tail.as_bytes());
+    bytes
+}
+
 #[test]
-fn an_oversized_binary_is_a_skip_and_blocks() {
+fn a_binary_past_the_batch_is_streamed_and_read_to_its_end() {
     let dir = repo_with_commit();
-    let mut bytes = vec![0u8; MAX_BLOB_BYTES as usize + 1];
-    bytes[1] = b'x';
-    std::fs::write(dir.path().join("big.bin"), &bytes).unwrap();
+    let len = BATCH_BLOB_BYTES as usize + 1;
+    // The key sits after the blob's only newline, past the batch cap, so it
+    // is found only if the whole blob was read.
+    let tail = format!("\nkey={}\n", aws_key_id());
+    std::fs::write(dir.path().join("big.bin"), binary_with_tail(len, &tail)).unwrap();
     git_in(dir.path(), &["add", "big.bin"]);
     let scan = scan_staged(dir.path(), &[]).expect("scan runs");
-    assert_eq!(scan.tally.hits_total, 0);
+    assert_eq!(scan.tally.skipped_total, 0, "{:?}", scan.tally.skipped);
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally.hits);
+    assert_eq!(scan.tally.hits[0].path, "big.bin");
+    assert_eq!(scan.tally.hits[0].line, 2);
+    assert_eq!(scan.tally.bytes_scanned as usize, len + tail.len() - 2);
+    let err = GitWriter::commit(&path_of(&dir), "assets", false).expect_err("blocked");
+    assert_eq!(err.kind(), IpcErrorKind::SecretScanBlocked);
+}
+
+#[test]
+fn a_clean_binary_past_the_batch_commits_without_an_override() {
+    let dir = repo_with_commit();
+    let bytes = binary_with_tail(BATCH_BLOB_BYTES as usize * 2, "\nplain trailer\n");
+    std::fs::write(dir.path().join("asset.bin"), bytes).unwrap();
+    git_in(dir.path(), &["add", "asset.bin"]);
+    let before = head(&dir);
+    GitWriter::commit(&path_of(&dir), "asset", false).expect("a clean large binary commits");
+    assert_ne!(head(&dir), before);
+}
+
+#[test]
+fn blobs_past_the_batch_budget_are_streamed_not_skipped() {
+    let dir = repo_with_commit();
+    // Each blob fits the batch on its own size; together they overflow its
+    // budget, and the overflow is streamed. The key is in the last one.
+    // Room for the key's tail, so the last blob also fits the batch by size
+    // and is streamed only because the budget ran out.
+    let each = BATCH_BLOB_BYTES as usize - 64;
+    let count = (BATCH_BUDGET_BYTES as usize / each) + 1;
+    for n in 0..count {
+        let tail = if n + 1 == count {
+            format!("\n{}\n", github_pat())
+        } else {
+            "\n".to_string()
+        };
+        let name = format!("part{n}.bin");
+        std::fs::write(dir.path().join(&name), binary_with_tail(each, &tail)).unwrap();
+        git_in(dir.path(), &["add", &name]);
+    }
+    let scan = scan_staged(dir.path(), &[]).expect("scan runs");
+    assert_eq!(scan.tally.skipped_total, 0, "{:?}", scan.tally.skipped);
+    assert_eq!(scan.tally.inputs_scanned as usize, count);
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally.hits);
+    assert_eq!(scan.tally.hits[0].path, format!("part{}.bin", count - 1));
+}
+
+#[test]
+fn a_blob_past_the_runners_buffered_limit_is_streamed_to_its_end() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = repo_with_commit();
+    // Sparse zeros past the runner's 64 MiB buffered-output limit, then a key.
+    let len = crate::engine::git_cli::MAX_OUTPUT_BYTES as u64 + 1024 * 1024;
+    let mut file = std::fs::File::create(dir.path().join("video.bin")).unwrap();
+    file.seek(SeekFrom::Start(len)).unwrap();
+    file.write_all(format!("\nkey={}\n", aws_key_id()).as_bytes())
+        .unwrap();
+    drop(file);
+    git_in(dir.path(), &["add", "video.bin"]);
+    let scan = scan_staged(dir.path(), &[]).expect("scan runs");
+    assert_eq!(scan.tally.skipped_total, 0, "{:?}", scan.tally.skipped);
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally.hits);
+    assert_eq!(scan.tally.hits[0].line, 2);
+}
+
+#[test]
+fn a_binary_past_the_stream_budget_is_a_skip_and_blocks() {
+    let dir = repo_with_commit();
+    // Sparse, so the fixture costs no disk: git still has to hash it.
+    let big = std::fs::File::create(dir.path().join("huge.bin")).unwrap();
+    big.set_len(STREAM_BUDGET_BYTES + 1).unwrap();
+    drop(big);
+    git_in(dir.path(), &["add", "huge.bin"]);
+    let scan = scan_staged(dir.path(), &[]).expect("scan runs");
     assert_eq!(scan.tally.skipped_total, 1);
     assert_eq!(scan.tally.skipped[0].reason, SkipReason::Oversized);
     assert!(!scan.tally.is_clean(), "a file nobody read is not clean");
     let err = GitWriter::commit(&path_of(&dir), "assets", false).expect_err("blocked");
-    assert!(err.message().contains("big.bin"), "{}", err.message());
+    assert!(err.message().contains("huge.bin"), "{}", err.message());
+}
+
+#[test]
+fn a_streamed_blob_git_could_not_produce_is_a_skip() {
+    let dir = repo_with_commit();
+    let bytes = binary_with_tail(BATCH_BLOB_BYTES as usize + 1, "\n");
+    std::fs::write(dir.path().join("big.bin"), bytes).unwrap();
+    git_in(dir.path(), &["add", "big.bin"]);
+    // Only the streamed read passes `blob` as an argument.
+    let scan = crate::engine::git_cli::with_forced_spawn_failure_of("blob", || {
+        scan_staged(dir.path(), &[]).expect("the scan still reaches a verdict")
+    });
+    assert_eq!(scan.tally.skipped_total, 1, "{:?}", scan.tally);
+    assert_eq!(scan.tally.skipped[0].reason, SkipReason::Unreadable);
+    assert!(!scan.tally.is_clean());
 }
 
 #[test]

@@ -14,7 +14,10 @@
 //!   it. The ship target for this row is about 50 ms.
 //! * `staged with binary`: the same change plus one staged 256 KiB binary
 //!   blob, which adds the `cat-file --batch-check` / `--batch` reads.
-//! * `engine 4 MiB`: `Tally::scan_blob` over generated mixed text (code,
+//! * `staged with streamed 24 MiB binary`: the typical change plus one 24 MiB
+//!   binary, past the batch cap, read through `git cat-file blob` into the
+//!   line splitter without being held.
+//! * `engine 4 MiB`:`Tally::scan_blob` over generated mixed text (code,
 //!   lockfile integrity hashes, UUIDs, base64, prose) with one planted key per
 //!   1,000 lines. Bytes per second through `dc_redact::find_secret`.
 //! * `parse_patch 4 MiB`: the strict `-U0` patch parser alone.
@@ -129,11 +132,20 @@ fn main() {
     }
     std::fs::write(Path::new(&with_binary).join("asset.bin"), &blob).unwrap();
     git(Path::new(&with_binary), &["add", "asset.bin"]);
+    // Past the batch cap, so it goes through the streamed read.
+    let with_streamed = staged_repo(&temp.path().join("streamed"), 24, 42);
+    let mut large = Vec::with_capacity(24 << 20);
+    while large.len() < 24 << 20 {
+        large.extend_from_slice(&blob);
+    }
+    std::fs::write(Path::new(&with_streamed).join("video.bin"), &large).unwrap();
+    git(Path::new(&with_streamed), &["add", "video.bin"]);
     let staged_rows = interleave(
         vec![
             staged_case("staged typical", &typical),
             staged_case("staged typical (null pair)", &typical),
             staged_case("staged with binary", &with_binary),
+            staged_case("staged with streamed 24 MiB binary", &with_streamed),
         ],
         opts.samples(41),
         opts.warmup(3),
@@ -170,8 +182,9 @@ fn main() {
 
     report.note(
         "staged rows: a generated repository with 24 staged files of 42 lines each (~1,000 added \
-         lines), one with an extra staged 256 KiB binary; scan_staged spawns git (raw listing, \
-         patch, and for the binary row cat-file twice); production spawn rate lifted. Engine rows: \
+         lines), one with an extra staged 256 KiB binary, one with an extra 24 MiB binary that is \
+         streamed; scan_staged spawns git (raw listing, patch, cat-file for binaries); production \
+         spawn rate lifted. Engine rows: \
          generated 4 MiB mixed text with a planted key every 1,000 lines, and a 64-file, \
          700-line-per-file -U0 patch"
             .to_string(),

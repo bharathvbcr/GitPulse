@@ -105,27 +105,33 @@ impl Tally {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         self.lines_scanned += 1;
         self.bytes_scanned += line.len() as u64;
-        let text = String::from_utf8_lossy(line);
-        if let Some(found) = dc_redact::find_secret(&text) {
-            self.hits_total += 1;
-            if self.hits.len() < MAX_REPORTED_HITS {
-                self.hits.push(Hit {
-                    rule: found.name,
-                    path: path.to_string(),
-                    line: line_no,
-                });
-            }
-        }
+        self.detect(path, line_no, line);
     }
 
-    /// Scan a whole file's bytes, numbering lines from 1.
-    pub fn scan_blob(&mut self, path: &str, bytes: &[u8]) {
-        self.inputs_scanned += 1;
-        let mut line_no: u32 = 0;
-        for line in bytes.split(|b| *b == b'\n') {
-            line_no = line_no.saturating_add(1);
-            self.scan_line(path, line_no, line);
+    /// Run the detector over `bytes` as one line and record a hit. True when
+    /// it matched.
+    fn detect(&mut self, path: &str, line_no: u32, bytes: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(bytes);
+        let Some(found) = dc_redact::find_secret(&text) else {
+            return false;
+        };
+        self.hits_total += 1;
+        if self.hits.len() < MAX_REPORTED_HITS {
+            self.hits.push(Hit {
+                rule: found.name,
+                path: path.to_string(),
+                line: line_no,
+            });
         }
+        true
+    }
+
+    /// Scan a whole file's bytes, numbering lines from 1. The same splitter
+    /// a streamed blob goes through, fed in one piece.
+    pub fn scan_blob(&mut self, path: &str, bytes: &[u8]) {
+        let mut lines = BlobLines::new(self, path);
+        lines.feed(bytes);
+        lines.finish();
     }
 
     pub fn skip(&mut self, path: &str, reason: SkipReason, bytes: Option<u64>) {
@@ -137,6 +143,100 @@ impl Tally {
                 bytes,
             });
         }
+    }
+}
+
+/// Most bytes of one line handed to the detector at once. Binary files can be
+/// one "line" tens of megabytes long; a longer line is read in windows of
+/// this size, each repeating the last [`WINDOW_OVERLAP`] bytes of the one
+/// before, so memory stays bounded and a credential across a window edge is
+/// still whole in one window.
+pub const LINE_WINDOW: usize = 64 * 1024;
+/// Bytes each window repeats from the previous one. Longer than any shape in
+/// the table, PEM header lines included.
+pub const WINDOW_OVERLAP: usize = 1024;
+
+/// A file's bytes split into numbered lines as they arrive, in any number of
+/// pieces. The result does not depend on where the pieces were cut: windows
+/// are placed from the start of each line, never from a chunk edge. A line
+/// counts once in `lines_scanned`, and its bytes once in `bytes_scanned`,
+/// however many windows read it, and gives at most one hit, as a short line
+/// does.
+pub struct BlobLines<'a> {
+    tally: &'a mut Tally,
+    path: &'a str,
+    line_no: u32,
+    /// The current line's bytes not yet read by a complete window: everything
+    /// since the last window's start plus its overlap.
+    pending: Vec<u8>,
+    /// Bytes of the current line already counted in `bytes_scanned`.
+    counted: usize,
+    /// The current line already gave a hit.
+    hit: bool,
+}
+
+impl<'a> BlobLines<'a> {
+    pub fn new(tally: &'a mut Tally, path: &'a str) -> Self {
+        tally.inputs_scanned += 1;
+        Self {
+            tally,
+            path,
+            line_no: 1,
+            pending: Vec::new(),
+            counted: 0,
+            hit: false,
+        }
+    }
+
+    pub fn feed(&mut self, mut bytes: &[u8]) {
+        while let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            let (line, rest) = (&bytes[..newline], &bytes[newline + 1..]);
+            if self.pending.is_empty() && self.counted == 0 && line.len() <= LINE_WINDOW {
+                // The common case: a whole short line in one piece, read in
+                // place without copying.
+                self.tally.scan_line(self.path, self.line_no, line);
+            } else {
+                self.take(line);
+                self.end_line();
+            }
+            self.line_no = self.line_no.saturating_add(1);
+            bytes = rest;
+        }
+        self.take(bytes);
+    }
+
+    /// Read the last line, which has no newline after it (empty when the file
+    /// ends with one).
+    pub fn finish(mut self) {
+        self.end_line();
+    }
+
+    /// Add part of the current line, reading every window it completes.
+    fn take(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        while self.pending.len() > LINE_WINDOW {
+            if !self.hit {
+                self.hit = self
+                    .tally
+                    .detect(self.path, self.line_no, &self.pending[..LINE_WINDOW]);
+            }
+            let step = LINE_WINDOW - WINDOW_OVERLAP;
+            self.counted += step;
+            self.pending.drain(..step);
+        }
+    }
+
+    /// Read what is left of the current line and count it once.
+    fn end_line(&mut self) {
+        let rest = self.pending.strip_suffix(b"\r").unwrap_or(&self.pending);
+        if !self.hit {
+            self.tally.detect(self.path, self.line_no, rest);
+        }
+        self.tally.lines_scanned += 1;
+        self.tally.bytes_scanned += (self.counted + rest.len()) as u64;
+        self.pending.clear();
+        self.counted = 0;
+        self.hit = false;
     }
 }
 

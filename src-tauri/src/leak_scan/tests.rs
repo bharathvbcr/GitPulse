@@ -88,6 +88,80 @@ fn a_blob_is_numbered_from_one_and_counts_every_line() {
     assert_eq!(tally.hits[0].line, 3);
 }
 
+/// A blob with lines long enough to be windowed, keys placed across window
+/// edges and inside overlaps, CRLF endings and a short-line tail.
+fn windowed_corpus() -> Vec<u8> {
+    let step = LINE_WINDOW - WINDOW_OVERLAP;
+    let mut blob = Vec::new();
+    // Line 1: a key across the first window's edge.
+    let mut line = vec![b' '; LINE_WINDOW * 3];
+    let key = format!(" {} ", github_pat());
+    let at = LINE_WINDOW - 10;
+    line[at..at + key.len()].copy_from_slice(key.as_bytes());
+    blob.extend_from_slice(&line);
+    blob.extend_from_slice(b"\r\n");
+    // Line 2: a key wholly inside an overlap, so two windows hold it.
+    let mut line = vec![b' '; LINE_WINDOW * 2];
+    let key = format!(" {} ", aws_key_id());
+    let at = step + 100;
+    line[at..at + key.len()].copy_from_slice(key.as_bytes());
+    blob.extend_from_slice(&line);
+    blob.push(b'\n');
+    // Line 3: long and clean. Line 4: short with a key. Line 5: no newline.
+    blob.extend_from_slice(&vec![b'z'; LINE_WINDOW + 1]);
+    blob.push(b'\n');
+    blob.extend_from_slice(format!("k={}\n", github_pat()).as_bytes());
+    blob.extend_from_slice(b"tail");
+    blob
+}
+
+#[test]
+fn a_long_line_is_read_in_windows_that_keep_a_key_at_the_edge_whole() {
+    let blob = windowed_corpus();
+    let mut tally = Tally::default();
+    tally.scan_blob("big.bin", &blob);
+    let lines: Vec<u32> = tally.hits.iter().map(|h| h.line).collect();
+    assert_eq!(
+        lines,
+        [1, 2, 4],
+        "one hit per line, a key in two windows counted once"
+    );
+    assert_eq!(tally.lines_scanned, 5);
+    let line_bytes: usize = blob
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l).len())
+        .sum();
+    assert_eq!(
+        tally.bytes_scanned as usize, line_bytes,
+        "each byte counted once, overlaps included"
+    );
+}
+
+#[test]
+fn where_a_stream_is_cut_never_changes_the_verdict() {
+    let blob = windowed_corpus();
+    let mut whole = Tally::default();
+    whole.scan_blob("big.bin", &blob);
+    // Seeded xorshift: chunk sizes from 1 byte to past a window.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    for _round in 0..24 {
+        let mut pieces = Tally::default();
+        let mut lines = BlobLines::new(&mut pieces, "big.bin");
+        let mut at = 0;
+        while at < blob.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let size = 1 + (state as usize) % (LINE_WINDOW * 2);
+            let end = (at + size).min(blob.len());
+            lines.feed(&blob[at..end]);
+            at = end;
+        }
+        lines.finish();
+        assert_eq!(pieces, whole);
+    }
+}
+
 #[test]
 fn a_skip_is_never_clean() {
     let mut tally = Tally::default();
