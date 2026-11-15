@@ -141,10 +141,12 @@ pub(crate) fn refusal_message_at(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low{by}"
         )),
-        Refusal::Pressure { reactive } => deferred(format!(
-            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
-             pressure",
-            if reactive { "reactive" } else { "background" }
+        Refusal::Pressure { reactive, cause } => deferred(format!(
+            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}",
+            if reactive { "reactive" } else { "background" },
+            cause
+                .unwrap_or(crate::sysload::Binding::MemoryPressure)
+                .cause_phrase()
         )),
     }
 }
@@ -585,11 +587,13 @@ pub(crate) enum Refusal {
     /// Background work refused without waiting: the rate budget was at or
     /// below the reserve kept for reactive reads.
     Shed,
-    /// Refused without waiting because the host is under memory pressure and
+    /// Refused without waiting because the host is under load (memory, swap or disk: see `cause`) and
     /// this class is shed while it lasts (`sysload::governor`). Carries the
     /// deferral marker, so the frontend retries it once the pressure clears.
     Pressure {
         reactive: bool,
+        /// What put the host in the tier that sheds, so the message names it.
+        cause: Option<crate::sysload::Binding>,
     },
     /// No concurrency slot became free before the command's own deadline.
     TimedOut {
@@ -1121,6 +1125,7 @@ impl SpawnGate {
             if (background && shed.background) || (!background && shed.reactive) {
                 let refusal = Refusal::Pressure {
                     reactive: !background,
+                    cause: shed.cause,
                 };
                 self.state
                     .lock()

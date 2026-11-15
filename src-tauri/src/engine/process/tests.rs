@@ -1,6 +1,7 @@
 use super::*;
 use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
+use crate::sysload::Binding;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -290,15 +291,39 @@ fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resume
     drop(calm);
 
     let warn = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Warn));
-    assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+    assert_eq!(
+        background(),
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
     assert_eq!((reactive(), interactive()), (None, None));
     drop(warn);
 
     let critical = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
-    assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
-    assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+    assert_eq!(
+        background(),
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
+    assert_eq!(
+        reactive(),
+        Some(Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
     assert_eq!(interactive(), None, "a click is never shed");
-    let message = refusal_message("git status", Refusal::Pressure { reactive: true });
+    let message = refusal_message(
+        "git status",
+        Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::MemoryPressure),
+        },
+    );
     assert!(
         is_deferred_under_load(message.message()),
         "{message}",
@@ -319,8 +344,38 @@ fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resume
         compressor_thrash: true,
         ..GovernorInput::test_pressure(Level::Normal)
     });
-    assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+    assert_eq!(
+        reactive(),
+        Some(Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::CompressorThrash)
+        })
+    );
     drop(thrash);
+
+    // A cause that is not memory is named, not called memory pressure.
+    let swap = crate::sysload::inject_governor(GovernorInput {
+        readings: crate::sysload::Readings {
+            swap_used: crate::sysload::Reading::Value(60 << 30),
+            ..crate::sysload::Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    });
+    let cause = background();
+    assert_eq!(
+        cause,
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::Swap)
+        })
+    );
+    let message = refusal_message("git status", cause.unwrap());
+    assert!(
+        message.message().contains("swap") && !message.message().contains("memory pressure"),
+        "{}",
+        message.message()
+    );
+    drop(swap);
 
     // Cleared: everything resumes.
     let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
@@ -397,7 +452,10 @@ fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
         for refusal in [
             Refusal::Shed,
             Refusal::Refused { waited },
-            Refusal::Pressure { reactive: true },
+            Refusal::Pressure {
+                reactive: true,
+                cause: None,
+            },
         ] {
             let message = refusal_message(label, refusal);
             assert!(

@@ -739,8 +739,14 @@ fn refusal_tail_is_single_line_json_safe_and_classified() {
             waited: Duration::from_millis(2_013),
         },
         Refusal::Shed,
-        Refusal::Pressure { reactive: true },
-        Refusal::Pressure { reactive: false },
+        Refusal::Pressure {
+            reactive: true,
+            cause: Some(crate::sysload::Binding::MemoryPressure),
+        },
+        Refusal::Pressure {
+            reactive: false,
+            cause: Some(crate::sysload::Binding::Swap),
+        },
         Refusal::Cancelled,
         Refusal::TimedOut {
             deadline: Duration::from_secs(3),
@@ -778,7 +784,10 @@ fn refusal_tail_is_single_line_json_safe_and_classified() {
     }
     // Pressure and Cancelled/TimedOut never carry the tail.
     for refusal in [
-        Refusal::Pressure { reactive: true },
+        Refusal::Pressure {
+            reactive: true,
+            cause: None,
+        },
         Refusal::Cancelled,
         Refusal::TimedOut {
             deadline: Duration::from_secs(1),
