@@ -123,6 +123,8 @@
     "host-load-battery",
     "host-load-disk",
   ] as const;
+  // The host-load input id behind the compressor row: a stored threshold key, not copy.
+  const COMPRESSOR_INPUT = "compressor_segments" as const;
   const CLI_NAMES = { codeMap: "devmap", policy: "manvi" } as const;
 
   let activeSection = $state<SettingsSectionId>("appearance");
@@ -1202,7 +1204,7 @@
                     <HostLoadInputSetting input="swap" active={isOpen && activeSection === "agents"} />
                   </div>
                   <div data-setting="host-load-compressor" hidden={!shown("host-load-compressor")}>
-                    <HostLoadInputSetting input="compressor_segments" active={isOpen && activeSection === "agents"} />
+                    <HostLoadInputSetting input={COMPRESSOR_INPUT} active={isOpen && activeSection === "agents"} />
                   </div>
                   <div data-setting="host-load-cpu" hidden={!shown("host-load-cpu")}>
                     <HostLoadInputSetting input="load" active={isOpen && activeSection === "agents"} />

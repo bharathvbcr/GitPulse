@@ -17,13 +17,13 @@
     ensureHostLoadSettings,
     hostLoadSettings,
     hostLoadStatus,
-    refreshHostLoad,
     updateHostLoadSettings,
     type InputMode,
     type Rule,
     type Thresholds,
   } from "../stores/hostLoadStore";
   import { MODE_LABELS, liveReading, ruleProblem, specOf, type InputId } from "../health/hostLoadInputs";
+  import { pollHostLoad } from "../health/hostLoadPoll";
   import { loadOnce } from "../settings/loadOnce";
 
   let { input, active = true }: { input: InputId; active?: boolean } = $props();
@@ -56,9 +56,7 @@
   // row is on screen so "now" does not go stale. The read is single-flight.
   $effect(() => {
     if (!active) return;
-    void refreshHostLoad().catch(() => undefined);
-    const timer = setInterval(() => void refreshHostLoad().catch(() => undefined), 5000);
-    return () => clearInterval(timer);
+    return pollHostLoad();
   });
 
   async function save(next: Thresholds[InputId], rejected?: () => void) {
@@ -106,7 +104,7 @@
     {/if}
     <select
       id={`gp-host-load-${input}`}
-      class="gp-field text-meta" data-size="sm"
+      class="gp-select text-meta" data-size="sm"
       data-testid={`host-load-input-${input}-mode`}
       disabled={busy || !settings || !settings.enabled}
       value={stored?.mode ?? "off"}

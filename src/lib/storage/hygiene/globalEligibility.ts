@@ -47,7 +47,7 @@ export function coverageNotice(inventory: CleanerInventory | null): string | nul
  * row the policy looked at and turned down.
  */
 export function itemStatusLabel(status: string): string {
-  if (status === "unexamined") return "could not examine";
+  if (status === "unexamined") return "couldn't examine";
   return status.replaceAll("_", " ");
 }
 
@@ -60,6 +60,6 @@ export function runRowsSummary(run: CleanerRun): string {
   const listed = `${run.items.length} targets reported`;
   const parts = [listed];
   if (run.unlisted) parts.push(`${run.unlisted} more not listed`);
-  if (run.unexamined) parts.push(`${run.unexamined} could not be examined under load`);
+  if (run.unexamined) parts.push(`${run.unexamined} couldn't be examined under load`);
   return parts.join(" · ");
 }

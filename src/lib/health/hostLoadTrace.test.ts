@@ -76,7 +76,7 @@ describe("previousBootLines", () => {
 
   it("names a trace that could not be read instead of showing an empty one", () => {
     expect(previousBootLines(previous({ error: "short file", records: [], ended_wall_s: null }))).toEqual([
-      "The last boot's trace could not be read: short file.",
+      "The last boot's trace couldn't be read: short file.",
     ]);
   });
 

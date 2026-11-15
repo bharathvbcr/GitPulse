@@ -321,7 +321,7 @@ const readOrUnknown = <T>(value: T | null, format: (value: T) => string): string
  */
 export function previousBootLines(previous: PreviousBoot): string[] {
   if (previous.error !== null) {
-    return [`The last boot's trace could not be read: ${previous.error}.`];
+    return [`The last boot's trace couldn't be read: ${previous.error}.`];
   }
   if (previous.records.length === 0 || previous.ended_wall_s === null) {
     return ["The last boot's trace holds no readings."];

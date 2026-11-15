@@ -73,13 +73,13 @@ describe("run rows", () => {
     repositories: 3, partial: false, issues: [], items: [], ...over,
   });
   it("never shows a check the host shed as a refusal", () => {
-    expect(itemStatusLabel("unexamined")).toBe("could not examine");
+    expect(itemStatusLabel("unexamined")).toBe("couldn't examine");
     expect(itemStatusLabel("completed_with_skips")).toBe("completed with skips");
   });
   it("counts rows a run kept and the ones it could not list", () => {
     expect(runRowsSummary(run())).toBe("0 targets reported");
     expect(runRowsSummary(run({ unlisted: 70, unexamined: 14 }))).toBe(
-      "0 targets reported · 70 more not listed · 14 could not be examined under load",
+      "0 targets reported · 70 more not listed · 14 couldn't be examined under load",
     );
   });
 });

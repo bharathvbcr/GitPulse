@@ -469,10 +469,10 @@ export async function runHostLoadChecks(ctx) {
     check("one dropped reading reads as singular", () =>
       has(previous(), "1 reading was dropped") && !has(previous(), "1 readings"));
 
-    // The boot's trace could not be read: the reason, in the warning colour, and no table.
+    // The boot's trace couldn't be read: the reason, in the warning colour, and no table.
     await show({ ...hostLoadStatusFixture(), previous_boot: { ...previousBootFixture(0), error: "the ring file is truncated", records: [] }, problems: [] });
     check("an unreadable previous boot says why and shows no table or peaks", () =>
-      has(previous(), "The last boot's trace could not be read: the ring file is truncated.")
+      has(previous(), "The last boot's trace couldn't be read: the ring file is truncated.")
         && previous().querySelector("tbody") === null && !has(previous(), "Swap used, at most")
         && previous().querySelector("p.text-warn") !== null);
 
