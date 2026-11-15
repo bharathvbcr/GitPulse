@@ -2472,6 +2472,10 @@ mod driver_tests;
 mod head_cache_adversarial_tests;
 
 #[cfg(test)]
+#[path = "verification_memo_tests.rs"]
+mod verification_memo_tests;
+
+#[cfg(test)]
 #[path = "intake_merge_tests.rs"]
 mod merge_tests;
 

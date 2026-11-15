@@ -1757,3 +1757,76 @@ fn a_host_that_is_closing_refuses_the_wait() {
     assert!(result.unwrap_err().contains("GitPulse closed"));
     assert!(fake.starts.borrow().is_empty());
 }
+
+/// Five sweeps and a board read, each on its own connection, over a store
+/// nobody writes to between them: the evidence table is walked once.
+#[test]
+fn sweeps_and_a_board_read_of_an_unchanged_store_walk_it_once() {
+    use crate::workbench::verification_gate::memo::seam;
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let path = std::path::PathBuf::from(store.connection().path().unwrap());
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    seam::advance_clock(Duration::from_secs(3));
+    for _ in 0..5 {
+        driver.sweep(&store, &fake);
+    }
+    let board = Store::open_readonly(&path).unwrap();
+    status_batch(&board, &fake, std::slice::from_ref(&id)).unwrap();
+    assert_eq!(seam::walks(&path), 1, "five sweeps and one board read");
+}
+
+/// The driver's own connection follows the profile: it is reopened when the
+/// file at the path is another file, and not held for one that is gone.
+#[test]
+fn the_driver_reopens_a_store_that_was_replaced() {
+    use crate::workbench::verification_driver::driver_store;
+    let verdict_of = |store: &Store| {
+        gate::latest(store, "a")
+            .unwrap()
+            .map(|record| record.outcome)
+    };
+    let put = |store: &Store, outcome: &str| {
+        store
+            .evidence_append(
+                gate::EVIDENCE_TYPE,
+                Some("a"),
+                None,
+                None,
+                &format!(r#"{{"item_id":"a","state":"settled","outcome":"{outcome}"}}"#),
+            )
+            .unwrap();
+    };
+    let (dir, path) = profile();
+    {
+        put(&Store::open(&path).unwrap(), "passed");
+    }
+    let mut held = None;
+    for _ in 0..2 {
+        // Same file both times: the connection is kept, not reopened.
+        let store = driver_store(Some(path.clone()), &mut held).expect("opens");
+        assert_eq!(verdict_of(store).as_deref(), Some("passed"));
+    }
+    let replacement = dir.path().join("replacement.sqlite");
+    {
+        put(&Store::open(&replacement).unwrap(), "failed");
+    }
+    // The held connection keeps the old file open; its log and index go with
+    // it so the replacement is not opened against them.
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.clone().into_os_string();
+        companion.push(suffix);
+        let _ = std::fs::remove_file(companion);
+    }
+    std::fs::rename(&replacement, &path).unwrap();
+    let after = driver_store(Some(path.clone()), &mut held).expect("reopens");
+    assert_eq!(
+        verdict_of(after).as_deref(),
+        Some("failed"),
+        "the connection still read the file that was replaced"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(driver_store(Some(path.clone()), &mut held).is_none());
+    assert!(driver_store(None, &mut held).is_none());
+}

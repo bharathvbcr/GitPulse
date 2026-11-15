@@ -20,6 +20,8 @@
 //! check that could not run (unreadable store, unreadable head, unparseable
 //! record) is a hold that says so, never a quiet pass.
 
+pub(crate) mod memo;
+
 use super::intake::resolve;
 use super::WorkbenchError;
 use crate::ipc_error::CommandError;
@@ -27,6 +29,7 @@ use dc_store::Store;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// The dc-store evidence type Manvi stores a verification record under.
@@ -97,8 +100,14 @@ pub(crate) enum Gate {
 /// 10,001 rows, each decoded) to use the first one, and called a verdict
 /// behind a page of other evidence "too long to establish". A card never
 /// verified still walks the whole table (`evidence` has no index on
-/// `task_id`); ask [`latest_many`] for more than one card.
+/// `task_id`); ask [`latest_many`] for more than one card. When
+/// [`latest_many`] holds an answer that is still exact, that answer is used
+/// and nothing is walked.
 pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, String> {
+    // A held answer that is still exact is the same newest row without the walk.
+    if let Some(held) = memo::held_text(store, item_id) {
+        return held.map(|data| parse_record(&data)).transpose();
+    }
     store
         .connection()
         .query_row(
@@ -128,37 +137,26 @@ fn parse_record(data: &str) -> Result<Record, String> {
 /// driver for every held card on every sweep. `evidence` has no index on
 /// `task_id` (dc-store's schema), so [`latest`] per card was one walk of the
 /// whole table per card: 4 s for 60 cards on an 82k-row profile, holding a
-/// storage slot throughout. This is one walk for them all.
+/// storage slot throughout. This is one walk for them all, and the walk's
+/// answer is kept (see [`Memo`]) for as long as the store files are provably
+/// as they were: a store nobody wrote to is not walked again.
 pub(crate) fn latest_many(
     store: &Store,
     item_ids: &[String],
 ) -> Result<std::collections::HashMap<String, Record>, String> {
-    let mut found = std::collections::HashMap::new();
     if item_ids.is_empty() {
-        return Ok(found);
+        return Ok(std::collections::HashMap::new());
     }
-    let unreadable =
-        |e: rusqlite::Error| format!("the verification evidence could not be read: {e}");
-    let ids = serde_json::to_string(item_ids).map_err(|e| e.to_string())?;
-    let mut statement = store
-        .connection()
-        .prepare(
-            "SELECT e.task_id, e.data_json FROM evidence e
-             JOIN (SELECT MAX(id) AS id FROM evidence
-                   WHERE type = ?1 AND task_id IN (SELECT value FROM json_each(?2))
-                   GROUP BY task_id) newest ON newest.id = e.id",
-        )
-        .map_err(unreadable)?;
-    let rows = statement
-        .query_map(rusqlite::params![EVIDENCE_TYPE, ids], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(unreadable)?;
-    for row in rows {
-        let (task, data) = row.map_err(unreadable)?;
-        found.insert(task, parse_record(&data)?);
-    }
-    Ok(found)
+    let wanted: HashSet<&str> = item_ids.iter().map(String::as_str).collect();
+    memo::with_newest(store, &wanted, |newest| {
+        let mut found = std::collections::HashMap::new();
+        for id in item_ids {
+            if let Some(data) = newest.get(id) {
+                found.insert(id.clone(), parse_record(data)?);
+            }
+        }
+        Ok(found)
+    })?
 }
 
 /// The gate for a claim of `done` on `item_id`, a task of the repository whose

@@ -1037,6 +1037,31 @@ impl Backend for HostBackend {
     }
 }
 
+/// The driver's own connection to the profile at `path`, kept for as long as
+/// the file there is the file it opened.
+///
+/// A profile replaced on disk (restored, or a new file moved over it) leaves a
+/// long-lived connection reading the old file, and a verdict read through it
+/// would be an answer about a store that is gone. The file's identity is
+/// checked on every call, which is one `stat`.
+pub(crate) fn driver_store(
+    path: Option<std::path::PathBuf>,
+    held: &mut Option<(Store, gate::memo::FileIdentity)>,
+) -> Option<&Store> {
+    let current = path.as_deref().and_then(gate::memo::FileIdentity::of);
+    if held
+        .as_ref()
+        .is_some_and(|(_, opened)| Some(*opened) != current)
+    {
+        *held = None;
+    }
+    if held.is_none() {
+        let identity = current?;
+        *held = Store::open(path?).ok().map(|store| (store, identity));
+    }
+    held.as_ref().map(|(store, _)| store)
+}
+
 /// Start the driver thread. A thread that fails to start costs automatic
 /// verification only: the Verify action still works.
 pub(crate) fn install(host: WorkbenchState) {
@@ -1045,16 +1070,9 @@ pub(crate) fn install(host: WorkbenchState) {
         let mut driver = Driver::default();
         // Its own connection: a sweep waits on the sidecar, and the
         // board's reads must not queue behind that.
-        let mut store: Option<Store> = None;
+        let mut own: Option<(Store, gate::memo::FileIdentity)> = None;
         while host.check_open().is_ok() {
-            if store.is_none() {
-                store = host
-                    .profile_path()
-                    .ok()
-                    .filter(|path| path.exists())
-                    .and_then(|path| Store::open(&path).ok());
-            }
-            if let Some(open) = &store {
+            if let Some(open) = driver_store(host.profile_path().ok(), &mut own) {
                 let report = driver.sweep(open, &backend);
                 if report != Report::default() {
                     log::info!(target: "workbench", "verification driver: {report:?}");
