@@ -405,6 +405,8 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
             dir: host_dir.path().to_path_buf(),
             binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
             idle_exit: Some(std::time::Duration::from_secs(3)),
+            // Passed to gitpulse-ptyd as GITPULSE_LOG_DIR (logging::LOG_DIR_ENV),
+            // so the host logs into this temp directory, never the user's real log.
             log_dir: Some(host_dir.path().join("logs")),
         },
     );

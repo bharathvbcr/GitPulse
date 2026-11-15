@@ -2,8 +2,9 @@
 //! cross-surface recovery offers, and single Rust resume-argv owner
 //! (`S2-03`, `S2-05`, `S2-07`).
 
-#[path = "../src/test_support/env.rs"]
-mod hermetic_env;
+// `common` also loads `src/test_support/env.rs`, the hermetic environment this
+// suite relies on for HOME, so it is not declared a second time here.
+mod common;
 
 use std::collections::HashSet;
 use std::fs;
@@ -58,6 +59,7 @@ fn spawn_spec(
 
 #[test]
 fn s2_03_sigkill_relaunch_marks_running_row_lost() {
+    common::unmetered_spawns();
     let tmp = TempDir::new().unwrap();
     let ledger_path = tmp.path().join("terminal-sessions.v1.jsonl");
     let repo = tmp.path().join("repo");
@@ -94,6 +96,7 @@ fn s2_03_sigkill_relaunch_marks_running_row_lost() {
 
 #[test]
 fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
+    common::unmetered_spawns();
     let tmp = TempDir::new().unwrap();
     let ledger_path = tmp.path().join("terminal-sessions.v1.jsonl");
     let repo = tmp.path().join("repo");
@@ -207,6 +210,7 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
 
 #[test]
 fn s2_03_gone_cwd_clean_exit_bounds_and_corrupt_row() {
+    common::unmetered_spawns();
     let tmp = TempDir::new().unwrap();
     let ledger_path = tmp.path().join("terminal-sessions.v1.jsonl");
     let repo = tmp.path().join("repo");
@@ -329,6 +333,7 @@ fn s2_03_gone_cwd_clean_exit_bounds_and_corrupt_row() {
 
 #[test]
 fn s2_05_persists_across_reloads_until_reopened_or_dismissed() {
+    common::unmetered_spawns();
     let tmp = TempDir::new().unwrap();
     let ledger_path = tmp.path().join("terminal-sessions.v1.jsonl");
     let repo = tmp.path().join("repo");
@@ -394,6 +399,7 @@ fn s2_05_persists_across_reloads_until_reopened_or_dismissed() {
 
 #[test]
 fn s2_07_refuses_raw_flags_checks_locators_and_blocks_hook_argv() {
+    common::unmetered_spawns();
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path();
     let sid = "6f0a6d1e-1111-4222-8333-444455550041";
