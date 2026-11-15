@@ -249,6 +249,17 @@ export function isStale(report: SecretsReport, nowMs: number): boolean {
   return isScanStale(report.scanned_at_ms, nowMs);
 }
 
+/** The backend's wording for a scan a newer one replaced (`SUPERSEDED` in secrets/run.rs). */
+export const SUPERSEDED_ERROR = "superseded by a newer secrets scan";
+
+/**
+ * A scan that was replaced, not one that failed: nothing is wrong with the
+ * repository or the scanner, so it earns no back-off.
+ */
+export function isSuperseded(report: SecretsReport): boolean {
+  return !report.ok && report.error === SUPERSEDED_ERROR;
+}
+
 /**
  * Whether `incoming` should replace `cached` in the per-repo cache. Only a
  * scan that ran (has a finish time) is cached, and an older scan landing

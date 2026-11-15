@@ -212,8 +212,8 @@
       // The automatic-scan settle (runtime/autoScan.ts) is shortened to nothing
       // for every check that is about something else; the scan-lifecycle checks
       // in healthChecks.js set the real settle themselves.
-      const { setAutoScanSettleMs, AUTO_SCAN_SETTLE_MS } = await import("../src/lib/runtime/autoScan.ts");
-      setAutoScanSettleMs(0);
+      const { setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS } = await import("../src/lib/runtime/autoScan.ts");
+      setAutoScanSettleMsForTest(0);
 
       interfaceStore.setAutoScanGithubAlerts(true);
       await repoStore.openRepo("/fixture/Other");
@@ -637,7 +637,7 @@
           const { runHealthChecks } = await import("./healthChecks.js");
           await runHealthChecks({
             check, root, section, has, flat, wait, until, button, scroller, header, agentBar, rescan,
-            ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMs, AUTO_SCAN_SETTLE_MS,
+            ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS,
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           check("no unhandled runtime errors", () => errors.length === 0);

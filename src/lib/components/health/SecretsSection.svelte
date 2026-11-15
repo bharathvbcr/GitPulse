@@ -34,7 +34,8 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";  import { currentRepoPath, repoStore } from "../../stores/repoStore";
+  import { onDestroy, untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import {
     RefreshCw,
     AlertTriangle,
@@ -64,6 +65,7 @@
     findingKey,
     groupSizes,
     isStale,
+    isSuperseded,
     locationChips,
     locationLabel,
     scopeNotes,
@@ -75,7 +77,14 @@
   import { formatError } from "../../ui/formatError";
   import { formatRelativeTime, plural } from "../../format";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
-  import { scheduleAutoScan } from "../../runtime/autoScan";
+  import {
+    activeScanBackoff,
+    clearScanFailure,
+    describeBackoff,
+    noteScanFailure,
+    scheduleAutoScan,
+    type AutoScanBackoff,
+  } from "../../runtime/autoScan";
   import { revealInFileManager } from "../../desktop/openInShell";
   import { toastStore } from "../../stores/toastStore";
 
@@ -163,6 +172,12 @@
    */
   let cancelPending: (() => void) | null = null;
   let pending = $state(false);
+  /**
+   * The failure holding automatic scans off for this repository, when one is.
+   * It is printed, so a scan that could not complete never reads as a clean
+   * result or as "not scanned yet".
+   */
+  let held = $state<AutoScanBackoff | null>(null);
   function stopPending() {
     cancelPending?.();
     cancelPending = null;
@@ -178,17 +193,27 @@
     inflight = guard;
     loading = true;
     errorMsg = null;
+    held = null;
+    const failureKey = `secrets:${repoPath}`;
     try {
       const next = await scanRepository(repoPath);
       if (!next.ok) recordFailure(scanFailureCopy(next));
+      // Per repository, not per pane: it must be recorded even when this pane
+      // was left before the scan returned. A scan a newer one replaced is
+      // neither a success nor a failure of this repository.
+      if (next.ok) clearScanFailure(failureKey);
+      else if (!isSuperseded(next)) noteScanFailure(failureKey, scanFailureCopy(next));
       if (!guard.isLive()) return;
       report = next;
+      held = next.ok ? null : activeScanBackoff(failureKey);
       nowMs = Date.now();
     } catch (err) {
+      noteScanFailure(failureKey, formatError(err));
       if (!guard.isLive()) return;
       // Keep the last report on screen: its age is printed beside it, and
       // the error says this refresh did not replace it.
       errorMsg = formatError(err);
+      held = activeScanBackoff(failureKey);
       recordFailure(errorMsg);
     } finally {
       // A cancelled scan must still release the spinner when nothing newer
@@ -210,12 +235,22 @@
     const cached = secretsCache.get(path);
     report = cached ?? null;
     errorMsg = null;
+    held = null;
     untrack(() => {
       if (inflightScans.has(path)) {
         // A scan is already running for this repository: join it now, it costs
         // nothing to listen.
         void scan(path);
       } else if (!cached || isStale(cached, Date.now())) {
+        const hold = activeScanBackoff(`secrets:${path}`);
+        if (hold) {
+          // The last automatic scan failed a moment ago. Starting another would
+          // run the same scan into the same failure on every visit, so it waits
+          // out the interval; the failure is shown, and a click retries now.
+          held = hold;
+          errorMsg = hold.reason;
+          return;
+        }
         // No result, or one too old to stand as the answer. Scanning is the
         // expensive part, so it waits for the pane to stay put. A visit
         // shorter than the settle starts nothing; a fresh cache is shown
@@ -364,6 +399,9 @@
     </div>
   {/snippet}
 
+  {#if held}
+    <p class="text-meta text-textMuted" data-testid="secrets-backoff">{describeBackoff(held)}</p>
+  {/if}
   {#if !$repoStore.currentPath}
     <p class="text-textMuted">No repository open. Open one to scan its working tree with Kingfisher.</p>
   {:else if pending && !report && !loading}

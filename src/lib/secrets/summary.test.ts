@@ -8,12 +8,14 @@ import {
   filterFindings,
   groupSizes,
   isStale,
+  isSuperseded,
   locationLabel,
   locationChips,
   scopeNotes,
   scanFailureCopy,
   shouldCache,
   STALE_AFTER_MS,
+  SUPERSEDED_ERROR,
   verdict,
 } from "./summary";
 
@@ -188,6 +190,12 @@ describe("staleness and caching", () => {
     expect(isStale(report({ scanned_at_ms: 1_000 }), 1_000 + STALE_AFTER_MS - 1)).toBe(false);
     expect(isStale(report({ scanned_at_ms: 1_000 }), 1_000 + STALE_AFTER_MS)).toBe(true);
     expect(isStale(report({ scanned_at_ms: 0 }), 1)).toBe(true);
+  });
+
+  it("tells a replaced scan from a failed one, so only the failure holds automatic scans off", () => {
+    expect(isSuperseded(report({ ok: false, error: SUPERSEDED_ERROR }))).toBe(true);
+    expect(isSuperseded(report({ ok: false, error: "kingfisher crashed (SIGBUS)" }))).toBe(false);
+    expect(isSuperseded(report({ ok: true, error: SUPERSEDED_ERROR }))).toBe(false);
   });
 
   it("never lets a late older scan, or a scan that never ran, replace the cache", () => {

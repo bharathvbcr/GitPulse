@@ -21,8 +21,6 @@
     };
   }
 
-  // Survives the per-tab remount so revisiting the Health view renders the
-  // last scan instantly; the fetch then refreshes it in place.
   /**
    * The dependency audit running for each repository. Module-level so a panel
    * left and reopened while an audit is still running joins it instead of
@@ -30,6 +28,8 @@
    */
   const inflightAudits = createScanJoin<DepsHealthReport>();
 
+  // Survives the per-tab remount so revisiting the Health view renders the
+  // last scan instantly; the fetch then refreshes it in place.
   const healthCache = createRepoPanelCache<{
     deps: DepsHealthReport;
     /** When `deps` was scanned (epoch ms), the stamp runtime/autoScan.ts judges freshness by. */
@@ -48,7 +48,15 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
-  import { isScanStale, scheduleAutoScan } from "../runtime/autoScan";
+  import {
+    activeScanBackoff,
+    clearScanFailure,
+    describeBackoff,
+    isScanStale,
+    noteScanFailure,
+    scheduleAutoScan,
+    type AutoScanBackoff,
+  } from "../runtime/autoScan";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,
@@ -168,6 +176,12 @@
    */
   let codegraph = $state<CodeintelStatus | null>(null);
   let loading = $state(false);
+  /**
+   * The failure holding automatic audits off for this repository, when one is.
+   * It is printed, so an audit that could not complete never reads as a clean
+   * result or as "not scanned yet".
+   */
+  let held = $state<AutoScanBackoff | null>(null);
   let checkingGithub = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -509,6 +523,8 @@
    */
   function recordScanFailure(repoPath: string, reason: unknown) {
     errorMsg = reportPanelError("health", reason);
+    noteScanFailure(`deps:${repoPath}`, errorMsg);
+    held = activeScanBackoff(`deps:${repoPath}`);
     if (!report || reportPath !== repoPath) {
       report = null;
       reportPath = null;
@@ -559,6 +575,7 @@
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
+    held = null;
     errorMsg = null;
     actionError = null;
     // Automatic local scans stay local. GitHub alerts use the GitHub CLI
@@ -578,10 +595,17 @@
       // finished answer for `repoPath`: keeping it means the return does not
       // run it again.
       if (deps.status === "fulfilled" && !reuse) cacheFinishedAudit(repoPath, deps.value);
+      // The repository's record, not this pane's: a failure seen after the
+      // pane was left still holds the next automatic start off.
+      if (!reuse) {
+        if (deps.status === "fulfilled") clearScanFailure(`deps:${repoPath}`);
+        else noteScanFailure(`deps:${repoPath}`, formatError(deps.reason));
+      }
       return;
     }
     try {
       if (deps.status === "fulfilled") {
+        if (!reuse) clearScanFailure(`deps:${repoPath}`);
         report = deps.value;
         reportPath = repoPath;
         // A new scan supersedes whatever a plan was written against.
@@ -1006,6 +1030,9 @@
       // The cancelled scan's `finally` no longer releases this; the next scan
       // to start sets it again.
       loading = false;
+      // Nothing said about the repository just left belongs on this one.
+      errorMsg = null;
+      held = null;
       if (cached) {
         report = cached.deps;
         reportPath = path;
@@ -1051,6 +1078,14 @@
       // An audit for this repository is already running (this panel was left
       // and reopened): listening to it costs nothing, so it is joined at once.
       untrack(() => void scan(path));
+    } else if (activeScanBackoff(`deps:${path}`)) {
+      // The last audit failed a moment ago. Starting another would run the same
+      // audit into the same failure on every visit, so automatic scanning waits
+      // out the interval; the failure is shown, and Scan local retries now.
+      untrack(() => {
+        held = activeScanBackoff(`deps:${path}`);
+        errorMsg = held?.reason ?? null;
+      });
     } else {
       untrack(() => {
         pending = true;
@@ -1084,7 +1119,8 @@
   {#snippet scanFailureBanner()}
     <div role="alert" class="gp-notice flex-wrap items-center justify-between" data-tone="danger">
       <span class="min-w-0 wrap-break-word"
-        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
+        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}{#if held}
+          <span class="block opacity-80" data-testid="health-backoff">{describeBackoff(held)}</span>{/if}</span
       >
       <span class="flex items-center gap-2 shrink-0">
         <button type="button" onclick={() => scan()} disabled={loading} class="gp-btn" data-size="sm">

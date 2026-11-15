@@ -1,12 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AUTO_SCAN_RETRY_MS,
   AUTO_SCAN_SETTLE_MS,
   REMOUNT_GRACE_MS,
   SCAN_FRESH_MS,
+  activeScanBackoff,
+  clearScanFailure,
   createScanJoin,
+  describeBackoff,
   isScanStale,
+  noteScanFailure,
+  pendingWaitCountForTest,
+  resetScanFailuresForTest,
   scheduleAutoScan,
-  setAutoScanSettleMs,
+  setAutoScanSettleMsForTest,
 } from "./autoScan";
 
 /** Lets the settle's `whenDocumentShown().then(...)` microtasks run. */
@@ -24,6 +31,100 @@ describe("isScanStale", () => {
     expect(isScanStale(-1, 10_000)).toBe(true);
     expect(isScanStale(1_000, 1_000 + SCAN_FRESH_MS - 1)).toBe(false);
     expect(isScanStale(1_000, 1_000 + SCAN_FRESH_MS)).toBe(true);
+  });
+});
+
+describe("scan back-off", () => {
+  beforeEach(() => resetScanFailuresForTest());
+
+  it("holds automatic scans off for the retry interval after a failure, then lets them through", () => {
+    noteScanFailure("deps:/r", "Fixture failure", 1_000);
+    const held = activeScanBackoff("deps:/r", 1_000 + AUTO_SCAN_RETRY_MS - 1);
+    expect(held).toEqual({ reason: "Fixture failure", failedAtMs: 1_000, retryAtMs: 1_000 + AUTO_SCAN_RETRY_MS });
+    expect(activeScanBackoff("deps:/r", 1_000 + AUTO_SCAN_RETRY_MS)).toBeNull();
+    // An expired record is forgotten, not merely ignored.
+    expect(activeScanBackoff("deps:/r", 1_000)).toBeNull();
+  });
+
+  it("keeps the interval inside the freshness window, so a failure never outlasts a result", () => {
+    expect(AUTO_SCAN_RETRY_MS).toBe(SCAN_FRESH_MS);
+  });
+
+  it("is per key, and a success clears it at once", () => {
+    noteScanFailure("secrets:/a", "x", 0);
+    expect(activeScanBackoff("secrets:/b", 1)).toBeNull();
+    expect(activeScanBackoff("deps:/a", 1)).toBeNull();
+    expect(activeScanBackoff("secrets:/a", 1)).not.toBeNull();
+    clearScanFailure("secrets:/a");
+    expect(activeScanBackoff("secrets:/a", 1)).toBeNull();
+  });
+
+  it("a newer failure replaces the older one's interval", () => {
+    noteScanFailure("k", "first", 0);
+    noteScanFailure("k", "second", 100_000);
+    expect(activeScanBackoff("k", AUTO_SCAN_RETRY_MS + 1)?.reason).toBe("second");
+  });
+
+  it("tracks a bounded number of repositories", () => {
+    for (let i = 0; i < 200; i++) noteScanFailure(`k:${i}`, "x", 0);
+    expect(activeScanBackoff("k:0", 1)).toBeNull();
+    expect(activeScanBackoff("k:199", 1)).not.toBeNull();
+  });
+
+  it("says when automatic scanning resumes and that a click retries now", () => {
+    noteScanFailure("k", "x", 0);
+    const text = describeBackoff(activeScanBackoff("k", 1)!);
+    expect(text).toContain("Automatic scanning is paused after this failure");
+    expect(text).toContain("Rescan tries now.");
+  });
+});
+
+describe("wait bookkeeping", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    setAutoScanSettleMsForTest(null);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    setAutoScanSettleMsForTest(null);
+  });
+
+  it("forgets a repository whose every wait was cancelled, once no rebuilt pane can resume it", async () => {
+    const before = pendingWaitCountForTest();
+    const cancel = scheduleAutoScan({ key: "forget:1", stillNeeded: () => true, run: vi.fn() });
+    expect(pendingWaitCountForTest()).toBe(before + 1);
+    cancel();
+    await vi.advanceTimersByTimeAsync(REMOUNT_GRACE_MS + 1);
+    expect(pendingWaitCountForTest()).toBe(before);
+  });
+
+  it("keeps it through the grace, so a rebuilt pane still resumes the wait", async () => {
+    const cancel = scheduleAutoScan({ key: "forget:2", stillNeeded: () => true, run: vi.fn() });
+    cancel();
+    await vi.advanceTimersByTimeAsync(REMOUNT_GRACE_MS - 1);
+    const before = pendingWaitCountForTest();
+    scheduleAutoScan({ key: "forget:2", stillNeeded: () => true, run: vi.fn() });
+    await vi.advanceTimersByTimeAsync(5);
+    expect(pendingWaitCountForTest()).toBe(before);
+  });
+
+  it("cancelling while the document is hidden removes the visibilitychange listener", async () => {
+    const added: Array<() => void> = [];
+    const removed: Array<() => void> = [];
+    vi.stubGlobal("document", {
+      hidden: true,
+      visibilityState: "hidden",
+      addEventListener: (_type: string, fn: () => void) => added.push(fn),
+      removeEventListener: (_type: string, fn: () => void) => removed.push(fn),
+    });
+    const cancel = scheduleAutoScan({ key: "listener:1", stillNeeded: () => true, run: vi.fn() });
+    await vi.advanceTimersByTimeAsync(AUTO_SCAN_SETTLE_MS);
+    await flush();
+    expect(added).toHaveLength(1);
+    expect(removed).toHaveLength(0);
+    cancel();
+    expect(removed).toEqual(added);
   });
 });
 
@@ -67,12 +168,12 @@ describe("createScanJoin", () => {
 describe("scheduleAutoScan", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    setAutoScanSettleMs(null);
+    setAutoScanSettleMsForTest(null);
   });
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
-    setAutoScanSettleMs(null);
+    setAutoScanSettleMsForTest(null);
   });
 
   it("starts nothing before the pane has settled, and one scan after", async () => {
@@ -211,7 +312,7 @@ describe("scheduleAutoScan", () => {
   });
 
   it("the settle can be shortened for a harness and restored", async () => {
-    setAutoScanSettleMs(0);
+    setAutoScanSettleMsForTest(0);
     const run = vi.fn();
     scheduleAutoScan({ key: freshKey(), stillNeeded: () => true, run });
     await vi.advanceTimersByTimeAsync(0);

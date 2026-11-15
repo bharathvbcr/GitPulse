@@ -62,7 +62,7 @@ export function createScanJoin<T>(): ScanJoin<T> {
 /** Test seam: the harness pages shorten the settle so their other checks stay quick. */
 const settle = { ms: AUTO_SCAN_SETTLE_MS };
 
-export function setAutoScanSettleMs(ms: number | null): void {
+export function setAutoScanSettleMsForTest(ms: number | null): void {
   settle.ms = ms === null ? AUTO_SCAN_SETTLE_MS : Math.max(0, ms);
 }
 
@@ -107,6 +107,7 @@ export function scheduleAutoScan(request: AutoScanRequest): () => void {
 
   let cancelled = false;
   let finished = false;
+  const hidden = new AbortController();
   const finish = () => {
     if (finished) return;
     finished = true;
@@ -115,7 +116,7 @@ export function scheduleAutoScan(request: AutoScanRequest): () => void {
   };
   const timer = setTimeout(
     () => {
-      void whenDocumentShown().then(() => {
+      void whenDocumentShown(hidden.signal).then(() => {
         if (cancelled) return;
         // Started or answered, either way this wait is over for every pane
         // holding it; a later one is a new visit.
@@ -131,6 +132,80 @@ export function scheduleAutoScan(request: AutoScanRequest): () => void {
     if (cancelled) return;
     cancelled = true;
     clearTimeout(timer);
+    // Stops a wait for a hidden document from leaving its listener behind.
+    hidden.abort();
     finish();
+    // Every wait for this key has been cancelled: keep the entry only for the
+    // grace in which a rebuilt pane may resume it, then forget it.
+    if (entry.active === 0) {
+      setTimeout(() => {
+        if (entry.active === 0 && waits.get(request.key) === entry) waits.delete(request.key);
+      }, REMOUNT_GRACE_MS);
+    }
   };
+}
+
+/** Test seam: how many keys still hold a wait record. */
+export function pendingWaitCountForTest(): number {
+  return waits.size;
+}
+
+/**
+ * A scan that failed is not retried by an automatic start until this long
+ * after it failed. It is the freshness window: a result is trusted for
+ * {@link SCAN_FRESH_MS}, and a failure that was just seen is trusted not to
+ * have fixed itself in the same time. A click is never held back.
+ */
+export const AUTO_SCAN_RETRY_MS = SCAN_FRESH_MS;
+
+export interface AutoScanBackoff {
+  /** What the failed scan said. */
+  reason: string;
+  failedAtMs: number;
+  /** When an automatic scan may try again. */
+  retryAtMs: number;
+}
+
+const MAX_TRACKED_FAILURES = 64;
+const failures = new Map<string, AutoScanBackoff>();
+
+/** Remembers that the scan named by `key` failed at `nowMs`. */
+export function noteScanFailure(key: string, reason: string, nowMs: number = Date.now()): void {
+  failures.delete(key);
+  failures.set(key, { reason, failedAtMs: nowMs, retryAtMs: nowMs + AUTO_SCAN_RETRY_MS });
+  while (failures.size > MAX_TRACKED_FAILURES) {
+    const oldest = failures.keys().next();
+    if (oldest.done) break;
+    failures.delete(oldest.value);
+  }
+}
+
+/** A scan that finished well, or was asked for by a click and finished. */
+export function clearScanFailure(key: string): void {
+  failures.delete(key);
+}
+
+/**
+ * The failure holding automatic scans off for `key`, or null when there is none
+ * or its interval has passed (an expired one is forgotten).
+ */
+export function activeScanBackoff(key: string, nowMs: number = Date.now()): AutoScanBackoff | null {
+  const held = failures.get(key);
+  if (!held) return null;
+  if (nowMs >= held.retryAtMs) {
+    failures.delete(key);
+    return null;
+  }
+  return held;
+}
+
+/** The sentence a pane prints beside a failure it is holding automatic scans off for. */
+export function describeBackoff(held: AutoScanBackoff): string {
+  const at = new Date(held.retryAtMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return `Automatic scanning is paused after this failure and tries again from ${at}. Rescan tries now.`;
+}
+
+/** Test seam: forget every recorded failure. */
+export function resetScanFailuresForTest(): void {
+  failures.clear();
 }

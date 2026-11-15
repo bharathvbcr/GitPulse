@@ -15,6 +15,7 @@ import { get } from "svelte/store";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
 import { interfaceStore } from "../src/lib/stores/interfaceStore";
+import { resetScanFailuresForTest } from "../src/lib/runtime/autoScan";
 import { terminalLaunchRequests } from "../src/lib/terminal/launchRequests";
 import { PROVIDER_LABELS } from "../src/lib/workbench/taskHandoff";
 import { formatSectionCount } from "../src/lib/health/counts";
@@ -24,7 +25,7 @@ import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/for
 const REPO = "/fixture/GitPulse";
 
 export async function runHealthChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMs, AUTO_SCAN_SETTLE_MS, setMode, setGithub } = ctx;
+  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS, setMode, setGithub } = ctx;
 
   const copied = [];
   const setClipboard = writeText => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
@@ -228,6 +229,10 @@ export async function runHealthChecks(ctx) {
     await settle();
 
     // ---- Scan lifecycle: one scan per visit, cache, no foreign data -------------
+    // Earlier checks failed scans on purpose, some on repositories used below. A
+    // failure holds automatic scans off (checked in the last block), so start
+    // from none rather than let those leak into these checks.
+    resetScanFailuresForTest();
     const visits = scanCalls("/fixture/Visit");
     const secretVisits = secretsScans("/fixture/Visit");
     await switchTo("/fixture/Visit");
@@ -402,7 +407,7 @@ export async function runHealthChecks(ctx) {
     // subject; these run with the real one. A scan nobody looked at is work thrown
     // away, so a visit shorter than the settle must start neither scan, a fresh
     // result must start neither, and a click is never made to wait.
-    setAutoScanSettleMs(null);
+    setAutoScanSettleMsForTest(null);
     const pastSettle = () => wait(AUTO_SCAN_SETTLE_MS + 400);
     const both = path => `secrets ${secretsScans(path)}, dependencies ${scanCalls(path)}`;
     const counts = path => [secretsScans(path), scanCalls(path)].join("/");
@@ -477,14 +482,32 @@ export async function runHealthChecks(ctx) {
       await switchTo("/fixture/Failing");
       await pastSettle();
       check("a failed audit is reported", () => has(root, "Fixture health scan failed"));
+      check("the failure says automatic scanning is paused and that a click retries", () =>
+        has(root, "Automatic scanning is paused after this failure") && has(root, "Rescan tries now."));
       const failedOnce = scanCalls("/fixture/Failing");
-      await remount(); await pastSettle();
-      check("a failed audit does not mark the repository scanned: the next visit tries again", () =>
-        scanCalls("/fixture/Failing") === failedOnce + 1, () => both("/fixture/Failing"));
-      setMode("findings");
-
-      // A result older than the freshness window is stale and scans again, after the settle.
       const realNow = Date.now;
+      await remount(); await pastSettle();
+      // The visit that follows a failure is not another scan into the same failure.
+      check("a failed audit is not retried automatically on the next visit", () =>
+        scanCalls("/fixture/Failing") === failedOnce, () => both("/fixture/Failing"));
+      check("and the next visit still says the audit failed, never a clean report or 'not scanned yet'", () =>
+        has(root, "Fixture health scan failed") && has(root, "Automatic scanning is paused") && !section("summary"));
+      button("Scan local").click(); await tick(); await wait(150);
+      check("a click retries at once", () => scanCalls("/fixture/Failing") === failedOnce + 1, () => both("/fixture/Failing"));
+      setMode("findings");
+      Date.now = () => realNow() + 6 * 60_000;
+      try {
+        await remount(); await wait(300);
+        check("once the interval has passed the next visit waits for the settle, not for a click", () =>
+          scanCalls("/fixture/Failing") === failedOnce + 1, () => both("/fixture/Failing"));
+        await pastSettle();
+        check("and then scans again", () => scanCalls("/fixture/Failing") === failedOnce + 2 && !!section("summary"), () => both("/fixture/Failing"));
+      } finally {
+        Date.now = realNow;
+      }
+
+      // A result older than the freshness window is stale: it stays on screen
+      // through the wait and through the scan, and is then scanned again.
       await switchTo("/fixture/Aged");
       await pastSettle();
       const agedScans = counts("/fixture/Aged");
@@ -492,13 +515,19 @@ export async function runHealthChecks(ctx) {
       try {
         await remount(); await wait(300);
         check("a stale result still waits for the settle", () => counts("/fixture/Aged") === agedScans, () => both("/fixture/Aged"));
-        await pastSettle();
+        check("and the stale report stays on screen during the wait", () => !!section("summary") && !button("Scan local").disabled);
+        knobs.scanDelay = 900;
+        await wait(AUTO_SCAN_SETTLE_MS - 300 + 250);
+        check("and stays on screen while the fresh scan runs", () =>
+          !!section("summary") && button("Scan local").disabled && scanCalls("/fixture/Aged") === 2);
+        await settle();
+        knobs.scanDelay = 0;
         check("and is then scanned again", () => counts("/fixture/Aged") === "2/2", () => both("/fixture/Aged"));
       } finally {
         Date.now = realNow;
       }
     } finally {
-      setAutoScanSettleMs(0);
+      setAutoScanSettleMsForTest(0);
       knobs.scanDelay = 0;
       knobs.secrets = null;
       setMode("findings");
