@@ -5967,18 +5967,23 @@ pub fn record_op_snapshot_event(
     seq: u64,
     stash_oid: Option<&str>,
     ref_count: usize,
+    prune_error: Option<&str>,
     now_ms: u64,
 ) -> Option<i64> {
     let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
-    let detail_json = serde_json::to_string(&serde_json::json!({
+    let mut detail = serde_json::json!({
         "source": "op_log",
         "snapshot": OP_SNAPSHOT_OK,
         "seq": seq,
         "op_ref": op_ref,
         "stash_oid": stash_oid,
         "ref_count": ref_count,
-    }))
-    .ok();
+    });
+    // The snapshot is real; only retention failed. Present only when it did.
+    if let (Some(error), Some(fields)) = (prune_error, detail.as_object_mut()) {
+        fields.insert("prune_error".to_string(), error.into());
+    }
+    let detail_json = serde_json::to_string(&detail).ok();
     record(Draft {
         repo_path: anchor,
         worktree_path: worktree,
@@ -6036,6 +6041,64 @@ pub fn record_unsnapshotted_git_op(
         outcome: Some(Outcome::Failed),
         before_ref: before_ref.map(str::to_string),
         after_ref: None,
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
+/// Ledger action of a turn checkpoint attempt.
+pub const TURN_CHECKPOINT_ACTION: &str = "turn.checkpoint";
+
+/// Appends one row for a turn checkpoint attempt that reached the app:
+/// `checkpoint` is `captured`, `unchanged`, `coalesced`, `skipped` or `failed`.
+/// Only `captured` and `unchanged` are `ok`; an attempt that produced no
+/// checkpoint never reads as one that did. `omissions` carries the untracked
+/// files left out and why, so a partial snapshot is not mistaken for a whole one.
+#[allow(clippy::too_many_arguments)]
+pub fn record_turn_checkpoint_event(
+    repo_path: &str,
+    session_id: Option<&str>,
+    event: &str,
+    checkpoint: &str,
+    reason: Option<&str>,
+    ref_name: Option<&str>,
+    head: Option<&str>,
+    omissions: &serde_json::Value,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, None, now_ms);
+    let detail_json = serde_json::to_string(&serde_json::json!({
+        "source": "turn_checkpoint",
+        "event": event,
+        "checkpoint": checkpoint,
+        "reason": reason,
+        "ref": ref_name,
+        "omissions": omissions,
+    }))
+    .ok();
+    let produced = matches!(checkpoint, "captured" | "unchanged");
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("gitpulse-turn-checkpoint".to_string()),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        task_id: resolved_task,
+        action: TURN_CHECKPOINT_ACTION.to_string(),
+        object: Some(ref_name.map_or_else(|| checkpoint.to_string(), str::to_string)),
+        outcome: Some(if produced {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        }),
+        before_ref: head.map(str::to_string),
+        after_ref: ref_name
+            .filter(|_| checkpoint == "captured")
+            .map(str::to_string),
         detail_json,
         event_stamp: Some(stamp),
         ..Default::default()

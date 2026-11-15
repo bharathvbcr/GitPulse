@@ -33,6 +33,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_status` | Narrower status (ledger + worktrees + codeintel) |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
+| `gitpulse_turn_checkpoints` | This worktree's turn checkpoints (files at each agent turn boundary, when the person enabled `turn_checkpoints`): the list, or with `id` a bounded patch. A checkpoint with `omissions.untracked_omitted` above 0 is partial. Read-only; nothing is restored |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |
 | `gitpulse_codeintel_*` | Symbol search, impact, dependencies, trace, dead symbols |
 | `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |

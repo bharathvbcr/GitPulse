@@ -2310,3 +2310,85 @@ fn agent_deliver_echoes_request_id_and_caps_concurrent_handlers_at_four() {
         assert_eq!(reply["delivery_outcome"], "woken_immediately");
     }
 }
+
+#[test]
+fn turn_checkpoints_have_their_own_small_cap_and_never_starve_a_gate_request() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let req = |id: &str| Request::RecordTurnCheckpoint {
+        id: id.into(),
+        cwd: "/repo/wt".into(),
+        session_id: None,
+        event: "turn_start".into(),
+        label: None,
+    };
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_turn_checkpointer(Arc::new(move |_| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({"outcome": "captured"}))
+        }));
+    }
+    owner.attach_gate(Arc::new(|_, _| Ok(serde_json::json!({"ok": true}))));
+
+    let held: Vec<_> = (0..MAX_CHECKPOINT_HANDLERS)
+        .map(|n| {
+            let socket = socket.clone();
+            let r = req(&format!("c-{n}"));
+            std::thread::spawn(move || {
+                Secondary::connect(&socket)
+                    .ok()
+                    .expect("reach the owner")
+                    .record_turn_checkpoint(&r, Duration::from_secs(30))
+            })
+        })
+        .collect();
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            entered.load(Ordering::Acquire) >= MAX_CHECKPOINT_HANDLERS
+        }),
+        "checkpoint handlers never filled"
+    );
+
+    // One past the cap is told it is busy, at once, and that matches the
+    // refusal every hook treats as "the owner is alive but occupied".
+    let over = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_turn_checkpoint(&req("c-over"), Duration::from_secs(5))
+        .expect_err("a checkpoint past the cap must be refused as busy");
+    assert_eq!(over, "the turn checkpoint is busy");
+    assert!(is_busy_refusal(&over));
+
+    // A gate-class asked request is still answered while the cap is full.
+    let gate = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-while-held"), Duration::from_secs(5));
+    assert!(gate.is_ok(), "{gate:?}");
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in held {
+        let reply = worker.join().unwrap().expect("checkpoint reply");
+        assert_eq!(reply["outcome"], "captured");
+    }
+    // The slots come back: a request after the burst is served, not refused.
+    let after = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_turn_checkpoint(&req("c-after"), Duration::from_secs(10));
+    assert!(after.is_ok(), "{after:?}");
+}

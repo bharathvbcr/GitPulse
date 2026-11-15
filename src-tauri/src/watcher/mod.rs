@@ -8,6 +8,8 @@ mod registration_timing;
 pub(crate) mod skip;
 #[cfg(all(test, unix))]
 mod storm;
+#[cfg(test)]
+mod turn_ref_tests;
 
 pub use debouncer::RepoFileWatcher;
 
@@ -877,7 +879,36 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if is_other_checkout_state(path, internal_roots) {
         return true;
     }
+    if is_turn_checkpoint_ref(path, internal_roots) {
+        return true;
+    }
     is_noise_leaf_name(path)
+}
+
+/// A write under `refs/gitpulse/turns/` (or its reflog): a turn checkpoint
+/// (`engine::turn_checkpoint`), taken at every turn of every agent session. It
+/// moves no branch, tag, remote or op-log ref and changes nothing the UI
+/// shows, so it must not refresh the repository. `refs/gitpulse/ops/` and
+/// every other ref stay `Refs`.
+fn is_turn_checkpoint_ref(path: &Path, internal_roots: &[PathBuf]) -> bool {
+    const TURNS: [&str; 3] = ["refs", "gitpulse", "turns"];
+    internal_roots.iter().any(|root| {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut components = relative.components().map(|c| c.as_os_str());
+        let first = components.next();
+        // `logs/refs/gitpulse/turns/…` is the reflog of the same refs.
+        let head = if first.is_some_and(|c| c == "logs") {
+            components.next()
+        } else {
+            first
+        };
+        let mut under = head.into_iter().chain(components);
+        TURNS
+            .iter()
+            .all(|want| under.next().is_some_and(|c| c == *want))
+    })
 }
 
 /// State that belongs to another checkout of the same repository, seen only

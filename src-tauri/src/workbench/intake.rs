@@ -683,12 +683,17 @@ pub(crate) fn place(
     replace: bool,
     position: i64,
 ) -> Result<Placed, WorkbenchError> {
-    place_once(store, repository, task, replace, position, None, false)
+    place_once(
+        store, repository, task, replace, position, None, None, false,
+    )
 }
 
 /// [`place`] for a task created from a scan of the board: the creating write
 /// names the newest event the scan saw, and the store refuses it with
 /// `board_changed` when any task was added, edited or removed since.
+///
+/// `expected_revision` holds a replace to the revision the caller read (see
+/// [`add_task_guarded`]); `None` replaces against the revision read here.
 fn place_scanned(
     store: &Store,
     repository: &Value,
@@ -696,6 +701,7 @@ fn place_scanned(
     replace: bool,
     position: i64,
     scan_sequence: Option<u64>,
+    expected_revision: Option<i64>,
 ) -> Result<Placed, WorkbenchError> {
     place_once(
         store,
@@ -704,10 +710,12 @@ fn place_scanned(
         replace,
         position,
         scan_sequence,
+        expected_revision,
         false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_once(
     store: &Store,
     repository: &Value,
@@ -715,6 +723,7 @@ fn place_once(
     replace: bool,
     position: i64,
     scan_sequence: Option<u64>,
+    expected_revision: Option<i64>,
     retried: bool,
 ) -> Result<Placed, WorkbenchError> {
     let repository_id = repository["id"]
@@ -762,6 +771,24 @@ fn place_once(
         },
         current => (id, current),
     };
+
+    // The caller's revision, when it sent one, is checked against the card
+    // this call is about to replace — the one just read — and refused before
+    // anything is built or written. The write below still goes against the
+    // revision it read, which now is the caller's, so the store's own
+    // compare-and-swap closes the window between this read and the write.
+    if let Some(expected) = expected_revision {
+        let Some(item) = &current else {
+            return Err(no_task_at_revision(&task.key));
+        };
+        let revision = item["revision"].as_i64().unwrap_or_default();
+        if revision != expected {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("The task is at revision {revision}, not {expected}; someone changed it. Re-read it with gitpulse_get_task before overwriting it. Nothing was written."),
+            ));
+        }
+    }
 
     // A subtask names its parent through the store's own `parent` link, so the
     // store's rules decide it: a live task, one parent, no cycle, bounded
@@ -881,6 +908,7 @@ fn place_once(
                 replace,
                 position,
                 scan_sequence,
+                expected_revision,
                 true,
             ),
             None => Err(error),
@@ -1154,6 +1182,35 @@ pub(crate) fn add_task(
     replace: bool,
     reviewed_related: &[String],
 ) -> Result<Value, WorkbenchError> {
+    add_task_guarded(store, repo_path, task, replace, reviewed_related, None)
+}
+
+/// [`add_task`] whose replace can be held to the revision the caller read.
+///
+/// Without `expected_revision` a replace is exactly what it always was: the
+/// revision it writes against is the one this call reads from the store a
+/// moment before the write. That read is what the store's compare-and-swap
+/// needs, and it keeps a replace from landing on a version that appeared
+/// between the read and the write, but it says nothing about edits made after
+/// the *caller* last looked, so a replace from a stale view still wins. Every
+/// existing caller (the desktop task creation, the proposals, subtask filing)
+/// passes none and is unchanged.
+///
+/// With `expected_revision`, the replace is refused with `revision_conflict`
+/// (naming the stored revision, nothing written) when the task is at any other
+/// revision, as complete, delete and merge do. The argument only means
+/// something for a replace of a task that exists, so anything else is refused
+/// rather than guessed at: without `replace` it is `invalid_input`, for a task
+/// that is not on the board it is `not_found`, and a revision below 1 (the
+/// store starts a task at 1) is `invalid_input`.
+pub(crate) fn add_task_guarded(
+    store: &Store,
+    repo_path: &str,
+    task: ExternalTask,
+    replace: bool,
+    reviewed_related: &[String],
+    expected_revision: Option<i64>,
+) -> Result<Value, WorkbenchError> {
     // The related-task scan and the creating write are one decision: the write
     // carries the sequence the scan started from, and the store refuses it
     // when the board moved since. One rescan answers a race; a board that keeps
@@ -1164,6 +1221,7 @@ pub(crate) fn add_task(
         &task,
         replace,
         reviewed_related,
+        expected_revision,
         &mut || {},
     )
 }
@@ -1177,14 +1235,61 @@ fn add_task_racing(
     task: &ExternalTask,
     replace: bool,
     reviewed_related: &[String],
+    expected_revision: Option<i64>,
     between: &mut dyn FnMut(),
 ) -> Result<Value, WorkbenchError> {
-    match add_task_once(store, repo_path, task, replace, reviewed_related, between) {
-        Err(error) if error.code == "board_changed" => {
-            add_task_once(store, repo_path, task, replace, reviewed_related, between)
-        }
+    match add_task_once(
+        store,
+        repo_path,
+        task,
+        replace,
+        reviewed_related,
+        expected_revision,
+        between,
+    ) {
+        Err(error) if error.code == "board_changed" => add_task_once(
+            store,
+            repo_path,
+            task,
+            replace,
+            reviewed_related,
+            expected_revision,
+            between,
+        ),
         other => other,
     }
+}
+
+/// An overwrite held to a revision, for a task that is not on the board.
+fn no_task_at_revision(key: &str) -> WorkbenchError {
+    WorkbenchError::new(
+        "not_found",
+        format!("No task {key:?} is on the board for this repository, so there is no revision to hold an overwrite to. Nothing was written; drop expected_revision to file it as a new task."),
+    )
+}
+
+/// The refusals of an `expected_revision` that cannot mean anything, decided
+/// before the repository is registered or the board scanned.
+fn check_expected_revision(
+    expected_revision: Option<i64>,
+    replace: bool,
+) -> Result<(), WorkbenchError> {
+    let Some(expected) = expected_revision else {
+        return Ok(());
+    };
+    if expected < 1 {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("expected_revision is {expected}; a task's revision starts at 1."),
+        ));
+    }
+    if !replace {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "expected_revision holds an overwrite to the revision you read, so it is only accepted with overwrite: true. Nothing was written.",
+        ));
+    }
+    Ok(())
 }
 
 /// The newest event sequence on the board, read before a scan so the scan can
@@ -1205,9 +1310,11 @@ fn add_task_once(
     task: &ExternalTask,
     replace: bool,
     reviewed_related: &[String],
+    expected_revision: Option<i64>,
     between: &mut dyn FnMut(),
 ) -> Result<Value, WorkbenchError> {
     check_reviewed_len(reviewed_related)?;
+    check_expected_revision(expected_revision, replace)?;
     let local = resolve_for_agent(repo_path)?;
     // Validate before registering, so a bad request leaves no trace.
     task.item_fields(&local.name)
@@ -1233,11 +1340,26 @@ fn add_task_once(
         }
         _ => {}
     }
+    if known_repository.is_none() && expected_revision.is_some() {
+        // Nothing has been filed here, so there is no task to hold, and
+        // nothing is registered on the way to saying so.
+        return Err(no_task_at_revision(&task.key));
+    }
     if let Some(repository) = known_repository {
         let repository_id = repository["id"].as_str().unwrap_or_default();
         let own = item_id(repository_id, &task.key);
         let creating = get_item(store, &own)?.is_none()
             && linked_board_item(store, repository_id, &task.key)?.is_none();
+        // A revision names a card that exists. Said before the related-task
+        // scan, which would answer a new card with a refusal about other work.
+        // A card deleted or merged away is named as that, with where its work
+        // went, as the other tools name it.
+        if creating && expected_revision.is_some() {
+            return Err(find_live_task(store, repository_id, &task.key)
+                .err()
+                .filter(|error| error.code != "not_found")
+                .unwrap_or_else(|| no_task_at_revision(&task.key)));
+        }
         // A key that is the board id of a card deleted or merged away names
         // that card, not a new one: filing under it would recreate exactly what
         // was removed. Say where it went instead. (A deleted card under the
@@ -1368,6 +1490,7 @@ fn add_task_once(
         replace,
         now_millis(),
         scan_sequence,
+        expected_revision,
     )?;
     match placed.outcome {
         Outcome::AlreadyPresent => Err(WorkbenchError::new(
