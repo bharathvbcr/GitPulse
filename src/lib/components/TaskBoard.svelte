@@ -5,7 +5,7 @@
   import { createResizeObservation } from "../dom/observeResize";
   import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, ArrowDownWideNarrow, Bot, CircleAlert, CircleQuestionMark, ListFilter, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -2678,33 +2678,31 @@
         {#if repositoryPath}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       {/snippet}
       {#snippet actions()}
+        <!-- Two rows, laid out on purpose. The title row: find a task, the
+             board's own housekeeping (Inbox, Archive, Refresh), and New task.
+             The toolbar row: how the board is drawn on the left, Manvi's
+             tools on the right. Each group wraps as a unit, never button by
+             button. -->
         <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repository:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
-        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
-        <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
-          <!-- inline-flex: an icon is a block-level svg, so without it the
-               label wrapped under the icon and doubled the header's height. -->
-          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
-          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
-        </div>
-        {#if initialized}<AutomaticEnhancements {active} compact />{/if}
+        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}><CircleQuestionMark size={13} /></button>
+        <span class="tool-sep" aria-hidden="true"></span>
         {#if initialized}
-          <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
+          <!-- Unread is a call for attention, so it is a corner badge on the
+               icon; the archived total is only a size, so it reads as muted
+               text beside the icon. Both stay the button's whole text. -->
+          <button type="button" class="gp-icon-btn relative" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
             <Inbox size={13} />
-            {#if !unreadError && unread > 0}<span class="gp-chip" data-kind="count" data-tone="accent">{unread}</span>{/if}
+            {#if !unreadError && unread > 0}<span class="gp-attention-badge bg-accent text-onAccent!">{unread}</span>{/if}
           </button>
           <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title="Archive — tasks filed away from this board, and deleted tasks to restore" onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
-            {#if archivedCount > 0}<span class="gp-chip" data-kind="count" data-tone="neutral">{archivedCount}</span>{/if}
+            {#if archivedCount > 0}<span class="tally">{archivedCount}</span>{/if}
           </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
-        <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
-        <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
-        <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}>Organize</button>
-        <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
-        <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
-        <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
+        <span class="tool-sep" aria-hidden="true"></span>
+        <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task"><Plus size={12} />New task</button>
         <!-- A disabled New task always says why, and a caveat says what the
              sheet will ask for. This used to render only for a profile with no
              repositories at all, so an empty workspace left the button dead
@@ -2713,9 +2711,28 @@
           {#if creation.blocked && emptyAddLabel}
             <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
           {:else}
-            <span class="hint" data-testid="task-create-hint">{creation.blocked ?? creation.caveat}</span>
+            <span class="hint" data-testid="task-create-hint" title={creation.blocked ?? creation.caveat}>{creation.blocked ?? creation.caveat}</span>
           {/if}
         {/if}
+      {/snippet}
+      {#snippet toolbar()}
+        <div class="tool-group" role="group" aria-label="Board display">
+          <div class="gp-segmented layout-switch" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
+            <!-- inline-flex: an icon is a block-level svg, so without it the
+                 label wrapped under the icon and doubled the header's height. -->
+            <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
+            <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
+          </div>
+          <span class="tool-sep" aria-hidden="true"></span>
+          <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}><ListFilter size={12} />Filters</button>
+          <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
+          <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
+        </div>
+        <div class="tool-group tool-group-end" role="group" aria-label="Manvi">
+          <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}><Sparkles size={12} />Suggest next</button>
+          <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}><ArrowDownWideNarrow size={12} />Organize</button>
+          {#if initialized}<AutomaticEnhancements {active} compact />{/if}
+        </div>
       {/snippet}
     </PageHeader>
     {#if initialized && (showFilters || filtering)}
@@ -3295,7 +3312,23 @@
   .undo-strip>span{flex:1;min-width:0;font-size:var(--text-xs)}
   button,input,select{font-size:var(--text-xs)}
   button:disabled{opacity:.5}
-  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted));max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* The header's tool groups. A group never splits across lines; the
+     toolbar wraps whole groups, and Manvi's group keeps to the right edge. */
+  .tool-group{display:flex;align-items:center;gap:var(--gp-space-1);flex-wrap:nowrap;min-width:0}
+  .tool-group-end{margin-left:auto}
+  .tool-sep{width:1px;height:16px;margin-inline:2px;flex-shrink:0;background:rgb(var(--c-border) / .7)}
+  /* The archived total: muted text beside the icon, on the same 24px pill. */
+  .tally{margin-left:3px;font-size:var(--text-micro);font-variant-numeric:tabular-nums;line-height:1}
+  /* The shared macOS liquid track is a 34px view switcher; inside a toolbar
+     row of 24px buttons it is one size too large. Same track, compact. */
+  /* 24px segments in a 1px track inside its 1px edge: 28px overall. */
+  .layout-switch.gp-segmented{padding:1px}
+  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn{padding:2px 10px}
+  /* The shared liquid rule clears the active fill because a gliding
+     `.gp-liquid-selection` draws it; this switch has none, so on macOS the
+     chosen layout was marked by text colour alone. Draw the bubble here. */
+  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn[data-active="true"]{background:rgb(var(--c-surface-hover));box-shadow:inset 0 0 0 1px var(--mac-glass-edge),var(--shadow-bubble)}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
   .match-hint{display:block;margin-top:4px;font-size:var(--text-micro);line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}

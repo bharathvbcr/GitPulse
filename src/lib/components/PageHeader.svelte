@@ -17,6 +17,14 @@
    * a description or not. The row is a minimum height, not a fixed one: a page
    * with many actions wraps them onto a second row below a narrow width rather
    * than spilling out of a bar of fixed height.
+   *
+   * A page with more tools than one row holds (Tasks) passes `toolbar`: a
+   * second, full-width row inside the same `<header>`, so the bar stays one
+   * element (one fill, one bottom edge for what measures under it) and its
+   * tools are laid out on purpose rather than wrapped wherever they ran out.
+   * The bar then pads its top by the toolbar's bottom padding, so the title
+   * row is not flush with the edge and a corner badge on one of its buttons
+   * stays inside the bar. Pages without it render exactly as before.
    */
   import type { Snippet } from "svelte";
 
@@ -32,19 +40,21 @@
     meta?: Snippet;
     /** Right-aligned page-level actions. */
     actions?: Snippet;
+    /** A second full-width row of tools under the title row, inside the header. */
+    toolbar?: Snippet;
     /** `data-testid` of the description line, for a page whose tests read it. */
     descriptionTestId?: string;
     /** Extra utilities on the bar, e.g. a test hook or a margin. */
     class?: string;
   }
 
-  let { title, description, level = 2, leading, meta, actions, descriptionTestId, class: className = "" }: Props = $props();
+  let { title, description, level = 2, leading, meta, actions, toolbar, descriptionTestId, class: className = "" }: Props = $props();
 </script>
 
 <header
   class={["gp-header", className]}
   data-page-header
-  style="height: auto; min-height: var(--gp-header-h); flex-wrap: wrap; row-gap: var(--gp-space-1);"
+  style="height: auto; min-height: var(--gp-header-h); flex-wrap: wrap; row-gap: var(--gp-space-1);{toolbar ? ' padding-top: var(--gp-space-2);' : ''}"
 >
   {@render leading?.()}
   {#if level === 1}
@@ -58,5 +68,8 @@
   {/if}
   {#if actions}
     <div class="gp-header-actions" style="flex-shrink: 1; min-width: 0; flex-wrap: wrap; justify-content: flex-end;">{@render actions()}</div>
+  {/if}
+  {#if toolbar}
+    <div data-page-header-toolbar style="flex-basis: 100%; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--gp-space-1) var(--gp-space-3); padding-bottom: var(--gp-space-2);">{@render toolbar()}</div>
   {/if}
 </header>

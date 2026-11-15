@@ -4526,8 +4526,9 @@ fn prune_with_policy(
     report
 }
 
-/// The first sibling ledger holding rows [`consolidate_worktree_ledgers`] has
-/// not imported into `anchor`, found without importing them.
+/// The first sibling ledger holding a row [`consolidate_worktree_ledgers`] has
+/// not imported into `anchor` *and* would import as a binding, found without
+/// importing anything.
 ///
 /// The read-only twin of consolidation's steady-state check, for a lookup
 /// that must fail closed on unmigrated history rather than run the migration:
@@ -4535,8 +4536,15 @@ fn prune_with_policy(
 /// Sources persist after import, so existence proves nothing; a source is
 /// consolidated when it is empty or the anchor's marker for it has reached its
 /// newest row — exactly where a completed import leaves the marker. A source
-/// that shrank below its marker was replaced, and consolidation re-reads it,
-/// so it counts as unimported until then.
+/// that shrank below its marker was replaced, and consolidation re-reads it
+/// from the start, so its rows count as unimported until then.
+///
+/// Only rows that could set a binding are a reason to refuse: a bind or
+/// unbind that [`SourceAuthority`] — the rule the import itself applies —
+/// would keep as one. Every other unimported row (a commit, a push, a bind
+/// imported as history only because the family's initial pass is over) leaves
+/// the binding exactly where the anchor already has it, so answering from the
+/// anchor is the answer consolidation would give.
 pub(crate) fn unconsolidated_legacy_ledger(
     anchor: &str,
     members: &[PathBuf],
@@ -4547,7 +4555,15 @@ pub(crate) fn unconsolidated_legacy_ledger(
             format!("could not resolve family ledger anchor: {error}"),
         )
     })?;
-    let mut anchor_conn: Option<Option<Connection>> = None;
+    let read_failed = |source_db: &Path, error: rusqlite::Error| {
+        LedgerError::new(
+            "legacy_read_failed",
+            format!("could not read {}: {error}", source_db.display()),
+        )
+    };
+    // The anchor, opened once a sibling with rows needs it: `Some(None)` when
+    // it has no import table (no pass has run, so the epoch is `Initial`).
+    let mut anchor_imports: Option<Option<(Connection, FamilyEpoch)>> = None;
     for source in members {
         if source == &anchor_path {
             continue;
@@ -4561,36 +4577,69 @@ pub(crate) fn unconsolidated_legacy_ledger(
                 .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
                     row.get(0)
                 })
-                .map_err(|error| {
-                    LedgerError::new(
-                        "legacy_read_failed",
-                        format!("could not read {}: {error}", source_db.display()),
-                    )
-                })?
+                .map_err(|error| read_failed(&source_db, error))?
         } else {
             0
         };
         if source_max == 0 {
             continue;
         }
-        if anchor_conn.is_none() {
-            anchor_conn = Some(open_readonly(&ledger_path(anchor))?);
+        if anchor_imports.is_none() {
+            let opened = match open_readonly(&ledger_path(anchor))? {
+                Some(conn) if has_table(&conn, "ledger_family_imports")? => {
+                    let (epoch, _) = read_family_epoch(&conn)?;
+                    Some((conn, epoch))
+                }
+                _ => None,
+            };
+            anchor_imports = Some(opened);
         }
-        let marker = match anchor_conn.as_ref().and_then(Option::as_ref) {
-            Some(conn) if has_table(conn, "ledger_family_imports")? => {
+        let (stored, epoch) = match anchor_imports.as_ref().and_then(Option::as_ref) {
+            Some((conn, epoch)) => {
                 let key = family_source_key(&anchor_path, &source.to_string_lossy())?;
-                conn.query_row(
-                    "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
-                    params![key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?
-                .unwrap_or(0)
+                let stored = conn
+                    .query_row(
+                        "SELECT source_cursor, source_label FROM ledger_family_imports
+                         WHERE source_key = ?1",
+                        params![key],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?;
+                (stored, *epoch)
             }
-            _ => 0,
+            None => (None, FamilyEpoch::Initial),
         };
-        if marker != source_max {
+        let marker = stored.as_ref().map_or(0, |(cursor, _)| *cursor);
+        if marker == source_max {
+            continue;
+        }
+        // Where the import would resume: a source that shrank below its
+        // marker was replaced and is re-read from the start.
+        let from = if source_max < marker { 0 } else { marker };
+        let authority = SourceAuthority::of(
+            epoch,
+            stored.as_ref().map(|(_, label)| label.as_str()),
+            source_max,
+        );
+        // No row of this source may set a binding any more: every unimported
+        // row is history only.
+        let Some(bound) = authority.legacy_bound else {
+            continue;
+        };
+        let upto = bound.min(source_max);
+        if upto <= from {
+            continue;
+        }
+        let could_bind: bool = source_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+                 WHERE id > ?1 AND id <= ?2 AND action IN (?3, ?4))",
+                params![from, upto, bindings::BIND, bindings::UNBIND],
+                |row| row.get(0),
+            )
+            .map_err(|error| read_failed(&source_db, error))?;
+        if could_bind {
             return Ok(Some(source.clone()));
         }
     }
