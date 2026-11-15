@@ -495,7 +495,9 @@ impl SessionLedger {
         let mut dirty = false;
         for entry in &mut guard.entries {
             match entry {
-                Entry::Corrupt { row_id: id, detail, .. } if id == row_id => {
+                Entry::Corrupt {
+                    row_id: id, detail, ..
+                } if id == row_id => {
                     found = Some(project_corrupt_row(id, detail));
                     break;
                 }
@@ -622,7 +624,9 @@ impl SessionLedger {
             .iter()
             .map(|entry| match entry {
                 Entry::Valid(r) => (r.row_id.clone(), r.end_state, r.withdrawn),
-                Entry::Corrupt { row_id, .. } => (row_id.clone(), SessionEndState::Unreadable, false),
+                Entry::Corrupt { row_id, .. } => {
+                    (row_id.clone(), SessionEndState::Unreadable, false)
+                }
             })
             .collect()
     }
@@ -1120,8 +1124,13 @@ mod tests {
 
         let first = SessionLedger::open(&ledger_path);
         first.record_spawn(spawn_spec("term-live", "claude", Some(UUID_1), &repo, None));
-        let clean_row =
-            first.record_spawn(spawn_spec("term-clean", "claude", Some(UUID_2), &repo, None));
+        let clean_row = first.record_spawn(spawn_spec(
+            "term-clean",
+            "claude",
+            Some(UUID_2),
+            &repo,
+            None,
+        ));
         assert!(first.record_exit("term-clean", false, Some(0), None));
         drop(first);
 
@@ -1172,12 +1181,16 @@ mod tests {
         ledger.record_spawn(spawn_spec("term-c1", "claude", Some(UUID_1), &repo, None));
         let reloaded = SessionLedger::open(&ledger_path);
         assert_eq!(
-            reloaded.view_with(|_, _| Transcript::Found).unreadable_count,
+            reloaded
+                .view_with(|_, _| Transcript::Found)
+                .unreadable_count,
             1
         );
         assert!(reloaded.dismiss(&corrupt.row_id));
         assert_eq!(
-            reloaded.view_with(|_, _| Transcript::Found).unreadable_count,
+            reloaded
+                .view_with(|_, _| Transcript::Found)
+                .unreadable_count,
             0
         );
 
@@ -1203,8 +1216,13 @@ mod tests {
         fs::create_dir_all(&gone_repo).unwrap();
 
         let ledger = SessionLedger::open(&ledger_path);
-        let row_id =
-            ledger.record_spawn(spawn_spec("term-gone", "claude", Some(UUID_1), &gone_repo, None));
+        let row_id = ledger.record_spawn(spawn_spec(
+            "term-gone",
+            "claude",
+            Some(UUID_1),
+            &gone_repo,
+            None,
+        ));
         ledger.mark_app_quit();
         fs::remove_dir_all(&gone_repo).unwrap();
 

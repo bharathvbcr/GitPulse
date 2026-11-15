@@ -834,7 +834,10 @@ fn a_gate_asker_that_left_before_its_verdict_is_not_a_refused_launch() {
     assert_eq!(level, log::Level::Info, "{line}");
     assert!(!line.contains("refused a launch"), "{line}");
     assert!(line.contains("the gate"), "names what was asked: {line}");
-    assert!(line.contains(" ms"), "says how long the answer took: {line}");
+    assert!(
+        line.contains(" ms"),
+        "says how long the answer took: {line}"
+    );
 }
 
 #[test]

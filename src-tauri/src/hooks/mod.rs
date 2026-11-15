@@ -11703,7 +11703,8 @@ done
                 .split_once("\n#[cfg(test)]\nmod ")
                 .map(|(head, _)| head)
                 .unwrap_or(&raw);
-            let sanitized = prod.replace("\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"", "");
+            let sanitized =
+                prod.replace("\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"", "");
             for needle in [
                 "update-ref",
                 "commit-tree",
@@ -11729,7 +11730,10 @@ done
             }
             checked += 1;
         }
-        assert!(checked >= 7, "expected all hook source files, read {checked}");
+        assert!(
+            checked >= 7,
+            "expected all hook source files, read {checked}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -11775,12 +11779,18 @@ done
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn gated_git_rebase_snapshots_pre_op_refs_and_stash_create_via_mailbox_without_touching_worktree_or_stash_list() {
+    fn gated_git_rebase_snapshots_pre_op_refs_and_stash_create_via_mailbox_without_touching_worktree_or_stash_list(
+    ) {
         use crate::test_support::git_in;
         let (_dir, repo, _requests) = scoped_hook_fixture(false);
         let bin_dir = tempfile::tempdir().expect("bin dir");
         let serial = crate::harness::sidecar::test_serial();
-        let _binary = install_manvi(bin_dir.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+        let _binary = install_manvi(
+            bin_dir.path(),
+            "allowing-manvi",
+            FAKE_ALLOWING_MANVI,
+            &serial,
+        );
 
         let repo_path = Path::new(&repo);
         crate::test_support::trust_repo(repo_path);
@@ -11802,7 +11812,10 @@ done
 
         // Seed one stash entry so we can verify `git stash list` is unchanged.
         std::fs::write(repo_path.join("seed.txt"), "stashed-seed\n").unwrap();
-        git_in(repo_path, &["stash", "push", "-q", "-m", "existing-user-stash"]);
+        git_in(
+            repo_path,
+            &["stash", "push", "-q", "-m", "existing-user-stash"],
+        );
         let stash_list_before = git_stdout(repo_path, &["stash", "list"]);
 
         // Return to feature and make a tracked edit for stash-create capture.
@@ -11847,14 +11860,21 @@ done
         assert_eq!(snap.op_ref, "refs/gitpulse/ops/1");
         assert_eq!(snap.head_ref.as_deref(), Some("refs/heads/feature"));
         assert_eq!(snap.head_oid.as_deref(), Some(pre_feature_oid.as_str()));
-        assert!(snap.stash_oid.is_some(), "dirty tracked tree must yield stash_create oid");
         assert!(
-            snap.refs.iter().any(|r| r.refname == "refs/heads/main" && r.oid == pre_main_oid),
+            snap.stash_oid.is_some(),
+            "dirty tracked tree must yield stash_create oid"
+        );
+        assert!(
+            snap.refs
+                .iter()
+                .any(|r| r.refname == "refs/heads/main" && r.oid == pre_main_oid),
             "snapshot must capture pre-rebase main: {:?}",
             snap.refs
         );
         assert!(
-            snap.refs.iter().any(|r| r.refname == "refs/heads/feature" && r.oid == pre_feature_oid),
+            snap.refs
+                .iter()
+                .any(|r| r.refname == "refs/heads/feature" && r.oid == pre_feature_oid),
             "snapshot must capture pre-rebase feature: {:?}",
             snap.refs
         );
@@ -11882,13 +11902,21 @@ done
         let (_dir, repo, _requests) = scoped_hook_fixture(false);
         let bin_dir = tempfile::tempdir().expect("bin dir");
         let serial = crate::harness::sidecar::test_serial();
-        let _binary = install_manvi(bin_dir.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+        let _binary = install_manvi(
+            bin_dir.path(),
+            "allowing-manvi",
+            FAKE_ALLOWING_MANVI,
+            &serial,
+        );
         let repo_path = Path::new(&repo);
         crate::test_support::trust_repo(repo_path);
 
         // 1. Unreachable mailbox -> TransportFailed fallback writes "unsnapshotted" + non-silent notice.
         let out_offline = gate_here(&bash_call(&repo, "git rebase main"));
-        assert!(!out_offline.is_silent(), "offline snapshot must never stay silent");
+        assert!(
+            !out_offline.is_silent(),
+            "offline snapshot must never stay silent"
+        );
         assert!(
             out_offline
                 .system_message
@@ -11915,7 +11943,10 @@ done
         );
 
         let out_failed = gate_here(&bash_call(&repo, "git reset --hard HEAD"));
-        assert!(!out_failed.is_silent(), "failed snapshot must never stay silent");
+        assert!(
+            !out_failed.is_silent(),
+            "failed snapshot must never stay silent"
+        );
         assert!(
             out_failed
                 .system_message

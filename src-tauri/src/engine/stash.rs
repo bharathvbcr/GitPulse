@@ -291,7 +291,10 @@ fn rollback_clean_worktree(
     git_text(worktree, &["reset", "--hard", "HEAD"])?;
     gate(&["clean", "-fd"])?;
     git_text(worktree, &["clean", "-fd"])?;
-    let residual = git_text(worktree, &["status", "--porcelain", "--untracked-files=normal"])?;
+    let residual = git_text(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
     if !residual.trim().is_empty() {
         return Err(format!(
             "target worktree still has residual changes after rollback: {}",
@@ -304,7 +307,8 @@ fn rollback_clean_worktree(
 
 #[doc(hidden)]
 pub fn stash_create_in(repo: &Path) -> Result<Option<String>, CommandError> {
-    let head_check = crate::engine::git_cli::git_captured(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    let head_check =
+        crate::engine::git_cli::git_captured(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
     if !head_check.success {
         return Ok(None);
     }
@@ -1008,8 +1012,8 @@ mod tests {
         }
 
         #[test]
-        fn op_log_stash_create_returns_none_when_clean_and_commit_without_touching_worktree_or_stash_list()
-        {
+        fn op_log_stash_create_returns_none_when_clean_and_commit_without_touching_worktree_or_stash_list(
+        ) {
             let dir = repo_with_base();
             let path = dir.path();
             let repo_str = path.to_str().unwrap();
@@ -1042,8 +1046,8 @@ mod tests {
         }
 
         #[test]
-        fn fork_stash_create_and_apply_oid_preserves_staged_and_unstaged_without_touching_stash_stack()
-        {
+        fn fork_stash_create_and_apply_oid_preserves_staged_and_unstaged_without_touching_stash_stack(
+        ) {
             let dir = repo_with_base();
             let path = dir.path();
             let repo_str = path.to_str().unwrap();
@@ -1102,10 +1106,7 @@ mod tests {
                 Ok(())
             })
             .expect("clean apply into fork");
-            assert_eq!(
-                gated_apply,
-                vec![vec!["stash", "apply", "--index", &oid]]
-            );
+            assert_eq!(gated_apply, vec![vec!["stash", "apply", "--index", &oid]]);
             assert_eq!(
                 git(&fork_path, &["status", "--porcelain"]),
                 source_porcelain,
@@ -1119,7 +1120,11 @@ mod tests {
                 std::fs::read_to_string(fork_path.join("b.txt")).unwrap(),
                 "unstaged edit\n"
             );
-            assert_eq!(oids(path), before_stack, "source stash stack stays untouched");
+            assert_eq!(
+                oids(path),
+                before_stack,
+                "source stash stack stays untouched"
+            );
         }
 
         #[test]
@@ -1166,7 +1171,10 @@ mod tests {
                 "expected Conflict variant, got {err:?}"
             );
             assert_eq!(
-                git(&fork_path, &["status", "--porcelain", "--untracked-files=normal"]),
+                git(
+                    &fork_path,
+                    &["status", "--porcelain", "--untracked-files=normal"]
+                ),
                 "",
                 "target fork worktree must be left with empty porcelain after conflict"
             );

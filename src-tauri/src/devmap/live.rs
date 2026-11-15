@@ -2334,7 +2334,11 @@ mod tests {
         // Productive build: streak resets to 0, wait enters WaitKind::Rest (>= 30s)
         let op = settle.record(Ok(productive), Duration::from_millis(10));
         assert_eq!(op.cooldown_remaining_ms, Some(30_000));
-        assert_eq!(live_echo_streak(path), 0, "productive build resets streak to 0");
+        assert_eq!(
+            live_echo_streak(path),
+            0,
+            "productive build resets streak to 0"
+        );
 
         // Subsequent echo starts at streak 0 again -> wait 1s
         let o_sub = settle.record(Ok(echo), Duration::from_millis(10));
@@ -2377,7 +2381,10 @@ mod tests {
         assert_eq!(live_echo_streak(path), 0, "streak must be reset to 0");
 
         // Wait is still active:
-        assert!(live_wait(path, Instant::now()).is_some(), "wait itself should remain active");
+        assert!(
+            live_wait(path, Instant::now()).is_some(),
+            "wait itself should remain active"
+        );
 
         // Next echo sees prev.streak == 0, so next streak is 1 (2s), not 4 (16s)
         let next_echo = settle.record(Ok(echo), Duration::from_millis(10));
@@ -2414,13 +2421,20 @@ mod tests {
         assert_eq!(outcome.cooldown_remaining_ms, Some(1_000));
 
         // Genuine edit arriving 500ms later (within the 1s cooldown):
-        let during_wait = live_refresh(path, true, start + Duration::from_millis(500), LiveBuildRun::Inline);
+        let during_wait = live_refresh(
+            path,
+            true,
+            start + Duration::from_millis(500),
+            LiveBuildRun::Inline,
+        );
         assert_eq!(
             during_wait.decision,
             LiveRefreshDecision::SkipCooldown,
             "during 1s cooldown, watcher tick returns SkipCooldown"
         );
-        assert!(during_wait.cooldown_remaining_ms.is_some_and(|ms| ms > 0 && ms <= 1_000));
+        assert!(during_wait
+            .cooldown_remaining_ms
+            .is_some_and(|ms| ms > 0 && ms <= 1_000));
 
         // Genuine edit arriving at 1200ms (after the 1s cooldown has expired):
         let after_wait = live_wait(path, start + Duration::from_millis(1200));

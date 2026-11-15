@@ -110,8 +110,22 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
     }
 
     let ledger = SessionLedger::open(&ledger_path);
-    ledger.record_spawn(spawn_spec("t1", "claude", Some(s1), &repo, &repo, Some("edit")));
-    ledger.record_spawn(spawn_spec("t2", "claude", Some(s2), &repo, &sub_a, Some("bypass")));
+    ledger.record_spawn(spawn_spec(
+        "t1",
+        "claude",
+        Some(s1),
+        &repo,
+        &repo,
+        Some("edit"),
+    ));
+    ledger.record_spawn(spawn_spec(
+        "t2",
+        "claude",
+        Some(s2),
+        &repo,
+        &sub_a,
+        Some("bypass"),
+    ));
     ledger.record_spawn(spawn_spec("t3", "claude", Some(s3), &repo, &sub_b, None));
     ledger.record_spawn(spawn_spec("t-shell", "shell", None, &repo, &repo, None));
 
@@ -140,7 +154,13 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
 
     for (tid, expected_sid, expected_cwd, expected_mode, expected_flag) in [
         ("t1", s1, repo.as_path(), Some("edit"), Some("acceptEdits")),
-        ("t2", s2, sub_a.as_path(), Some("bypass"), Some("bypassPermissions")),
+        (
+            "t2",
+            s2,
+            sub_a.as_path(),
+            Some("bypass"),
+            Some("bypassPermissions"),
+        ),
         ("t3", s3, sub_b.as_path(), None, None),
     ] {
         let offer = view
@@ -172,7 +192,8 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
         );
         if let Some(perm_val) = expected_flag {
             assert!(
-                argv.windows(2).any(|w| w == ["--permission-mode", perm_val]),
+                argv.windows(2)
+                    .any(|w| w == ["--permission-mode", perm_val]),
                 "expected [--permission-mode, {perm_val}] in {argv:?}"
             );
         } else {
@@ -249,8 +270,14 @@ fn s2_03_gone_cwd_clean_exit_bounds_and_corrupt_row() {
     assert_eq!(failed.last_error.as_deref(), Some("custom reopen failure"));
 
     let view = ledger.view();
-    assert!(view.offers.iter().all(|o| o.terminal_id.as_deref() != Some("t-clean")));
-    assert!(view.offers.iter().all(|o| o.terminal_id.as_deref() != Some("t-closed")));
+    assert!(view
+        .offers
+        .iter()
+        .all(|o| o.terminal_id.as_deref() != Some("t-clean")));
+    assert!(view
+        .offers
+        .iter()
+        .all(|o| o.terminal_id.as_deref() != Some("t-closed")));
     let still_listed = view
         .offers
         .iter()
@@ -313,8 +340,22 @@ fn s2_05_persists_across_reloads_until_reopened_or_dismissed() {
     write_claude_transcript(s2);
 
     let ledger = SessionLedger::open(&ledger_path);
-    let r1 = ledger.record_spawn(spawn_spec("t1", "claude", Some(s1), &repo, &repo, Some("edit")));
-    let r2 = ledger.record_spawn(spawn_spec("t2", "claude", Some(s2), &repo, &repo, Some("edit")));
+    let r1 = ledger.record_spawn(spawn_spec(
+        "t1",
+        "claude",
+        Some(s1),
+        &repo,
+        &repo,
+        Some("edit"),
+    ));
+    let r2 = ledger.record_spawn(spawn_spec(
+        "t2",
+        "claude",
+        Some(s2),
+        &repo,
+        &repo,
+        Some("edit"),
+    ));
     assert_eq!(ledger.mark_app_quit(), 2);
     drop(ledger);
 
@@ -331,7 +372,14 @@ fn s2_05_persists_across_reloads_until_reopened_or_dismissed() {
     let ledger = SessionLedger::open(&ledger_path);
     ledger.record_spawn(NewSessionRow {
         reopen_row_id: Some(r1.clone()),
-        ..spawn_spec("t1-reopened", "claude", Some(s1), &repo, &repo, Some("edit"))
+        ..spawn_spec(
+            "t1-reopened",
+            "claude",
+            Some(s1),
+            &repo,
+            &repo,
+            Some("edit"),
+        )
     });
     let after_reopen = ledger.view();
     assert!(!after_reopen.offers.iter().any(|o| o.row_id == r1));
@@ -402,6 +450,9 @@ fn s2_07_refuses_raw_flags_checks_locators_and_blocks_hook_argv() {
         br#"{"v":1,"event":"error","args":["--resume","x"]}"#.as_slice(),
         br#"{"v":1,"event":"error","command":"claude --resume x"}"#.as_slice(),
     ] {
-        assert_eq!(parse_report_stamped(payload), Err(Reason::ForbiddenArgvField));
+        assert_eq!(
+            parse_report_stamped(payload),
+            Err(Reason::ForbiddenArgvField)
+        );
     }
 }

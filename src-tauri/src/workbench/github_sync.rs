@@ -14,7 +14,7 @@ use super::{is_record_id, query, WorkbenchError, WorkbenchState};
 use crate::github::{
     discover_github_remote, execute_outbox_create_issue, execute_outbox_update_issue,
     find_issue_by_marker, strip_outbox_marker, view_issue, GhMutationOutcome, GitHubRepoRef,
-    IssueDetail,
+    IssueContent, IssueDetail,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -105,10 +105,7 @@ pub(super) trait IssueTransport {
         &self,
         repo_path: &str,
         remote: &GitHubRepoRef,
-        title: &str,
-        body: &str,
-        state: &str,
-        labels: &[String],
+        content: IssueContent<'_>,
         idempotency_key: &str,
     ) -> GhMutationOutcome;
 
@@ -118,10 +115,7 @@ pub(super) trait IssueTransport {
         remote: &GitHubRepoRef,
         number: u64,
         fields: &[String],
-        title: &str,
-        body: &str,
-        state: &str,
-        labels: &[String],
+        content: IssueContent<'_>,
         current_remote: Option<&IssueDetail>,
     ) -> GhMutationOutcome;
 }
@@ -179,13 +173,10 @@ impl IssueTransport for GhCliTransport {
         &self,
         repo_path: &str,
         remote: &GitHubRepoRef,
-        title: &str,
-        body: &str,
-        state: &str,
-        labels: &[String],
+        content: IssueContent<'_>,
         idempotency_key: &str,
     ) -> GhMutationOutcome {
-        execute_outbox_create_issue(repo_path, remote, title, body, state, labels, idempotency_key)
+        execute_outbox_create_issue(repo_path, remote, content, idempotency_key)
     }
 
     fn update_issue(
@@ -194,23 +185,10 @@ impl IssueTransport for GhCliTransport {
         remote: &GitHubRepoRef,
         number: u64,
         fields: &[String],
-        title: &str,
-        body: &str,
-        state: &str,
-        labels: &[String],
+        content: IssueContent<'_>,
         current_remote: Option<&IssueDetail>,
     ) -> GhMutationOutcome {
-        execute_outbox_update_issue(
-            repo_path,
-            remote,
-            number,
-            fields,
-            title,
-            body,
-            state,
-            labels,
-            current_remote,
-        )
+        execute_outbox_update_issue(repo_path, remote, number, fields, content, current_remote)
     }
 }
 
@@ -261,7 +239,12 @@ pub(super) fn poll_with(
     let request_id = required_string(&top, "request_id")?;
 
     let mut get_req = Map::new();
-    if let Some(id) = top.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(id) = top
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if !is_record_id(id) {
             return Err(invalid("invalid sync link id"));
         }
@@ -277,8 +260,13 @@ pub(super) fn poll_with(
         }
         get_req.insert("task_id".into(), json!(tid));
     } else if let (Some(slug), Some(num)) = (
-        top.get("repo_slug").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()),
-        top.get("issue_number").and_then(Value::as_u64).filter(|n| *n >= 1),
+        top.get("repo_slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        top.get("issue_number")
+            .and_then(Value::as_u64)
+            .filter(|n| *n >= 1),
     ) {
         get_req.insert("repo_slug".into(), json!(slug));
         get_req.insert("issue_number".into(), json!(num));
@@ -305,9 +293,15 @@ pub(super) fn poll_with(
     let repo_slug = item["repo_slug"].as_str().ok_or_else(|| {
         WorkbenchError::new("protocol_error", "github_sync.get omitted repo_slug")
     })?;
-    let issue_number = item["issue_number"].as_u64().filter(|n| *n >= 1).ok_or_else(|| {
-        WorkbenchError::new("protocol_error", "github_sync.get omitted valid issue_number")
-    })?;
+    let issue_number = item["issue_number"]
+        .as_u64()
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| {
+            WorkbenchError::new(
+                "protocol_error",
+                "github_sync.get omitted valid issue_number",
+            )
+        })?;
 
     let remote = transport.resolve_remote(repo_path, repo_slug)?;
     let detail = transport.view_issue(repo_path, &remote, issue_number)?;
@@ -334,8 +328,7 @@ pub(super) fn sweep_delivering_on_startup(state: &WorkbenchState) -> usize {
         if let Some(ref next) = cursor {
             input["cursor"] = json!(next);
         }
-        let page = match state.with_store(|store| query(store, "outbox.list", &input.to_string()))
-        {
+        let page = match state.with_store(|store| query(store, "outbox.list", &input.to_string())) {
             Ok(page) => page,
             Err(error) => {
                 log::warn!(
@@ -348,9 +341,7 @@ pub(super) fn sweep_delivering_on_startup(state: &WorkbenchState) -> usize {
             }
         };
         for item in page["items"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(revision)) =
-                (item["id"].as_str(), item["revision"].as_i64())
-            {
+            if let (Some(id), Some(revision)) = (item["id"].as_str(), item["revision"].as_i64()) {
                 if seen.insert(id.to_owned()) {
                     candidates.push((id.to_owned(), revision));
                 }
@@ -563,8 +554,8 @@ pub(super) fn deliver_with(
             "issue_url": detail.url,
             "remote": remote_snapshot_json(&detail),
         });
-        let preflight_resp =
-            state.with_store(|store| query(store, "outbox.preflight", &preflight_req.to_string()))?;
+        let preflight_resp = state
+            .with_store(|store| query(store, "outbox.preflight", &preflight_req.to_string()))?;
         if preflight_resp["item"]["state"] == "conflict" {
             return Ok(preflight_resp);
         }
@@ -621,9 +612,9 @@ pub(super) fn deliver_with(
             .to_string(),
         )
     })?;
-    let claim_rev = claim_resp["item"]["revision"].as_i64().ok_or_else(|| {
-        WorkbenchError::new("protocol_error", "outbox.claim omitted revision")
-    })?;
+    let claim_rev = claim_resp["item"]["revision"]
+        .as_i64()
+        .ok_or_else(|| WorkbenchError::new("protocol_error", "outbox.claim omitted revision"))?;
 
     let payload = &entry["payload"];
     let title = payload["title"].as_str().unwrap_or_default();
@@ -631,17 +622,15 @@ pub(super) fn deliver_with(
     let state_str = payload["state"].as_str().unwrap_or("open");
     let labels = string_vec(&payload["labels"]);
     let fields = string_vec(&payload["fields"]);
+    let content = IssueContent {
+        title,
+        body,
+        state: state_str,
+        labels: &labels,
+    };
 
     let outcome = match op {
-        "create_issue" => transport.create_issue(
-            repo_path,
-            &remote,
-            title,
-            body,
-            state_str,
-            &labels,
-            idempotency_key,
-        ),
+        "create_issue" => transport.create_issue(repo_path, &remote, content, idempotency_key),
         "update_issue" => {
             let num = issue_number.filter(|n| *n >= 1).ok_or_else(|| {
                 WorkbenchError::new(
@@ -654,10 +643,7 @@ pub(super) fn deliver_with(
                 &remote,
                 num,
                 &fields,
-                title,
-                body,
-                state_str,
-                &labels,
+                content,
                 current_remote.as_ref(),
             )
         }
@@ -794,10 +780,7 @@ mod tests {
             &self,
             _repo_path: &str,
             _remote: &GitHubRepoRef,
-            _title: &str,
-            _body: &str,
-            _state: &str,
-            _labels: &[String],
+            _content: IssueContent<'_>,
             _idempotency_key: &str,
         ) -> GhMutationOutcome {
             *self.create_calls.borrow_mut() += 1;
@@ -810,10 +793,7 @@ mod tests {
             _remote: &GitHubRepoRef,
             _number: u64,
             _fields: &[String],
-            _title: &str,
-            _body: &str,
-            _state: &str,
-            _labels: &[String],
+            _content: IssueContent<'_>,
             _current_remote: Option<&IssueDetail>,
         ) -> GhMutationOutcome {
             *self.update_calls.borrow_mut() += 1;

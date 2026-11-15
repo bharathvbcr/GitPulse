@@ -351,7 +351,10 @@ impl FileSink {
             }
         }
         if std::mem::take(&mut state.marker_owed) {
-            Self::write_locked(&mut state, &session_marker(&stem_of(&self.current), "start"));
+            Self::write_locked(
+                &mut state,
+                &session_marker(&stem_of(&self.current), "start"),
+            );
         }
         let projected = state
             .bytes
@@ -1680,7 +1683,10 @@ mod tests {
         let lines = file_lines(&dir.path().join("gitpulse.log"));
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].contains("gitpulse start pid"), "{lines:?}");
-        assert!(lines[1].contains("Background cleanup failed: x"), "{lines:?}");
+        assert!(
+            lines[1].contains("Background cleanup failed: x"),
+            "{lines:?}"
+        );
         assert!(lines[2].contains("second line"), "{lines:?}");
     }
 

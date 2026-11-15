@@ -362,7 +362,10 @@ mod tests {
         assert!(vet(ME.pgrp, Basis::Session(77)).is_err());
         assert!(vet(ME.sid, Basis::Session(77)).is_err());
         assert!(vet(600, Basis::Session(ME.sid)).is_err(), "own session");
-        assert!(vet(600, Basis::Session(ME.pgrp)).is_err(), "own group session");
+        assert!(
+            vet(600, Basis::Session(ME.pgrp)).is_err(),
+            "own group session"
+        );
         assert!(vet(600, Basis::Session(ME.ppid)).is_err(), "parent session");
         assert!(vet(600, Basis::Session(ME.pid)).is_err(), "own pid session");
         assert!(vet(600, Basis::Session(1)).is_err(), "session 1");

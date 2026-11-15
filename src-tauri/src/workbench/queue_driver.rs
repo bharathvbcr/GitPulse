@@ -156,7 +156,13 @@ pub(super) fn enqueue_host(
             .ok_or_else(|| invalid("each queue member must be a JSON object"))?;
         check_allowed_keys(
             member,
-            &["member_id", "repository_id", "repo_path", "task_id", "depends_on"],
+            &[
+                "member_id",
+                "repository_id",
+                "repo_path",
+                "task_id",
+                "depends_on",
+            ],
             "queue member",
         )?;
         let member_id = required_string(member, "member_id")?;
@@ -299,7 +305,14 @@ pub(super) fn verify_combined(
                     .ok_or_else(|| invalid("each verification result must be a JSON object"))?;
                 check_allowed_keys(
                     row,
-                    &["member_id", "ok", "head_oid", "command", "exit_code", "summary"],
+                    &[
+                        "member_id",
+                        "ok",
+                        "head_oid",
+                        "command",
+                        "exit_code",
+                        "summary",
+                    ],
                     "verification result",
                 )?;
                 let member_id = required_string(row, "member_id")?;
@@ -420,22 +433,21 @@ pub(super) fn sweep_expired_queues(state: &WorkbenchState) -> usize {
             if let Some(ref next) = cursor {
                 input["cursor"] = json!(next);
             }
-            let page = match state.with_store(|store| query(store, "queue.list", &input.to_string()))
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    log::warn!(
-                        target: "workbench",
-                        "queue expiry sweep could not list {q_state} queues: {}: {}",
-                        error.code,
-                        error.message
-                    );
-                    break;
-                }
-            };
+            let page =
+                match state.with_store(|store| query(store, "queue.list", &input.to_string())) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        log::warn!(
+                            target: "workbench",
+                            "queue expiry sweep could not list {q_state} queues: {}: {}",
+                            error.code,
+                            error.message
+                        );
+                        break;
+                    }
+                };
             for item in page["items"].as_array().into_iter().flatten() {
-                if let (Some(id), Some(revision)) =
-                    (item["id"].as_str(), item["revision"].as_i64())
+                if let (Some(id), Some(revision)) = (item["id"].as_str(), item["revision"].as_i64())
                 {
                     if seen_ids.insert(id.to_owned()) {
                         candidates.push((id.to_owned(), revision));
@@ -676,10 +688,7 @@ mod tests {
             .iter()
             .find(|m| m["member_id"] == "m-alpha")
             .unwrap();
-        let beta = members
-            .iter()
-            .find(|m| m["member_id"] == "m-beta")
-            .unwrap();
+        let beta = members.iter().find(|m| m["member_id"] == "m-beta").unwrap();
         assert_eq!(alpha["state"], "leased");
         assert_eq!(alpha["lease_held"], true);
         assert_eq!(alpha["base_oid"], head_a);

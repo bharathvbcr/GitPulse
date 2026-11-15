@@ -981,14 +981,13 @@ impl TerminalSessions {
         self.host.set_agent_meta(session_id, meta);
     }
 
-    /// Records `meta` in this app's `agent_meta` map and binds the native
-    /// conversation id in the session ledger, without forwarding to `gitpulse-ptyd`.
-    fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
-        let _ = self.session_ledger.bind_native_id(
-            session_id,
-            &meta.agent,
-            &meta.conversation_id,
-        );
+    /// Records `meta` in this process's `agent_meta` map and binds the native
+    /// conversation id in the session ledger, without forwarding to
+    /// `gitpulse-ptyd` (used both locally and inside `gitpulse-ptyd` itself).
+    pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
+        let _ = self
+            .session_ledger
+            .bind_native_id(session_id, &meta.agent, &meta.conversation_id);
         let mut map = self
             .agent_meta
             .lock()

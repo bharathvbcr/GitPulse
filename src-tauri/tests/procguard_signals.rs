@@ -444,8 +444,16 @@ fn adversarial_signal_blast_radius_guard_blocks_host_tree() {
 
     // 2. Verify signal_group rejects host IDs under Basis::Session(me.sid)
     for id in host_ids.iter() {
-        let res = signal::signal_group(*id, libc::SIGKILL, Basis::Session(me.sid), "adversarial-test");
-        assert!(res.is_err(), "signal_group in host session should reject id {id}");
+        let res = signal::signal_group(
+            *id,
+            libc::SIGKILL,
+            Basis::Session(me.sid),
+            "adversarial-test",
+        );
+        assert!(
+            res.is_err(),
+            "signal_group in host session should reject id {id}"
+        );
         let err = res.unwrap_err();
         assert!(
             signal::is_refusal(&err),
