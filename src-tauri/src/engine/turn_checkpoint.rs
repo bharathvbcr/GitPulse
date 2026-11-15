@@ -76,11 +76,12 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::git_cli::{
     find_git_root, git_captured, git_captured_with_stdin, git_text_capped, git_with_index,
-    validate_repo, BoundedRun,
+    validate_repo,
 };
 use crate::engine::git_writer::{
     absent_oid_for_len, validate_oid, validate_ref_name, SNAPSHOT_IDENTITY_ARGS,
 };
+use crate::engine::process::BoundedRun;
 
 /// Ref prefix under which turn checkpoints are stored.
 pub const TURN_REF_PREFIX: &str = "refs/gitpulse/turns/";
