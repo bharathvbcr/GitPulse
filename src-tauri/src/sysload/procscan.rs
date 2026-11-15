@@ -1796,6 +1796,12 @@ pub fn observe_sessions_with_caller() -> Result<SessionScan, String> {
 
 /// The processes whose working directory is `dir` or inside it, other than
 /// this one. `Err` when the table could not be read.
+///
+/// This is the cwd-only question. A process that builds into `dir` from
+/// somewhere else (`cargo --target-dir dir`, a test executable run from
+/// `dir`) is invisible to it, so a caller that decides to delete `dir` asks
+/// [`processes_using`] instead; this one remains for callers that want to
+/// find processes to signal by where they are standing.
 pub(crate) fn working_in(dir: &Path) -> Result<Vec<i32>, String> {
     let me = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut pids = Vec::new();
@@ -1805,6 +1811,261 @@ pub(crate) fn working_in(dir: &Path) -> Result<Vec<i32>, String> {
         .filter(|pid| *pid > 0 && *pid != me)
         .filter(|pid| os::cwd(*pid).is_some_and(|cwd| cwd.starts_with(dir)))
         .collect())
+}
+
+/// How a process was found to be using a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum UseKind {
+    /// Its current directory is the directory or inside it.
+    WorkingDirectory,
+    /// It is running an executable that lives inside the directory.
+    Executable,
+    /// An argument names the directory (`--target-dir dir`, `--manifest-path
+    /// dir/Cargo.toml`, a bare path), as a path or inside a longer argument.
+    Argument,
+    /// A variable in its environment names the directory (`CARGO_TARGET_DIR`).
+    Environment,
+}
+
+impl UseKind {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::WorkingDirectory => "its working directory is inside",
+            Self::Executable => "it runs an executable from inside",
+            Self::Argument => "an argument names",
+            Self::Environment => "its environment names",
+        }
+    }
+}
+
+/// What the OS would say about one process, as far as the user is allowed to
+/// read it. `None` is "could not be read", never "empty".
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProcessUse {
+    pub pid: i32,
+    /// The process belongs to the user running this program. Another user's
+    /// process cannot be inspected without privilege and is only counted.
+    pub mine: bool,
+    pub cwd: Option<PathBuf>,
+    pub exe: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+}
+
+/// Who is using a directory, and what could not be checked.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct DirUse {
+    pub users: Vec<(i32, UseKind)>,
+    /// The user's own processes whose arguments or environment could not be
+    /// read, so they cannot be shown not to use the directory.
+    pub unreadable: Vec<i32>,
+    /// Other users' processes, which are not inspected.
+    pub other_users: usize,
+}
+
+impl DirUse {
+    pub(crate) fn pids(&self) -> Vec<i32> {
+        let mut pids: Vec<i32> = self.users.iter().map(|(pid, _)| *pid).collect();
+        pids.dedup();
+        pids
+    }
+
+    /// The directory is shown unused only when nobody is using it and every
+    /// process of the user's could be read.
+    pub(crate) fn provably_unused(&self) -> bool {
+        self.users.is_empty() && self.unreadable.is_empty()
+    }
+
+    /// One sentence for a candidate that is kept because of this reading.
+    pub(crate) fn why_kept(&self) -> Option<String> {
+        if let Some((pid, kind)) = self.users.first() {
+            return Some(format!(
+                "process {pid}: {} it ({} process(es) in all)",
+                kind.describe(),
+                self.pids().len()
+            ));
+        }
+        (!self.unreadable.is_empty()).then(|| {
+            format!(
+                "{} of your processes could not be read, so none of them can be shown not to use it",
+                self.unreadable.len()
+            )
+        })
+    }
+}
+
+/// A `KERN_PROCARGS2` block: argc, the exec path, padding, `argc` arguments,
+/// then the environment. `None` for a block too short to hold argc and a path.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_procargs2(data: &[u8]) -> Option<(String, Vec<String>, Vec<String>)> {
+    let argc = i32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok()?.min(4096);
+    let rest = &data[4..];
+    let exec_end = rest.iter().position(|b| *b == 0)?;
+    let exec = String::from_utf8_lossy(&rest[..exec_end]).into_owned();
+    let mut items = rest[exec_end..]
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    let argv: Vec<String> = items.by_ref().take(argc).collect();
+    Some((exec, argv, items.collect()))
+}
+
+/// Whether `pid` is still a process. `EPERM` means it is, and is not ours.
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The spellings of `dir` a process may use: as given, resolved, and with the
+/// macOS `/private` alias added or removed (`/tmp` is `/private/tmp`).
+fn dir_spellings(dir: &Path) -> Vec<PathBuf> {
+    let mut all = vec![dir.to_path_buf()];
+    if let Ok(real) = dir.canonicalize() {
+        all.push(real);
+    }
+    let extra: Vec<PathBuf> = all
+        .iter()
+        .filter_map(|path| {
+            if let Ok(rest) = path.strip_prefix("/private") {
+                Some(Path::new("/").join(rest))
+            } else if path.starts_with("/tmp")
+                || path.starts_with("/var")
+                || path.starts_with("/etc")
+            {
+                Some(Path::new("/private").join(path.strip_prefix("/").ok()?))
+            } else {
+                None
+            }
+        })
+        .collect();
+    all.extend(extra);
+    all.sort();
+    all.dedup();
+    all
+}
+
+fn path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '+' | '~')
+}
+
+/// `text` contains `needle` as a whole path: not the tail of a longer path
+/// (`/other/dir`) and not the head of a longer name (`dir-two`).
+fn mentions(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + needle.len()..].chars().next();
+        before.is_none_or(|c| !path_char(c) && c != '/')
+            && after.is_none_or(|c| c == '/' || !path_char(c))
+    })
+}
+
+/// `cwd` joined with `token`, with `.` and `..` resolved as text.
+fn lexical_join(cwd: &Path, token: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in cwd.join(token).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// How `process` uses a directory spelled `spellings`, if it does.
+fn classify_use(spellings: &[PathBuf], process: &ProcessUse) -> Option<UseKind> {
+    let text: Vec<&str> = spellings.iter().filter_map(|p| p.to_str()).collect();
+    let inside = |path: &Path| spellings.iter().any(|dir| path.starts_with(dir));
+    let names = |value: &str| text.iter().any(|dir| mentions(value, dir));
+    if process.cwd.as_deref().is_some_and(inside) {
+        return Some(UseKind::WorkingDirectory);
+    }
+    if process
+        .exe
+        .as_deref()
+        .is_some_and(|exe| inside(Path::new(exe)))
+    {
+        return Some(UseKind::Executable);
+    }
+    if let Some(argv) = &process.argv {
+        for (index, arg) in argv.iter().enumerate() {
+            if names(arg) {
+                return Some(UseKind::Argument);
+            }
+            // The program's own name is never a path argument, and a relative
+            // argument means nothing without the directory it is relative to.
+            if index > 0 && !arg.starts_with('/') && !arg.starts_with('-') {
+                if let Some(cwd) = &process.cwd {
+                    if inside(&lexical_join(cwd, arg)) {
+                        return Some(UseKind::Argument);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(env) = &process.env {
+        if env
+            .iter()
+            .any(|entry| entry.split_once('=').is_some_and(|(_, value)| names(value)))
+        {
+            return Some(UseKind::Environment);
+        }
+    }
+    None
+}
+
+/// [`DirUse`] over an already-read process table, `me` excluded.
+pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
+    let spellings = dir_spellings(dir);
+    let mut out = DirUse::default();
+    for process in table.iter().filter(|p| p.pid > 0 && p.pid != me) {
+        if let Some(kind) = classify_use(&spellings, process) {
+            out.users.push((process.pid, kind));
+        } else if !process.mine {
+            out.other_users += 1;
+        } else if process.argv.is_none() || process.env.is_none() {
+            out.unreadable.push(process.pid);
+        }
+    }
+    out
+}
+
+/// Every process the OS lists, read for [`dir_use_in`]. A process that exits
+/// while the table is read is dropped; a table that cannot be listed is an
+/// `Err`.
+pub(crate) fn read_use_table() -> Result<Vec<ProcessUse>, String> {
+    let mut pids = Vec::new();
+    os::list_pids(&mut pids)?;
+    let mut buf = Vec::new();
+    Ok(pids
+        .into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| os::read_use(pid, &mut buf))
+        .collect())
+}
+
+/// Who is using `dir` right now, read from the live process table.
+pub(crate) fn dir_use(dir: &Path) -> Result<DirUse, String> {
+    let me = i32::try_from(std::process::id()).unwrap_or(-1);
+    Ok(dir_use_in(dir, &read_use_table()?, me))
+}
+
+/// The pids using `dir`, for a caller that is about to delete it or something
+/// inside it: a working directory inside, an executable inside, an argument
+/// or an environment value naming it. `Err` when the table could not be read,
+/// and `Err` when nothing was found but some process of the user's could not
+/// be read: unreadable is not unused.
+pub(crate) fn processes_using(dir: &Path) -> Result<Vec<i32>, String> {
+    let reading = dir_use(dir)?;
+    if reading.users.is_empty() && !reading.unreadable.is_empty() {
+        return Err(reading.why_kept().unwrap_or_default());
+    }
+    Ok(reading.pids())
 }
 
 /// Every pid in the process table, bounded by [`MAX_SCANNED_PROCESSES`].
@@ -2487,6 +2748,67 @@ mod os {
         .map(|(_, argv, _)| argv)
     }
 
+    /// from `KERN_PROCARGS2`; `None` when the kernel refuses it or the block
+    /// is larger than `buf`.
+    fn full_procargs(pid: i32, buf: &mut [u8]) -> Option<(String, Vec<String>, Vec<String>)> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = buf.len();
+        // SAFETY: `buf` is a live buffer of `size` bytes.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || size > buf.len() {
+            return None;
+        }
+        super::parse_procargs2(&buf[..size])
+    }
+
+    /// What `pid` shows of itself to this user, for the directory-use check.
+    /// `None` when it is gone. A process of the user's whose argument block
+    /// cannot be read is returned with `argv` and `env` empty of knowledge
+    /// (`None`), so the caller cannot take it for one that uses nothing.
+    pub(crate) fn read_use(pid: i32, buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
+        let basic = basic(pid)?;
+        if basic.zombie {
+            return None;
+        }
+        let cwd = cwd(pid);
+        if basic.uid != uid() {
+            return Some(super::ProcessUse {
+                pid,
+                mine: false,
+                cwd,
+                ..Default::default()
+            });
+        }
+        if buf.is_empty() {
+            buf.resize(argmax(), 0);
+        }
+        match full_procargs(pid, buf) {
+            Some((exe, argv, env)) => Some(super::ProcessUse {
+                pid,
+                mine: true,
+                cwd,
+                exe: Some(exe),
+                argv: Some(argv),
+                env: Some(env),
+            }),
+            None => super::process_exists(pid).then_some(super::ProcessUse {
+                pid,
+                mine: true,
+                cwd,
+                ..Default::default()
+            }),
+        }
+    }
+
     pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
         let me = uid();
         let mut buf = vec![0u8; argmax()];
@@ -2965,6 +3287,43 @@ mod os {
         text.starts_with('/').then(|| text.into_owned())
     }
 
+    /// What `pid` shows of itself to this user, for the directory-use check.
+    /// `None` when it is gone. Anything of the user's that cannot be read is
+    /// `None` in the row, never an empty list.
+    pub(crate) fn read_use(pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
+        let info = stat(pid)?;
+        if info.zombie {
+            return None;
+        }
+        let cwd = cwd(pid);
+        if owner(pid)? != uid() {
+            return Some(super::ProcessUse {
+                pid,
+                mine: false,
+                cwd,
+                ..Default::default()
+            });
+        }
+        let split = |raw: Vec<u8>| -> Vec<String> {
+            raw.split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+                .map(|item| String::from_utf8_lossy(item).into_owned())
+                .collect()
+        };
+        Some(super::ProcessUse {
+            pid,
+            mine: true,
+            cwd,
+            exe: exe_path(pid),
+            argv: read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
+                .ok()
+                .map(split),
+            env: read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
+                .ok()
+                .map(split),
+        })
+    }
+
     /// The exec spelling, arguments and launch environment. `argv[0]` wins
     /// when it is a path, because `/proc/<pid>/exe` has already resolved a
     /// symlink. `None` when the argument list itself could not be read.
@@ -3067,6 +3426,10 @@ mod os {
     }
 
     pub(super) fn pid_ppid_start(_pid: i32) -> Option<(i32, u64)> {
+        None
+    }
+
+    pub(crate) fn read_use(_pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
         None
     }
 
@@ -3227,6 +3590,269 @@ pub(crate) mod tests {
             std::os::unix::process::ExitStatusExt::signal(&status),
             Some(libc::SIGTERM)
         );
+    }
+
+    fn table_row(pid: i32, cwd: &str, exe: &str, argv: &[&str], env: &[&str]) -> ProcessUse {
+        ProcessUse {
+            pid,
+            mine: true,
+            cwd: Some(PathBuf::from(cwd)),
+            exe: Some(exe.into()),
+            argv: Some(argv.iter().map(|a| (*a).into()).collect()),
+            env: Some(env.iter().map(|e| (*e).into()).collect()),
+        }
+    }
+
+    /// The cwd-only reading, over the same rows, for a before/after pair.
+    fn cwd_only(dir: &Path, table: &[ProcessUse]) -> Vec<i32> {
+        table
+            .iter()
+            .filter(|p| p.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(dir)))
+            .map(|p| p.pid)
+            .collect()
+    }
+
+    /// Today's shape: the building process stands in another directory and the
+    /// scratch directory appears only as `--target-dir` and in the paths of
+    /// running test executables.
+    #[test]
+    fn a_directory_named_only_by_arguments_and_executables_is_in_use() {
+        let dir = Path::new("/private/tmp/claude-501/proj/sess/scratchpad/cargo-target");
+        let table = vec![
+            table_row(
+                10,
+                "/Users/u/repo",
+                "/Users/u/.cargo/bin/cargo",
+                &[
+                    "cargo",
+                    "test",
+                    "--target-dir",
+                    "/private/tmp/claude-501/proj/sess/scratchpad/cargo-target",
+                ],
+                &["HOME=/Users/u"],
+            ),
+            table_row(
+                11,
+                "/Users/u/repo/src-tauri",
+                "/private/tmp/claude-501/proj/sess/scratchpad/cargo-target/debug/deps/app-1a2b",
+                &["app-1a2b"],
+                &[],
+            ),
+            table_row(12, "/Users/u", "/bin/zsh", &["-zsh"], &[]),
+        ];
+        assert!(
+            cwd_only(dir, &table).is_empty(),
+            "the cwd-only reading calls today's directory unused"
+        );
+        let reading = dir_use_in(dir, &table, 1);
+        assert_eq!(
+            reading.users,
+            vec![(10, UseKind::Argument), (11, UseKind::Executable)]
+        );
+        assert!(!reading.provably_unused());
+    }
+
+    #[test]
+    fn every_way_of_naming_a_directory_is_found() {
+        let dir = Path::new("/work/x-target");
+        let by = |argv: &[&str], env: &[&str], cwd: &str| {
+            classify_use(
+                &dir_spellings(dir),
+                &table_row(1, cwd, "/bin/tool", argv, env),
+            )
+        };
+        assert_eq!(
+            by(&["t"], &[], "/work/x-target/deep"),
+            Some(UseKind::WorkingDirectory)
+        );
+        assert_eq!(
+            by(&["t", "--target-dir=/work/x-target"], &[], "/"),
+            Some(UseKind::Argument)
+        );
+        assert_eq!(
+            by(
+                &["rustc", "-Ldependency=/work/x-target/debug/deps"],
+                &[],
+                "/"
+            ),
+            Some(UseKind::Argument)
+        );
+        assert_eq!(
+            by(
+                &["cargo", "--manifest-path", "/work/x-target/Cargo.toml"],
+                &[],
+                "/"
+            ),
+            Some(UseKind::Argument)
+        );
+        // A relative spelling resolved against the process's own directory.
+        assert_eq!(
+            by(
+                &["cargo", "build", "--target-dir", "x-target"],
+                &[],
+                "/work"
+            ),
+            Some(UseKind::Argument)
+        );
+        assert_eq!(
+            by(
+                &["cargo", "--target-dir", "../x-target"],
+                &[],
+                "/work/other"
+            ),
+            Some(UseKind::Argument)
+        );
+        assert_eq!(
+            by(&["cargo"], &["CARGO_TARGET_DIR=/work/x-target"], "/"),
+            Some(UseKind::Environment)
+        );
+    }
+
+    /// Names that only look like the directory are not it, so a different
+    /// session's longer id (or another prefix) never keeps this one alive.
+    #[test]
+    fn a_longer_name_or_a_longer_path_is_not_the_directory() {
+        let dir = Path::new("/work/sess-1");
+        let by = |argv: &[&str], env: &[&str]| {
+            classify_use(
+                &dir_spellings(dir),
+                &table_row(1, "/", "/bin/tool", argv, env),
+            )
+        };
+        assert_eq!(by(&["t", "/work/sess-10/target"], &[]), None);
+        assert_eq!(by(&["t", "/work/sess-1-copy"], &[]), None);
+        assert_eq!(by(&["t", "/elsewhere/work/sess-1/target"], &[]), None);
+        assert_eq!(by(&["t"], &["X=/work/sess-1x"]), None);
+        assert_eq!(by(&["t", "/work"], &[]), None);
+        assert_eq!(
+            by(&["t", "/work/sess-1/target"], &[]),
+            Some(UseKind::Argument)
+        );
+    }
+
+    #[test]
+    fn the_macos_private_alias_is_the_same_directory() {
+        let table = vec![table_row(
+            1,
+            "/",
+            "/bin/tool",
+            &["t", "--target-dir", "/tmp/a/b"],
+            &[],
+        )];
+        assert_eq!(
+            dir_use_in(Path::new("/private/tmp/a/b"), &table, 99).users,
+            vec![(1, UseKind::Argument)]
+        );
+        let table = vec![table_row(1, "/private/tmp/a/b", "/bin/tool", &["t"], &[])];
+        assert_eq!(
+            dir_use_in(Path::new("/tmp/a/b"), &table, 99).users,
+            vec![(1, UseKind::WorkingDirectory)]
+        );
+    }
+
+    /// A process of the user's that cannot be read cannot be shown not to use
+    /// the directory; another user's is counted and does not block.
+    #[test]
+    fn an_unreadable_process_is_unproven_not_unused() {
+        let dir = Path::new("/work/x");
+        let unreadable = ProcessUse {
+            pid: 7,
+            mine: true,
+            ..Default::default()
+        };
+        let foreign = ProcessUse {
+            pid: 8,
+            mine: false,
+            ..Default::default()
+        };
+        let reading = dir_use_in(dir, &[unreadable.clone(), foreign.clone()], 1);
+        assert!(reading.users.is_empty());
+        assert_eq!(reading.unreadable, vec![7]);
+        assert_eq!(reading.other_users, 1);
+        assert!(!reading.provably_unused());
+        assert!(reading
+            .why_kept()
+            .is_some_and(|why| why.contains("could not be read")));
+        let clear = dir_use_in(dir, &[foreign], 1);
+        assert!(clear.provably_unused());
+        // Only a read failure of the argument block or environment counts.
+        let half = ProcessUse {
+            argv: Some(vec!["x".into()]),
+            ..unreadable
+        };
+        assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
+    }
+
+    #[test]
+    fn this_process_is_never_its_own_user() {
+        let dir = Path::new("/work/x");
+        let table = vec![table_row(5, "/work/x", "/bin/tool", &["t"], &[])];
+        assert!(dir_use_in(dir, &table, 5).users.is_empty());
+    }
+
+    #[test]
+    fn a_procargs2_block_yields_path_arguments_and_environment() {
+        let mut block = 2i32.to_ne_bytes().to_vec();
+        block.extend_from_slice(
+            b"/bin/tool\0\0\0tool\0--target-dir\0/w/x\0HOME=/h\0CARGO_TARGET_DIR=/w/x\0",
+        );
+        let (exec, argv, env) = parse_procargs2(&block).expect("block");
+        assert_eq!(exec, "/bin/tool");
+        assert_eq!(argv, vec!["tool", "--target-dir"]);
+        assert_eq!(env, vec!["/w/x", "HOME=/h", "CARGO_TARGET_DIR=/w/x"]);
+        assert!(parse_procargs2(&[1, 0]).is_none());
+    }
+
+    /// The same shape against real processes: neither child stands in the
+    /// directory, so the cwd-only check finds nothing and the new one finds
+    /// the child whose argument names it and the one running from inside it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_processes_naming_a_directory_are_found_where_cwd_is_blind() {
+        use crate::procguard::LockedSpawn;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scratch = root.join("scratch-target");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(scratch.join("debug/deps")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let mut named = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :", "sh", "--target-dir"])
+            .arg(&scratch)
+            .current_dir(&elsewhere)
+            .stdin(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("spawn");
+        let mut env_named = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :"])
+            .env("CARGO_TARGET_DIR", &scratch)
+            .current_dir(&elsewhere)
+            .stdin(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("spawn");
+        let (named_pid, env_pid) = (
+            i32::try_from(named.id()).unwrap(),
+            i32::try_from(env_named.id()).unwrap(),
+        );
+        let mut found = Vec::new();
+        for _ in 0..200 {
+            found = processes_using(&scratch).unwrap_or_default();
+            if found.contains(&named_pid) && found.contains(&env_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let blind = working_in(&scratch).expect("scan");
+        for child in [&mut named, &mut env_named] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            blind.is_empty(),
+            "the cwd-only check sees no process: {blind:?}"
+        );
+        assert!(found.contains(&named_pid), "{named_pid} not in {found:?}");
+        assert!(found.contains(&env_pid), "{env_pid} not in {found:?}");
     }
 
     /// A refusal before the dialog never shows it.
