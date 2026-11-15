@@ -280,6 +280,7 @@
     "allow-cmd-stash-show",
     "allow-cmd-status-action",
     "allow-cmd-storage-scan",
+    "allow-cmd-storage-stale-worktrees",
     "allow-cmd-submodule-change",
     "allow-cmd-syntax-highlight",
     "allow-cmd-tag-cleanup-plan",
