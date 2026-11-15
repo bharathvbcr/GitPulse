@@ -472,14 +472,17 @@ impl TempIndex {
             .map_err(|e| format!("cannot open the private index: {e}"))?;
         std::io::copy(&mut input, &mut output)
             .map_err(|e| format!("cannot copy the index: {e}"))?;
-        // Git decides whether an index entry may be trusted by comparing the
-        // entry's timestamps with the index file's own modified time (the
-        // "racily clean" rule). A copy stamped "now" is newer than every
-        // entry, so each entry would be rehashed, and an entry that is only
-        // racily clean in the original is not. Carrying the source's time over
-        // keeps the copy exactly as trustworthy as the original. If the time
-        // cannot be carried, the copy is unusable as a stat cache, so this is a
-        // seed failure and the caller falls back to `read-tree HEAD`.
+        // Git treats an index entry as racily clean, and compares its content
+        // instead of trusting its cached stat, when the entry's cached mtime
+        // is not older than the index file's own mtime. A copy stamped "now"
+        // is newer than every entry, so no entry would look racy and each
+        // would be trusted from its cached stat. An entry that was racily
+        // clean against the original index (edited in the same tick it was
+        // staged, at the same size) would then be trusted too, and `add -u`
+        // would miss the edit. Carrying the source's mtime over keeps exactly
+        // the entries that were racy in the original racy in the copy. If the
+        // time cannot be carried, this is a seed failure and the caller falls
+        // back to `read-tree HEAD`.
         let modified = input
             .metadata()
             .and_then(|meta| meta.modified())
