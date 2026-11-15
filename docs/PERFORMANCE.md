@@ -3034,3 +3034,93 @@ Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30
 A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with GitPulse running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
 
 Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.
+
+## 2026-11-15: commit secret scan recall against Kingfisher and Betterleaks
+
+How much of what Kingfisher finds does the commit gate's scan (`leak_scan`, the vendored `dc_redact::find_secret` table) find? This is the measurement that drives which shapes go upstream into DevCouncil `rust/dc-redact`.
+
+### Reproduce
+
+Kingfisher and Betterleaks must be installed (PATH, the GUI fallback directories, or `GITPULSE_KINGFISHER` / `GITPULSE_BETTERLEAKS`). Neither validates anything live.
+
+```bash
+GITPULSE_LEAK_RECALL_OUT=/tmp/leak-recall.md cargo test --manifest-path src-tauri/Cargo.toml --lib leak_scan::recall_tests::measure_recall -- --ignored --exact --nocapture
+```
+
+The run takes about 15 s after the build.
+
+- **How plants are made:** `src-tauri/src/leak_scan/plant_sampler.rs` samples candidates from each visible Kingfisher rule's own regex. It makes four at minimum length and two with the secret at a realistic length, seeded by the rule id. Each must match the rule as the `regex` crate reads it.
+- **What counts as a plant:** Kingfisher scans the candidates once, and a rule's plant is the first candidate it reports as that rule. **Kingfisher is therefore 100% by construction.**
+- **Scoring:** Betterleaks and dc-redact (through `Tally`, the gate's own entry point) are then scored on the same files.
+- **No committed tokens:** plants live in a temporary directory, and both oracles run with `--redact`. The report names rules only, and `assert_no_plant_in` refuses to print or write it if any 16-character run of a plant appears in it.
+- **Fails loudly, never scores zero:** a missing binary, an unexpected exit status, a missing or unparseable report, or an oracle that finds nothing in a non-empty corpus fails the run. Betterleaks exits 0 on a directory that does not exist, which is why the directory is checked first.
+- **Spread:** `GITPULSE_LEAK_RECALL_SALT=<n>` draws a different deterministic corpus, for measuring how much the numbers move.
+
+### Measured (kingfisher 2.16.0, betterleaks 1.10.1, salt 0)
+
+Kingfisher lists 454 visible rules (368 high, 86 medium), plus 47 helper rules it never reports on their own.
+
+| confidence | plants | Kingfisher | Betterleaks | dc-redact, old table (`b07f2d9b`) | dc-redact, DevCouncil `cbd51369` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| high | 316 | 316/316 | 306/316 | 42/316 | **49/316** |
+| medium | 76 | 76/76 | 58/76 | 9/76 | **10/76** |
+
+**Spread over five corpora (salts 0–4, same build):**
+
+| table | high | medium |
+| --- | --- | --- |
+| old | 42, 40, 42, 44, 41 | 9, 10, 10, 10, 10 |
+| `cbd51369` | 49, 47, 48, 50, 48 | 10, 11, 11, 11, 11 |
+
+The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the five corpora.
+
+**Against the lost 2026-11-14 corpus (41/308 high, 14/75 medium):**
+- **High reproduces:** 42/316 on the old table is 13.3%, the same as 41/308.
+- **Medium does not.** It comes out at 9–10 out of 76–77 on every salt, not 14. The old generator is lost, so the cause is not established. On the old table, the realistic-length plants get 12/76, the closest figure to 14.
+
+**Rules without a confirmed plant: 62 (52 high, 10 medium).** Each is listed with its reason in the report:
+- Most depend on a helper rule (a client secret needs its client id), so Kingfisher reports nothing on a single plant.
+- Seven lose their bytes to a sibling rule. For example, Kingfisher reports the Veles npm rule instead of Betterleaks' `npm-access-token`, and `generic-credential-uri` instead of `sidekiq-sensitive-url`.
+- Three never produced a sample matching their own regex.
+
+### Where dc-redact misses (current table)
+
+- **Length artefacts:** 8 misses are found once the secret is at a realistic length, for example Slack bot and app tokens whose minimum-length plant is under dc-redact's floor. The report labels these and keeps them out of the ranking.
+- **Real misses:** the remaining 325 rules, grouped by vendor.
+
+| tier | vendors missed | rules missed |
+| --- | ---: | ---: |
+| cloud | 20 | 32 |
+| CI, source and packages | 38 | 63 |
+| payments and finance | 28 | 40 |
+| AI providers | 31 | 37 |
+| databases and data | 15 | 23 |
+| messaging and email | 19 | 29 |
+| observability and on-call | 11 | 20 |
+| identity and secret managers | 7 | 8 |
+| generic and context | 3 | 4 |
+| other SaaS | 55 | 69 |
+
+Each tier is ranked by how common the credential is (the order of `VENDORS` in `recall_tests.rs`).
+
+**Formats missing for vendors dc-redact already names:**
+- AWS Bedrock API keys, long- and short-lived;
+- the Gemini API key format (`gcp-gemini-api`);
+- three GitLab formats: incoming-mail token, runner registration token, session cookie;
+- Stripe `stripe-access-token`;
+- four Slack formats: legacy token, legacy workspace token, session cookie, session token;
+- OpenRouter's Veles form, `sk-or-v<n>-` with a free body. dc-redact only has `v1` with a 64-hex body.
+
+**Vendors with no shape at all, first in each tier:**
+- **Cloud:** Azure (Teams webhook), Cloudflare (4), Heroku (2), Vercel (6), Netlify, Fly.io, IBM Cloud.
+- **CI and packages:** Bitbucket (3), Docker (4), RubyGems, NuGet, crates.io, Packagist (3), Gitea, CircleCI (3), Travis, Buildkite (2), HashiCorp Terraform and Vault (3), Pulumi.
+- **Payments:** Square, Plaid (3), Coinbase, Flutterwave (3), Paddle, GoCardless.
+- **AI providers:** Cohere, Groq, Mistral, Perplexity, DeepSeek, Together, Cerebras, NVIDIA.
+- **Databases:** PlanetScale (2), Neon, Databricks, Supabase, Elastic, Confluent (2), and the four Kingfisher connection-string password rules.
+
+**Betterleaks misses 10 high and 18 medium plants.** Each is named in the report, as one of three cases:
+- a Veles or Kingfisher-native rule it has no counterpart for;
+- a rule it has, whose filters drop the plant;
+- a plant at minimum length only, which it finds at realistic length.
+
+**Report sections:** the funnel, per-rule results for all three tools, the ranked vendor list, every disagreement with its reason, and every rule without a plant with its reason.

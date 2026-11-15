@@ -12,10 +12,11 @@
 use super::Tally;
 
 /// Deterministic generator, so a failure names the same token every run.
-struct Seeded(u64);
+/// Shared with the recall sampler (`plant_sampler`).
+pub(super) struct Seeded(pub(super) u64);
 
 impl Seeded {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         // SplitMix64.
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
