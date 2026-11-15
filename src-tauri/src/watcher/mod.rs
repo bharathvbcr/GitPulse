@@ -4119,12 +4119,12 @@ mod tests {
             // unwinds, and a stop that hangs must not outlive its bound.
             let mut cmd = Command::new("git");
             cmd.args(["fsmonitor--daemon", "stop"]).current_dir(&root);
-            let _ = crate::engine::git_cli::run_bounded(
+            let _ = crate::engine::process::run_bounded(
                 cmd,
                 "git fsmonitor--daemon stop",
                 // Held to the runner's ceiling: relaxed past it, the stop is refused unrun.
                 crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET)
-                    .min(crate::engine::git_cli::NETWORK_TIMEOUT),
+                    .min(crate::engine::process::NETWORK_TIMEOUT),
                 None,
             );
         });

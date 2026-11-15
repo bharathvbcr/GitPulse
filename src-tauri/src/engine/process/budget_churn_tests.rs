@@ -1,18 +1,11 @@
-//! The spawn budget's observability and churn (ft-da85cd5599b713d7a7f5910da2133d70):
-//! what one edit-time hook invocation spends by call site (a characterization
-//! of the current spend; the cut lands with the hooks half), what a refusal
-//! says about the bucket that refused, and how often denied waiters rewrite the
-//! shared record. The measurement tests print their numbers (`--nocapture`).
+//! The spawn budget's observability and churn tests (process side).
 
 use super::{
-    refusal_message, refusal_message_at, shared_budget, with_admission, with_background_processes,
-    Admission, BucketLevel, Refusal, RefusingBucket, RunError, SpawnGate,
+    is_deferred_under_load, refusal_message, refusal_message_at, shared_budget, with_admission,
+    with_background_processes, Admission, BucketLevel, Refusal, RefusingBucket, RunError,
+    SpawnGate,
 };
-#[cfg(unix)]
-use super::{spawn_log, subcommand};
 use crate::test_support::coverage_relaxed;
-#[cfg(unix)]
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 fn level(bucket: RefusingBucket, tokens: u32, floor: u32, burst: u32) -> BucketLevel {
@@ -22,108 +15,6 @@ fn level(bucket: RefusingBucket, tokens: u32, floor: u32, burst: u32) -> BucketL
         floor,
         burst,
     }
-}
-
-/// A repository with `siblings` linked worktrees, each dirty in a file of its
-/// own, and the files the edit is of: the ordinary state of a machine running
-/// parallel agents.
-#[cfg(unix)]
-struct Farm {
-    _repo: tempfile::TempDir,
-    _siblings: tempfile::TempDir,
-    repo: String,
-    dirs: Vec<std::path::PathBuf>,
-}
-
-#[cfg(unix)]
-fn farm(siblings: usize) -> Farm {
-    use crate::test_support::git_in;
-    let repo_dir = tempfile::tempdir().expect("repository");
-    git_in(repo_dir.path(), &["init", "-b", "main"]);
-    std::fs::write(repo_dir.path().join("seed.txt"), "seed").expect("seed");
-    git_in(repo_dir.path(), &["add", "seed.txt"]);
-    git_in(repo_dir.path(), &["commit", "-m", "seed"]);
-    let repo = repo_dir
-        .path()
-        .canonicalize()
-        .expect("canonical repository");
-    let sibling_root = tempfile::tempdir().expect("sibling worktrees");
-    let root = sibling_root.path().canonicalize().expect("canonical root");
-    let mut dirs = vec![repo.clone()];
-    for n in 0..siblings {
-        let wt = root.join(format!("sibling-{n}"));
-        git_in(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &format!("b{n}"),
-                &wt.to_string_lossy(),
-            ],
-        );
-        std::fs::write(wt.join(format!("own-{n}.txt")), "mine").expect("dirty a sibling");
-        dirs.push(wt);
-    }
-    Farm {
-        repo: repo.to_string_lossy().into_owned(),
-        _repo: repo_dir,
-        _siblings: sibling_root,
-        dirs,
-    }
-}
-
-/// AC1, characterization. One PreToolUse Edit through the production
-/// `collision-guard` (what `gitpulse-hook collision-guard` dispatches) against
-/// a real repository with two linked worktrees, and every git child it
-/// started, by where it ran and what it ran. Each child is one token of the
-/// shared spawn budget.
-///
-/// The count is PINNED at what the code spends today. The cut (answer from the
-/// app over its socket, or cache the scan) lands with the hooks half of the
-/// card, behind ft-42081f16, and will lower this number deliberately.
-#[cfg(unix)]
-#[test]
-fn one_edit_hook_invocation_spends_this_many_git_spawns_by_call_site() {
-    let farm = farm(2);
-    let marks: Vec<usize> = farm
-        .dirs
-        .iter()
-        .map(|dir| spawn_log::spawns_in(dir).len())
-        .collect();
-    let output = crate::hooks::run_collision_guard(&crate::hooks::HookInput {
-        hook_event_name: "PreToolUse".to_string(),
-        tool_name: "Edit".to_string(),
-        cwd: farm.repo.clone(),
-        file_path: format!("{}/seed.txt", farm.repo),
-        ..Default::default()
-    });
-    let mut table: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut total = 0;
-    for (dir, mark) in farm.dirs.iter().zip(&marks) {
-        let place = if dir == &farm.dirs[0] {
-            "main checkout".to_string()
-        } else {
-            format!("sibling {}", dir.file_name().unwrap().to_string_lossy())
-        };
-        for argv in &spawn_log::spawns_in(dir)[*mark..] {
-            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-            *table
-                .entry((place.clone(), subcommand(&args).to_string()))
-                .or_default() += 1;
-            total += 1;
-        }
-    }
-    println!("EDIT HOOK SPAWNS (3 worktrees, 1 PreToolUse Edit): {total} git children");
-    println!("{:<18} {:<14} spawns", "where", "git command");
-    for ((place, command), count) in &table {
-        println!("{place:<18} {command:<14} {count}");
-    }
-    assert!(!output.is_silent() || total > 0, "the guard did not run");
-    assert_eq!(
-        total, 4,
-        "the hook's spend changed: {table:?}; if this is the hooks-half cut, lower the pin"
-    );
 }
 
 /// AC3. A refusal names the bucket that refused and the level it saw, and
@@ -153,7 +44,7 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
         message = message.message()
     );
     assert!(
-        super::is_deferred_under_load(message.message()),
+        is_deferred_under_load(message.message()),
         "{message}",
         message = message.message()
     );
@@ -178,11 +69,11 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
          spawn rate budget is low (local bucket: 3 token(s), needs more than 4, burst 16)"
     );
     assert!(
-        super::is_deferred_under_load(message.message()),
+        is_deferred_under_load(message.message()),
         "{message}",
         message = message.message()
     );
-    assert!(super::is_deferred_under_load(&format!(
+    assert!(is_deferred_under_load(&format!(
         "[deferred_worktree] {message}",
         message = message.message()
     )));

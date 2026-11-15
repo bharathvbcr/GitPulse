@@ -974,7 +974,7 @@ mod tests {
 
         for failing in ["--get-regexp", "for-each-ref"] {
             let refused =
-                crate::engine::git_cli::with_forced_spawn_failure_of(failing, || list(path));
+                crate::engine::process::with_forced_spawn_failure_of(failing, || list(path));
             assert!(
                 refused.is_err(),
                 "a refused {failing} read listed {refused:?} instead of failing"

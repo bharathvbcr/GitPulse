@@ -20,8 +20,9 @@
 use crate::codeintel::worktree_overlay::{
     compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr, DirtyNodeScan,
 };
-use crate::engine::git_cli::{resolve_git_common_dir, validate_repo, DEFAULT_TIMEOUT};
+use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
+use crate::engine::process::DEFAULT_TIMEOUT;
 use crate::engine::worktree::{list_worktrees, WorktreeInfo};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
@@ -3312,6 +3313,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: true,
                     terminal_session_id: None,
                 },
@@ -3328,6 +3331,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: Some("term-1".into()),
                 },
@@ -3344,6 +3349,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: None,
                 },
@@ -3360,6 +3367,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: None,
                 },

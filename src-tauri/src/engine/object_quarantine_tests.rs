@@ -235,9 +235,9 @@ fn a_refused_spawn_is_an_error_and_leaves_nothing() {
         let dir = quarantine.path().to_path_buf();
         let run = || quarantine.merge_tree(repo.path(), &main, &f, soon());
         let answer = if gate_refusal == "spawn failure" {
-            crate::engine::git_cli::with_forced_spawn_failure(run)
+            crate::engine::process::with_forced_spawn_failure(run)
         } else {
-            crate::engine::git_cli::with_forced_deferral(run)
+            crate::engine::process::with_forced_deferral(run)
         };
         assert!(
             matches!(answer, Err(QuarantineError::Git(_))),
@@ -548,11 +548,11 @@ fn a_git_failure_a_deadline_and_a_bad_operand_are_unknown() {
         other => panic!("expected unknown, got {other:?}"),
     };
 
-    let refused = unknown(crate::engine::git_cli::with_forced_spawn_failure(|| {
+    let refused = unknown(crate::engine::process::with_forced_spawn_failure(|| {
         merge_tree_candidate(repo.path(), &main, &f, soon())
     }));
     assert!(!refused.is_empty());
-    let deferred = unknown(crate::engine::git_cli::with_forced_deferral(|| {
+    let deferred = unknown(crate::engine::process::with_forced_deferral(|| {
         merge_tree_candidate(repo.path(), &main, &f, soon())
     }));
     assert!(!deferred.is_empty());

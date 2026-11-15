@@ -41,7 +41,7 @@ impl Drop for TerminalCleanup {
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -685,7 +685,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
                 .unwrap()
                 .get(id)
                 .is_some_and(|marks| !marks.is_empty())),
-            "session {id} never reported its tty raw"
+            "a session never reported its tty raw"
         );
     };
     let echo = || {

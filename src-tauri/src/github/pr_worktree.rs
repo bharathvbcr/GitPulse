@@ -18,8 +18,9 @@ use super::{
     bounded_error, gh_repo_flags, gh_unavailable_reason, pick_named_github_remote, probe_gh_cli,
     GitHubRepoRef,
 };
-use crate::engine::git_cli::{git_text, git_text_network, run_command_in, validate_repo};
+use crate::engine::git_cli::{git_text, git_text_network, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::process::run_command_in;
 use crate::engine::worktree::{
     add_worktree_argv_configured, add_worktree_configured, prune_worktree_argv,
     read_worktree_entries, remove_worktree_argv, resolve_worktree_path_for_branch,
@@ -968,7 +969,7 @@ mod tests {
         let repo_buf = repo.path().canonicalize().expect("canonical repo");
         let repo_s = repo_buf.to_str().expect("utf8").to_string();
         let calls = AtomicUsize::new(0);
-        crate::engine::git_cli::with_forced_spawn_failure_of("--version", || {
+        crate::engine::process::with_forced_spawn_failure_of("--version", || {
             super::super::GH_PROBES.clear();
             let gate = |_: &str, _: &[&str]| {
                 calls.fetch_add(1, Ordering::SeqCst);

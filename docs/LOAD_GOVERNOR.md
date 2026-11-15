@@ -333,7 +333,7 @@ the same way by cards 3 and 4. The two callers are thin:
   build (`ensure_room`), and before an agent CLI's PTY opens
   (`terminal::spawn_session_inner`; the user's own shell is never gated).
   `tests/governor_sites.rs` pins those places by function name.
-- **1c, `sysload::shed`.** Read by the spawn gate (`git_cli::acquire_until`)
+- **1c, `sysload::shed`.** Read by the spawn gate (`process::gate::acquire_until`)
   and nowhere else. A shed spawn is refused at once with the existing
   "deferred under load" marker, so the frontend's retries resume it when the
   pressure clears. There is no new scheduler: the classes are the ones

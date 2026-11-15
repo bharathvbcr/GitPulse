@@ -3,14 +3,14 @@
 //!
 //! A hook is the repository owner's program, not git: a `pre-commit` that
 //! lints and tests, a `commit-msg` that calls a service, `git-lfs` behind
-//! `pre-push`. Those legitimately outlast [`super::DEFAULT_TIMEOUT`], which
+//! `pre-push`. Those legitimately outlast [`DEFAULT_TIMEOUT`], which
 //! is sized for plumbing, and killing them there surfaced as "git commit
 //! timed out" with nothing to say a hook was what ran. Hook-running
 //! subcommands therefore get [`HOOK_TIMEOUT`]: still finite, so a hook that
 //! never returns does not pin the repository's mutation lock forever, and
 //! cancellable by the user through [`cancel`] long before it elapses.
 
-use super::ProcessObserver;
+use crate::engine::process::{with_spawn_source, ProcessObserver, DEFAULT_TIMEOUT};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,7 +80,7 @@ pub(crate) fn default_timeout_for(sub: &str) -> Duration {
     if hooks_run_by(sub).is_some() {
         hook_timeout()
     } else {
-        super::DEFAULT_TIMEOUT
+        DEFAULT_TIMEOUT
     }
 }
 
@@ -122,7 +122,7 @@ fn installed_hooks(repo: &Path, sub: &str) -> Option<(PathBuf, Vec<&'static str>
     let candidates = hooks_run_by(sub)?;
     // `--git-path hooks` honours `core.hooksPath` and linked worktrees, which
     // is where git itself looks; guessing `.git/hooks` would miss husky.
-    let raw = super::with_spawn_source("git_cli.hooks.installed_hooks", || {
+    let raw = with_spawn_source("git_cli.hooks.installed_hooks", || {
         super::git_text(repo, &["rev-parse", "--git-path", "hooks"])
     })
     .ok()?;
@@ -302,14 +302,10 @@ mod tests {
             "",
             "log",
         ] {
-            assert_eq!(
-                default_timeout_for(sub),
-                super::super::DEFAULT_TIMEOUT,
-                "{sub}"
-            );
+            assert_eq!(default_timeout_for(sub), super::DEFAULT_TIMEOUT, "{sub}");
         }
-        assert!(HOOK_TIMEOUT > super::super::DEFAULT_TIMEOUT);
-        assert!(HOOK_TIMEOUT < super::super::NETWORK_TIMEOUT);
+        assert!(HOOK_TIMEOUT > super::DEFAULT_TIMEOUT);
+        assert!(HOOK_TIMEOUT < crate::engine::process::NETWORK_TIMEOUT);
     }
 
     #[test]

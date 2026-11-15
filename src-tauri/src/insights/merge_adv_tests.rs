@@ -3,7 +3,7 @@
 //! object names, and an all-unknown answer that must not read as complete.
 
 use super::*;
-use crate::engine::git_cli::{spawn_log, with_forced_spawn_failure_of};
+use crate::engine::process::{spawn_log, with_forced_spawn_failure_of};
 use crate::test_support::{git_in, repo_with_worktrees, trust_repo, write};
 use std::path::{Path, PathBuf};
 

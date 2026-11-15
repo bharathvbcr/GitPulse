@@ -172,7 +172,7 @@ fn render(title: &str, procs: &[GitProc], report: &mut Report) {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("git_inprocess_reads");
     let temp = tempfile::tempdir().expect("temp dir");
 

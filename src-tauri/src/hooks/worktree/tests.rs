@@ -174,13 +174,20 @@ fn creates_at_claude_codes_path_on_its_branch_from_the_local_default() {
     );
 
     assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
-    let expected = fixture.root.join(".claude/worktrees/bold-oak-a3f2");
+    let expected = fixture.root.join(".gitpulse/worktrees/bold-oak-a3f2");
     assert_eq!(finished.path.as_deref(), expected.to_str());
-    // Claude Code's attribution keeps working on the path it would have used.
+    // GitPulse's lane attribution and git-status exclude both hold on the new worktree.
     let layout = agent_layout(expected.to_str().unwrap()).expect("an agent layout");
     assert_eq!(
         (layout.kind.as_str(), layout.slug.as_str()),
-        ("claude", "bold-oak-a3f2")
+        ("gitpulse", "bold-oak-a3f2")
+    );
+    assert_eq!(
+        crate::engine::git_cli::git_text(&fixture.root, &["status", "--porcelain"])
+            .unwrap()
+            .trim(),
+        "",
+        "info/exclude must keep .gitpulse/worktrees out of git status"
     );
     // Its branch, cut from local main: not origin/main (behind) and not the
     // feature branch the session happens to have checked out.
@@ -245,7 +252,7 @@ fn an_untrusted_repository_is_handed_back_to_plain_git_untouched() {
         finished.notes.iter().any(|n| n.contains("is not trusted")),
         "{finished:?}"
     );
-    assert!(!fixture.root.join(".claude").exists());
+    assert!(!fixture.root.join(".gitpulse").exists());
     assert!(
         gate.seen().is_empty(),
         "nothing was judged, because nothing was run"
@@ -290,7 +297,7 @@ fn a_policy_refusal_creates_nothing_and_does_not_fall_back() {
         .notes
         .iter()
         .any(|n| n.contains("refused by policy")));
-    assert!(!fixture.root.join(".claude/worktrees/refused").exists());
+    assert!(!fixture.root.join(".gitpulse/worktrees/refused").exists());
 }
 
 #[test]
@@ -317,7 +324,7 @@ fn a_gate_that_could_not_run_is_a_gitpulse_failure_plain_git_recovers_from() {
             .any(|n| n.starts_with("GitPulse failure")),
         "{finished:?}"
     );
-    assert!(!fixture.root.join(".claude/worktrees/gate-down").exists());
+    assert!(!fixture.root.join(".gitpulse/worktrees/gate-down").exists());
     assert_eq!(marker.load(Ordering::SeqCst), EXIT_UNAVAILABLE);
 }
 
@@ -365,7 +372,7 @@ fn names_that_could_escape_or_break_the_branch_are_refused() {
 fn a_container_that_is_a_link_is_refused() {
     let fixture = trusted();
     let elsewhere = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), fixture.root.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), fixture.root.join(".gitpulse")).unwrap();
     let gate = Recorder::answering(PolicyStatus::Allowed);
 
     let finished = create(
@@ -461,7 +468,7 @@ fn a_failed_post_create_hook_keeps_the_worktree_and_says_so() {
     );
 
     assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
-    let path = fixture.root.join(".claude/worktrees/broken-setup");
+    let path = fixture.root.join(".gitpulse/worktrees/broken-setup");
     assert_eq!(finished.path.as_deref(), path.to_str());
     assert!(path.join(".git").is_file());
     assert!(
@@ -569,7 +576,7 @@ fn something_else_at_the_path_is_never_handed_over() {
     assert_eq!(finished.path, None);
     assert!(finished.notes.iter().any(|n| n.contains("already exists")));
     // A plain directory there is refused the same way.
-    fs::create_dir_all(fixture.root.join(".claude/worktrees/squatter")).unwrap();
+    fs::create_dir_all(fixture.root.join(".gitpulse/worktrees/squatter")).unwrap();
     let finished = create(
         &input_for_create(&fixture.root, "squatter"),
         &|r, a| gate.judge(r, a),
@@ -588,12 +595,12 @@ fn only_a_worktree_git_registered_counts_as_ready() {
 
     // A hand-written gitfile pointing at the real registry entry is not this
     // worktree: the entry names its own checkout back.
-    let impostor = fixture.root.join(".claude/worktrees/impostor");
+    let impostor = fixture.root.join(".gitpulse/worktrees/impostor");
     fs::create_dir_all(&impostor).unwrap();
     fs::copy(path.join(".git"), impostor.join(".git")).unwrap();
     assert!(!is_ready(&impostor, &common));
     // Nor is a directory with no gitfile, or one naming another repository.
-    let bare = fixture.root.join(".claude/worktrees/bare");
+    let bare = fixture.root.join(".gitpulse/worktrees/bare");
     fs::create_dir_all(&bare).unwrap();
     assert!(!is_ready(&bare, &common));
     let other = trusted();
@@ -742,12 +749,12 @@ fn a_session_inside_a_linked_worktree_gets_its_worktree_under_the_main_checkout(
     let lane = lane.canonicalize().unwrap();
 
     let path = created_from(&lane, "inner");
-    assert_eq!(path, fixture.root.join(".claude/worktrees/inner"));
-    assert!(!lane.join(".claude").exists());
+    assert_eq!(path, fixture.root.join(".gitpulse/worktrees/inner"));
+    assert!(!lane.join(".gitpulse").exists());
     let layout = agent_layout(path.to_str().unwrap()).expect("an agent layout");
     assert_eq!(
         (layout.kind.as_str(), layout.slug.as_str()),
-        ("claude", "inner")
+        ("gitpulse", "inner")
     );
 
     let (finished, gate) = removing(&path, false);
@@ -757,15 +764,57 @@ fn a_session_inside_a_linked_worktree_gets_its_worktree_under_the_main_checkout(
 
 #[test]
 fn the_branch_to_delete_is_named_by_the_innermost_claude_worktree() {
-    let nested = Path::new("/r/.claude/worktrees/a/.claude/worktrees/b");
-    assert!(made_by_claude(nested, "worktree-b"));
-    assert!(!made_by_claude(nested, "worktree-a"));
+    let nested_lane = Path::new("/r/.gitpulse/worktrees/a/.gitpulse/worktrees/b");
+    assert!(made_by_claude(nested_lane, "worktree-b"));
+    assert!(!made_by_claude(nested_lane, "worktree-a"));
+    let nested_claude = Path::new("/r/.claude/worktrees/a/.claude/worktrees/b");
+    assert!(made_by_claude(nested_claude, "worktree-b"));
+    assert!(!made_by_claude(nested_claude, "worktree-a"));
     assert!(made_by_claude(
         Path::new("/r/.gitpulse/worktrees/l/.claude/worktrees/x"),
         "worktree-x"
     ));
+    assert!(!made_by_claude(
+        Path::new("/r/.gitpulse/worktrees/x"),
+        "gitpulse/x"
+    ));
+    assert!(!made_by_claude(
+        Path::new("/r/.gitpulse/worktrees/x"),
+        "main"
+    ));
     assert!(!made_by_claude(Path::new("/r/.claude/worktrees/x"), "main"));
     assert!(!made_by_claude(Path::new("/r/elsewhere/x"), "worktree-x"));
+}
+
+#[test]
+fn plan_create_uses_shared_engine_worktree_path_resolver() {
+    let fixture = trusted();
+    let expected = crate::engine::worktree::resolve_worktree_path(
+        &fixture.root,
+        "shared-slug",
+        crate::engine::worktree::WorktreeLayout::Lane,
+    )
+    .expect("shared resolver succeeds");
+    let planned = plan_create(&fixture.root, "shared-slug").expect("plan_create succeeds");
+    assert_eq!(planned.target, expected);
+
+    let lane = fixture.root.join(".gitpulse/worktrees/anchor-lane");
+    git_in(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "gitpulse/anchor-lane",
+            lane.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let lane = lane.canonicalize().unwrap();
+    let planned_from_lane =
+        plan_create(&lane, "shared-slug").expect("plan_create from linked lane resolves");
+    assert_eq!(planned_from_lane.target, expected);
 }
 
 #[test]

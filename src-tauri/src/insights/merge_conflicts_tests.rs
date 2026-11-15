@@ -149,7 +149,7 @@ fn a_git_failure_is_unknown_and_never_clean() {
     commit_file(&linked[1], "b.txt", "b");
     let path = root.to_str().unwrap().to_string();
     // The listing and the partial-clone check run, then every spawn is refused.
-    let read = crate::engine::git_cli::with_forced_spawn_failure(|| merge_conflicts(&path));
+    let read = crate::engine::process::with_forced_spawn_failure(|| merge_conflicts(&path));
     assert_eq!(read.clean, 0, "{read:?}");
     assert!(!read.ok, "{read:?}");
 }

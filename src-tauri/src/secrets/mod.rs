@@ -395,7 +395,7 @@ mod tests {
         let deadline = std::time::Duration::from_secs(7);
         let reason = |err: &str| run::runner_failure_reason(err, deadline);
         // The gate's own formatter, not a transcription of it.
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         assert_eq!(
             reason(refusal_message("kingfisher", Refusal::TimedOut { deadline }).message()),
             "kingfisher could not start: no process slot became free in time"

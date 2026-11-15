@@ -67,6 +67,10 @@ export interface LiveSession {
   proc_start?: string;
   /** The cwd the registry recorded; differs from `cwd` for an isolation worktree. */
   registry_cwd?: string;
+  /** Kernel-reported start time in microseconds since the Unix epoch. */
+  start_us?: number;
+  /** True when this session is an ancestor of the process answering the query. */
+  is_caller?: boolean;
 }
 
 /** A session nested under another in the same worktree. */

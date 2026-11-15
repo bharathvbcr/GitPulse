@@ -23,7 +23,7 @@ pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, Comman
         if !path.is_absolute() || value.len() > 4096 || value.chars().any(char::is_control) {
             return Err("Roots and exclusions must be absolute directory paths".into());
         }
-        let path = crate::engine::git_cli::canonicalize_plain(path)
+        let path = crate::engine::process::canonicalize_plain(path)
             .map_err(|e| format!("{value}: {e}"))?;
         super::tree::no_symlinks(Path::new(value))?;
         if !path.is_dir() || path.parent().is_none() {
@@ -44,7 +44,7 @@ pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, Comman
 /// mismatch. Compare after stripping that prefix; do not change `validate_repo`
 /// itself — the sandbox containment check depends on the verbatim spelling.
 pub(crate) fn same_discovered_repo(validated: &Path, walked: &Path) -> bool {
-    crate::engine::git_cli::canonicalize_plain(validated)
+    crate::engine::process::canonicalize_plain(validated)
         .ok()
         .as_deref()
         == Some(walked)

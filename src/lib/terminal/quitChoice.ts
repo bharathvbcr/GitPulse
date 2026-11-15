@@ -1,23 +1,22 @@
 /**
- * What a quit does with the terminals, when they can outlive GitPulse.
+ * What a quit does with terminals and managed runs, when they can outlive GitPulse.
  *
- * With the terminal host (`gitpulse-ptyd`, Settings → Agents → "Keep
- * terminals running when GitPulse quits") a session no longer has to end with
- * the app, so a quit with sessions open asks: leave them running for the next
- * launch, or stop them. In-process, nothing changes: quitting ends every
- * session, and `quitGuard.ts` asks about the agents among them.
+ * On Unix, terminals always live in the terminal host (`gitpulse-ptyd`), so a
+ * session outlives quitting or crashing and a quit with sessions open asks:
+ * leave them running for the next launch, or stop them. In-process (non-Unix),
+ * quitting ends every session, and `quitGuard.ts` asks about the agents among
+ * them.
  *
  * A session list that cannot be read is not "no sessions": the question is
  * asked anyway, saying the count is unknown.
  *
- * Managed agent runs (Codex and Claude driven by the Manvi sidecar) are a
- * different kind of work: the terminal host does not keep them. By default
- * quitting closes the sidecar, and the sidecar cancels every run it holds, with
- * either terminal backend, so `decideQuitManagedRuns` asks about them on every
- * quit. When the person has chosen to keep agents running and the installed
- * Manvi can host them (`ManagedHosting.hosted`), a hosted Manvi holds the runs
- * instead and the question becomes the terminals' three-way one: leave them,
- * stop them, or keep working.
+ * Managed agent runs (Codex and Claude driven by the Manvi sidecar) are hosted
+ * separately by Manvi's socket mode when `keep_terminals_running` is enabled
+ * (default on, Settings -> Agents -> "Keep managed agent runs running when
+ * GitPulse quits") and the installed Manvi supports `--listen`. When hosted
+ * (`ManagedHosting.hosted`), the quit question becomes the three-way one (leave
+ * running, stop them, keep working); when turned off or unsupported, quitting
+ * closes the sidecar and `decideQuitManagedRuns` asks for confirmation first.
  */
 
 import { invoke as tauriInvoke } from "../ipc/invoke";

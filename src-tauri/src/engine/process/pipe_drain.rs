@@ -269,8 +269,7 @@ impl OutputDrains {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputDrains, PipeDrain};
-    use crate::engine::git_cli::Stop;
+    use super::{OutputDrains, PipeDrain, Stop};
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};

@@ -26,7 +26,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn repo() -> (TempDir, String) {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().unwrap();
     git(dir.path(), &["init", "-q", "-b", "main"]);
     git(dir.path(), &["config", "user.email", "a@b.c"]);

@@ -44,6 +44,10 @@ const NO_TS_MIRROR = new Map<string, string>([
     "`gitpulse_landed` is an MCP read tool: its `via` reaches agents over MCP and has no frontend consumer",
   ],
   [
+    "WorktreeLayout",
+    "`gitpulse_worktree_create` takes `layout` as an MCP string parsed by WorktreeLayout::parse; no IPC command carries it and the frontend never sees it",
+  ],
+  [
     "LandedReason",
     "`gitpulse_landed` is an MCP read tool: its `reason` code reaches agents over MCP and has no frontend consumer",
   ],

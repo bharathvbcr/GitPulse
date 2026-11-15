@@ -168,7 +168,7 @@ pub(crate) use env::{coverage_relaxed, wait_until};
 /// directory are the caller's. Only stdin is closed. The exit status is left
 /// to the caller.
 ///
-/// A budget past the runner's ceiling ([`crate::engine::git_cli::NETWORK_TIMEOUT`])
+/// A budget past the runner's ceiling ([`crate::engine::process::NETWORK_TIMEOUT`])
 /// is held to it: [`coverage_relaxed`] scales budgets by instrumentation and
 /// host load, and an unclamped 60 s reached 1,920 s on a loaded instrumented
 /// run, which the runner refuses without starting the helper.
@@ -177,9 +177,9 @@ pub(crate) fn run_within(
     cmd: Command,
     label: &str,
     budget: std::time::Duration,
-) -> crate::engine::git_cli::BoundedRun {
-    let budget = budget.min(crate::engine::git_cli::NETWORK_TIMEOUT);
-    crate::engine::git_cli::run_bounded(cmd, label, budget, None)
+) -> crate::engine::process::BoundedRun {
+    let budget = budget.min(crate::engine::process::NETWORK_TIMEOUT);
+    crate::engine::process::run_bounded(cmd, label, budget, None)
         .and_then(|run| run.require_complete(label))
         .unwrap_or_else(|why| {
             panic!(
@@ -209,8 +209,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         && dir.join(".githooks/pre-commit").is_file()
     {
         panic!(
-            "refusing to persist {} in {}; this checkout rejects fixture identities",
-            args[1],
+            "refusing to persist a fixture identity in {}; this checkout rejects it",
             dir.display()
         );
     }
@@ -240,8 +239,8 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "git {args:?} failed with {}",
+        output.status
     );
     if args.first() == Some(&"init") {
         trust_repo(&dir);
@@ -259,7 +258,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
 /// is removed by name; [`pin_git`] also sweeps every inherited `GIT_*` for the
 /// names this host's git does not list but a newer one may.
 ///
-/// [`STRIPPED_GIT_ENV`]: crate::engine::git_cli
+/// [`STRIPPED_GIT_ENV`]: crate::engine::process
 #[cfg(test)]
 const FIXTURE_STRIPPED_GIT_ENV: &[&str] = &[
     "GIT_CEILING_DIRECTORIES",
@@ -327,10 +326,10 @@ const FIXTURE_STRIPPED_GIT_ENV: &[&str] = &[
 /// sets afterwards (an author date, a template) is the caller's choice and
 /// survives.
 ///
-/// [`strip_injected_git_env`]: crate::engine::git_cli::strip_injected_git_env
+/// [`strip_injected_git_env`]: crate::engine::process::strip_injected_git_env
 #[cfg(test)]
 pub(crate) fn pin_git(command: &mut Command) -> &mut Command {
-    crate::engine::git_cli::strip_injected_git_env(command);
+    crate::engine::process::strip_injected_git_env(command);
     for name in FIXTURE_STRIPPED_GIT_ENV {
         command.env_remove(name);
     }
@@ -435,7 +434,7 @@ pub(crate) fn repo_with_worktrees(linked: usize) -> (TempDir, TempDir, Vec<PathB
                 ],
             );
             trust_repo(&path);
-            crate::engine::git_cli::canonicalize_plain(&path).unwrap()
+            crate::engine::process::canonicalize_plain(&path).unwrap()
         })
         .collect();
     (main, parent, paths)
@@ -765,7 +764,7 @@ mod tests {
     fn run_within_runs_a_helper_whose_budget_is_past_the_runners_ceiling() {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "printf ran"]);
-        let past = crate::engine::git_cli::NETWORK_TIMEOUT + Duration::from_secs(120);
+        let past = crate::engine::process::NETWORK_TIMEOUT + Duration::from_secs(120);
         let run = run_within(cmd, "relaxed-helper", past);
         assert_eq!(run.stdout.as_slice(), &b"ran"[..]);
         assert!(run.success);

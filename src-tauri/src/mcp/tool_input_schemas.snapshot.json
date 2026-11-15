@@ -1878,6 +1878,27 @@
     ],
     "type": "object"
   },
+  "gitpulse_sessions": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "description": "Maximum live sessions to return (default 64, max 256)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_status": {
     "additionalProperties": false,
     "properties": {
@@ -2323,6 +2344,15 @@
         "description": "Optional command to execute in worktree upon completion",
         "maxLength": 1024,
         "minLength": 1,
+        "type": "string"
+      },
+      "layout": {
+        "description": "Worktree path layout: 'lane' (default, <repo>/.gitpulse/worktrees/<slug>) or 'sibling' (../<Repo>.<slug>)",
+        "enum": [
+          "lane",
+          "sibling"
+        ],
+        "maxLength": 32,
         "type": "string"
       },
       "repo_path": {

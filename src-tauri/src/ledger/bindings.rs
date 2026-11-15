@@ -110,7 +110,7 @@ fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerErro
     // one we looked at and rejected.
     let code = if crate::repository_trust::refused(&message) {
         "untrusted_worktree"
-    } else if crate::engine::git_cli::is_deferred_under_load(&message) {
+    } else if crate::engine::process::is_deferred_under_load(&message) {
         // The same shape as trust: Git never ran, because the spawn gate
         // declined to start it under load. Nothing about the worktree was
         // examined, so it is neither invalid nor unrelated, and asking
@@ -836,7 +836,7 @@ mod tests {
     /// every wording it has: shed at once (`0.000s`, background work) and
     /// refused after waiting out the rate budget (any duration).
     fn gate_deferrals() -> Vec<String> {
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         vec![
             refusal_message("git worktree", Refusal::Shed).into_message(),
             refusal_message(
@@ -860,7 +860,7 @@ mod tests {
             let error = classify(&path, &path, message.clone());
             assert_eq!(error.code, DEFERRED_WORKTREE, "{message}");
             assert!(
-                crate::engine::git_cli::is_deferred_under_load(&error.message),
+                crate::engine::process::is_deferred_under_load(&error.message),
                 "the cause stays in the message: {error}"
             );
         }
@@ -914,7 +914,7 @@ mod tests {
         bind(&path, &path, "TASK-1").unwrap();
         let (_linked_parent, linked) = linked_worktree(std::path::Path::new(&path));
         let error =
-            crate::engine::git_cli::with_forced_deferral(|| resolve_binding(&path, &linked))
+            crate::engine::process::with_forced_deferral(|| resolve_binding(&path, &linked))
                 .expect_err("a shed read must not resolve");
         assert_eq!(error.code, DEFERRED_WORKTREE, "{error}");
         assert_ne!(error.code, "untrusted_worktree");
@@ -930,7 +930,7 @@ mod tests {
         // code reaches it unchanged and it still refuses exactly as before
         // (hard `task.scope_unavailable`, rendered as Deny). CARD 13's hook
         // half changes this; until it lands, this is the pinned behavior.
-        let judged = crate::engine::git_cli::with_forced_deferral(|| {
+        let judged = crate::engine::process::with_forced_deferral(|| {
             crate::harness::check_command_in_scope(
                 crate::harness::sidecar::Lane::Shared,
                 &linked,
@@ -1852,7 +1852,7 @@ mod tests {
 #[cfg(test)]
 mod readonly_tests {
     use super::*;
-    use crate::engine::git_cli::spawn_log;
+    use crate::engine::process::spawn_log;
     use crate::test_support::git_in;
 
     pub(super) fn fresh_repo() -> tempfile::TempDir {

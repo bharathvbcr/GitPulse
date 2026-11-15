@@ -1,6 +1,6 @@
 //! Adversarial tests for lane W3-L2 (macOS QoS tiering). Test-only.
 
-use crate::engine::git_cli::{
+use crate::engine::process::{
     band_outcomes, run_bounded, run_observed, with_admission, with_background_band,
     with_background_budget_wait, with_background_processes, Admission, OutputStream,
     ProcessObserver, MAX_OUTPUT_BYTES,

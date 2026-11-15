@@ -13,9 +13,10 @@ use crate::coverage_toolchain::{
 };
 use crate::deadline::ScanDeadline;
 use crate::engine::git_cli::{
-    capture_command, git_text_partial, is_sandbox_symlink_escape, sandbox_join,
-    sandbox_join_canonical, validate_repo,
+    git_text_partial, is_sandbox_symlink_escape, sandbox_join, sandbox_join_canonical,
+    validate_repo,
 };
+use crate::engine::process::capture_command;
 use crate::fs_entry::BoundedRead;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};

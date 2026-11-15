@@ -91,7 +91,7 @@ pub async fn cmd_get_file_diff(
 /// Reads nothing and writes nothing in the repository, so it is not guarded.
 #[tauri::command(async)]
 pub fn cmd_cancel_read(request_id: String) -> bool {
-    crate::engine::git_cli::read_cancel::cancel(&request_id)
+    crate::engine::process::read_cancel::cancel(&request_id)
 }
 
 #[tauri::command(async)]

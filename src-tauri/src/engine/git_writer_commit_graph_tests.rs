@@ -65,7 +65,7 @@ fn text(path: &Path) -> String {
 /// user action before the writer spawns, so a busy host defers refresh traffic,
 /// not the person's write. Marked per call because the mark is thread-local.
 fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, CommandError> {
-    crate::engine::git_cli::mark_user_action(repo);
+    crate::engine::process::mark_user_action(repo);
     GitWriter::commit_graph_write(repo, confirmed)
 }
 
@@ -245,7 +245,7 @@ fn concurrent_clicks_in_one_common_dir_are_one_write() {
 fn a_timeout_kills_the_write_and_leaves_no_lock_or_graph() {
     let (_dir, repo) = large_history(30_000);
     let argv = GitWriter::commit_graph_write_argv();
-    crate::engine::git_cli::mark_user_action(&text(&repo));
+    crate::engine::process::mark_user_action(&text(&repo));
     let error = GitWriter::commit_graph_write_within(
         &text(&repo),
         &argv,
@@ -253,7 +253,7 @@ fn a_timeout_kills_the_write_and_leaves_no_lock_or_graph() {
     )
     .expect_err("a 5 ms budget cannot write 30k commits");
     assert!(
-        crate::engine::git_cli::is_timed_out(error.message()),
+        crate::engine::process::is_timed_out(error.message()),
         "{error}",
         error = error.message()
     );

@@ -212,7 +212,7 @@ flowchart TD
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 121 contracts (311 structs, 2171 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 121 contracts (311 structs, 2173 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -483,10 +483,12 @@ subtly wrong:
 
 **1. Rust core — the only thing that touches the system.**
 No frontend code shells out, reads a file, or opens a socket. Every such operation is
-a `cmd_*` handler. `engine/git_cli.rs` is the canonical owner of process execution: it
-strips ambient `GIT_*` configuration, disables terminal prompts and interactive
-credential helpers, and bounds both output size and wall-clock time. New code that
-runs a process goes **through** it, not beside it.
+a `cmd_*` handler. `engine/process/` is the canonical owner of process execution
+(`run_bounded_capped`, `capture_command`, admission gate, deadlines, and child env
+pinning), while `engine/git_cli.rs` owns git invocations through it: stripping ambient
+`GIT_*` configuration, disabling terminal prompts and interactive credential helpers,
+and bounding both output size and wall-clock time. New code that runs a process goes
+**through** `engine/process/` (or `engine/git_cli.rs` for git), not beside it.
 
 **2. The IPC seam — narrow, typed, and verified.**
 A command is added in four places, in this order: implement in
@@ -527,8 +529,8 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 ## 6. Coding Standards
 
 1. **One canonical owner.** Do not stand up a second registry, utility, or command
-   path beside an existing one. Extend the view registry, the command handlers, and
-   `git_cli` rather than duplicating them.
+   path beside an existing one. Extend the view registry, the command handlers,
+   `engine::process`, and `git_cli` rather than duplicating them.
 2. **Strict IPC contracts.** See §4 and §5. `bun run check:ipc` must report zero drift.
 3. **Async hygiene.** Use `createAsyncGuard` for component-level async work.
 4. **No unchecked casts.** No `any`, no loose casts. Model every IPC payload with a
@@ -556,6 +558,21 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 5. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
    subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). GitPulse parses
    these in its own commit filter, so the repository holds itself to them.
+6. Sign off every commit (`git commit -s`). See "Licence of contributions" below.
+
+### Licence of contributions
+
+GitPulse is under the [MIT License](LICENSE), and a contribution is accepted
+under that same licence. Signing off a commit adds a `Signed-off-by:` line with
+your name and email, which states that you agree to the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/): you
+wrote the change, or otherwise have the right to submit it under the
+project's licence. Use your real name. A pull request with an unsigned commit
+is asked to amend it (`git commit --amend -s`, or
+`git rebase --signoff main` for several commits).
+
+The GitPulse name and logo are not covered by the MIT License; see
+[TRADEMARKS.md](TRADEMARKS.md).
 
 ### Looking for something to work on?
 

@@ -254,7 +254,7 @@ pub(crate) fn interpret(run: UseRun) -> ManviStatus {
 
 fn run_use(binary: &str, args: &[&str]) -> Result<UseRun, String> {
     let probe = manvi_probe_command(binary, args);
-    let run = crate::engine::git_cli::run_bounded_capped(
+    let run = crate::engine::process::run_bounded_capped(
         probe,
         "manvi use",
         USE_TIMEOUT,

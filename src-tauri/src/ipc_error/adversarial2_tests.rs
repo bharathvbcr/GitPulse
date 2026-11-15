@@ -5,7 +5,7 @@
 //! that names the repository.
 
 use super::*;
-use crate::engine::git_cli::{refusal_message, Refusal};
+use crate::engine::process::{refusal_message, Refusal};
 use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
 
@@ -63,7 +63,7 @@ fn a_helper_deferral_never_makes_a_write_or_unlisted_command_retryable() {
         assert_eq!(exact.kind, inline(command).kind, "{exact}");
     }
     let user_action = read(|| {
-        crate::engine::git_cli::mark_user_action("/nonexistent-adv-repo");
+        crate::engine::process::mark_user_action("/nonexistent-adv-repo");
         carried()
     })
     .expect_err("refused");
@@ -244,7 +244,7 @@ fn a_trust_refusal_inside_a_spawn_failure_keeps_its_origin() {
         .status_locked()
         .expect("git init");
     assert!(status.success());
-    let error = crate::engine::git_cli::run_command_in(
+    let error = crate::engine::process::run_command_in(
         "true",
         &[],
         std::time::Duration::from_secs(5),

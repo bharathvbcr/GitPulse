@@ -10,7 +10,7 @@
  * a soft `RLIMIT_NOFILE` of 256, and past it every spawn fails with
  * "Too many open files (os error 24)".
  *
- * The backend now caps concurrent children too (`engine::git_cli`'s spawn
+ * The backend now caps concurrent children too (`engine::process`'s spawn
  * gate), but a cap reached by queueing hundreds of blocked threads is still
  * the wrong shape. Callers bound the fan-out here, at the point that knows how
  * wide the work is.

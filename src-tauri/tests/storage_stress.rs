@@ -30,7 +30,7 @@ impl TempRepo {
         // The suite shares one process gate. Leaving the production rate on
         // makes a parallel run defer `git worktree` and report a complete
         // fixture as truncated — the gate's own tests cover that refusal.
-        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let guard = tempfile::tempdir().expect("tempdir");
         let root = guard.path().join("repo");
         fs::create_dir_all(&root).unwrap();

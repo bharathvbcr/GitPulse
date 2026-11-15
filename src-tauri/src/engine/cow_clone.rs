@@ -2062,7 +2062,7 @@ mod tests {
         let anchor = main.path().canonicalize().unwrap();
         fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
         fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
-        let synced = crate::engine::git_cli::with_forced_spawn_failure_of("check-ignore", || {
+        let synced = crate::engine::process::with_forced_spawn_failure_of("check-ignore", || {
             reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
         });
         let error = synced.expect_err("an unchecked cache was copied or skipped silently");
