@@ -3141,6 +3141,18 @@ fn shared_dirt_clause(snapshot: &InsightsSnapshot, shared: &insights::SharedWork
 /// `git status` that never ran would be the same lie this module refuses to
 /// tell about collisions, one line further down the page.
 pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> String {
+    session_brief_with(snapshot, here, source, None)
+}
+
+/// [`session_brief`] with one more line right under the header, so it is never
+/// the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot says
+/// (`load_gate::brief_line_live`).
+fn session_brief_with(
+    snapshot: &InsightsSnapshot,
+    here: &str,
+    source: &str,
+    load: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "GitPulse brief ({})\nrepo: {}\n",
@@ -3151,6 +3163,10 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         },
         snapshot.repo_path
     ));
+    if let Some(load) = load {
+        out.push_str(load);
+        out.push('\n');
+    }
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
     // have filled are partial rather than empty.
@@ -3338,7 +3354,12 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
         ));
     };
     report_agent_session_meta(&here, input);
-    let brief = session_brief(&snapshot, &here, &input.source);
+    let brief = session_brief_with(
+        &snapshot,
+        &here,
+        &input.source,
+        Some(&load_gate::brief_line_live()),
+    );
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
     let brief = match worktree::setup_failure(&root) {
@@ -8536,6 +8557,32 @@ done
         assert!(detached_brief.contains("detached or bare"));
         assert!(unknown_brief.contains("UNKNOWN (not established)"));
         assert_ne!(detached_brief, unknown_brief);
+    }
+
+    /// The host-load line goes under the header, where the cap never cuts, and
+    /// a brief without one is the brief it always was.
+    #[test]
+    fn the_brief_carries_the_load_line_under_its_header_even_when_the_cap_cuts() {
+        let plain = snapshot_fixture();
+        assert_eq!(
+            session_brief(&plain, "/repo", "startup"),
+            session_brief_with(&plain, "/repo", "startup", None)
+        );
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let line = "host load: elevated, swap in use is above GitPulse's limit for it (sensor fresh)";
+        let brief = session_brief_with(&snapshot, "/repo", "startup", Some(line));
+        assert!(brief.len() <= BRIEF_LIMIT);
+        assert!(brief.ends_with("… truncated"));
+        assert_eq!(brief.lines().nth(2), Some(line), "{brief}");
     }
 
     #[test]

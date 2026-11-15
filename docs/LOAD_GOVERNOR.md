@@ -618,14 +618,27 @@ of `allow`/`deny`/`ask`/`defer`, `permissionDecisionReason` shown to Claude,
 at 10,000 characters; input `session_id`, `permission_mode`). Not confirmed from
 those pages, though the code reads it already: `tool_use_id` on the input.
 
-**Cost**, in process (a debug build, so an upper bound), host load average
-about 11 on 18 cores, 9 rounds of 200 calls, interleaved and rotated, the median
-of round medians, `cargo test --lib -- --ignored --nocapture load_stage_cost`:
-a command that is not heavy 1.7 µs; one of 10 KB 175 µs; a heavy command with a
-clear host, settings cold and the snapshot read from disk, 42.6 µs; a refused one,
-which also writes the loop marker, 464 µs. The hook process's own start (about
-25 ms, `tests/hook_gate_bench.rs`) is the cost to look at; this stage is not
-measurable against it, and no end-to-end speed claim is made.
+**The session brief** (`session-brief`, SessionStart) carries one `host load:`
+line right under its header, where the brief's 2,000-byte cap never cuts: tier and
+what binds it with the sensor's state, or `UNKNOWN (why)` and that heavy commands
+are not load-checked, and the Claude and Codex sessions launched and observed. It
+reads the same snapshot and never samples. The `gitpulse-load` skill
+(`plugins/gitpulse/skills/gitpulse-load`) says what to do with it and with a
+refusal; the terminal launch prompt names it, because `dc-store` owns the shared
+brief and does not.
+
+**Cost**, in process (a debug build, so an upper bound), 9 rounds of 200 calls per
+arm, interleaved and rotated, the median of round medians (the range of the
+medians in brackets), run twice with the host load average at 11 and then 15 on
+18 cores (`cargo test --lib -- --ignored --nocapture load_stage_cost`). A command
+that is not heavy: 1.7 µs [1.6 to 1.9]. One of 10 KB: 175 to 179 µs. A heavy
+command with a clear host, settings cold and the snapshot read from disk: 43 µs
+at load 11 and 61 µs at load 15 [40 to 75]. A refused one, which also writes the
+loop marker: 464 and 746 µs [427 to 879]. The session brief's added line: 25 µs
+[17 to 34]. The hook process's own start (about 25 ms, `tests/hook_gate_bench.rs`)
+is the cost to look at; this stage is not measurable against it, and no
+end-to-end speed claim is made. The session brief's end-to-end time before and
+after was **not** measured: that needs a second, pre-change hook binary.
 
 ## Health and the status bar
 

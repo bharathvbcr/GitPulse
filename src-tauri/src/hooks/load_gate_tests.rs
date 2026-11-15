@@ -733,6 +733,12 @@ fn load_stage_cost() {
             }),
         ),
         (
+            "brief-line",
+            Box::new(|_| {
+                std::hint::black_box(brief_line_live());
+            }),
+        ),
+        (
             "heavy/clear",
             Box::new(|_| {
                 crate::tool_config::invalidate_cache();
@@ -764,7 +770,7 @@ fn load_stage_cost() {
                     times.push(started.elapsed().as_secs_f64() * 1e6);
                 }
             } else {
-                if arms[index].0 == "heavy/clear" {
+                if arms[index].0 == "heavy/clear" || arms[index].0 == "brief-line" {
                     publish(clear);
                 }
                 for n in 0..calls {
@@ -808,5 +814,73 @@ fn load_stage_cost() {
             times[times.len() / 2],
             times[times.len() - 1]
         );
+    }
+}
+
+fn counts(launched: u32, observed: u32) -> Reading<crate::sysload::SessionCount> {
+    Reading::Value(crate::sysload::SessionCount { launched, observed })
+}
+
+#[test]
+fn the_session_brief_line_says_what_the_snapshot_says_and_what_it_could_not_read() {
+    let published = PublishedVerdict {
+        tier: Tier::Severe,
+        binding: Some(Binding::MemoryPressure),
+        admit: false,
+        shed_background: true,
+        shed_reactive: true,
+    };
+    let mut snapshot = snapshot_with(Reading::Value(published), true);
+    snapshot.claude = counts(3, 14);
+    snapshot.codex = Reading::Unavailable(Why::Failed);
+    let line = brief_line(&report(SensorState::Fresh, None), Some(&snapshot));
+    for must in [
+        "host load: severe, the kernel reports memory pressure",
+        "sensor fresh",
+        "not admitting launches",
+        "refuses heavy build and test commands",
+        "Claude 3 launched / 14 observed",
+        "Codex unknown",
+    ] {
+        assert!(line.contains(must), "{must:?} missing: {line}");
+    }
+    assert!(!line.contains('\n'), "one line: {line}");
+
+    // A clear host is one short clause, with no refusal in it.
+    let calm = PublishedVerdict {
+        tier: Tier::Clear,
+        binding: None,
+        admit: true,
+        shed_background: false,
+        shed_reactive: false,
+    };
+    let mut snapshot = snapshot_with(Reading::Value(calm), true);
+    snapshot.claude = counts(0, 2);
+    snapshot.codex = counts(0, 0);
+    let line = brief_line(&report(SensorState::StaleRecent, None), Some(&snapshot));
+    assert!(
+        line.starts_with("host load: clear (sensor stale, reading recent);"),
+        "{line}"
+    );
+    assert!(
+        !line.contains("refuses") && !line.contains("not admitting"),
+        "{line}"
+    );
+
+    // Nothing to read is UNKNOWN, with the reason, and says nothing was checked.
+    for (report, snapshot) in [
+        (report(SensorState::Dead, Some("no sampler")), None),
+        (
+            report(SensorState::StaleOld, None),
+            Some(snapshot_with(Reading::Value(calm), true)),
+        ),
+        (
+            report(SensorState::Fresh, None),
+            Some(snapshot_with(Reading::Unavailable(Why::Unsupported), true)),
+        ),
+    ] {
+        let line = brief_line(&report, snapshot.as_ref());
+        assert!(line.starts_with("host load: UNKNOWN ("), "{line}");
+        assert!(line.contains("not load-checked"), "{line}");
     }
 }

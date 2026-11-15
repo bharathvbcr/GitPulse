@@ -44,6 +44,7 @@ describe("native Codex plugin package", () => {
     expect(existsSync(path.join(PLUGIN, "skills", "gitpulse-collisions", "SKILL.md"))).toBe(true);
     expect(existsSync(path.join(PLUGIN, "skills", "gitpulse-tasks", "SKILL.md"))).toBe(true);
     expect(existsSync(path.join(PLUGIN, "skills", "gitpulse-terminal", "SKILL.md"))).toBe(true);
+    expect(existsSync(path.join(PLUGIN, "skills", "gitpulse-load", "SKILL.md"))).toBe(true);
   });
 });
 

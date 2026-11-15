@@ -270,3 +270,63 @@ fn many_hooks_reading_one_snapshot_at_once_all_get_the_same_answer() {
         );
     }
 }
+
+#[test]
+fn the_session_brief_carries_one_load_line_read_from_the_snapshot() {
+    let world = World::new();
+    world.publish(severe());
+    let repo = world.home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&repo)
+        .status_locked()
+        .unwrap()
+        .success());
+    let payload = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "cwd": repo.canonicalize().unwrap(),
+        "session_id": SESSION,
+        "source": "startup",
+    })
+    .to_string();
+    let mut child = Command::new(HOOK)
+        .arg("session-brief")
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, &world.logs)
+        .env("HOME", &world.home)
+        .env("TMPDIR", &world.tmp)
+        .env("XDG_CONFIG_HOME", world.home.join(".config"))
+        .env("GITPULSE_TOOL_CONFIG", &world.config)
+        .env("GITPULSE_MANVI_BIN", world.home.join("no-such-manvi"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn_locked()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let out = parsed(&String::from_utf8(output.stdout).unwrap());
+    let brief = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let lines: Vec<_> = brief
+        .lines()
+        .filter(|l| l.starts_with("host load:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{brief}");
+    assert!(
+        lines[0].contains("severe, swap in use") && lines[0].contains("not admitting launches"),
+        "{brief}"
+    );
+    assert_eq!(
+        brief.lines().nth(2),
+        Some(lines[0]),
+        "right under the header: {brief}"
+    );
+}

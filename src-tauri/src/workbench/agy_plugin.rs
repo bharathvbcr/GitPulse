@@ -34,6 +34,7 @@ const SKILL_COLLISIONS: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-collisions/SKILL.md");
 const SKILL_INSIGHTS: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-insights/SKILL.md");
+const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-load/SKILL.md");
 const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md");
 const SKILL_TERMINAL: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-terminal/SKILL.md");
@@ -42,9 +43,10 @@ const SKILL_TERMINAL: &str =
 pub(crate) const PRODUCER_MARKER: &str = ".gitpulse-managed";
 const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.0.0\n";
 
-const SKILLS: [(&str, &str); 4] = [
+const SKILLS: [(&str, &str); 5] = [
     ("gitpulse-collisions", SKILL_COLLISIONS),
     ("gitpulse-insights", SKILL_INSIGHTS),
+    ("gitpulse-load", SKILL_LOAD),
     ("gitpulse-tasks", SKILL_TASKS),
     ("gitpulse-terminal", SKILL_TERMINAL),
 ];
@@ -434,6 +436,7 @@ mod tests {
         assert!(plugin_dir
             .join("skills/gitpulse-terminal/SKILL.md")
             .is_file());
+        assert!(plugin_dir.join("skills/gitpulse-load/SKILL.md").is_file());
 
         let mcp_json: Value =
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("mcp.json")).unwrap())

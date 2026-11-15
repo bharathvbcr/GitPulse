@@ -98,6 +98,61 @@ pub(super) struct Gathered {
     pub now: SystemTime,
 }
 
+/// The one line the SessionStart brief carries about host load, read from the
+/// published snapshot: never a sample of the host.
+pub(super) fn brief_line_live() -> String {
+    let Some(dir) = crate::tool_config::default_config_dir() else {
+        return "host load: UNKNOWN (there is no per-user config directory)".into();
+    };
+    let path = dir.join(crate::sysload::SNAPSHOT_FILE_NAME);
+    let (report, snapshot) = crate::sysload::report(&path, crate::sysload::Clock::now());
+    brief_line(&report, snapshot.as_ref())
+}
+
+/// [`brief_line_live`] over a report someone already read.
+pub(super) fn brief_line(report: &SensorReport, snapshot: Option<&Snapshot>) -> String {
+    let sessions = |snapshot: Option<&Snapshot>| match snapshot {
+        Some(s) => {
+            let count = |name: &str, reading: &Reading<crate::sysload::SessionCount>| match reading
+            {
+                Reading::Value(c) => {
+                    format!("{name} {} launched / {} observed", c.launched, c.observed)
+                }
+                Reading::Unavailable(_) => format!("{name} unknown"),
+            };
+            format!(
+                "sessions: {}, {}",
+                count("Claude", &s.claude),
+                count("Codex", &s.codex)
+            )
+        }
+        None => "sessions: unknown".to_string(),
+    };
+    let line = match availability_of(report, snapshot) {
+        Availability::Verdict { verdict, state, .. } => {
+            let state = match state {
+                SensorState::Fresh => "sensor fresh",
+                _ => "sensor stale, reading recent",
+            };
+            let host = match verdict.tier {
+                Tier::Clear => "clear".to_string(),
+                tier => format!("{}, {}", tier_word(tier), binding_phrase(verdict.binding)),
+            };
+            let gate = if verdict.admit {
+                ""
+            } else {
+                "; the governor is not admitting launches, and the command gate refuses heavy build and test commands"
+            };
+            format!("host load: {host} ({state}){gate}; {}", sessions(snapshot))
+        }
+        Availability::Unavailable(why) => format!(
+            "host load: UNKNOWN ({why}); heavy commands are not load-checked; {}",
+            sessions(snapshot)
+        ),
+    };
+    bounded(line)
+}
+
 /// What the real world says. Called only for a command that is in the table.
 pub(super) fn gather_live() -> Gathered {
     let mode = crate::tool_config::host_load_hook_mode();

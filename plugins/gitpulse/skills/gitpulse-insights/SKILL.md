@@ -43,6 +43,10 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null and `verified` false for a commit with no verification note; a verification does not survive a rewrite |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `false` only when absence is provable, otherwise null with a `reason` code; `reverted` from a revert commit by ancestry; `landed_at` from the base branch's reflog. Refuses in a partial clone. Writes nothing (the content check runs in a quarantined object directory) |
 
+## Host load
+
+The SessionStart brief that `gitpulse_insights` accompanies carries a `host load:` line read from the host-load snapshot (tier, what is binding, Claude and Codex sessions launched and observed). It is not a `gitpulse_insights` facet. Before a heavy build or test, and whenever a command is refused for load, follow the `gitpulse-load` skill.
+
 ## Honesty rules this server already enforces
 
 - Unscanned worktrees are counted, never implied clean.
