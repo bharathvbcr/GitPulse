@@ -771,7 +771,7 @@ pub(super) fn leaked_temp(user_temp: &Path, ctx: &Context<'_>) -> Vec<LeakedTemp
             reason: format!("report only: {NO_PROOF}; {use_note}"),
         });
     }
-    found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    found.sort_by_key(|leak| std::cmp::Reverse(leak.bytes));
     found.truncate(MAX_LEAKED);
     found
 }

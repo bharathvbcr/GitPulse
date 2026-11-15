@@ -339,7 +339,7 @@ fn a_young_unreadable_or_oversized_target_is_kept() {
     let sealed = pad.join("sealed/debug");
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&sealed, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o0)).unwrap();
         let scan = run(&nobody(), &idle, |ctx| {
             scan_sessions(&root, UID, ctx, false)
         });
@@ -545,7 +545,7 @@ fn only_a_marked_target_directly_under_claude_is_ever_a_candidate() {
     cargo_target(&claude.join("skills/deep-target"), 30);
     fs::remove_dir_all(claude.join("x-target")).unwrap();
     let scan = run(&nobody(), &idle, |ctx| {
-        scan_claude_targets(&[repo.clone()], ctx, false)
+        scan_claude_targets(std::slice::from_ref(&repo), ctx, false)
     });
     assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
     assert!(kept_reason(&scan, "y-target")
@@ -585,7 +585,7 @@ fn a_recent_or_unproven_claude_build_folder_says_which() {
     let (_temp, repo, _lane) = claude_fixture();
     cargo_target(&repo.join(".claude/fresh-target"), 1);
     let scan = run(&nobody(), &idle, |ctx| {
-        scan_claude_targets(&[repo.clone()], ctx, false)
+        scan_claude_targets(std::slice::from_ref(&repo), ctx, false)
     });
     assert!(kept_reason(&scan, "fresh-target")
         .reason
@@ -597,7 +597,7 @@ fn a_recent_or_unproven_claude_build_folder_says_which() {
         })
     };
     let scan = run(&nobody(), &unreadable, |ctx| {
-        scan_claude_targets(&[repo.clone()], ctx, false)
+        scan_claude_targets(std::slice::from_ref(&repo), ctx, false)
     });
     assert!(scan.candidates.is_empty());
     assert!(kept_reason(&scan, "x-target")
