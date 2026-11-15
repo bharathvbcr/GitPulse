@@ -180,6 +180,8 @@ fn busy_main(farm: &Farm, dirty: bool) -> live_sessions::Observation {
         session_id: Some(format!("s{pid}")),
         proc_start: None,
         registry_cwd: None,
+        start_us: None,
+        is_caller: false,
         ide_hosted: false,
         terminal_session_id: None,
     };

@@ -23,9 +23,10 @@
 //! * `publish + read`: one snapshot write under the sequence lock and one
 //!   reader decode, in a temp directory.
 //!
-//! `GITPULSE_HOST_LOAD_ONCE=scan|sessions|collision` runs one sample in this
-//! process and exits. `gitpulse-hook` is a new process per call, so that is
-//! the figure for the collision guard; the rows above reuse one process.
+//! `GITPULSE_HOST_LOAD_ONCE=scan|sessions|mcp_sessions|collision` runs one sample
+//! in this process and exits. `gitpulse-hook` and `gitpulse_sessions` inspect
+//! a cold process scan, so those are the figures for CLI/MCP one-shot callers;
+//! the rows above reuse one process.
 //!
 //! Fresh release processes, 15 each, on 2026-10-14. Before is the full table
 //! read `observe_sessions` used to pay (1,247–1,250 processes, 33 sessions).
@@ -43,6 +44,16 @@
 //! listing. Before: min 377.5 ms, p50 646.0 ms, p95 969.0 ms, worst 1005.2 ms
 //! (12 worktrees). After: min 287.1 ms, p50 340.6 ms, p95 563.7 ms, worst
 //! 1049.4 ms (11 worktrees). `sessions_ok` was true throughout.
+//!
+//! Fresh release processes, 15 each, on 2026-11-14 (S3-04 `ft-9cfa527403d342da25e756db971761c5`,
+//! tied to `ft-7ba9b4b2`'s `observe_sessions` baseline on this host under ~27 live
+//! sessions; `mcp_sessions` adds Claude registry, CARD 11 attribution, ledger bindings,
+//! and hub snapshot read with zero `git` spawns):
+//!
+//! | | min | p50 | p95 | worst |
+//! |---|---|---|---|---|
+//! | `sessions` (`observe_sessions`) | 9.73 ms | 40.39 ms | 89.90 ms | 161.52 ms |
+//! | `mcp_sessions` (`insights::sessions`, 4 repo sessions) | 11.90 ms | 16.03 ms | 32.16 ms | 36.49 ms |
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
@@ -90,8 +101,9 @@ fn measure(name: &'static str, samples: usize, mut run: impl FnMut()) -> Row {
 /// the first scan, not a warm repeat inside one process. Launch this binary
 /// once per sample with `GITPULSE_HOST_LOAD_ONCE=scan` (the sampler's full
 /// table read), `sessions` (`observe_sessions`, what the hook's collision
-/// guard pays) or `collision`. `GITPULSE_HOST_LOAD_REPO` is the repository
-/// the collision sample reads.
+/// guard pays), `mcp_sessions` (`insights::sessions` without git), or
+/// `collision`. `GITPULSE_HOST_LOAD_REPO` is the repository the `collision`
+/// and `mcp_sessions` samples read.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn one_shot() -> bool {
     let Ok(mode) = std::env::var("GITPULSE_HOST_LOAD_ONCE") else {
@@ -121,6 +133,35 @@ fn one_shot() -> bool {
                 Err(error) => {
                     let us = started.elapsed().as_micros();
                     println!("once sessions_us={us} ok=false error={error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "mcp_sessions" => {
+            let repo = std::env::var("GITPULSE_HOST_LOAD_REPO").unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string())
+            });
+            if let Ok(preview) = gitpulse_lib::repository_trust::inspect(&repo) {
+                let _ = gitpulse_lib::repository_trust::grant(&repo, &preview.identity, false);
+            }
+            let started = std::time::Instant::now();
+            match gitpulse_lib::insights::sessions(&repo, None, &|_| None) {
+                Ok(report) => {
+                    let us = started.elapsed().as_micros();
+                    println!(
+                        "once mcp_sessions_us={us} ok={} total={} returned={} app_ok={}",
+                        report.ok, report.total, report.returned, report.app_state.ok
+                    );
+                    if !report.ok {
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    let us = started.elapsed().as_micros();
+                    println!("once mcp_sessions_us={us} ok=false error={error}");
                     std::process::exit(1);
                 }
             }

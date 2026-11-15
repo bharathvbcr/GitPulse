@@ -32,6 +32,9 @@ pub use entity_collision::{
     classify_incoming, classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind,
     EntityCollisionVerdict, IncomingEdit, LineRange, OldSideHunk,
 };
+pub use live_sessions::{
+    sessions, AppStateFacet, SessionRow, SessionsReport, DEFAULT_SESSIONS_CAP,
+};
 
 use crate::codeintel::{self, CodeintelStatus};
 use crate::engine::git_cli::{current_admission, git_text, with_admission};
@@ -153,6 +156,12 @@ pub struct LiveSession {
     /// in the parent checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_cwd: Option<String>,
+    /// Kernel-reported start time in microseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_us: Option<u64>,
+    /// True when this session is an ancestor of the process answering the query.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_caller: bool,
     /// Internal classification flag from `procscan` (`true` for IDE processes,
     /// `false` for CLI processes like `agy` / `claude`).
     #[serde(skip)]
@@ -191,7 +200,7 @@ pub struct LiveWorktree {
 }
 
 /// What one agent kind's detector established for this repository.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveKindStatus {
     pub kind: String,
     /// Whether this kind's sessions could be observed at all. `sessions: 0`

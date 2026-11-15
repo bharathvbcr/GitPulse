@@ -1633,15 +1633,43 @@ fn signal_term(_pid: i32, _start_us: u64) -> Result<(), String> {
 /// Whether this platform has a process scan at all.
 pub(crate) const SCAN_SUPPORTED: bool = os::SUPPORTED;
 
+/// Identity of the agent session that spawned the current server process,
+/// resolved by walking parents using both pid and start timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerIdentity {
+    pub pid: i32,
+    pub start_us: u64,
+}
+
+/// One sessions-only process scan paired with the caller's own owning
+/// session (when an agent session sits above this process in the table).
+#[derive(Debug, Clone, Default)]
+pub struct SessionScan {
+    pub sessions: Vec<AgentSession>,
+    pub caller: Option<CallerIdentity>,
+}
+
+/// Start time in microseconds since the Unix epoch of a live process,
+/// or `None` when the process is gone or this platform cannot report it.
+pub fn process_start_us(pid: u32) -> Option<u64> {
+    if !os::SUPPORTED {
+        return None;
+    }
+    let pid = i32::try_from(pid).ok().filter(|&p| p > 0)?;
+    let (_, start_us) = os::pid_ppid_start(pid)?;
+    (start_us > 0).then_some(start_us)
+}
+
 /// Turns classified rows into sessions. A row whose parent row is the same
 /// kind is that parent's wrapper target, not a second session. A parent that
 /// is not itself a candidate is not a wrapper. More than [`MAX_SESSIONS`] is
 /// a scan that could not finish. Working directories are read only for the
 /// sessions that remain.
-fn assemble_sessions(
+fn assemble_scan(
     table: SessionTable,
     mut cwd_of: impl FnMut(i32) -> Option<PathBuf>,
-) -> Result<Vec<AgentSession>, String> {
+    caller: Option<(i32, Option<(i32, u64)>)>,
+) -> Result<SessionScan, String> {
     let SessionTable {
         rows,
         links,
@@ -1660,8 +1688,8 @@ fn assemble_sessions(
             "more than {MAX_SESSIONS} agent sessions are running; the scan does not describe them all"
         ));
     }
-    let session_pids: std::collections::HashSet<i32> = kept.iter().map(|row| row.pid).collect();
-    Ok(kept
+    let start_by_pid: HashMap<i32, u64> = kept.iter().map(|row| (row.pid, row.start_us)).collect();
+    let sessions = kept
         .into_iter()
         .map(|row| AgentSession {
             kind: row.kind,
@@ -1678,7 +1706,7 @@ fn assemble_sessions(
                 row.ppid,
                 row.start_us,
                 |pid| links.get(&pid).copied(),
-                |pid| session_pids.contains(&pid),
+                |pid| start_by_pid.contains_key(&pid),
             ),
             // This path does not read footprints. Unavailable is the
             // not-measured signal; zero would say the session uses no memory.
@@ -1688,7 +1716,29 @@ fn assemble_sessions(
             ide_hosted: row.ide_hosted,
             terminal_session_id: row.launch.as_ref().and_then(|key| key.session_id.clone()),
         })
-        .collect())
+        .collect();
+    let resolved_caller = caller.and_then(|(caller_pid, fallback_link)| {
+        let link = links
+            .get(&caller_pid)
+            .copied()
+            .or_else(|| fallback_link.map(|(ppid, start_us)| ProcLink { ppid, start_us }))?;
+        let agent_pid = nearest_agent_ancestor(
+            caller_pid,
+            link.ppid,
+            link.start_us,
+            |pid| links.get(&pid).copied(),
+            |pid| start_by_pid.contains_key(&pid),
+        )?;
+        let start_us = start_by_pid.get(&agent_pid).copied()?;
+        Some(CallerIdentity {
+            pid: agent_pid,
+            start_us,
+        })
+    });
+    Ok(SessionScan {
+        sessions,
+        caller: resolved_caller,
+    })
 }
 
 /// A failed table read stays an error. An empty `Ok` would mean no sessions.
@@ -1696,7 +1746,17 @@ pub(crate) fn sessions_from_read(
     read: Result<SessionTable, String>,
     cwd_of: impl FnMut(i32) -> Option<PathBuf>,
 ) -> Result<Vec<AgentSession>, String> {
-    assemble_sessions(read?, cwd_of)
+    Ok(assemble_scan(read?, cwd_of, None)?.sessions)
+}
+
+#[cfg(test)]
+pub(crate) fn scan_from_read(
+    read: Result<SessionTable, String>,
+    cwd_of: impl FnMut(i32) -> Option<PathBuf>,
+    caller_pid: i32,
+    caller_link: Option<(i32, u64)>,
+) -> Result<SessionScan, String> {
+    assemble_scan(read?, cwd_of, Some((caller_pid, caller_link)))
 }
 
 /// Every agent session running now, for callers outside the sampler (the
@@ -1712,6 +1772,26 @@ pub fn observe_sessions() -> Result<Vec<AgentSession>, String> {
         return Err("this platform has no process scan".into());
     }
     sessions_from_read(os::read_session_rows(), os::cwd)
+}
+
+/// [`observe_sessions`] plus the nearest owning agent session above the
+/// current process, verified by `(pid, start_us)`.
+pub fn observe_sessions_with_caller() -> Result<SessionScan, String> {
+    if !os::SUPPORTED {
+        return Err("this platform has no process scan".into());
+    }
+    let table = os::read_session_rows()?;
+    let self_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    let fallback = if self_pid > 0 && !table.links.contains_key(&self_pid) {
+        os::pid_ppid_start(self_pid)
+    } else {
+        None
+    };
+    assemble_scan(
+        table,
+        os::cwd,
+        (self_pid > 0).then_some((self_pid, fallback)),
+    )
 }
 
 /// The processes whose working directory is `dir` or inside it, other than
@@ -2415,6 +2495,10 @@ mod os {
         })
     }
 
+    pub(super) fn pid_ppid_start(pid: i32) -> Option<(i32, u64)> {
+        basic(pid).map(|info| (info.ppid, info.start_us))
+    }
+
     pub(super) struct OsSource {
         pids: Vec<i32>,
         args: Vec<u8>,
@@ -2795,6 +2879,14 @@ mod os {
         })
     }
 
+    pub(super) fn pid_ppid_start(pid: i32) -> Option<(i32, u64)> {
+        let st = stat(pid)?;
+        let ticks = clock_ticks().max(1);
+        let boot = boot_us();
+        let start_us = boot.saturating_add(st.start_ticks.saturating_mul(1_000_000) / ticks);
+        Some((st.ppid, start_us))
+    }
+
     pub(super) struct OsSource {
         pids: Vec<i32>,
         me: u32,
@@ -2971,6 +3063,10 @@ mod os {
     }
 
     pub(crate) fn probe_one(_pid: i32) -> Option<ProcFacts> {
+        None
+    }
+
+    pub(super) fn pid_ppid_start(_pid: i32) -> Option<(i32, u64)> {
         None
     }
 
@@ -4088,6 +4184,51 @@ pub(crate) mod tests {
             &[(1, 0, 1), (90, 85, 200), (85, 80, 150)],
         );
         assert_eq!(parents_of(table), [(80, None), (100, Some(80))]);
+    }
+
+    #[test]
+    fn caller_identity_picks_nearest_agent_ancestor_and_rejects_pid_reuse() {
+        // Coordinator (80) -> wrapper shell (85) -> subagent (100) -> shell (110) -> server (120)
+        // Sibling (200) sits under init (1).
+        let table = table_with(
+            vec![
+                agent_row(80, 1, 100, AgentKind::Claude),
+                agent_row(100, 85, 300, AgentKind::Claude),
+                agent_row(200, 1, 150, AgentKind::Codex),
+            ],
+            &[(1, 0, 1), (85, 80, 200), (110, 100, 400), (120, 110, 500)],
+        );
+        let scan = scan_from_read(Ok(table), |_| None, 120, None).unwrap();
+        assert_eq!(
+            scan.caller,
+            Some(CallerIdentity {
+                pid: 100,
+                start_us: 300,
+            })
+        );
+
+        // PID reuse: agent 80 started *after* shell 90 (start_us 900 > 200).
+        let reused = table_with(
+            vec![agent_row(80, 1, 900, AgentKind::Claude)],
+            &[(1, 0, 1), (90, 80, 200), (120, 90, 500)],
+        );
+        let scan = scan_from_read(Ok(reused), |_| None, 120, None).unwrap();
+        assert_eq!(scan.caller, None);
+
+        // Direct agent parent via fallback link (caller not in table.links) and reparented-to-init.
+        let direct = table_with(vec![agent_row(80, 1, 100, AgentKind::Claude)], &[(1, 0, 1)]);
+        let scan = scan_from_read(Ok(direct), |_| None, 999, Some((80, 200))).unwrap();
+        assert_eq!(
+            scan.caller,
+            Some(CallerIdentity {
+                pid: 80,
+                start_us: 100,
+            })
+        );
+
+        let orphan = table_with(vec![agent_row(80, 1, 100, AgentKind::Claude)], &[(1, 0, 1)]);
+        let scan = scan_from_read(Ok(orphan), |_| None, 999, Some((1, 200))).unwrap();
+        assert_eq!(scan.caller, None);
     }
 
     /// A direct same-kind child is a wrapper target and still not a second
