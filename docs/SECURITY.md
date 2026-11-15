@@ -253,7 +253,10 @@ flowchart TD
   always 0), so the staged diff or commit goes as GitPulse built it. GitPulse's own
   loopback client (and its consent flow) is used only when Manvi is not installed or
   lacks the op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
-  `manvi use cloud|local` only on a human action in the Manvi pane.
+  `manvi use cloud|local` only on a human action: the Manvi pane's cloud/local
+  toggle and Claude model picker, and picking a local model in the Manvi pill or
+  the Local model servers card (which switches Manvi to local for every program
+  that starts it). The loopback consent dialog never writes it.
 - Commit messages are classified in the app from the staged patch. When no
   loopback model is selected, a supported Mac may ask Apple Intelligence only
   for the subject, and only from that classified brief — the patch itself is

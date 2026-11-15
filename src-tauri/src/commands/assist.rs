@@ -36,7 +36,9 @@ pub async fn cmd_ai_status(base_url: Option<String>, model: Option<String>) -> c
 
 /// Changes what Manvi runs on (`manvi use cloud|local …`), the one writer of
 /// that choice, and answers what Manvi now reports. Human-initiated: only the
-/// Manvi pane's model controls call it, never a background path. The shapes
+/// Manvi pane's cloud/local toggle and Claude picker, and picking a local model
+/// in the Manvi pill or the Local model servers card, call it; never a
+/// background path, and never the loopback consent dialog. The shapes
 /// are checked before Manvi is asked ([`crate::harness::manvi_use::validate`]):
 /// a `claude-` model id for cloud; a loopback base URL and a plain model id
 /// for local. The live profile worker is retired so the next call spawns for
