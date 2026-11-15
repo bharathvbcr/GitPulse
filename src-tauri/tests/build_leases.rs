@@ -122,6 +122,7 @@ impl World {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("GITPULSE_TOOL_CONFIG", &self.tools)
+            .env(gitpulse_lib::logging::LOG_DIR_ENV, self.home.join("logs"))
             .env("GITPULSE_LEASE_POLL_MS", "50")
             .env("GITPULSE_LEASE_ANNOUNCE_MS", "200")
             .env("GITPULSE_TERMINAL_SESSION", format!("term-{tag}"))

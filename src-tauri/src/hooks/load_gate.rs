@@ -107,6 +107,7 @@ pub(super) enum LeaseSource {
     /// is found.
     Live,
     /// Handed in, for tests.
+    #[cfg(test)]
     Fixed(LeaseFacts),
 }
 
@@ -184,6 +185,7 @@ fn lease_lines(
         return Vec::new();
     }
     let facts = match &g.lease {
+        #[cfg(test)]
         LeaseSource::Fixed(facts) => facts.clone(),
         LeaseSource::Live => live_lease_facts(input, availability),
     };

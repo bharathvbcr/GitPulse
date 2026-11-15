@@ -422,7 +422,7 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
     assert!(Command::new("git")
         .args(["init", "-q"])
         .current_dir(&repo)
-        .status()
+        .status_locked()
         .unwrap()
         .success());
     let env_file = world.home.join("claude-env");

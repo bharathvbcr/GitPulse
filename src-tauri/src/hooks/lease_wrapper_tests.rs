@@ -197,8 +197,9 @@ fn the_build_starts_with_its_slot_held_marked_and_its_jobs_split() {
     assert_eq!(jobs_for(18, 1), 18);
     assert_eq!(jobs_for(4, 4), 2, "never below two");
     assert_eq!(jobs_for(8, 0), 8, "no division by zero");
-    assert!(MAX_SLOTS >= 4);
 }
+
+const _: () = assert!(MAX_SLOTS >= 4);
 
 #[test]
 fn a_free_slot_is_granted_at_once_and_recorded_with_why_it_was_granted() {

@@ -242,6 +242,7 @@ fn the_links_are_made_repaired_by_rename_and_refused_without_a_hook_to_point_at(
 #[cfg(unix)]
 mod disk {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, Command, Stdio};
 
@@ -310,7 +311,7 @@ mod disk {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .spawn()
+                .spawn_locked()
                 .unwrap();
             let mut lines = BufReader::new(child.stdout.take().unwrap());
             let mut line = String::new();

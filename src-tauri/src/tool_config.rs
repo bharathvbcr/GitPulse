@@ -2353,7 +2353,6 @@ mod tests {
                 idle: HostLoadIdle {
                     idle_after_s: 600,
                     park_after_s: 300,
-                    ..HostLoadIdle::default()
                 },
                 ..HostLoadSettings::default()
             })
