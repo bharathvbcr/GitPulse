@@ -48,8 +48,9 @@
 
   // The fill rule's own measurement state, from the sampler's status: warming
   // up and an older writing build read differently from a calm disk.
-  const state = (
-    guard === "fill" &&  ? fillRateLine(.snapshot, .governor.disk_fill) : null,
+  const status = $derived($hostLoadStatus);
+  const fillState = $derived(
+    guard === "fill" && status ? fillRateLine(status.snapshot, status.governor.disk_fill) : null,
   );
   $effect(() => {
     if (!active || guard !== "fill") return;
@@ -121,8 +122,8 @@
     </select>
   </div>
   <p class="text-textMuted text-micro leading-snug">{spec.description}</p>
-  {#if state}
-    <p class="text-textMuted text-micro" data-testid="host-load-guard-fill-state">{state}</p>
+  {#if fillState}
+    <p class="text-textMuted text-micro" data-testid="host-load-guard-fill-state">{fillState}</p>
   {/if}
   {#if stored && stored.mode !== "off"}
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
