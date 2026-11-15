@@ -608,6 +608,42 @@ describe("check:workflows release-gate rule: a trusted check must not be able to
     });
   });
 
+  describe("a job that calls a reusable workflow, or has no steps", () => {
+    const calls = (target: string, extra: string[] = []) => wf("  a:", `    uses: ${target}`, ...extra);
+
+    it.each(["./.github/workflows/other.yml", "octo/repo/.github/workflows/x.yml@3d3c42e5aac5ba805825da76410c181273ba90b1"])(
+      "fails a job-level uses of %s, whose jobs this rule cannot read",
+      (target) => {
+        const [finding, ...rest] = gate(calls(target));
+        expect(rest).toEqual([]);
+        expect(finding).toContain('job "a"');
+        expect(finding).toContain("`uses`");
+        expect(finding).toMatch(/reusable workflow/);
+      },
+    );
+
+    it("honours an allowlist entry for uses, and fails a stale one", () => {
+      expect(gate(calls("./.github/workflows/other.yml"), [allow({ job: "a", key: "uses" })])).toEqual([]);
+      const stale = gate(clean, [allow({ job: "a", key: "uses" })]);
+      expect(stale).toHaveLength(1);
+      expect(stale[0]).toMatch(/stale/);
+      // An entry for another key does not excuse it.
+      expect(gate(calls("./x.yml"), [allow({ job: "a", key: "if" })]).some((f) => f.includes("`uses`"))).toBe(true);
+    });
+
+    it("fails a job with neither steps nor uses", () => {
+      const [finding, ...rest] = gate(wf("  a:", "    runs-on: ubuntu-latest"));
+      expect(rest).toEqual([]);
+      expect(finding).toContain('job "a"');
+      expect(finding).toContain("`steps`");
+    });
+
+    it("fails a job with both steps and uses, and still judges the rest of a uses job", () => {
+      expect(gate(wf("  a:", "    uses: ./x.yml", "    steps:", "      - run: x"))).toHaveLength(1);
+      expect(gate(calls("./x.yml", ["    if: always()"]))).toHaveLength(2);
+    });
+  });
+
   describe("matrix exclude", () => {
     const withExclude = (shape: string[]) =>
       wf("  test:", "    runs-on: ${{ matrix.os }}", "    strategy:", "      matrix:", "        os: [ubuntu-latest, windows-latest]", ...shape, "    steps:", "      - run: x");

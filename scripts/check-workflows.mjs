@@ -705,7 +705,8 @@ export function parseWorkflowYaml(text) {
 /**
  * One entry of the release-gate allowlist. `key` is the rule being waived:
  * `if` (a job- or step-level condition), `continue-on-error`, `needs` (a job
- * that needs a job which can skip) or `matrix.exclude`. `step` is the step's
+ * that needs a job which can skip), `matrix.exclude` or `uses` (a job that
+ * calls a reusable workflow, whose jobs this rule cannot read). `step` is the step's
  * `name`, or `#<index>` (0-based), and is absent for a job-level waiver.
  *
  * @typedef {{ workflow: string, job: string, step?: string, key: string, reason: string }} ReleaseGateAllowEntry
@@ -736,7 +737,7 @@ export const RELEASE_GATE_ALLOWLIST = [
   },
 ];
 
-const ALLOW_KEYS = new Set(["if", "continue-on-error", "needs", "matrix.exclude"]);
+const ALLOW_KEYS = new Set(["if", "continue-on-error", "needs", "matrix.exclude", "uses"]);
 const SKIP_HINT = "remove the condition or add an allowlist entry with a reason (RELEASE_GATE_ALLOWLIST in scripts/check-workflows.mjs)";
 
 /**
@@ -959,7 +960,13 @@ function skipViolations(workflow, jobs) {
       else if (matrix.has("exclude")) add(jobId, null, [], "matrix.exclude", "`matrix.exclude` removes legs from the matrix without a trace");
     }
     const steps = job.get("steps");
-    if (steps === undefined) continue;
+    if (job.has("uses")) {
+      add(jobId, null, [], "uses", "job-level `uses` calls a reusable workflow whose jobs and steps this rule cannot read, and they may skip or carry `continue-on-error`");
+    }
+    if (steps === undefined) {
+      if (!job.has("uses")) add(jobId, null, [], "unreadable", "the job has neither `steps` nor `uses`, so there is nothing to check; a job must define `steps`");
+      continue;
+    }
     if (!Array.isArray(steps)) {
       add(jobId, null, [], "unreadable", "`steps` is not a list, so the steps cannot be checked");
       continue;
