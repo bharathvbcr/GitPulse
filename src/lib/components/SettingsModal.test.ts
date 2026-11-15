@@ -146,7 +146,7 @@ describe("SettingsModal", () => {
     // able to push the categories or the footer buttons off a short window.
     expect(source).toContain("max-h-[calc(100vh-2rem)]");
     expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
-    expect(source).toContain("w-36 shrink-0 overflow-y-auto");
+    expect(source).toContain("w-52 shrink-0 overflow-y-auto");
     expect(source).toContain("shrink-0");
   });
 });
