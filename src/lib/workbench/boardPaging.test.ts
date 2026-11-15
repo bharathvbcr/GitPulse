@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, pagesLoaded, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "./boardPaging";
+import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, fillColumns, pagesLoaded, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "./boardPaging";
 import type { Page } from "./client";
 
 type Row = { id: string };
@@ -145,6 +145,14 @@ describe("readOn", () => {
   });
 });
 
+describe("reloadSize past a lower threshold", () => {
+  it("reads a column past its first page back at the larger size, and page one at the smaller", () => {
+    expect(reloadSize(30, 30, 200, 30)).toBe(30);
+    expect(reloadSize(31, 30, 200, 30)).toBe(200);
+    expect(pagesLoaded(450, reloadSize(450, 30, 200, 30)), "450 filled cards reload in 3 requests, not 15").toBe(3);
+  });
+});
+
 describe("reloadSize", () => {
   it("keeps the column page size while a reload reaches what is loaded, and takes the store page past it", () => {
     expect(reloadSize(0, 30, 200)).toBe(30);
@@ -190,5 +198,129 @@ describe("samePage", () => {
     const task = (severity: string) => ({ id: "t", revision: 1, severity });
     expect(samePage(page([task("")]), page([task("High")]))).toBe(false);
     expect(sameRecords([space(2)], [space(2)])).toBe(true);
+  });
+});
+
+describe("fillColumns", () => {
+  type Key = "a" | "b";
+  /** Two columns, each a store of its own, shown as the board would hold them after page one. */
+  async function board(sizes: Record<Key, number>, first = 30, size = 200) {
+    const stores = { a: store(rows(sizes.a).map((r) => ({ id: `a${r.id}` })), size), b: store(rows(sizes.b).map((r) => ({ id: `b${r.id}` })), size) };
+    const firstPage = async (key: Key) => {
+      const page = await store(rows(sizes[key]).map((r) => ({ id: `${key}${r.id}` })), first).read(undefined);
+      return page;
+    };
+    const columns: Record<Key, Page<Row>> = { a: await firstPage("a"), b: await firstPage("b") };
+    const order: Key[] = [];
+    return { stores, columns, order, read: (key: Key, cursor: string) => { order.push(key); return stores[key].read(cursor); } };
+  }
+
+  it("reads every column to its end without being asked, page by page", async () => {
+    const b = await board({ a: 450, b: 31 });
+    const outcome = await fillColumns<Key, Row>({
+      keys: ["a", "b"], budget: 2000, live: () => true,
+      current: (key) => b.columns[key], read: b.read,
+      apply: (key, page) => { b.columns[key] = page; return true; },
+    });
+    expect(outcome).toBe("complete");
+    expect(b.columns.a.items).toHaveLength(450);
+    expect(new Set(b.columns.a.items.map((r) => r.id)).size).toBe(450);
+    expect(b.columns.a.next_cursor).toBeNull();
+    expect(b.columns.b.items).toHaveLength(31);
+    expect(b.columns.a.shown).toBe(450);
+  });
+
+  it("takes a page from each column in turn, so one long column cannot take the whole budget", async () => {
+    const b = await board({ a: 5000, b: 5000 });
+    const outcome = await fillColumns<Key, Row>({
+      keys: ["a", "b"], budget: 1000, live: () => true,
+      current: (key) => b.columns[key], read: b.read,
+      apply: (key, page) => { b.columns[key] = page; return true; },
+    });
+    expect(outcome, "the cap is reported, never drawn as the end").toBe("budget");
+    expect(b.order.slice(0, 4)).toEqual(["a", "b", "a", "b"]);
+    expect(Math.abs(b.columns.a.items.length - b.columns.b.items.length)).toBeLessThanOrEqual(200);
+    expect(b.columns.a.next_cursor).not.toBeNull();
+  });
+
+  it("stops rather than fold a page into a column that was replaced while it was read", async () => {
+    const b = await board({ a: 300, b: 0 });
+    const moved = { ...b.columns.a, items: b.columns.a.items.slice(1), next_cursor: "elsewhere" };
+    const outcome = await fillColumns<Key, Row>({
+      keys: ["a", "b"], budget: 2000, live: () => true,
+      current: (key) => b.columns[key],
+      read: async (key, cursor) => { const page = await b.read(key, cursor); b.columns.a = moved; return page; },
+      apply: (key, page) => { b.columns[key] = page; return true; },
+    });
+    expect(outcome).toBe("stopped");
+    expect(b.columns.a, "the reload's column stands; the stale page is dropped").toBe(moved);
+  });
+
+  it("asks for nothing once the board moved on, and stops when the reader takes over", async () => {
+    const b = await board({ a: 300, b: 300 });
+    let live = false;
+    const options = {
+      keys: ["a", "b"] as const, budget: 2000, live: () => live,
+      current: (key: Key) => b.columns[key], read: b.read,
+      apply: (key: Key, page: Page<Row>) => { b.columns[key] = page; return false; },
+    };
+    expect(await fillColumns<Key, Row>(options)).toBe("stopped");
+    expect(b.order).toEqual([]);
+    live = true;
+    expect(await fillColumns<Key, Row>(options)).toBe("stopped");
+    expect(b.order).toEqual(["a"]);
+  });
+
+  it("drops a page that lands after the board moved on, instead of folding it in", async () => {
+    const b = await board({ a: 300, b: 0 });
+    let live = true;
+    const before = b.columns.a;
+    const outcome = await fillColumns<Key, Row>({
+      keys: ["a", "b"], budget: 2000, live: () => live,
+      current: (key) => b.columns[key],
+      read: async (key, cursor) => { const page = await b.read(key, cursor); live = false; return page; },
+      apply: (key, page) => { b.columns[key] = page; return true; },
+    });
+    expect(outcome).toBe("stopped");
+    expect(b.columns.a, "nothing read for a board that is gone is shown").toBe(before);
+  });
+
+  it("shows a card a page repeats once, at its first place", async () => {
+    let column: Page<Row> = { items: [{ id: "x1" }, { id: "x2" }], total: 4, shown: 2, has_more: true, next_cursor: "x2" };
+    const outcome = await fillColumns<"a", Row>({
+      keys: ["a"], budget: 2000, live: () => true,
+      current: () => column,
+      read: async () => ({ items: [{ id: "x2" }, { id: "x3" }, { id: "x4" }], total: 4, shown: 3, has_more: false, next_cursor: null }),
+      apply: (_key, page) => { column = page; return true; },
+    });
+    expect(outcome).toBe("complete");
+    expect(column.items.map((row) => row.id)).toEqual(["x1", "x2", "x3", "x4"]);
+    expect(column.shown).toBe(4);
+  });
+
+  it("does not spin on a store that hands its cursor back, and says the column did not end", async () => {
+    const b = await board({ a: 300, b: 0 });
+    let reads = 0;
+    const outcome = await fillColumns<Key, Row>({
+      keys: ["a", "b"], budget: 2000, live: () => true,
+      current: (key) => b.columns[key],
+      read: async (_key, cursor) => { reads++; return { items: [{ id: "x" }], total: 300, shown: 1, has_more: true, next_cursor: cursor }; },
+      apply: (key, page) => { b.columns[key] = page; return true; },
+    });
+    expect(outcome).toBe("stopped");
+    expect(reads).toBe(1);
+  });
+
+  it("is bounded in requests however the store answers", async () => {
+    let n = 0;
+    let column: Page<Row> = { items: [], total: 1e9, shown: 0, has_more: true, next_cursor: "c0" };
+    const outcome = await fillColumns<"a", Row>({
+      keys: ["a"], budget: Number.POSITIVE_INFINITY, live: () => true,
+      current: () => column,
+      read: async () => { n++; return { items: [], total: 1e9, shown: 0, has_more: true, next_cursor: `c${n}` }; },
+      apply: (_key, page) => { column = page; return true; },
+    });
+    expect(outcome).toBe("stopped");
+    expect(n).toBe(MAX_COLUMN_PAGES);
   });
 });

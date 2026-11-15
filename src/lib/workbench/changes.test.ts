@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createWorkbenchChanges, ECHO_WINDOW_MS, type WorkbenchChange } from "./changes";
+import { createWorkbenchChanges, type WorkbenchChange } from "./changes";
 import { sameAutomaticUpdate } from "./client";
 
 /** A host that emits on demand and counts listens and unlistens. */
@@ -7,9 +7,7 @@ function host(options: { fail?: string; slow?: boolean } = {}) {
   let handler: ((event: { payload: unknown }) => void) | null = null;
   let release: (() => void) | null = null;
   const log = { listens: 0, unlistens: 0 };
-  let clock = 1_000;
   const hub = createWorkbenchChanges({
-    now: () => clock,
     listen: (_event, next) => {
       log.listens++;
       if (options.fail) return Promise.reject(new Error(options.fail));
@@ -21,7 +19,6 @@ function host(options: { fail?: string; slow?: boolean } = {}) {
   return {
     hub, log,
     emit: (payload: unknown) => handler?.({ payload }),
-    advance: (ms: number) => { clock += ms; },
     release: () => release?.(),
     listening: () => handler !== null,
   };
@@ -54,26 +51,28 @@ describe("workbench change hub", () => {
     expect(s.changes.map((c) => c.sequence)).toEqual([5, 4, 6]);
   });
 
-  it("drops the external echo of an in-process write, once", async () => {
+  /**
+   * The watcher's poll after an in-process write may hold only that write's
+   * echo, or the echo and an agent's write that landed in the same tick: one
+   * event says both. Dropping it as an echo lost the agent's task until the
+   * next commit or a click into the window, so every external event reaches
+   * the surfaces, whose live loaders space their reads.
+   */
+  it("delivers an external change that follows an in-process write, since it may hold another process's write", async () => {
     const h = host(); const s = surface();
     h.hub.subscribe(s.subscriber); await settle();
     h.emit({ sequence: 9 });
-    h.advance(1_000);
     h.emit({ sequence: null, source: "external" });
-    expect(s.changes).toHaveLength(1);
-    // The watcher coalesces a burst into one echo, so the next external event is a real one.
-    h.advance(100);
+    expect(s.changes).toEqual([{ sequence: 9, source: "local" }, { sequence: null, source: "external" }]);
     h.emit({ sequence: null, source: "external" });
-    expect(s.changes).toHaveLength(2);
-    expect(s.changes[1]).toEqual({ sequence: null, source: "external" });
+    expect(s.changes).toHaveLength(3);
   });
 
-  it("delivers an external change with no local write before it, or long after one", async () => {
+  it("delivers an external change with no local write before it, or after one", async () => {
     const h = host(); const s = surface();
     h.hub.subscribe(s.subscriber); await settle();
     h.emit({ sequence: null, source: "external" });
     h.emit({ sequence: 1 });
-    h.advance(ECHO_WINDOW_MS + 1);
     h.emit({ sequence: null, source: "external" });
     expect(s.changes.map((c) => c.source)).toEqual(["external", "local", "external"]);
   });

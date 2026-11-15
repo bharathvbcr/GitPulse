@@ -24,6 +24,12 @@
 //!      `GITPULSE_TERMINAL_SESSION` set) if the binary disappears, while exiting
 //!      `0` outside GitPulse so moving `GitPulse.app` to Trash never bricks
 //!      standalone `agy` sessions.
+//! 4. No `PreToolUse` hook is registered. Antigravity IDE 2.32.1 turned every
+//!    answer from one that was not `"decision":"allow"` — `{}` included — into
+//!    "tool call denied by pre-tool hook", so the collision guard and command
+//!    gate blocked every edit and command. `"allow"` would override the user's
+//!    own approval settings, so Antigravity runs ungated; GitPulse still records
+//!    its edits through `PostToolUse`.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -449,12 +455,18 @@ mod tests {
         let hooks_json: Value =
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("hooks.json")).unwrap())
                 .unwrap();
-        let pre_cmd = hooks_json["gitpulse"]["PreToolUse"][0]["hooks"][0]["command"]
+        // No pre-tool gate: Antigravity IDE 2.32.1 denied every call such a
+        // hook answered without `"decision":"allow"`, `{}` included.
+        assert!(
+            hooks_json["gitpulse"].get("PreToolUse").is_none(),
+            "Antigravity must get no PreToolUse hook: {hooks_json}"
+        );
+        let brief_cmd = hooks_json["gitpulse"]["SessionStart"][0]["command"]
             .as_str()
             .unwrap();
         assert!(
-            pre_cmd.contains("bin/gitpulse-hook' --host=agy collision-guard"),
-            "unexpected hook command: {pre_cmd}"
+            brief_cmd.contains("bin/gitpulse-hook' --host=agy session-brief"),
+            "unexpected hook command: {brief_cmd}"
         );
 
         // If `agy` is installed on the host, run `agy plugin validate --strict --json`.

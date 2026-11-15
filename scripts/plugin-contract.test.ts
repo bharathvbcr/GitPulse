@@ -1052,32 +1052,30 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
   );
   const notifyEvents = new Set([...bridgeTable.matchAll(/name: "([a-z_]+)"/g)].map((m) => m[1]));
 
-  const incomingFn = /fn incoming_edit\([\s\S]*?\n\}\n/.exec(hookSource)?.[0] ?? "";
-  const armHeaders = [...incomingFn.matchAll(/^\s{8}("[^"]+"(?:\s*\|\s*"[^"]+")*)\s*=>/gm)].map(
-    (m) => m[1],
-  );
-  const agyEditTools = armHeaders
-    .flatMap((arm) => [...arm.matchAll(/"([a-z][a-z_]*)"/g)].map((m) => m[1]))
-    .sort();
-
   const HANDLER_KEYS = ["command", "env", "timeout", "type"];
   const GROUP_KEYS = ["hooks", "matcher"];
 
   function validateAgyHooks(candidate: Record<string, Record<string, AgyEntry[]>>) {
     expect(Object.keys(candidate)).toEqual(["gitpulse"]);
+    // No PreToolUse: Antigravity IDE 2.32.1 denied every call a pre-tool hook
+    // answered without `"decision":"allow"` (`{}` included), so the collision
+    // guard and command gate blocked every edit and command. Answering `allow`
+    // would override the user's own approval settings.
+    expect(
+      Object.keys(candidate.gitpulse),
+      "Antigravity must not get a PreToolUse hook",
+    ).not.toContain("PreToolUse");
     expect(Object.keys(candidate.gitpulse).sort()).toEqual([
       "PostInvocation",
       "PostToolUse",
       "PreInvocation",
-      "PreToolUse",
       "SessionStart",
       "Stop",
     ]);
     expect(implemented.size).toBeGreaterThan(0);
     expect(notifyEvents.size).toBeGreaterThan(0);
-    expect(agyEditTools.length).toBeGreaterThan(0);
 
-    const groupedEvents = new Set(["PreToolUse", "PostToolUse"]);
+    const groupedEvents = new Set(["PostToolUse"]);
     const routes: Array<string> = [];
 
     for (const [event, entries] of Object.entries(candidate.gitpulse)) {
@@ -1089,12 +1087,7 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
           );
           expect(Array.isArray(item.hooks), `${event} must use grouped hooks wrapper`).toBe(true);
           expect(typeof item.matcher, `${event} group must declare a matcher`).toBe("string");
-          const matcher = String(item.matcher);
-          if (event === "PreToolUse") {
-            expect(matcher.startsWith("^") && matcher.endsWith("$"), matcher).toBe(true);
-          } else {
-            expect(matcher).toBe("*");
-          }
+          expect(String(item.matcher)).toBe("*");
         } else {
           expect(item.hooks, `${event} is a flat lifecycle event in agy`).toBeUndefined();
           expect(item.matcher, `${event} ignores matchers in agy`).toBeUndefined();
@@ -1158,18 +1151,7 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
       }
     }
 
-    const editMatcher = String(candidate.gitpulse.PreToolUse[0]?.matcher ?? "");
-    const editGroupMatch = /^\^\(([a-z_|]+)\)\$$/.exec(editMatcher);
-    expect(editGroupMatch, `invalid edit matcher ${editMatcher}`).toBeTruthy();
-    const declaredEditTools = editGroupMatch![1].split("|");
-    expect(new Set(declaredEditTools).size, "duplicate edit tool in matcher").toBe(
-      declaredEditTools.length,
-    );
-    expect([...declaredEditTools].sort()).toEqual(agyEditTools);
-
     expect(routes).toEqual([
-      `PreToolUse|${editMatcher}|gitpulse-hook collision-guard`,
-      "PreToolUse|^run_command$|gitpulse-hook command-gate",
       "PostToolUse|*|gitpulse-hook notify tool_finished",
       "SessionStart||gitpulse-hook session-brief",
       "SessionStart||gitpulse-hook peer-inbox",
@@ -1219,14 +1201,15 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
   it("rejects millisecond, zero, negative, fractional, missing, or below-budget timeouts, invalid matchers, and uninterpolated env vars", () => {
     // Boundary acceptance: 60s (the synchronous ceiling) is valid.
     const atCeiling = structuredClone(hooks);
-    atCeiling.gitpulse.PreToolUse[0].hooks![0].timeout = 60;
+    atCeiling.gitpulse.SessionStart[0].timeout = 60;
     expect(() => validateAgyHooks(atCeiling)).not.toThrow();
 
     // Invalid timeouts: missing, string, 0, negative, float, >60s, millisecond values, and below internal budget.
-    for (const badTimeout of [undefined, "10", 0, -5, 5.5, 61, 5000, 10000, 9]) {
+    const briefBudget = minHostTimeoutSeconds("session-brief", "");
+    for (const badTimeout of [undefined, "10", 0, -5, 5.5, 61, 5000, 10000, briefBudget - 1]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.PreToolUse[0].hooks![0].timeout = badTimeout;
-      expect(() => validateAgyHooks(copy), `collision-guard timeout=${String(badTimeout)}`).toThrow();
+      copy.gitpulse.SessionStart[0].timeout = badTimeout;
+      expect(() => validateAgyHooks(copy), `session-brief timeout=${String(badTimeout)}`).toThrow();
     }
     const belowPeerBudget = structuredClone(hooks);
     belowPeerBudget.gitpulse.PreInvocation[0].timeout = 3;
@@ -1256,11 +1239,11 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
 
     // Claude worktree launcher or uninterpolated `$` variable in `command`.
     for (const badCommand of [
-      `${WORKTREE_LAUNCHER_PREFIX}gitpulse-hook collision-guard`,
-      '"$PLUGIN_ROOT/gitpulse-hook" collision-guard',
+      `${WORKTREE_LAUNCHER_PREFIX}gitpulse-hook session-brief`,
+      '"$PLUGIN_ROOT/gitpulse-hook" session-brief',
     ]) {
       const copy = structuredClone(hooks);
-      copy.gitpulse.PreToolUse[0].hooks![0].command = badCommand;
+      copy.gitpulse.SessionStart[0].command = badCommand;
       expect(() => validateAgyHooks(copy), badCommand).toThrow();
     }
 
@@ -1274,10 +1257,24 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     extraOnGroup.gitpulse.PostToolUse[0].timeout = 5;
     expect(() => validateAgyHooks(extraOnGroup), "group wrapper extra timeout").toThrow();
 
-    // Deleting a safety gate (`command-gate`), startup brief (`session-brief`), or retargeting `Stop`.
-    const deletedCommandGate = structuredClone(hooks);
-    deletedCommandGate.gitpulse.PreToolUse.splice(1, 1);
-    expect(() => validateAgyHooks(deletedCommandGate), "deleted command-gate").toThrow();
+    // Re-adding a pre-tool gate, deleting the startup brief (`session-brief`), or retargeting `Stop`.
+    for (const gate of ["collision-guard", "command-gate"]) {
+      const regated = structuredClone(hooks);
+      regated.gitpulse.PreToolUse = [
+        {
+          matcher: gate === "command-gate" ? "^run_command$" : "^(edit_file|write_file)$",
+          hooks: [
+            {
+              type: "command",
+              command: `gitpulse-hook ${gate}`,
+              timeout: 10,
+              env: { GITPULSE_HOST: "antigravity" },
+            },
+          ],
+        },
+      ];
+      expect(() => validateAgyHooks(regated), `re-added ${gate}`).toThrow();
+    }
 
     const deletedSessionBrief = structuredClone(hooks);
     deletedSessionBrief.gitpulse.SessionStart.splice(0, 1);
@@ -1286,10 +1283,6 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
     const retargetedStop = structuredClone(hooks);
     retargetedStop.gitpulse.Stop[0].command = "gitpulse-hook peer-inbox";
     expect(() => validateAgyHooks(retargetedStop), "retargeted Stop to peer-inbox").toThrow();
-
-    const driftedEditMatcher = structuredClone(hooks);
-    driftedEditMatcher.gitpulse.PreToolUse[0].matcher = "^(write_file|edit_file)$";
-    expect(() => validateAgyHooks(driftedEditMatcher), "dropped edit tools from matcher").toThrow();
 
     // Uninterpolated `$PLUGIN_ROOT` or missing `GITPULSE_HOST` in `env`.
     const uninterpolatedEnv = structuredClone(hooks);
@@ -1309,10 +1302,6 @@ describe("Antigravity plugin (plugins/gitpulse-agy)", () => {
       copy.gitpulse.PostToolUse[0].matcher = badPostMatcher;
       expect(() => validateAgyHooks(copy), `PostToolUse matcher=${String(badPostMatcher)}`).toThrow();
     }
-    const unanchoredPre = structuredClone(hooks);
-    unanchoredPre.gitpulse.PreToolUse[1].matcher = "run_command";
-    expect(() => validateAgyHooks(unanchoredPre)).toThrow();
-
     const flatWithMatcher = structuredClone(hooks);
     flatWithMatcher.gitpulse.Stop[0].matcher = "*";
     expect(() => validateAgyHooks(flatWithMatcher)).toThrow();

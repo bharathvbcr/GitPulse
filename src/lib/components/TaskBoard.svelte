@@ -17,8 +17,8 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
-  import { MAX_COLUMN_PAGES, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
-  import { createLiveLoader } from "../workbench/liveLoader";
+  import { MAX_COLUMN_PAGES, fillColumns, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
+  import { createLiveLoader, createLiveReturn, liveOnScreen } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, organizeTasks, putTask, registerRepository, restoreDeletedTask, suggestTasks, WorkbenchError,
@@ -220,6 +220,10 @@
   let candidates = $state.raw<CandidateSet | null>(null);
   /** What a Load all is walking — the search's candidates or one column — and the flag Stop sets for it to check between pages. */
   let loadingAll = $state<"search" | TaskStatus | null>(null); let stopLoadingAll = false;
+  /** The board is reading the rest of its tasks on its own (`fillBoard`); each fill takes a ticket so only the newest clears it. */
+  let filling = $state(false); let fillTicket = 0;
+  /** The newest fill, which the live loader waits for: a change mid-fill is read after it, not by killing it. */
+  let fillRun: Promise<void> = Promise.resolve();
   const boardKey = $derived(JSON.stringify([scope, plan.key]));
   /**
    * A new search on the same scope while its candidates load, or a cleared
@@ -681,7 +685,8 @@
     if (!candidates || loadedKey !== boardKey) return null;
     return describeSearch({ matched: visibleCount, set: candidates, word: plan.word, relaxed: ranking?.relaxed ?? false, ranked: order === "relevance" });
   });
-  const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** The search's own Load more and Load all: offered where the automatic read (`fillBoard`) stopped short, not while it runs. */
+  const moreCandidates = $derived(!filling && searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
   /** What hidden repositories keep off this board, counted over the loaded tasks; null when nothing is hidden here. */
   const hiddenRepositoryReport = $derived.by(() => {
     if (!hidingRepositories || !initialized || !candidates || loadedKey !== boardKey) return null;
@@ -766,6 +771,7 @@
         if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = (pages.in_progress?.items ?? []).filter((card) => !hiddenHere(card)).length;
         keepSelected(pages);
         settled(quiet);
+        void fillBoard(generation, key, target, current);
         return true;
       }
       // Columns are re-read as far as they were paged in (`boardPaging.ts`),
@@ -776,7 +782,9 @@
       const [pages, archive] = await Promise.all([
         Promise.all(STATUSES.map(async (status) => {
           // A column read past 600 cards (Load all) is read back at the store's page size, not cut to 600.
-          const loaded = kept ? columns[status]?.items.length ?? 0 : 0, size = reloadSize(loaded, TASK_PAGE_SIZE, CANDIDATE_PAGE);
+          // Past its first page a column was read on by the fill 200 at a time, and is read back that way:
+          // 450 cards are 3 requests a change, not 15.
+          const loaded = kept ? columns[status]?.items.length ?? 0 : 0, size = reloadSize(loaded, TASK_PAGE_SIZE, CANDIDATE_PAGE, TASK_PAGE_SIZE);
           return [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, size, BOARD), loaded, size)] as const;
         })),
         archived,
@@ -788,6 +796,7 @@
       keepSelected(read);
       settled(quiet);
       void loadCardReads(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
+      void fillBoard(generation, key, target, current);
       return true;
     } catch (cause) {
       // A background read that failed says so, and the next one that
@@ -799,6 +808,84 @@
   }
   /** A read landed: a failure only an earlier background read reported is over. */
   function settled(quiet: boolean) { if (quiet && refreshError) { error = ""; refreshError = false; } }
+  /**
+   * The rest of the board, read on its own after each read that landed: every
+   * column (or a search's candidates) to its end, `CANDIDATE_PAGE` tasks a
+   * request, one request at a time and drawn as each lands, until the board
+   * holds `MAX_CANDIDATES` cards. Columns used to stop at their first 30 until
+   * someone pressed Load more.
+   *
+   * It shows no loading state and leaves every control enabled. It gives way
+   * at once to anything newer: a read that replaced the board (the revision
+   * moved), and the reader starting a move or a Load more, whose answer it
+   * would otherwise race. Giving way to the reader asks the live loader for a
+   * quiet re-read, which fills again from the column as it then stands; a
+   * change that adds tasks past a full column does the same, so the board
+   * never settles short of its end while it is under the cap.
+   */
+  function fillBoard(generation: number, key: string, target: Scope, current: SearchPlan): Promise<void> {
+    fillRun = fillRest(generation, key, target, current);
+    return fillRun;
+  }
+  async function fillRest(generation: number, key: string, target: Scope, current: SearchPlan) {
+    const touched = interactions;
+    const stale = () => generation !== revision || disposed || key !== boardKey;
+    const live = () => !stale() && !moving && touched === interactions;
+    const unread = current.mode === "search" ? candidates !== null && canLoadMore(candidates) : STATUSES.some((status) => columns[status]?.next_cursor);
+    // A fill that cannot start yet (a move or Load more is under way) asks for
+    // the quiet re-read that starts it once the board is idle; a move's own
+    // reload, which runs while `moving` is still set, would otherwise leave a
+    // column short of its end.
+    if (unread && !stale() && !live()) background.schedule();
+    if (!unread || !live()) return;
+    // Taken only by a fill that runs: one that returned above must not keep an
+    // older fill's finally from clearing `filling`.
+    const ticket = ++fillTicket;
+    let grew = false;
+    filling = true;
+    try {
+      if (current.mode === "search") {
+        let shown = candidates;
+        if (!shown) return;
+        const read: CandidateRead = (query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD);
+        await readAllCandidates(shown, current.word, read, (next) => {
+          // Only over the set it read from: a reload or a Load more that replaced it wins.
+          if (!live() || candidates !== shown) return false;
+          candidates = shown = next; columns = bucketByStatus(next.cards);
+          return true;
+        });
+        if (live() && candidates === shown && shown && candidatesComplete(shown)) {
+          if (JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = (columns.in_progress?.items ?? []).filter((card) => !hiddenHere(card)).length;
+          settled(true);
+        }
+        if (!stale() && candidates && canLoadMore(candidates) && !live()) background.schedule();
+        return;
+      }
+      const outcome = await fillColumns<TaskStatus, TaskCard>({
+        keys: STATUSES,
+        current: (status) => columns[status],
+        read: (status, cursor) => listTasks(target, status, "", cursor, CANDIDATE_PAGE, BOARD),
+        apply: (status, page) => { if (!live()) return false; columns = { ...columns, [status]: page }; grew = true; return true; },
+        live,
+        budget: MAX_CANDIDATES,
+      });
+      if (stale()) return;
+      if (outcome === "stopped" && !live()) { background.schedule(); return; }
+      inProgressCount = columns.in_progress?.total ?? 0;
+      // A fill that read on cleanly ends what an earlier failed one said.
+      settled(true);
+    } catch (cause) {
+      // The board's own read, never the reader's: the next one that lands
+      // clears it (`settled`), and an error the reader caused is left alone.
+      if (!stale() && !(error && !refreshError)) { error = failure("load", "all tasks", cause); refreshError = true; }
+    } finally {
+      if (ticket === fillTicket) filling = false;
+      // The cards it added need their verdicts and subtask counts, whether or
+      // not it read to the end: a card shown without them must not look like
+      // one nobody checked. The read before the fill asked for its own.
+      if (grew && !stale()) void loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
+    }
+  }
   /** Drops from the selection what the read no longer holds; an unchanged selection keeps its identity. */
   function keepSelected(pages: Partial<Record<TaskStatus, Page<TaskCard>>>) {
     const kept = [...selected].filter((id) => loadedHas(id, pages));
@@ -880,15 +967,19 @@
    * A read that had to give way to the reader is asked again afterwards.
    */
   const background = createLiveLoader({
-    canRun: () => initialized && active && !disposed && !readBackgroundDocument(),
+    canRun: () => initialized && active && !disposed && liveOnScreen(),
     read: async () => {
-      // The agents on the cards follow the same spaced, foreground-only
-      // cadence; on every change they cost a read of runs and one per live run.
+      // The agents on the cards follow the same spaced cadence, on screen
+      // focused or not; on every change they cost a read of runs and one per
+      // live run (workbench reads, no git). Their own timer still stops on blur.
       void boardAgents.refresh();
       if (loading || moving) { background.schedule(); return; }
       membershipToken++;
       try { await catalog(); } catch (cause) { if (!disposed) catalogError = failure("refresh", "repositories and workspaces", cause); }
       if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
+      // The fill that read started runs inside this read, so a change that
+      // lands meanwhile is read once after it rather than restarting it.
+      await fillRun;
       await loadUnread();
     },
     onError: (cause) => { if (!disposed) liveNotice = `${failure("keep", "live updates running", cause)} Use Refresh.`; },
@@ -961,16 +1052,21 @@
     const changed = () => { scheduleRefresh(); };
     listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Couldn't watch for live updates. ${message} Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
+    const returned = createLiveReturn();
     const onForeground = () => {
       boardAgents.wake();
       // A checkout is moved in a file manager, not here; coming back to the
       // window is when that can have happened.
       if (!readBackgroundDocument()) checkoutToken++;
-      if (readBackgroundDocument()) {
+      // Only a hidden window pauses the board: one on screen beside another
+      // app is where an agent's new task is meant to show up (`liveOnScreen`).
+      const visible = liveOnScreen(), back = returned(visible);
+      if (!visible) {
         background.reset();
         return;
       }
-      scheduleRefresh();
+      // A blur while still on screen re-reads nothing: changes keep arriving as events.
+      if (back) scheduleRefresh();
     };
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
@@ -1487,14 +1583,15 @@
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "the column", cause); return false; }
     finally { if (generation === revision && !disposed) loading = false; }
   }
-  async function pageColumn(status: TaskStatus, cursor?: string) {
+  async function pageColumn(status: TaskStatus, cursor: string) {
     if (searching || loading || moving || loadedKey !== boardKey) return;
     const generation = revision, key = boardKey;
     interactions++; loading = true; error = ""; refreshError = false;
     try {
-      const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
+      // The fill's page size: past the board's cap this is how the rest of a column is reached.
+      const result = await listTasks(scope, status, "", cursor, CANDIDATE_PAGE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
-      const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
+      const items = [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()];
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
       loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
@@ -2515,19 +2612,23 @@
        past a column's first page could not be reached from it at all, and the
        board's said "Next" for what appends rather than turns a page. -->
   {@const pageOf = columns[status]}
-  {#if pageOf && (pageOf.next_cursor || pageOf.items.length > TASK_PAGE_SIZE)}
+  <!-- The board reads every column to its end on its own (`fillBoard`), so
+       this shows only while a column still has tasks behind its cursor: while
+       that read is under way, and where it stopped at the board's cap of
+       MAX_CANDIDATES cards or on a failure, which Load more and Load all then
+       continue. A count short of the total is never drawn as the whole column. -->
+  {#if pageOf?.next_cursor}
     <div class="paging" data-task-paging={status}>
       <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
+      {#if filling && !loading}<span class="paging-note" data-testid="task-column-filling">Loading the rest…</span>{:else}
       {#if boardSort === "priority" && !searching && pageOf.next_cursor}
         {@const note = priorityOrderNote(pageOf.items.length, pageOf.total)}
         {#if note}<p class="paging-note" data-testid="task-priority-partial">{note} Load all orders the rest.</p>{/if}
       {/if}
-      {#if pageOf.next_cursor}<button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => pageColumn(status, pageOf.next_cursor ?? undefined)} disabled={loading}>Load more</button>{/if}
-      {#if pageOf.next_cursor}
+      <button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => { if (pageOf.next_cursor) void pageColumn(status, pageOf.next_cursor); }} disabled={loading}>Load more</button>
         {#if loadingAll === status}<button type="button" class="gp-btn" aria-label={`Stop loading ${STATUS_LABELS[status]} tasks`} onclick={() => { stopLoadingAll = true; }}>Stop</button>
-        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards; show only the first page of another column, or search, to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
+        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards, the most it reads on its own; Load more continues this column, or search to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
       {/if}
-      {#if pageOf.items.length > TASK_PAGE_SIZE}<button type="button" class="gp-btn" aria-label={`Show only the first ${STATUS_LABELS[status]} page`} onclick={() => pageColumn(status)} disabled={loading}>First page</button>{/if}
     </div>
   {/if}
 {/snippet}
@@ -2832,6 +2933,7 @@
                it is partial and offers the next page; it never reads as
                everything that matches. -->
           <span class="query-coverage" role="status" data-testid="task-query-coverage">{searchReport}</span>
+          {#if filling && candidates && !candidatesComplete(candidates)}<span class="paging-note" data-testid="task-search-filling">Loading the rest…</span>{/if}
         {/if}
         {#if moreCandidates}
           <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
@@ -2971,7 +3073,7 @@
       </div>
     {/if}
     {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button type="button" class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Try again</button></div>{/if}
-    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
+    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} onchange={() => void loadUnread()} />{/if}
     {#if showArchive}
       <TaskArchive
         {scope}
