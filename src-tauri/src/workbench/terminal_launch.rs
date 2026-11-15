@@ -312,8 +312,13 @@ fn check_task_readiness(
     task_id: &str,
     require_subtasks_done: bool,
 ) -> Result<(), WorkbenchError> {
-    let readiness =
-        state.with_store(|store| query(store, "items.readiness", &json!({"id": task_id}).to_string()))?;
+    let readiness = state.with_store(|store| {
+        query(
+            store,
+            "items.readiness",
+            &json!({"id": task_id}).to_string(),
+        )
+    })?;
     let item = &readiness["item"];
     if !item["ready"].as_bool().unwrap_or(false) {
         let blockers: Vec<String> = item["blocked_by"]
@@ -328,7 +333,10 @@ fn check_task_readiness(
         let detail = if blockers.is_empty() {
             "Task has open blocking dependencies.".to_string()
         } else {
-            format!("Task is blocked by open dependencies: {}.", blockers.join(", "))
+            format!(
+                "Task is blocked by open dependencies: {}.",
+                blockers.join(", ")
+            )
         };
         return Err(WorkbenchError::new("task_blocked", detail));
     }
@@ -2680,7 +2688,10 @@ mod tests {
         assert_eq!(refused.code, "task_blocked", "{}", refused.message);
         assert!(refused.message.contains("blocker"), "{}", refused.message);
         let wt_dir = root.join(".git").join("worktrees");
-        assert!(!wt_dir.exists(), "blocked launch must not provision a worktree");
+        assert!(
+            !wt_dir.exists(),
+            "blocked launch must not provision a worktree"
+        );
 
         // Completing the blocker unblocks `task`.
         state
@@ -2788,7 +2799,11 @@ mod tests {
         let no_lease = state
             .request("runs.prepare_terminal", &sub_gated.to_string())
             .unwrap_err();
-        assert_eq!(no_lease.code, "queue_lease_required", "{}", no_lease.message);
+        assert_eq!(
+            no_lease.code, "queue_lease_required",
+            "{}",
+            no_lease.message
+        );
 
         state
             .request(

@@ -22,12 +22,12 @@ pub(crate) mod claude_hook;
 pub mod conversation;
 #[doc(hidden)]
 pub mod external_changes;
+mod github_sync;
 mod in_flight;
 pub(crate) mod intake;
 mod lineage;
 pub(crate) mod managed_run;
 pub(crate) mod notifications;
-mod github_sync;
 mod organize;
 pub(crate) mod process_birth;
 mod queue_driver;

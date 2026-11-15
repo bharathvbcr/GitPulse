@@ -951,7 +951,10 @@ const OUTBOX_MARKER_SUFFIX: &str = " -->";
 /// HTML comment appended when creating an issue via the durable outbox so
 /// crash recovery can relocate an already-created issue by idempotency key.
 pub fn outbox_marker(idempotency_key: &str) -> String {
-    format!("{OUTBOX_MARKER_PREFIX}{}{OUTBOX_MARKER_SUFFIX}", idempotency_key.trim())
+    format!(
+        "{OUTBOX_MARKER_PREFIX}{}{OUTBOX_MARKER_SUFFIX}",
+        idempotency_key.trim()
+    )
 }
 
 /// Removes trailing outbox idempotency markers from an issue body so
@@ -1102,7 +1105,9 @@ fn validate_outbox_idempotency_key(key: &str) -> Result<(), String> {
     }
     if trimmed.contains("-->")
         || trimmed.contains('"')
-        || trimmed.chars().any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
     {
         return Err("Outbox idempotency key contains unsupported characters".into());
     }
@@ -2465,15 +2470,29 @@ pub fn issue_state_argv(remote: &GitHubRepoRef, number: u64, state: &str) -> Opt
     Some(args)
 }
 
+/// What an outbox create or update writes to an issue, borrowed from the
+/// outbox entry's payload. One value carries the four fields from the entry
+/// through the transport to `gh`, so they cannot be passed out of order.
+#[derive(Debug, Clone, Copy)]
+pub struct IssueContent<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub state: &'a str,
+    pub labels: &'a [String],
+}
+
 pub fn execute_outbox_create_issue(
     repo_path: &str,
     remote: &GitHubRepoRef,
-    title: &str,
-    body: &str,
-    state: &str,
-    labels: &[String],
+    content: IssueContent<'_>,
     idempotency_key: &str,
 ) -> GhMutationOutcome {
+    let IssueContent {
+        title,
+        body,
+        state,
+        labels,
+    } = content;
     if !matches!(state, "open" | "closed") {
         return GhMutationOutcome::DefinitiveFailure {
             message: format!("Issue state must be open or closed (got {state})"),
@@ -2561,12 +2580,15 @@ pub fn execute_outbox_update_issue(
     remote: &GitHubRepoRef,
     number: u64,
     fields: &[String],
-    title: &str,
-    body: &str,
-    state: &str,
-    labels: &[String],
+    content: IssueContent<'_>,
     current_remote: Option<&IssueDetail>,
 ) -> GhMutationOutcome {
+    let IssueContent {
+        title,
+        body,
+        state,
+        labels,
+    } = content;
     if number == 0 {
         return GhMutationOutcome::DefinitiveFailure {
             message: "Invalid issue number".into(),
@@ -2690,8 +2712,7 @@ pub fn execute_outbox_update_issue(
         if needs_state_change {
             if let Some(state_args) = issue_state_argv(remote, number, state) {
                 let refs: Vec<&str> = state_args.iter().skip(1).map(String::as_str).collect();
-                if let Err(err) =
-                    run_command_in("gh", &refs, Duration::from_secs(45), Some(&repo))
+                if let Err(err) = run_command_in("gh", &refs, Duration::from_secs(45), Some(&repo))
                 {
                     return classify_gh_mutation_error(&err);
                 }
@@ -5961,10 +5982,12 @@ mod non_ascii_tail_tests {
         let bad_state = execute_outbox_create_issue(
             "/nonexistent",
             &remote,
-            "Title",
-            "Body",
-            "bogus",
-            &[],
+            IssueContent {
+                title: "Title",
+                body: "Body",
+                state: "bogus",
+                labels: &[],
+            },
             "k1",
         );
         assert!(matches!(
@@ -5979,10 +6002,12 @@ mod non_ascii_tail_tests {
             &remote,
             12,
             &["labels".into()],
-            "Title",
-            "Body",
-            "open",
-            &["-evil".into()],
+            IssueContent {
+                title: "Title",
+                body: "Body",
+                state: "open",
+                labels: &["-evil".into()],
+            },
             None,
         );
         assert!(matches!(
@@ -6083,11 +6108,18 @@ mod non_ascii_tail_tests {
             repo.path().to_str().unwrap(),
             &remote,
             77,
-            &["title".into(), "body".into(), "state".into(), "labels".into()],
-            "Renamed",
-            "Updated body",
-            "closed",
-            &["ops".into()],
+            &[
+                "title".into(),
+                "body".into(),
+                "state".into(),
+                "labels".into(),
+            ],
+            IssueContent {
+                title: "Renamed",
+                body: "Updated body",
+                state: "closed",
+                labels: &["ops".into()],
+            },
             Some(&current),
         );
         match outcome {
@@ -6098,8 +6130,14 @@ mod non_ascii_tail_tests {
             other => panic!("expected Applied outcome, got {other:?}"),
         }
         let logged = std::fs::read_to_string(&log).unwrap();
-        assert!(logged.lines().any(|l| l.starts_with("issue list --state all --search")));
-        assert!(logged.lines().any(|l| l.contains("issue edit 77") && l.contains("--add-label ops") && l.contains("--remove-label bug")));
-        assert!(logged.lines().any(|l| l.starts_with("issue close 77 --repo acme/repo")));
+        assert!(logged
+            .lines()
+            .any(|l| l.starts_with("issue list --state all --search")));
+        assert!(logged.lines().any(|l| l.contains("issue edit 77")
+            && l.contains("--add-label ops")
+            && l.contains("--remove-label bug")));
+        assert!(logged
+            .lines()
+            .any(|l| l.starts_with("issue close 77 --repo acme/repo")));
     }
 }
