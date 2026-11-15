@@ -857,7 +857,14 @@ fn feed_loop(shared: &Arc<FeedShared>, opener: &TraceOpener, dir: &Path, boot_id
         match outcome {
             Ok(()) => state.problem = None,
             Err(why) => {
-                state.dropped_unwritten = state.dropped_unwritten.saturating_add(carried);
+                // The record is lost as surely as one the slot refused: it
+                // is counted the same way, with what it was carrying, so the
+                // next record that lands says the ring has a gap there.
+                state.dropped_unwritten = state
+                    .dropped_unwritten
+                    .saturating_add(carried)
+                    .saturating_add(1);
+                state.dropped_total = state.dropped_total.saturating_add(1);
                 state.problem = Some(format!("trace: {why}"));
             }
         }
@@ -923,7 +930,7 @@ pub struct PreviousBoot {
     pub records: Vec<TraceRecord>,
     /// Peaks over exactly those records.
     pub peaks: TracePeaks,
-    /// Records the sampler dropped while the trace write was blocked, summed
+    /// Records lost while the trace write was blocked or failing, summed
     /// over every record the ring still holds (not only the tail shown). Drops
     /// after the last record that reached the ring are not in it: nothing was
     /// left to carry the count.

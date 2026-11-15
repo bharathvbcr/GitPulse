@@ -454,6 +454,54 @@ fn a_failing_open_is_a_problem_and_does_not_hold_up_stop() {
     assert!(began.elapsed() < 5 * SECONDS, "stop waited for the reopen timer");
 }
 
+/// A write the disk refused loses its record as surely as a full slot does, so
+/// it is counted the same way: the next record that lands carries it, and
+/// `dropped()` includes it. A write that failed must not look like one that
+/// landed.
+#[test]
+fn a_write_that_failed_is_counted_as_a_lost_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    gate.release();
+    let opener = blocked_sink_tests::failing_writes(gate, 1);
+    let mut feed = TraceFeed::start(opener, dir.path().to_path_buf(), 7).unwrap();
+    assert!(feed.offer(rec(1)));
+    let deadline = Instant::now() + 30 * SECONDS;
+    while feed.problem().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(feed.problem().as_deref(), Some("trace: disk said no"));
+    assert!(feed.offer(rec(2)));
+    assert!(feed.stop(30 * SECONDS));
+    let held = read_ring(&path(&dir)).unwrap();
+    assert_eq!(held.len(), 1, "only the second record landed");
+    assert_eq!(held[0].wall_s, rec(2).wall_s);
+    assert_eq!(held[0].dropped_before, 1, "the failed write is in the gap");
+    assert_eq!(held[0].dropped_total, 1);
+    assert_eq!(feed.dropped(), 1);
+}
+
+/// A full slot and a failed write in the same gap add up.
+#[test]
+fn a_dropped_record_and_a_failed_write_in_one_gap_are_both_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    let opener = blocked_sink_tests::failing_writes(gate.clone(), 1);
+    let mut feed = TraceFeed::start(opener, dir.path().to_path_buf(), 7).unwrap();
+    assert!(feed.offer(rec(1)));
+    assert!(gate.wait_entered(30 * SECONDS));
+    assert!(feed.offer(rec(2)));
+    assert!(!feed.offer(rec(3)), "the slot is full: dropped");
+    gate.release();
+    assert!(feed.stop(30 * SECONDS));
+    let held = read_ring(&path(&dir)).unwrap();
+    assert_eq!(held.len(), 1, "record 1 failed, record 3 was dropped");
+    assert_eq!(held[0].wall_s, rec(2).wall_s);
+    assert_eq!(held[0].dropped_before, 2, "one dropped plus one failed");
+    assert_eq!(held[0].dropped_total, 2);
+    assert_eq!(feed.dropped(), 2);
+}
+
 /// The count the ring carries is summed over everything it holds when the
 /// previous boot is read, and a record an older build wrote (zeros there)
 /// reads as nothing dropped.

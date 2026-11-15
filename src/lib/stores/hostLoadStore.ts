@@ -347,7 +347,7 @@ export interface TraceRecord {
   thermal: Thermal | null;
   power: Power | null;
   segment_fraction: number | null;
-  /** Readings dropped while the trace write was blocked, since the previous record that landed. */
+  /** Readings lost while the trace write was blocked or failing, since the previous record that landed. */
   dropped_before: number;
   /** The same count since the trace feed started. */
   dropped_total: number;

@@ -509,7 +509,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         tick_problems.extend(trace_problem.clone());
         if let Some(at) = last_drop.filter(|at| at.elapsed() < DROP_NOTICE) {
             tick_problems.push(format!(
-                "trace: {drops_seen} reading(s) dropped while the trace write was blocked (last {} s ago); the ring has a gap",
+                "trace: {drops_seen} reading(s) dropped while the trace write was blocked or failing (last {} s ago); the ring has a gap",
                 at.elapsed().as_secs()
             ));
         }

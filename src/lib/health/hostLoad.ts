@@ -333,7 +333,7 @@ export function previousBootLines(previous: PreviousBoot): string[] {
   const gap =
     previous.dropped > 0
       ? [
-          `${previous.dropped} reading${previous.dropped === 1 ? " was" : "s were"} dropped while the trace write was blocked, so this history has gaps. Anything dropped after the last row below is not counted.`,
+          `${previous.dropped} reading${previous.dropped === 1 ? " was" : "s were"} dropped while the trace write was blocked or failing, so this history has gaps. Anything dropped after the last row below is not counted.`,
         ]
       : [];
   return [
