@@ -431,8 +431,8 @@ impl Thresholds {
                     candidate.disk = r;
                     // A value stored before the floors scaled has no `auto`:
                     // a person set it, so it stays theirs.
-                    candidate.disk_auto = value.get("auto").and_then(serde_json::Value::as_bool)
-                        == Some(true);
+                    candidate.disk_auto =
+                        value.get("auto").and_then(serde_json::Value::as_bool) == Some(true);
                 }),
             };
             if let Err(error) = parsed {
@@ -771,12 +771,21 @@ impl Thresholds {
             "free disk space",
             readings.free_gib().map(|v| low_tier(v, &this.disk)),
         );
+        // An unreadable disk is one failure, said once: by the level rule
+        // when it is on, by this one only when it is the only one that is.
+        let projection = match this.fill_projection(readings) {
+            Err(Gap::Failed)
+                if this.disk.mode != InputMode::Off && readings.free_gib().is_err() =>
+            {
+                Err(Gap::Silent)
+            }
+            other => other,
+        };
         take(
             Binding::DiskFilling,
             this.disk_guard.fill.mode,
             "the disk fill rate",
-            this.fill_projection(readings)
-                .map(|fill| fill.map_or(Tier::Clear, |fill| fill.tier)),
+            projection.map(|fill| fill.map_or(Tier::Clear, |fill| fill.tier)),
         );
         take(
             Binding::Thermal,
@@ -870,10 +879,7 @@ impl Thresholds {
                             .to_string(),
                     );
                 };
-                let (free, floor) = (
-                    fill.free_bytes as f64 / GIB,
-                    fill.floor_bytes as f64 / GIB,
-                );
+                let (free, floor) = (fill.free_bytes as f64 / GIB, fill.floor_bytes as f64 / GIB);
                 let rate = fill.rate_bytes_per_min as f64 / GIB;
                 let verdict = if fill.eta_min < horizon {
                     format!("inside the {horizon:.0} minute horizon")

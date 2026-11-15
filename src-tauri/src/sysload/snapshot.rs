@@ -1154,6 +1154,7 @@ mod tests {
         s.memguard_warn = true;
         s.memguard_pid = 68214;
         s.orphans = 1;
+        s.disk_fill_rate = Reading::Value(2_899_102_924);
         s.verdict = Reading::Value(PublishedVerdict {
             tier: Tier::Severe,
             binding: Some(Binding::Swap),
@@ -1195,6 +1196,152 @@ mod tests {
         // Unavailable stays unavailable, with its reason: never a zero.
         assert_eq!(back.codex, Reading::Unavailable(Why::Unreadable));
         assert_eq!(back.launched_write_rate, Reading::Unavailable(Why::NotYet));
+    }
+
+    const EVERY_BINDING: [Binding; 9] = [
+        Binding::MemoryPressure,
+        Binding::CompressorThrash,
+        Binding::CompressorSegments,
+        Binding::Swap,
+        Binding::LowDisk,
+        Binding::Thermal,
+        Binding::CpuLoad,
+        Binding::Battery,
+        Binding::DiskFilling,
+    ];
+
+    fn with_binding(binding: Option<Binding>) -> Snapshot {
+        let mut snap = full(clock(50));
+        snap.disk_fill_rate = Reading::Unavailable(Why::Unsupported);
+        snap.verdict = Reading::Value(PublishedVerdict {
+            tier: Tier::Elevated,
+            binding,
+            admit: true,
+            shed_background: true,
+            shed_reactive: false,
+        });
+        snap
+    }
+
+    /// What a build from before the disk fill rule does with the byte every
+    /// version reads: it refuses a code it does not know, and a refused code
+    /// makes the whole verdict unreadable (`ext_reading`), which the command
+    /// gate answers with "not load-checked" and never a refusal.
+    fn older_reader_binding(record: &[u8]) -> Option<Option<Binding>> {
+        const KNOWN_BEFORE: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let code = record[OFF_X_BINDING];
+        KNOWN_BEFORE
+            .contains(&code)
+            .then(|| Binding::of_code(code))?
+    }
+
+    /// An installed hook or MCP binary is older than this build. The byte it
+    /// reads must be one it knows for every binding, so a disk filling is read
+    /// as the low disk it is and refused for, not dropped as unreadable.
+    #[test]
+    fn every_binding_is_published_in_a_byte_an_older_reader_knows() {
+        for binding in EVERY_BINDING.into_iter().map(Some).chain([None]) {
+            let record = encode(&with_binding(binding), 10);
+            let seen = older_reader_binding(&record)
+                .unwrap_or_else(|| panic!("{binding:?} is published as an unknown byte"));
+            assert_eq!(seen, binding.map(Binding::wire), "{binding:?}");
+        }
+        let filling = encode(&with_binding(Some(Binding::DiskFilling)), 10);
+        assert_eq!(
+            filling[OFF_X_BINDING], 5,
+            "the byte every version reads is LowDisk"
+        );
+        assert_eq!(filling[OFF_X_BINDING_EXACT], 9);
+        // This build reads the exact one back.
+        let back = decode_as(&filling, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(
+            back.verdict.value().map(|v| v.binding),
+            Some(Some(Binding::DiskFilling))
+        );
+        // Codes are never reused: nine bindings, nine bytes.
+        let mut codes: Vec<u8> = EVERY_BINDING
+            .iter()
+            .map(|b| Binding::code_of(Some(*b)))
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    /// Everything an older reader reads is byte for byte what an older writer
+    /// wrote: a record that holds no new binding differs from the record of a
+    /// writer that predates the rule only in the spare bytes it left zero, and
+    /// the filling record differs from the LowDisk record only in the spare
+    /// bytes. Its bytes 0..692 are the same.
+    #[test]
+    fn the_new_bytes_live_only_in_the_spare_ones_an_older_reader_never_reads() {
+        for binding in [None, Some(Binding::Swap), Some(Binding::LowDisk)] {
+            let record = encode(&with_binding(binding), 10);
+            assert!(
+                record[OFF_X_BINDING_EXACT..OFF_X_CHECKSUM]
+                    .iter()
+                    .all(|b| *b == 0),
+                "{binding:?}: nothing is added for a binding every version knows"
+            );
+        }
+        let low = encode(&with_binding(Some(Binding::LowDisk)), 10);
+        let filling = encode(&with_binding(Some(Binding::DiskFilling)), 10);
+        assert_eq!(low[..OFF_X_BINDING_EXACT], filling[..OFF_X_BINDING_EXACT]);
+        assert_eq!(filling.len(), EXTENDED_LEN);
+        assert_eq!(get_u32(&filling, OFF_LENGTH) as usize, EXTENDED_LEN);
+        // The extension's checksum covers the spare bytes, and a reader that
+        // does not know them hashes them the same way: the record still reads.
+        assert!(decode_as(&filling, MIN_READ_VERSION, RECORD_LEN).is_ok());
+    }
+
+    /// The failure this design exists to avoid, on the code an older reader
+    /// runs: an unknown binding byte makes the verdict unreadable, not refused.
+    #[test]
+    fn an_unknown_binding_byte_reads_as_no_verdict_which_is_why_it_is_never_written() {
+        let mut record = encode(&with_binding(Some(Binding::DiskFilling)), 10);
+        // What a build that does not know code 9 would have read had it been
+        // written to the byte every version reads.
+        record[OFF_X_BINDING] = 200;
+        record[OFF_X_BINDING_EXACT] = 0;
+        let sum = ext_checksum(&record, 10);
+        put_u64(&mut record, OFF_X_CHECKSUM, sum);
+        let back = decode_as(&record, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert!(
+            matches!(back.verdict, Reading::Unavailable(Why::Failed)),
+            "{:?}",
+            back.verdict
+        );
+        // A binding this build does not know in the detail byte falls back to
+        // the byte every version reads.
+        let mut future = encode(&with_binding(Some(Binding::DiskFilling)), 10);
+        future[OFF_X_BINDING_EXACT] = 200;
+        let sum = ext_checksum(&future, 10);
+        put_u64(&mut future, OFF_X_CHECKSUM, sum);
+        let back = decode_as(&future, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(
+            back.verdict.value().map(|v| v.binding),
+            Some(Some(Binding::LowDisk))
+        );
+    }
+
+    #[test]
+    fn the_fill_rate_round_trips_with_its_reason_and_older_records_say_unsupported() {
+        for rate in [
+            Reading::Value(0),
+            Reading::Value(2_899_102_924),
+            Reading::Unavailable(Why::NotYet),
+            Reading::Unavailable(Why::Failed),
+            Reading::Unavailable(Why::Unsupported),
+        ] {
+            let mut snap = full(clock(50));
+            snap.disk_fill_rate = rate;
+            let back = decode_as(&encode(&snap, 10), MIN_READ_VERSION, RECORD_LEN).unwrap();
+            assert_eq!(back.disk_fill_rate, rate);
+        }
+        // A version-1 record has no extension: nothing published, not a zero.
+        let v1 = encode_v1(&full(clock(50)), 10);
+        let back = decode_as(&v1, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(back.disk_fill_rate, Reading::Unavailable(Why::Unsupported));
     }
 
     #[test]

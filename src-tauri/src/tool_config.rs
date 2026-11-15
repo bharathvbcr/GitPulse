@@ -605,10 +605,12 @@ impl HostLoadSettings {
     /// on. While the floors are automatic the numbers are not stored or read
     /// back (`Thresholds::disk_auto`), so showing them costs nothing.
     fn with_resolved_disk_floors(mut self) -> Self {
-        self.thresholds = self.thresholds.resolved(
-            crate::sysload::physical_memory()
-                .map_or(crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed), crate::sysload::Reading::Value),
-        );
+        self.thresholds = self
+            .thresholds
+            .resolved(crate::sysload::physical_memory().map_or(
+                crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed),
+                crate::sysload::Reading::Value,
+            ));
         self
     }
 
@@ -664,10 +666,7 @@ where
 }
 
 /// Writes only the guards that differ from their default.
-fn write_disk_guard<S>(
-    guard: &crate::sysload::DiskGuard,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn write_disk_guard<S>(guard: &crate::sysload::DiskGuard, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -1839,6 +1838,7 @@ mod tests {
         with_temp_config(|path| {
             let mut thresholds = Thresholds::default();
             thresholds.swap.mode = InputMode::Shed;
+            thresholds.disk_auto = false;
             thresholds.disk.severe_at = 5.0;
             set_host_load_settings(HostLoadSettings {
                 enabled: false,
@@ -1883,6 +1883,98 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert!(stored.get("host_load").is_none());
             assert!(stored.get("host_load_thresholds").is_some());
+        });
+    }
+
+    /// The disk guards (fill-rate horizon, coverage headroom) are stored as a
+    /// top-level `host_load_disk_guard` key of their own, because a build that
+    /// predates them rewrites `host_load_thresholds` from the keys it knows and
+    /// would drop these; and the automatic disk floors survive a round trip
+    /// through Settings that never touched them.
+    #[test]
+    fn the_disk_guards_have_their_own_key_and_automatic_floors_survive_a_settings_round_trip() {
+        use crate::sysload::{InputMode, Reading};
+        with_temp_config(|path| {
+            let mut settings = host_load_settings();
+            assert!(settings.thresholds.disk_auto);
+            // What Settings shows is what the governor decides on: resolved.
+            let shown = settings.thresholds.disk;
+            assert_eq!(
+                shown,
+                settings
+                    .thresholds
+                    .resolved(Reading::Value(
+                        crate::sysload::physical_memory().unwrap_or(0)
+                    ))
+                    .disk
+            );
+            // Load, change something else, save: the floors stay automatic and
+            // nothing is stored for them.
+            settings.thresholds.swap.mode = InputMode::Shed;
+            settings.thresholds.disk_guard.fill.elevated_within_min = 45.0;
+            settings.thresholds.disk_guard.coverage.headroom_gib = 80.0;
+            set_host_load_settings(settings).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored["host_load_thresholds"].get("disk").is_none());
+            assert_eq!(
+                stored["host_load_disk_guard"]["fill"]["elevated_within_min"],
+                45.0
+            );
+            assert_eq!(
+                stored["host_load_disk_guard"]["coverage"]["headroom_gib"],
+                80.0
+            );
+            assert!(
+                stored["host_load_thresholds"].get("disk_guard").is_none(),
+                "the guards never ride inside the key an older build rewrites"
+            );
+            let back = host_load_settings();
+            assert!(back.thresholds.disk_auto);
+            assert_eq!(back.thresholds.disk_guard.fill.elevated_within_min, 45.0);
+            assert_eq!(back.thresholds.disk_guard.coverage.headroom_gib, 80.0);
+            assert_eq!(back.thresholds.swap.mode, InputMode::Shed);
+
+            // A person's own floors are stored, and win over any memory size.
+            let mut explicit = back;
+            explicit.thresholds.disk_auto = false;
+            explicit.thresholds.disk.elevated_at = 20.0;
+            explicit.thresholds.disk.severe_at = 10.0;
+            set_host_load_settings(explicit).unwrap();
+            invalidate_cache();
+            let back = host_load_settings();
+            assert!(!back.thresholds.disk_auto);
+            assert_eq!(
+                (
+                    back.thresholds.disk.elevated_at,
+                    back.thresholds.disk.severe_at
+                ),
+                (20.0, 10.0)
+            );
+
+            // A value stored before the floors scaled has no `auto`: it stays
+            // the person's, whatever it equals.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_thresholds":{"disk":{"mode":"shed","elevated_at":25.0,"severe_at":12.0}}}"#,
+            );
+            let old = host_load_settings();
+            assert!(!old.thresholds.disk_auto);
+            assert_eq!(old.thresholds.disk.severe_at, 12.0);
+            assert_eq!(old.thresholds.disk.mode, InputMode::Shed);
+
+            // An unreadable guard keeps its default and costs nothing else.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_disk_guard":{"fill":"nope","coverage":{"mode":"shed","headroom_gib":-3}},"host_load_thresholds":{"swap":{"mode":"off","elevated_at":0.5,"severe_at":0.75}}}"#,
+            );
+            let lenient = host_load_settings();
+            assert_eq!(
+                lenient.thresholds.disk_guard,
+                crate::sysload::DiskGuard::default()
+            );
+            assert_eq!(lenient.thresholds.swap.mode, InputMode::Off);
         });
     }
 
@@ -2006,7 +2098,14 @@ mod tests {
                 path,
                 r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load_thresholds":[1,2]}"#,
             );
-            assert_eq!(host_load_settings().thresholds, defaults);
+            // Defaults, with the automatic disk floors shown for this machine.
+            assert_eq!(
+                host_load_settings().thresholds,
+                defaults.resolved(crate::sysload::physical_memory().map_or(
+                    crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed),
+                    crate::sysload::Reading::Value
+                ))
+            );
             assert_eq!(
                 load().map(|c| c.devmap.binary).unwrap_or_default(),
                 Some("/tmp/fake".to_owned())
@@ -2014,6 +2113,7 @@ mod tests {
 
             // Saving an invalid value is refused with the reason, writing nothing.
             let mut bad = HostLoadSettings::default();
+            bad.thresholds.disk_auto = false;
             bad.thresholds.disk.severe_at = 99.0;
             let error = set_host_load_settings(bad).unwrap_err();
             assert!(error.starts_with("disk:"), "{error}");

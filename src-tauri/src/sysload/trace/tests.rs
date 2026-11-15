@@ -23,6 +23,7 @@ fn rec(n: u64) -> TraceRecord {
         thermal: Some(Thermal::Fair),
         power: Some(Power::Ac),
         segment_fraction: Some(0.25),
+        disk_fill_rate: Some(n << 30),
         dropped_before: 0,
         dropped_total: 0,
     }
@@ -48,6 +49,7 @@ fn blank(n: u64) -> TraceRecord {
         thermal: None,
         power: None,
         segment_fraction: None,
+        disk_fill_rate: None,
         dropped_before: 0,
         dropped_total: 0,
     }
@@ -594,4 +596,69 @@ fn the_previous_boot_reports_the_drops_its_ring_recorded() {
         "no drops reads as zero"
     );
     assert_eq!(previous.records[2].dropped_total, 7);
+}
+
+/// 2026-11-15: the installed app's trace had nothing for the window in which
+/// 145 GiB vanished. The rate and the exact binding are in the record.
+#[test]
+fn the_fill_rate_and_a_disk_filling_binding_are_in_the_trace_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = TraceWriter::open_with_capacity(dir.path(), 7, 8).unwrap();
+    let filling = TraceRecord {
+        binding: Some(Binding::DiskFilling),
+        tier: Some(Tier::Elevated),
+        free_disk: Some(80 << 30),
+        disk_fill_rate: Some(2_899_102_924 & !((1 << 20) - 1)),
+        ..rec(1)
+    };
+    let not_measured = TraceRecord {
+        disk_fill_rate: None,
+        ..rec(2)
+    };
+    let not_falling = TraceRecord {
+        disk_fill_rate: Some(0),
+        ..rec(3)
+    };
+    for record in [&filling, &not_measured, &not_falling] {
+        writer.append(record).unwrap();
+    }
+    let held = read_ring(&path(&dir)).unwrap();
+    assert_eq!(held, [filling.clone(), not_measured, not_falling]);
+    assert_eq!(held[0].binding, Some(Binding::DiskFilling));
+    assert!(held[0].disk_fill_rate.is_some_and(|rate| rate > 2 << 30));
+    assert_eq!(
+        held[2].disk_fill_rate,
+        Some(0),
+        "a real zero is not 'not measured'"
+    );
+}
+
+/// An older build rejects a record whose binding byte it does not know, which
+/// would drop the very records that explain a disk filling; the byte it reads
+/// is LowDisk and the exact binding is beside it.
+#[test]
+fn an_older_build_still_validates_and_places_a_disk_filling_record() {
+    let record = TraceRecord {
+        binding: Some(Binding::DiskFilling),
+        ..rec(1)
+    };
+    let bytes = encode_record(1, &record);
+    assert_eq!(bytes[R_BINDING], 5, "LowDisk is what every build reads");
+    assert_eq!(bytes[R_BINDING_EXACT], 9);
+    assert!(Binding::of_code(bytes[R_BINDING]).is_some());
+    // The checksum an older build checks covers the new bytes (0..120).
+    assert_eq!(get_u64(&bytes, R_CHECKSUM), checksum(&bytes[..R_CHECKSUM]));
+    // Bindings every build knows carry no extra byte, so those records are
+    // byte for byte what an older writer wrote.
+    let swap = encode_record(1, &rec(1));
+    assert_eq!(swap[R_BINDING_EXACT], 0);
+    // A binding this build does not know in the extra byte falls back.
+    let mut future = bytes;
+    future[R_BINDING_EXACT] = 200;
+    let sum = checksum(&future[..R_CHECKSUM]);
+    put_u64(&mut future, R_CHECKSUM, sum);
+    assert_eq!(
+        decode_record(&future).unwrap().1.binding,
+        Some(Binding::LowDisk)
+    );
 }
