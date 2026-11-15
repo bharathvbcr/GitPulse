@@ -193,26 +193,15 @@ fn value<T: Copy>(reading: Reading<T>) -> Option<T> {
 impl TraceRecord {
     /// The record for one tick: the snapshot just published and the verdict
     /// the governor holds after counting it.
-    pub fn of(
-        snapshot: &Snapshot,
-        tier: Tier,
-        binding: Option<Binding>,
-        admit: bool,
-    ) -> Self {
+    pub fn of(snapshot: &Snapshot, tier: Tier, binding: Option<Binding>, admit: bool) -> Self {
         let sessions = |launched: Option<u32>, observed: Option<u32>| match (launched, observed) {
             (Some(a), Some(b)) => Some(a.saturating_add(b)),
             _ => None,
         };
         let claude = value(snapshot.claude);
         let codex = value(snapshot.codex);
-        let launched = sessions(
-            claude.map(|c| c.launched),
-            codex.map(|c| c.launched),
-        );
-        let observed = sessions(
-            claude.map(|c| c.observed),
-            codex.map(|c| c.observed),
-        );
+        let launched = sessions(claude.map(|c| c.launched), codex.map(|c| c.launched));
+        let observed = sessions(claude.map(|c| c.observed), codex.map(|c| c.observed));
         let host = &snapshot.host;
         Self {
             wall_s: snapshot.written.wall_ms / 1000,
@@ -266,7 +255,9 @@ impl std::fmt::Display for TraceError {
             Self::Unsafe(why) => write!(f, "the trace is not safe to read: {why}"),
             Self::Io(why) => write!(f, "the trace could not be read: {why}"),
             Self::BadMagic => write!(f, "the file is not a host-load trace"),
-            Self::UnsupportedVersion(v) => write!(f, "the trace is version {v}; this build reads 1"),
+            Self::UnsupportedVersion(v) => {
+                write!(f, "the trace is version {v}; this build reads 1")
+            }
             Self::Short { length, need } => {
                 write!(f, "the trace holds {length} bytes; it needs {need}")
             }
@@ -331,13 +322,19 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
     put_u32(&mut b, R_LAUNCHED_N, r.launched_sessions.unwrap_or(NONE32));
     put_u32(&mut b, R_OBSERVED_N, r.observed_sessions.unwrap_or(NONE32));
     put_u64(&mut b, R_FOREIGN, r.largest_foreign.unwrap_or(NONE64));
-    put_u64(&mut b, R_LAUNCHED_FP, r.launched_footprint.unwrap_or(NONE64));
+    put_u64(
+        &mut b,
+        R_LAUNCHED_FP,
+        r.launched_footprint.unwrap_or(NONE64),
+    );
     put_u32(
         &mut b,
         R_SEGMENTS,
         r.segment_fraction
             .filter(|f| f.is_finite() && *f >= 0.0)
-            .map_or(NONE32, |f| ((f * 1_000_000.0).round() as u64).min(u64::from(NONE32 - 1)) as u32),
+            .map_or(NONE32, |f| {
+                ((f * 1_000_000.0).round() as u64).min(u64::from(NONE32 - 1)) as u32
+            }),
     );
     put_u64(&mut b, R_DROPPED_BEFORE, r.dropped_before);
     put_u64(&mut b, R_DROPPED_TOTAL, r.dropped_total);
@@ -500,8 +497,12 @@ fn read_ring_from(file: &File) -> Result<(Header, Vec<TraceRecord>), TraceError>
         }
         filled += n;
     }
-    let mut records: Vec<(u64, TraceRecord)> =
-        body.as_chunks::<RECORD_LEN>().0.iter().filter_map(|c| decode_record(c)).collect();
+    let mut records: Vec<(u64, TraceRecord)> = body
+        .as_chunks::<RECORD_LEN>()
+        .0
+        .iter()
+        .filter_map(|c| decode_record(c))
+        .collect();
     records.sort_by_key(|(seq, _)| *seq);
     Ok((header, records.into_iter().map(|(_, r)| r).collect()))
 }
@@ -534,7 +535,11 @@ impl TraceWriter {
 
     /// [`TraceWriter::open`] with a chosen capacity, so a test can wrap a
     /// small ring.
-    pub(super) fn open_with_capacity(dir: &Path, boot_id: u64, capacity: u32) -> Result<Self, String> {
+    pub(super) fn open_with_capacity(
+        dir: &Path,
+        boot_id: u64,
+        capacity: u32,
+    ) -> Result<Self, String> {
         let path = dir.join(TRACE_FILE_NAME);
         match crate::fs_entry::open_private_record_readonly(&path) {
             Ok(None) => {}
@@ -648,8 +653,7 @@ impl TraceSink for TraceWriter {
 
 /// Opens the sink for a boot in a directory. Run on the feed's thread, never
 /// on the sampler's: opening can rename the previous boot's ring and syncs.
-pub type TraceOpener =
-    Arc<dyn Fn(&Path, u64) -> Result<Box<dyn TraceSink>, String> + Send + Sync>;
+pub type TraceOpener = Arc<dyn Fn(&Path, u64) -> Result<Box<dyn TraceSink>, String> + Send + Sync>;
 
 /// The opener the app uses: the ring file in the directory.
 pub fn file_opener() -> TraceOpener {
@@ -725,10 +729,11 @@ impl TraceFeed {
             wake: Condvar::new(),
         });
         let worker = shared.clone();
-        let thread = crate::supervisor::spawn_once("host-load-trace", "host-load-trace", move || {
-            feed_loop(&worker, &opener, &dir, boot_id);
-        })
-        .map_err(|e| format!("could not start the trace thread: {e}"))?;
+        let thread =
+            crate::supervisor::spawn_once("host-load-trace", "host-load-trace", move || {
+                feed_loop(&worker, &opener, &dir, boot_id);
+            })
+            .map_err(|e| format!("could not start the trace thread: {e}"))?;
         Ok(Self {
             shared,
             thread: Some(thread),
@@ -898,10 +903,13 @@ impl TracePeaks {
             get: impl Fn(&TraceRecord) -> Option<T>,
             better: impl Fn(&T, &T) -> bool,
         ) -> Option<T> {
-            records.iter().filter_map(get).fold(None, |best, v| match best {
-                Some(b) if !better(&v, &b) => Some(b),
-                _ => Some(v),
-            })
+            records
+                .iter()
+                .filter_map(get)
+                .fold(None, |best, v| match best {
+                    Some(b) if !better(&v, &b) => Some(b),
+                    _ => Some(v),
+                })
         }
         Self {
             records: records.len(),
@@ -977,6 +985,6 @@ pub fn due(is_writer: bool, enabled: bool, tick: u64) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 pub(super) mod blocked_sink_tests;
+#[cfg(test)]
+mod tests;

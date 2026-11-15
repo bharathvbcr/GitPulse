@@ -530,7 +530,11 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 // The verdict the previous tick's count produced (pending on
                 // the first): the record is published before this tick's
                 // sample is counted.
-                snap.verdict = if enabled { held_verdict } else { Reading::default() };
+                snap.verdict = if enabled {
+                    held_verdict
+                } else {
+                    Reading::default()
+                };
                 if let Err(why) = w.publish(&snap) {
                     tick_problems.push(format!("publish: {why}"));
                 }
@@ -789,7 +793,9 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let sampler = start(options).unwrap();
-        crate::test_support::wait_until(Duration::from_secs(20), || ticks.load(Ordering::SeqCst) >= 6);
+        crate::test_support::wait_until(Duration::from_secs(20), || {
+            ticks.load(Ordering::SeqCst) >= 6
+        });
         sampler.stop();
         let record = snapshot::read(&dir.path().join(snapshot::SNAPSHOT_FILE_NAME)).unwrap();
         assert_eq!(record.version, snapshot::VERSION);
@@ -817,8 +823,13 @@ mod tests {
             // A ring a previous boot left behind.
             let mut old = super::trace::TraceWriter::open(dir.path(), foreign_boot).unwrap();
             let snap = Snapshot::empty(Clock::now(), own_identity(), true);
-            old.append(&TraceRecord::of(&snap, super::governor::Tier::Severe, None, false))
-                .unwrap();
+            old.append(&TraceRecord::of(
+                &snap,
+                super::governor::Tier::Severe,
+                None,
+                false,
+            ))
+            .unwrap();
         }
         let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = ticks.clone();
@@ -828,7 +839,9 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let writer = start(options).unwrap();
-        crate::test_support::wait_until(Duration::from_secs(30), || ticks.load(Ordering::SeqCst) >= 16);
+        crate::test_support::wait_until(Duration::from_secs(30), || {
+            ticks.load(Ordering::SeqCst) >= 16
+        });
         let status = writer.status().expect("a status");
         assert_eq!(status.role, Role::Writer, "{:?}", status.problems);
         // A second sampler in the same directory loses the election and
@@ -854,7 +867,11 @@ mod tests {
 
         let held = trace::read_ring(&dir.path().join(trace::TRACE_FILE_NAME)).unwrap();
         let counted = ticks.load(Ordering::SeqCst);
-        assert!(held.len() >= 3, "{} records after {counted} ticks", held.len());
+        assert!(
+            held.len() >= 3,
+            "{} records after {counted} ticks",
+            held.len()
+        );
         assert!(
             held.len() <= counted / 5 + 1,
             "{} records after {counted} ticks: more than one per five",
@@ -883,7 +900,10 @@ mod tests {
         let sampler = start(options).unwrap();
         let snapshot_path = dir.path().join(snapshot::SNAPSHOT_FILE_NAME);
         let wait = crate::test_support::coverage_relaxed(Duration::from_secs(30));
-        assert!(gate.wait_entered(wait), "no record ever reached the trace write");
+        assert!(
+            gate.wait_entered(wait),
+            "no record ever reached the trace write"
+        );
         let seq_when_blocked = snapshot::read(&snapshot_path).unwrap().seq;
         let ticks_when_blocked = sampler.status().expect("a status").tick.ticks;
 
@@ -891,7 +911,10 @@ mod tests {
         let mut dropping = false;
         crate::test_support::wait_until(Duration::from_secs(30), || {
             let status = sampler.status().expect("a status");
-            dropping = status.problems.iter().any(|p| p.contains("dropped while the trace write was blocked"));
+            dropping = status
+                .problems
+                .iter()
+                .any(|p| p.contains("dropped while the trace write was blocked"));
             dropping && status.tick.ticks >= ticks_when_blocked + 30
         });
         let status = sampler.status().expect("a status");
@@ -902,7 +925,11 @@ mod tests {
             seq_when_blocked,
             record.seq
         );
-        assert!(status.tick.ticks >= ticks_when_blocked + 20, "{:?}", status.tick);
+        assert!(
+            status.tick.ticks >= ticks_when_blocked + 20,
+            "{:?}",
+            status.tick
+        );
         assert!(
             matches!(record.verdict, Reading::Value(_)),
             "the governor stopped counting: {:?}",

@@ -82,7 +82,10 @@ fn a_zero_or_unreadable_denominator_is_a_gap_never_infinity_or_zero() {
     r.memsize = Reading::Value(0);
     let a = t.assess(&r);
     assert_eq!(tier_of(&t, &r, Binding::Swap), None);
-    assert!(a.warnings.iter().any(|w| w.starts_with("swap is unreadable")));
+    assert!(a
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("swap is unreadable")));
 
     let mut r = Readings::calm();
     r.cores = Reading::Value(Cores::default());

@@ -190,12 +190,7 @@ impl Thresholds {
     fn problems(&self) -> Vec<String> {
         [
             rule_problem("swap", &self.swap, MAX_SWAP_RATIO, false),
-            rule_problem(
-                "compressor_segments",
-                &self.compressor_segments,
-                1.0,
-                false,
-            ),
+            rule_problem("compressor_segments", &self.compressor_segments, 1.0, false),
             rule_problem("load", &self.load, MAX_LOAD_PER_CPU, false),
             rule_problem("disk", &self.disk, MAX_DISK_GIB, true),
         ]
@@ -237,7 +232,11 @@ impl Thresholds {
                 );
                 continue;
             }
-            if let Some(problem) = candidate.problems().into_iter().find(|p| p.starts_with(key)) {
+            if let Some(problem) = candidate
+                .problems()
+                .into_iter()
+                .find(|p| p.starts_with(key))
+            {
                 log::warn!(
                     target: "tool_config",
                     "ignoring invalid host_load_thresholds.{key}, it keeps its default: {problem}"
@@ -438,10 +437,7 @@ impl Thresholds {
     /// that are governed on but unreadable. Pure.
     pub fn assess(&self, readings: &Readings) -> Assessment {
         let mut out = Assessment::default();
-        let mut take = |binding: Binding,
-                        mode: InputMode,
-                        label: &str,
-                        tier: Result<Tier, Gap>| {
+        let mut take = |binding: Binding, mode: InputMode, label: &str, tier: Result<Tier, Gap>| {
             if mode == InputMode::Off {
                 return;
             }
@@ -572,13 +568,15 @@ impl Thresholds {
             Binding::Thermal => match readings.thermal.value()? {
                 Thermal::Critical => "the thermal state is critical".to_string(),
                 Thermal::Serious => "the thermal state is serious".to_string(),
-                other => format!("the thermal state is {other:?} (was serious or worse)")
-                    .to_lowercase(),
+                other => {
+                    format!("the thermal state is {other:?} (was serious or worse)").to_lowercase()
+                }
             },
             Binding::Battery => match readings.power.value()? {
                 Power::Battery => "the computer is running on battery".to_string(),
-                Power::Ac => "the computer is back on mains power (held until it stays so)"
-                    .to_string(),
+                Power::Ac => {
+                    "the computer is back on mains power (held until it stays so)".to_string()
+                }
             },
         })
     }

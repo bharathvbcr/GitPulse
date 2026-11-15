@@ -1801,7 +1801,10 @@ mod tests {
             assert_eq!(loaded.thresholds, thresholds);
             let stored: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(stored["host_load"], serde_json::json!({"enabled": false, "govern_launches": true}));
+            assert_eq!(
+                stored["host_load"],
+                serde_json::json!({"enabled": false, "govern_launches": true})
+            );
             let keys: Vec<_> = stored["host_load_thresholds"]
                 .as_object()
                 .unwrap()
@@ -1854,7 +1857,11 @@ mod tests {
             unknown: serde_json::Map<String, serde_json::Value>,
         }
         with_temp_config(|path| {
-            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Enforce, "enforce by default");
+            assert_eq!(
+                host_load_hook_mode(),
+                HostLoadHookMode::Enforce,
+                "enforce by default"
+            );
             set_host_load_settings(HostLoadSettings {
                 enabled: false,
                 hook_mode: HostLoadHookMode::Advise,
@@ -1874,7 +1881,10 @@ mod tests {
             );
             // The older build parses the block, keeps the key, and writes both back.
             let older: OlderConfig = serde_json::from_str(&text).unwrap();
-            assert!(older.host_load.as_ref().is_some_and(|b| !b.enabled), "the block survives");
+            assert!(
+                older.host_load.as_ref().is_some_and(|b| !b.enabled),
+                "the block survives"
+            );
             assert_eq!(older.unknown["host_load_hook_mode"], "advise");
             let rewritten: serde_json::Value =
                 serde_json::from_str(&serde_json::to_string(&older).unwrap()).unwrap();
@@ -1922,9 +1932,19 @@ mod tests {
             let settings = host_load_settings();
             let defaults = Thresholds::default();
             assert!(!settings.enabled, "the switches are untouched");
-            assert_eq!(settings.thresholds.swap, defaults.swap, "invalid: its default");
-            assert_eq!(settings.thresholds.load, defaults.load, "malformed: its default");
-            assert_eq!(settings.thresholds.battery.mode, InputMode::Shed, "the good one stands");
+            assert_eq!(
+                settings.thresholds.swap, defaults.swap,
+                "invalid: its default"
+            );
+            assert_eq!(
+                settings.thresholds.load, defaults.load,
+                "malformed: its default"
+            );
+            assert_eq!(
+                settings.thresholds.battery.mode,
+                InputMode::Shed,
+                "the good one stands"
+            );
             assert_eq!(
                 load().map(|c| c.devmap.binary).unwrap_or_default(),
                 Some("/tmp/fake".to_owned())

@@ -8592,7 +8592,8 @@ done
                 ..Default::default()
             })
             .collect();
-        let line = "host load: elevated, swap in use is above GitPulse's limit for it (sensor fresh)";
+        let line =
+            "host load: elevated, swap in use is above GitPulse's limit for it (sensor fresh)";
         let brief = session_brief_with(&snapshot, "/repo", "startup", Some(line));
         assert!(brief.len() <= BRIEF_LIMIT);
         assert!(brief.ends_with("… truncated"));

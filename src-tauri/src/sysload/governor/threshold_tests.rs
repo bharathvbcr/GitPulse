@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::sysload::sensor::{CompressorSegments, Cores, Power, Thermal};
-use crate::sysload::{Reading, Why};
 use crate::sysload::thresholds::InputMode;
+use crate::sysload::{Reading, Why};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -57,7 +57,9 @@ fn the_incident_is_refused_on_swap_though_the_kernel_said_warn() {
     assert!(!verdict.admit, "{}", verdict.message);
     assert!(verdict.shed.reactive && verdict.shed.background);
     assert!(
-        verdict.message.contains("swap used is 0.83x physical memory")
+        verdict
+            .message
+            .contains("swap used is 0.83x physical memory")
             && verdict.message.contains("at or above 0.75x"),
         "{}",
         verdict.message
@@ -69,7 +71,11 @@ fn the_incident_is_refused_on_swap_though_the_kernel_said_warn() {
 fn every_input_reaches_elevated_and_severe_at_its_threshold() {
     type Push = fn(&mut Input, bool);
     let cases: [(&str, Push, Binding); 6] = [
-        ("swap", |i, severe| swap_at(i, if severe { 0.8 } else { 0.6 }), Binding::Swap),
+        (
+            "swap",
+            |i, severe| swap_at(i, if severe { 0.8 } else { 0.6 }),
+            Binding::Swap,
+        ),
         (
             "segments",
             |i, severe| segments_at(i, if severe { 0.85 } else { 0.65 }),
@@ -115,7 +121,12 @@ fn every_input_reaches_elevated_and_severe_at_its_threshold() {
         let mut input = calm();
         push(&mut input, false);
         let elevated = settle(input);
-        assert_eq!(elevated.tier, Tier::Elevated, "{name}: {}", elevated.message);
+        assert_eq!(
+            elevated.tier,
+            Tier::Elevated,
+            "{name}: {}",
+            elevated.message
+        );
         assert_eq!(elevated.binding, Some(binding), "{name}");
         assert!(elevated.admit && elevated.shed.background && !elevated.shed.reactive);
 
@@ -139,7 +150,10 @@ fn off_ignores_shed_stops_at_elevated_and_refuse_reaches_severe() {
 
     input.thresholds.swap.mode = InputMode::Off;
     let off = settle(input.clone());
-    assert_eq!((off.tier, off.admit, off.binding), (Tier::Clear, true, None));
+    assert_eq!(
+        (off.tier, off.admit, off.binding),
+        (Tier::Clear, true, None)
+    );
     assert!(off.warnings.is_empty());
 
     input.thresholds.swap.mode = InputMode::Shed;
@@ -219,7 +233,10 @@ fn an_unreadable_reading_adds_a_warning_and_no_tier() {
         ..GovernorReport::ungoverned()
     };
     assert_eq!(
-        admit_on(Site::PtySpawn, &report).unwrap().warning.as_deref(),
+        admit_on(Site::PtySpawn, &report)
+            .unwrap()
+            .warning
+            .as_deref(),
         Some("swap is unreadable: not governed on")
     );
     // Not governed on at all, or never provided: nothing to warn about.
@@ -279,7 +296,12 @@ fn describe_names_each_resource_its_value_and_its_threshold() {
     let mut input = calm();
     free_at(&mut input, 4.0);
     let v = settle(input);
-    assert!(v.message.contains("free disk space is 4.0 GiB, below 10.0 GiB"), "{}", v.message);
+    assert!(
+        v.message
+            .contains("free disk space is 4.0 GiB, below 10.0 GiB"),
+        "{}",
+        v.message
+    );
     let mut input = calm();
     load_at(&mut input, 3.5);
     input.readings.cores = Reading::Value(Cores {
@@ -289,7 +311,11 @@ fn describe_names_each_resource_its_value_and_its_threshold() {
         perf1: 0,
     });
     let v = settle(input);
-    assert!(v.message.contains("per CPU") && v.message.contains("at or above 3.00"), "{}", v.message);
+    assert!(
+        v.message.contains("per CPU") && v.message.contains("at or above 3.00"),
+        "{}",
+        v.message
+    );
 }
 
 /// The disk guard was advice only (owner decision 2026-10-21) and is now a
@@ -306,7 +332,11 @@ fn disk_refuses_a_launch_only_in_refuse_mode_below_severe_at() {
                 verdict: settle(input.clone()),
                 ..GovernorReport::ungoverned()
             };
-            assert!(admit_on(site, &report).is_ok(), "{mode:?} refused {}", site.name());
+            assert!(
+                admit_on(site, &report).is_ok(),
+                "{mode:?} refused {}",
+                site.name()
+            );
         }
     }
     input.thresholds.disk.mode = InputMode::Refuse;

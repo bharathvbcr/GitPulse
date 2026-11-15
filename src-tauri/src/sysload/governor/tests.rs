@@ -724,7 +724,9 @@ fn low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode()
         input.readings.free_disk = Reading::Value(1 << 30);
         input.thresholds.disk.mode = mode;
         let mut governor = Governor::default();
-        feed(&mut governor, Instant::now(), vec![input; 3]).0.verdict
+        feed(&mut governor, Instant::now(), vec![input; 3])
+            .0
+            .verdict
     };
     for mode in [InputMode::Off, InputMode::Shed] {
         let verdict = starved(mode);
@@ -733,7 +735,11 @@ fn low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode()
                 verdict: verdict.clone(),
                 ..GovernorReport::ungoverned()
             };
-            assert!(admit_on(site, &report).is_ok(), "{mode:?} refused {}", site.name());
+            assert!(
+                admit_on(site, &report).is_ok(),
+                "{mode:?} refused {}",
+                site.name()
+            );
         }
     }
     let refused = starved(InputMode::Refuse);

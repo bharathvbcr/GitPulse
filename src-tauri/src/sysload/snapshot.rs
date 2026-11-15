@@ -42,8 +42,8 @@
 //! for the writer's whole life: a dev build or a second profile beside the
 //! installed app loses the election and reads instead.
 
-use super::procscan::SessionCount;
 use super::governor::{Binding, GovernorVerdict, Tier};
+use super::procscan::SessionCount;
 use super::sensor::{
     Compressor, CompressorDelta, CompressorSegments, Cores, HostSample, Level, Power, Reading,
     Thermal, Why,
@@ -564,9 +564,7 @@ fn encode_v1_fields(b: &mut [u8], snap: &Snapshot, seq: u64) {
         put_u16(b, OFF_CORE_P0, c.perf0);
         put_u16(b, OFF_CORE_P1, c.perf1);
     });
-    put_reading(b, S_MEMSIZE, h.memsize, |b, v| {
-        put_u64(b, OFF_MEMSIZE, v)
-    });
+    put_reading(b, S_MEMSIZE, h.memsize, |b, v| put_u64(b, OFF_MEMSIZE, v));
     put_reading(b, S_OPEN_FILES, h.open_files, |b, v| {
         put_u64(b, OFF_OPEN_FILES, v)
     });
@@ -576,9 +574,7 @@ fn encode_v1_fields(b: &mut [u8], snap: &Snapshot, seq: u64) {
     put_reading(b, S_FREE_DISK, h.free_disk, |b, v| {
         put_u64(b, OFF_FREE_DISK, v)
     });
-    put_reading(b, S_THERMAL, h.thermal, |b, t| {
-        b[OFF_THERMAL] = t.code()
-    });
+    put_reading(b, S_THERMAL, h.thermal, |b, t| b[OFF_THERMAL] = t.code());
     put_reading(b, S_POWER, h.power, |b, p| {
         b[OFF_POWER] = match p {
             Power::Ac => 0,
@@ -607,18 +603,12 @@ fn encode_v1_fields(b: &mut [u8], snap: &Snapshot, seq: u64) {
     put_reading(b, S_LARGEST_FOREIGN, snap.largest_foreign, |b, v| {
         put_u64(b, OFF_LARGEST_FOREIGN, v)
     });
-    put_reading(
-        b,
-        S_LAUNCHED_WRATE,
-        snap.launched_write_rate,
-        |b, v| put_u64(b, OFF_LAUNCHED_WRATE, v),
-    );
-    put_reading(
-        b,
-        S_MAX_TREE_WRATE,
-        snap.max_tree_write_rate,
-        |b, v| put_u64(b, OFF_MAX_TREE_WRATE, v),
-    );
+    put_reading(b, S_LAUNCHED_WRATE, snap.launched_write_rate, |b, v| {
+        put_u64(b, OFF_LAUNCHED_WRATE, v)
+    });
+    put_reading(b, S_MAX_TREE_WRATE, snap.max_tree_write_rate, |b, v| {
+        put_u64(b, OFF_MAX_TREE_WRATE, v)
+    });
     put_u32(b, OFF_MEMGUARD_PID, snap.memguard_pid);
     put_u32(b, OFF_TICK_LAST, snap.tick.last_us);
     put_u64(b, OFF_TICKS, snap.tick.ticks);
@@ -1262,10 +1252,18 @@ mod tests {
         let record = encode(&snap, 8);
         assert_eq!(record.len(), EXTENDED_LEN);
         assert_eq!(&record[0..4], &MAGIC);
-        assert_eq!(get_u32(&record, OFF_VERSION), 2, "at or above its minimum, 1");
+        assert_eq!(
+            get_u32(&record, OFF_VERSION),
+            2,
+            "at or above its minimum, 1"
+        );
         assert!(get_u32(&record, OFF_LENGTH) as usize >= RECORD_LEN);
         assert_eq!(get_u64(&record, OFF_SEQ), 8);
-        assert_eq!(get_u64(&record, OFF_SEQ_TAIL), 8, "the tail is where v1 looks");
+        assert_eq!(
+            get_u64(&record, OFF_SEQ_TAIL),
+            8,
+            "the tail is where v1 looks"
+        );
         assert_eq!(get_u64(&record, OFF_CHECKSUM), checksum(&record));
         // Decoded as version 1 reads it (the first RECORD_LEN bytes known):
         let older = decode_as(&record[..RECORD_LEN], MIN_READ_VERSION, RECORD_LEN);
@@ -1274,7 +1272,11 @@ mod tests {
         assert_eq!(older.host.swap_used, snap.host.swap_used);
         assert_eq!(older.tick, snap.tick);
         assert_eq!(older.written, snap.written);
-        assert_eq!(older.verdict, Reading::default(), "it never saw the extension");
+        assert_eq!(
+            older.verdict,
+            Reading::default(),
+            "it never saw the extension"
+        );
     }
 
     /// An older writer's 664-byte record reads in this build, with the new
@@ -1288,7 +1290,10 @@ mod tests {
         assert_eq!(seen.host.swap_used, snap.host.swap_used);
         assert_eq!(seen.host.compressor_segments, Reading::default());
         assert_eq!(seen.verdict, Reading::default());
-        assert_eq!(Reading::<u8>::default(), Reading::Unavailable(Why::Unsupported));
+        assert_eq!(
+            Reading::<u8>::default(),
+            Reading::Unavailable(Why::Unsupported)
+        );
     }
 
     #[test]
@@ -1355,12 +1360,18 @@ mod tests {
         }
         assert_eq!(read(&path).unwrap().verdict, Reading::default());
         let mut writer = Writer::elect(dir.path()).unwrap().unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, EXTENDED_LEN);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            EXTENDED_LEN
+        );
         writer.publish(&full(clock(2))).unwrap();
         let seen = read(&path).unwrap();
         assert_eq!(seen.version, 2);
         assert_eq!(seen.verdict, full(clock(2)).verdict);
-        assert!(seen.seq > 6, "the sequence carries on from the older writer");
+        assert!(
+            seen.seq > 6,
+            "the sequence carries on from the older writer"
+        );
     }
 
     #[test]

@@ -79,7 +79,10 @@ fn a_full_ring_overwrites_its_oldest_records_and_never_grows() {
 
 #[test]
 fn the_real_capacity_is_three_hours_at_ten_second_records() {
-    assert_eq!(u64::from(CAPACITY) * EVERY_NTH_TICK * (crate::sysload::CADENCE_MS / 1000), 3 * 3600);
+    assert_eq!(
+        u64::from(CAPACITY) * EVERY_NTH_TICK * (crate::sysload::CADENCE_MS / 1000),
+        3 * 3600
+    );
     assert_eq!(file_len(CAPACITY), 64 + 1080 * 128);
 }
 
@@ -118,13 +121,21 @@ fn a_new_boot_keeps_the_old_ring_as_prev_and_replaces_an_older_prev() {
     assert!(!prev.exists());
 
     let mut second = TraceWriter::open_with_capacity(dir.path(), 2, 4).unwrap();
-    assert_eq!(read_ring(&prev).unwrap(), [rec(1)], "boot 1's readings survive");
+    assert_eq!(
+        read_ring(&prev).unwrap(),
+        [rec(1)],
+        "boot 1's readings survive"
+    );
     assert_eq!(read_ring(&path(&dir)).unwrap(), [], "boot 2 starts empty");
     second.append(&rec(2)).unwrap();
     drop(second);
 
     let _third = TraceWriter::open_with_capacity(dir.path(), 3, 4).unwrap();
-    assert_eq!(read_ring(&prev).unwrap(), [rec(2)], "an older prev is replaced");
+    assert_eq!(
+        read_ring(&prev).unwrap(),
+        [rec(2)],
+        "an older prev is replaced"
+    );
 }
 
 #[test]
@@ -210,7 +221,9 @@ fn a_trace_this_user_does_not_alone_own_is_refused_and_left_alone() {
     writer.append(&rec(1)).unwrap();
     drop(writer);
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let error = TraceWriter::open_with_capacity(dir.path(), 5, 4).err().unwrap();
+    let error = TraceWriter::open_with_capacity(dir.path(), 5, 4)
+        .err()
+        .unwrap();
     assert!(error.contains("other users"), "{error}");
     assert!(matches!(read_ring(&file), Err(TraceError::Unsafe(_))));
     assert!(file.exists(), "a refused file is not replaced");
@@ -220,13 +233,21 @@ fn a_trace_this_user_does_not_alone_own_is_refused_and_left_alone() {
     std::fs::write(&target, b"x").unwrap();
     std::os::unix::fs::symlink(&target, &file).unwrap();
     assert!(TraceWriter::open_with_capacity(dir.path(), 5, 4).is_err());
-    assert_eq!(std::fs::read(&target).unwrap(), b"x", "nothing written through the link");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"x",
+        "nothing written through the link"
+    );
 }
 
 #[test]
 fn the_previous_boot_is_its_last_thirty_records_with_their_peaks() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(previous_boot(dir.path()), None, "no previous trace is not an error");
+    assert_eq!(
+        previous_boot(dir.path()),
+        None,
+        "no previous trace is not an error"
+    );
     let mut writer = TraceWriter::open_with_capacity(dir.path(), 1, 100).unwrap();
     for n in 1..=50 {
         let mut r = rec(n);
@@ -249,7 +270,11 @@ fn the_previous_boot_is_its_last_thirty_records_with_their_peaks() {
     assert_eq!(peaks.records, PREVIOUS_TAIL);
     assert_eq!(peaks.max_swap_used, Some(50 << 30));
     assert_eq!(peaks.max_load_1m, Some(50.5));
-    assert_eq!(peaks.min_free_disk, Some(100 << 30), "record 20 is outside the tail");
+    assert_eq!(
+        peaks.min_free_disk,
+        Some(100 << 30),
+        "record 20 is outside the tail"
+    );
     assert!(peaks.refused, "record 49 refused launches");
     assert_eq!(peaks.max_tier, Some(Tier::Elevated));
     assert_eq!(peaks.worst_thermal, Some(Thermal::Fair));
@@ -288,8 +313,14 @@ fn a_previous_trace_that_cannot_be_trusted_is_said_not_shown_empty() {
 fn only_the_elected_writer_measuring_on_every_fifth_tick_appends() {
     let ticks: Vec<u64> = (1..=20).filter(|t| due(true, true, *t)).collect();
     assert_eq!(ticks, [5, 10, 15, 20]);
-    assert!(!(1..=20).any(|t| due(false, true, t)), "a reader never appends");
-    assert!(!(1..=20).any(|t| due(true, false, t)), "switched off records nothing");
+    assert!(
+        !(1..=20).any(|t| due(false, true, t)),
+        "a reader never appends"
+    );
+    assert!(
+        !(1..=20).any(|t| due(true, false, t)),
+        "switched off records nothing"
+    );
 }
 
 #[test]
@@ -326,10 +357,16 @@ fn a_record_is_made_from_the_snapshot_and_the_held_verdict() {
     let r = TraceRecord::of(&snap, Tier::Severe, Some(Binding::Swap), false);
     assert_eq!((r.wall_s, r.mono_ms, r.boot_id), (1_700_000_123, 9_000, 42));
     assert_eq!(r.pressure, Some(Level::Critical));
-    assert_eq!((r.tier, r.binding, r.admit), (Some(Tier::Severe), Some(Binding::Swap), Some(false)));
+    assert_eq!(
+        (r.tier, r.binding, r.admit),
+        (Some(Tier::Severe), Some(Binding::Swap), Some(false))
+    );
     assert_eq!(r.swap_used, Some(57 << 30));
     assert_eq!(r.load_1m, Some(120.0));
-    assert_eq!((r.launched_sessions, r.observed_sessions), (Some(4), Some(4)));
+    assert_eq!(
+        (r.launched_sessions, r.observed_sessions),
+        (Some(4), Some(4))
+    );
     assert_eq!(r.segment_fraction, Some(0.25));
     assert_eq!(r.thermal, None, "unreadable is not nominal");
     assert_eq!(r.free_disk, None);
@@ -342,8 +379,16 @@ fn a_record_is_made_from_the_snapshot_and_the_held_verdict() {
 
 const SECONDS: Duration = Duration::from_secs(1);
 
-fn feed_over(gate: &std::sync::Arc<blocked_sink_tests::Gate>, dir: &tempfile::TempDir) -> TraceFeed {
-    TraceFeed::start(blocked_sink_tests::blocked_writes(gate.clone()), dir.path().to_path_buf(), 7).unwrap()
+fn feed_over(
+    gate: &std::sync::Arc<blocked_sink_tests::Gate>,
+    dir: &tempfile::TempDir,
+) -> TraceFeed {
+    TraceFeed::start(
+        blocked_sink_tests::blocked_writes(gate.clone()),
+        dir.path().to_path_buf(),
+        7,
+    )
+    .unwrap()
 }
 
 /// Records offered while the write is stuck are dropped, counted, and the
@@ -355,8 +400,14 @@ fn records_offered_while_the_write_is_blocked_are_dropped_and_the_ring_says_how_
     let gate = blocked_sink_tests::Gate::new();
     let mut feed = feed_over(&gate, &dir);
     assert!(feed.offer(rec(1)));
-    assert!(gate.wait_entered(30 * SECONDS), "the thread never reached the sink");
-    assert!(feed.offer(rec(2)), "the slot is free once the thread took the first");
+    assert!(
+        gate.wait_entered(30 * SECONDS),
+        "the thread never reached the sink"
+    );
+    assert!(
+        feed.offer(rec(2)),
+        "the slot is free once the thread took the first"
+    );
     assert!(!feed.offer(rec(3)));
     assert!(!feed.offer(rec(4)));
     assert_eq!(feed.dropped(), 2);
@@ -364,9 +415,20 @@ fn records_offered_while_the_write_is_blocked_are_dropped_and_the_ring_says_how_
     assert!(feed.stop(30 * SECONDS), "stopped once the write resumed");
     let held = read_ring(&path(&dir)).unwrap();
     assert_eq!(held.len(), 2, "records 3 and 4 are not in the ring");
-    assert_eq!((held[0].wall_s, held[0].dropped_before, held[0].dropped_total), (rec(1).wall_s, 0, 0));
     assert_eq!(
-        (held[1].wall_s, held[1].dropped_before, held[1].dropped_total),
+        (
+            held[0].wall_s,
+            held[0].dropped_before,
+            held[0].dropped_total
+        ),
+        (rec(1).wall_s, 0, 0)
+    );
+    assert_eq!(
+        (
+            held[1].wall_s,
+            held[1].dropped_before,
+            held[1].dropped_total
+        ),
         (rec(2).wall_s, 2, 2),
         "the record after the gap carries the count"
     );
@@ -410,8 +472,14 @@ fn stop_returns_after_its_wait_with_a_blocked_write_and_the_detached_thread_fini
     let finished = feed.stop(Duration::from_millis(150));
     let took = began.elapsed();
     assert!(!finished, "the write is still blocked");
-    assert!(took >= Duration::from_millis(100), "waited its bound: {took:?}");
-    assert!(took < 10 * SECONDS, "returned in {took:?}, not when the write did");
+    assert!(
+        took >= Duration::from_millis(100),
+        "waited its bound: {took:?}"
+    );
+    assert!(
+        took < 10 * SECONDS,
+        "returned in {took:?}, not when the write did"
+    );
     gate.release();
     let held = || read_ring(&path(&dir)).map(|r| r.len()).unwrap_or(0);
     assert!(
@@ -445,7 +513,10 @@ fn a_failing_open_is_a_problem_and_does_not_hold_up_stop() {
     assert!(!feed.take_opened());
     let began = Instant::now();
     assert!(feed.stop(30 * SECONDS));
-    assert!(began.elapsed() < 5 * SECONDS, "stop waited for the reopen timer");
+    assert!(
+        began.elapsed() < 5 * SECONDS,
+        "stop waited for the reopen timer"
+    );
 }
 
 /// A write the disk refused loses its record as surely as a full slot does, so
@@ -502,12 +573,25 @@ fn the_previous_boot_reports_the_drops_its_ring_recorded() {
     {
         let mut old = TraceWriter::open(dir.path(), 7).unwrap();
         old.append(&rec(1)).unwrap();
-        old.append(&TraceRecord { dropped_before: 3, dropped_total: 3, ..rec(2) }).unwrap();
-        old.append(&TraceRecord { dropped_before: 4, dropped_total: 7, ..rec(3) }).unwrap();
+        old.append(&TraceRecord {
+            dropped_before: 3,
+            dropped_total: 3,
+            ..rec(2)
+        })
+        .unwrap();
+        old.append(&TraceRecord {
+            dropped_before: 4,
+            dropped_total: 7,
+            ..rec(3)
+        })
+        .unwrap();
     }
     TraceWriter::open(dir.path(), 8).unwrap();
     let previous = previous_boot(dir.path()).expect("the old ring is kept");
     assert_eq!(previous.dropped, 7);
-    assert_eq!(previous.records[0].dropped_before, 0, "no drops reads as zero");
+    assert_eq!(
+        previous.records[0].dropped_before, 0,
+        "no drops reads as zero"
+    );
     assert_eq!(previous.records[2].dropped_total, 7);
 }

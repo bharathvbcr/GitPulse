@@ -69,13 +69,11 @@ pub use sampler::{
 };
 pub use sensor::{
     Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, HostSample, Level,
-    OsSensor, Power,
-    Reading, ReplaySensor, Sensor, Thermal, Why,
+    OsSensor, Power, Reading, ReplaySensor, Sensor, Thermal, Why,
 };
 pub use snapshot::{
     read, report, PublishedVerdict, Snapshot, SnapshotError, TickStats, Writer as SnapshotWriter,
-    WriterIdentity, EXTENDED_LEN,
-    LOCK_FILE_NAME, RECORD_LEN, SNAPSHOT_FILE_NAME, VERSION,
+    WriterIdentity, EXTENDED_LEN, LOCK_FILE_NAME, RECORD_LEN, SNAPSHOT_FILE_NAME, VERSION,
 };
 
 use serde::{Deserialize, Serialize};

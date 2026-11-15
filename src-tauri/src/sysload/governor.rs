@@ -347,10 +347,7 @@ fn level_words(level: Option<Level>) -> String {
 
 /// The binding resource and its value, in words.
 fn describe(binding: Binding, input: &Input, held: Tier) -> String {
-    if let Some(words) = input
-        .thresholds
-        .describe(binding, &input.readings, held)
-    {
+    if let Some(words) = input.thresholds.describe(binding, &input.readings, held) {
         return words;
     }
     match binding {
@@ -1152,7 +1149,10 @@ pub fn admit_anyway(confirm: &dyn Fn(&str, &str) -> bool) -> Result<String, Stri
         verdict.message,
         OVERRIDE_WINDOW.as_secs()
     );
-    if !confirm("Admit agent launches while the machine is overloaded?", &question) {
+    if !confirm(
+        "Admit agent launches while the machine is overloaded?",
+        &question,
+    ) {
         return Err("Not admitted: launches stay refused while the pressure lasts.".to_string());
     }
     grant_override()?;
@@ -1271,6 +1271,6 @@ fn write_ledger(
 #[cfg(test)]
 mod adv2;
 #[cfg(test)]
-mod threshold_tests;
-#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod threshold_tests;
