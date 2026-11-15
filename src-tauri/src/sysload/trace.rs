@@ -128,6 +128,11 @@ const R_BINDING: usize = 34;
 const R_ADMIT: usize = 35;
 const R_THERMAL: usize = 36;
 const R_POWER: usize = 37;
+// Bytes 38..40: the sustained disk fill rate (what Severe decides on) in 16 MiB
+// a minute plus one, a little endian 16-bit number; 0 is "not measured", which
+// is what every record written before it holds. The checksum covers it.
+const R_FILL_SUSTAINED: usize = 38;
+const FILL_SUSTAINED_MAX: u32 = 0xFFFF;
 const R_SWAP: usize = 40;
 const R_COMPRESSED: usize = 48;
 const R_LOAD: usize = 56;
@@ -194,6 +199,9 @@ pub struct TraceRecord {
     /// record from before it was kept. Beside `free_disk` and `binding`, so a
     /// window in which the disk emptied explains itself.
     pub disk_fill_rate: Option<u64>,
+    /// The sustained rate Severe decides on, to 16 MiB a minute; `None` when
+    /// it was not measured.
+    pub disk_fill_sustained: Option<u64>,
     /// Records the sampler offered while the trace write was still busy, and
     /// so never reached the ring, since the previous record that did. Set by
     /// the feed when it takes the record; zero from [`TraceRecord::of`].
@@ -241,6 +249,7 @@ impl TraceRecord {
             segment_fraction: value(host.compressor_segments)
                 .and_then(|s| (s.limit > 0).then(|| s.total as f64 / s.limit as f64)),
             disk_fill_rate: value(snapshot.disk_fill_rate),
+            disk_fill_sustained: value(snapshot.disk_fill_sustained),
             dropped_before: 0,
             dropped_total: 0,
         }
@@ -362,6 +371,12 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
             .min(FILL_MAX)
     });
     b[R_FILL..R_FILL + 3].copy_from_slice(&fill.to_le_bytes()[..3]);
+    let sustained = r.disk_fill_sustained.map_or(0, |bytes| {
+        u32::try_from((bytes >> 24).saturating_add(1))
+            .unwrap_or(FILL_SUSTAINED_MAX)
+            .min(FILL_SUSTAINED_MAX)
+    });
+    b[R_FILL_SUSTAINED..R_FILL_SUSTAINED + 2].copy_from_slice(&sustained.to_le_bytes()[..2]);
     put_u64(&mut b, R_DROPPED_BEFORE, r.dropped_before);
     put_u64(&mut b, R_DROPPED_TOTAL, r.dropped_total);
     let sum = checksum(&b[..R_CHECKSUM]);
@@ -413,6 +428,13 @@ fn decode_record(b: &[u8]) -> Option<(u64, TraceRecord)> {
             disk_fill_rate: match u32::from_le_bytes([b[R_FILL], b[R_FILL + 1], b[R_FILL + 2], 0]) {
                 0 => None,
                 stored => Some(u64::from(stored - 1) << 20),
+            },
+            disk_fill_sustained: match u16::from_le_bytes([
+                b[R_FILL_SUSTAINED],
+                b[R_FILL_SUSTAINED + 1],
+            ]) {
+                0 => None,
+                stored => Some(u64::from(stored - 1) << 24),
             },
             dropped_before: get_u64(b, R_DROPPED_BEFORE),
             dropped_total: get_u64(b, R_DROPPED_TOTAL),

@@ -294,7 +294,7 @@
             window.__gpHost.stored = structuredClone(args.settings);
             return structuredClone(window.__gpHost.stored);
           }
-          if (cmd === "cmd_host_load_status") return hostLoadStatus;
+          if (cmd === "cmd_host_load_status") return structuredClone(hostLoadStatus);
           if (cmd === "cmd_lappi_settings") {
             return {
               settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
@@ -545,6 +545,31 @@
             && JSON.stringify(lastSave().thresholds.load) === JSON.stringify({ mode: "shed", elevated_at: 3, severe_at: 6 }) && !resetButton("load"));
           await pickMode("battery", "shed");
           check("Battery saves a mode and no thresholds", H.attempts.length === 6 && JSON.stringify(lastSave().thresholds.battery) === JSON.stringify({ mode: "shed" }));
+
+          // The fill rule's row says what it is doing when it has no rate: each
+          // reason is its own sentence, and a measured zero is not any of them.
+          {
+            const { refreshHostLoad } = await import("../src/lib/stores/hostLoadStore");
+            const stateText = () => flatText(document.querySelector('[data-testid="host-load-guard-fill-state"]'));
+            const rate = hostLoadStatus.snapshot.disk_fill_rate;
+            const states = [
+              [{ status: "unavailable", value: "not_yet" }, "Fill rate: warming up"],
+              [{ status: "unavailable", value: "disabled" }, "Fill rate: off (host load measurement is switched off)"],
+              [{ status: "unavailable", value: "older" }, "Fill rate: not available (the app writing the snapshot is an older build)"],
+              [{ status: "unavailable", value: "unsupported" }, "Fill rate: not available on this platform"],
+              [{ status: "unavailable", value: "failed" }, "Fill rate: not available (free disk space can't be read)"],
+              [{ status: "value", value: 0 }, "Fill rate: not falling"],
+              [{ status: "value", value: 3 * 2 ** 30 }, "Fill rate: 3.00 GB/min"],
+            ];
+            for (const [reading, expected] of states) {
+              hostLoadStatus.snapshot.disk_fill_rate = reading;
+              await refreshHostLoad();
+              await wait(80);
+              check(`the fill row says "${expected}" for ${reading.status} ${reading.value}`, stateText() === expected);
+            }
+            hostLoadStatus.snapshot.disk_fill_rate = rate;
+            await refreshHostLoad();
+          }
 
           // Values the rules refuse are said so on screen, and nothing is saved.
           const before = H.attempts.length;

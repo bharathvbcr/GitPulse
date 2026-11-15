@@ -1915,15 +1915,15 @@ mod tests {
                     "{ram_gib} GiB of memory"
                 );
             }
-            // And what this machine shows is half and a quarter of its own
-            // memory, from the clamp written out here.
-            let ram = crate::sysload::physical_memory().expect("memory size") as f64
-                / (1u64 << 30) as f64;
-            assert_eq!(
-                (shown.elevated_at, shown.severe_at),
-                ((ram / 2.0).max(20.0), (ram / 4.0).max(10.0)),
-                "{ram} GiB of memory"
-            );
+            // A memory size nobody can read gives the smallest floors, never a
+            // guess; what this machine shows is whichever of those it is, and
+            // no assertion here depends on how much memory the test host has.
+            let unknown = settings
+                .thresholds
+                .resolved(Reading::Unavailable(crate::sysload::Why::Failed))
+                .disk;
+            assert_eq!((unknown.elevated_at, unknown.severe_at), (20.0, 10.0));
+            assert!(shown.elevated_at >= 20.0 && shown.severe_at >= 10.0);
             // Load, change something else, save: the floors stay automatic and
             // nothing is stored for them.
             settings.thresholds.swap.mode = InputMode::Shed;

@@ -24,6 +24,7 @@ fn rec(n: u64) -> TraceRecord {
         power: Some(Power::Ac),
         segment_fraction: Some(0.25),
         disk_fill_rate: Some(n << 30),
+        disk_fill_sustained: Some(n << 30),
         dropped_before: 0,
         dropped_total: 0,
     }
@@ -50,6 +51,7 @@ fn blank(n: u64) -> TraceRecord {
         power: None,
         segment_fraction: None,
         disk_fill_rate: None,
+        disk_fill_sustained: None,
         dropped_before: 0,
         dropped_total: 0,
     }
@@ -609,14 +611,17 @@ fn the_fill_rate_and_a_disk_filling_binding_are_in_the_trace_record() {
         tier: Some(Tier::Elevated),
         free_disk: Some(80 << 30),
         disk_fill_rate: Some(2_899_102_924 & !((1 << 20) - 1)),
+        disk_fill_sustained: Some(2 << 30),
         ..rec(1)
     };
     let not_measured = TraceRecord {
         disk_fill_rate: None,
+        disk_fill_sustained: None,
         ..rec(2)
     };
     let not_falling = TraceRecord {
         disk_fill_rate: Some(0),
+        disk_fill_sustained: Some(0),
         ..rec(3)
     };
     for record in [&filling, &not_measured, &not_falling] {
@@ -626,11 +631,14 @@ fn the_fill_rate_and_a_disk_filling_binding_are_in_the_trace_record() {
     assert_eq!(held, [filling.clone(), not_measured, not_falling]);
     assert_eq!(held[0].binding, Some(Binding::DiskFilling));
     assert!(held[0].disk_fill_rate.is_some_and(|rate| rate > 2 << 30));
+    assert_eq!(held[0].disk_fill_sustained, Some(2 << 30));
     assert_eq!(
         held[2].disk_fill_rate,
         Some(0),
         "a real zero is not 'not measured'"
     );
+    assert_eq!(held[2].disk_fill_sustained, Some(0));
+    assert_eq!(held[1].disk_fill_sustained, None);
 }
 
 /// An older build rejects a record whose binding byte it does not know, which

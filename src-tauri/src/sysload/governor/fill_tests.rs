@@ -47,7 +47,9 @@ impl Replay {
     fn tick(&mut self, free: Reading<u64>) -> Seen {
         self.tracker.observe(BOOT, self.at_ms, free);
         self.input.readings.free_disk = free;
-        self.input.readings.disk_fill = self.tracker.rate(self.at_ms);
+        let rates = self.tracker.rates(self.at_ms);
+        self.input.readings.disk_fill = rates.quick;
+        self.input.readings.disk_fill_sustained = rates.sustained;
         let verdict = self.governor.observe(self.now, self.input.clone()).verdict;
         self.at_ms += TICK_MS;
         self.now += Duration::from_millis(TICK_MS);
@@ -201,112 +203,255 @@ fn lump(i: u64, total: f64) -> f64 {
     }
 }
 
-/// GiB lost by tick `i` of a one-off step: `total` GiB spread evenly over the
-/// `ticks` ticks from tick `begin`, and nothing after.
-fn step(i: u64, begin: u64, ticks: u64, total: f64) -> f64 {
-    if i < begin {
-        0.0
-    } else if i >= begin + ticks {
-        total
-    } else {
-        (i - begin + 1) as f64 * total / ticks as f64
+/// Free GiB at `s` seconds of a one-off loss of `size` GiB over `dur` seconds
+/// starting at `at`, from `from` GiB.
+fn burst(from: f64, size: f64, dur: u64, at: u64) -> impl Fn(u64) -> f64 {
+    move |s| match s.checked_sub(at) {
+        None => from,
+        Some(t) if t >= dur => from - size,
+        Some(t) => from - size * t as f64 / dur as f64,
     }
 }
 
-#[test]
-fn a_one_off_step_followed_by_a_flat_line_never_binds_at_any_starting_level() {
-    // Each was a review replay on this 64 GiB Mac (16 GiB severe floor): a
-    // least-squares fit over the long window read a step of h GiB as a fall of
-    // about 1.5 h / window, which refused launches for about 25 seconds.
-    // (start free GiB, GiB lost, ticks the loss took: 15 ticks is 30 s)
-    for (start, lost, ticks) in [
-        (70.0, 12.0, 15),
-        (100.0, 20.0, 5),
-        (50.0, 8.0, 15),
-        (160.0, 12.0, 15),
-        (45.0, 6.0, 5),
-    ] {
-        let mut replay = Replay::new();
-        for i in 0..450u64 {
-            let seen = replay.tick_gib(start - step(i, 100, ticks, lost));
-            assert_eq!(
-                seen.verdict.tier,
-                Tier::Clear,
-                "{lost} GiB over {} s from {start} GiB, tick {i} ({:.1} GiB free): {:?}",
-                ticks * 2,
-                seen.free_gib,
-                seen.verdict
-            );
-            assert!(seen.verdict.admit, "tick {i}");
+/// A fall of `per_min` GiB a minute from second `at`.
+fn linear(from: f64, per_min: f64, at: u64) -> impl Fn(u64) -> f64 {
+    move |s| from - per_min * s.saturating_sub(at) as f64 / 60.0
+}
+
+/// `size` GiB lost over `dur` seconds at the start of every `every` seconds,
+/// from second `at`: a build that writes in lumps.
+fn lumps(from: f64, size: f64, dur: u64, every: u64, at: u64) -> impl Fn(u64) -> f64 {
+    move |s| match s.checked_sub(at) {
+        None => from,
+        Some(t) => {
+            from - (t / every) as f64 * size - size * (t % every).min(dur) as f64 / dur as f64
         }
     }
 }
 
-#[test]
-fn two_steps_a_minute_apart_are_a_sustained_fall_and_bind() {
-    // 12 GiB over 30 s, again 90 s later, again: the lumps of a build that keeps
-    // writing. It is a fall, however it arrives.
+/// A free-space pattern: GiB free at a second.
+type Pattern = Box<dyn Fn(u64) -> f64>;
+
+/// What a run through the real tracker and governor showed.
+#[derive(Debug, Default)]
+struct Outcome {
+    /// (second, free GiB) of the first tick held at each tier.
+    elevated: Option<(u64, f64)>,
+    severe: Option<(u64, f64)>,
+    refused: Option<(u64, f64)>,
+    /// Seconds held at Elevated or above.
+    shedding_s: u64,
+    /// Second of the first fall back to Clear after Severe.
+    cleared_after_severe: Option<u64>,
+}
+
+/// Drives `free` for `seconds` at the 2 s tick; the tracker is reset at `reset`.
+fn drive(free: impl Fn(u64) -> f64, seconds: u64, reset: Option<u64>) -> Outcome {
     let mut replay = Replay::new();
-    let mut bound = None;
-    for i in 0..450u64 {
-        let lost = (0..6).map(|k| step(i, 100 + k * 45, 15, 12.0)).sum::<f64>();
-        let seen = replay.tick_gib(150.0 - lost);
-        if seen.verdict.tier >= Tier::Elevated && bound.is_none() {
-            bound = Some((i * 2, seen.free_gib, seen.verdict.binding));
-        }
-    }
-    let (second, free, binding) = bound.expect("a repeating burst is a fall");
-    assert_eq!(binding, Some(Binding::DiskFilling));
-    assert!(free > 60.0, "bound at {free:.1} GiB after {second} s");
-}
-
-#[test]
-fn a_staircase_of_five_gib_a_minute_is_a_sustained_fall() {
-    let mut replay = Replay::new();
-    let mut elevated = None;
-    let mut refused = None;
-    for i in 0..750u64 {
-        let free = 100.0 - 5.0 * (i * 2 / 60) as f64;
-        let seen = replay.tick_gib(free);
-        if seen.verdict.tier >= Tier::Elevated && elevated.is_none() {
-            elevated = Some((i * 2, seen.free_gib, seen.verdict.binding));
-        }
-        if !seen.verdict.admit && refused.is_none() {
-            refused = Some((i * 2, seen.free_gib, seen.verdict.binding));
-        }
-    }
-    let (second, free, binding) = elevated.expect("a staircase is a fall");
-    assert_eq!(binding, Some(Binding::DiskFilling));
-    assert!(free > 80.0, "elevated at {free:.1} GiB after {second} s");
-    let (second, free, binding) = refused.expect("and it is refused before the floor");
-    assert_eq!(binding, Some(Binding::DiskFilling));
-    assert!(free > 40.0, "refused at {free:.1} GiB after {second} s");
-}
-
-#[test]
-fn a_fall_of_ten_gib_a_minute_from_150_gib_refuses_while_most_of_the_disk_is_free() {
-    // 2026-11-15: about 150 GiB to nothing in about fifteen minutes.
-    let mut replay = Replay::new();
-    let mut elevated = None;
-    let mut refused = None;
-    for i in 0..450u64 {
-        let free = falling(150.0, 10.0, i * 2);
-        if free < 20.0 {
+    let mut out = Outcome::default();
+    for i in 0..seconds / 2 {
+        let s = i * 2;
+        let at = free(s);
+        if at < 0.0 {
             break;
         }
-        let seen = replay.tick_gib(free);
-        if seen.verdict.tier >= Tier::Elevated && elevated.is_none() {
-            elevated = Some((i * 2, seen.free_gib));
+        if reset == Some(s) {
+            replay.tracker.reset();
         }
-        if !seen.verdict.admit && refused.is_none() {
-            refused = Some((i * 2, seen.free_gib, seen.verdict.binding));
+        let seen = replay.tick_gib(at);
+        let tier = seen.verdict.tier;
+        if tier >= Tier::Elevated {
+            out.shedding_s += 2;
+            out.elevated.get_or_insert((s, at));
+        }
+        if tier == Tier::Severe {
+            out.severe.get_or_insert((s, at));
+        }
+        if !seen.verdict.admit {
+            out.refused.get_or_insert((s, at));
+        }
+        if out.severe.is_some() && tier == Tier::Clear {
+            out.cleared_after_severe.get_or_insert(s);
         }
     }
-    let (second, free) = elevated.expect("it must shed");
-    assert!(free > 120.0, "shed at {free:.1} GiB after {second} s");
-    let (second, free, binding) = refused.expect("it must refuse");
-    assert_eq!(binding, Some(Binding::DiskFilling));
-    assert!(free > 100.0, "refused at {free:.1} GiB after {second} s");
+    out
+}
+
+/// How a pattern starts: 30 s into the run (cold), after ten flat minutes, or
+/// with the tracker reset at 300 s (a pattern already going on loses its
+/// history; a one-off burst follows the reset by 30 s).
+#[derive(Clone, Copy, Debug)]
+enum Start {
+    Cold,
+    Warm,
+    Reset,
+}
+
+impl Start {
+    const ALL: [Start; 3] = [Start::Cold, Start::Warm, Start::Reset];
+
+    /// Second the pattern begins, for a continuing pattern and for a burst.
+    fn begins(self, one_off: bool) -> u64 {
+        match (self, one_off) {
+            (Start::Cold, _) => 30,
+            (Start::Warm, _) => 630,
+            (Start::Reset, true) => 330,
+            (Start::Reset, false) => 30,
+        }
+    }
+
+    fn reset(self) -> Option<u64> {
+        matches!(self, Start::Reset).then_some(300)
+    }
+}
+
+/// Minutes until the 16 GiB floor at `average` GiB a minute from `free`.
+fn minutes_left(free: f64, average: f64) -> f64 {
+    (free - 16.0) / average
+}
+
+#[test]
+fn a_one_off_burst_never_refuses_and_sheds_for_a_bounded_time_at_every_start() {
+    // (from, GiB lost, seconds it took). Each is Elevated for at most three
+    // minutes, which is what shedding on a burst costs, and never Severe:
+    // refusing is for a fall that goes on, or a burst that ate what was left.
+    for (from, size, dur) in [
+        (70.0, 12.0, 30),
+        (100.0, 20.0, 10),
+        (50.0, 8.0, 30),
+        (100.0, 20.0, 60),
+        (120.0, 30.0, 90),
+    ] {
+        for start in Start::ALL {
+            let at = start.begins(true) + 70;
+            let out = drive(burst(from, size, dur, at), 1_200, start.reset());
+            let case = format!("{size} GiB over {dur} s from {from} GiB, {start:?}: {out:?}");
+            eprintln!("{case}");
+            assert_eq!(out.severe, None, "{case}");
+            assert_eq!(out.refused, None, "{case}");
+            assert!(out.shedding_s <= 180, "{case}");
+        }
+    }
+}
+
+#[test]
+fn smooth_falls_shed_as_early_as_before_and_refuse_with_minutes_to_spare() {
+    // (from, GiB/min, the shed no later than this free space, the refusal with
+    // at least this many true minutes left, and with more than this free).
+    for (from, rate, shed_by, minutes, refuse_above) in
+        [(99.0, 2.7, 91.0, 8.0, 0.0), (150.0, 10.0, 128.0, 6.0, 60.0)]
+    {
+        for start in Start::ALL {
+            let out = drive(
+                linear(from, rate, start.begins(false)),
+                2_400,
+                start.reset(),
+            );
+            let case = format!("{rate} GiB/min from {from} GiB, {start:?}: {out:?}");
+            eprintln!("{case}");
+            let (_, shed_free) = out.elevated.expect(&case);
+            assert!(shed_free >= shed_by, "{case}");
+            let (_, free) = out.refused.expect(&case);
+            assert!(minutes_left(free, rate) >= minutes, "{case}");
+            assert!(free > refuse_above, "{case}");
+            // A tracker reset forgets a fall that was already refused; nothing
+            // else lets go of it.
+            if let Some(second) = out.cleared_after_severe {
+                assert!(
+                    matches!(start, Start::Reset) && (300..=360).contains(&second),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_build_that_writes_in_lumps_is_a_fall_whatever_the_pauses_between() {
+    // (from GiB, GiB per lump, seconds a lump takes, seconds between lump
+    // starts, average GiB a minute). Shed with at least 20 true minutes left,
+    // refuse with at least 6, and never let go while the pattern goes on.
+    for (from, size, dur, every, average) in [
+        (100.0, 5.0, 1, 60, 5.0),
+        (150.0, 5.0, 1, 80, 3.75),
+        (150.0, 5.0, 1, 90, 5.0 / 1.5),
+        (99.0, 8.0 * 40.0 / 60.0, 40, 120, 8.0 * 40.0 / 120.0),
+        (150.0, 12.0, 30, 90, 8.0),
+    ] {
+        for start in Start::ALL {
+            let out = drive(
+                lumps(from, size, dur, every, start.begins(false)),
+                2_400,
+                start.reset(),
+            );
+            let case =
+                format!("{size} GiB over {dur} s every {every} s from {from}, {start:?}: {out:?}");
+            eprintln!("{case}");
+            // Shed with 20 true minutes left, or as soon as two minutes of
+            // history allow when the pattern starts with less than that.
+            let (shed_at, shed_free) = out.elevated.expect(&case);
+            assert!(
+                minutes_left(shed_free, average) >= 20.0 || shed_at <= start.begins(false) + 160,
+                "{case}"
+            );
+            let (_, free) = out.severe.expect(&case);
+            assert!(minutes_left(free, average) >= 6.0, "{case}");
+            if let Some(second) = out.cleared_after_severe {
+                assert!(
+                    matches!(start, Start::Reset) && (300..=360).contains(&second),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_disk_that_is_not_falling_never_refuses_and_a_write_then_delete_barely_sheds() {
+    for start in Start::ALL {
+        let begin = start.begins(false);
+        let cases: Vec<(&str, Pattern)> = vec![
+            ("flat", Box::new(|_| 60.0)),
+            (
+                "0.2 GiB/min",
+                Box::new(move |s| linear(60.0, 0.2, begin)(s)),
+            ),
+            (
+                "5 GiB written then deleted every 60 s",
+                Box::new(move |s| {
+                    if s >= begin && (s - begin) % 60 < 30 {
+                        55.0
+                    } else {
+                        60.0
+                    }
+                }),
+            ),
+        ];
+        for (name, free) in cases {
+            let out = drive(free, 1_800, start.reset());
+            let case = format!("{name}, {start:?}: {out:?}");
+            eprintln!("{case}");
+            assert_eq!(out.severe, None, "{case}");
+            assert_eq!(out.refused, None, "{case}");
+            assert!(out.shedding_s <= 60, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_repeating_burst_binds_at_a_stated_point_not_just_at_some_point() {
+    // 12 GiB over 30 s every 90 s from 150 GiB: 8 GiB a minute on average.
+    let out = drive(lumps(150.0, 12.0, 30, 90, 100), 1_800, None);
+    let (second, free) = out.elevated.expect("it sheds");
+    assert!(
+        (120..=900).contains(&second) && (125.0..=140.0).contains(&free),
+        "{out:?}"
+    );
+    let (second, free) = out.severe.expect("it refuses");
+    assert!(
+        (80.0..=110.0).contains(&free) && minutes_left(free, 8.0) >= 6.0,
+        "refused at second {second}, {free:.1} GiB: {out:?}"
+    );
 }
 
 #[test]

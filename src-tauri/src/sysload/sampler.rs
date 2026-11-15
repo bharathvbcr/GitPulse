@@ -526,7 +526,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                     fill(&mut snap, &mut sensor, &mut trend, &view);
                     let at_ms = snap.written.mono_ns / 1_000_000;
                     fill_tracker.observe(snap.written.boot_id, at_ms, snap.host.free_disk);
-                    snap.disk_fill_rate = fill_tracker.rate(at_ms);
+                    let rates = fill_tracker.rates(at_ms);
+                    snap.disk_fill_rate = rates.quick;
+                    snap.disk_fill_sustained = rates.sustained;
                     procs = Some(view);
                 } else {
                     // Off is not calm: the next run starts its thrash count
@@ -534,6 +536,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                     // samples hours old.
                     trend = CompressorTrend::default();
                     fill_tracker.reset();
+                    // Said as what it is: not an older build, not a calm disk.
+                    snap.disk_fill_rate = Reading::Unavailable(Why::Disabled);
+                    snap.disk_fill_sustained = Reading::Unavailable(Why::Disabled);
                 }
                 snap.tick = tick;
                 // The verdict the previous tick's count produced (pending on

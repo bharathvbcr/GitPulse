@@ -144,12 +144,16 @@ fn validation_names_the_input_and_the_rule_it_broke() {
     let mut t = Thresholds::default();
     t.load.elevated_at = 0.0;
     assert!(t.problem().unwrap().starts_with("load:"));
-    let mut t = Thresholds::default();
-    t.disk_auto = false;
+    let mut t = Thresholds {
+        disk_auto: false,
+        ..Thresholds::default()
+    };
     t.disk.severe_at = 30.0; // lower is worse: severe must not be above
     assert!(t.problem().unwrap().starts_with("disk:"));
-    let mut t = Thresholds::default();
-    t.disk_auto = false;
+    let mut t = Thresholds {
+        disk_auto: false,
+        ..Thresholds::default()
+    };
     t.disk.elevated_at = f64::INFINITY;
     assert!(t.problem().is_some());
 }
@@ -295,8 +299,10 @@ fn automatic_floors_are_a_stored_fact_not_an_inference_from_the_numbers() {
 
     // Explicit 20/10 equals the old defaults and is still stored and still
     // theirs: on a 64 GiB Mac it differs from the automatic 32/16.
-    let mut same = Thresholds::default();
-    same.disk_auto = false;
+    let same = Thresholds {
+        disk_auto: false,
+        ..Thresholds::default()
+    };
     let stored = same.to_stored();
     assert_eq!(
         stored["disk"],
@@ -369,6 +375,7 @@ fn the_fill_rule_modes_cap_what_the_projection_can_do() {
     let mut r = Readings::calm();
     r.free_disk = Reading::Value(40 << 30);
     r.disk_fill = Reading::Value(4 << 30);
+    r.disk_fill_sustained = Reading::Value(4 << 30);
     let mut t = Thresholds::default();
     assert_eq!(tier_of(&t, &r, Binding::DiskFilling), Some(Tier::Severe));
     t.disk_guard.fill.mode = InputMode::Shed;
@@ -389,17 +396,47 @@ fn the_fill_rule_modes_cap_what_the_projection_can_do() {
         Reading::Unavailable(Why::Unsupported),
     ] {
         r.disk_fill = rate;
+        r.disk_fill_sustained = rate;
         let t = Thresholds::default();
         assert_eq!(
             tier_of(&t, &r, Binding::DiskFilling),
-            Some(Tier::Clear).filter(|_| rate.value().is_some()),
+            rate.value().is_some().then_some(Tier::Clear),
             "{rate:?}"
         );
         assert!(t.assess(&r).warnings.is_empty(), "{rate:?}");
     }
     // A rate that could not be measured is said, never a pass.
     r.disk_fill = Reading::Unavailable(Why::Failed);
+    r.disk_fill_sustained = Reading::Unavailable(Why::Failed);
     assert!(Thresholds::default()
+        .assess(&r)
+        .warnings
+        .iter()
+        .any(|w| w.contains("the disk fill rate is unreadable")));
+}
+
+#[test]
+fn severe_needs_the_sustained_rate_and_a_quick_one_alone_only_sheds() {
+    // 40 GiB free, 6 minutes from the 16 GiB floor at 4 GiB a minute.
+    let mut r = Readings::calm();
+    r.free_disk = Reading::Value(40 << 30);
+    let t = Thresholds::default();
+
+    // A burst: the quick rate says so, the sustained one has not seen a fall.
+    r.disk_fill = Reading::Value(4 << 30);
+    r.disk_fill_sustained = Reading::Value(0);
+    assert_eq!(tier_of(&t, &r, Binding::DiskFilling), Some(Tier::Elevated));
+    r.disk_fill_sustained = Reading::Unavailable(Why::NotYet);
+    assert_eq!(tier_of(&t, &r, Binding::DiskFilling), Some(Tier::Elevated));
+
+    // Sustained, quick not there yet: Severe, from the sustained rate alone.
+    r.disk_fill = Reading::Unavailable(Why::NotYet);
+    r.disk_fill_sustained = Reading::Value(4 << 30);
+    assert_eq!(tier_of(&t, &r, Binding::DiskFilling), Some(Tier::Severe));
+
+    // A quick rate that failed is still said, whatever the sustained one reads.
+    r.disk_fill = Reading::Unavailable(Why::Failed);
+    assert!(t
         .assess(&r)
         .warnings
         .iter()

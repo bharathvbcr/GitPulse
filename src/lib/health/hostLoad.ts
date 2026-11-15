@@ -35,6 +35,8 @@ const WHY_LABEL: Record<Why, string> = {
   unreadable: "unreadable",
   failed: "couldn't read",
   not_yet: "pending",
+  disabled: "switched off",
+  older: "not published by this writer",
 };
 
 /** A reading in words: its value formatted, or why there is none. */
@@ -277,16 +279,23 @@ export function fillRateLine(snapshot: Snapshot | null, fill: DiskFill | null | 
   if (fill) return diskFillLine(fill);
   if (!snapshot) return null;
   const reading = snapshot.disk_fill_rate;
-  // A snapshot with no such field is one an older build wrote.
+  // This backend always emits the field, so a missing one is only ever a
+  // record an older build wrote and something re-serialised without it.
   if (!reading) return FILL_OLDER_BUILD;
   if (reading.status === "value") {
     return reading.value > 0 ? `Fill rate: ${fillRateLabel(reading.value)}` : "Fill rate: not falling";
   }
+  // Each reason is decided in Rust (`diskrate`, `sampler`, `snapshot`); this
+  // only words it.
   switch (reading.value) {
     case "not_yet":
       return "Fill rate: warming up";
-    case "unsupported":
+    case "disabled":
+      return "Fill rate: off (host load measurement is switched off)";
+    case "older":
       return FILL_OLDER_BUILD;
+    case "unsupported":
+      return "Fill rate: not available on this platform";
     default:
       return "Fill rate: not available (free disk space can't be read)";
   }

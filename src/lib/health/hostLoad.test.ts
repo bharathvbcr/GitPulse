@@ -329,10 +329,19 @@ describe("the fill rate line tells not measured from not falling", () => {
     expect(fillRateLine(snapshot({ status: "unavailable", value: "not_yet" }), null)).toBe("Fill rate: warming up");
   });
 
-  it("says the writing app is an older build, for an unsupported or an absent reading", () => {
+  it("says the writing app is an older build only for an older record or an absent field", () => {
     const older = "Fill rate: not available (the app writing the snapshot is an older build)";
-    expect(fillRateLine(snapshot({ status: "unavailable", value: "unsupported" }), null)).toBe(older);
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "older" }), null)).toBe(older);
     expect(fillRateLine(snapshot(undefined), null)).toBe(older);
+  });
+
+  it("says a switched-off sensor is off, and an unsupported platform is unsupported", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "disabled" }), null)).toBe(
+      "Fill rate: off (host load measurement is switched off)",
+    );
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "unsupported" }), null)).toBe(
+      "Fill rate: not available on this platform",
+    );
   });
 
   it("says the disk can't be read when it can't, and not falling only when it measured that", () => {

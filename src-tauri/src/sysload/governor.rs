@@ -316,6 +316,7 @@ impl Input {
             govern_launches,
             readings: snapshot.map_or_else(Readings::default, |s| Readings {
                 disk_fill: s.disk_fill_rate,
+                disk_fill_sustained: s.disk_fill_sustained,
                 ..Readings::of(&s.host)
             }),
             thresholds,

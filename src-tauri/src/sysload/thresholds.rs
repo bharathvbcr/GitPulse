@@ -537,6 +537,9 @@ pub struct Readings {
     /// (`diskrate`): not part of a host sample, because one sample cannot have
     /// a rate. `NotYet` while the tracker warms up or after a gap.
     pub disk_fill: Reading<u64>,
+    /// The sustained rate Severe decides on: one burst cannot fake it and a
+    /// pause cannot hide it (`diskrate`).
+    pub disk_fill_sustained: Reading<u64>,
 }
 
 impl Readings {
@@ -551,6 +554,7 @@ impl Readings {
             free_disk: host.free_disk,
             segments: host.compressor_segments,
             disk_fill: Reading::default(),
+            disk_fill_sustained: Reading::default(),
         }
     }
 
@@ -576,6 +580,7 @@ impl Readings {
                 limit: 100,
             }),
             disk_fill: Reading::Value(0),
+            disk_fill_sustained: Reading::Value(0),
         }
     }
 
@@ -624,7 +629,9 @@ enum Gap {
 fn value_or_gap<T: Copy>(reading: Reading<T>) -> Result<T, Gap> {
     match reading {
         Reading::Value(v) => Ok(v),
-        Reading::Unavailable(Why::Unsupported | Why::NotYet) => Err(Gap::Silent),
+        Reading::Unavailable(Why::Unsupported | Why::NotYet | Why::Disabled | Why::Older) => {
+            Err(Gap::Silent)
+        }
         Reading::Unavailable(Why::Unreadable | Why::Failed) => Err(Gap::Failed),
     }
 }
@@ -685,32 +692,48 @@ pub struct DiskFill {
 }
 
 impl Thresholds {
-    /// The projection from the writer's measured rate, for these (already
-    /// resolved) thresholds. `Ok(None)` when the disk is not falling fast
+    /// The projection from the writer's measured rates, for these (already
+    /// resolved) thresholds: Elevated from the quick rate, Severe only from the
+    /// sustained one, because shedding on a burst was always acceptable and
+    /// refusing on one is not. `Ok(None)` when the disk is not falling fast
     /// enough to project.
     fn fill_projection(&self, readings: &Readings) -> Result<Option<DiskFill>, Gap> {
-        let rate = value_or_gap(readings.disk_fill)?;
+        let sustained = readings.disk_fill_sustained.value();
+        // A rate that was attempted and failed is said; one that is not there
+        // yet is silent, and the sustained rate may still be.
+        let quick = match (value_or_gap(readings.disk_fill), sustained) {
+            (Ok(rate), _) => rate,
+            (Err(Gap::Failed), _) | (Err(Gap::Silent), None) => {
+                return value_or_gap(readings.disk_fill).map(|_| None);
+            }
+            (Err(Gap::Silent), Some(_)) => 0,
+        };
         let free = value_or_gap(readings.free_disk)?;
-        if rate < MIN_FILL_BYTES_PER_MIN {
-            return Ok(None);
-        }
+        let sustained = sustained.unwrap_or(0);
         let floor = self.disk.severe_at * GIB;
-        let eta_min = if (free as f64) <= floor {
-            0.0
-        } else {
-            (free as f64 - floor) / rate as f64
+        let eta = |rate: u64| {
+            if (free as f64) <= floor {
+                0.0
+            } else {
+                (free as f64 - floor) / rate as f64
+            }
         };
         let guard = &self.disk_guard.fill;
-        let tier = if eta_min < guard.severe_within_min {
-            Tier::Severe
-        } else if eta_min < guard.elevated_within_min {
-            Tier::Elevated
+        let severe =
+            sustained >= MIN_FILL_BYTES_PER_MIN && eta(sustained) < guard.severe_within_min;
+        let elevated = quick >= MIN_FILL_BYTES_PER_MIN && eta(quick) < guard.elevated_within_min;
+        let (rate, tier) = if severe {
+            (sustained, Tier::Severe)
+        } else if elevated {
+            (quick, Tier::Elevated)
+        } else if quick.max(sustained) >= MIN_FILL_BYTES_PER_MIN {
+            (quick.max(sustained), Tier::Clear)
         } else {
-            Tier::Clear
+            return Ok(None);
         };
         Ok(Some(DiskFill {
             rate_bytes_per_min: rate,
-            eta_min,
+            eta_min: eta(rate),
             free_bytes: free,
             floor_bytes: floor as u64,
             tier,

@@ -79,6 +79,8 @@ export function hostLoadStatusFixture(): HostLoadStatus {
       memguard_pid: 0,
       orphans: 0,
       tick,
+      disk_fill_rate: value(0),
+      disk_fill_sustained: value(0),
       verdict: value({ tier: "clear", binding: null, admit: true, shed_background: false, shed_reactive: false }),
     },
     procs: null,

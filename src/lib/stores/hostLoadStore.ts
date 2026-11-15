@@ -18,7 +18,7 @@ import { diagnostics } from "../diagnostics/diagnostics";
  * reads.
  */
 
-export type Why = "unsupported" | "unreadable" | "failed" | "not_yet";
+export type Why = "unsupported" | "unreadable" | "failed" | "not_yet" | "disabled" | "older";
 /** `sysload::Reading<T>`: a value, or why there is none. */
 export type Reading<T> = { status: "value"; value: T } | { status: "unavailable"; value: Why };
 export type Level = "normal" | "warn" | "critical";
@@ -135,8 +135,14 @@ export interface Snapshot {
   memguard_pid: number;
   orphans: number;
   tick: TickStats;
-  /** Bytes of free disk lost per minute, as the writer measured it. */
+  /**
+   * Bytes of free disk lost per minute, as the writer measured it (the quick
+   * rate, which Elevated decides on). Optional only for a record an older build
+   * wrote: this backend always emits it, and says why when there is no value.
+   */
   disk_fill_rate?: Reading<number>;
+  /** The sustained rate, which Severe decides on: one burst cannot fake it. */
+  disk_fill_sustained?: Reading<number>;
   /**
    * The app's held governor verdict, for readers with no history (the hook,
    * `gitpulse-mcp`). One tick behind the readings: the sampler publishes, then
@@ -361,6 +367,8 @@ export interface TraceRecord {
   free_disk: number | null;
   /** Bytes of free space lost per minute, or null when it was not measured. */
   disk_fill_rate?: number | null;
+  /** The sustained rate Severe decides on, or null when it was not measured. */
+  disk_fill_sustained?: number | null;
   launched_sessions: number | null;
   observed_sessions: number | null;
   largest_foreign: number | null;

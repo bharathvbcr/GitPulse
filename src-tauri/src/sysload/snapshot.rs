@@ -146,10 +146,15 @@ const OFF_X_SEG_LIMIT: usize = 684;
 // The exact binding when the byte at `OFF_X_BINDING` is the nearest one older
 // readers know (`Binding::wire`); 0 when that byte is the whole truth.
 const OFF_X_BINDING_EXACT: usize = 692;
-// How the disk fill rate reads: 0 not published, 1 a value, 2 not yet, 3 failed.
+// How the two disk fill rates read, each: 0 not published (a writer from before
+// it), 1 a value, 2 not yet, 3 the disk could not be read, 4 this platform has
+// no reader, 5 measurement is switched off.
 const OFF_X_FILL_STATUS: usize = 693;
-// Bytes of free disk lost per minute, when `OFF_X_FILL_STATUS` is 1.
+const OFF_X_FILL_SUSTAINED_STATUS: usize = 694;
+// MiB of free disk lost per minute, as little endian u32, when the matching
+// status is 1: the quick rate, then the sustained one.
 const OFF_X_FILL_RATE: usize = 696;
+const OFF_X_FILL_SUSTAINED_RATE: usize = 700;
 const OFF_X_CHECKSUM: usize = 704;
 
 // One status byte per reading: 0 is a value, else a `Why` code.
@@ -185,7 +190,7 @@ const _: () = assert!(OFF_WRITER_PATH + PATH_FIELD_LEN == OFF_STATUS);
 const _: () = assert!(S_MAX_TREE_WRATE < OFF_PRESSURE - OFF_STATUS);
 const _: () = assert!(OFF_SAMPLER_CPU + 8 == OFF_CHECKSUM);
 const _: () = assert!(OFF_X_SEG_LIMIT + 8 <= OFF_X_BINDING_EXACT);
-const _: () = assert!(OFF_X_FILL_RATE + 8 == OFF_X_CHECKSUM);
+const _: () = assert!(OFF_X_FILL_SUSTAINED_RATE + 4 == OFF_X_CHECKSUM);
 const _: () = assert!(OFF_X_CHECKSUM + 8 == EXTENDED_LEN);
 
 const FLAG_ENABLED: u32 = 1;
@@ -286,9 +291,15 @@ pub struct Snapshot {
     pub tick: TickStats,
     /// Bytes of free disk lost per minute (`diskrate`), measured by the
     /// writer, which alone holds the history: a reader with none (the hook, a
-    /// second GitPulse) still has the rate. Unsupported in a record that
-    /// predates it, or while the sensor is switched off.
+    /// second GitPulse) still has the rate. Each unavailable reading says why:
+    /// `Older` in a record from before it, `Disabled` while the sensor is
+    /// switched off, `Unsupported` on a platform with no disk reader, `Failed`
+    /// for a disk that cannot be read, `NotYet` while history builds. This is
+    /// the quick rate, which Elevated decides on.
     pub disk_fill_rate: Reading<u64>,
+    /// The sustained rate, which Severe decides on (`diskrate`): the one a
+    /// single burst cannot fake and a pause cannot hide.
+    pub disk_fill_sustained: Reading<u64>,
     /// The app's held governor verdict (see [`PublishedVerdict`]). Pending on
     /// a writer's first tick, unsupported in a version-1 record or while the
     /// sensor is switched off.
@@ -326,6 +337,7 @@ impl Snapshot {
             orphans: 0,
             tick: TickStats::default(),
             disk_fill_rate: Reading::default(),
+            disk_fill_sustained: Reading::default(),
             verdict: Reading::default(),
         }
     }
@@ -498,17 +510,52 @@ fn encode_extension(b: &mut [u8], snap: &Snapshot, seq: u64) {
         }
         Reading::Unavailable(why) => b[OFF_X_VERDICT_STATUS] = why.code(),
     }
-    match snap.disk_fill_rate {
-        Reading::Value(rate) => {
-            b[OFF_X_FILL_STATUS] = 1;
-            put_u64(b, OFF_X_FILL_RATE, rate);
-        }
-        Reading::Unavailable(Why::NotYet) => b[OFF_X_FILL_STATUS] = 2,
-        Reading::Unavailable(Why::Unreadable | Why::Failed) => b[OFF_X_FILL_STATUS] = 3,
-        Reading::Unavailable(Why::Unsupported) => b[OFF_X_FILL_STATUS] = 0,
-    }
+    put_fill(b, OFF_X_FILL_STATUS, OFF_X_FILL_RATE, snap.disk_fill_rate);
+    put_fill(
+        b,
+        OFF_X_FILL_SUSTAINED_STATUS,
+        OFF_X_FILL_SUSTAINED_RATE,
+        snap.disk_fill_sustained,
+    );
     let sum = ext_checksum(b, seq);
     put_u64(b, OFF_X_CHECKSUM, sum);
+}
+
+/// One fill rate: its status byte and, for a value, MiB a minute (the most
+/// the field holds is 4 PiB a minute).
+fn put_fill(b: &mut [u8], status_at: usize, rate_at: usize, reading: Reading<u64>) {
+    match reading {
+        Reading::Value(rate) => {
+            b[status_at] = 1;
+            let mib = u32::try_from(rate >> 20).unwrap_or(u32::MAX);
+            b[rate_at..rate_at + 4].copy_from_slice(&mib.to_le_bytes());
+        }
+        Reading::Unavailable(Why::NotYet) => b[status_at] = 2,
+        Reading::Unavailable(Why::Unreadable | Why::Failed) => b[status_at] = 3,
+        Reading::Unavailable(Why::Unsupported) => b[status_at] = 4,
+        Reading::Unavailable(Why::Disabled) => b[status_at] = 5,
+        // A writer never says "older"; zero is what an older writer left.
+        Reading::Unavailable(Why::Older) => b[status_at] = 0,
+    }
+}
+
+/// The reading [`put_fill`] wrote.
+fn get_fill(b: &[u8], status_at: usize, rate_at: usize) -> Reading<u64> {
+    match b[status_at] {
+        1 => Reading::Value(
+            u64::from(u32::from_le_bytes([
+                b[rate_at],
+                b[rate_at + 1],
+                b[rate_at + 2],
+                b[rate_at + 3],
+            ])) << 20,
+        ),
+        2 => Reading::Unavailable(Why::NotYet),
+        3 => Reading::Unavailable(Why::Failed),
+        4 => Reading::Unavailable(Why::Unsupported),
+        5 => Reading::Unavailable(Why::Disabled),
+        _ => Reading::Unavailable(Why::Older),
+    }
 }
 
 /// FNV-1a over the extension's bytes, with the sequence mixed in.
@@ -697,7 +744,8 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
     {
         return Err(SnapshotError::Torn);
     }
-    let (segments, verdict, disk_fill_rate) = decode_extension(buf, version, length, seq)?;
+    let (segments, verdict, disk_fill_rate, disk_fill_sustained) =
+        decode_extension(buf, version, length, seq)?;
     let flags = get_u32(buf, OFF_FLAGS);
     let platform = Platform::from_code((flags & FLAG_PLATFORM_MASK) >> FLAG_PLATFORM_SHIFT)
         .unwrap_or(Platform::Unavailable);
@@ -802,6 +850,7 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
             cpu_ns: get_u64(buf, OFF_SAMPLER_CPU),
         },
         disk_fill_rate,
+        disk_fill_sustained,
         verdict,
     })
 }
@@ -816,10 +865,11 @@ fn ext_reading<T>(status: u8, read: impl FnOnce() -> Option<T>) -> Reading<T> {
 }
 
 /// What the extension block carries: compressor segments, the held verdict and
-/// the disk fill rate.
+/// the two disk fill rates.
 type Extension = (
     Reading<CompressorSegments>,
     Reading<PublishedVerdict>,
+    Reading<u64>,
     Reading<u64>,
 );
 
@@ -838,7 +888,8 @@ fn decode_extension(
         || buf.len() < EXTENDED_LEN
         || buf[OFF_EXT..OFF_EXT + 4] != EXT_MAGIC
     {
-        return Ok((Reading::default(), Reading::default(), Reading::default()));
+        let older = Reading::Unavailable(Why::Older);
+        return Ok((Reading::default(), Reading::default(), older, older));
     }
     if get_u64(buf, OFF_X_CHECKSUM) != ext_checksum(buf, seq) {
         return Err(SnapshotError::Torn);
@@ -863,13 +914,9 @@ fn decode_extension(
             shed_reactive: flag(OFF_X_SHED_REACTIVE)?,
         })
     });
-    let fill = match buf[OFF_X_FILL_STATUS] {
-        1 => Reading::Value(get_u64(buf, OFF_X_FILL_RATE)),
-        2 => Reading::Unavailable(Why::NotYet),
-        3 => Reading::Unavailable(Why::Failed),
-        _ => Reading::default(),
-    };
-    Ok((segments, verdict, fill))
+    let fill = get_fill(buf, OFF_X_FILL_STATUS, OFF_X_FILL_RATE);
+    let sustained = get_fill(buf, OFF_X_FILL_SUSTAINED_STATUS, OFF_X_FILL_SUSTAINED_RATE);
+    Ok((segments, verdict, fill, sustained))
 }
 
 #[cfg(unix)]
@@ -1155,7 +1202,8 @@ mod tests {
         s.memguard_warn = true;
         s.memguard_pid = 68214;
         s.orphans = 1;
-        s.disk_fill_rate = Reading::Value(2_899_102_924);
+        s.disk_fill_rate = Reading::Value(2_899_102_924 & !((1 << 20) - 1));
+        s.disk_fill_sustained = Reading::Value(1 << 30);
         s.verdict = Reading::Value(PublishedVerdict {
             tier: Tier::Severe,
             binding: Some(Binding::Swap),
@@ -1213,7 +1261,9 @@ mod tests {
 
     fn with_binding(binding: Option<Binding>) -> Snapshot {
         let mut snap = full(clock(50));
-        snap.disk_fill_rate = Reading::Unavailable(Why::Unsupported);
+        // What a writer from before the rates left in those bytes: zero.
+        snap.disk_fill_rate = Reading::Unavailable(Why::Older);
+        snap.disk_fill_sustained = Reading::Unavailable(Why::Older);
         snap.verdict = Reading::Value(PublishedVerdict {
             tier: Tier::Elevated,
             binding,
@@ -1326,23 +1376,49 @@ mod tests {
     }
 
     #[test]
-    fn the_fill_rate_round_trips_with_its_reason_and_older_records_say_unsupported() {
+    fn the_fill_rates_round_trip_with_their_reasons_and_older_records_say_older() {
+        let mib = |n: u64| Reading::Value(n << 20);
         for rate in [
             Reading::Value(0),
-            Reading::Value(2_899_102_924),
+            mib(2_765),
             Reading::Unavailable(Why::NotYet),
             Reading::Unavailable(Why::Failed),
             Reading::Unavailable(Why::Unsupported),
+            Reading::Unavailable(Why::Disabled),
         ] {
             let mut snap = full(clock(50));
             snap.disk_fill_rate = rate;
+            snap.disk_fill_sustained = rate;
             let back = decode_as(&encode(&snap, 10), MIN_READ_VERSION, RECORD_LEN).unwrap();
             assert_eq!(back.disk_fill_rate, rate);
+            assert_eq!(back.disk_fill_sustained, rate);
         }
-        // A version-1 record has no extension: nothing published, not a zero.
+        // The two are independent.
+        let mut snap = full(clock(50));
+        snap.disk_fill_rate = mib(4_096);
+        snap.disk_fill_sustained = Reading::Unavailable(Why::NotYet);
+        let back = decode_as(&encode(&snap, 10), MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(back.disk_fill_rate, mib(4_096));
+        assert_eq!(back.disk_fill_sustained, Reading::Unavailable(Why::NotYet));
+        // A version-1 record has no extension: nothing published, which is
+        // not a zero and not an unsupported platform.
         let v1 = encode_v1(&full(clock(50)), 10);
         let back = decode_as(&v1, MIN_READ_VERSION, RECORD_LEN).unwrap();
-        assert_eq!(back.disk_fill_rate, Reading::Unavailable(Why::Unsupported));
+        assert_eq!(back.disk_fill_rate, Reading::Unavailable(Why::Older));
+        assert_eq!(back.disk_fill_sustained, Reading::Unavailable(Why::Older));
+    }
+
+    #[test]
+    fn an_extension_written_before_the_fill_rates_reads_older_not_unsupported() {
+        // The status bytes an earlier writer left are zero.
+        let mut b = encode(&full(clock(50)), 10);
+        b[OFF_X_FILL_STATUS] = 0;
+        b[OFF_X_FILL_SUSTAINED_STATUS] = 0;
+        let sum = ext_checksum(&b, 10);
+        put_u64(&mut b, OFF_X_CHECKSUM, sum);
+        let back = decode_as(&b, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(back.disk_fill_rate, Reading::Unavailable(Why::Older));
+        assert_eq!(back.disk_fill_sustained, Reading::Unavailable(Why::Older));
     }
 
     #[test]
