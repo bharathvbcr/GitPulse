@@ -311,6 +311,37 @@ impl SessionLedger {
         changed
     }
 
+    /// Marks a tab GitPulse closed on the person's click to give its memory back
+    /// (`sysload::activity::park`) as [`SessionEndState::AppQuit`], so it is
+    /// offered for reopening with its conversation resumed and the hangup
+    /// that follows cannot overwrite it ([`Self::record_exit`] never does).
+    /// Unlike [`Self::mark_user_closed`] it is never withdrawn: a parked
+    /// session is meant to come back. Returns whether a row changed.
+    pub fn mark_parked(&self, terminal_id: &str) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = now_ms();
+        let mut changed = false;
+        for entry in guard.entries.iter_mut().rev() {
+            let Entry::Valid(row) = entry else { continue };
+            if row.terminal_id.as_deref() != Some(terminal_id) {
+                continue;
+            }
+            row.end_state = SessionEndState::AppQuit;
+            row.withdrawn = false;
+            row.ended_at = Some(now);
+            ensure_agy_fallback(row);
+            changed = true;
+            break;
+        }
+        if changed {
+            self.persist_locked(&guard.entries);
+        }
+        changed
+    }
+
     /// Marks every non-withdrawn `Running` row as [`SessionEndState::AppQuit`]
     /// synchronously and flushes to disk before teardown sends `SIGHUP`.
     pub fn mark_app_quit(&self) -> usize {
@@ -1113,6 +1144,38 @@ mod tests {
             assert_eq!(offer.mode.as_deref(), Some("edit"));
             assert!(offer.resumable);
         }
+    }
+
+    #[test]
+    fn a_parked_session_is_offered_for_reopening_and_the_hangup_cannot_withdraw_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let ledger = SessionLedger::open(&ledger_path);
+        ledger.record_spawn(spawn_spec("term-1-0", "claude", Some(UUID_1), &repo, None));
+        ledger.record_spawn(spawn_spec("term-1-1", "claude", Some(UUID_2), &repo, None));
+        // The person closed the second tab with Close: it is withdrawn.
+        assert!(ledger.mark_user_closed("term-1-1"));
+        // The first was parked; GitPulse's own hangup arrives afterwards.
+        assert!(ledger.mark_parked("term-1-0"));
+        assert!(!ledger.record_exit("term-1-0", true, None, Some("Hangup: 1")));
+        assert!(
+            !ledger.mark_parked("term-nope"),
+            "an unknown tab changes nothing"
+        );
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1, "only the parked tab is offered");
+        assert_eq!(view.offers[0].terminal_id.as_deref(), Some("term-1-0"));
+        assert_eq!(view.offers[0].end_state, SessionEndState::AppQuit);
+        assert!(view.offers[0].resumable);
+        // It survives a relaunch, which reconciles only what was running.
+        let relaunched = SessionLedger::open(&ledger_path);
+        assert_eq!(relaunched.reconcile_startup(&HashSet::new()), 0);
+        assert_eq!(
+            relaunched.view_with(|_, _| Transcript::Found).offers.len(),
+            1
+        );
     }
 
     #[test]

@@ -716,31 +716,17 @@ where
     leases.to_stored().serialize(serializer)
 }
 
-/// What GitPulse does about an idle agent session under load.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdleMode {
-    /// Health lists idle sessions and what they hold. Nothing is stopped.
-    #[default]
-    Advise,
-    /// Under an elevated or severe load, a session GitPulse launched that has
-    /// been idle past `park_after_s` and can be resumed is parked. An observed
-    /// session is never parked.
-    Park,
-}
-
 /// How an idle session is recognised and what is done about it. Stored as its
 /// own top-level key, `host_load_idle`, only where it differs from the
 /// default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostLoadIdle {
-    #[serde(default)]
-    pub mode: IdleMode,
     /// Seconds a session must have been waiting, and its terminal quiet,
     /// before it is called idle.
     #[serde(default = "default_idle_after")]
     pub idle_after_s: u64,
-    /// Seconds idle before `park` mode parks it.
+    /// Seconds idle before Health offers Park for it. Nothing is parked on
+    /// its own: a park is always a person's click and a system dialog.
     #[serde(default = "default_park_after")]
     pub park_after_s: u64,
 }
@@ -756,7 +742,6 @@ fn default_park_after() -> u64 {
 impl Default for HostLoadIdle {
     fn default() -> Self {
         Self {
-            mode: IdleMode::Advise,
             idle_after_s: default_idle_after(),
             park_after_s: default_park_after(),
         }
@@ -801,7 +786,6 @@ impl HostLoadIdle {
                 }
             }
         }
-        field(object, "mode", &mut idle.mode);
         field(object, "idle_after_s", &mut idle.idle_after_s);
         field(object, "park_after_s", &mut idle.park_after_s);
         if let Some(problem) = idle.problem() {
@@ -817,9 +801,6 @@ impl HostLoadIdle {
     pub fn to_stored(&self) -> serde_json::Value {
         let default = Self::default();
         let mut object = serde_json::Map::new();
-        if self.mode != default.mode {
-            object.insert("mode".into(), serde_json::json!(self.mode));
-        }
         if self.idle_after_s != default.idle_after_s {
             object.insert("idle_after_s".into(), self.idle_after_s.into());
         }
@@ -2283,7 +2264,7 @@ mod tests {
                     ..HostLoadLeases::default()
                 },
                 idle: HostLoadIdle {
-                    mode: IdleMode::Park,
+                    park_after_s: 7_200,
                     ..HostLoadIdle::default()
                 },
                 ..HostLoadSettings::default()
@@ -2298,7 +2279,7 @@ mod tests {
             );
             assert_eq!(
                 stored["host_load_idle"],
-                serde_json::json!({"mode": "park"})
+                serde_json::json!({"park_after_s": 7200})
             );
             assert!(
                 stored.get("host_load").is_none(),
@@ -2306,7 +2287,7 @@ mod tests {
             );
             let loaded = host_load_settings();
             assert_eq!((loaded.leases.slots, loaded.leases.wait_max_s), (2, 1_800));
-            assert_eq!(loaded.idle.mode, IdleMode::Park);
+            assert_eq!(loaded.idle.park_after_s, 7_200);
             assert_eq!(host_load_leases().slots, 2);
 
             set_host_load_settings(HostLoadSettings::default()).unwrap();

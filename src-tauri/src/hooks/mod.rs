@@ -51,6 +51,13 @@ pub mod deliver;
 mod heavy_commands;
 #[cfg(unix)]
 pub mod lease_wrapper;
+
+/// Whether `program args` is a build that takes a build slot: the one reading
+/// of the heavy table (`heavy_commands::leased`) the lease wrapper acts on and
+/// Health counts unleased builds by.
+pub(crate) fn build_is_leased(program: &str, args: &[String]) -> bool {
+    heavy_commands::leased(program, args)
+}
 mod load_gate;
 pub(crate) mod notify_drops;
 mod notify_input;

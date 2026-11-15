@@ -1205,6 +1205,7 @@ mod tests {
             tree: None,
             run_id: None,
             parent_pid: None,
+            cpu_rate: crate::sysload::Reading::Value(0),
             footprint: crate::sysload::Reading::Value(1),
             members: 1,
             unreadable_members: 0,

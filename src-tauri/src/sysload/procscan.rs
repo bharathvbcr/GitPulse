@@ -752,6 +752,10 @@ pub struct AgentSession {
     /// read the same. A direct same-kind parent is a wrapper (this process
     /// would not be a session), so it is never reported here.
     pub parent_pid: Option<i32>,
+    /// CPU time the session and its descendants used per second since the
+    /// previous tick, in nanoseconds (a full core is 1,000,000,000). Not a
+    /// rate on the first tick, and unreadable when any member's CPU time was.
+    pub cpu_rate: Reading<u64>,
     /// The session's own process plus every descendant still attached.
     pub footprint: Reading<u64>,
     pub members: u32,
@@ -772,6 +776,9 @@ pub struct LaunchedTree {
     pub footprint: Reading<u64>,
     /// Bytes per second written since the previous tick.
     pub write_rate: Reading<u64>,
+    /// CPU nanoseconds per second used since the previous tick (see
+    /// [`AgentSession::cpu_rate`]).
+    pub cpu_rate: Reading<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -939,6 +946,8 @@ pub struct Scanner {
     tree_names: Vec<String>,
     written_before: HashMap<(i32, u64), u64>,
     written_now: HashMap<(i32, u64), u64>,
+    cpu_before: HashMap<(i32, u64), u64>,
+    cpu_now: HashMap<(i32, u64), u64>,
     previous_us: Option<u64>,
 }
 
@@ -955,6 +964,8 @@ impl Scanner {
             tree_names: Vec::new(),
             written_before: HashMap::with_capacity(4096),
             written_now: HashMap::with_capacity(4096),
+            cpu_before: HashMap::with_capacity(4096),
+            cpu_now: HashMap::with_capacity(4096),
             previous_us: None,
         }
     }
@@ -980,6 +991,7 @@ impl Scanner {
         let view = self.summarise(ctx, me_uid, &sessions_at);
         self.previous_us = Some(ctx.now_us);
         std::mem::swap(&mut self.written_before, &mut self.written_now);
+        std::mem::swap(&mut self.cpu_before, &mut self.cpu_now);
         view
     }
 
@@ -1120,6 +1132,10 @@ impl Scanner {
             readable: u32,
             unreadable: u32,
             written: u64,
+            /// CPU nanoseconds since the previous tick.
+            cpu: u64,
+            /// A member's CPU time could not be read, so the sum is not one.
+            cpu_unread: bool,
         }
         impl Sum {
             fn add(&mut self, footprint: Reading<u64>) {
@@ -1152,6 +1168,7 @@ impl Scanner {
         let mut orphan_candidates = Vec::new();
         let mut memguard: Option<usize> = None;
         self.written_now.clear();
+        self.cpu_now.clear();
 
         for i in 0..self.facts.len() {
             let f = &self.facts[i];
@@ -1173,18 +1190,39 @@ impl Scanner {
                     _ => 0,
                 };
             }
+            // The same for CPU time, with one difference: a reading that could
+            // not be taken makes the sum of the tree it is in unreadable
+            // instead of counting as zero.
+            let (mut cpu_delta, mut cpu_unread) = (0u64, false);
+            match f.cpu_ns {
+                Reading::Value(now) => {
+                    let id = (f.pid, f.start_us);
+                    self.cpu_now.insert(id, now);
+                    cpu_delta = match (self.cpu_before.get(&id), self.previous_us) {
+                        (Some(before), _) => now.saturating_sub(*before),
+                        (None, Some(prev)) if f.start_us > prev => now,
+                        _ => 0,
+                    };
+                }
+                Reading::Unavailable(_) => cpu_unread = true,
+            }
             match self.tree_of[i] {
                 Some(t) => {
                     let sum = &mut trees[t as usize];
                     sum.add(f.footprint);
                     sum.written = sum.written.saturating_add(written_delta);
+                    sum.cpu = sum.cpu.saturating_add(cpu_delta);
+                    sum.cpu_unread |= cpu_unread;
                     launched.add(f.footprint);
                 }
                 None if self.session_of[i].is_some() => observed.add(f.footprint),
                 None => {}
             }
             if let Some(s) = self.session_of[i] {
-                per_session[s as usize].add(f.footprint);
+                let sum = &mut per_session[s as usize];
+                sum.add(f.footprint);
+                sum.cpu = sum.cpu.saturating_add(cpu_delta);
+                sum.cpu_unread |= cpu_unread;
             }
             if f.ident.memguard
                 && memguard.is_none_or(|m| {
@@ -1233,6 +1271,14 @@ impl Scanner {
             ),
             None => Reading::Unavailable(Why::NotYet),
         };
+        // CPU nanoseconds per second: the delta over the tick's microseconds.
+        let cpu_rate = |sum: &Sum| match dt_us {
+            _ if sum.cpu_unread => Reading::Unavailable(Why::Unreadable),
+            Some(dt) => Reading::Value(
+                u64::try_from(u128::from(sum.cpu) * 1_000_000 / u128::from(dt)).unwrap_or(u64::MAX),
+            ),
+            None => Reading::Unavailable(Why::NotYet),
+        };
         let mut launched_written = 0u64;
         let mut max_tree: Reading<u64> = if dt_us.is_some() {
             Reading::Value(0)
@@ -1260,6 +1306,7 @@ impl Scanner {
                 unreadable_members: sum.unreadable,
                 footprint: sum.reading(),
                 write_rate,
+                cpu_rate: cpu_rate(sum),
             });
         }
         tree_rows.sort_by(|a, b| a.tree.cmp(&b.tree));
@@ -1312,6 +1359,7 @@ impl Scanner {
                     },
                     |pid| session_pids.contains(&pid),
                 ),
+                cpu_rate: cpu_rate(&sum),
                 footprint: sum.reading(),
                 members: sum.readable + sum.unreadable,
                 unreadable_members: sum.unreadable,
@@ -1680,8 +1728,10 @@ fn assemble_sessions(
                 |pid| links.get(&pid).copied(),
                 |pid| session_pids.contains(&pid),
             ),
-            // This path does not read footprints. Unavailable is the
-            // not-measured signal; zero would say the session uses no memory.
+            // This path reads neither footprints nor CPU time. Unavailable is
+            // the not-measured signal; zero would say the session uses no
+            // memory and is not running.
+            cpu_rate: Reading::Unavailable(Why::Unsupported),
             footprint: Reading::Unavailable(Why::Unsupported),
             members: 1,
             unreadable_members: 0,
@@ -4463,6 +4513,56 @@ pub(crate) mod tests {
         facts.lock().unwrap()[0].written = Reading::Value(5);
         let third = scan.scan(&ctx(14_000_000));
         assert_eq!(third.launched_write_rate, Reading::Value(0));
+    }
+
+    #[test]
+    fn tree_cpu_rate_is_a_delta_and_unreadable_on_first_tick() {
+        let (mut scan, facts) = scanner(vec![P {
+            env: &["GITPULSE_RUN_ID=c"],
+            cpu_ns: 5_000_000_000,
+            ..p(20, 1, CLAUDE)
+        }]);
+        let first = scan.scan(&ctx(10_000_000));
+        // CPU used before the sampler started is not a rate.
+        let tree = |view: &ProcView| {
+            view.trees
+                .iter()
+                .find(|t| t.tree == "run:c")
+                .unwrap()
+                .cpu_rate
+        };
+        assert_eq!(tree(&first), Reading::Unavailable(Why::NotYet));
+        assert_eq!(
+            first.sessions[0].cpu_rate,
+            Reading::Unavailable(Why::NotYet)
+        );
+        {
+            let mut f = facts.lock().unwrap();
+            f[0].cpu_ns = Reading::Value(6_000_000_000);
+            // A child born after the first tick: all its CPU is new.
+            f.extend(facts_of(vec![P {
+                env: &["GITPULSE_RUN_ID=c"],
+                cpu_ns: 500_000_000,
+                start_us: 11_000_000,
+                ..p(21, 20, "/usr/bin/cc")
+            }]));
+        }
+        let second = scan.scan(&ctx(12_000_000));
+        // 1.5 s of CPU over 2 s: three quarters of a core.
+        assert_eq!(tree(&second), Reading::Value(750_000_000));
+        assert_eq!(second.sessions[0].cpu_rate, Reading::Value(750_000_000));
+        // A counter that went down is never a negative rate, and a member
+        // whose CPU time cannot be read makes the sum unreadable, not zero.
+        facts.lock().unwrap()[0].cpu_ns = Reading::Value(1);
+        let third = scan.scan(&ctx(14_000_000));
+        assert_eq!(tree(&third), Reading::Value(0));
+        facts.lock().unwrap()[1].cpu_ns = Reading::Unavailable(Why::Unreadable);
+        let fourth = scan.scan(&ctx(16_000_000));
+        assert_eq!(tree(&fourth), Reading::Unavailable(Why::Unreadable));
+        assert_eq!(
+            fourth.sessions[0].cpu_rate,
+            Reading::Unavailable(Why::Unreadable)
+        );
     }
 
     #[test]

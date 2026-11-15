@@ -40,7 +40,8 @@ use super::advisory_once::{marker_dir, private_dir, prune};
 use super::heavy_commands::leased;
 use super::load_gate::{availability_live, Availability};
 use crate::sysload::lease::{
-    self, capacity, may_take, order, session_of, Capacity, Dir, Grant, Load, Own, Record, Waiter,
+    self, capacity, may_take, order, session_of, Dir, Grant, LeaseCapacity, LeaseRecord,
+    LeaseWaiter, Load, Own,
 };
 use crate::sysload::Clock;
 use crate::tool_config::LeaseMode;
@@ -96,7 +97,7 @@ pub enum Acquired {
     Granted {
         grant: Grant,
         waited: Duration,
-        capacity: Capacity,
+        capacity: LeaseCapacity,
     },
     /// Waited past `wait_max` and started without a slot (or without a slot
     /// record: every slot file was in use, `grant` is `None`).
@@ -134,8 +135,8 @@ fn age(ns: u64) -> String {
 pub fn waiting_line(
     rank: usize,
     queued: usize,
-    holders: &[lease::Holder],
-    capacity: &Capacity,
+    holders: &[lease::LeaseHolder],
+    capacity: &LeaseCapacity,
     now_ns: u64,
 ) -> String {
     let who = holders
@@ -178,7 +179,7 @@ pub fn waiting_line(
 /// the caller reports as "not leased" and runs the build anyway.
 pub fn acquire(
     dir: &Dir,
-    template: &Record,
+    template: &LeaseRecord,
     policy: &Policy,
     ports: &mut dyn Ports,
 ) -> Result<Acquired, String> {
@@ -199,7 +200,7 @@ pub fn acquire(
         let cap = capacity(policy.slots, &load);
         let own = ticket.own();
         let mut board = dir.board(&own);
-        board.waiters.push(Waiter {
+        board.waiters.push(LeaseWaiter {
             name: ticket.name.clone(),
             record: template.clone(),
         });
@@ -210,7 +211,7 @@ pub fn acquire(
             .position(|w| w.name == ticket.name)
             .unwrap_or(0);
         let held = board.holders.len();
-        let granted_at = |overflow: bool| Record {
+        let granted_at = |overflow: bool| LeaseRecord {
             granted_mono_ns: Some(now),
             tier_at_grant: cap.tier,
             verdict_unavailable_reason: match &load {
@@ -453,7 +454,7 @@ fn env_ms(name: &str, default: Duration, min: u64, max: u64) -> Duration {
 
 /// The record a waiter and its slot carry, from this process and its
 /// environment.
-fn template(label: String) -> Record {
+fn template(label: String) -> LeaseRecord {
     let me = i32::try_from(std::process::id()).unwrap_or(0);
     let facts = crate::sysload::procscan::probe_one(me);
     let start_us = facts.as_ref().map_or(0, |f| f.start_us);
@@ -468,7 +469,7 @@ fn template(label: String) -> Record {
         .then(|| agent_ancestor(me))
         .flatten();
     let (session_key, priority) = session_of(terminal.as_deref(), run.as_deref(), ancestor, parent);
-    Record {
+    LeaseRecord {
         pid: me,
         start_us,
         session_key,

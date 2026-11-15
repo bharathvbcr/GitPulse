@@ -11,8 +11,8 @@ fn verdict(tier: Tier, admit: bool) -> Load {
     })
 }
 
-fn record(pid: i32, session: &str, priority: Priority, enqueued: u64) -> Record {
-    Record {
+fn record(pid: i32, session: &str, priority: Priority, enqueued: u64) -> LeaseRecord {
+    LeaseRecord {
         pid,
         start_us: 1,
         session_key: session.into(),
@@ -29,22 +29,22 @@ fn record(pid: i32, session: &str, priority: Priority, enqueued: u64) -> Record 
     }
 }
 
-fn waiter(pid: i32, session: &str, priority: Priority, enqueued: u64) -> Waiter {
-    Waiter {
+fn waiter(pid: i32, session: &str, priority: Priority, enqueued: u64) -> LeaseWaiter {
+    LeaseWaiter {
         name: format!("{enqueued}-{pid}.json"),
         record: record(pid, session, priority, enqueued),
     }
 }
 
-fn holder(slot: usize, pid: i32, session: &str) -> Holder {
-    Holder {
+fn holder(slot: usize, pid: i32, session: &str) -> LeaseHolder {
+    LeaseHolder {
         slot,
         pid,
         record: Some(record(pid, session, Priority::Observed, 1)),
     }
 }
 
-fn pids(waiters: &[Waiter]) -> Vec<i32> {
+fn pids(waiters: &[LeaseWaiter]) -> Vec<i32> {
     waiters.iter().map(|w| w.record.pid).collect()
 }
 

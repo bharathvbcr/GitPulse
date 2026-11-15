@@ -62,8 +62,8 @@ fn policy() -> Policy {
     }
 }
 
-fn mine(now: u64) -> Record {
-    Record {
+fn mine(now: u64) -> LeaseRecord {
+    LeaseRecord {
         pid: i32::try_from(std::process::id()).unwrap(),
         start_us: 1,
         session_key: "agent:test".into(),
@@ -220,7 +220,7 @@ fn a_free_slot_is_granted_at_once_and_recorded_with_why_it_was_granted() {
         "granted at once: nothing to announce"
     );
     assert_eq!(ports.slept, Duration::ZERO);
-    let written: Record =
+    let written: LeaseRecord =
         serde_json::from_slice(&std::fs::read(dir.root().join("slot-1.json")).unwrap()).unwrap();
     assert_eq!(written.tier_at_grant, Some(Tier::Clear));
     assert_eq!(written.granted_mono_ns, Some(ports.now));
@@ -242,7 +242,7 @@ fn no_verdict_still_grants_and_records_why_it_was_not_load_checked() {
         panic!("an unreadable verdict is not a refusal")
     };
     assert_eq!(capacity.slots, 2);
-    let written: Record =
+    let written: LeaseRecord =
         serde_json::from_slice(&std::fs::read(dir.root().join("slot-1.json")).unwrap()).unwrap();
     assert_eq!(written.tier_at_grant, None);
     assert_eq!(
@@ -295,10 +295,10 @@ fn an_elevated_verdict_halves_the_slots_a_build_may_take() {
 #[test]
 fn the_waiting_line_names_the_place_the_holders_and_the_reason() {
     let capacity = crate::sysload::lease::capacity(4, &verdict(Tier::Elevated, true));
-    let holder = |slot, pid| crate::sysload::lease::Holder {
+    let holder = |slot, pid| crate::sysload::lease::LeaseHolder {
         slot,
         pid,
-        record: (pid != 7).then(|| Record {
+        record: (pid != 7).then(|| LeaseRecord {
             granted_mono_ns: Some(1_000_000_000),
             ..mine(1_000_000_000)
         }),

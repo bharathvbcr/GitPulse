@@ -48,7 +48,7 @@
 //! The setting, lowered by the governor's published verdict ([`capacity`]):
 //! half under an elevated tier (at least one), none under a severe tier or a
 //! verdict that does not admit launches. With no readable verdict the setting
-//! applies and [`Capacity::note`] says why it was not lowered: a reading that
+//! applies and [`LeaseCapacity::note`] says why it was not lowered: a reading that
 //! could not be taken is never presented as a healthy one.
 
 use std::path::{Path, PathBuf};
@@ -105,7 +105,7 @@ pub enum Priority {
 /// What a slot or a ticket says about its build. Display only: nothing here
 /// decides whether a slot is held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
+pub struct LeaseRecord {
     pub pid: i32,
     pub start_us: u64,
     /// The session the build belongs to: `terminal:<id>`, `run:<id>`,
@@ -126,7 +126,7 @@ pub struct Record {
     pub overflow: bool,
 }
 
-impl Record {
+impl LeaseRecord {
     /// This record with its free text cut to what a reader will show.
     pub fn bounded(mut self) -> Self {
         self.cwd = self.cwd.chars().take(CWD_CHARS).collect();
@@ -138,26 +138,26 @@ impl Record {
 
 /// A slot some process holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Holder {
+pub struct LeaseHolder {
     pub slot: usize,
     pub pid: i32,
     /// `None` is a lock with no record, or a record another process wrote.
-    pub record: Option<Record>,
+    pub record: Option<LeaseRecord>,
 }
 
 /// A live ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Waiter {
+pub struct LeaseWaiter {
     pub name: String,
-    pub record: Record,
+    pub record: LeaseRecord,
 }
 
 /// The holders and the live queue at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Board {
-    pub holders: Vec<Holder>,
+    pub holders: Vec<LeaseHolder>,
     /// In service order.
-    pub waiters: Vec<Waiter>,
+    pub waiters: Vec<LeaseWaiter>,
     /// Slot files and tickets that could not be read: counted, never read as
     /// "free".
     pub unreadable: Vec<String>,
@@ -173,7 +173,7 @@ pub enum Load {
 
 /// How many builds may run now, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Capacity {
+pub struct LeaseCapacity {
     pub configured: u32,
     pub slots: u32,
     /// The verdict forbids a new grant: a waiter must not start without a
@@ -185,17 +185,17 @@ pub struct Capacity {
 }
 
 /// The slots the setting asks for, lowered by what the governor published.
-pub fn capacity(configured: u32, load: &Load) -> Capacity {
+pub fn capacity(configured: u32, load: &Load) -> LeaseCapacity {
     let configured = configured.clamp(1, MAX_SLOTS);
     match load {
-        Load::Unknown(why) => Capacity {
+        Load::Unknown(why) => LeaseCapacity {
             configured,
             slots: configured,
             refuses: false,
             tier: None,
             note: Some(format!("slots not lowered for load: {why}")),
         },
-        Load::Verdict(verdict) if !verdict.admit || verdict.tier >= Tier::Severe => Capacity {
+        Load::Verdict(verdict) if !verdict.admit || verdict.tier >= Tier::Severe => LeaseCapacity {
             configured,
             slots: 0,
             refuses: true,
@@ -208,7 +208,7 @@ pub fn capacity(configured: u32, load: &Load) -> Capacity {
         },
         Load::Verdict(verdict) if verdict.tier >= Tier::Elevated => {
             let slots = (configured / 2).max(1);
-            Capacity {
+            LeaseCapacity {
                 configured,
                 slots,
                 refuses: false,
@@ -217,7 +217,7 @@ pub fn capacity(configured: u32, load: &Load) -> Capacity {
                     .then(|| format!("halved from {configured} while the host load is elevated")),
             }
         }
-        Load::Verdict(verdict) => Capacity {
+        Load::Verdict(verdict) => LeaseCapacity {
             configured,
             slots: configured,
             refuses: false,
@@ -230,14 +230,14 @@ pub fn capacity(configured: u32, load: &Load) -> Capacity {
 /// Whether the waiter at `rank` (0 is next) may take a slot while `held` are
 /// held: only a waiter ahead of the number of free slots may, so two slots
 /// freeing at once serve the first two waiters and nobody else.
-pub fn may_take(rank: usize, held: usize, capacity: &Capacity) -> bool {
+pub fn may_take(rank: usize, held: usize, capacity: &LeaseCapacity) -> bool {
     let free = (capacity.slots as usize).saturating_sub(held);
     rank < free
 }
 
 /// Sorts `waiters` into service order: priority, then how many slots the
 /// waiter's session already holds (fewest first), then enqueue time, then pid.
-pub fn order(waiters: &mut [Waiter], holders: &[Holder]) {
+pub fn order(waiters: &mut [LeaseWaiter], holders: &[LeaseHolder]) {
     let held_by = |session: &str| {
         holders
             .iter()
@@ -280,6 +280,140 @@ pub fn session_of(
     }
 }
 
+/// Everything Health shows about build leases, in one read. A field that
+/// could not be read carries why; none of them is ever a zero standing in for
+/// "unknown".
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseStatus {
+    /// Leases are switched on in Settings.
+    pub on: bool,
+    /// The setting, before the governor lowers it.
+    pub configured: u32,
+    /// How many may run now, and why that many.
+    pub capacity: LeaseCapacity,
+    pub holders: Vec<LeaseHolder>,
+    /// In service order.
+    pub queue: Vec<LeaseWaiter>,
+    /// Slot files and tickets that could not be read.
+    pub unreadable: Vec<String>,
+    /// Why the lease directory could not be used at all.
+    pub error: Option<String>,
+    /// Why the `cargo` and `go` links an agent's PATH starts with are not in
+    /// place, or `None` when they are.
+    pub links_missing: Option<String>,
+    /// Builds that ran unleased in the last 15 minutes, counted from markers.
+    pub misses: Option<u32>,
+    pub misses_error: Option<String>,
+    /// Heavy builds running that hold no slot (and have no holder above them):
+    /// something that never went through the wrapper.
+    pub unleased_running: Option<u32>,
+    pub unleased_error: Option<String>,
+    /// The monotonic clock the records are dated on, to age them.
+    pub now_mono_ns: u64,
+}
+
+/// Counts heavy builds in the process table that hold no slot. `Err` when the
+/// table could not be read.
+#[cfg(unix)]
+pub fn unleased_running(holders: &[LeaseHolder]) -> Result<u32, String> {
+    let table = super::procscan::signal_table()?;
+    let parent: std::collections::HashMap<i32, i32> =
+        table.rows.iter().map(|r| (r.pid, r.ppid)).collect();
+    let held: std::collections::HashSet<i32> = holders.iter().map(|h| h.pid).collect();
+    let mut count = 0;
+    for row in &table.rows {
+        let Some(argv) = &row.argv else { continue };
+        let Some((program, args)) = argv.split_first() else {
+            continue;
+        };
+        if row.real_uid() != table.me_uid || !crate::hooks::build_is_leased(program, args) {
+            continue;
+        }
+        let mut at = row.pid;
+        let mut covered = false;
+        for _ in 0..32 {
+            if held.contains(&at) {
+                covered = true;
+                break;
+            }
+            match parent.get(&at) {
+                Some(next) if *next > 1 && *next != at => at = *next,
+                _ => break,
+            }
+        }
+        if !covered {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(not(unix))]
+pub fn unleased_running(_holders: &[LeaseHolder]) -> Result<u32, String> {
+    Err("build leases are not supported on this platform".into())
+}
+
+/// The lease state for Health: the setting, the governor's verdict, the board.
+pub fn status(
+    config_dir: Option<&Path>,
+    settings: &crate::tool_config::HostLoadLeases,
+    load: &Load,
+    misses: Result<usize, String>,
+) -> LeaseStatus {
+    let capacity = capacity(settings.slots, load);
+    let mut out = LeaseStatus {
+        on: settings.mode == crate::tool_config::LeaseMode::On,
+        configured: settings.slots,
+        capacity,
+        holders: Vec::new(),
+        queue: Vec::new(),
+        unreadable: Vec::new(),
+        error: None,
+        links_missing: None,
+        misses: None,
+        misses_error: None,
+        unleased_running: None,
+        unleased_error: None,
+        now_mono_ns: super::Clock::now().mono_ns,
+    };
+    match misses {
+        Ok(n) => out.misses = Some(u32::try_from(n).unwrap_or(u32::MAX)),
+        Err(why) => out.misses_error = Some(why),
+    }
+    let Some(config) = config_dir else {
+        out.error = Some("there is no per-user config directory (HOME unset)".into());
+        return out;
+    };
+    let bin = bin_dir(config);
+    if let Some(missing) = LINKED_PROGRAMS
+        .iter()
+        .find(|p| bin.join(p).symlink_metadata().is_err())
+    {
+        out.links_missing = Some(format!("{} does not exist", bin.join(missing).display()));
+    }
+    #[cfg(unix)]
+    {
+        match Dir::open(&lease_dir(config)) {
+            Ok(dir) => {
+                let board = dir.board(&Own::default());
+                out.holders = board.holders;
+                out.queue = board.waiters;
+                out.unreadable = board.unreadable;
+            }
+            Err(why) => out.error = Some(why),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        out.error = Some("build leases are not supported on this platform".into());
+    }
+    match unleased_running(&out.holders) {
+        Ok(n) => out.unleased_running = Some(n),
+        Err(why) => out.unleased_error = Some(why),
+    }
+    out
+}
+
 /// `<config>/leases`.
 pub fn lease_dir(config_dir: &Path) -> PathBuf {
     config_dir.join(DIR_NAME)
@@ -295,13 +429,13 @@ fn slot_name(slot: usize) -> String {
     format!("slot-{slot}")
 }
 
-fn parse_record(bytes: &[u8]) -> Option<Record> {
+fn parse_record(bytes: &[u8]) -> Option<LeaseRecord> {
     if bytes.len() > RECORD_MAX_BYTES {
         return None;
     }
-    serde_json::from_slice::<Record>(bytes)
+    serde_json::from_slice::<LeaseRecord>(bytes)
         .ok()
-        .map(Record::bounded)
+        .map(LeaseRecord::bounded)
 }
 
 /// The programs the app links into [`bin_dir`].
@@ -390,8 +524,8 @@ mod unix {
     use crate::fs_entry;
 
     use super::{
-        order, parse_record, slot_name, Board, Holder, Record, Waiter, MAX_QUEUE_SCAN, QUEUE_DIR,
-        SLOT_FILES,
+        order, parse_record, slot_name, Board, LeaseHolder, LeaseRecord, LeaseWaiter,
+        MAX_QUEUE_SCAN, QUEUE_DIR, SLOT_FILES,
     };
 
     /// What a lock probe saw.
@@ -491,7 +625,7 @@ mod unix {
     #[derive(Debug)]
     pub struct Grant {
         pub slot: usize,
-        pub record: Record,
+        pub record: LeaseRecord,
         file: File,
     }
 
@@ -582,7 +716,7 @@ mod unix {
                         .and_then(|bytes| parse_record(&bytes))
                         // A record another holder wrote is not this holder's.
                         .filter(|record| record.pid == pid);
-                        board.holders.push(Holder { slot, pid, record });
+                        board.holders.push(LeaseHolder { slot, pid, record });
                     }
                     Err(error) => board
                         .unreadable
@@ -626,7 +760,7 @@ mod unix {
                         // Locked, but its record is not written yet: it shows
                         // on the next read.
                         if let (Ok(_), Some(record)) = (read, parse_record(&bytes)) {
-                            board.waiters.push(Waiter { name, record });
+                            board.waiters.push(LeaseWaiter { name, record });
                         }
                     }
                     Err(error) => board
@@ -638,7 +772,7 @@ mod unix {
 
         /// Puts `record` in the queue. The ticket is locked by this process
         /// from the moment it exists.
-        pub fn enqueue(&self, record: &Record) -> Result<Ticket, String> {
+        pub fn enqueue(&self, record: &LeaseRecord) -> Result<Ticket, String> {
             let body = serde_json::to_vec(record).map_err(|e| e.to_string())?;
             for attempt in 0..3u64 {
                 let name = format!(
@@ -700,7 +834,7 @@ mod unix {
         /// Tries to take `slot`. `Ok(None)` when another process holds it (the
         /// race was lost: ask again after the next read), `Err` when the file
         /// cannot be used at all.
-        pub fn take(&self, slot: usize, record: &Record) -> Result<Option<Grant>, String> {
+        pub fn take(&self, slot: usize, record: &LeaseRecord) -> Result<Option<Grant>, String> {
             let path = self.slot_path(slot);
             let file = fs_entry::open_private_record(&path)?;
             match try_lock(&file) {
@@ -724,7 +858,7 @@ mod unix {
             })
         }
 
-        fn write_record(&self, slot: usize, record: &Record) -> Result<(), String> {
+        fn write_record(&self, slot: usize, record: &LeaseRecord) -> Result<(), String> {
             let body = serde_json::to_vec(record).map_err(|e| e.to_string())?;
             let tmp = self
                 .root

@@ -37,6 +37,7 @@
 //! been verified on a real Linux host. Windows reports unavailable. See
 //! [`Platform`].
 
+pub mod activity;
 mod disk;
 mod governor;
 pub mod lease;
