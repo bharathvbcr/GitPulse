@@ -5677,6 +5677,7 @@ describe("a push the secret scan refused", () => {
     expect(pushes).toEqual([{ repoPath: "/r/a", remote: undefined, branch: undefined, force: false }]);
     const toast = get(toastStore).find((t) => t.action?.label === "Push anyway");
     expect(toast?.kind).toBe("error");
+    expect(toast?.duration, "the findings stay until the person dismisses them").toBe(0);
     expect(toast?.message).toContain("0123456789ab:k.env:1");
     // The person moves to another repository before pressing the button.
     await store.openRepo("/r/b");
@@ -5709,6 +5710,6 @@ describe("a push the secret scan refused", () => {
     expect(push).toContain("offerPushPastSecretScan(await run(false, target), () => run(true, refused))");
     const offer = source.slice(source.indexOf("function offerPushPastSecretScan"), source.indexOf("function repoFacts"));
     expect(offer).toContain('label: "Push anyway"');
-    expect(offer).toContain("onClick: async () => (await again()).ok");
+    expect(offer).toContain('{ label: "Push anyway", onClick: async () => (await again()).ok }');
   });
 });

@@ -669,10 +669,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     again: () => Promise<MutationOutcome>,
   ): MutationOutcome {
     if (outcome.ok || !secretScanRefused(outcome.cause)) return outcome;
-    toastStore.error(outcome.error ?? "Push blocked by the secret scan.", {
-      label: "Push anyway",
-      onClick: async () => (await again()).ok,
-    });
+    // Sticky (duration 0): an action toast otherwise expires, and this one is
+    // the only place the refusal's findings are shown.
+    toastStore.error(
+      outcome.error ?? "Push blocked by the secret scan.",
+      { label: "Push anyway", onClick: async () => (await again()).ok },
+      0,
+    );
     return { ...outcome, surfaced: true };
   }
 

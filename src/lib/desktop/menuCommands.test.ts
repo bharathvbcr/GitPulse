@@ -29,6 +29,15 @@ describe("native repository commands", () => {
       expect(h.deps.activity).toHaveBeenLastCalledWith("/repo/a", null);
     },
   );
+  it("does not repeat a failure that was already surfaced", async () => {
+    // The secret scan's push refusal comes back surfaced: its own toast
+    // carries the findings and the "Push anyway" button.
+    const h = harness();
+    vi.mocked(h.deps.repo.push).mockResolvedValue({ ok: false, error: "Push blocked by the secret scan.", surfaced: true });
+    await h.commands.push();
+    expect(h.deps.error).not.toHaveBeenCalled();
+    expect(h.deps.success).not.toHaveBeenCalled();
+  });
   it("disabled commands do not invoke Git", async () => {
     const h = harness(); h.deps.enabled = () => false;
     await h.commands.stageAll();
