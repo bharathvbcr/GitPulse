@@ -192,6 +192,37 @@ pub fn park_blocker(
     .map(|why| format!("it could not be resumed: {why}"))
 }
 
+/// Why closing this session's terminal is not parking an agent: the terminal
+/// was not launched as that agent (a shell tab with `claude` typed into it
+/// carries a GitPulse session id too, and closing it would close the shell and
+/// everything else in it), or more than one agent runs in it.
+pub fn tab_blocker(
+    kind: AgentKind,
+    launcher: Option<&str>,
+    agents_in_terminal: usize,
+) -> Option<String> {
+    let expected = match kind {
+        AgentKind::Claude => "claude",
+        AgentKind::Antigravity => "agy",
+        // Refused for its own reason by `park_blocker`.
+        _ => return None,
+    };
+    if agents_in_terminal > 1 {
+        return Some(format!(
+            "{agents_in_terminal} agents run in that terminal, and closing it would close all of them"
+        ));
+    }
+    match launcher {
+        Some(launched) if launched == expected => None,
+        Some(launched) => Some(format!(
+            "that terminal was launched as {launched}, not as {expected}, so closing it would close more than the agent"
+        )),
+        None => Some(
+            "that terminal was not launched as this agent (it is a shell tab, or GitPulse could not read how it was launched), so closing it would close more than the agent".into(),
+        ),
+    }
+}
+
 /// One agent session in the report.
 #[derive(Debug, Clone, Serialize)]
 pub struct IdleSession {
@@ -230,6 +261,10 @@ pub struct Facts {
     pub pty_quiet_ms: Option<Option<u64>>,
     pub conversation: Option<(String, String)>,
     pub holds_lease: bool,
+    /// What the terminal was launched as (`claude`, `agy`, ...), from its
+    /// listing; `None` for a plain shell tab or a listing that could not be
+    /// read.
+    pub launcher: Option<String>,
     /// The build-slot state could not be read, so "holds no slot" is unknown.
     pub lease_unreadable: bool,
 }
@@ -281,6 +316,12 @@ pub fn build(
                 }
                 other => other,
             };
+            let in_terminal = terminal.as_deref().map_or(0, |id| {
+                sessions
+                    .iter()
+                    .filter(|o| o.terminal_session_id.as_deref() == Some(id))
+                    .count()
+            });
             let park_blocked = park_blocker(
                 s.kind,
                 terminal.as_deref(),
@@ -289,7 +330,12 @@ pub fn build(
                     .as_ref()
                     .map(|(a, c)| (a.as_str(), c.as_str())),
                 s.cwd.as_deref(),
-            );
+            )
+            .or_else(|| {
+                terminal
+                    .as_ref()
+                    .and_then(|_| tab_blocker(s.kind, facts.launcher.as_deref(), in_terminal))
+            });
             IdleSession {
                 terminal_session: terminal,
                 kind: s.kind,
@@ -336,11 +382,28 @@ pub fn park(
     confirm: &dyn Fn(&str, &str) -> bool,
     act: impl FnOnce(&IdleSession) -> Result<String, String>,
 ) -> Result<String, String> {
+    park_when_idle_for(check, confirm, act, 0)
+}
+
+/// [`park`] for a session that has been idle at least `min_idle_ms`: the
+/// setting `host_load_idle.park_after_s` is enforced here, not only by what
+/// Health offers.
+pub fn park_when_idle_for(
+    check: impl Fn() -> Result<IdleSession, String>,
+    confirm: &dyn Fn(&str, &str) -> bool,
+    act: impl FnOnce(&IdleSession) -> Result<String, String>,
+    min_idle_ms: u64,
+) -> Result<String, String> {
     let ready = |seen: &IdleSession| -> Result<(), String> {
         if let Some(why) = &seen.park_blocked {
             return Err(format!("this session cannot be parked: {why}"));
         }
         match &seen.activity {
+            SessionActivity::Idle { since_ms, .. } if *since_ms < min_idle_ms => Err(format!(
+                "this session has been idle for {} s, under the {} s set for parking",
+                since_ms / 1000,
+                min_idle_ms / 1000
+            )),
             SessionActivity::Idle { .. } => Ok(()),
             SessionActivity::Busy { why } => Err(format!("this session is not idle: {why}")),
             SessionActivity::Unknown { why } => Err(format!("it is not known to be idle: {why}")),
@@ -402,6 +465,11 @@ pub fn report(state: &crate::terminal::TerminalSessions) -> IdleReport {
                     .agent_meta_for(id)
                     .map(|m| (m.agent, m.conversation_id)),
                 holds_lease: held.iter().any(|h| h == id),
+                launcher: listing
+                    .as_ref()
+                    .ok()
+                    .and_then(|listed| listed.iter().find(|l| l.id == id))
+                    .and_then(|l| l.launcher.clone()),
                 lease_unreadable,
             }
         },
@@ -451,7 +519,10 @@ pub fn park_session(
     session_id: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
 ) -> Result<String, String> {
-    park(
+    let min_idle_ms = crate::tool_config::host_load_idle()
+        .park_after_s
+        .saturating_mul(1000);
+    park_when_idle_for(
         || {
             report(state)
                 .sessions
@@ -497,6 +568,7 @@ pub fn park_session(
                 }
             ))
         },
+        min_idle_ms,
     )
 }
 

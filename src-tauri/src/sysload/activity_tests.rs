@@ -173,6 +173,7 @@ fn waiting_facts() -> Facts {
         pty_quiet_ms: Some(Some(2 * IDLE_AFTER)),
         conversation: Some(("claude".into(), UUID.into())),
         holds_lease: false,
+        launcher: Some("claude".into()),
         lease_unreadable: false,
     }
 }
@@ -383,4 +384,77 @@ fn an_unreadable_build_slot_state_keeps_a_waiting_session_from_being_called_idle
         panic!("unknown")
     };
     assert!(why.contains("build slot"), "{why}");
+}
+
+fn two_in_one_terminal() -> Vec<AgentSession> {
+    let mut second = session(AgentKind::Claude, Some("term-1"));
+    second.pid = 4_001;
+    vec![session(AgentKind::Claude, Some("term-1")), second]
+}
+
+#[test]
+fn a_shell_tab_with_an_agent_typed_into_it_is_not_parked() {
+    // Every PTY carries a GitPulse session id; only a tab launched AS the agent
+    // may be closed to park it.
+    let sessions = [session(AgentKind::Claude, Some("term-1"))];
+    for (launcher, why) in [
+        (None, "not launched as this agent"),
+        (Some("codex"), "launched as codex, not as claude"),
+    ] {
+        let read = build(
+            &sessions,
+            |_| Facts {
+                launcher: launcher.map(str::to_owned),
+                ..waiting_facts()
+            },
+            900,
+            3_600,
+        );
+        let blocked = read.sessions[0].park_blocked.as_deref().expect("blocked");
+        assert!(blocked.contains(why), "{blocked}");
+        // Still idle: the refusal is about closing the tab, not about the agent.
+        assert!(is_idle(&read.sessions[0].activity));
+    }
+    // And launched as that agent, it can be.
+    let ok = build(&sessions, |_| waiting_facts(), 900, 3_600);
+    assert_eq!(ok.sessions[0].park_blocked, None);
+}
+
+#[test]
+fn a_terminal_that_hosts_two_agents_parks_neither() {
+    let read = build(&two_in_one_terminal(), |_| waiting_facts(), 900, 3_600);
+    assert_eq!(read.sessions.len(), 2);
+    for row in &read.sessions {
+        let blocked = row.park_blocked.as_deref().expect("blocked");
+        assert!(
+            blocked.contains("2 agents run in that terminal"),
+            "{blocked}"
+        );
+    }
+}
+
+#[test]
+fn park_enforces_the_park_after_time_itself_not_only_what_health_offers() {
+    let acted = Cell::new(false);
+    // Idle for 1.8 million ms (`waiting_facts`), against a one hour minimum.
+    let early = park_when_idle_for(
+        || Ok(idle_row()),
+        &|_, _| true,
+        |_| {
+            acted.set(true);
+            Ok(String::new())
+        },
+        3_600_000,
+    );
+    assert!(early
+        .unwrap_err()
+        .contains("under the 3600 s set for parking"));
+    assert!(!acted.get());
+    let late = park_when_idle_for(
+        || Ok(idle_row()),
+        &|_, _| true,
+        |_| Ok("parked".into()),
+        1_800_000,
+    );
+    assert_eq!(late.unwrap(), "parked");
 }
