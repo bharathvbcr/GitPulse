@@ -1576,6 +1576,9 @@ html.macos {
   /* `--gp-float-blur` is the Settings input; 0 also stamps
      `html[data-float-blur="off"]`, because `blur(0)` is not `none`. */
   --mac-glass-blur-float: var(--gp-float-blur, 34px);
+  /* The wallpaper input. `none` until ui/appearance/apply.ts writes a
+     `url("…")` inline; drawn only by the body rule below the shell. */
+  --gp-backdrop: none;
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
   /* An inset area inside a panel -- a diff preview, a code block, an
@@ -1661,6 +1664,22 @@ html.macos .gp-shell {
     radial-gradient(70% 68% at 98% 6%, rgb(var(--mac-hue-c) / calc(0.42 * var(--mac-hue-gain))), rgb(var(--mac-hue-c) / 0) 100%),
     radial-gradient(74% 70% at 88% 100%, rgb(var(--mac-hue-b) / calc(0.38 * var(--mac-hue-gain))), rgb(var(--mac-hue-b) / 0) 100%),
     radial-gradient(64% 62% at 6% 96%, rgb(var(--mac-hue-d) / calc(0.3 * var(--mac-hue-gain))), rgb(var(--mac-hue-d) / 0) 100%);
+}
+
+/* The wallpaper (Settings → Appearance → Wallpaper). It is painted on `body`,
+   BENEATH the shell veil above, so it stands where the desktop would: the
+   material model already proves the stack over a pure white and a pure black
+   desktop, the extremes of any picture, and that proof covers a wallpaper
+   only from down here. Painted on the shell itself it would sit above the
+   veil (an image layer paints over the element's own background colour) and
+   the proof would no longer hold. `--gp-backdrop` is the input written
+   inline by ui/appearance/apply.ts; this rule is the only place it is drawn.
+   Static: one composited image, no animation, no filter. */
+html.macos[data-backdrop] body {
+  background-image: var(--gp-backdrop);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
@@ -2087,6 +2106,13 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     background-image: none;
   }
 
+  /* The wallpaper too: a picture behind solid surfaces is the half-finished
+     state these preferences exist to avoid. Same selector as the rule that
+     draws it, and later, so it wins. */
+  html.macos[data-backdrop] body {
+    background-image: none;
+  }
+
   /* The window itself stays transparent -- that is fixed at build time -- so
      the only way to honour the preference is for the page to paint over it. */
   html.macos,
@@ -2156,6 +2182,10 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
    selector, so the rules are written twice, and mac-material-contract.test.ts
    pins the two lists equal rule for rule: add a surface to both or neither. */
 html.macos[data-transparency="reduced"] .gp-shell {
+  background-image: none;
+}
+
+html.macos[data-transparency="reduced"][data-backdrop] body {
   background-image: none;
 }
 

@@ -59,11 +59,14 @@
       return;
     }
     interfaceStore.patchAppearance(themeToPatch(result.theme));
+    // Kept on the shelf too, so it can be switched back to after trying another.
+    const shelved = interfaceStore.saveTheme(result.theme);
     exportName = result.theme.name;
+    const kept = shelved === "full" ? " Your themes are full, so it wasn't added to them." : "";
     status =
       result.ignoredKeys.length > 0
-        ? `Imported “${result.theme.name}”. Ignored ${result.ignoredKeys.length} unknown ${result.ignoredKeys.length === 1 ? "key" : "keys"}: ${result.ignoredKeys.slice(0, 3).join(", ")}.`
-        : `Imported “${result.theme.name}”.`;
+        ? `Imported “${result.theme.name}”. Ignored ${result.ignoredKeys.length} unknown ${result.ignoredKeys.length === 1 ? "key" : "keys"}: ${result.ignoredKeys.slice(0, 3).join(", ")}.${kept}`
+        : `Imported “${result.theme.name}”.${kept}`;
   }
 
   function currentExport() {

@@ -325,6 +325,14 @@
     if (isOpen) themePreference = themeStore.preference();
   });
 
+  // And while it is open: applying a theme preset switches the window to the
+  // preset's own appearance from inside this modal, and the segment has to
+  // say so rather than keep showing the choice that preset replaced.
+  const storedThemePreference = themeStore.preferenceState;
+  $effect(() => {
+    themePreference = $storedThemePreference;
+  });
+
   /**
    * Arrow-key movement for the category rail.
    *

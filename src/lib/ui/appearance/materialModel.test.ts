@@ -110,3 +110,42 @@ describe("the measured floor", () => {
     expect(materialIntensityFloor()).toBe(MATERIAL_FLOOR.light);
   });
 });
+
+describe("a derived palette", () => {
+  it("reproduces the shipped floor when it is the shipped palette (parity with the stylesheet model)", async () => {
+    const { deriveTokens, SHIPPED_BASE_HEX, SHIPPED_CONTRAST } = await import("../color/derive");
+    const { derivedPalette } = await import("./materialModel");
+    const { ACCENTS } = await import("../accents");
+    const { formatHex } = await import("../color/oklch");
+    for (const appearance of ["dark", "light"] as const) {
+      const derived = deriveTokens(
+        { base: SHIPPED_BASE_HEX[appearance], accent: formatHex(ACCENTS[0].rgb[appearance]), contrast: SHIPPED_CONTRAST },
+        appearance,
+      );
+      if (!derived.ok) throw new Error("shipped palette refused");
+      const stack = SHIPPED_STACK[appearance];
+      const palette = derivedPalette(appearance, derived.tokens, { blobs: stack.blobs, gain: stack.gain });
+      expect(measureFloor(appearance, palette).floor).toBe(measureFloor(appearance).floor);
+      expect(worstContrast(appearance, 0, palette.textMuted, palette).ratio).toBeCloseTo(
+        worstContrast(appearance, 0, inks(appearance).textMuted).ratio,
+        1,
+      );
+    }
+  });
+
+  it("measures a palette with weaker muted text to a higher floor than the shipped one", async () => {
+    const { derivedPalette } = await import("./materialModel");
+    const stack = SHIPPED_STACK.dark;
+    // The shipped dark ladder with its muted ink pulled toward the ground: a
+    // theme like that cannot be held to the shipped 0 floor.
+    const tokens = {
+      "--c-bg": "11 14 23",
+      "--c-surface": "20 26 41",
+      "--c-surface-hover": "31 39 58",
+      "--c-text": "233 237 248",
+      "--c-text-muted": "128 140 168",
+    };
+    const palette = derivedPalette("dark", tokens, { blobs: stack.blobs, gain: stack.gain });
+    expect(measureFloor("dark", palette).floor).toBeGreaterThan(measureFloor("dark").floor);
+  });
+});

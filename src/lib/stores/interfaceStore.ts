@@ -43,6 +43,10 @@ import {
 import type { Appearance } from "../ui/color/derive";
 import { densityFromLegacy, type Density } from "../ui/appearance/density";
 import type { GitPulseTheme } from "../ui/appearance/themeSchema";
+import type { BackdropId } from "../ui/appearance/backdrops";
+import { presetPatch, themeSelectionPatch, type ThemePreset } from "../ui/appearance/presets";
+import { withSavedTheme, withoutSavedTheme, type SaveOutcome } from "../ui/appearance/savedThemes";
+import { customWallpaper } from "../ui/appearance/wallpaperStore";
 import { themeStore } from "./themeStore";
 import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
@@ -802,9 +806,44 @@ function createInterfaceStore() {
     setCustomTheme: (theme: GitPulseTheme | null) => patch({ customTheme: theme }),
     /** Applies several appearance fields at once (an imported theme), as one save. */
     patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
-    /** Puts every Appearance preference back without touching the rest. */
+    /**
+     * Puts every Appearance preference back without touching the rest. The
+     * reader's saved themes are a library, not a setting, so they stay.
+     */
     resetAppearance: () =>
-      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT, nativeGlass: false, highRefresh: false }),
+      patch((prefs) => ({
+        ...APPEARANCE_DEFAULTS,
+        savedThemes: prefs.savedThemes,
+        accent: DEFAULT_ACCENT,
+        nativeGlass: false,
+        highRefresh: false,
+      })),
+    setBackdrop: (backdrop: BackdropId) => patch({ backdrop }),
+    /**
+     * Applies a built-in preset: its theme, wallpaper and material, and switches
+     * the window to the preset's appearance, because a theme only draws in its own.
+     */
+    applyPreset: (preset: ThemePreset) => {
+      patch((prefs) => presetPatch(preset, prefs));
+      themeStore.setTheme(preset.theme.appearance);
+    },
+    /** Applies a theme from the reader's shelf, in its own appearance. The wallpaper is left as it is. */
+    applyTheme: (theme: GitPulseTheme) => {
+      patch(themeSelectionPatch(theme));
+      themeStore.setTheme(theme.appearance);
+    },
+    /** Puts `theme` on the shelf. A full shelf refuses rather than dropping someone's theme. */
+    saveTheme: (theme: GitPulseTheme): SaveOutcome => {
+      let outcome: SaveOutcome = "full";
+      patch((prefs) => {
+        const next = withSavedTheme(prefs.savedThemes, theme);
+        outcome = next.outcome;
+        return { savedThemes: next.list };
+      });
+      return outcome;
+    },
+    removeSavedTheme: (theme: Pick<GitPulseTheme, "name" | "appearance">) =>
+      patch((prefs) => ({ savedThemes: withoutSavedTheme(prefs.savedThemes, theme) })),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setNativeGlass: (on: boolean) => patch({ nativeGlass: on }),
     setHighRefresh: (on: boolean) => patch({ highRefresh: on }),
@@ -997,5 +1036,10 @@ export const interfaceStore = createInterfaceStore();
 // The document follows the preferences from here on, whichever window or test
 // harness imported the store first; there is one subscription and it lives as
 // long as the page. It is a no-op without a document.
-installAppearance({ prefs: interfaceStore, theme: themeStore, platform: hostPlatform });
+installAppearance({
+  prefs: interfaceStore,
+  theme: themeStore,
+  platform: hostPlatform,
+  customBackdrop: customWallpaper,
+});
 installHeaderLabels(interfaceStore);
