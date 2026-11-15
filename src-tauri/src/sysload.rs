@@ -39,6 +39,7 @@
 
 mod disk;
 mod governor;
+pub mod lease;
 mod probe;
 pub(crate) mod procscan;
 mod sampler;
