@@ -599,7 +599,7 @@ fn the_previous_boot_reports_the_drops_its_ring_recorded() {
 }
 
 /// 2026-11-15: the installed app's trace had nothing for the window in which
-/// 145 GiB vanished. The rate and the exact binding are in the record.
+/// about 150 GiB vanished. The rate and the exact binding are in the record.
 #[test]
 fn the_fill_rate_and_a_disk_filling_binding_are_in_the_trace_record() {
     let dir = tempfile::tempdir().unwrap();

@@ -1899,14 +1899,30 @@ mod tests {
             assert!(settings.thresholds.disk_auto);
             // What Settings shows is what the governor decides on: resolved.
             let shown = settings.thresholds.disk;
+            // Literal floors for a stated memory size, so this cannot agree
+            // with itself by running the same function twice.
+            let gib = |n: u64| Reading::Value(n << 30);
+            for (ram_gib, elevated, severe) in [
+                (8, 20.0, 10.0),
+                (32, 20.0, 10.0),
+                (64, 32.0, 16.0),
+                (128, 64.0, 32.0),
+            ] {
+                let at = settings.thresholds.resolved(gib(ram_gib)).disk;
+                assert_eq!(
+                    (at.elevated_at, at.severe_at),
+                    (elevated, severe),
+                    "{ram_gib} GiB of memory"
+                );
+            }
+            // And what this machine shows is half and a quarter of its own
+            // memory, from the clamp written out here.
+            let ram = crate::sysload::physical_memory().expect("memory size") as f64
+                / (1u64 << 30) as f64;
             assert_eq!(
-                shown,
-                settings
-                    .thresholds
-                    .resolved(Reading::Value(
-                        crate::sysload::physical_memory().unwrap_or(0)
-                    ))
-                    .disk
+                (shown.elevated_at, shown.severe_at),
+                ((ram / 2.0).max(20.0), (ram / 4.0).max(10.0)),
+                "{ram} GiB of memory"
             );
             // Load, change something else, save: the floors stay automatic and
             // nothing is stored for them.

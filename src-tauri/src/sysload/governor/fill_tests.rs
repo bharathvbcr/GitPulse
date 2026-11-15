@@ -1,7 +1,8 @@
 //! The disk fill rule, over the real tracker and the real hysteresis: a replay
-//! of 2026-11-15, when free disk fell from 99 to 45 GiB in twenty minutes under
-//! one coverage build and the governor, which looked only at the level, said
-//! nothing.
+//! of an earlier incident, when free disk fell from 99 to 45 GiB in twenty
+//! minutes under one coverage build and the governor, which looked only at the
+//! level, said nothing, and of 2026-11-15, when it fell from about 150 GiB to
+//! nothing in about fifteen.
 //!
 //! Everything here runs on a 64 GiB machine, so the automatic floors are 32 GiB
 //! (elevated) and 16 GiB (severe).
@@ -200,27 +201,112 @@ fn lump(i: u64, total: f64) -> f64 {
     }
 }
 
-#[test]
-fn a_burst_of_twelve_gib_in_half_a_minute_can_shed_but_never_refuses() {
-    // 24 GiB a minute for 30 s is not ordinary, and the long window sees it
-    // for three minutes: background work may be shed for a while. Launches are
-    // never refused on a burst that is over.
-    let mut replay = Replay::new();
-    let mut shed = false;
-    for i in 0..400u64 {
-        let seen = replay.tick_gib(160.0 - lump(i, 12.0));
-        assert_ne!(
-            seen.verdict.tier,
-            Tier::Severe,
-            "tick {i}: {:?}",
-            seen.verdict
-        );
-        assert!(seen.verdict.admit, "tick {i}");
-        shed |= seen.verdict.tier == Tier::Elevated;
+/// GiB lost by tick `i` of a one-off step: `total` GiB spread evenly over the
+/// `ticks` ticks from tick `begin`, and nothing after.
+fn step(i: u64, begin: u64, ticks: u64, total: f64) -> f64 {
+    if i < begin {
+        0.0
+    } else if i >= begin + ticks {
+        total
+    } else {
+        (i - begin + 1) as f64 * total / ticks as f64
     }
-    assert!(shed, "the long window does see the burst");
-    let end = replay.tick_gib(148.0);
-    assert_eq!(end.verdict.tier, Tier::Clear, "and lets go of it");
+}
+
+#[test]
+fn a_one_off_step_followed_by_a_flat_line_never_binds_at_any_starting_level() {
+    // Each was a review replay on this 64 GiB Mac (16 GiB severe floor): a
+    // least-squares fit over the long window read a step of h GiB as a fall of
+    // about 1.5 h / window, which refused launches for about 25 seconds.
+    // (start free GiB, GiB lost, ticks the loss took: 15 ticks is 30 s)
+    for (start, lost, ticks) in [
+        (70.0, 12.0, 15),
+        (100.0, 20.0, 5),
+        (50.0, 8.0, 15),
+        (160.0, 12.0, 15),
+        (45.0, 6.0, 5),
+    ] {
+        let mut replay = Replay::new();
+        for i in 0..450u64 {
+            let seen = replay.tick_gib(start - step(i, 100, ticks, lost));
+            assert_eq!(
+                seen.verdict.tier,
+                Tier::Clear,
+                "{lost} GiB over {} s from {start} GiB, tick {i} ({:.1} GiB free): {:?}",
+                ticks * 2,
+                seen.free_gib,
+                seen.verdict
+            );
+            assert!(seen.verdict.admit, "tick {i}");
+        }
+    }
+}
+
+#[test]
+fn two_steps_a_minute_apart_are_a_sustained_fall_and_bind() {
+    // 12 GiB over 30 s, again 90 s later, again: the lumps of a build that keeps
+    // writing. It is a fall, however it arrives.
+    let mut replay = Replay::new();
+    let mut bound = None;
+    for i in 0..450u64 {
+        let lost = (0..6).map(|k| step(i, 100 + k * 45, 15, 12.0)).sum::<f64>();
+        let seen = replay.tick_gib(150.0 - lost);
+        if seen.verdict.tier >= Tier::Elevated && bound.is_none() {
+            bound = Some((i * 2, seen.free_gib, seen.verdict.binding));
+        }
+    }
+    let (second, free, binding) = bound.expect("a repeating burst is a fall");
+    assert_eq!(binding, Some(Binding::DiskFilling));
+    assert!(free > 60.0, "bound at {free:.1} GiB after {second} s");
+}
+
+#[test]
+fn a_staircase_of_five_gib_a_minute_is_a_sustained_fall() {
+    let mut replay = Replay::new();
+    let mut elevated = None;
+    let mut refused = None;
+    for i in 0..750u64 {
+        let free = 100.0 - 5.0 * (i * 2 / 60) as f64;
+        let seen = replay.tick_gib(free);
+        if seen.verdict.tier >= Tier::Elevated && elevated.is_none() {
+            elevated = Some((i * 2, seen.free_gib, seen.verdict.binding));
+        }
+        if !seen.verdict.admit && refused.is_none() {
+            refused = Some((i * 2, seen.free_gib, seen.verdict.binding));
+        }
+    }
+    let (second, free, binding) = elevated.expect("a staircase is a fall");
+    assert_eq!(binding, Some(Binding::DiskFilling));
+    assert!(free > 80.0, "elevated at {free:.1} GiB after {second} s");
+    let (second, free, binding) = refused.expect("and it is refused before the floor");
+    assert_eq!(binding, Some(Binding::DiskFilling));
+    assert!(free > 40.0, "refused at {free:.1} GiB after {second} s");
+}
+
+#[test]
+fn a_fall_of_ten_gib_a_minute_from_150_gib_refuses_while_most_of_the_disk_is_free() {
+    // 2026-11-15: about 150 GiB to nothing in about fifteen minutes.
+    let mut replay = Replay::new();
+    let mut elevated = None;
+    let mut refused = None;
+    for i in 0..450u64 {
+        let free = falling(150.0, 10.0, i * 2);
+        if free < 20.0 {
+            break;
+        }
+        let seen = replay.tick_gib(free);
+        if seen.verdict.tier >= Tier::Elevated && elevated.is_none() {
+            elevated = Some((i * 2, seen.free_gib));
+        }
+        if !seen.verdict.admit && refused.is_none() {
+            refused = Some((i * 2, seen.free_gib, seen.verdict.binding));
+        }
+    }
+    let (second, free) = elevated.expect("it must shed");
+    assert!(free > 120.0, "shed at {free:.1} GiB after {second} s");
+    let (second, free, binding) = refused.expect("it must refuse");
+    assert_eq!(binding, Some(Binding::DiskFilling));
+    assert!(free > 100.0, "refused at {free:.1} GiB after {second} s");
 }
 
 #[test]

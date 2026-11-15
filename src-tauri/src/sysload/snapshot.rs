@@ -815,6 +815,14 @@ fn ext_reading<T>(status: u8, read: impl FnOnce() -> Option<T>) -> Reading<T> {
     }
 }
 
+/// What the extension block carries: compressor segments, the held verdict and
+/// the disk fill rate.
+type Extension = (
+    Reading<CompressorSegments>,
+    Reading<PublishedVerdict>,
+    Reading<u64>,
+);
+
 /// The extension's readings, or unsupported for both when the record has no
 /// extension: a version-1 record (an older writer), or a longer one from some
 /// other newer writer that does not carry this build's block. A block that is
@@ -824,14 +832,7 @@ fn decode_extension(
     version: u32,
     length: usize,
     seq: u64,
-) -> Result<
-    (
-        Reading<CompressorSegments>,
-        Reading<PublishedVerdict>,
-        Reading<u64>,
-    ),
-    SnapshotError,
-> {
+) -> Result<Extension, SnapshotError> {
     if version < 2
         || length < EXTENDED_LEN
         || buf.len() < EXTENDED_LEN
