@@ -217,6 +217,7 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
         "nothing was committed"
     );
     // The reader cap is what this test is about, so commit with git itself.
+    git_in(repo.path(), &["add", "big.bin"]);
     git_in(repo.path(), &["commit", "-q", "-m", "big"]);
     let started = Instant::now();
     let err = GitReader::get_file_blob(path, "big.bin", None).unwrap_err();
