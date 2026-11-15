@@ -853,13 +853,55 @@ pub fn gitpulse_lane_container(main_checkout: &Path) -> PathBuf {
         .join(WORKTREES_SEGMENT)
 }
 
+pub const LANE_EXCLUDE_MARKER: &str =
+    "# GitPulse: task agent worktrees (machine-generated, never committed)";
+
+/// Placement layout for newly created worktrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeLayout {
+    /// `<main_checkout>/.gitpulse/worktrees/<slug>` (default).
+    #[default]
+    Lane,
+    /// `<main_checkout_parent>/<repo>.<slug>` (explicit opt-in).
+    Sibling,
+}
+
+impl WorktreeLayout {
+    pub const VALUES: &[&'static str] = &["lane", "sibling"];
+
+    pub fn parse(raw: Option<&str>) -> Result<Self, CommandError> {
+        match raw {
+            None | Some("lane") => Ok(Self::Lane),
+            Some("sibling") => Ok(Self::Sibling),
+            Some(other) => Err(CommandError::plain(format!(
+                "invalid worktree layout {other:?} (expected \"lane\" or \"sibling\")"
+            ))),
+        }
+    }
+}
+
+/// Ensures `.gitpulse/worktrees/` is excluded via `$GIT_COMMON_DIR/info/exclude`
+/// anchored at the main checkout so lanes stay out of `git status`.
+pub fn ensure_gitpulse_lane_excluded(repo_or_worktree: &Path) -> Result<(), CommandError> {
+    let anchor = resolve_main_checkout(repo_or_worktree)?;
+    let outcome =
+        crate::devmap::init::ensure_dir_excluded(&anchor, GITPULSE_LANE_DIR, LANE_EXCLUDE_MARKER);
+    if !outcome.is_clean() {
+        return Err(CommandError::plain(format!(
+            "GitPulse could not keep {GITPULSE_LANE_DIR}/ out of git status: {outcome:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a hand-made worktree inside GitPulse's task-worktree container.
 ///
-/// `workbench::agent_worktree` is the one creator of worktrees there: it
-/// excludes the container from `git status` before adding, names the branch
-/// after the attempt, and removes what a refused attempt made. A worktree added
-/// there by hand got none of that — `git add -A` in the main checkout would
-/// stage it — and was then labelled "GitPulse task" with no task behind it.
+/// GitPulse's own lane creators (`workbench::agent_worktree`,
+/// `gitpulse_worktree_create`, and `hooks::worktree`) exclude the container
+/// from `git status` before adding and anchor at the main checkout. Hand-supplied
+/// target paths (`cmd_add_worktree`, raw `base_target`) remain refused so
+/// manual worktrees do not leak into `git add -A` in the main checkout.
 /// Read from the path text, so it holds whether or not the target exists yet.
 pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError> {
     match agent_layout(target_path) {
@@ -3785,6 +3827,7 @@ pub fn add_worktree_configured(
             &cleaned_sparse,
             cow_caches,
             zero_copy_devmap,
+            false,
             gate,
         )?;
         let mut created = WorktreeCreated {
@@ -6346,6 +6389,106 @@ pub fn render_branch_template(
     Ok(rendered)
 }
 
+/// Resolves the main checkout anchor for `worktree_or_repo` (canonicalized,
+/// never nested inside a linked worktree). Bare repositories and separate
+/// gitdirs without a `.git` checkout parent return the canonicalized input.
+pub fn resolve_main_checkout(worktree_or_repo: &Path) -> Result<PathBuf, CommandError> {
+    let canon = worktree_or_repo.canonicalize().map_err(|e| {
+        CommandError::plain(format!("cannot resolve {}: {e}", worktree_or_repo.display()))
+    })?;
+    let canon = PathBuf::from(plain_path_text(&canon.to_string_lossy()));
+    if let Ok((_, common)) = crate::repository_trust::git_directories(&canon) {
+        let common = common.canonicalize().unwrap_or(common);
+        if common.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            if let Some(parent) = common.parent() {
+                let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                return Ok(PathBuf::from(plain_path_text(&parent.to_string_lossy())));
+            }
+        }
+    }
+    Ok(canon)
+}
+
+fn validate_worktree_slug(slug: &str) -> Result<(), CommandError> {
+    if slug.is_empty()
+        || matches!(slug, "." | "..")
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains('\0')
+    {
+        return Err(CommandError::plain(format!(
+            "Invalid worktree directory slug: {slug:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Canonical worktree path resolver shared across MCP worktree creation and
+/// Claude Code's `WorktreeCreate` hook.
+pub fn resolve_worktree_path(
+    repo_or_worktree: &Path,
+    slug: &str,
+    layout: WorktreeLayout,
+) -> Result<PathBuf, CommandError> {
+    validate_worktree_slug(slug)?;
+    let anchor = resolve_main_checkout(repo_or_worktree)?;
+    match layout {
+        WorktreeLayout::Lane => {
+            let mut container = anchor;
+            for segment in [format!(".{GITPULSE_LANE_KIND}"), WORKTREES_SEGMENT.to_string()] {
+                container.push(segment);
+                match container.symlink_metadata() {
+                    Ok(meta) if meta.file_type().is_dir() => {}
+                    Ok(_) => {
+                        return Err(CommandError::plain(format!(
+                            "{} is not a directory (Claude Code and GitPulse refuse a worktree path through a link inside the repository)",
+                            container.display()
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(CommandError::plain(format!(
+                            "cannot read {}: {e}",
+                            container.display()
+                        )));
+                    }
+                }
+            }
+            Ok(container.join(slug))
+        }
+        WorktreeLayout::Sibling => {
+            let parent = anchor.parent().ok_or_else(|| {
+                CommandError::plain(format!(
+                    "Repository {} has no parent directory for sibling worktree placement",
+                    anchor.display()
+                ))
+            })?;
+            let repo_name = anchor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo");
+            let target = parent.join(format!("{repo_name}.{slug}"));
+            let target_s = target.to_string_lossy();
+            validate_target_path(&target_s)?;
+            refuse_gitpulse_lane_target(&target_s)?;
+            Ok(target)
+        }
+    }
+}
+
+/// Resolves a deterministic target worktree path for a branch in a repository
+/// using the specified placement layout.
+pub fn resolve_worktree_path_for_branch_with_layout(
+    repo_path: &str,
+    branch: &str,
+    layout: WorktreeLayout,
+) -> Result<PathBuf, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let slug = sanitize_branch_name(branch);
+    validate_worktree_slug(&slug)?;
+    resolve_worktree_path(&repo, &slug, layout)
+}
+
 /// Resolves a deterministic target worktree path for a branch in a repository.
 pub fn resolve_worktree_path_for_branch(
     repo_path: &str,
@@ -6357,23 +6500,7 @@ pub fn resolve_worktree_path_for_branch(
         refuse_gitpulse_lane_target(target)?;
         return Ok(PathBuf::from(target));
     }
-    let repo = validate_repo(repo_path)?;
-    let anchor = resolve_worktree_family(repo_path, repo_path)
-        .ok()
-        .and_then(|f| f.anchor.to_str().and_then(|s| validate_repo(s).ok()))
-        .unwrap_or(repo);
-    let repo_name = anchor
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
-    let template = "../{{ repo }}.{{ branch | sanitize }}";
-    let rendered = render_branch_template(template, repo_name, branch, None, None, None)?;
-    let parent = anchor.parent().unwrap_or(&anchor);
-    let target = parent.join(rendered.trim_start_matches("../"));
-    if let Some(target_str) = target.to_str() {
-        refuse_gitpulse_lane_target(target_str)?;
-    }
-    Ok(target)
+    resolve_worktree_path_for_branch_with_layout(repo_path, branch, WorktreeLayout::Sibling)
 }
 
 /// Results of the Six-Point Branch Integration Verification Algorithm.
@@ -7258,6 +7385,34 @@ pub fn add_sparse_worktree_zero_copy(
         scope_paths,
         selective_cache,
         true,
+        false,
+        gate,
+    )
+}
+
+/// Authorized sparse zero-copy creation inside `<main_checkout>/.gitpulse/worktrees/`,
+/// used only by GitPulse's own managed lane creators after policy admission and
+/// `info/exclude` setup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_sparse_worktree_zero_copy_for_lane(
+    repo_path: &str,
+    target_path: &str,
+    branch: &str,
+    base: Option<&str>,
+    scope_paths: &[String],
+    selective_cache: bool,
+    gate: GitWriteGate<'_>,
+) -> Result<SparseWorktreeCreated, CommandError> {
+    add_sparse_worktree_zero_copy_optional_branch(
+        repo_path,
+        target_path,
+        Some(branch),
+        base,
+        false,
+        scope_paths,
+        selective_cache,
+        true,
+        true,
         gate,
     )
 }
@@ -7272,16 +7427,21 @@ fn add_sparse_worktree_zero_copy_optional_branch(
     scope_paths: &[String],
     selective_cache: bool,
     zero_copy_devmap: bool,
+    allow_lane_target: bool,
     gate: GitWriteGate<'_>,
 ) -> Result<SparseWorktreeCreated, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_target_path(target_path)?;
-    refuse_gitpulse_lane_target(target_path)?;
     if let Some(branch) = new_branch {
         validate_ref_name(branch)?;
     }
     if let Some(start) = base {
         validate_oid_or_revision(start)?;
+    }
+    if allow_lane_target {
+        ensure_gitpulse_lane_excluded(&repo)?;
+    } else {
+        refuse_gitpulse_lane_target(target_path)?;
     }
 
     let anchor = resolve_worktree_family(repo_path, repo_path)
@@ -8665,6 +8825,53 @@ some-future-field whatever
         ] {
             assert_eq!(refuse_gitpulse_lane_target(target), Ok(()), "{target}");
         }
+    }
+
+    #[test]
+    fn resolve_worktree_path_supports_lane_default_and_explicit_sibling() {
+        assert_eq!(WorktreeLayout::parse(None).unwrap(), WorktreeLayout::Lane);
+        assert_eq!(
+            WorktreeLayout::parse(Some("lane")).unwrap(),
+            WorktreeLayout::Lane
+        );
+        assert_eq!(
+            WorktreeLayout::parse(Some("sibling")).unwrap(),
+            WorktreeLayout::Sibling
+        );
+        assert!(WorktreeLayout::parse(Some("elsewhere")).is_err());
+
+        let repo = dirty_repo();
+        let canon = repo.path().canonicalize().unwrap();
+        let canon_str = canon.to_str().unwrap();
+
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(
+                resolve_worktree_path(&canon, bad, WorktreeLayout::Lane).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+
+        let lane_path = resolve_worktree_path(&canon, "feat-a", WorktreeLayout::Lane).unwrap();
+        assert_eq!(lane_path, canon.join(".gitpulse/worktrees/feat-a"));
+
+        let sibling_path =
+            resolve_worktree_path(&canon, "feat-a", WorktreeLayout::Sibling).unwrap();
+        let name = canon.file_name().unwrap().to_str().unwrap();
+        assert_eq!(sibling_path, canon.parent().unwrap().join(format!("{name}.feat-a")));
+
+        assert_eq!(
+            resolve_worktree_path_for_branch(canon_str, "feat/a", None).unwrap(),
+            sibling_path
+        );
+        assert_eq!(
+            resolve_worktree_path_for_branch_with_layout(
+                canon_str,
+                "feat/a",
+                WorktreeLayout::Lane
+            )
+            .unwrap(),
+            lane_path
+        );
     }
 
     fn dirty_repo() -> tempfile::TempDir {
@@ -15342,6 +15549,7 @@ some-future-field whatever
             None,
             false,
             &["src".to_string()],
+            false,
             false,
             false,
             &mut |_| Ok(()),
