@@ -57,7 +57,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-proc",
-        "commit": "c678888371e6473f14e2e62b9ad034990921004e"
+        "commit": "230bbf04f599be907732effefa801e5ed6aebd21"
       },
       "omitted": [
         "tests/",
@@ -71,8 +71,8 @@
       "files": {
         "Cargo.toml": "427997dd5bd1f8fab91fad51472e48ad77478fa5839e3b27e5dfeb2557e371b0",
         "src/diskio.rs": "a095fa4c05342f881824774fc3942fe73601e00be6ef3375889c2b57850eb0bf",
-        "src/lean_kernel.rs": "0823ebb88e56d3d34636c21dc480e344a8035376aa17c0eaac4de48a69c90d1b",
-        "src/lib.rs": "bb609fa69db4c0bb0b52efe9ba2927bb98d9787fab9f8320ea895acc02b80d97"
+        "src/lean_kernel.rs": "05096102967cf5305c98b391620787746cd0e1295f054a2496d1459244f4b546",
+        "src/lib.rs": "7736d475412f18b7a84f48ee556a9e2291f793760eeb0e1d65ce7b69a67a90ff"
       }
     },
     {

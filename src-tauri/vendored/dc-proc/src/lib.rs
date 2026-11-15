@@ -1321,9 +1321,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// The child's stdin, once; `None` after the first call. Writing to it
-    /// after the child has gone is an `Err(BrokenPipe)`, never a signal: see
-    /// [`SessionStdin`].
+    /// The child's stdin, once; `None` after the first call. A write once the
+    /// pipe's reader is gone is an `Err(BrokenPipe)`, never a signal. That can be
+    /// later than the reap: see [`SessionStdin`].
     pub fn take_stdin(&mut self) -> Option<SessionStdin> {
         self.child.stdin.take().map(SessionStdin::new)
     }
@@ -1432,6 +1432,13 @@ impl Drop for Session {
 /// has to be able to see that the child is gone, so writes here return
 /// `Err(BrokenPipe)` instead, on whichever thread they run.
 ///
+/// The error comes once nothing holds the read end, which is not always the
+/// moment the child is reaped. On macOS, writes after the reap of a `/bin/sh`
+/// child were seen to succeed for up to 14 ms (see the `AsFd` implementation
+/// below). A caller must not take a successful write as proof the child is
+/// alive: bound the wait for its reply instead, as the language-server client
+/// does.
+///
 /// On macOS the signal is not the writing thread's to mask: the unmasked write
 /// returned `BrokenPipe` and the process was killed anyway (the test beside
 /// this crate shows it), so the descriptor's own `F_SETNOSIGPIPE` flag is used.
@@ -1446,6 +1453,27 @@ impl SessionStdin {
     fn new(inner: std::process::ChildStdin) -> Self {
         sigpipe::refuse_on_descriptor(&inner);
         Self { inner }
+    }
+}
+
+/// The descriptor, borrowed, as [`std::process::ChildStdin`] lends its own: to
+/// `poll` it, for instance, to learn that the reader has gone.
+///
+/// The child's exit is not that moment. On macOS, the read end of a reaped
+/// `/bin/sh` or `/usr/bin/env bash` child was seen open for up to 14 ms after the
+/// reap, even when the child had closed its stdin. Under load a write after the
+/// reap succeeded in 62 of 6400 trials for `/bin/sh`, and in none for
+/// `/bin/bash` started directly. Both are trampolines that `exec` again; that
+/// this is the cause is inferred from those controls, and the kernel mechanism
+/// was not identified. `poll` reports the reader gone (`POLLHUP` on macOS,
+/// `POLLERR` on Linux) when it is.
+///
+/// Write through [`Write`](std::io::Write), which keeps the `SIGPIPE` guard; a
+/// raw `write(2)` on this descriptor does not have it.
+#[cfg(unix)]
+impl std::os::fd::AsFd for SessionStdin {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 
