@@ -641,7 +641,7 @@ fn a_claude_target_with_tmp_is_removed_and_a_repository_inside_it_is_not() {
     fs::write(copy.join("debug/build/log/0123abcd/out"), "x").unwrap();
     age(&copy, 30);
     let scan = run(&nobody(), &idle, |ctx| {
-        scan_claude_targets(&[lane.clone()], ctx, false)
+        scan_claude_targets(std::slice::from_ref(&lane), ctx, false)
     });
     assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
     run(&nobody(), &idle, |ctx| {
