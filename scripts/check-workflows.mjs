@@ -522,7 +522,7 @@ const isSequenceItem = (body) => body === "-" || /^-[ \t]/.test(body);
 /** @param {string} text @returns {YamlLine[]} */
 function yamlLines(text) {
   return text
-    .replace(/^﻿/, "")
+    .replace(/^\uFEFF/, "")
     .split(/\r\n|\n|\r/)
     .map((raw, index) => {
       const indent = /^ */.exec(raw)?.[0].length ?? 0;
@@ -673,6 +673,7 @@ export function parseWorkflowYaml(text) {
       requireSpaceIndent(line);
       if (isSequenceItem(line.body)) throw fail(line, "a sequence item where a mapping key was expected");
       if (line.body.startsWith("? ")) throw fail(line, "a complex mapping key is not supported");
+      if (/^[&*!]/.test(line.body)) throw fail(line, "a key with an anchor, alias or tag is not supported");
       const entry = splitKey(line.body);
       if (!entry) throw fail(line, "expected `key: value`");
       if (entry.key === "<<") throw fail(line, "a merge key is not supported");
@@ -820,39 +821,89 @@ function matrixAxes(job) {
   return axes;
 }
 
-const PLATFORM_TERM = /^(matrix\.[A-Za-z_][\w-]*|runner\.os)\s*(==|!=)\s*'([A-Za-z0-9._-]+)'$/;
+const PLATFORM_TERM = /^(matrix\.(?:os|platform)|runner\.os)\s*(==|!=)\s*'([A-Za-z0-9._-]+)'$/;
 const RUNNER_OS = ["linux", "macos", "windows"];
+/** More legs than this are not enumerated; a selector on such a job needs an allowlist entry. */
+const MAX_LEGS = 256;
+
+/**
+ * @typedef {{ axes: Record<string, string>, runnerOs: string | null }} MatrixLeg
+ */
+
+/** @param {string} label  a runs-on label such as `ubuntu-latest` @returns {string | null} */
+function runnerOsOf(label) {
+  const lower = label.toLowerCase();
+  if (/^(?:ubuntu|linux)/.test(lower)) return "linux";
+  if (/^macos/.test(lower)) return "macos";
+  if (/^windows/.test(lower)) return "windows";
+  return null;
+}
+
+/**
+ * The legs the job runs as: the product of its matrix axes, each with the
+ * operating system its `runs-on` gives it (null when `runs-on` is not a
+ * literal image name or a plain `${{ matrix.<axis> }}`). A job with no matrix
+ * is one leg. Null when the product is too large to enumerate.
+ *
+ * @param {Map<string, YamlNode>} job
+ * @returns {MatrixLeg[] | null}
+ */
+function matrixLegs(job) {
+  /** @type {Record<string, string>[]} */
+  let combinations = [{}];
+  for (const [axis, values] of matrixAxes(job)) {
+    if (combinations.length * values.length > MAX_LEGS) return null;
+    combinations = combinations.flatMap((combination) => values.map((value) => ({ ...combination, [axis]: value })));
+  }
+  const runsOn = job.get("runs-on");
+  const label = runsOn !== undefined && !Array.isArray(runsOn) && !isMap(runsOn) && runsOn.kind === "scalar" ? runsOn.value.trim() : null;
+  const viaAxis = label === null ? null : /^\$\{\{\s*matrix\.([A-Za-z_][\w-]*)\s*\}\}$/.exec(label);
+  return combinations.map((axes) => {
+    const image = label === null ? null : viaAxis ? (axes[viaAxis[1]] ?? null) : label;
+    return { axes, runnerOs: image === null || image.includes("${{") ? null : runnerOsOf(image) };
+  });
+}
 
 /**
  * Why a step condition is not one of the forms that cannot hide a failure on
- * every platform at once, or null when it is. Accepted: `!cancelled()` and
- * `matrix.<axis>` / `runner.os` compared with `==` or `!=` to a literal that
- * selects at least one leg and not all legs' complement, joined by `&&`. Any
- * condition this does not recognise is rejected.
+ * every platform at once, or null when it is. Accepted: `&&`-joined terms that
+ * are `!cancelled()` or `matrix.os` / `matrix.platform` / `runner.os` compared
+ * with `==` or `!=` to a literal — and only when at least one leg of the job
+ * satisfies the whole chain, so the step runs somewhere. Any condition this
+ * does not recognise is rejected.
  *
  * @param {string | null} text
+ * @param {MatrixLeg[] | null} legs
  * @param {Map<string, string[]>} axes
  * @returns {string | null}
  */
-function stepConditionProblem(text, axes) {
+function stepConditionProblem(text, legs, axes) {
   if (text === null || text === "") return "its condition could not be read";
+  /** @type {{ term: string, subject: string, operator: string, wanted: string }[]} */
+  const selectors = [];
   for (const term of text.split("&&").map((part) => part.trim())) {
     if (term === "!cancelled()") continue;
     const platform = PLATFORM_TERM.exec(term);
-    if (!platform) return `\`${term}\` is not \`!cancelled()\` or a platform selector (matrix.<axis> / runner.os ==|!= 'literal')`;
-    const [, subject, operator, literal] = platform;
-    const wanted = literal.toLowerCase();
+    if (!platform) return `\`${term}\` is not \`!cancelled()\` or a platform selector (matrix.os / matrix.platform / runner.os ==|!= 'literal')`;
+    selectors.push({ term, subject: platform[1], operator: platform[2], wanted: platform[3].toLowerCase() });
+  }
+  if (selectors.length === 0) return null;
+  if (legs === null) return `the job's matrix has more than ${MAX_LEGS} legs, so the selector cannot be checked`;
+  for (const { term, subject, wanted } of selectors) {
     if (subject === "runner.os") {
       if (!RUNNER_OS.includes(wanted)) return `\`${term}\` compares runner.os with a value no runner reports`;
-      continue;
+      if (legs.some((leg) => leg.runnerOs === null)) return `\`${term}\` selects on runner.os, but the job's \`runs-on\` is not a literal image name or \`\${{ matrix.<axis> }}\` naming one, so its operating system is unknown`;
+    } else if (!axes.has(subject.slice("matrix.".length))) {
+      return `\`${term}\` names ${subject}, which this job's matrix does not define as a list`;
     }
-    const values = axes.get(subject.slice("matrix.".length));
-    if (!values) return `\`${term}\` names ${subject}, which this job's matrix does not define as a list`;
-    const lower = values.map((value) => value.toLowerCase());
-    if (operator === "==" && !lower.includes(wanted)) return `\`${term}\` matches none of the job's legs (${values.join(", ")}), so the step never runs`;
-    if (operator === "!=" && lower.every((value) => value === wanted)) return `\`${term}\` excludes every one of the job's legs, so the step never runs`;
   }
-  return null;
+  const runs = legs.some((leg) =>
+    selectors.every(({ subject, operator, wanted }) => {
+      const actual = (subject === "runner.os" ? leg.runnerOs : leg.axes[subject.slice("matrix.".length)])?.toLowerCase();
+      return operator === "==" ? actual === wanted : actual !== wanted;
+    }),
+  );
+  return runs ? null : `no leg of the job (${legs.map((leg) => leg.runnerOs ?? JSON.stringify(leg.axes)).join(", ")}) satisfies \`${text}\`, so the step never runs`;
 }
 
 /**
@@ -914,6 +965,7 @@ function skipViolations(workflow, jobs) {
       continue;
     }
     const axes = matrixAxes(job);
+    const legs = matrixLegs(job);
     const names = steps.map((step) => {
       const name = isMap(step) ? step.get("name") : undefined;
       return name && !isMap(name) && !Array.isArray(name) && name.kind === "scalar" && name.value !== "" ? name.value : null;
@@ -930,7 +982,7 @@ function skipViolations(workflow, jobs) {
         add(jobId, label, keys, "continue-on-error", "step-level `continue-on-error` lets the step fail without failing the job");
       }
       if (step.has("if")) {
-        const problem = stepConditionProblem(conditionText(/** @type {YamlNode} */ (step.get("if"))), axes);
+        const problem = stepConditionProblem(conditionText(/** @type {YamlNode} */ (step.get("if"))), legs, axes);
         if (problem) add(jobId, label, keys, "if", `step-level \`if\` can skip the step on every platform at once: ${problem}`);
       }
     });
@@ -1101,7 +1153,8 @@ export function main() {
   // A rule that was checked and broken outranks an actionlint that could not run.
   if (findings.length) return 1;
   if (code === 0) {
-    console.log(`OK: ${files.length} workflow files lint clean, every action pinned to a commit, no checkout keeps its token, no download is piped into a shell, no check the release gate trusts can skip (${files.join(", ")})`);
+    const trusted = trustedWorkflowNames(readFileSync(RELEASE_STATE_PATH, "utf8")).workflows;
+    console.log(`OK: ${files.length} workflow files lint clean, every action pinned to a commit, no checkout keeps its token, no download is piped into a shell (${files.join(", ")}); release-gate skip rule held on ${trusted.join(", ")} with ${RELEASE_GATE_ALLOWLIST.length} allowlisted exemptions`);
   }
   return code;
 }

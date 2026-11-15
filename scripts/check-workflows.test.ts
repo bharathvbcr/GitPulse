@@ -560,6 +560,31 @@ describe("check:workflows release-gate rule: a trusted check must not be able to
       expect(gate(step("matrix.arch == 'x64'"))).toHaveLength(1);
     });
 
+    it("evaluates the whole condition against each leg, so one that no leg satisfies fails", () => {
+      expect(gate(step("matrix.os == 'ubuntu-latest' && matrix.os == 'macos-latest'"))).toHaveLength(1);
+      expect(gate(step("matrix.os == 'macos-latest' && runner.os == 'Linux'"))).toHaveLength(1);
+      expect(gate(step("matrix.os == 'ubuntu-latest' && runner.os == 'Linux'"))).toEqual([]);
+      expect(gate(step("${{ !cancelled() && matrix.os != 'ubuntu-latest' && runner.os != 'macOS' }}"))).toHaveLength(1);
+    });
+
+    it("checks runner.os against the operating systems the job's runs-on can give", () => {
+      const single = (condition: string, runsOn = "ubuntu-latest") =>
+        wf("  test:", `    runs-on: ${runsOn}`, "    steps:", "      - name: Check", `        if: ${condition}`, "        run: x");
+      expect(gate(single("runner.os == 'Windows'"))).toHaveLength(1);
+      expect(gate(single("runner.os != 'Linux'"))).toHaveLength(1);
+      expect(gate(single("runner.os == 'Linux'"))).toEqual([]);
+      expect(gate(single("runner.os == 'Linux'", "[self-hosted, big]"))).toHaveLength(1);
+      expect(gate(single("runner.os == 'Linux'", "${{ inputs.runner }}"))).toHaveLength(1);
+    });
+
+    it("accepts only matrix.os, matrix.platform and runner.os as platform subjects", () => {
+      const axis = (name: string) =>
+        wf("  test:", `    runs-on: \${{ matrix.${name} }}`, "    strategy:", "      matrix:", `        ${name}: [ubuntu-latest, macos-latest]`, "    steps:", "      - name: Check", `        if: matrix.${name} == 'ubuntu-latest'`, "        run: x");
+      expect(gate(axis("platform"))).toEqual([]);
+      expect(gate(axis("os"))).toEqual([]);
+      expect(gate(axis("flavour"))).toHaveLength(1);
+    });
+
     it("fails an inequality that excludes every leg", () => {
       const single = wf("  test:", "    runs-on: ${{ matrix.os }}", "    strategy:", "      matrix:", "        os: [ubuntu-latest]", "    steps:", "      - name: Check", "        if: matrix.os != 'ubuntu-latest'", "        run: x");
       expect(gate(single)).toHaveLength(1);
@@ -668,6 +693,13 @@ describe("check:workflows release-gate rule: a trusted check must not be able to
       expect(gate(wf("  'test':", "    runs-on: x", "    steps:", "      - run: x"))).toEqual([]);
     });
 
+    it("does not let an anchor or a tag hide a key", () => {
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - &a if: always()", "        run: x")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", "        !!str if: always()")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", "        *ref continue-on-error: true")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", '        "&not-anchor": fine'))).toEqual([]);
+    });
+
     it("reads an if written with and without ${{ }}", () => {
       const job = (value: string) => wf("  test:", `    if: ${value}`, "    runs-on: x", "    steps:", "      - run: x");
       expect(gate(job("${{ github.ref == 'x' }}"))).toHaveLength(1);
@@ -709,6 +741,12 @@ describe("check:workflows release-gate rule: a trusted check must not be able to
     it("finds a real if that follows a block scalar", () => {
       const text = wf("  test:", "    runs-on: x", "    steps:", "      - run: |", "          echo hi", "        if: always()");
       expect(gate(text)).toHaveLength(1);
+    });
+
+    it("reads a file that starts with a byte-order mark", () => {
+      const bom = String.fromCharCode(0xfeff);
+      expect(gate(bom + clean)).toEqual([]);
+      expect(gate(bom + wf("  test:", "    if: always()", "    runs-on: x", "    steps:", "      - run: x"))).toHaveLength(1);
     });
 
     it("reads CRLF and bare-CR line endings the same as LF", () => {
