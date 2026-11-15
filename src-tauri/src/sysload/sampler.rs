@@ -18,6 +18,7 @@ use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
 use super::snapshot::{self, PublishedVerdict, Snapshot, TickStats, Writer, WriterIdentity};
+use super::trace::{self, PreviousBoot, TraceRecord, TraceWriter};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,11 @@ pub struct HostLoadStatus {
     /// Requests the sampler made that the OS refused (QoS, activity,
     /// election, publish).
     pub problems: Vec<String>,
+    /// The tail of the previous boot's trace (`host-load-trace.prev.v1`) and
+    /// its peaks, read once when the sampler started, for "Before the last
+    /// restart". `None` when there is none; a file that could not be trusted
+    /// is a value that says so.
+    pub previous_boot: Option<PreviousBoot>,
 }
 
 /// The small per-tick message the frontend listens for.
@@ -189,6 +195,8 @@ impl ActivityHold {
 struct Shared {
     dir: PathBuf,
     status: Mutex<Option<HostLoadStatus>>,
+    /// Read once when the sampler starts; refreshed when the trace rotates.
+    previous_boot: Mutex<Option<PreviousBoot>>,
     /// This sampler's governor. Only the app's is registered for the rest
     /// of the process to ask (`governor::report`).
     governor: Arc<Mutex<Governor>>,
@@ -247,6 +255,7 @@ pub fn start(options: SamplerOptions) -> Result<StopHandle, String> {
     let shared = Arc::new(Shared {
         dir: options.dir.clone(),
         status: Mutex::new(None),
+        previous_boot: Mutex::new(None),
         governor: Arc::new(Mutex::new(Governor::default())),
         stop: AtomicBool::new(false),
     });
@@ -280,6 +289,11 @@ pub fn status() -> HostLoadStatus {
             // stopped ticking must not leave a fresh-looking verdict.
             return HostLoadStatus {
                 governor: governor::report(),
+                previous_boot: shared
+                    .previous_boot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
                 ..status
             };
         }
@@ -306,6 +320,7 @@ pub fn status() -> HostLoadStatus {
             procs: None,
             tick: TickStats::default(),
             problems: Vec::new(),
+            previous_boot: None,
         },
     }
 }
@@ -331,6 +346,7 @@ fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats)
         procs: None,
         tick,
         problems,
+        previous_boot: None,
     }
 }
 
@@ -429,6 +445,14 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     // The governor's held verdict after the last tick's count, for the next
     // record to carry; pending until there has been a count.
     let mut held_verdict: Reading<PublishedVerdict> = Reading::Unavailable(Why::NotYet);
+    // The pre-crash trace: opened only once this process holds the writer
+    // election, so a reader process never appends.
+    let mut trace_ring: Option<TraceWriter> = None;
+    let mut trace_problem: Option<String> = None;
+    *shared
+        .previous_boot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = trace::previous_boot(&shared.dir);
 
     while !shared.stop.load(Ordering::Acquire) {
         let began = Instant::now();
@@ -445,6 +469,23 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 Err(why) => tick_problems.push(format!("election: {why}")),
             }
         }
+        if writer.is_some() && trace_ring.is_none() {
+            // Opening moves a ring written under another boot to
+            // `host-load-trace.prev.v1`, so the previous boot is read after.
+            match TraceWriter::open(&shared.dir, Clock::now().boot_id) {
+                Ok(opened) => {
+                    trace_ring = Some(opened);
+                    trace_problem = None;
+                    *shared
+                        .previous_boot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        trace::previous_boot(&shared.dir);
+                }
+                Err(why) => trace_problem = Some(format!("trace: {why}")),
+            }
+        }
+        tick_problems.extend(trace_problem.clone());
         let status = match writer.as_mut() {
             Some(w) => {
                 let mut snap = Snapshot::empty(Clock::now(), identity.clone(), enabled);
@@ -504,6 +545,23 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             }
             status.governor = governor.report(Instant::now());
             held_verdict = Reading::Value(PublishedVerdict::of(&status.governor.verdict));
+        }
+
+        // One record every fifth tick (10 s), from the elected writer only.
+        // A write that fails is a problem in Health, not a silent gap.
+        if trace::due(writer.is_some(), enabled, tick.ticks + 1) {
+            if let (Some(ring), Some(snapshot)) = (trace_ring.as_mut(), status.snapshot.as_ref()) {
+                let verdict = &status.governor.verdict;
+                trace_problem = ring
+                    .append(&TraceRecord::of(
+                        snapshot,
+                        verdict.tier,
+                        verdict.binding,
+                        verdict.admit,
+                    ))
+                    .err()
+                    .map(|why| format!("trace: {why}"));
+            }
         }
 
         let took = began.elapsed();
@@ -713,6 +771,71 @@ mod tests {
             assert_eq!(verdict.binding, None);
         }
         assert!(!verdict.shed_reactive || verdict.shed_background);
+    }
+
+    /// Real: the elected sampler appends a record every fifth tick, and on
+    /// starting after a reboot keeps the old boot's ring as the previous
+    /// one and reports its tail. A reader beside it appends nothing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_traces_every_fifth_tick_and_keeps_the_last_boots_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign_boot = Clock::now().boot_id ^ 0x5eed;
+        {
+            // A ring a previous boot left behind.
+            let mut old = TraceWriter::open(dir.path(), foreign_boot).unwrap();
+            let snap = Snapshot::empty(Clock::now(), own_identity(), true);
+            old.append(&TraceRecord::of(&snap, super::governor::Tier::Severe, None, false))
+                .unwrap();
+        }
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ticks.clone();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.on_tick = Some(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let writer = start(options).unwrap();
+        let deadline = Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(30));
+        while ticks.load(Ordering::SeqCst) < 16 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = writer.status().expect("a status");
+        assert_eq!(status.role, Role::Writer, "{:?}", status.problems);
+        // A second sampler in the same directory loses the election and
+        // reads: it must append nothing.
+        let mut second = SamplerOptions::new(dir.path().to_path_buf());
+        second.cadence = Duration::from_millis(20);
+        let reader = start(second).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        reader.stop();
+        // What Health shows under "Before the last restart" (`status()` adds
+        // it to the stored status): the tail of the ring the old boot left.
+        let shown = writer
+            .shared
+            .previous_boot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the previous boot is reported");
+        assert_eq!((shown.records.len(), shown.error.as_deref()), (1, None));
+        assert_eq!(shown.peaks.max_tier, Some(super::governor::Tier::Severe));
+        assert!(shown.peaks.refused);
+        writer.stop();
+
+        let held = trace::read_ring(&dir.path().join(trace::TRACE_FILE_NAME)).unwrap();
+        let counted = ticks.load(Ordering::SeqCst);
+        assert!(held.len() >= 3, "{} records after {counted} ticks", held.len());
+        assert!(
+            held.len() <= counted / 5 + 1,
+            "{} records after {counted} ticks: more than one per five",
+            held.len()
+        );
+        assert!(held.iter().all(|r| r.boot_id == Clock::now().boot_id));
+        let previous = trace::read_ring(&dir.path().join(trace::PREV_TRACE_FILE_NAME)).unwrap();
+        assert_eq!(previous.len(), 1, "the old boot's ring was kept");
+        assert_eq!(previous[0].tier, Some(super::governor::Tier::Severe));
+        assert_eq!(previous[0].admit, Some(false));
     }
 
     /// Real: a tick that panics does not end the sampler. A raw thread died

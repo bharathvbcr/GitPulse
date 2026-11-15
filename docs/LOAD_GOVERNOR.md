@@ -187,6 +187,55 @@ retries the election every tick. A process forked by the writer holds a copy of
 the lock descriptor until it execs. A writer that exits while such a fork is
 in flight therefore keeps the lock a moment longer; the next tick retries.
 
+## The trace, `host-load-trace.v1`
+
+`host-load.v1` is one overwritten record, so after the 2026-11-14 hard reset
+nothing said what the last minutes looked like. The trace is a bounded ring
+beside it, in the same directory, that keeps them.
+
+- **Layout.** A 64-byte header (magic `GPHT`, version, record length 128,
+  capacity, the boot id it belongs to, a checksum) then 1,080 fixed 128-byte
+  slots. Each record carries its sequence number and its own checksum; the slot
+  is `(seq - 1) % capacity`, so the file never grows past 138,304 bytes and the
+  oldest record is overwritten first.
+- **Cadence.** One record every 5th sampler tick (10 s at the 2 s cadence), so
+  the ring holds three hours.
+- **Who writes.** Only the elected writer sampler appends; a reader process
+  never opens the file for writing. `tests/host_load_sampler_scope.rs` pins
+  that `TraceWriter` is named only by the sampler and `trace.rs`. The file is
+  opened through `fs_entry::open_private_record`, so a symlink, a file owned by
+  someone else or one readable by others is refused and never touched.
+- **Fields.** Wall seconds, monotonic ms, boot id, memory pressure, the
+  governor's held tier, binding and admit verdict, swap used, compressed bytes,
+  1-minute load, free disk, launched and observed session counts, the largest
+  foreign footprint, the summed launched footprint, thermal state, power
+  source and the compressor segment fraction. A reading that could not be taken
+  is stored as unreadable (a sentinel no real value can take) and shown as
+  unreadable, never as zero.
+- **Cost and durability.** One 128-byte write and one `File::sync_all` per
+  10 s. On Apple targets the standard library implements `sync_all` (and
+  `sync_data`) as `fcntl(F_FULLFSYNC)`, a whole-device cache flush (verified in
+  `library/std/src/sys/fs/unix.rs` at the installed rustc's commit
+  0ef1bc386). So a hard reset loses at most the record being appended (up to
+  10 s of readings), not what the drive had in its cache. The price, measured
+  on the owner's Mac at load average about 20 (300 appends, interleaved with
+  plain `fsync(2)`): `sync_all` min 2.9 ms, median 4.9 ms, p95 11.2 ms, max
+  23 ms; plain `fsync(2)` median 0.07 ms, max 3.7 ms. A torn record fails its
+  checksum and is dropped on read. The append runs on the sampler thread after
+  the tick's snapshot is published and inside the tick's timing, so a slow
+  flush shows in `tick.last_us`, `tick.max_us` and, past the 2 s cadence,
+  `tick.overruns` in Health; a stall delays the next publish (the snapshot then
+  ages through the sensor states above).
+- **Boot change.** When the sampler starts and the header's boot id differs
+  from this boot's, the file is renamed to `host-load-trace.prev.v1` (replacing
+  any older one) and a fresh ring starts. A restart inside the same boot resumes
+  the sequence. A short, torn or foreign file is a typed error, is never
+  decoded, and is replaced.
+- **Where it shows.** `HostLoadStatus.previous_boot` carries the last 30
+  records of the previous boot plus the peaks over them (or the typed error).
+  Health, Host load, renders it as "Before the last restart". No new IPC
+  command was added; the status payload grew.
+
 ## Where it runs
 
 Only in the GitPulse app process. `lib.rs::run` starts the sampler from its

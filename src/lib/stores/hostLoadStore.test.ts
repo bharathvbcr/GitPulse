@@ -70,6 +70,7 @@ function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
     procs: null,
     tick: { ticks: 1, overruns: 0, missed: 0, last_us: 1, max_us: 1, cpu_ns: 1 },
     problems: [],
+    previous_boot: null,
     ...over,
   };
 }

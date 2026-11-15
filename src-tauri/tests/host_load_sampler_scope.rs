@@ -95,3 +95,47 @@ fn no_shipped_binary_but_the_app_reaches_the_sampler() {
         );
     }
 }
+
+/// The pre-crash trace is appended by the elected sampler and nobody else: the
+/// writer type is named only by its own module and the sampler, in production
+/// code, so no hook, no CLI and no second code path in the app can write the
+/// ring (and no reader process can: it never holds the election).
+#[test]
+fn only_the_elected_sampler_appends_to_the_trace() {
+    let mut files = Vec::new();
+    rust_files(&crate_dir().join("src"), &mut files);
+    let sysload = crate_dir().join("src").join("sysload");
+    let mut namers = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(crate_dir())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Test modules (`tests.rs`, `*_tests.rs`, `tests/`) exercise it.
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == "tests.rs" || name.ends_with("_tests.rs") || rel.contains("/tests/") {
+            continue;
+        }
+        let source = std::fs::read_to_string(file).unwrap();
+        if production(&source)
+            .lines()
+            .any(|line| line.split("//").next().unwrap_or("").contains("TraceWriter"))
+        {
+            namers.push(rel);
+        }
+    }
+    namers.sort();
+    assert_eq!(
+        namers,
+        ["src/sysload/sampler.rs", "src/sysload/trace.rs"],
+        "something besides the sampler names the trace writer"
+    );
+    // Inside the sampler, the append sits behind the election and the
+    // switch: `trace::due` takes both.
+    let sampler = std::fs::read_to_string(sysload.join("sampler.rs")).unwrap();
+    assert!(
+        production(&sampler).contains("trace::due(writer.is_some(), enabled,"),
+        "the sampler no longer gates the append on being the elected writer"
+    );
+}

@@ -492,7 +492,7 @@ fn ext_checksum(record: &[u8], seq: u64) -> u64 {
 /// Everything version 1 held, written where version 1 wrote it. The caller
 /// stamps the magic, version, length and checksum, which depend on which
 /// version is being written.
-fn encode_v1_fields(mut b: &mut [u8], snap: &Snapshot, seq: u64) {
+fn encode_v1_fields(b: &mut [u8], snap: &Snapshot, seq: u64) {
     let mut flags = (snap.platform.code() << FLAG_PLATFORM_SHIFT) & FLAG_PLATFORM_MASK;
     if snap.enabled {
         flags |= FLAG_ENABLED;
@@ -506,39 +506,39 @@ fn encode_v1_fields(mut b: &mut [u8], snap: &Snapshot, seq: u64) {
     if snap.memguard_warn {
         flags |= FLAG_MEMGUARD_WARN;
     }
-    put_u32(&mut b, OFF_FLAGS, flags);
-    put_u64(&mut b, OFF_SEQ, seq);
-    put_u64(&mut b, OFF_WALL, snap.written.wall_ms);
-    put_u64(&mut b, OFF_MONO, snap.written.mono_ns);
-    put_u64(&mut b, OFF_BOOT, snap.written.boot_id);
-    put_u32(&mut b, OFF_WRITER_PID, snap.writer.pid);
-    put_u32(&mut b, OFF_CADENCE, snap.cadence_ms);
-    put_u64(&mut b, OFF_WRITER_START, snap.writer.start_us);
+    put_u32(b, OFF_FLAGS, flags);
+    put_u64(b, OFF_SEQ, seq);
+    put_u64(b, OFF_WALL, snap.written.wall_ms);
+    put_u64(b, OFF_MONO, snap.written.mono_ns);
+    put_u64(b, OFF_BOOT, snap.written.boot_id);
+    put_u32(b, OFF_WRITER_PID, snap.writer.pid);
+    put_u32(b, OFF_CADENCE, snap.cadence_ms);
+    put_u64(b, OFF_WRITER_START, snap.writer.start_us);
     put_text(
-        &mut b,
+        b,
         OFF_WRITER_VERSION,
         VERSION_FIELD_LEN,
         &snap.writer.version,
     );
-    put_text(&mut b, OFF_WRITER_PATH, PATH_FIELD_LEN, &snap.writer.path);
+    put_text(b, OFF_WRITER_PATH, PATH_FIELD_LEN, &snap.writer.path);
 
     let h = &snap.host;
-    put_reading(&mut b, S_PRESSURE, h.pressure, |b, v| {
+    put_reading(b, S_PRESSURE, h.pressure, |b, v| {
         put_u32(b, OFF_PRESSURE, v.kernel())
     });
-    put_reading(&mut b, S_SWAP_USED, h.swap_used, |b, v| {
+    put_reading(b, S_SWAP_USED, h.swap_used, |b, v| {
         put_u64(b, OFF_SWAP_USED, v)
     });
-    put_reading(&mut b, S_SWAP_TOTAL, h.swap_total, |b, v| {
+    put_reading(b, S_SWAP_TOTAL, h.swap_total, |b, v| {
         put_u64(b, OFF_SWAP_TOTAL, v)
     });
-    put_reading(&mut b, S_COMPRESSOR, h.compressor, |b, c| {
+    put_reading(b, S_COMPRESSOR, h.compressor, |b, c| {
         put_u64(b, OFF_COMPRESSOR, c.thrashing_detected);
         put_u64(b, OFF_COMPRESSOR + 8, c.free_below_reserved);
         put_u64(b, OFF_COMPRESSOR + 16, c.swapouts_pressure);
         put_u64(b, OFF_COMPRESSOR + 24, c.major_compaction_segments_freed);
     });
-    put_reading(&mut b, S_COMPRESSOR_DELTA, snap.compressor_delta, |b, d| {
+    put_reading(b, S_COMPRESSOR_DELTA, snap.compressor_delta, |b, d| {
         put_u64(b, OFF_COMPRESSOR_DELTA, d.thrashing_detected);
         put_u64(b, OFF_COMPRESSOR_DELTA + 8, d.free_below_reserved);
         put_u64(b, OFF_COMPRESSOR_DELTA + 16, d.swapouts_pressure);
@@ -548,85 +548,85 @@ fn encode_v1_fields(mut b: &mut [u8], snap: &Snapshot, seq: u64) {
             d.major_compaction_segments_freed,
         );
     });
-    put_reading(&mut b, S_COMPRESSED, h.compressed_bytes, |b, v| {
+    put_reading(b, S_COMPRESSED, h.compressed_bytes, |b, v| {
         put_u64(b, OFF_COMPRESSED, v)
     });
-    put_reading(&mut b, S_LOAD, h.load, |b, l| {
+    put_reading(b, S_LOAD, h.load, |b, l| {
         for (i, v) in l.iter().enumerate() {
             // Milli-load: a load of 4.2 B is far past anything real.
             let milli = (v.max(0.0) * 1000.0).round().min(f64::from(u32::MAX)) as u32;
             put_u32(b, OFF_LOAD + 4 * i, milli);
         }
     });
-    put_reading(&mut b, S_CORES, h.cores, |b, c| {
+    put_reading(b, S_CORES, h.cores, |b, c| {
         b[OFF_CORE_LEVELS] = c.levels;
         put_u16(b, OFF_CORE_LOGICAL, c.logical);
         put_u16(b, OFF_CORE_P0, c.perf0);
         put_u16(b, OFF_CORE_P1, c.perf1);
     });
-    put_reading(&mut b, S_MEMSIZE, h.memsize, |b, v| {
+    put_reading(b, S_MEMSIZE, h.memsize, |b, v| {
         put_u64(b, OFF_MEMSIZE, v)
     });
-    put_reading(&mut b, S_OPEN_FILES, h.open_files, |b, v| {
+    put_reading(b, S_OPEN_FILES, h.open_files, |b, v| {
         put_u64(b, OFF_OPEN_FILES, v)
     });
-    put_reading(&mut b, S_MAX_FILES, h.max_files, |b, v| {
+    put_reading(b, S_MAX_FILES, h.max_files, |b, v| {
         put_u64(b, OFF_MAX_FILES, v)
     });
-    put_reading(&mut b, S_FREE_DISK, h.free_disk, |b, v| {
+    put_reading(b, S_FREE_DISK, h.free_disk, |b, v| {
         put_u64(b, OFF_FREE_DISK, v)
     });
-    put_reading(&mut b, S_THERMAL, h.thermal, |b, t| {
+    put_reading(b, S_THERMAL, h.thermal, |b, t| {
         b[OFF_THERMAL] = t.code()
     });
-    put_reading(&mut b, S_POWER, h.power, |b, p| {
+    put_reading(b, S_POWER, h.power, |b, p| {
         b[OFF_POWER] = match p {
             Power::Ac => 0,
             Power::Battery => 1,
         }
     });
-    put_reading(&mut b, S_PROCESSES, snap.processes, |b, v| {
+    put_reading(b, S_PROCESSES, snap.processes, |b, v| {
         put_u32(b, OFF_PROCESSES, v)
     });
-    put_u32(&mut b, OFF_UNREADABLE, snap.unreadable_processes);
-    put_u32(&mut b, OFF_ORPHANS, snap.orphans);
-    put_reading(&mut b, S_CLAUDE, snap.claude, |b, c| {
+    put_u32(b, OFF_UNREADABLE, snap.unreadable_processes);
+    put_u32(b, OFF_ORPHANS, snap.orphans);
+    put_reading(b, S_CLAUDE, snap.claude, |b, c| {
         put_u32(b, OFF_CLAUDE, c.launched);
         put_u32(b, OFF_CLAUDE + 4, c.observed);
     });
-    put_reading(&mut b, S_CODEX, snap.codex, |b, c| {
+    put_reading(b, S_CODEX, snap.codex, |b, c| {
         put_u32(b, OFF_CODEX, c.launched);
         put_u32(b, OFF_CODEX + 4, c.observed);
     });
-    put_reading(&mut b, S_LAUNCHED_FP, snap.launched_footprint, |b, v| {
+    put_reading(b, S_LAUNCHED_FP, snap.launched_footprint, |b, v| {
         put_u64(b, OFF_LAUNCHED_FP, v)
     });
-    put_reading(&mut b, S_OBSERVED_FP, snap.observed_footprint, |b, v| {
+    put_reading(b, S_OBSERVED_FP, snap.observed_footprint, |b, v| {
         put_u64(b, OFF_OBSERVED_FP, v)
     });
-    put_reading(&mut b, S_LARGEST_FOREIGN, snap.largest_foreign, |b, v| {
+    put_reading(b, S_LARGEST_FOREIGN, snap.largest_foreign, |b, v| {
         put_u64(b, OFF_LARGEST_FOREIGN, v)
     });
     put_reading(
-        &mut b,
+        b,
         S_LAUNCHED_WRATE,
         snap.launched_write_rate,
         |b, v| put_u64(b, OFF_LAUNCHED_WRATE, v),
     );
     put_reading(
-        &mut b,
+        b,
         S_MAX_TREE_WRATE,
         snap.max_tree_write_rate,
         |b, v| put_u64(b, OFF_MAX_TREE_WRATE, v),
     );
-    put_u32(&mut b, OFF_MEMGUARD_PID, snap.memguard_pid);
-    put_u32(&mut b, OFF_TICK_LAST, snap.tick.last_us);
-    put_u64(&mut b, OFF_TICKS, snap.tick.ticks);
-    put_u64(&mut b, OFF_OVERRUNS, snap.tick.overruns);
-    put_u64(&mut b, OFF_MISSED, snap.tick.missed);
-    put_u32(&mut b, OFF_TICK_MAX, snap.tick.max_us);
-    put_u64(&mut b, OFF_SAMPLER_CPU, snap.tick.cpu_ns);
-    put_u64(&mut b, OFF_SEQ_TAIL, seq);
+    put_u32(b, OFF_MEMGUARD_PID, snap.memguard_pid);
+    put_u32(b, OFF_TICK_LAST, snap.tick.last_us);
+    put_u64(b, OFF_TICKS, snap.tick.ticks);
+    put_u64(b, OFF_OVERRUNS, snap.tick.overruns);
+    put_u64(b, OFF_MISSED, snap.tick.missed);
+    put_u32(b, OFF_TICK_MAX, snap.tick.max_us);
+    put_u64(b, OFF_SAMPLER_CPU, snap.tick.cpu_ns);
+    put_u64(b, OFF_SEQ_TAIL, seq);
 }
 
 /// FNV-1a over the version-1 fields, with the head sequence included: a

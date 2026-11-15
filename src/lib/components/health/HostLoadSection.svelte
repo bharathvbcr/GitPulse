@@ -34,7 +34,9 @@
     formatAge,
     levelLabel,
     memguardLine,
+    previousBootLines,
     sensorStateLabel,
+    traceRow,
   } from "../../health/hostLoad";
   import { describeFailure, type FailureAction, type FailureCopy } from "../../ui/copy/describeFailure";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
@@ -46,6 +48,15 @@
     { label: "Directory" },
     { label: "Started by" },
     { label: "Memory" },
+  ]);
+  const TRACE_COLUMNS = Object.freeze([
+    { label: "Time" },
+    { label: "Memory pressure" },
+    { label: "Governor" },
+    { label: "Swap used" },
+    { label: "Load" },
+    { label: "Free disk" },
+    { label: "Started here" },
   ]);
   const TREE_COLUMNS = Object.freeze([
     { label: "Run" },
@@ -339,6 +350,26 @@
       {#if outcome}
         <p class="text-textMuted" data-testid="host-load-terminate-outcome">{outcome}</p>
       {/if}
+    {/if}
+
+    {#if status.previous_boot}
+      <div class="space-y-1" data-testid="host-load-previous-boot">
+        <h4 class="gp-label">Before the last restart</h4>
+        {#each previousBootLines(status.previous_boot) as line (line)}
+          <p class="{status.previous_boot.error ? 'text-warn' : 'text-textMuted'}">{line}</p>
+        {/each}
+        {#if status.previous_boot.records.length > 0}
+          <HealthTable caption="The last readings before the previous boot ended" columns={TRACE_COLUMNS}>
+            {#each status.previous_boot.records as record, at (`${record.mono_ms}:${at}`)}
+              <tr>
+                {#each traceRow(record) as cell, at (at)}
+                  <td class="px-3 py-1.5 {at === 0 ? 'text-textPrimary' : 'text-textMuted'}">{cell}</td>
+                {/each}
+              </tr>
+            {/each}
+          </HealthTable>
+        {/if}
+      </div>
     {/if}
 
     <p class="text-textMuted" data-testid="host-load-sampler">

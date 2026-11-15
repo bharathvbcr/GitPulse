@@ -45,8 +45,10 @@ mod sampler;
 mod sensor;
 mod snapshot;
 mod thresholds;
+mod trace;
 
 pub use thresholds::{InputMode, ModeRule, Readings, Rule, Thresholds};
+pub use trace::{PreviousBoot, TracePeaks, TraceRecord};
 
 pub use disk::{block_size, free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
 pub use governor::{

@@ -84,5 +84,6 @@ export function hostLoadStatusFixture(): HostLoadStatus {
     procs: null,
     tick,
     problems: [],
+    previous_boot: null,
   };
 }

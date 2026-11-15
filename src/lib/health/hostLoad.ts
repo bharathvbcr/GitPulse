@@ -16,7 +16,9 @@ import type {
   HostLoadPulse,
   Level,
   MemguardHealth,
+  PreviousBoot,
   Reading,
+  TraceRecord,
   SensorState,
   Why,
 } from "../stores/hostLoadStore";
@@ -302,4 +304,57 @@ export function memguardLine(memguard: MemguardHealth): string {
   const log = describeReading(memguard.log_path, (path) => path);
   const beat = describeReading(memguard.heartbeat_age_s, (s) => `${formatAge(s * 1000)} ago`);
   return `memguard running${pid} · log ${log} · last written ${beat}`;
+}
+
+/** Seconds since the epoch as a local date and time, for "ended at". */
+export function wallTime(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+const readOrUnknown = <T>(value: T | null, format: (value: T) => string): string =>
+  value === null ? "unreadable" : format(value);
+
+/**
+ * The previous boot's trace in sentences, for "Before the last restart": when
+ * it ended, then the worst of each reading over its last 30 records. A reading
+ * that could not be taken says so; it is never shown as zero.
+ */
+export function previousBootLines(previous: PreviousBoot): string[] {
+  if (previous.error !== null) {
+    return [`The last boot's trace could not be read: ${previous.error}.`];
+  }
+  if (previous.records.length === 0 || previous.ended_wall_s === null) {
+    return ["The last boot's trace holds no readings."];
+  }
+  const p = previous.peaks;
+  const first = previous.records[0].mono_ms;
+  const last = previous.records[previous.records.length - 1].mono_ms;
+  const spanMs = Math.max(0, last - first);
+  return [
+    `Ended ${wallTime(previous.ended_wall_s)}; its last ${previous.records.length} readings span ${formatAge(spanMs)}.`,
+    `Highest memory pressure: ${p.max_pressure === null ? "unreadable" : levelLabel(p.max_pressure)}. Governor: ${p.max_tier ?? "unknown"}${p.refused ? ", launches were refused" : ", launches were admitted"}.`,
+    `Swap used, at most ${readOrUnknown(p.max_swap_used, bytes)}. Compressor segments, at most ${readOrUnknown(p.max_segment_fraction, (f) => f.toFixed(2))} of the limit.`,
+    `1-minute load, at most ${readOrUnknown(p.max_load_1m, (l) => l.toFixed(1))}. Free disk, at least ${readOrUnknown(p.min_free_disk, bytes)}.`,
+    `GitPulse's launched trees, at most ${readOrUnknown(p.max_launched_footprint, bytes)}. Largest other process, at most ${readOrUnknown(p.max_largest_foreign, bytes)}.`,
+    `Thermal state, worst ${p.worst_thermal ?? "unreadable"}.`,
+  ];
+}
+
+/** One trace record as a row: time, pressure, tier and binding, then the readings. */
+export function traceRow(record: TraceRecord): string[] {
+  const tier =
+    record.tier === null
+      ? "unknown"
+      : record.binding === null
+        ? record.tier
+        : `${record.tier}: ${bindingLabel(record.binding)}`;
+  return [
+    new Date(record.wall_s * 1000).toLocaleTimeString(),
+    record.pressure === null ? "unreadable" : levelLabel(record.pressure),
+    record.admit === false ? `${tier} (refusing)` : tier,
+    readOrUnknown(record.swap_used, bytes),
+    readOrUnknown(record.load_1m, (l) => l.toFixed(1)),
+    readOrUnknown(record.free_disk, bytes),
+    readOrUnknown(record.launched_sessions, String),
+  ];
 }

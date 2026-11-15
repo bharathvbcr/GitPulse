@@ -327,6 +327,52 @@ export interface GovernorPulse {
 /** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
 export const HOST_PRESSURE_REFUSAL = "host_pressure";
 
+/** `sysload::TraceRecord`: one sample of the pre-crash ring; null is unreadable, never zero. */
+export interface TraceRecord {
+  wall_s: number;
+  mono_ms: number;
+  boot_id: number;
+  pressure: Level | null;
+  tier: Tier | null;
+  binding: Binding | null;
+  admit: boolean | null;
+  swap_used: number | null;
+  compressed_bytes: number | null;
+  load_1m: number | null;
+  free_disk: number | null;
+  launched_sessions: number | null;
+  observed_sessions: number | null;
+  largest_foreign: number | null;
+  launched_footprint: number | null;
+  thermal: Thermal | null;
+  power: Power | null;
+  segment_fraction: number | null;
+}
+
+/** `sysload::TracePeaks`: the worst of each reading over a window; null when none could be read. */
+export interface TracePeaks {
+  records: number;
+  max_tier: Tier | null;
+  refused: boolean;
+  max_swap_used: number | null;
+  max_compressed_bytes: number | null;
+  max_load_1m: number | null;
+  min_free_disk: number | null;
+  max_launched_footprint: number | null;
+  max_largest_foreign: number | null;
+  max_segment_fraction: number | null;
+  worst_thermal: Thermal | null;
+  max_pressure: Level | null;
+}
+
+/** `sysload::PreviousBoot`: what the last boot's trace ended with. */
+export interface PreviousBoot {
+  ended_wall_s: number | null;
+  records: TraceRecord[];
+  peaks: TracePeaks;
+  error: string | null;
+}
+
 export interface HostLoadStatus {
   platform: Platform;
   role: Role;
@@ -340,6 +386,8 @@ export interface HostLoadStatus {
   procs: ProcView | null;
   tick: TickStats;
   problems: string[];
+  /** The tail of the previous boot's trace; null when there is none. */
+  previous_boot: PreviousBoot | null;
 }
 
 export interface HostLoadPulse {
