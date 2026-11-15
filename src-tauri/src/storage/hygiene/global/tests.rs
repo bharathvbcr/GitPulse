@@ -1,6 +1,7 @@
 use super::{
     eligible_candidates, Cleaner, CleanerCandidate, CleanerConfig, CleanerRun, Saved, VERSION,
 };
+use crate::procguard::LockedSpawn;
 use crate::storage::hygiene::discovery;
 use std::fs;
 use std::sync::atomic::AtomicBool;
@@ -1924,7 +1925,7 @@ fn worktree_with_cargo_target(root: &std::path::Path) -> (std::path::PathBuf, st
         .current_dir(&r)
         .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
         .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
-        .status()
+        .status_locked()
         .unwrap();
     assert!(status.success());
     let wt = r.join(".claude/worktrees/agent-x");
