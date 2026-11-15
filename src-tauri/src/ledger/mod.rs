@@ -5602,7 +5602,9 @@ fn is_env_assignment(token: &str) -> bool {
         return false;
     };
     let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -5675,7 +5677,9 @@ fn extract_git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
         }
         return Some((arg, &tokens[idx + 1..]));
     }
-    tokens.get(idx).map(|sub| (sub.as_str(), &tokens[idx + 1..]))
+    tokens
+        .get(idx)
+        .map(|sub| (sub.as_str(), &tokens[idx + 1..]))
 }
 
 fn is_git_write_subcommand(sub: &str, rest: &[String]) -> bool {
@@ -5727,7 +5731,10 @@ fn is_git_write_subcommand(sub: &str, rest: &[String]) -> bool {
     }
 
     match sub {
-        "reflog" => !matches!(rest.first().map(String::as_str), None | Some("show" | "exists")),
+        "reflog" => !matches!(
+            rest.first().map(String::as_str),
+            None | Some("show" | "exists")
+        ),
         "stash" => !matches!(rest.first().map(String::as_str), Some("list" | "show")),
         "worktree" => !matches!(rest.first().map(String::as_str), Some("list")),
         "remote" => !matches!(
@@ -5770,7 +5777,9 @@ fn is_git_write_subcommand(sub: &str, rest: &[String]) -> bool {
                         | "--edit-description"
                 ) || (a.starts_with('-')
                     && !a.starts_with("--")
-                    && a.chars().skip(1).any(|ch| matches!(ch, 'd' | 'D' | 'm' | 'M' | 'c' | 'C')))
+                    && a.chars()
+                        .skip(1)
+                        .any(|ch| matches!(ch, 'd' | 'D' | 'm' | 'M' | 'c' | 'C')))
             });
             if has_write_flag {
                 return true;
@@ -5809,7 +5818,12 @@ fn is_git_write_subcommand(sub: &str, rest: &[String]) -> bool {
             let has_write = rest.iter().any(|a| {
                 matches!(
                     a.as_str(),
-                    "--unset" | "--unset-all" | "--replace-all" | "--add" | "--remove-section" | "--rename-section"
+                    "--unset"
+                        | "--unset-all"
+                        | "--replace-all"
+                        | "--add"
+                        | "--remove-section"
+                        | "--rename-section"
                 )
             });
             !(has_read && !has_write)
@@ -5921,7 +5935,10 @@ pub fn record_op_snapshot_event(
         worktree_path: worktree,
         actor_kind: Some(ActorKind::Agent),
         actor_id: Some("gitpulse-op-log".to_string()),
-        session_id: session_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         task_id: resolved_task,
         action: action_for_git_command(command),
         object: Some(op_ref.to_string()),
@@ -5959,7 +5976,10 @@ pub fn record_unsnapshotted_git_op(
         worktree_path: worktree,
         actor_kind: Some(ActorKind::Agent),
         actor_id: Some("gitpulse-op-log".to_string()),
-        session_id: session_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         task_id: resolved_task,
         action: action_for_git_command(command),
         object: Some(OP_UNSNAPSHOTTED.to_string()),
@@ -6094,7 +6114,10 @@ mod tests {
         assert!(!is_git_write_command("ls -la && echo 'git commit'"));
 
         assert_eq!(action_for_git_command("git -C x rebase main"), "git.rebase");
-        assert_eq!(action_for_git_command("git cherry-pick abc123"), "git.cherry_pick");
+        assert_eq!(
+            action_for_git_command("git cherry-pick abc123"),
+            "git.cherry_pick"
+        );
     }
 
     use super::*;

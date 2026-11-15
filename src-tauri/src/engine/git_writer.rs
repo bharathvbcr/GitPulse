@@ -4268,7 +4268,11 @@ fn working_tree_has_user_changes(repo: &Path) -> Result<bool, CommandError> {
 fn list_op_ref_tips(repo: &Path) -> Result<Vec<(u64, String, String)>, CommandError> {
     let raw = git_text(
         repo,
-        &["for-each-ref", "--format=%(refname)%00%(objectname)", OP_REF_PREFIX],
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            OP_REF_PREFIX,
+        ],
     )?;
     let mut tips = Vec::new();
     for line in raw.lines() {
@@ -4304,9 +4308,8 @@ fn read_op_payload(
         .split_once("\n\n")
         .ok_or_else(|| format!("Snapshot {op_ref} ({snapshot_oid}) has no commit message body"))?;
     let trimmed = body.trim();
-    let payload: OpSnapshotPayload = serde_json::from_str(trimmed).map_err(|e| {
-        format!("Snapshot {op_ref} ({snapshot_oid}) payload is invalid JSON: {e}")
-    })?;
+    let payload: OpSnapshotPayload = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Snapshot {op_ref} ({snapshot_oid}) payload is invalid JSON: {e}"))?;
     if payload.seq != seq {
         return Err(format!(
             "Snapshot {op_ref} sequence mismatch: payload carries {}, ref carries {seq}",
@@ -4613,10 +4616,8 @@ impl GitWriter {
     ) -> Result<OpSnapshotList, CommandError> {
         let repo = validate_repo(repo_path)?;
         let live_refs = read_heads_and_tags(&repo)?;
-        let live_map: HashMap<String, String> = live_refs
-            .into_iter()
-            .map(|r| (r.refname, r.oid))
-            .collect();
+        let live_map: HashMap<String, String> =
+            live_refs.into_iter().map(|r| (r.refname, r.oid)).collect();
         let mut tips = list_op_ref_tips(&repo)?;
         tips.reverse();
 
@@ -4725,10 +4726,8 @@ impl GitWriter {
         let head_sym_before = read_head_symbolic_ref(&repo)?;
         let live_rows = read_heads_and_tags(&repo)?;
         let absent_oid = repo_absent_oid(&repo, head_before.as_deref(), &live_rows)?;
-        let live_map: HashMap<String, String> = live_rows
-            .into_iter()
-            .map(|r| (r.refname, r.oid))
-            .collect();
+        let live_map: HashMap<String, String> =
+            live_rows.into_iter().map(|r| (r.refname, r.oid)).collect();
 
         let mut expected_map: HashMap<&str, Option<&str>> =
             HashMap::with_capacity(plan.expected_refs.len());
@@ -4741,9 +4740,11 @@ impl GitWriter {
                 .insert(exp.refname.as_str(), exp.expected_oid.as_deref())
                 .is_some()
             {
-                return Err(
-                    format!("Undo plan contains duplicate expectation for {}", exp.refname).into(),
-                );
+                return Err(format!(
+                    "Undo plan contains duplicate expectation for {}",
+                    exp.refname
+                )
+                .into());
             }
         }
 
@@ -9224,8 +9225,9 @@ mod bound_to_checked_state {
         git_in(p, &["add", "--", "extra.txt"]);
         git_in(p, &["commit", "-q", "-m", "extra move after review"]);
         let feature_externally_moved = rev(p, "refs/heads/feature");
-        let moved_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &stale_plan, &mut |_| Ok(()))
-            .expect_err("moved ref after review must be refused by CAS");
+        let moved_err =
+            GitWriter::undo_op_snapshot_with_gate(repo_str, &stale_plan, &mut |_| Ok(()))
+                .expect_err("moved ref after review must be refused by CAS");
         assert!(
             moved_err.message().contains("refs/heads/feature"),
             "refusal must name moved ref: {}",
@@ -9241,7 +9243,10 @@ mod bound_to_checked_state {
         let untracked_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
             .expect_err("untracked user file must require confirm_dirty");
         assert!(
-            untracked_err.message().to_lowercase().contains("uncommitted")
+            untracked_err
+                .message()
+                .to_lowercase()
+                .contains("uncommitted")
                 || untracked_err.message().to_lowercase().contains("dirty"),
             "expected dirty confirmation error for untracked user file, got: {}",
             untracked_err.message()
@@ -9265,12 +9270,18 @@ mod bound_to_checked_state {
         assert_eq!(outcome.seq, 1);
         assert_eq!(outcome.op_ref, "refs/gitpulse/ops/1");
         assert_eq!(outcome.restored_refs, 3);
-        assert_eq!(outcome.head_before.as_deref(), Some(feature_externally_moved.as_str()));
+        assert_eq!(
+            outcome.head_before.as_deref(),
+            Some(feature_externally_moved.as_str())
+        );
         assert_eq!(outcome.head_after.as_deref(), Some(feature_before.as_str()));
         assert_eq!(rev(p, "refs/heads/main"), main_before);
         assert_eq!(rev(p, "refs/heads/feature"), feature_before);
         assert_eq!(rev(p, "refs/tags/v0.1.0"), main_before);
-        assert_eq!(std::fs::read_to_string(p.join("feature.txt")).unwrap(), "feat-1\n");
+        assert_eq!(
+            std::fs::read_to_string(p.join("feature.txt")).unwrap(),
+            "feat-1\n"
+        );
 
         let page = crate::ledger::query_readonly_page(
             repo_str,
@@ -9286,11 +9297,20 @@ mod bound_to_checked_state {
         .expect("ledger exists");
         assert_eq!(page.events.len(), 1);
         let row = &page.events[0];
-        assert_eq!(row.before_ref.as_deref(), Some(feature_externally_moved.as_str()));
+        assert_eq!(
+            row.before_ref.as_deref(),
+            Some(feature_externally_moved.as_str())
+        );
         assert_eq!(row.after_ref.as_deref(), Some(feature_before.as_str()));
         let detail = row.detail_json.as_deref().unwrap_or("");
-        assert!(detail.contains("\"occurred_at\""), "detail missing occurred_at: {detail}");
-        assert!(detail.contains("\"kind\":\"undo\""), "detail missing kind: {detail}");
+        assert!(
+            detail.contains("\"occurred_at\""),
+            "detail missing occurred_at: {detail}"
+        );
+        assert!(
+            detail.contains("\"kind\":\"undo\""),
+            "detail missing kind: {detail}"
+        );
     }
 
     #[test]
@@ -9348,7 +9368,10 @@ mod bound_to_checked_state {
 
         // Verify .git/config bytes were never touched by snapshot creation, eviction, or expiry.
         let config_after = std::fs::read(&config_path).expect("read .git/config after prune");
-        assert_eq!(config_after, config_before, "pruning must write no .git/config");
+        assert_eq!(
+            config_after, config_before,
+            "pruning must write no .git/config"
+        );
     }
 }
 

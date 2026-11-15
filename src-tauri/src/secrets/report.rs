@@ -189,9 +189,7 @@ pub(crate) fn scan_exclusions(
         trees.extend(view.ignored.iter().filter_map(|entry| {
             let dir = entry.strip_suffix('/')?;
             let name = dir.rsplit('/').next()?;
-            BULK_IGNORED_DIRS
-                .contains(&name)
-                .then(|| entry.clone())
+            BULK_IGNORED_DIRS.contains(&name).then(|| entry.clone())
         }));
     }
     trees.extend(worktrees.iter().filter_map(|tree| {
@@ -210,7 +208,10 @@ pub(crate) fn scan_exclusions(
     // `/`, so a prefix is a whole path segment.
     let mut kept: Vec<String> = Vec::new();
     for rel in trees {
-        if !kept.iter().any(|ancestor| rel.starts_with(ancestor.as_str())) {
+        if !kept
+            .iter()
+            .any(|ancestor| rel.starts_with(ancestor.as_str()))
+        {
             kept.push(rel);
         }
     }

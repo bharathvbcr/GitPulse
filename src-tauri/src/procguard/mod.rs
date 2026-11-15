@@ -1407,9 +1407,8 @@ mod sys {
     /// been recycled, and the registry's rule that a reaped pid is forgotten
     /// under the entry lock is what rules that out.
     fn signal_group(pid: u32, signo: libc::c_int, who: &str) -> io::Result<bool> {
-        let pgid = i32::try_from(pid).map_err(|_| {
-            super::signal::refusal(format!("pid {pid} does not fit a pid_t"))
-        })?;
+        let pgid = i32::try_from(pid)
+            .map_err(|_| super::signal::refusal(format!("pid {pid} does not fit a pid_t")))?;
         // The guarded primitive refuses 0, 1, negative ids, our own group and a
         // leader that is no longer one of ours; see `super::signal`.
         super::signal::signal_group(pgid, signo, super::signal::Basis::Spawned, who)

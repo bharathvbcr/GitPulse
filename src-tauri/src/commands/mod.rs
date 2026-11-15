@@ -29,13 +29,13 @@ use crate::engine::{
     RemoteList, RepoOperation, ResetMode, StashAction, SubmoduleChange, SubmoduleList,
     WorktreeInfo,
 };
+use crate::github::avatars::{load_author_avatars, AuthorAvatarQuery, AuthorAvatarReport};
 use crate::github::{
     checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
     load_code_scanning_alerts, load_dependabot_alerts, load_github_context,
     load_workflow_runs_report, pr_checkout_argv, validate_issue_payload, CodeScanningReport,
     DependabotReport, GitHubContext,
 };
-use crate::github::avatars::{load_author_avatars, AuthorAvatarQuery, AuthorAvatarReport};
 use crate::graph::{
     mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
     LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,

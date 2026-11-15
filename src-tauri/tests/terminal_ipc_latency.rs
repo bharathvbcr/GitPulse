@@ -1332,7 +1332,11 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
                         tauri::async_runtime::block_on(cmd_terminal_context(state, id.clone()))
                             .map(|_| ())
                     } else {
-                        tauri::async_runtime::block_on(cmd_terminal_kill(handle.clone(), state, id.clone()))
+                        tauri::async_runtime::block_on(cmd_terminal_kill(
+                            handle.clone(),
+                            state,
+                            id.clone(),
+                        ))
                     }
                 })
             })

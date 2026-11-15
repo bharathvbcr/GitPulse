@@ -831,11 +831,9 @@ impl TerminalSessions {
     /// Records `meta` in this process's `agent_meta` map without forwarding to
     /// `gitpulse-ptyd` (used both locally and inside `gitpulse-ptyd` itself).
     pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
-        let _ = self.session_ledger.bind_native_id(
-            session_id,
-            &meta.agent,
-            &meta.conversation_id,
-        );
+        let _ = self
+            .session_ledger
+            .bind_native_id(session_id, &meta.agent, &meta.conversation_id);
         let mut map = self
             .agent_meta
             .lock()

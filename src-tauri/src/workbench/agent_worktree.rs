@@ -402,10 +402,7 @@ pub fn plan_fork_target(
     }
     let container = gitpulse_lane_container(&main);
     std::fs::create_dir_all(&container).map_err(|e| {
-        CommandError::plain(format!(
-            "Could not create {}: {e}",
-            container.display()
-        ))
+        CommandError::plain(format!("Could not create {}: {e}", container.display()))
     })?;
 
     let source_name = Path::new(source_worktree_path)
@@ -416,14 +413,17 @@ pub fn plan_fork_target(
         let base = slug(source_name);
         base.strip_suffix("-fork").unwrap_or(&base).to_string()
     };
-    let explicit_branch = requested_branch
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let explicit_branch = requested_branch.map(str::trim).filter(|s| !s.is_empty());
     if let Some(branch) = explicit_branch {
         crate::engine::git_writer::validate_ref_name(branch)?;
         let taken = crate::engine::git_cli::git_captured(
             &main,
-            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
         )?;
         if taken.success {
             return Err(CommandError::plain(format!(
@@ -450,7 +450,12 @@ pub fn plan_fork_target(
         }
         let branch_taken = crate::engine::git_cli::git_captured(
             &main,
-            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
         )?;
         if branch_taken.success {
             continue;

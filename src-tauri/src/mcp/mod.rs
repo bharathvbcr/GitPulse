@@ -8276,7 +8276,10 @@ mod tests {
             "gitpulse_get_task",
             json!({"repo_path": repo, "task_id": "nonexistent"}),
         );
-        assert!(error, "getting a task when no board exists must return error");
+        assert!(
+            error,
+            "getting a task when no board exists must return error"
+        );
         assert_eq!(get_empty, json!(NO_BOARD));
         assert!(
             !database.exists(),
@@ -8302,7 +8305,10 @@ mod tests {
             }),
         );
         assert!(!error, "{added2}");
-        assert!(database.exists(), "workbench.sqlite must exist after add_task");
+        assert!(
+            database.exists(),
+            "workbench.sqlite must exist after add_task"
+        );
 
         // 3. Mark the database file as read-only.
         struct ReadonlyGuard(std::path::PathBuf);
@@ -8311,7 +8317,8 @@ mod tests {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
                 }
                 #[cfg(windows)]
                 if let Ok(meta) = std::fs::metadata(&self.0) {
@@ -8328,7 +8335,10 @@ mod tests {
 
         // 4. Verify reader tools succeed on the read-only database.
         let (error, listed) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
-        assert!(!error, "gitpulse_list_tasks must succeed on read-only store: {listed}");
+        assert!(
+            !error,
+            "gitpulse_list_tasks must succeed on read-only store: {listed}"
+        );
         assert_eq!(listed["returned"], 2, "{listed}");
         let titles: Vec<&str> = listed["tasks"]
             .as_array()
@@ -8343,7 +8353,10 @@ mod tests {
             "gitpulse_get_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task"}),
         );
-        assert!(!error, "gitpulse_get_task must succeed on read-only store: {fetched}");
+        assert!(
+            !error,
+            "gitpulse_get_task must succeed on read-only store: {fetched}"
+        );
         assert_eq!(fetched["task"]["title"], "Task for read-only store test");
 
         // 5. Verify mutating tools fail when the store cannot be opened writeable.
@@ -8351,13 +8364,19 @@ mod tests {
             "gitpulse_complete_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task", "status": "review"}),
         );
-        assert!(error, "gitpulse_complete_task must fail when database is read-only: {complete_res}");
+        assert!(
+            error,
+            "gitpulse_complete_task must fail when database is read-only: {complete_res}"
+        );
 
         let (error, delete_res) = tool_json(
             "gitpulse_delete_task",
             json!({"repo_path": repo, "task_id": "gp-ro-test-task", "reason": "test"}),
         );
-        assert!(error, "gitpulse_delete_task must fail when database is read-only: {delete_res}");
+        assert!(
+            error,
+            "gitpulse_delete_task must fail when database is read-only: {delete_res}"
+        );
 
         let (error, merge_res) = tool_json(
             "gitpulse_merge_tasks",
@@ -8368,7 +8387,10 @@ mod tests {
                 "reason": "test"
             }),
         );
-        assert!(error, "gitpulse_merge_tasks must fail when database is read-only: {merge_res}");
+        assert!(
+            error,
+            "gitpulse_merge_tasks must fail when database is read-only: {merge_res}"
+        );
     }
 
     /// `inbox` was merged into `backlog`. An agent written before that still
