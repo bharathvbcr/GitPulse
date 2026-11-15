@@ -17,7 +17,7 @@
     hostLoadSettings,
     loadHostLoadSettings,
     updateHostLoadSettings,
-    type HookMode,
+    type HostLoadHookMode,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
   import { loadOnce } from "../settings/loadOnce";
@@ -28,7 +28,7 @@
   // here never saves their thresholds back stale.
   const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
   const thresholdsAreDefault = $derived(JSON.stringify(settings.thresholds) === JSON.stringify(DEFAULT_THRESHOLDS));
-  const HOOK_MODES: readonly { value: HookMode; label: string; title: string }[] = [
+  const HOOK_MODES: readonly { value: HostLoadHookMode; label: string; title: string }[] = [
     { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
     { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },
     { value: "off", label: "Off", title: "Say nothing about load" },

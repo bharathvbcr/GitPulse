@@ -433,14 +433,14 @@ export interface Thresholds {
 }
 
 /** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
-export type HookMode = "enforce" | "advise" | "off";
+export type HostLoadHookMode = "enforce" | "advise" | "off";
 
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
   govern_launches: boolean;
   /** Stored as the top-level `host_load_hook_mode`, never inside `host_load`. */
-  hook_mode: HookMode;
+  hook_mode: HostLoadHookMode;
   thresholds: Thresholds;
 }
 
