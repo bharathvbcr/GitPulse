@@ -368,26 +368,31 @@
       "path": "ops-log",
       "boundary": {
         "durableBefore": "refs/gitpulse/ops/<n> written by a compare-and-set update-ref",
-        "notYetWritten": "retention pruning (expiry and over-cap eviction), which can fail and is propagated with ?"
+        "notYetWritten": "retention pruning (expiry and over-cap eviction), which can fail"
       },
       "injection": {
-        "kind": "none",
-        "detail": "no hook makes the prune fail or kills between update-ref and the prune",
+        "kind": "state",
+        "detail": "no production hook: the test plants a leftover refs/gitpulse/ops/1.lock for the expired snapshot the prune must evict, so git update-ref -d fails for real after the new ref is written",
         "hooks": []
       },
-      "tests": [],
-      "nearestTests": [
+      "tests": [
         {
           "file": "src-tauri/src/engine/git_writer.rs",
-          "name": "op_log_evicts_oldest_over_cap_expires_old_and_never_writes_git_config",
+          "name": "a_prune_failure_after_the_snapshot_ref_is_written_still_reports_the_snapshot",
+          "cfg": [
+            "all(test,unix)"
+          ]
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer.rs",
+          "name": "serve_op_record_answers_snapshotted_when_only_the_prune_failed",
           "cfg": [
             "all(test,unix)"
           ]
         }
       ],
-      "recovery": "unknown: a prune error after the ref exists makes record_op_snapshot return Err, so serve_op_record writes an unsnapshotted row for a snapshot that does exist",
-      "status": "uncovered",
-      "reason": "the only prune test is the success path; no test fails the prune after the ref is written, and the code appears to report that as unsnapshotted"
+      "recovery": "the snapshot is reported as taken: record_op_snapshot returns Ok, its ledger row is written with the prune error in detail_json, serve_op_record answers snapshotted true and no unsnapshotted row is written; the failed eviction is logged at warn and the next snapshot's prune retries it",
+      "status": "covered"
     },
     {
       "id": "OPSLOG-SNAPSHOT-REF-BEFORE-LEDGER-ROW",

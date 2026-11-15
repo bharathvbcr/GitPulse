@@ -4555,7 +4555,20 @@ impl GitWriter {
         }
 
         let keep = if max_ops > 0 { Some(next_seq) } else { None };
-        prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep)?;
+        // The ref is durable now, so the snapshot exists whatever retention
+        // does next: a failed prune is reported on the snapshot's own ledger
+        // row, never as a failed snapshot.
+        let prune_error =
+            match prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep) {
+                Ok(_) => None,
+                Err(err) => {
+                    log::warn!(
+                        "op snapshot {op_ref} was recorded but retention pruning failed: {}",
+                        err.message()
+                    );
+                    Some(err.message().to_string())
+                }
+            };
 
         crate::ledger::record_op_snapshot_event(
             repo_path,
@@ -4567,6 +4580,7 @@ impl GitWriter {
             next_seq,
             stash_oid.as_deref(),
             live_refs.len(),
+            prune_error.as_deref(),
             now_ms,
         );
 
@@ -9371,6 +9385,135 @@ mod bound_to_checked_state {
         assert_eq!(
             config_after, config_before,
             "pruning must write no .git/config"
+        );
+    }
+
+    /// A repository holding an expired snapshot 1 whose ref cannot be deleted:
+    /// a leftover `refs/gitpulse/ops/1.lock` makes `git update-ref -d` fail for
+    /// real, the way a concurrent or crashed git does. The next snapshot's
+    /// prune must evict snapshot 1, so it fails after the new ref is written.
+    fn repo_with_unprunable_expired_snapshot() -> (tempfile::TempDir, String) {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+        let repo = p.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git commit --allow-empty -m old",
+            None,
+            None,
+            1_700_000_000_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("record the old snapshot");
+        std::fs::write(p.join(".git/refs/gitpulse/ops/1.lock"), b"").expect("plant ref lock");
+        (dir, repo)
+    }
+
+    #[test]
+    fn a_prune_failure_after_the_snapshot_ref_is_written_still_reports_the_snapshot() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+
+        let summary = GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git rebase main",
+            None,
+            None,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("the snapshot exists once its ref is written, so the call succeeds");
+        assert_eq!(summary.seq, 2);
+        assert_eq!(summary.op_ref, "refs/gitpulse/ops/2");
+        let listed = GitWriter::list_op_snapshots(&repo, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 1],
+            "the new ref exists; the locked one stayed"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        let row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("refs/gitpulse/ops/2"))
+            .expect("the snapshot's own ledger row is written");
+        let detail = row.detail_json.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("\"prune_error\"") && detail.contains("refs/gitpulse/ops/1"),
+            "the row must carry the prune failure: {detail}"
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "an existing snapshot must not be logged as unsnapshotted"
+        );
+    }
+
+    #[test]
+    fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+        let request = crate::desktop::instance::Request::RecordGitOp {
+            id: "op-1".to_string(),
+            cwd: repo.clone(),
+            command: "git reset --hard HEAD".to_string(),
+            session_id: None,
+            task_id: None,
+        };
+
+        let answer = GitWriter::serve_op_record(&request).expect("served");
+        assert_eq!(answer["snapshotted"], true, "answer: {answer}");
+        assert_eq!(answer["seq"], 2);
+        assert_eq!(answer["op_ref"], "refs/gitpulse/ops/2");
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "no unsnapshotted row for a snapshot that exists"
+        );
+        assert!(
+            page.events.iter().any(|row| {
+                row.object.as_deref() == Some("refs/gitpulse/ops/2")
+                    && row
+                        .detail_json
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("\"prune_error\"")
+            }),
+            "the prune failure is recorded on the snapshot's row"
         );
     }
 }
