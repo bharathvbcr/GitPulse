@@ -717,6 +717,73 @@
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
             check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => el.querySelector("canvas")).length === 1);
+
+            // -- The resource profile's cap budgets hidden contexts, never a pane on
+            // screen: on the compact budget (two) three more panes beside the dock's
+            // session all draw through WebGL, and what leaves the screen is held only
+            // within the budget. Real xterm terminals and WebGL addons share the
+            // page's own slot pool, as the dock's sessions do.
+            {
+              const { Terminal } = await import("@xterm/xterm");
+              const { WebglAddon } = await import("@xterm/addon-webgl");
+              const { createGpuRenderer, gpuSlots } = await import("../src/lib/terminal/gpuRenderer.ts");
+              const { COMPACT_BUDGETS } = await import("../src/lib/resourceBudgets.ts");
+              const capBefore = gpuSlots.cap();
+              gpuSlots.setCap(COMPACT_BUDGETS.gpu_contexts);
+              const base = gpuSlots.held();
+              check("the dock's session is the only context before the panes (compact budget in force)",
+                () => base === 1 && gpuSlots.cap() === 2);
+              const makePane = () => {
+                const host = document.createElement("div");
+                host.style.cssText = "position:fixed;left:0;top:0;width:360px;height:120px;opacity:0.01;pointer-events:none";
+                document.body.append(host);
+                const term = new Terminal({ cols: 40, rows: 6, allowProposedApi: true });
+                term.open(host);
+                const pane = { host, term, canvas: null, renderer: null };
+                pane.renderer = createGpuRenderer({
+                  attach: () => {
+                    const addon = new WebglAddon();
+                    term.loadAddon(addon);
+                    pane.canvas = [...term.element.querySelectorAll("canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+                    return {
+                      canvas: pane.canvas,
+                      dispose: () => addon.dispose(),
+                      onContextLoss: (listener) => addon.onContextLoss(listener),
+                      clearTextureAtlas: () => addon.clearTextureAtlas(),
+                    };
+                  },
+                  slots: gpuSlots,
+                  refresh: () => term.refresh(0, term.rows - 1),
+                });
+                return pane;
+              };
+              const panes = [makePane(), makePane(), makePane()];
+              for (const pane of panes) pane.renderer.sync(true);
+              await frames(2);
+              const contexts = panes.map((pane) => pane.canvas?.getContext("webgl2"));
+              check("three panes on screen on the compact budget all draw through WebGL",
+                () => panes.every((pane) => pane.renderer.state() === "webgl") && contexts.every((gl) => !!gl && !gl.isContextLost()));
+              check("the pool holds one context per pane on screen, past the budget of two",
+                () => gpuSlots.held() === base + 3);
+              panes[0].renderer.sync(false);
+              check("a pane that leaves the screen while the pool is over its budget releases its context at once",
+                () => panes[0].renderer.state() === "dom" && contexts[0].isContextLost() && gpuSlots.held() === base + 2);
+              panes[1].renderer.sync(false);
+              check("the next one to leave is released too: the dock's session and one pane still on screen use the budget",
+                () => panes[1].renderer.state() === "dom" && contexts[1].isContextLost() && gpuSlots.held() === 2);
+              panes[2].renderer.sync(false);
+              check("the last one to leave is held for the grace: one hidden context, inside the budget",
+                () => panes[2].renderer.state() === "webgl" && !contexts[2].isContextLost() && gpuSlots.held() === 2);
+              check("the dock's own session was never touched by any of that",
+                () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost());
+              for (const pane of panes) {
+                pane.renderer.dispose();
+                pane.term.dispose();
+                pane.host.remove();
+              }
+              check("disposing the panes returns every context they held", () => gpuSlots.held() === base);
+              gpuSlots.setCap(capBefore);
+            }
             gpuPolicy.hideGraceMs = 400;
 
             // -- A lost context: the DOM at once, then WebGL again, within the budget.

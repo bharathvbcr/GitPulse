@@ -19,7 +19,9 @@ fn hash_boot_id(text: &str) -> u64 {
     hash.max(1)
 }
 
-pub(super) use imp::{boot_id, shared_monotonic_ns, thread_cpu_ns, Activity, HostProbe};
+pub(super) use imp::{
+    boot_id, installed_memory, shared_monotonic_ns, thread_cpu_ns, Activity, HostProbe,
+};
 
 /// Puts the calling thread in the user-initiated QoS class (macOS), so the
 /// sampler is neither throttled as background work nor coalesced away while
@@ -72,6 +74,11 @@ mod imp {
             Ok(_) => Reading::Unavailable(Why::Failed),
             Err(why) => Reading::Unavailable(why),
         }
+    }
+
+    /// Installed physical memory: `hw.memsize`.
+    pub(crate) fn installed_memory() -> Reading<u64> {
+        sysctl_uint(c"hw.memsize")
     }
 
     fn sysctl_string(name: &CStr) -> Option<String> {
@@ -509,6 +516,17 @@ mod imp {
             .ok()
     }
 
+    /// Installed physical memory: `MemTotal` in `/proc/meminfo`.
+    pub(crate) fn installed_memory() -> Reading<u64> {
+        match read_small("/proc/meminfo") {
+            Ok(text) => meminfo_kib(&text, "MemTotal")
+                .map_or(Reading::Unavailable(Why::Failed), |kib| {
+                    Reading::Value(kib.saturating_mul(1024))
+                }),
+            Err(why) => Reading::Unavailable(why),
+        }
+    }
+
     pub(crate) struct HostProbe {
         disk_path: Option<CString>,
         cores: Reading<Cores>,
@@ -632,7 +650,60 @@ mod imp {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
-    use super::super::sensor::HostSample;
+    use super::super::sensor::{HostSample, Reading, Why};
+
+    /// Installed physical memory: `GlobalMemoryStatusEx` on Windows, and
+    /// unsupported where there is no call this crate knows.
+    #[cfg(windows)]
+    pub(crate) fn installed_memory() -> Reading<u64> {
+        /// `MEMORYSTATUSEX`: the layout `GlobalMemoryStatusEx` fills in; only
+        /// `total_phys` is read, the rest is there to be the right size.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        /// `sizeof(MEMORYSTATUSEX)`, which the call requires in `length`.
+        const LENGTH: u32 = 64;
+        const _: () = assert!(std::mem::size_of::<MemoryStatusEx>() == LENGTH as usize);
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            length: LENGTH,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        // SAFETY: `status` is a live, correctly laid-out MEMORYSTATUSEX whose
+        // `length` field is set as the call requires; the call writes only
+        // within it.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return Reading::Unavailable(Why::of_errno(
+                std::io::Error::last_os_error().raw_os_error(),
+            ));
+        }
+        Reading::Value(status.total_phys)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn installed_memory() -> Reading<u64> {
+        Reading::Unavailable(Why::Unsupported)
+    }
 
     pub(crate) fn shared_monotonic_ns() -> u64 {
         0

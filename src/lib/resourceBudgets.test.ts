@@ -107,18 +107,48 @@ describe("roomy is what shipped before there was a profile", () => {
     expect(roomy.graph_cache_repositories).toBe(GRAPH_CACHE_LIMIT);
   });
 
-  it("matches the Rust roomy tier in src-tauri/src/sysload/profile.rs", () => {
-    const source = readFileSync(resolve(__dirname, "../../src-tauri/src/sysload/profile.rs"), "utf8");
-    const roomyBlock = /Self::Roomy => ResourceBudgets \{([^}]*)\}/.exec(source);
-    expect(roomyBlock, "the Roomy arm of ProfileTier::budgets").not.toBeNull();
-    const body = roomyBlock?.[1] ?? "";
-    const number = (field: string): number => {
+});
+
+/**
+ * The page carries one row of the Rust table, the compact one, because it is
+ * what every consumer needs before the first status arrives. This reads that
+ * table out of `profile.rs` so the copy cannot drift from its owner, and
+ * reads the roomy row too, which must stay what shipped before profiles.
+ */
+describe("the budgets the page carries are the Rust table's rows", () => {
+  const source = readFileSync(resolve(__dirname, "../../src-tauri/src/sysload/profile.rs"), "utf8");
+
+  const row = (tier: "Compact" | "Standard" | "Roomy"): ResourceBudgets => {
+    const block = new RegExp(`Self::${tier} => ResourceBudgets \\{([^}]*)\\}`).exec(source);
+    expect(block, `the ${tier} arm of ProfileTier::budgets`).not.toBeNull();
+    const body = block?.[1] ?? "";
+    const number = (field: keyof ResourceBudgets): number => {
       const match = new RegExp(`${field}:\\s*([0-9_ *]+),`).exec(body);
-      expect(match, field).not.toBeNull();
-      return (match?.[1] ?? "").split("*").reduce((product, factor) => product * Number(factor.replace(/_/g, "").trim()), 1);
+      expect(match, `${tier}.${field}`).not.toBeNull();
+      return (match?.[1] ?? "")
+        .split("*")
+        .reduce((product, factor) => product * Number(factor.replace(/_/g, "").trim()), 1);
     };
-    expect(number("gpu_contexts")).toBe(roomy.gpu_contexts);
-    expect(number("gpu_hide_grace_ms")).toBe(roomy.gpu_hide_grace_ms);
-    expect(number("graph_cache_repositories")).toBe(roomy.graph_cache_repositories);
+    return {
+      gpu_contexts: number("gpu_contexts"),
+      gpu_hide_grace_ms: number("gpu_hide_grace_ms"),
+      graph_cache_repositories: number("graph_cache_repositories"),
+    };
+  };
+
+  it("COMPACT_BUDGETS is the compact row", () => {
+    expect(COMPACT_BUDGETS).toEqual(row("Compact"));
+  });
+
+  it("the roomy row is the three constants the budgets replaced", () => {
+    expect(row("Roomy")).toEqual(roomy);
+  });
+
+  it("the three rows ascend, so a smaller machine never holds more", () => {
+    const [c, s, r] = [row("Compact"), row("Standard"), row("Roomy")];
+    for (const field of ["gpu_contexts", "gpu_hide_grace_ms", "graph_cache_repositories"] as const) {
+      expect(c[field], field).toBeLessThan(s[field]);
+      expect(s[field], field).toBeLessThan(r[field]);
+    }
   });
 });

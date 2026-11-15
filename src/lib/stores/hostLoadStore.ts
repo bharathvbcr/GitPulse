@@ -1,4 +1,4 @@
-import { derived, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
@@ -424,6 +424,10 @@ export function startHostLoad(): void {
   const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
     announceRefusal(event.payload);
+    // The pulse does not carry the resource profile, so a startup read that
+    // failed would leave every consumer on the compact budgets for the whole
+    // run. Until one read has landed, each pulse retries it (single-flight).
+    if (get(statusStore) === null) void refreshHostLoad().catch(() => undefined);
   }).catch((error) => {
     if (listening === attempt) listening = null;
     diagnostics.warn("hostLoad", `couldn't listen for the host-load pulse; will retry: ${String(error)}`);

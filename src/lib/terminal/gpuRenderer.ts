@@ -30,11 +30,14 @@
  *
  * ## Invariants this module keeps
  *
- *  - **At most `MAX_VISIBLE_SESSIONS` contexts per window.** Slots are counted
- *    exactly: a slot is held from `attach` until the context has been freed, a
- *    session in its hold counts, and a caller that claims more sessions are on
- *    screen than can be is refused here, where the mistake is, and keeps
- *    drawing through the DOM.
+ *  - **At most `MAX_VISIBLE_SESSIONS` contexts per window, and a terminal on
+ *    screen is never refused one before that.** Slots are counted exactly: a
+ *    slot is held from `attach` until the context has been freed, a session in
+ *    its hold counts, and a caller that claims more sessions are on screen than
+ *    can be is refused here, where the mistake is, and keeps drawing through
+ *    the DOM. The resource profile's cap budgets only what is held beyond the
+ *    terminals on screen (`max(cap, on screen)` contexts in all), so a small
+ *    machine holds fewer hidden contexts, never a slower on-screen pane.
  *  - **A loss never blanks the pane.** The DOM renderer is back synchronously,
  *    on the canvas's own `webglcontextlost`, without waiting out the addon's
  *    three-second restore window.
@@ -160,19 +163,24 @@ export interface GpuSlots {
   give(): void;
   /** Slots held now, including those a hidden session is holding. */
   held(): number;
-  /** The most contexts the pool lets live at once. */
+  /**
+   * The budget for contexts held beyond what is on screen. The pool holds
+   * at most `max(cap, terminals on screen)` contexts, never more than its
+   * window maximum; a terminal on screen always gets one up to that maximum.
+   */
   cap(): number;
   /**
    * Changes the cap (floored, at least one; a value that is not a finite
-   * number is ignored). A larger cap takes effect at once and wakes refused
-   * sessions. A smaller one gives up hidden holders beyond it, longest-hidden
-   * first; an on-screen session is never taken from, so the pool may stay
-   * over a smaller cap until those leave, and nobody new is admitted meanwhile.
+   * number is ignored). A smaller cap gives up hidden holders beyond it,
+   * longest-hidden first, at once; an on-screen or attaching session is never
+   * taken from.
    */
   setCap(next: number): void;
   /**
    * Offers a held slot to whoever needs it: `release` must free the context
-   * and `give()` its slot. Returns a function that withdraws the offer.
+   * and `give()` its slot. Returns a function that withdraws the offer. When
+   * the pool is over its budget the longest-hidden offer is taken up at once,
+   * so a terminal hidden past the budget does not wait out its grace.
    */
   idle(release: () => void): () => void;
   /**
@@ -182,7 +190,11 @@ export interface GpuSlots {
   wait(retry: () => void): () => void;
 }
 
-export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
+export function createGpuSlots(
+  initialCap: number = MAX_VISIBLE_SESSIONS,
+  /** The most contexts that may be live at once, whatever the budget. */
+  hardCap: number = initialCap,
+): GpuSlots {
   let cap = initialCap;
   let held = 0;
   /** Hidden holders, longest-hidden first (a Set keeps insertion order). */
@@ -191,6 +203,16 @@ export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSl
   /** Above zero while a take is freeing a slot for itself: nobody else may have it. */
   let reclaiming = 0;
   let notifying = false;
+
+  /** Holders that are drawing or attaching: everything held that is not on offer. */
+  const active = () => held - idles.size;
+  /**
+   * How many contexts may be held while `onScreen` terminals are drawing: the
+   * budget, or one per terminal on screen when that is more, never past the
+   * window's maximum. The budget is for the hidden; it never takes a context
+   * from a terminal that can be seen.
+   */
+  const allowed = (onScreen: number) => Math.min(hardCap, Math.max(cap, onScreen));
 
   const reclaimOldest = () => {
     const [oldest] = idles;
@@ -204,13 +226,19 @@ export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSl
     }
   };
 
+  /** Gives up hidden holders the pool can no longer afford, longest-hidden first. */
+  const trim = () => {
+    const limit = allowed(active());
+    while (held > limit && idles.size > 0) reclaimOldest();
+  };
+
   const notify = () => {
     if (notifying) return;
     notifying = true;
     try {
       // Each retry either takes the slot, which ends the loop's condition, or
       // is final; a waiter that is refused again re-registers behind the loop.
-      while (waiters.size > 0 && (held < cap || idles.size > 0)) {
+      while (waiters.size > 0 && active() < hardCap) {
         const [next] = waiters;
         waiters.delete(next);
         next();
@@ -222,8 +250,11 @@ export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSl
 
   return {
     take() {
-      if (held >= cap) reclaimOldest();
-      if (held >= cap) return false;
+      if (active() >= hardCap) return false;
+      // A terminal on screen always gets its context: the budget is spent on
+      // hidden holders first, longest-hidden first.
+      const limit = allowed(active() + 1);
+      while (held + 1 > limit && idles.size > 0) reclaimOldest();
       held += 1;
       return true;
     },
@@ -236,14 +267,15 @@ export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSl
     setCap(next) {
       if (!Number.isFinite(next)) return;
       cap = Math.max(1, Math.floor(next));
-      // Give up hidden holders beyond the cap, longest-hidden first. An
-      // on-screen session is not in `idles`, so it is never taken from.
-      while (held > cap && idles.size > 0) reclaimOldest();
-      // A larger cap, or a freed slot, may be what a refused session waits for.
+      // An on-screen or attaching session is not in `idles`, so it is never taken from.
+      trim();
       notify();
     },
     idle(release) {
       idles.add(release);
+      // Hidden while the pool is over its budget: the longest-hidden holder
+      // goes now, which is this one when it is the only one on offer.
+      trim();
       notify();
       return () => {
         idles.delete(release);
@@ -259,10 +291,12 @@ export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSl
 }
 
 /**
- * Every terminal in the window draws from this one pool. It starts at the
- * compact cap and follows the resource profile (`applyResourceBudgets`).
+ * Every terminal in the window draws from this one pool. Its budget for
+ * hidden contexts starts at the compact one and follows the resource profile
+ * (`applyResourceBudgets`); a terminal on screen is never held back by it, up
+ * to `MAX_VISIBLE_SESSIONS`.
  */
-export const gpuSlots = createGpuSlots(COMPACT_BUDGETS.gpu_contexts);
+export const gpuSlots = createGpuSlots(COMPACT_BUDGETS.gpu_contexts, MAX_VISIBLE_SESSIONS);
 
 export interface GpuRenderer {
   /**

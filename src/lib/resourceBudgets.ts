@@ -28,6 +28,12 @@ export interface ResourceBudgets {
  * What every consumer uses until the first status arrives. A machine with
  * 8 GB must not allocate roomy-sized pools during startup, so "not known yet"
  * is the smallest tier, never the largest.
+ *
+ * This is the only row of the table the page carries: it is the one needed
+ * before the backend has answered, and the backend's status carries every
+ * other. It is a copy of `ProfileTier::Compact` in
+ * `src-tauri/src/sysload/profile.rs`; `resourceBudgets.test.ts` reads that
+ * file and fails if the two differ.
  */
 export const COMPACT_BUDGETS: ResourceBudgets = {
   gpu_contexts: 2,

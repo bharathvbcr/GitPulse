@@ -93,9 +93,10 @@
       {/each}
     </select>
     <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
-      Sizes how much GitPulse keeps warm: terminals drawn with the GPU, how long a hidden terminal keeps its GPU
-      context, and how many repositories keep their commit graph in memory. It never changes your session limits or
-      scrollback. Automatic picks from this computer's memory.
+      Sizes how much GitPulse keeps ready in memory: how many terminals that are out of sight keep their GPU
+      drawing, for how long, and how many repositories keep their commit graph. Every terminal you can see is
+      still drawn with the GPU. It never changes your session limits or scrollback. Automatic picks from this
+      computer's memory.
       {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
     </p>
   </div>

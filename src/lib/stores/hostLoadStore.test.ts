@@ -107,6 +107,26 @@ describe("hostLoadStore", () => {
     expect(get(hostPressure)).toBe("critical");
   });
 
+  it("rereads the status on a pulse when the startup read failed, so the profile is not left unknown", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("backend not ready")).mockResolvedValue(status());
+    startHostLoad();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(listen).toHaveBeenCalledTimes(1));
+    // Let the rejected startup read settle, as the two seconds before the first pulse do.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(get(resourceProfile), "nothing has been read yet").toBeNull();
+
+    const handler = vi.mocked(listen).mock.calls[0][1] as (e: { payload: HostLoadPulse }) => void;
+    handler({ payload: pulseOf(status()) } as never);
+    await vi.waitFor(() => expect(get(resourceProfile)?.tier).toBe("roomy"));
+    expect(invoke).toHaveBeenCalledTimes(2);
+
+    // Once a status is held, pulses do not each cost a read.
+    handler({ payload: pulseOf(status()) } as never);
+    handler({ payload: pulseOf(status()) } as never);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
   it("derives the pulse from a status exactly as the backend does", () => {
     const stale = status({
       sensor: { state: "stale_old", age_ms: 400_000, level: "critical", enabled: true, reason: null },

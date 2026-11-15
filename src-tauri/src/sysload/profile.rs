@@ -14,19 +14,25 @@
 //!
 //! # Where it comes from
 //!
-//! [`derive`] is pure: physical memory and core counts from a
-//! [`HostSample`], plus the user's [`ProfileChoice`]. There is no second
-//! sensor; a memory reading that is unavailable (or a nonsensical zero) is
-//! not guessed from: the tier is `standard` and the basis says
+//! [`derive`] is pure: installed memory, logical cores and the user's
+//! [`ProfileChoice`]. Installed memory is a fact about the machine, not a
+//! pressure sample, so [`installed_memory`] reads it directly (macOS
+//! `hw.memsize`, Linux `MemTotal`, Windows `GlobalMemoryStatusEx`) and the
+//! sampler is not involved: the tier is the same with the "Measure memory
+//! pressure" switch off, before the first tick, and on a platform that has no
+//! sensor. A memory read that fails (or returns a nonsensical zero) is not
+//! guessed from: the tier is `standard` and the basis says
 //! [`ProfileBasis::MemoryUnreadable`], so the page can tell "derived" from
 //! "could not tell".
 //!
 //! The `roomy` budgets are the constants GitPulse shipped with before there
 //! was a profile, so a machine with more than 16 GiB behaves as it always did.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
-use super::sensor::{Cores, HostSample, Reading};
+use super::sensor::Reading;
 
 const GIB: u64 = 1 << 30;
 
@@ -124,24 +130,24 @@ impl ProfileTier {
 pub struct ResourceProfile {
     pub tier: ProfileTier,
     pub basis: ProfileBasis,
-    /// Physical memory the sensor read, when it did.
+    /// Installed physical memory, when it could be read.
     pub memory_bytes: Option<u64>,
-    /// Logical cores the sensor read, when it did.
+    /// Logical cores, when they could be counted.
     pub logical_cores: Option<u16>,
     pub budgets: ResourceBudgets,
 }
 
-/// The profile for a machine with `memsize` of physical memory and `cores`,
-/// under the user's `choice`. Pure.
+/// The profile for a machine with `memsize` of installed memory and
+/// `logical_cores`, under the user's `choice`. Pure.
 pub fn derive(
     memsize: Reading<u64>,
-    cores: Reading<Cores>,
+    logical_cores: Option<u16>,
     choice: ProfileChoice,
 ) -> ResourceProfile {
     // Zero is what a failed sysctl can look like through a wrapper; no
     // machine has it, so it is "unreadable", not "compact".
     let memory_bytes = memsize.value().filter(|bytes| *bytes > 0);
-    let logical_cores = cores.value().map(|c| c.logical).filter(|n| *n > 0);
+    let logical_cores = logical_cores.filter(|n| *n > 0);
     let (tier, basis) = match (choice, memory_bytes) {
         (ProfileChoice::Compact, _) => (ProfileTier::Compact, ProfileBasis::Override),
         (ProfileChoice::Standard, _) => (ProfileTier::Standard, ProfileBasis::Override),
@@ -158,11 +164,37 @@ pub fn derive(
     }
 }
 
-/// [`derive`] over the host readings of a snapshot, or over nothing when
-/// there is none (no sample yet reads as unreadable memory).
-pub fn of_host(host: Option<&HostSample>, choice: ProfileChoice) -> ResourceProfile {
-    let host = host.copied().unwrap_or_default();
-    derive(host.memsize, host.cores, choice)
+/// Installed physical memory in bytes, read from the operating system and
+/// remembered once it has been read: it does not change while GitPulse runs.
+/// A failed read is not remembered, so the next call tries again.
+pub fn installed_memory() -> Reading<u64> {
+    static INSTALLED: OnceLock<u64> = OnceLock::new();
+    if let Some(bytes) = INSTALLED.get() {
+        return Reading::Value(*bytes);
+    }
+    let read = super::probe::installed_memory();
+    if let Reading::Value(bytes) = read {
+        if bytes > 0 {
+            let _ = INSTALLED.set(bytes);
+        }
+    }
+    read
+}
+
+/// Logical cores this process may use, counted once.
+fn logical_cores() -> Option<u16> {
+    static CORES: OnceLock<Option<u16>> = OnceLock::new();
+    *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .ok()
+            .map(|n| u16::try_from(n.get()).unwrap_or(u16::MAX))
+    })
+}
+
+/// The profile of this machine under `choice`: [`derive`] over what the
+/// operating system says it has. Independent of the sampler.
+pub fn current(choice: ProfileChoice) -> ResourceProfile {
+    derive(installed_memory(), logical_cores(), choice)
 }
 
 #[cfg(test)]
@@ -173,12 +205,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn tier_of(bytes: u64) -> ProfileTier {
-        derive(
-            Reading::Value(bytes),
-            Reading::default(),
-            ProfileChoice::Auto,
-        )
-        .tier
+        derive(Reading::Value(bytes), None, ProfileChoice::Auto).tier
     }
 
     #[test]
@@ -198,16 +225,7 @@ mod tests {
 
     #[test]
     fn a_readable_memory_reading_is_a_derived_answer() {
-        let p = derive(
-            Reading::Value(8 * GIB),
-            Reading::Value(Cores {
-                logical: 8,
-                levels: 2,
-                perf0: 4,
-                perf1: 4,
-            }),
-            ProfileChoice::Auto,
-        );
+        let p = derive(Reading::Value(8 * GIB), Some(8), ProfileChoice::Auto);
         assert_eq!(p.basis, ProfileBasis::Memory);
         assert_eq!(p.memory_bytes, Some(8 * GIB));
         assert_eq!(p.logical_cores, Some(8));
@@ -223,18 +241,32 @@ mod tests {
             // A zero from a failed sysctl is not a machine with no memory.
             Reading::Value(0),
         ] {
-            let p = derive(memsize, Reading::default(), ProfileChoice::Auto);
+            let p = derive(memsize, None, ProfileChoice::Auto);
             assert_eq!(p.tier, ProfileTier::Standard, "{memsize:?}");
             assert_eq!(p.basis, ProfileBasis::MemoryUnreadable, "{memsize:?}");
             assert_eq!(p.memory_bytes, None, "{memsize:?}");
         }
     }
 
+    /// The installed-memory read is the operating system's own answer: it
+    /// works with no sampler and no snapshot, and agrees with itself.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
-    fn no_sample_at_all_reads_as_unreadable_memory() {
-        let p = of_host(None, ProfileChoice::Auto);
-        assert_eq!(p.tier, ProfileTier::Standard);
-        assert_eq!(p.basis, ProfileBasis::MemoryUnreadable);
+    fn installed_memory_is_read_without_a_sampler() {
+        let first = installed_memory();
+        assert!(
+            matches!(first, Reading::Value(bytes) if bytes >= 64 * 1024 * 1024),
+            "{first:?}"
+        );
+        assert_eq!(installed_memory(), first, "read once, remembered");
+        let profile = current(ProfileChoice::Auto);
+        assert_eq!(profile.basis, ProfileBasis::Memory);
+        assert_eq!(profile.memory_bytes, first.value());
+        assert_eq!(
+            profile.tier,
+            ProfileTier::of_memory(first.value().unwrap_or(0))
+        );
+        assert!(profile.logical_cores.is_some_and(|n| n > 0));
     }
 
     #[test]
@@ -249,7 +281,7 @@ mod tests {
                 Reading::Value(4 * GIB),
                 Reading::Unavailable(Why::Unreadable),
             ] {
-                let p = derive(memsize, Reading::default(), choice);
+                let p = derive(memsize, None, choice);
                 assert_eq!(p.tier, tier);
                 assert_eq!(p.basis, ProfileBasis::Override);
             }
@@ -260,7 +292,7 @@ mod tests {
     fn roomy_is_what_shipped_before_there_was_a_profile() {
         // MAX_VISIBLE_SESSIONS (src/lib/terminal/attendance.ts), GPU_HIDE_GRACE_MS
         // (gpuRenderer.ts) and GRAPH_CACHE_LIMIT (graphLimits.ts); the vitest
-        // contract in resourceBudget.test.ts reads this file to keep them equal.
+        // contract in resourceBudgets.test.ts reads this file to keep them equal.
         let roomy = ProfileTier::Roomy.budgets();
         assert_eq!(roomy.gpu_contexts, 8);
         assert_eq!(roomy.gpu_hide_grace_ms, 300_000);
@@ -296,11 +328,7 @@ mod tests {
 
     #[test]
     fn the_profile_serialises_the_shape_the_page_reads() {
-        let p = derive(
-            Reading::Value(8 * GIB),
-            Reading::default(),
-            ProfileChoice::Auto,
-        );
+        let p = derive(Reading::Value(8 * GIB), None, ProfileChoice::Auto);
         let json = serde_json::to_value(p).unwrap();
         assert_eq!(json["tier"], "compact");
         assert_eq!(json["basis"], "memory");

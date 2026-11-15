@@ -16,7 +16,7 @@
 
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
-use super::profile::{of_host as profile_of_host, ProfileChoice, ResourceProfile};
+use super::profile::{current as current_profile, ProfileChoice, ResourceProfile};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor};
 use super::snapshot::{self, Snapshot, TickStats, Writer, WriterIdentity};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
@@ -284,13 +284,9 @@ pub fn status() -> HostLoadStatus {
             // The profile is re-derived from the stored choice too: a change in
             // Settings must reach the page on its next read, not after the
             // sampler's next tick.
-            let profile = profile_of_host(
-                status.snapshot.as_ref().map(|s| &s.host),
-                stored_profile_choice(),
-            );
             return HostLoadStatus {
                 governor: governor::report(),
-                profile,
+                profile: current_profile(stored_profile_choice()),
                 ..status
             };
         }
@@ -322,7 +318,7 @@ pub fn status() -> HostLoadStatus {
             },
             pressure: PressureInput::Unavailable,
             governor: governor::report(),
-            profile: profile_of_host(None, stored_profile_choice()),
+            profile: current_profile(stored_profile_choice()),
             snapshot_path: None,
             writer: None,
             writer_is_self: false,
@@ -339,12 +335,14 @@ fn stored_profile_choice() -> ProfileChoice {
     crate::tool_config::host_load_settings().profile
 }
 
-/// What this machine can afford GitPulse to hold: the latest status's memory
-/// reading under the stored `host_load.profile`. Like [`governor::shed`], it
-/// answers in every process; one with no sample reads as unreadable memory
-/// (`standard`, basis `memory_unreadable`), never as a derived answer.
+/// What this machine can afford GitPulse to hold: its installed memory under
+/// the stored `host_load.profile`. Like [`governor::shed`], it answers in
+/// every process, sampling or not: installed memory is read from the
+/// operating system directly, so the "Measure memory pressure" switch and the
+/// sampler's first tick do not change it. `memory_unreadable` means that read
+/// itself failed.
 pub fn profile() -> ResourceProfile {
-    status().profile
+    current_profile(stored_profile_choice())
 }
 
 fn reader_status(
@@ -366,7 +364,7 @@ fn reader_status(
         role,
         pressure: PressureInput::of(&sensor),
         governor: governor::report(),
-        profile: profile_of_host(snap.as_ref().map(|s| &s.host), choice),
+        profile: current_profile(choice),
         sensor,
         snapshot_path: Some(path.to_string_lossy().into_owned()),
         writer: snap.as_ref().map(|s| s.writer.clone()),
@@ -623,12 +621,14 @@ mod tests {
         assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
     }
 
-    /// A status with no snapshot behind it has no memory reading, and says so
-    /// rather than passing a default off as a derived answer; a chosen tier
-    /// is carried through whatever the reading.
+    /// Installed memory is a fact about the machine, not a sample: a status
+    /// read before any tick (no snapshot behind it) already carries a tier
+    /// derived from it, so a big machine is never left on `standard` while it
+    /// waits for the sampler. A chosen tier is carried through as before.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
-    fn a_status_with_no_snapshot_has_an_underived_profile() {
-        use super::super::profile::{ProfileBasis, ProfileTier};
+    fn a_status_read_before_any_tick_already_derives_from_installed_memory() {
+        use super::super::profile::ProfileBasis;
         let dir = tempfile::tempdir().unwrap();
         let none = |choice| {
             reader_status(
@@ -638,14 +638,41 @@ mod tests {
                 TickStats::default(),
                 choice,
             )
-            .profile
         };
         let auto = none(ProfileChoice::Auto);
-        assert_eq!(auto.tier, ProfileTier::Standard);
-        assert_eq!(auto.basis, ProfileBasis::MemoryUnreadable);
-        let pinned = none(ProfileChoice::Compact);
-        assert_eq!(pinned.tier, ProfileTier::Compact);
+        assert!(auto.snapshot.is_none(), "no sampler has written anything");
+        assert_eq!(auto.profile.basis, ProfileBasis::Memory);
+        assert!(auto.profile.memory_bytes.is_some_and(|bytes| bytes > 0));
+        let pinned = none(ProfileChoice::Compact).profile;
+        assert_eq!(pinned.tier, super::super::profile::ProfileTier::Compact);
         assert_eq!(pinned.basis, ProfileBasis::Override);
+    }
+
+    /// The "Measure memory pressure" switch stops the readings; it must not
+    /// change what the machine is. With sampling off the tick writes an empty
+    /// snapshot, and the profile is still the one sampling on gives.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_profile_with_sampling_off_equals_the_profile_with_sampling_on() {
+        use super::super::profile::ProfileBasis;
+        let first_status = |enabled: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = SamplerOptions::new(dir.path().to_path_buf());
+            options.cadence = Duration::from_millis(100);
+            options.enabled = Box::new(move || enabled);
+            let sampler = start(options).unwrap();
+            let mut status = None;
+            crate::test_support::wait_until(Duration::from_secs(10), || {
+                status = sampler.status();
+                status.is_some()
+            });
+            sampler.stop();
+            status.expect("a status within ten seconds")
+        };
+        let off = first_status(false);
+        let on = first_status(true);
+        assert_eq!(off.profile.basis, ProfileBasis::Memory, "{:?}", off.profile);
+        assert_eq!(off.profile, on.profile);
     }
 
     fn report(state: SensorState, level: Option<Level>, enabled: bool) -> SensorReport {

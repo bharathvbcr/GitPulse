@@ -60,8 +60,9 @@ pub use procscan::{
     MemguardHealth, Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
 };
 pub use profile::{
-    derive as derive_profile, of_host as profile_of_host, ProfileBasis, ProfileChoice, ProfileTier,
-    ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES, STANDARD_MAX_BYTES,
+    current as current_profile, derive as derive_profile, installed_memory, ProfileBasis,
+    ProfileChoice, ProfileTier, ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES,
+    STANDARD_MAX_BYTES,
 };
 pub use sampler::{
     profile, pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput,
