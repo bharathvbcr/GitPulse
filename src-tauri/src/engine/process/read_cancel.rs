@@ -12,7 +12,7 @@
 //! * a thread-local scope ([`ReadScope::enter`]) so the flag reaches the `git`
 //!   runner without a parameter on every reader between the command and it, the
 //!   way the admission class does;
-//! * the runner's side (`git_cli`) polls the flag through its existing
+//! * the runner's side (`runner.rs`) polls the flag through its existing
 //!   `ProcessObserver::cancelled`, so the kill is the one owner's: SIGTERM so
 //!   git releases its own locks, a grace, then SIGKILL, exactly as for a
 //!   timeout. There is no second kill path here.

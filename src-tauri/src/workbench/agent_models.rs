@@ -20,7 +20,7 @@
 //! list on its own: "could not ask" and "has no models" are different answers.
 
 use super::terminal_command::{self, validate_model_id};
-use crate::engine::git_cli::CapturedOutput;
+use crate::engine::process::CapturedOutput;
 use crate::ipc_error::CommandError;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -340,7 +340,7 @@ fn cached(launcher: &str) -> Option<AgentModelCatalog> {
 /// open repository, because an agent CLI may write project files where it runs.
 fn list_with_cli(launcher: &str) -> Result<CapturedOutput, CommandError> {
     let program = terminal_command::program(launcher).map_err(|error| error.message)?;
-    crate::engine::git_cli::capture_command(
+    crate::engine::process::capture_command(
         &program,
         &["models"],
         Some(&std::env::temp_dir()),

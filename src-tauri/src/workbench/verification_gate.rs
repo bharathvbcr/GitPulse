@@ -184,7 +184,7 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // the whole ref store is stamped, as for the verification base. An
     // unchanged worktree is answered from the ref cache by file stats, with no
     // process.
-    crate::engine::git_cli::with_spawn_source(CURRENT_HEAD_SOURCE, || {
+    crate::engine::process::with_spawn_source(CURRENT_HEAD_SOURCE, || {
         crate::engine::ref_cache::git_text(
             Path::new(worktree),
             &[crate::engine::ref_cache::ALL_REFS],

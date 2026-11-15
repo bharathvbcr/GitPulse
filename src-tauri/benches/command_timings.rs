@@ -545,7 +545,7 @@ fn hook_collision_cases(repo: &Repo) -> Vec<Case<'static>> {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("command_timings");
     let temp = tempfile::tempdir().expect("temp dir");
 

@@ -52,7 +52,7 @@ fn terminals(dir: &Path) -> TerminalSessions {
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -72,7 +72,7 @@ fn repo() -> tempfile::TempDir {
 /// repository this app trusted only for its own session is refused there.
 #[test]
 fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = host_dir();
     let repo = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")

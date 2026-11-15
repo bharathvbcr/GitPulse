@@ -20,8 +20,9 @@
 use crate::codeintel::worktree_overlay::{
     compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr, DirtyNodeScan,
 };
-use crate::engine::git_cli::{resolve_git_common_dir, validate_repo, DEFAULT_TIMEOUT};
+use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
+use crate::engine::process::DEFAULT_TIMEOUT;
 use crate::engine::worktree::{list_worktrees, WorktreeInfo};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;

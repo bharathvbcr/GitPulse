@@ -2,9 +2,8 @@
 
 use super::parse::{parse_kingfisher_json, SecretsReport};
 use super::report::{assemble, git_view, scan_exclusions, RunFacts};
-use crate::engine::git_cli::{
-    run_observed, validate_repo, Incomplete, OutputStream, ProcessObserver,
-};
+use crate::engine::git_cli::validate_repo;
+use crate::engine::process::{run_observed, Incomplete, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -151,7 +150,7 @@ fn process_scrubbed_env() -> BTreeMap<String, OsString> {
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, so a Homebrew install was reported as
 /// "not installed".
 pub fn resolve_kingfisher() -> Option<PathBuf> {
-    crate::engine::git_cli::find_external_tool("kingfisher").map(PathBuf::from)
+    crate::engine::process::find_external_tool("kingfisher").map(PathBuf::from)
 }
 
 /// [`resolve_kingfisher`] under an injected environment, for reproducing a
@@ -162,7 +161,7 @@ pub(super) fn resolve_kingfisher_with(
     path_var: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    crate::engine::git_cli::find_external_tool_with("kingfisher", path_var, home).map(PathBuf::from)
+    crate::engine::process::find_external_tool_with("kingfisher", path_var, home).map(PathBuf::from)
 }
 
 fn scrubbed_command(binary: &Path) -> Command {
@@ -424,7 +423,7 @@ pub fn scan_with_binary(
 
     // Destructure so stderr is dropped here and never reaches the report.
     // Byte counts were already taken by the ticket; the bytes stay here.
-    let crate::engine::git_cli::BoundedRun {
+    let crate::engine::process::BoundedRun {
         stdout,
         stderr: _stderr,
         status_code,
@@ -539,9 +538,9 @@ fn note_failure(report: &mut SecretsReport, reason: &str, facts: &ScanDiagnostic
 /// path, so none of it is forwarded — but each cause gets its own sentence:
 /// "timed out waiting for a process slot" is not the scan timing out.
 pub(super) fn runner_failure_reason(err: &str, deadline: Duration) -> String {
-    if crate::engine::git_cli::is_deferred_under_load(err) {
+    if crate::engine::process::is_deferred_under_load(err) {
         "kingfisher was deferred: GitPulse was under load and started no new process in time".into()
-    } else if crate::engine::git_cli::is_slot_wait_timeout(err) {
+    } else if crate::engine::process::is_slot_wait_timeout(err) {
         "kingfisher could not start: no process slot became free in time".into()
     } else if err.contains("cancelled before spawn") {
         SUPERSEDED.into()

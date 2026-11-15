@@ -472,9 +472,9 @@ mod tests {
             );
         }
 
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        let before = crate::engine::process::spawn_log::spawns_in(&kept_path);
         memo.risk_for_path(&kept_path.to_string_lossy(), "src/planned.rs", &observation);
-        let after = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        let after = crate::engine::process::spawn_log::spawns_in(&kept_path);
         assert!(
             after.len() >= before.len(),
             "spawn log dropped {kept_path:?}; cannot prove the listing was kept"

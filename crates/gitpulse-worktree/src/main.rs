@@ -25,8 +25,8 @@ use gitpulse_lib::engine::agent_bus::{
     register_or_update_lane_with_conflicts, release_lane, scan_parallel_agent_radar,
 };
 use gitpulse_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
-use gitpulse_lib::engine::git_cli::capture_command;
 use gitpulse_lib::engine::git_reader::compute_default_base;
+use gitpulse_lib::engine::process::capture_command;
 use gitpulse_lib::engine::worktree::{
     add_sparse_worktree_zero_copy, add_worktree, add_worktree_argv, add_worktree_with_devmap,
     expand_sparse_cone_with_devmap, list_worktrees, merge_worktree_pipeline, prune_worktree,
@@ -1924,9 +1924,9 @@ fn emit_error(json_mode: bool, error: &str) {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_as_background();
-    gitpulse_lib::engine::git_cli::run_process_awaiting_background_budget();
-    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
+    gitpulse_lib::engine::process::run_process_as_background();
+    gitpulse_lib::engine::process::run_process_awaiting_background_budget();
+    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (json_mode, cmd) = match parse_cli(&argv) {

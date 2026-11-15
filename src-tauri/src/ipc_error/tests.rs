@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::git_cli::{mark_user_action, refusal_message, Refusal};
+use crate::engine::process::{mark_user_action, refusal_message, Refusal};
 use crate::engine::stash::STALE_STACK_HINT;
 use crate::ipc_error::CommandError;
 use serde_json::{json, Value};

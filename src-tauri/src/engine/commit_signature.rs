@@ -19,9 +19,10 @@
 
 use crate::engine::git_cli::{
     git_captured, git_observed, git_text_with_timeout, read_objects_batch, validate_repo,
-    BatchObject, OutputStream, ProcessObserver, DEFAULT_TIMEOUT,
+    BatchObject,
 };
 use crate::engine::git_writer::validate_oid;
+use crate::engine::process::{OutputStream, ProcessObserver, DEFAULT_TIMEOUT};
 use crate::engine::ref_cache::{user_config_paths, FileIdentity};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};

@@ -8,7 +8,7 @@
 //! by the child at its first instruction. The probes here re-run this very test
 //! binary as the child (`ADV_W4B_PROBE` set) and ask it for that number.
 
-use crate::engine::git_cli::{
+use crate::engine::process::{
     run_bounded, run_bounded_capped, run_observed, with_admission, with_background_band,
     with_background_processes, Admission,
 };

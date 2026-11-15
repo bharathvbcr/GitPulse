@@ -9,9 +9,9 @@ mod common;
 use gitpulse_lib::ipc_error::CommandError;
 use std::time::{Duration, Instant};
 
-use gitpulse_lib::engine::git_cli::{
-    current_admission_name, git_global, run_process_as_background,
-    run_process_awaiting_background_budget,
+use gitpulse_lib::engine::git_cli::git_global;
+use gitpulse_lib::engine::process::{
+    current_admission_name, run_process_as_background, run_process_awaiting_background_budget,
 };
 
 const SHED: &str = "background work is shed while the git spawn rate budget is low";

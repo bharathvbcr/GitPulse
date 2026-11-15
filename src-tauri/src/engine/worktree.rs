@@ -8,13 +8,13 @@
 //! write.
 
 use crate::engine::git_cli::{
-    git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, resolve_git_dir,
-    validate_repo,
+    git_text, git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
 use crate::engine::git_writer::is_full_oid;
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
+use crate::engine::process::plain_path_text;
 use crate::ipc_error::CommandError;
 use crate::lru_map::LruMap;
 use serde::{Deserialize, Serialize};
@@ -1087,7 +1087,7 @@ pub(crate) const STATUS_CELL_CAP: usize = status_cell::MAX_CELLS;
 /// - Trust is checked before the cell is consulted, as at the spawn.
 mod status_cell {
     use super::{spawn_porcelain, ScanDeadline, DEADLINE_PASSED};
-    use crate::engine::git_cli::{current_admission, is_timed_out, Admission};
+    use crate::engine::process::{current_admission, is_timed_out, Admission};
     use crate::ipc_error::CommandError;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2079,7 +2079,7 @@ pub fn list_worktrees_scanned(
     let repo = validate_repo(repo_path)?;
     let key = FlightKey {
         repo,
-        class: crate::engine::git_cli::current_admission(),
+        class: crate::engine::process::current_admission(),
     };
     let (flight, leader, previous) = {
         let mut lanes = flight_lanes()
@@ -2180,7 +2180,7 @@ struct FlightKey {
     repo: PathBuf,
     /// A background caller never shares a user-facing one's scan, nor the
     /// other way round: the class decides what the gate may refuse.
-    class: crate::engine::git_cli::Admission,
+    class: crate::engine::process::Admission,
 }
 
 #[derive(Default)]
@@ -2301,7 +2301,7 @@ fn scan_listing(
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    let class = crate::engine::git_cli::current_admission();
+    let class = crate::engine::process::current_admission();
     // Asked once for the whole listing, whenever any scanned worktree is on a
     // branch: without the base no branch is known to be it, so even a lone
     // checkout of the default needs the answer to be called "no divergence".
@@ -2367,7 +2367,7 @@ fn scan_listing(
 /// by the same deadline inside their own status read.
 fn scan_in_waves<F>(
     targets: &[usize],
-    class: crate::engine::git_cli::Admission,
+    class: crate::engine::process::Admission,
     deadline: Option<&ScanDeadline>,
     scan: F,
 ) -> HashMap<usize, WorktreeScan>
@@ -2385,7 +2385,7 @@ where
                 .map(|&idx| {
                     let scan = &scan;
                     let handle = scope
-                        .spawn(move || crate::engine::git_cli::with_admission(class, || scan(idx)));
+                        .spawn(move || crate::engine::process::with_admission(class, || scan(idx)));
                     (idx, handle)
                 })
                 .collect();
@@ -2480,7 +2480,7 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
             ..ParsedWorktree::default()
         })
         .collect();
-    let class = crate::engine::git_cli::current_admission();
+    let class = crate::engine::process::current_admission();
     // The pass began when its clock did, so a status any stage of it read since
     // (the main checkout's, for one) is this stage's answer too.
     let pass = ScanPass::asked_at(deadline.started());
@@ -2939,7 +2939,7 @@ fn scan_worktree(
     // The measurements below swallow their own errors as "absent"; the
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
-    let failures = crate::engine::git_cli::process_failures();
+    let failures = crate::engine::process::process_failures();
     let status = match read_status_since(dir, deadline, pass.not_before) {
         Ok(read) => read.bytes,
         Err(reason) if reason == DEADLINE_PASSED => return WorktreeScan::cut_off(),
@@ -3008,10 +3008,10 @@ fn scan_worktree(
             reason = reason.message()
         ));
     }
-    if crate::engine::git_cli::process_failures() != failures {
+    if crate::engine::process::process_failures() != failures {
         scan.note = Some(format!(
             "some measurements were not taken: {}",
-            crate::engine::git_cli::last_process_failure()
+            crate::engine::process::last_process_failure()
                 .map(CommandError::into_message)
                 .unwrap_or_else(|| "a git read produced no answer".into())
         ));
@@ -7041,7 +7041,7 @@ pub fn verify_branch_integration(
                 repo,
                 &target_sha,
                 &branch_sha,
-                Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+                Instant::now() + crate::engine::process::DEFAULT_TIMEOUT,
             ) {
                 Ok(crate::engine::object_quarantine::MergeOutcome::Clean { tree }) => {
                     tree == target_tree
@@ -7378,7 +7378,7 @@ pub fn merge_worktree_pipeline(
                     &anchor,
                     &target_sha,
                     &source_sha,
-                    Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+                    Instant::now() + crate::engine::process::DEFAULT_TIMEOUT,
                 )
                 .map_err(|e| CommandError::plain(e.to_string()))?
             {
@@ -8303,7 +8303,7 @@ mod tests {
     /// nothing on Windows and a "spawned zero" assertion passes or fails for
     /// the wrong reason. Plain `canonicalize` off Windows.
     fn plain(path: impl AsRef<Path>) -> PathBuf {
-        crate::engine::git_cli::canonicalize_plain(path.as_ref()).unwrap()
+        crate::engine::process::canonicalize_plain(path.as_ref()).unwrap()
     }
 
     /// The fixtures below are written in `--porcelain`'s newline layout for
@@ -8652,7 +8652,7 @@ some-future-field whatever
 
     /// `diff` children a listing started in `dir`.
     fn diff_spawns_in(dir: &Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(dir)
+        crate::engine::process::spawn_log::spawns_in(dir)
             .iter()
             .filter(|argv| argv.iter().any(|arg| arg == "diff"))
             .count()
@@ -8813,7 +8813,7 @@ some-future-field whatever
             ..ParsedWorktree::default()
         };
         let repo = plain(main.path());
-        let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
+        let scan = crate::engine::process::with_forced_spawn_failure_of("diff", || {
             scan_worktree(
                 &repo,
                 &entry,
@@ -8863,7 +8863,7 @@ some-future-field whatever
     /// background work competed as refresh traffic.
     #[test]
     fn worktree_scans_keep_the_callers_admission_class() {
-        use crate::engine::git_cli::{spawn_log, with_admission, Admission};
+        use crate::engine::process::{spawn_log, with_admission, Admission};
         let (main, _parent, linked) = repo_with_worktrees(6);
         // Changed, so each scan starts both its children (status and diff):
         // a clean worktree's diff is not asked for.
@@ -10441,7 +10441,7 @@ some-future-field whatever
         };
 
         let (dir, wt) = teardown_fixture_on(None, "develop");
-        let refused = crate::engine::git_cli::with_forced_spawn_failure_of(
+        let refused = crate::engine::process::with_forced_spawn_failure_of(
             "refs/remotes/origin/HEAD",
             || merge(&dir, &wt),
         )
@@ -10520,7 +10520,7 @@ some-future-field whatever
         assert_eq!(measured(&batched), Some(expected), "batched");
         // The same counts when the batch is refused and each worktree walks.
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+        let walked = crate::engine::process::with_forced_spawn_failure_of(&format, || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -10588,13 +10588,13 @@ some-future-field whatever
         let base = rev(&root, "main");
         let arg = format!("--format=%(refname)%00%(ahead-behind:{base})");
         let retries = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&root)
+            crate::engine::process::spawn_log::spawns_in(&root)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "--format=%(refname)"))
                 .count()
         };
         let before = retries();
-        let got = crate::engine::git_cli::with_forced_spawn_failure_of(&arg, || {
+        let got = crate::engine::process::with_forced_spawn_failure_of(&arg, || {
             batch_divergence(&root, &base, &["main"])
         });
         assert_eq!(got, None);
@@ -11446,7 +11446,7 @@ some-future-field whatever
 
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
         cwds.iter()
-            .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+            .flat_map(|cwd| crate::engine::process::spawn_log::spawns_in(cwd))
             .filter(|argv| argv.iter().any(|arg| arg == needle))
             .count()
     }
@@ -11513,7 +11513,7 @@ some-future-field whatever
             rev(&root, "main")
         );
         let before = spawned_with(std::slice::from_ref(&root), "rev-list");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+        let walked = crate::engine::process::with_forced_spawn_failure_of(&format, || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -11562,7 +11562,7 @@ some-future-field whatever
     fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
         let (main, _parent, _linked) = repo_with_worktrees(2);
         let root = plain(main.path());
-        let listed = crate::engine::git_cli::with_forced_spawn_failure_of("for-each-ref", || {
+        let listed = crate::engine::process::with_forced_spawn_failure_of("for-each-ref", || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -11684,7 +11684,7 @@ some-future-field whatever
 
     /// `worktree list` processes run in `root`.
     fn listings_in(root: &Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(root)
+        crate::engine::process::spawn_log::spawns_in(root)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|a| a == "list") && argv.iter().any(|a| a == "--porcelain")
@@ -11696,7 +11696,7 @@ some-future-field whatever
     fn gathering(root: &Path) -> bool {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         lanes.get(&key).is_some_and(|lane| lane.open.is_some())
@@ -11706,7 +11706,7 @@ some-future-field whatever
     fn sharing(root: &Path) -> usize {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         // The lane and the leader hold one reference each; every joiner, one.
@@ -11849,7 +11849,7 @@ some-future-field whatever
     /// round, and a `Listing`-depth ask never waits for a scan.
     #[test]
     fn listings_share_only_within_one_admission_class_and_depth_listing_never_waits() {
-        use crate::engine::git_cli::{with_admission, Admission};
+        use crate::engine::process::{with_admission, Admission};
         let (main, _parent, _linked) = repo_with_worktrees(1);
         let root = plain(main.path());
         let before = listings_in(&root);
@@ -14531,12 +14531,12 @@ some-future-field whatever
             // Never panics: this also runs while another failure unwinds.
             let mut cmd = std::process::Command::new("hdiutil");
             cmd.args(["detach", "-force"]).arg(&self.mount);
-            let _ = crate::engine::git_cli::run_bounded(
+            let _ = crate::engine::process::run_bounded(
                 cmd,
                 "hdiutil detach",
                 // Held to the runner's ceiling: relaxed past it, the detach is refused unrun.
                 crate::test_support::coverage_relaxed(HDIUTIL_BUDGET)
-                    .min(crate::engine::git_cli::NETWORK_TIMEOUT),
+                    .min(crate::engine::process::NETWORK_TIMEOUT),
                 None,
             );
         }
@@ -14835,7 +14835,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         for name in ["main", "master", "feat/x"] {
@@ -14908,7 +14908,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         let b = branches.iter().find(|b| b.name == "unrelated").unwrap();
@@ -14942,7 +14942,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         assert_eq!(adv_measured(&batched, "lane"), Some((2, 0)), "batched");
         assert_eq!(
@@ -14961,7 +14961,7 @@ some-future-field whatever
         let _keep = (&main, &parent);
         let root = plain(main.path());
         let count = |needle: &str| {
-            crate::engine::git_cli::spawn_log::spawns_in(&root)
+            crate::engine::process::spawn_log::spawns_in(&root)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == needle))
                 .count()
@@ -14970,10 +14970,10 @@ some-future-field whatever
             let cold = list_worktrees(root.to_str().unwrap()).expect("list");
             assert_eq!(cold.len(), 51);
             assert_eq!(count("refs/remotes/origin/HEAD"), 1, "cold lookups");
-            let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let spawned = crate::engine::process::spawn_log::spawns_in(&root).len();
             let _ = list_worktrees(root.to_str().unwrap()).expect("list");
             assert_eq!(count("refs/remotes/origin/HEAD"), 1, "warm lookups");
-            let again = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let again = crate::engine::process::spawn_log::spawns_in(&root).len();
             eprintln!("root spawns cold={spawned} warm-extra={}", again - spawned);
         });
         let _ = linked;
@@ -16207,12 +16207,12 @@ some-future-field whatever
 #[cfg(test)]
 mod scan_once_tests {
     use super::*;
-    use crate::engine::git_cli::spawn_log::spawns_in;
+    use crate::engine::process::spawn_log::spawns_in;
     use crate::engine::ref_cache::ManualClock;
     use crate::test_support::{git_in, repo_with_worktrees};
 
     fn plain(path: &Path) -> PathBuf {
-        crate::engine::git_cli::canonicalize_plain(path).unwrap()
+        crate::engine::process::canonicalize_plain(path).unwrap()
     }
 
     fn spawned(cwds: &[PathBuf], needle: &str) -> usize {
@@ -16237,7 +16237,7 @@ mod scan_once_tests {
     fn gathering(root: &Path) -> bool {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         lanes.get(&key).is_some_and(|lane| lane.open.is_some())

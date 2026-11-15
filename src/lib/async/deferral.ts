@@ -1,6 +1,6 @@
 /**
  * The backend's spawn gate declines to start more git under load and says so
- * with one marker (`DEFERRED_MARKER` in src-tauri/src/engine/git_cli.rs). A
+ * with one marker (`DEFERRED_MARKER` in src-tauri/src/engine/process/gate.rs). A
  * deferral is not a failure of the repository or of git: nothing ran, and the
  * same read may succeed a few seconds later. It must not be reported as an
  * error, and it must not be retried at once, straight back into the limit that
@@ -16,7 +16,7 @@ export function isDeferredUnderLoad(message: string): boolean {
 }
 
 /**
- * What a child that hit its deadline says (`TIMEOUT_MARKER` in git_cli.rs),
+ * What a child that hit its deadline says (`TIMEOUT_MARKER` in engine/process/gate.rs),
  * and the suffix that marks one which never got a process slot at all
  * (`SLOT_WAIT_SUFFIX`). Both are checked against the Rust source by
  * deferral.test.ts.

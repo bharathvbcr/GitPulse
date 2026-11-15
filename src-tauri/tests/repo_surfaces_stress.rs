@@ -39,7 +39,7 @@ fn init_repo() -> TempDir {
     // contention, not the production spawn rate. Every test starts here and
     // the suite shares one process gate, so a parallel run otherwise spends
     // the burst and defers git mid-listing.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     run_git(dir.path(), &["init", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "t@example.com"]);

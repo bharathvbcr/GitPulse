@@ -67,7 +67,7 @@
 //! of the child.
 
 use super::cli::{self, BuildOutcome, CliStatus};
-use crate::engine::git_cli::is_deferred_under_load;
+use crate::engine::process::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -569,7 +569,7 @@ fn probe_status(repo_path: &str, now: Instant) -> ProbeAnswer {
     let repo = repo_path.to_string();
     let started =
         crate::supervisor::spawn_once("devmap-live-status", "devmap-live-status", move || {
-            crate::engine::git_cli::with_background_processes(|| run_probe(&repo, id, &answer));
+            crate::engine::process::with_background_processes(|| run_probe(&repo, id, &answer));
         });
     if let Err(error) = started {
         let mut probes = lock_live_probes();
@@ -1520,7 +1520,7 @@ pub(crate) fn live_refresh(
                 "devmap-live-build",
                 "devmap-live-build",
                 move || {
-                    crate::engine::git_cli::with_background_processes(|| {
+                    crate::engine::process::with_background_processes(|| {
                         run_detached_build(slot, thread_settle, build_clock, |settler| {
                             prepared.run_then(settler)
                         })
@@ -1808,7 +1808,7 @@ mod tests {
     /// messages, so a reworded refusal fails here rather than in the field.
     #[test]
     fn a_build_the_gate_declined_is_deferred_not_failed() {
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         let wanted = LiveRefreshDecision::Refresh;
         for refusal in [
             Refusal::Shed,
@@ -3099,8 +3099,8 @@ exit 2
         );
 
         // Step 3: Interactive execution is not starved while probe is hung in background
-        let interactive_ran = crate::engine::git_cli::with_admission(
-            crate::engine::git_cli::Admission::Interactive,
+        let interactive_ran = crate::engine::process::with_admission(
+            crate::engine::process::Admission::Interactive,
             || true,
         );
         assert!(interactive_ran);

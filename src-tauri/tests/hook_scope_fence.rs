@@ -143,7 +143,7 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     // same call in `hook_protocol_stress`, since this test is ignored without a
     // manvi binary). The trust read does not: it reads the filesystem. The hook
     // processes this test drives have gates of their own.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
     let db = gitpulse_lib::tasks::store_path(repo);
@@ -298,7 +298,7 @@ fn sibling_worktree_and_outside_reads_are_judged_end_to_end() {
     let main_repo = main_dir.to_str().expect("utf8 main");
     let wt_b_repo = wt_b_dir.to_str().expect("utf8 wt_b");
 
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let main_preview = gitpulse_lib::repository_trust::inspect(main_repo).expect("inspect main");
     gitpulse_lib::repository_trust::grant(main_repo, &main_preview.identity, true)
         .expect("trust main");

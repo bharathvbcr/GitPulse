@@ -14,7 +14,7 @@
 //! The `poll` branch is compiled for Unix test builds only: it is the host
 //! stand-in that exercises the same worker, permit and cancel logic as the
 //! Windows overlapped-I/O branch, not a production path. Production Unix uses
-//! `pipe_drain`; `git_cli.rs` compiles this module only for `not(unix)` or test.
+//! `pipe_drain`; `process` compiles this module only for `not(unix)` or test.
 
 use super::{Drained, ProcessObserver, SpawnPermit, Stop};
 use std::io;
@@ -106,7 +106,7 @@ mod sys {
                 let error = io::Error::last_os_error();
                 // A full pipe is already raised; anything else is a fault.
                 if error.kind() != io::ErrorKind::WouldBlock {
-                    log::warn!(target: "git_cli", "pipe cancel signal failed: {error}");
+                    log::warn!(target: "process", "pipe cancel signal failed: {error}");
                 }
             }
         }
@@ -312,7 +312,7 @@ mod sys {
         pub(super) fn raise(&self) {
             // SAFETY: the event stays open until this `Signal` drops.
             if unsafe { SetEvent(self.handle()) } == 0 {
-                log::warn!(target: "git_cli", "pipe cancel event failed: {}", io::Error::last_os_error());
+                log::warn!(target: "process", "pipe cancel event failed: {}", io::Error::last_os_error());
             }
         }
     }
@@ -639,7 +639,7 @@ impl<T> Drop for Worker<T> {
         if self.finished() {
             if let Some(handle) = self.handle.take() {
                 if handle.join().is_err() {
-                    log::warn!(target: "git_cli", "pipe worker panicked during cleanup");
+                    log::warn!(target: "process", "pipe worker panicked during cleanup");
                 }
             }
         }
@@ -817,8 +817,8 @@ impl InputFeed {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{SpawnGate, SpawnPermit};
     use super::{reader, Cancel, CancelRead, Done, Drained, InputFeed, OutputDrains, Stop, Worker};
-    use crate::engine::git_cli::{SpawnGate, SpawnPermit};
     use crate::procguard::LockedSpawn;
     use std::io::{self, Read};
     use std::process::{Child, ChildStdout, Command, Stdio};

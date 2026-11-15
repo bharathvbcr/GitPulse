@@ -39,8 +39,8 @@ use super::{
     read_listing, AgentSummary, ChangesFacet, CollisionRisk, GitFacets, InsightsSnapshot,
     WorktreeFacet, MAX_SNAPSHOT_WORKTREES,
 };
-use crate::engine::git_cli::{with_admission, Admission};
 use crate::engine::git_reader::GitReader;
+use crate::engine::process::{with_admission, Admission};
 use crate::engine::worktree::{self, ScanDeadline, StatusRead, WorktreeInfo};
 use crate::ipc_error::CommandError;
 

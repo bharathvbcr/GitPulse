@@ -5,9 +5,9 @@ use crate::coverage_toolchain::{
     NATIVE_COVERAGE_BUILD_DIR, NATIVE_COVERAGE_FLAG, NATIVE_COVERAGE_LCOV, PYTEST_PACKAGES,
     VENV_DIR_NAMES,
 };
-use crate::engine::git_cli::{
-    extended_child_path, resolve_spawn_program_with, run_captured, sandbox_join,
-    sandbox_join_canonical, validate_repo, RunOutcome,
+use crate::engine::git_cli::{sandbox_join, sandbox_join_canonical, validate_repo};
+use crate::engine::process::{
+    extended_child_path, resolve_spawn_program_with, run_captured, RunOutcome,
 };
 use crate::harness::{guard_command, PolicyVerdict};
 use crate::ipc_error::CommandError;

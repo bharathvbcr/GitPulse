@@ -3553,7 +3553,7 @@ const DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_sec
 pub const WORST_CASE_DEFERRED_READ: std::time::Duration = std::time::Duration::from_secs(
     DEFERRAL_RETRY_WINDOW.as_secs()
         + 2 * (insights::SNAPSHOT_DEADLINE.as_secs()
-            + crate::engine::git_cli::SPAWN_QUEUE_BUDGET.as_secs()),
+            + crate::engine::process::SPAWN_QUEUE_BUDGET.as_secs()),
 );
 
 /// A value in `0..bound` that differs between processes and between calls.
@@ -4138,7 +4138,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let mut command_exit_code = None;
             let mut command_error = None;
             if let Some(argv) = command_argv.as_deref() {
-                match crate::engine::git_cli::capture_command(
+                match crate::engine::process::capture_command(
                     argv[0],
                     &argv[1..],
                     Some(std::path::Path::new(&worktree_path)),
@@ -12798,7 +12798,7 @@ mod deferral_retry_tests {
         let repo = crate::test_support::git_repo();
         let path = repo.path().to_str().unwrap();
         for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
-            let answer = crate::engine::git_cli::with_forced_deferral(|| {
+            let answer = crate::engine::process::with_forced_deferral(|| {
                 handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
             });
             assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
@@ -12913,7 +12913,7 @@ mod deferral_retry_tests {
     fn a_ledger_read_that_stays_shed_names_the_deferral_after_one_retry() {
         let repo = crate::test_support::git_repo();
         let harness = Harness::new(0, ROOMY);
-        let error = crate::engine::git_cli::with_forced_deferral(|| {
+        let error = crate::engine::process::with_forced_deferral(|| {
             harness.run(|retry| read_address(repo.path().to_str().unwrap(), retry))
         })
         .expect_err("a shed read cannot resolve");

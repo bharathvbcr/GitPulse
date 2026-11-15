@@ -7,7 +7,7 @@
 //! * **Admission (card 1b):** [`admit`] is called before an agent launch's
 //!   checkout probes, its capacity check and its PTY spawn. It refuses only on
 //!   memory pressure, and fails open on everything else.
-//! * **Shedding (card 1c):** the spawn gate (`engine::git_cli`) asks
+//! * **Shedding (card 1c):** the spawn gate (`engine::process`) asks
 //!   [`shed`] which of its own admission classes to refuse, and refuses them
 //!   with the deferral marker the frontend already retries on. Nothing here
 //!   schedules anything.

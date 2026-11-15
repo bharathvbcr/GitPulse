@@ -293,7 +293,10 @@ describe("the frontend has one IPC entry point", () => {
   });
 
   it("relies on a backend guarantee that is still in the Rust source", () => {
-    const source = readFileSync(join(repoRoot, "src-tauri", "src", "engine", "git_cli.rs"), "utf8");
+    const source = readFileSync(
+      join(repoRoot, "src-tauri", "src", "engine", "process", "gate.rs"),
+      "utf8",
+    );
     // The retry above is safe only because a command that reached the
     // mutation guard never carries the deferral marker out.
     expect(/pub\(crate\) fn run_command_scope</.test(source), "run_command_scope exists").toBe(true);

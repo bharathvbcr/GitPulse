@@ -8,6 +8,7 @@
 
 use gitpulse_lib::engine::budget;
 use gitpulse_lib::engine::git_cli;
+use gitpulse_lib::engine::process;
 use gitpulse_lib::engine::GitReader;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
@@ -151,7 +152,7 @@ fn a_binary_diff_is_cut_on_whole_lines() {
 #[test]
 fn the_spawn_gate_reclaims_permits_from_failures_timeouts_and_panics() {
     // Permits, not rate tokens: a rate refusal would read as a leaked permit.
-    git_cli::run_process_with_unlimited_spawn_rate();
+    process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     let _ = repo_with(dir.path(), "f.txt", "a\n", "b\n");
     let repo = dir.path();
@@ -162,7 +163,7 @@ fn the_spawn_gate_reclaims_permits_from_failures_timeouts_and_panics() {
     }
     // Timeouts: a command killed by its deadline.
     for _ in 0..8 {
-        let err = git_cli::run_command("sh", &["-c", "sleep 5"], Duration::from_millis(80))
+        let err = process::run_command("sh", &["-c", "sleep 5"], Duration::from_millis(80))
             .expect_err("must time out");
         assert!(err.contains("timed out"), "got: {err}", err = err.message());
     }

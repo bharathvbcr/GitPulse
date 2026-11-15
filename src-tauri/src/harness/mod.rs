@@ -1666,9 +1666,9 @@ mod scope_tests {
     #[cfg(unix)]
     fn family_resolutions<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, usize) {
         let cwd = std::path::Path::new(cwd);
-        let before = crate::engine::git_cli::spawn_log::spawns_in(cwd).len();
+        let before = crate::engine::process::spawn_log::spawns_in(cwd).len();
         let value = f();
-        let count = crate::engine::git_cli::spawn_log::spawns_in(cwd)
+        let count = crate::engine::process::spawn_log::spawns_in(cwd)
             .into_iter()
             .skip(before)
             .filter(|argv| {
