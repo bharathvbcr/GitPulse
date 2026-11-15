@@ -53,6 +53,8 @@ fewest tasks that cover the work.
    so send its existing title, description and criteria **plus** yours. Every
    field you leave out — status, priority, severity, owner, due date, labels,
    logs — stays exactly as the card had it, as do its column position and links.
+   Pass the revision you read as `expected_revision`, so an edit made after
+   your read is refused instead of replaced.
 4. **Merge duplicates you find.** When the board already holds two or more
    open tasks for one concern, fold them into one with
    `gitpulse_merge_tasks` (see [Merging tasks](#merging-tasks)) rather than
@@ -104,6 +106,14 @@ choose another `task_id`. A title or description the person **locked** on
 the card is theirs: an overwrite that would change it is refused with
 `field_locked`, and one that leaves it as it is goes through.
 
+An overwrite replaces the card as it is when the call lands, so one sent from
+an earlier read overwrites whatever the person changed since. Pass
+`expected_revision` (the `revision` from `gitpulse_get_task` or
+`gitpulse_list_tasks`) to hold it to what you read: if the task is at another
+revision nothing is written and `revision_conflict` names the current one, so
+re-read it, merge, and send again. It is refused with `invalid_input` without
+`overwrite: true`, and with `not_found` when no such task is on the board.
+
 | Parameter | Required | Rule |
 | --- | --- | --- |
 | `repo_path` | yes | Absolute path to the repository (any of its worktrees). |
@@ -122,6 +132,7 @@ the card is theirs: an overwrite that would change it is refused with
 | `repositories` | no | Other related repository names, kept as a `## Related repositories` section. |
 | `logs` | no | Raw evidence kept verbatim, at most 256 KiB. |
 | `overwrite` | no | Replace an existing task's content, by `task_id` or board `item_id`. |
+| `expected_revision` | no | With `overwrite: true`: only replace the task if it is still at this revision (1 to 9,007,199,254,740,991); otherwise `revision_conflict`. Without it the overwrite is not checked against what you read. |
 | `reviewed_related` | no | At most 500 `item_id`s: every task a `related_tasks_exist` refusal listed, once you have read them and judged this separate. A refusal names 25 at a time; pass back everything you have read so far and the next refusal names the following ones. |
 | `parent_task_id` | no | File this task as a subtask of one already on this repository's board: its `task_id`, or an `item_id` from `gitpulse_list_tasks`. The parent must be live, a task has one parent, a cycle or a chain past the board's depth bound is refused, and the parent you name is not held back as related work. With `overwrite`, it moves the task under that parent and keeps its other links. The reply's `parent_item_id` is the parent's board id. |
 
