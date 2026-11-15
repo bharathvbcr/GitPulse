@@ -1,5 +1,6 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { createScanJoin } from "../runtime/autoScan";
   import type {
     DepsHealthReport,
     DependabotReport,
@@ -22,8 +23,17 @@
 
   // Survives the per-tab remount so revisiting the Health view renders the
   // last scan instantly; the fetch then refreshes it in place.
+  /**
+   * The dependency audit running for each repository. Module-level so a panel
+   * left and reopened while an audit is still running joins it instead of
+   * starting a second one beside it.
+   */
+  const inflightAudits = createScanJoin<DepsHealthReport>();
+
   const healthCache = createRepoPanelCache<{
     deps: DepsHealthReport;
+    /** When `deps` was scanned (epoch ms), the stamp runtime/autoScan.ts judges freshness by. */
+    scannedAtMs: number;
     dependabot: DependabotReport | null;
     dependabotCheckedAt: number | null;
     dependabotRequestFailed: boolean;
@@ -34,10 +44,11 @@
 </script>
 
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
+  import { isScanStale, scheduleAutoScan } from "../runtime/autoScan";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,
@@ -507,9 +518,43 @@
     scanned.path = "";
   }
 
-  async function scan(path?: string) {
+  /**
+   * An automatic scan waiting for this panel to settle (runtime/autoScan.ts).
+   * Any scan that starts, a click included, ends the wait.
+   */
+  let cancelPending: (() => void) | null = null;
+  let pending = $state(false);
+  function stopPending() {
+    cancelPending?.();
+    cancelPending = null;
+    pending = false;
+  }
+  onDestroy(stopPending);
+
+  /**
+   * `reuse` answers the dependency audit from a result that is still fresh
+   * instead of running it again; the code-map queries beside it are cheap and
+   * always run. A reused result keeps its original stamp, so reuse never
+   * renews itself.
+   */
+  function cacheFinishedAudit(repoPath: string, deps: DepsHealthReport) {
+    const prior = healthCache.get(repoPath);
+    healthCache.set(repoPath, {
+      deps,
+      scannedAtMs: Date.now(),
+      dependabot: prior?.dependabot ?? null,
+      dependabotCheckedAt: prior?.dependabotCheckedAt ?? null,
+      dependabotRequestFailed: prior?.dependabotRequestFailed ?? false,
+      codeScanning: prior?.codeScanning ?? null,
+      codeScanningCheckedAt: prior?.codeScanningCheckedAt ?? null,
+      codeScanningRequestFailed: prior?.codeScanningRequestFailed ?? false,
+    });
+  }
+
+  async function scan(path?: string, reuse?: { deps: DepsHealthReport; scannedAtMs: number }) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
+    stopPending();
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
@@ -519,11 +564,22 @@
     // Automatic local scans stay local. GitHub alerts use the GitHub CLI
     // and the network; they run through scanDependabot, not this path.
     const [deps, dead, graph] = await Promise.allSettled([
-      invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+      reuse
+        ? Promise.resolve(reuse.deps)
+        : inflightAudits.run(repoPath, () =>
+            invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+          ),
       getDeadSymbols(repoPath),
       getCodeintelStatus(repoPath),
     ]);
-    if (!guard.isLive()) return;
+    if (!guard.isLive()) {
+      // The panel was left, or the repository changed, while this audit ran.
+      // What is on screen now is not this scan's to write, but the audit is a
+      // finished answer for `repoPath`: keeping it means the return does not
+      // run it again.
+      if (deps.status === "fulfilled" && !reuse) cacheFinishedAudit(repoPath, deps.value);
+      return;
+    }
     try {
       if (deps.status === "fulfilled") {
         report = deps.value;
@@ -570,6 +626,7 @@
       if (deps.status === "fulfilled") {
         healthCache.set(repoPath, {
           deps: deps.value,
+          scannedAtMs: reuse ? reuse.scannedAtMs : Date.now(),
           dependabot,
           dependabotCheckedAt,
           dependabotRequestFailed,
@@ -610,6 +667,9 @@
     if (!deps) return;
     healthCache.set(repoPath, {
       deps,
+      // The audit itself did not rerun, so its stamp stays what it was. Unknown
+      // (0) reads as stale and is rescanned on the next visit.
+      scannedAtMs: healthCache.get(repoPath)?.scannedAtMs ?? 0,
       dependabot: result,
       dependabotCheckedAt: checkedAt,
       dependabotRequestFailed: requestFailed,
@@ -898,6 +958,7 @@
   $effect(() => {
     const path = $currentRepoPath;
     if (!path) {
+      stopPending();
       inflight?.cancel();
       dependabotInflight?.cancel();
       fixInflight?.cancel();
@@ -926,6 +987,10 @@
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    stopPending();
+    // The audit of the repository just left must not land on this one. It is
+    // not lost: it caches itself when it finishes (see `scan`).
+    inflight?.cancel();
     dependabotInflight?.cancel();
     cancelHealthAgentLaunch();
     untrack(() => {
@@ -938,6 +1003,9 @@
     const github = githubAlertsCache.get(path);
     untrack(() => {
       checkingGithub = false;
+      // The cancelled scan's `finally` no longer releases this; the next scan
+      // to start sets it again.
+      loading = false;
       if (cached) {
         report = cached.deps;
         reportPath = path;
@@ -973,7 +1041,26 @@
         codeScanningRequestFailed = github.codeScanningRequestFailed;
       }
     });
-    void scan(path);
+    // A still-fresh audit is reused and starts nothing. Otherwise the scan
+    // waits for the panel to stay put: a visit shorter than the settle pays
+    // for no audit, and a failed scan leaves `scanned.path` cleared so the
+    // next visit tries again.
+    if (cached && !isScanStale(cached.scannedAtMs, Date.now())) {
+      untrack(() => void scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs }));
+    } else if (inflightAudits.has(path)) {
+      // An audit for this repository is already running (this panel was left
+      // and reopened): listening to it costs nothing, so it is joined at once.
+      untrack(() => void scan(path));
+    } else {
+      untrack(() => {
+        pending = true;
+        cancelPending = scheduleAutoScan({
+          key: `deps:${path}`,
+          stillNeeded: () => $repoStore.currentPath === path,
+          run: () => void scan(path),
+        });
+      });
+    }
     // Launch also fetches these; this call joins that in-flight request or
     // hydrates from its cache so opening Health after a warning is not empty.
     if ($interfaceStore.autoScanGithubAlerts && !github) void scanDependabot(path);
@@ -1336,7 +1423,7 @@
         <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
-    {#if loading && !report}
+    {#if (loading || pending) && !report}
       <div class="space-y-4">
         <div class="grid grid-cols-1 @2xl:grid-cols-3 gap-3">
           <Skeleton variant="card" count={3} />

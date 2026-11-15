@@ -30,6 +30,19 @@ describe("HealthPanel rendering", () => {
     expect(freshness.label.length).toBeGreaterThan(0);
   });
 
+  it("scans automatically only through the shared settle, reusing a fresh audit", () => {
+    // Behaviour is pinned in harness/healthChecks.js (vitest never runs
+    // $effect); this keeps the wiring from being inlined back into the effect.
+    const effect = source.slice(source.indexOf("$effect(() => {\n    const path = $currentRepoPath;"), source.indexOf("async function openExternal"));
+    expect(effect).toContain("isScanStale(cached.scannedAtMs, Date.now())");
+    expect(effect).toContain("scheduleAutoScan({");
+    expect(effect).toContain("scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs })");
+    // No bare `void scan(path);` is left in the effect: that was the
+    // scan-on-every-mount.
+    expect(effect).not.toMatch(/^\s*void scan\(path\);/m);
+    expect(source).toContain("onclick={() => scan()}");
+  });
+
   it("labels outdated results as npm-only, through the catalog heading", () => {
     expect(HEALTH_SECTIONS.find((s) => s.id === "outdated")?.heading).toBe(
       "Outdated npm packages",

@@ -8,6 +8,7 @@
  * always says by how much.
  */
 import { plural } from "../format";
+import { SCAN_FRESH_MS, isScanStale } from "../runtime/autoScan";
 import type { SecretFinding, SecretLocation, SecretsReport } from "./types";
 
 /** Most actionable first; matches the backend's sort. */
@@ -231,7 +232,7 @@ function excludedNote(paths: readonly string[]): string | null {
 }
 
 /** A cached report older than this is refreshed when the panel reopens. */
-export const STALE_AFTER_MS = 5 * 60_000;
+export const STALE_AFTER_MS = SCAN_FRESH_MS;
 
 /**
  * The text behind Copy error. Kingfisher's own output is not part of it.
@@ -245,7 +246,7 @@ export function scanFailureCopy(report?: SecretsReport | null): string {
 }
 
 export function isStale(report: SecretsReport, nowMs: number): boolean {
-  return report.scanned_at_ms <= 0 || nowMs - report.scanned_at_ms >= STALE_AFTER_MS;
+  return isScanStale(report.scanned_at_ms, nowMs);
 }
 
 /**
