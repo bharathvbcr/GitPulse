@@ -151,7 +151,7 @@ fn walk(
         return Err("Special files inside candidate; cleanup is unavailable".into());
     }
     if strict && !relative.as_os_str().is_empty() {
-        if devmap_query::hygiene::protected_entry(relative) {
+        if devmap_query::hygiene::protected_entry_in(root, relative) {
             return Err(format!(
                 "Protected content inside candidate: {}",
                 relative.display()
@@ -380,8 +380,102 @@ pub fn remove_reviewed(
 
 #[cfg(test)]
 mod tests {
-    use super::no_symlinks;
+    use super::{no_symlinks, remove_reviewed, snapshot};
     use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    /// Cargo's own layout: scratch `tmp`, a build-script directory named like a
+    /// crate (`log`), and a `--target <triple>` tree with its own `tmp`.
+    fn cargo_layout(root: &Path, marked: bool) {
+        for dir in [
+            "tmp",
+            "debug/build/log/0123abcd",
+            "aarch64-apple-darwin/debug",
+            "aarch64-apple-darwin/tmp",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "tmp/x.txt",
+            "debug/build/log/0123abcd/out",
+            "aarch64-apple-darwin/debug/.cargo-lock",
+            "aarch64-apple-darwin/tmp/y.txt",
+        ] {
+            fs::write(root.join(file), "x").unwrap();
+        }
+        if marked {
+            fs::write(
+                root.join("CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55",
+            )
+            .unwrap();
+            fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        }
+    }
+
+    fn walk(root: &Path) -> Result<super::Snapshot, String> {
+        snapshot(root, true, &AtomicBool::new(false))
+    }
+
+    /// The walk passes its own root to the name protection, so Cargo's own
+    /// directory names inside a marked target are not refused, and the same
+    /// tree without the markers still is.
+    #[test]
+    fn a_marked_cargo_target_walks_clean_and_an_unmarked_one_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let marked = root.join("marked");
+        cargo_layout(&marked, true);
+        let seen = walk(&marked).expect("Cargo's own tmp and crate-named directories");
+        assert!(seen
+            .entries
+            .contains_key(Path::new("debug/build/log/0123abcd/out")));
+        let unmarked = root.join("unmarked");
+        cargo_layout(&unmarked, false);
+        let refused = walk(&unmarked).expect_err("no markers, no waiver");
+        assert!(
+            refused.contains("Protected content inside candidate"),
+            "{refused}"
+        );
+    }
+
+    /// The waiver stops at what is protected for its own sake: a repository
+    /// inside `tmp`, a `.env`, and `node_modules` stay refused even inside a
+    /// marked target.
+    #[test]
+    fn protection_resumes_below_cargos_tmp_and_for_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        for (index, hidden) in ["tmp/repo/.git/config", "tmp/.env", "debug/node_modules/x"]
+            .into_iter()
+            .enumerate()
+        {
+            let target = root.join(format!("target-{index}"));
+            cargo_layout(&target, true);
+            let file = target.join(hidden);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "x").unwrap();
+            let refused = walk(&target).expect_err(hidden);
+            assert!(
+                refused.contains("Protected content inside candidate"),
+                "{hidden}: {refused}"
+            );
+        }
+    }
+
+    /// What the cleaner's agent scopes need: a real-shaped target, `tmp`
+    /// included, is walked and removed, not refused.
+    #[test]
+    fn a_marked_cargo_target_with_cargos_own_tmp_is_reviewed_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let target = root.join("x-target");
+        cargo_layout(&target, true);
+        let reviewed = walk(&target).unwrap();
+        remove_reviewed(&target, &reviewed, &AtomicBool::new(false)).unwrap();
+        assert!(!target.exists());
+    }
 
     #[test]
     fn no_symlinks_walks_a_canonical_temp_path() {

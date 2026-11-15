@@ -605,27 +605,62 @@ fn a_recent_or_unproven_claude_build_folder_says_which() {
         .starts_with("owner unproven:"));
 }
 
-/// A real Cargo target has a `tmp` directory (Cargo's own scratch), and the
-/// preserved-name list refuses an entry of that name anywhere inside a
-/// candidate. Until that list tells a build directory's own `tmp` from a
-/// person's, such a target is kept, not offered: this scope reclaims nothing
-/// from a target that has built a test or a build script.
+/// A real Cargo target has a `tmp` directory and crate-named build-script
+/// directories (`build/log/<hash>`). The walk passes the candidate root to the
+/// name protection, which waives exactly those under a directory with both
+/// Cargo markers, so such a target is offered and removed, in a session
+/// scratchpad and under `.claude/` alike.
 #[test]
-fn a_target_holding_cargos_own_tmp_directory_is_kept_by_the_preserved_name_list() {
+fn a_real_shaped_cargo_target_with_tmp_is_offered_and_removed() {
     let (_temp, root) = temp_root();
     let target = scratchpad(&root, OLD).join("cargo-target");
     cargo_target(&target, 30);
     fs::create_dir_all(target.join("tmp")).unwrap();
     fs::write(target.join("tmp/x"), "x").unwrap();
+    fs::create_dir_all(target.join("debug/build/log/0123abcd")).unwrap();
+    fs::write(target.join("debug/build/log/0123abcd/out"), "x").unwrap();
     age(&target, 30);
-    let refused = devmap_query::hygiene::protected_entry(Path::new("tmp"));
     let scan = run(&nobody(), &idle, |ctx| {
         scan_sessions(&root, UID, ctx, false)
     });
-    assert_eq!(scan.candidates.is_empty(), refused, "{:?}", scan.kept);
-    if refused {
-        assert!(kept_reason(&scan, "cargo-target")
-            .reason
-            .contains("Protected content inside candidate"));
-    }
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+    run(&nobody(), &idle, |ctx| {
+        remove(&scan.candidates[0], ctx, u64::MAX)
+    })
+    .unwrap();
+    assert!(!target.exists());
+}
+
+#[test]
+fn a_claude_target_with_tmp_is_removed_and_a_repository_inside_it_is_not() {
+    let (_temp, repo, lane) = claude_fixture();
+    let copy = lane.join(".claude/x-target");
+    fs::create_dir_all(copy.join("tmp")).unwrap();
+    fs::write(copy.join("tmp/x"), "x").unwrap();
+    fs::create_dir_all(copy.join("debug/build/log/0123abcd")).unwrap();
+    fs::write(copy.join("debug/build/log/0123abcd/out"), "x").unwrap();
+    age(&copy, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_claude_targets(&[lane.clone()], ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+    run(&nobody(), &idle, |ctx| {
+        remove(&scan.candidates[0], ctx, u64::MAX)
+    })
+    .unwrap();
+    assert!(!copy.exists());
+    assert!(lane.join(".claude/skills/a.md").is_file());
+    // A repository, a .env or node_modules inside the main one keep it whole.
+    let main = repo.join(".claude/x-target");
+    fs::create_dir_all(main.join("tmp/repo/.git")).unwrap();
+    fs::write(main.join("tmp/repo/.git/config"), "x").unwrap();
+    age(&main, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_claude_targets(std::slice::from_ref(&repo), ctx, false)
+    });
+    assert!(scan.candidates.is_empty());
+    assert!(kept_reason(&scan, "x-target")
+        .reason
+        .contains("Protected content inside candidate"));
+    assert!(main.join("tmp/repo/.git/config").is_file());
 }
