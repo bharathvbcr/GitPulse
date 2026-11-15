@@ -3073,7 +3073,7 @@
       </div>
     {/if}
     {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button type="button" class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Try again</button></div>{/if}
-    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
+    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} onchange={() => void loadUnread()} />{/if}
     {#if showArchive}
       <TaskArchive
         {scope}

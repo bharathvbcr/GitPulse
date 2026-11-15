@@ -226,11 +226,15 @@ export async function getAttention(id: string): Promise<Attention> {
   const result = record(await request("attention.get", { id }), attention);
   return result.id === id ? result : invalid();
 }
-export function attentionWrite(item: Attention, action: AttentionAction): AttentionWrite {
+export function attentionWrite(item: Pick<AttentionRow, "id" | "revision">, action: AttentionAction): AttentionWrite {
   return { id: item.id, expected_revision: item.revision, request_id: newID(), action, ...(action === "snooze" ? { seconds: 3600 } : {}) };
 }
-export async function updateAttention(input: AttentionWrite): Promise<Attention> {
-  const result = record(await request("attention.update", { ...input }), attention);
+/**
+ * The store applies an action to a notice of any kind, so the receipt is decoded as an inbox row: a kind this build
+ * cannot read can still be dismissed, and its receipt comes back as the same {@link UnreadAttention} row it was.
+ */
+export async function updateAttention(input: AttentionWrite): Promise<AttentionRow> {
+  const result = record(await request("attention.update", { ...input }), attentionRow);
   if (result.id !== input.id || result.revision !== input.expected_revision + 1) return invalid();
   return result;
 }
