@@ -115,6 +115,17 @@ This validates the current host. Run it before opening a pull request; the
 platform jobs in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml`
 must still pass on their respective operating systems.
 
+The Rust test gate builds an instrumented copy of the crate (about 50 GiB in
+`<cargo target>/llvm-cov-target`). The runner deletes it itself once the coverage floor has
+read `lcov.info`, and also when a gate fails or the run is abandoned where the runner still
+has control; it prints what it removed and how much it freed, and says plainly if it could
+not remove it. A Ctrl-C or `kill` that stops the runner itself is not covered, so check
+for the directory after one. Set `CI_LOCAL_KEEP_COVERAGE_BUILD=1` to keep it: an
+incremental coverage rebuild is about 15 minutes faster, at the cost of the disk space. The
+runner deletes the directory cargo-llvm-cov actually used (`CARGO_LLVM_COV_TARGET_DIR`,
+`CARGO_TARGET_DIR` and cargo's own configuration are honoured) and refuses, loudly, to delete
+a path it cannot identify as that build.
+
 > [!IMPORTANT]
 > **macOS is the platform this project is developed and hand-tested on.** CI
 > runs the automated suites elsewhere, but no one drives a running Windows or
@@ -220,7 +231,7 @@ flowchart TD
 | `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
 | `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
 | `bun run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
-| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
+| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command, then deletes the ~50 GiB coverage build unless `CI_LOCAL_KEEP_COVERAGE_BUILD=1` |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
