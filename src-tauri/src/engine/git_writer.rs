@@ -9,6 +9,8 @@ use crate::engine::process::{
     OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use crate::ipc_error::CommandError;
+use crate::leak_scan::staged::guard_commit as guard_staged_secrets;
+pub use crate::leak_scan::staged::Policy as SecretPolicy;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1511,6 +1513,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, CommandError> {
+        Self::commit_with_policy(repo_path, message, amend, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::commit`] with the secret gate's policy named. The staged
+    /// changes are scanned under the mutation lock, so the index that was
+    /// scanned is the index this process commits; a refusal leaves it as it was.
+    pub fn commit_with_policy(
+        repo_path: &str,
+        message: &str,
+        amend: bool,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() && !(amend && message.is_empty()) {
             return Err("Commit message must not be empty".into());
@@ -1520,6 +1534,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard_staged_secrets(&repo, &[], secrets)?;
         Self::commit_inner(&repo, message, amend)
     }
 
@@ -1552,6 +1567,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// silently marked resolved. Ignored untracked files stay untracked —
     /// `git add --all` does not force them.
     pub fn quick_commit(repo_path: &str, message: &str) -> Result<String, CommandError> {
+        Self::quick_commit_with_policy(repo_path, message, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::quick_commit`] with the secret gate's policy named. The scan
+    /// runs after `add --all`, so it reads what the commit will record. A
+    /// refusal leaves those files staged and nothing committed.
+    pub fn quick_commit_with_policy(
+        repo_path: &str,
+        message: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() {
             return Err("Commit message must not be empty".into());
@@ -1560,16 +1586,21 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::quick_commit_inner(&repo, message)
+        Self::quick_commit_inner(&repo, message, secrets)
     }
 
-    fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, CommandError> {
+    fn quick_commit_inner(
+        repo: &Path,
+        message: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         Self::require_commit_identity(repo)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
             return Err("Resolve merge conflicts before committing.".into());
         }
         git_text(repo, Self::QUICK_COMMIT_ADD_ARGV)?;
+        guard_staged_secrets(repo, &[], secrets)?;
         Self::commit_inner(repo, message, false)
     }
 
@@ -1608,6 +1639,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
             &["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
             &input,
         )?;
+        // `--only` commits these paths and nothing else staged, so the scan
+        // reads exactly these paths: the same `:(literal)` strings the commit
+        // is handed, so the two cannot match different files. Programmatic
+        // callers have no person to override a refusal.
+        guard_staged_secrets(&repo, &paths, SecretPolicy::Enforce)?;
         git_with_stdin(
             &repo,
             &[

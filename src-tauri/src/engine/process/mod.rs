@@ -92,7 +92,8 @@ pub(crate) use read_cancel::CANCELLED_MESSAGE;
 pub use runner::{
     byte_tail, capture_command, found_but_failed_detail, is_spawn_not_found, run_captured,
     run_command, run_command_in, CapturedOutput, CapturedRun, Incomplete, RunOptions, RunOutcome,
-    DEFAULT_DRAIN_GRACE, DEFAULT_KILL_GRACE, DEFAULT_TIMEOUT, MAX_OUTPUT_BYTES, NETWORK_TIMEOUT,
+    DEFAULT_DRAIN_GRACE, DEFAULT_KILL_GRACE, DEFAULT_TIMEOUT, MAX_DRAINED_OUTPUT_BYTES,
+    MAX_OUTPUT_BYTES, NETWORK_TIMEOUT,
 };
 pub(crate) use runner::{
     capture_command_scrubbed, capture_command_with_env, classify_tool_probe, is_run_timeout,

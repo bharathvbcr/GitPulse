@@ -40,6 +40,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
+    "SkipReason",
+    "the secret scan's skip reason rides in a `secret_scan_blocked` error's detail; the commit view renders the refusal's message and never branches on the reason",
+  ],
+  [
     "LandedVia",
     "`gitpulse_landed` is an MCP read tool: its `via` reaches agents over MCP and has no frontend consumer",
   ],
