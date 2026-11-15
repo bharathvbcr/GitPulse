@@ -601,6 +601,30 @@ const moveThroughMenu = async (id, status) => {
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
+    // ---- The header lays its tools out in two deliberate rows -------------
+    // Thirteen controls in one right-aligned strip were wider than the bar,
+    // so they wrapped under a near-empty title row, at four different
+    // heights (24, 26, 28 and 34px). The title row keeps search, Inbox,
+    // Archive, Refresh and New task; the toolbar row holds the layout and
+    // view controls on the left and Manvi's tools on the right. Every control
+    // sits on its row's centre line and none is taller than 28px.
+    {
+      const header = root.querySelector('[data-testid="task-board"] .board-main > header[data-page-header]');
+      const actionsRow = header?.querySelector(":scope > .gp-header-actions");
+      const toolbar = header?.querySelector(":scope > [data-page-header-toolbar]");
+      const named = (row, label) => Boolean(row && button(label, row));
+      check("the title row holds search, Inbox, Archive, Refresh and New task",
+        Boolean(actionsRow?.querySelector("#task-search")) && ["Inbox", "Archive", "Refresh", "New task"].every(label => named(actionsRow, label)));
+      check("the toolbar row is inside the header and holds the layout, view and Manvi tools",
+        ["Board", "List", "Filters", "Suggest next", "Organize"].every(label => named(toolbar, label)) && Boolean(toolbar?.querySelector("[data-task-views-toggle]")));
+      const controlsIn = row => row ? [...row.querySelectorAll("button, .gp-segmented")].filter(el => el.getClientRects().length && !el.parentElement.closest(".gp-segmented")) : [];
+      const geometry = row => controlsIn(row).map(el => { const box = el.getBoundingClientRect(); return { label: el.getAttribute("aria-label") ?? el.textContent.trim(), height: box.height, centre: box.top + box.height / 2 }; });
+      const level = rows => { const centres = rows.map(row => row.centre); return rows.length > 0 && Math.max(...centres) - Math.min(...centres) <= 2 && rows.every(row => row.height <= 28); };
+      const top = geometry(actionsRow), bottom = geometry(toolbar);
+      check(`every header control is at most 28px and on its row's centre line (title row: ${top.map(row => `${row.label} ${Math.round(row.height)}`).join(", ")}; toolbar: ${bottom.map(row => `${row.label} ${Math.round(row.height)}`).join(", ")})`,
+        level(top) && level(bottom));
+    }
+
     // ---- The drag preview sits under the pointer ----------------------------
     // The board lives in a `.gp-pane`, whose `contain: layout paint` is the
     // containing block of any `position: fixed` inside it. A ghost rendered
