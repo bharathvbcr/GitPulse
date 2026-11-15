@@ -80,55 +80,135 @@ pub(super) fn selection(
     }
 }
 
+
+/// Where one AI request goes. `provider` `None` or `"local"` is today's
+/// behavior exactly: the saved loopback selection (or the consent gate when
+/// there is none). Anything else goes through the workbench's one selection
+/// parser, so a Claude choice means what it means for task enhancements (no
+/// `base_url`, a `claude-` model id) and is carried by the same profile worker.
+pub(super) fn route(
+    provider: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    workbench: &crate::workbench::WorkbenchState,
+) -> Result<crate::ai::Route, IpcError> {
+    if matches!(provider.as_deref(), None | Some("local")) {
+        return Ok(crate::ai::Route::Local(selection(base_url, model)));
+    }
+    match crate::workbench::parse_model_selection_parts(provider, base_url, model) {
+        Ok(Some(crate::harness::sidecar::ModelSelection::Claude { model })) => {
+            Ok(crate::ai::Route::Claude(workbench.assist_route(model)))
+        }
+        Ok(_) => Err("A model is required for a Claude selection.".into()),
+        Err(error) => Err(error.message.into()),
+    }
+}
+
 #[tauri::command(async)]
 pub async fn cmd_ai_generate_commit_message(
     repo_path: String,
+    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || crate::ai::generate_commit_message(&repo_path, selection(base_url, model)))
-        .await
+    let route = route(provider, base_url, model, workbench.inner())?;
+    off_thread(move || crate::ai::generate_commit_message(&repo_path, route)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_explain_commit(
     repo_path: String,
     commit_id: String,
+    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || {
-        crate::ai::explain_commit(&repo_path, &commit_id, selection(base_url, model))
-    })
-    .await
+    let route = route(provider, base_url, model, workbench.inner())?;
+    off_thread(move || crate::ai::explain_commit(&repo_path, &commit_id, route)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_fix_health(
     repo_path: String,
     report: String,
+    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
+    let route = route(provider, base_url, model, workbench.inner())?;
+    off_thread(move || crate::ai::fix_health(&repo_path, &report, route)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_coverage_report(
     repo_path: String,
     report: String,
+    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || crate::ai::coverage_report(&repo_path, &report, selection(base_url, model)))
-        .await
+    let route = route(provider, base_url, model, workbench.inner())?;
+    off_thread(move || crate::ai::coverage_report(&repo_path, &report, route)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_suggest_branch_name(
     repo_path: String,
+    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))).await
+    let route = route(provider, base_url, model, workbench.inner())?;
+    off_thread(move || crate::ai::suggest_branch_name(&repo_path, route)).await
+}
+
+#[cfg(test)]
+mod assist_tests {
+    use super::*;
+    use crate::ai::Route;
+
+    fn pick(
+        provider: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Route, IpcError> {
+        route(
+            provider.map(str::to_string),
+            base_url.map(str::to_string),
+            model.map(str::to_string),
+            &crate::workbench::WorkbenchState::default(),
+        )
+    }
+
+    #[test]
+    fn no_provider_or_local_keeps_todays_loopback_behavior() {
+        for provider in [None, Some("local")] {
+            match pick(provider, Some("http://127.0.0.1:11434/v1"), Some("qwen")).unwrap() {
+                Route::Local(Some(selection)) => assert_eq!(selection.model, "qwen"),
+                other => panic!("expected a local selection, got {other:?}"),
+            }
+            assert!(matches!(pick(provider, None, None).unwrap(), Route::Local(None)));
+        }
+    }
+
+    #[test]
+    fn a_claude_choice_routes_to_manvi_and_never_to_loopback() {
+        match pick(Some("anthropic"), None, Some("claude-sonnet-5-5")).unwrap() {
+            Route::Claude(cloud) => assert_eq!(cloud.model, "claude-sonnet-5-5"),
+            other => panic!("expected the Claude route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_claude_choice_that_names_an_endpoint_or_a_non_claude_model_is_refused() {
+        assert!(pick(Some("anthropic"), Some("http://127.0.0.1:1/v1"), Some("claude-x")).is_err());
+        assert!(pick(Some("anthropic"), None, Some("gpt-5")).is_err());
+        assert!(pick(Some("anthropic"), None, None).is_err());
+        assert!(pick(Some("openai"), None, Some("claude-x")).is_err());
+    }
 }

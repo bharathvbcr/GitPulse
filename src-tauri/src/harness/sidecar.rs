@@ -56,6 +56,10 @@ pub const MANAGED_CONTINUE_TIMEOUT: Duration = Duration::from_secs(65);
 /// How long `work.enhancements.refine` may take: Manvi's model-call budget
 /// (150 s) plus the 30 s it allows for grounding and board reads around it.
 pub const REFINE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long `work.assist.complete` may take: Manvi's 150 s model-call deadline
+/// plus the 30 s it allows around it. The op has its own lane in Manvi, so it
+/// never waits behind an enhancement.
+pub const ASSIST_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long `work.scan.gaps` may take to *claim* a scan. The scan itself runs
 /// on after the answer; this covers git, the index status and the lane's own
 /// minute, which is Manvi's deadline for the request.
@@ -71,6 +75,7 @@ pub(crate) fn op_deadline(op: &str) -> Duration {
         "work.runs.managed.stop" => MANAGED_STOP_TIMEOUT,
         "work.runs.managed.continue" => MANAGED_CONTINUE_TIMEOUT,
         "work.enhancements.refine" => REFINE_TIMEOUT,
+        "work.assist.complete" => ASSIST_TIMEOUT,
         "work.scan.gaps" => SCAN_START_TIMEOUT,
         _ => DEFAULT_CALL_TIMEOUT,
     }
@@ -1797,7 +1802,11 @@ const HOSTED_OPS: [&str; 2] = [OP_SERVE_STATUS, OP_SERVE_STOP_ALL];
 
 /// Ops whose answer depends on the model the server was started with.
 #[cfg(unix)]
-const MODEL_BOUND_OPS: [&str; 2] = ["work.enhancements.generate", "work.enhancements.refine"];
+const MODEL_BOUND_OPS: [&str; 3] = [
+    "work.enhancements.generate",
+    "work.enhancements.refine",
+    "work.assist.complete",
+];
 
 /// How the profile worker came to ask for a hosted server.
 #[cfg(unix)]
@@ -2573,6 +2582,7 @@ fn missing_op_message(op: &str) -> String {
             "managed runs"
         }
         "work.runs.managed.continue" => "follow-ups to a managed run",
+        "work.assist.complete" => "Claude for GitPulse's AI features",
         _ => "task enhancements",
     };
     format!("This Manvi binary does not advertise {op}. Update Manvi to use {feature}.")
@@ -2764,6 +2774,7 @@ impl ProfileConnection {
                 | "work.verify.task"
                 | "work.verify.get"
                 | "work.enhancements.refine"
+                | "work.assist.complete"
                 | "work.scan.gaps"
                 | "work.scan.get"
                 | "work.scan.cancel"

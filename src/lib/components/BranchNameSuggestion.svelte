@@ -1,6 +1,7 @@
 <script lang="ts">
   /**
-   * Names a branch for the work in progress with the local model, beside the
+   * Names a branch for the work in progress with the selected model (a local
+   * server, or Claude through Manvi), beside the
    * field that takes a branch name.
    *
    * Offered only while the model is ready: the suggestion is the only thing
@@ -10,7 +11,7 @@
    * from, which is captured when the suggestion is asked for.
    */
   import { GitBranch } from "@lucide/svelte";
-  import { harnessStore } from "../stores/harnessStore";
+  import { harnessStore, aiReadiness } from "../stores/harnessStore";
   import { repoStore, type MutationTarget } from "../stores/repoStore";
   import { describeFailure } from "../ui/copy/describeFailure";
 
@@ -23,7 +24,7 @@
   let isSuggesting = $state(false);
   let branchError = $state<string | null>(null);
 
-  let ready = $derived(Boolean($harnessStore.ai?.ready));
+  let ready = $derived($aiReadiness.ready);
 
   /** "Couldn't <verb> <object>. <Reason>." for an error line. */
   function failure(verb: string, object: string, cause: unknown): string {

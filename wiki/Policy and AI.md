@@ -31,7 +31,7 @@ Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI d
 
 ## Local AI
 
-Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go to a **loopback** OpenAI-compatible server: Ollama, LM Studio, llama.cpp, vLLM. Remote URLs are rejected.
+Completions (commit messages, commit explanations, branch names, health/coverage suggestions) go to a **loopback** OpenAI-compatible server by default: Ollama, LM Studio, llama.cpp, vLLM. Remote URLs are rejected. When the Manvi pane has chosen a Claude model, the same features use it instead, through Manvi's `work.assist.complete` (a failed call is an error, never a quiet fall back to loopback).
 
 Commit messages are classified in the app directly from the staged patch into a structured brief (type, scope, subject). When no loopback model is active, supported Macs can use on-device Apple Intelligence to phrase the subject from the classified brief (without sending the raw patch). If Apple Intelligence is unavailable or the subject fails validation, GitPulse falls back to the deterministic patch-based draft. See [[Security]].
 

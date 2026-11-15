@@ -320,8 +320,8 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(16);
-    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest", "work.tasks.organize", "work.runs.managed.continue"]));
+    expect(ops).toHaveLength(17);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.assist.complete", "work.tasks.suggest", "work.tasks.organize", "work.runs.managed.continue"]));
   });
 
   it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {
@@ -379,6 +379,23 @@ describe("the ops GitPulse names are served", () => {
     // refine: id, request_id and expected_revision come from the generation request; the root is added by the host.
     expect(workbenchRs).toMatch(/params\["repo_root"\] = json!\(root\);\s*return self\.worker_call\("work\.enhancements\.refine"/);
     expect(declared("RefineParams")).toEqual(expect.arrayContaining(["id", "request_id", "expected_revision", "repo_root"]));
+  });
+
+  it("what GitPulse sends work.assist.complete is declared, and max_output_tokens is always sent", () => {
+    const aiRs = read("src-tauri", "src", "ai", "mod.rs");
+    expect(aiRs).toContain('pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";');
+    expect(contract.ops.optional).toContain("work.assist.complete");
+    // Both the capability call and the real call, from run_cloud.
+    const body = aiRs.slice(aiRs.indexOf("fn run_cloud("));
+    const sent = [...body.matchAll(/serde_json::json!\(\{([^}]*)\}\)/g)]
+      .map((m) => [...m[1].matchAll(/"(\w+)":/g)].map((k) => k[1]))
+      .filter((keys) => keys.includes("max_output_tokens"));
+    expect(sent.length).toBeGreaterThanOrEqual(2);
+    for (const keys of sent) {
+      expect(undeclared(keys, "AssistCompleteParams")).toEqual([]);
+      expect(missingRequired(keys, "AssistCompleteParams")).toEqual([]);
+    }
+    expect(declared("AssistCompleteParams")).toEqual(expect.arrayContaining(["system", "user", "max_output_tokens", "dry_run"]));
   });
 
   it("the evidence type the completion gate reads is the one Manvi stores a verification under", () => {

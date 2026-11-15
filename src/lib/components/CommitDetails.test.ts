@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import CommitDetails from "./CommitDetails.svelte";
+import { deriveAiReadiness, describeAiTarget } from "../stores/harnessStore";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "CommitDetails.svelte"),
@@ -14,6 +15,24 @@ describe("CommitDetails", () => {
   it("renders empty state when no commit is selected", () => {
     const { body } = render(CommitDetails);
     expect(body).toBeDefined();
+  });
+
+  it("gates Explain on aiReadiness, so cloud-ready with no local server enables it", () => {
+    // The gate is one derived value, not local discovery; the derivation itself
+    // is covered in harnessStoreAiRoute.test.ts (vitest never runs $effect).
+    expect(source).toContain("let aiReady = $derived($aiReadiness.ready);");
+    expect(source).not.toContain("$harnessStore.ai?.ready");
+    expect(source).not.toContain("$harnessStore.ai?.detail");
+    expect(source).toContain("disabled={isExplaining || !aiReady || !currentCommitId}");
+    expect(source).toContain("`Explain this commit with ${aiTarget}`");
+    // Cloud ready, no local server answering: the readiness the button reads.
+    const readiness = deriveAiReadiness({
+      manviClaude: { model: "claude-sonnet-5-5" },
+      ai: null,
+      claudeCredential: { status: { keySaved: true, account: null, accountError: null }, error: null },
+    });
+    expect(readiness.ready).toBe(true);
+    expect(describeAiTarget(readiness)).toBe("claude-sonnet-5-5 (Claude API, via Manvi)");
   });
 
   it("has a resizable top edge: an accessible separator, no fixed h-64", () => {

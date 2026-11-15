@@ -108,7 +108,10 @@ telemetry. Git remotes, GitHub operations, Firebase App Hosting checks you ask f
 optional tool downloads, release checks, and configured agent providers can use the
 network.
 
-Built-in local AI connects to loopback model servers. Task enhancement and agent
+Built-in AI (commit messages, explanations, branch names, health and coverage plans)
+connects to loopback model servers by default. When the Manvi pane chooses a Claude
+model, those features go to the Claude API through Manvi instead, and only then does a
+diff leave the machine. Task enhancement and agent
 runs use their configured provider; supported Mac builds can also use Apple
 Intelligence for task titles and descriptions. These are distinct execution paths.
 

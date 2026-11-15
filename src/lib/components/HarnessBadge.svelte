@@ -23,7 +23,6 @@
   import { openManviFocus } from "../ui/openManviFocus";
   import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, RefreshCw, CircleAlert, Cloud } from "@lucide/svelte";
   import {
-    claudeKey,
     claudeCredentialProblem,
     claudeModelLabel,
     type ClaudeCredentialStatus,
@@ -67,31 +66,19 @@
 
   /**
    * Manvi on Claude ("cloud"): the pill shows that instead of local-model
-   * discovery, which then concerns only GitPulse's own AI features. The
-   * credential is asked for while cloud is selected and again when the menu
+   * discovery. The same choice routes GitPulse's own AI features to Claude
+   * (see `aiReadiness`), so local discovery is only what applies when Manvi is
+   * not on Claude. The credential answer lives in `harnessStore` (it is asked
+   * for when Claude is chosen and at startup) and again here when the menu
    * opens, so a fix made in Settings or with `anthropic-account` shows up.
    */
   let manviClaude = $derived($harnessStore.manviClaude);
   let onCloud = $derived(Boolean(manviClaude));
-  let cloudCredential = $state<ClaudeCredentialStatus | null>(null);
-  let cloudReadError = $state<string | null>(null);
-  let cloudToken = 0;
-  async function loadCloudCredential() {
-    const token = ++cloudToken;
-    try {
-      const status = await claudeKey.status();
-      if (token !== cloudToken) return;
-      cloudCredential = status;
-      cloudReadError = null;
-    } catch (err: unknown) {
-      if (token !== cloudToken) return;
-      cloudCredential = null;
-      cloudReadError = err instanceof Error ? err.message : String(err);
-    }
+  let cloudCredential = $derived<ClaudeCredentialStatus | null>($harnessStore.claudeCredential.status);
+  let cloudReadError = $derived($harnessStore.claudeCredential.error);
+  function loadCloudCredential() {
+    void harnessStore.refreshClaudeCredential();
   }
-  $effect(() => {
-    if (onCloud) void loadCloudCredential();
-  });
   /** Unknown until answered: no alert is raised on a credential not yet read. */
   let cloudProblem = $derived(
     !onCloud ? null
@@ -388,7 +375,7 @@
           </button>
           <span class="gp-menu-sep" role="separator"></span>
         {/if}
-        <p class="gp-label px-1">{manviClaude ? "Local model · GitPulse AI" : "Local model"}</p>
+        <p class="gp-label px-1">{manviClaude ? "Local model · when Manvi is not on Claude" : "Local model"}</p>
         <div role="none" class="flex items-center gap-1.5">
           <!-- Native selection supplies keyboard navigation, typeahead and
                dismissal. The select stays for the model list, but it is drawn

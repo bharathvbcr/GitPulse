@@ -1,9 +1,15 @@
-import { writable, get } from "svelte/store";
+import { writable, get, derived } from "svelte/store";
 import { invoke, readIpcError } from "../ipc/invoke";
 import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
 import { clean } from "../terminal/sessionActivity";
 import { formatDisplayFailure } from "../diagnostics/report";
 import { mergeEvents } from "../ledger/projection";
+import {
+  claudeCredentialProblem,
+  claudeCredentialStatus,
+  type ClaudeCredentialStatus,
+} from "../workbench/claudeKey";
+import { effectiveSelection } from "../workbench/taskModel";
 import {
   ledgerStatus,
   type LedgerEvent,
@@ -152,16 +158,84 @@ export interface AiGeneration {
   elapsed_ms: number;
 }
 
+/** The credential check for a Claude-selected Manvi: unknown until answered. */
+export interface ClaudeCredentialState {
+  status: ClaudeCredentialStatus | null;
+  /** Why the check itself failed; never conflated with "no credential". */
+  error: string | null;
+}
+
+/** Whether GitPulse's AI features can run right now, and on what. */
+export interface AiReadiness {
+  ready: boolean;
+  /** Where a request goes: the Claude API through Manvi, or a loopback server. */
+  target: "cloud" | "local";
+  /** The model that would answer ("" when none is chosen). */
+  model: string;
+  /** Why it is not ready; empty when it is. */
+  reason: string;
+}
+
+/**
+ * The one answer to "can an AI feature run?". Cloud when the Manvi pane chose
+ * Claude: ready only when the credential check answered with no problem (an
+ * unanswered check is not ready, never assumed fine). Otherwise local
+ * discovery's own verdict. Pure, so it is testable without Svelte.
+ */
+export function deriveAiReadiness(
+  state: Pick<HarnessState, "manviClaude" | "ai" | "claudeCredential">,
+): AiReadiness {
+  if (state.manviClaude) {
+    const chosen = state.manviClaude.model;
+    const model = effectiveSelection({ preferred: null, ai: null, manviClaude: state.manviClaude });
+    if (!model || model.provider !== "anthropic") {
+      return { ready: false, target: "cloud", model: chosen, reason: `"${chosen}" is not a Claude model id.` };
+    }
+    const { status, error } = state.claudeCredential;
+    if (error) {
+      return { ready: false, target: "cloud", model: chosen, reason: `Couldn't check the Claude credential. ${error}` };
+    }
+    if (!status) {
+      return { ready: false, target: "cloud", model: chosen, reason: "Checking the Claude credential…" };
+    }
+    const problem = claudeCredentialProblem(status);
+    return { ready: problem === null, target: "cloud", model: chosen, reason: problem ?? "" };
+  }
+  const ai = state.ai;
+  return {
+    ready: ai?.ready ?? false,
+    target: "local",
+    model: ai?.selected?.model ?? "",
+    reason: ai?.detail || (ai ? "" : "Local models have not been checked."),
+  };
+}
+
+/** How AI features name where a request goes, for tooltips and notes. */
+export function describeAiTarget(readiness: AiReadiness): string {
+  return readiness.target === "cloud"
+    ? `${readiness.model} (Claude API, via Manvi)`
+    : "the local model";
+}
+
 export interface HarnessState {
   harness: HarnessStatus | null;
   ai: AiStatus | null;
   /** Model the user pinned, or null to let discovery choose. */
   preferred: AiSelection | null;
   /**
-   * The Claude model Manvi uses instead of a local one, or null to keep Manvi
-   * on the local selection. Manvi only: GitPulse's own AI features stay local.
+   * The Claude model chosen in the Manvi pane, or null to stay on the local
+   * selection. It decides where everything goes: task enhancements and
+   * GitPulse's own AI features (explain a commit, commit messages, branch
+   * names, health and coverage plans) all use it when it is set, and only then
+   * does a diff leave this machine (to the Claude API, through Manvi).
    */
   manviClaude: { model: string } | null;
+  /**
+   * What the last credential check for that Claude choice answered. Owned
+   * here, next to the choice, so the Manvi pill and every AI control read one
+   * answer ([`deriveAiReadiness`]) instead of each asking the Keychain.
+   */
+  claudeCredential: ClaudeCredentialState;
   isProbing: boolean;
   /** Most recent policy decision for the active repository, for the status strip. */
   lastVerdict: PolicyVerdict | null;
@@ -419,6 +493,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     ai: null,
     preferred: loadPreferred(),
     manviClaude: loadManviClaude(),
+    claudeCredential: { status: null, error: null },
     isProbing: false,
     lastVerdict: null,
     error: null,
@@ -721,7 +796,55 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     }
   }
 
+  /**
+   * Runs one of GitPulse's own AI commands on the route the Manvi pane chose.
+   *
+   * `effectiveSelection` is the one owner of "Claude when chosen". It is asked
+   * with `ai: null` on purpose: a server merely discovered on loopback is not
+   * the user's choice (the consent gate in `withEndpointConsent` handles that),
+   * so only the Claude choice and the saved `preferred` selection count here.
+   * A Claude choice that is not a valid model id throws instead of falling
+   * through to a local server the user did not pick.
+   */
+  async function runAi<T>(send: (route: Record<string, unknown>) => Promise<T>): Promise<T> {
+    const state = get({ subscribe });
+    if (state.manviClaude) {
+      const selection = effectiveSelection({
+        preferred: null,
+        ai: null,
+        manviClaude: state.manviClaude,
+      });
+      if (!selection || selection.provider !== "anthropic") {
+        throw new Error(
+          `"${state.manviClaude.model}" is not a Claude model id. Choose another in Manvi's settings.`,
+        );
+      }
+      return send({ provider: "anthropic", model: selection.model });
+    }
+    return withEndpointConsent((preferred) =>
+      send({ baseUrl: preferred?.base_url ?? null, model: preferred?.model ?? null }),
+    );
+  }
+
+  let credentialToken = 0;
+  /** Asks the backend which credential a Claude-selected Manvi would use. */
+  async function refreshClaudeCredential(): Promise<void> {
+    const token = ++credentialToken;
+    try {
+      const status = claudeCredentialStatus(await invokeFn<unknown>("cmd_claude_key_status"));
+      if (token !== credentialToken) return;
+      update((s) => ({ ...s, claudeCredential: { status, error: null } }));
+    } catch (err: unknown) {
+      if (token !== credentialToken) return;
+      const error = err instanceof Error ? err.message : String(err);
+      update((s) => ({ ...s, claudeCredential: { status: null, error } }));
+    }
+  }
+
   async function probeAi(token: number): Promise<AiStatus | null> {
+    // Every refresh path ends here, so a restored Claude choice, Refresh and
+    // Reconnect all re-ask the credential and clear a stale or stuck answer.
+    if (get({ subscribe }).manviClaude) void refreshClaudeCredential();
     const preferred = currentPreferred();
     update((s) => ({ ...s, isProbing: true }));
     try {
@@ -918,8 +1041,17 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     /** Points Manvi at a Claude model, or back at the local selection with null. */
     selectManviClaude: (choice: { model: string } | null) => {
       saveManviClaude(choice);
-      update((s) => ({ ...s, manviClaude: choice }));
+      // A new choice invalidates the last answer: not ready until re-checked.
+      update((s) => ({
+        ...s,
+        manviClaude: choice,
+        claudeCredential: { status: null, error: null },
+      }));
+      if (choice) void refreshClaudeCredential();
     },
+
+    /** Re-asks which Claude credential applies (after a fix in Settings). */
+    refreshClaudeCredential,
 
     recordVerdict: (verdict: PolicyVerdict | null, repoPath?: string) => {
       const target = repoPath
@@ -1056,75 +1188,41 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
      */
     syncLedger,
 
-    generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
-      return withEndpointConsent((preferred) =>
-        invokeFn<AiGeneration>("cmd_ai_generate_commit_message", {
-          repoPath,
-          baseUrl: preferred?.base_url ?? null,
-          model: preferred?.model ?? null,
-        }),
-      );
-    },
+    generateCommitMessage: (repoPath: string): Promise<AiGeneration> =>
+      runAi((route) =>
+        invokeFn<AiGeneration>("cmd_ai_generate_commit_message", { repoPath, ...route }),
+      ),
 
-    explainCommit: async (
-      repoPath: string,
-      commitId: string,
-    ): Promise<AiGeneration> => {
-      return withEndpointConsent((preferred) =>
-        invokeFn<AiGeneration>("cmd_ai_explain_commit", {
-          repoPath,
-          commitId,
-          baseUrl: preferred?.base_url ?? null,
-          model: preferred?.model ?? null,
-        }),
-      );
-    },
+    explainCommit: (repoPath: string, commitId: string): Promise<AiGeneration> =>
+      runAi((route) =>
+        invokeFn<AiGeneration>("cmd_ai_explain_commit", { repoPath, commitId, ...route }),
+      ),
 
-    suggestBranchName: async (repoPath: string): Promise<AiGeneration> => {
-      return withEndpointConsent((preferred) =>
-        invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", {
-          repoPath,
-          baseUrl: preferred?.base_url ?? null,
-          model: preferred?.model ?? null,
-        }),
-      );
-    },
+    suggestBranchName: (repoPath: string): Promise<AiGeneration> =>
+      runAi((route) =>
+        invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", { repoPath, ...route }),
+      ),
 
     /** Turns a rendered dependency-health report into a remediation plan. */
-    fixHealth: async (
-      repoPath: string,
-      report: string,
-    ): Promise<AiGeneration> => {
-      return withEndpointConsent((preferred) =>
-        invokeFn<AiGeneration>("cmd_ai_fix_health", {
-          repoPath,
-          report,
-          baseUrl: preferred?.base_url ?? null,
-          model: preferred?.model ?? null,
-        }),
-      );
-    },
+    fixHealth: (repoPath: string, report: string): Promise<AiGeneration> =>
+      runAi((route) =>
+        invokeFn<AiGeneration>("cmd_ai_fix_health", { repoPath, report, ...route }),
+      ),
 
-    /** Turns a rendered coverage report into a local-model analysis. */
-    coverageReport: async (
-      repoPath: string,
-      report: string,
-    ): Promise<AiGeneration> => {
-      return withEndpointConsent((preferred) =>
-        invokeFn<AiGeneration>("cmd_ai_coverage_report", {
-          repoPath,
-          report,
-          baseUrl: preferred?.base_url ?? null,
-          model: preferred?.model ?? null,
-        }),
-      );
-    },
+    /** Turns a rendered coverage report into an analysis by the selected model. */
+    coverageReport: (repoPath: string, report: string): Promise<AiGeneration> =>
+      runAi((route) =>
+        invokeFn<AiGeneration>("cmd_ai_coverage_report", { repoPath, report, ...route }),
+      ),
   };
 
   return store;
 }
 
 export const harnessStore = createHarnessStore();
+
+/** The one readiness every AI control reads (see [`deriveAiReadiness`]). */
+export const aiReadiness = derived(harnessStore, deriveAiReadiness);
 
 /** How a verdict is labelled in the UI. */
 export function verdictLabel(verdict: PolicyVerdict): string {

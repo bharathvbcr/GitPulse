@@ -4,7 +4,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { resolveCurrentCommitId } from "../graph/currentCommit";
-  import { harnessStore, type AiGeneration } from "../stores/harnessStore";
+  import { harnessStore, aiReadiness, describeAiTarget, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     GitCommit,
@@ -248,13 +248,15 @@
   });
   let previewTruncated = $derived(selectedDiffText.split("\n").length > PREVIEW_LINE_CAP);
 
-  // Explain-this-commit, answered by a model on this machine.
+  // Explain-this-commit, answered by the model the Manvi pane chose: a local
+  // server by default, or Claude through Manvi.
   let explanation = $state<AiGeneration | null>(null);
   let explanationFor = $state<string | null>(null);
   let isExplaining = $state(false);
   let explainFailure = $state<FailureCopy | null>(null);
 
-  let aiReady = $derived($harnessStore.ai?.ready ?? false);
+  let aiReady = $derived($aiReadiness.ready);
+  let aiTarget = $derived(describeAiTarget($aiReadiness));
   let explainGuard: AsyncGuard | null = null;
 
   let copiedSha = $state(false);
@@ -561,15 +563,16 @@
           <div class="px-2 py-1 text-meta text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
         {/if}
 
-        <!-- Local explanation of the commit. Nothing leaves the machine: the
-             diff goes to a model server on loopback and the answer comes back. -->
+        <!-- Explanation of the commit. With a local model nothing leaves the machine:
+             the diff goes to a server on loopback. When the Manvi pane chose Claude, the
+             diff goes to the Claude API through Manvi, and the tooltip says so. -->
         <div class="px-2 py-1.5">
           <button
             onclick={explainCommit}
             disabled={isExplaining || !aiReady || !currentCommitId}
             title={aiReady
-              ? "Explain this commit with the local model"
-              : ($harnessStore.ai?.detail ?? "No local model server is running")}
+              ? `Explain this commit with ${aiTarget}`
+              : ($aiReadiness.reason || "No model is available to explain this commit.")}
             class="gp-btn"
             data-size="sm"
           >

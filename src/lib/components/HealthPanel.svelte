@@ -57,6 +57,8 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     harnessStore,
+    aiReadiness,
+    describeAiTarget,
     type AiGeneration,
   } from "../stores/harnessStore";
   import { copyText, createCopyFlash } from "../desktop/clipboard";
@@ -880,7 +882,8 @@
     }
   }
 
-  let aiReady = $derived($harnessStore.ai?.ready ?? false);
+  let aiReady = $derived($aiReadiness.ready);
+  let aiTarget = $derived(describeAiTarget($aiReadiness));
 
   $effect(() => {
     return () => {
@@ -1175,8 +1178,8 @@
           class="gp-btn"
           data-variant="primary"
           title={aiReady
-            ? "Ask the local model, through Manvi, for a remediation plan"
-            : "Needs a local model server. See Settings → Agents → Local model servers. The exact error is reported if none is running."}
+            ? `Ask ${aiTarget} for a remediation plan`
+            : $aiReadiness.target === "cloud" ? $aiReadiness.reason : "Needs a local model server. See Settings → Agents → Local model servers. The exact error is reported if none is running."}
         >
           {#if fixing}
             <LoaderCircle size={13} class="animate-spin" />
@@ -1414,7 +1417,7 @@
           <div class="space-y-3 rounded-2xl border border-accent/35 bg-surface shadow-card p-4">
             {#if fixing && !plan}
               <div class="space-y-2 py-2">
-                <p class="text-textMuted">Sending the health report to the local model…</p>
+                <p class="text-textMuted">Sending the health report to {aiTarget}…</p>
                 <Skeleton variant="text" count={3} height="1.25rem" />
               </div>
             {:else if plan}

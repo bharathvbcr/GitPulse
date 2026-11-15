@@ -4,8 +4,8 @@
    * Anthropic API, and shows which credential Claude bills: the machine's
    * `~/.anthropic-accounts` account (key and workspace from one organisation,
    * set up with Manvi's `anthropic-account`) when there is one, else a key
-   * saved here. GitPulse's own AI features (commit messages, explanations)
-   * stay on the local model either way.
+   * saved here. GitPulse's own AI features (commit messages, explanations,
+   * branch names, health and coverage plans) follow the same choice.
    */
   import { onMount } from "svelte";
   import { harnessStore } from "../stores/harnessStore";
@@ -44,6 +44,8 @@
     try {
       await action();
       await refresh();
+      // Saving or removing a key changes what every AI control is ready for.
+      if (choice) void harnessStore.refreshClaudeCredential();
     } catch (err: unknown) {
       error = formatDisplayFailure(err, "manvi");
     } finally {
@@ -110,6 +112,8 @@
     </label>
     <p class="text-meta text-textMuted">
       Task suggestions and Manvi's own model calls are billed to {account ? "this account" : "this key"}.
+      GitPulse's own AI features (commit messages, commit explanations, branch names, health and
+      coverage plans) use this model too, so their diffs are sent to the Claude API through Manvi.
       Claude Code agents Manvi launches keep their own login. Manvi keeps the key from every program it
       starts.
     </p>

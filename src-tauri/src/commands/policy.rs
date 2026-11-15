@@ -4,7 +4,7 @@ use super::*;
 use crate::ipc_error::CommandError;
 
 // ---------------------------------------------------------------------------
-// MANVI harness: policy-gated Git actions, and the local AI features.
+// MANVI harness: policy-gated Git actions, and the AI features (loopback, or Claude through Manvi).
 // ---------------------------------------------------------------------------
 
 /// A Git action's result together with the policy decision it ran under.

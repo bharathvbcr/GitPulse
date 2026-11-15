@@ -438,13 +438,13 @@ describe("HarnessBadge cloud mode", () => {
     expect(body).toContain("No models");
   });
 
-  it("puts Manvi's cloud model first in the menu and labels the local picker for GitPulse AI", () => {
+  it("puts Manvi's cloud model first in the menu and labels the local picker as the not-on-Claude choice", () => {
     const body = renderState({ ai: empty, ...cloud }, true);
     const menu = body.slice(body.indexOf("data-manvi-menu"));
     expect(menu).toContain("data-manvi-cloud-row");
     expect(menu).toContain("Cloud · claude-sonnet-5-5");
     const cloudAt = menu.search(/Manvi(?:'|&#39;|&apos;)s model</);
-    const localAt = menu.indexOf("Local model · GitPulse AI");
+    const localAt = menu.indexOf("Local model · when Manvi is not on Claude");
     expect(cloudAt).toBeGreaterThan(-1);
     expect(localAt).toBeGreaterThan(cloudAt);
     // The local picker keeps describing local discovery, never "Cloud".

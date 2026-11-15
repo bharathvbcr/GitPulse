@@ -242,10 +242,15 @@ flowchart TD
   not be confirmed, and warns against a blind retry — because a false failure is
   what turns one deployment into two.
 
-### Loopback-Only Local AI Transport
+### Loopback-Only Local AI Transport (and the Claude route)
 - Built-in local AI completions (commit messages, explanations and branch names)
   and local model probes restrict their transport to loopback addresses
   (`127.0.0.1`, `localhost`, `[::1]`); remote base URLs are rejected on that path.
+- When the Manvi pane has chosen a Claude model, the same features are sent to the
+  Claude API through Manvi's `work.assist.complete` instead; that route never sweeps,
+  probes or falls back to loopback, and a local selection never reaches it. Manvi does
+  not redact the prompt (`redactions` is always 0), so the staged diff or commit goes
+  as GitPulse built it.
 - Commit messages are classified in the app from the staged patch. When no
   loopback model is selected, a supported Mac may ask Apple Intelligence only
   for the subject, and only from that classified brief — the patch itself is
