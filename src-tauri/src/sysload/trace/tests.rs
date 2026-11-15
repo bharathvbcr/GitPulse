@@ -413,15 +413,12 @@ fn stop_returns_after_its_wait_with_a_blocked_write_and_the_detached_thread_fini
     assert!(took >= Duration::from_millis(100), "waited its bound: {took:?}");
     assert!(took < 10 * SECONDS, "returned in {took:?}, not when the write did");
     gate.release();
-    let deadline = Instant::now() + 30 * SECONDS;
-    loop {
-        let held = read_ring(&path(&dir)).map(|r| r.len()).unwrap_or(0);
-        if held == 2 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the detached thread never wrote its records ({held})");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let held = || read_ring(&path(&dir)).map(|r| r.len()).unwrap_or(0);
+    assert!(
+        crate::test_support::wait_until(30 * SECONDS, || held() == 2),
+        "the detached thread never wrote its records ({})",
+        held()
+    );
 }
 
 #[test]
@@ -443,10 +440,7 @@ fn a_failing_open_is_a_problem_and_does_not_hold_up_stop() {
     let opener: TraceOpener = Arc::new(|_, _| Err("disk said no".into()));
     let dir = tempfile::tempdir().unwrap();
     let mut feed = TraceFeed::start(opener, dir.path().to_path_buf(), 7).unwrap();
-    let deadline = Instant::now() + 30 * SECONDS;
-    while feed.problem().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_support::wait_until(30 * SECONDS, || feed.problem().is_some());
     assert_eq!(feed.problem().as_deref(), Some("trace: disk said no"));
     assert!(!feed.take_opened());
     let began = Instant::now();
@@ -466,10 +460,7 @@ fn a_write_that_failed_is_counted_as_a_lost_record() {
     let opener = blocked_sink_tests::failing_writes(gate, 1);
     let mut feed = TraceFeed::start(opener, dir.path().to_path_buf(), 7).unwrap();
     assert!(feed.offer(rec(1)));
-    let deadline = Instant::now() + 30 * SECONDS;
-    while feed.problem().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_support::wait_until(30 * SECONDS, || feed.problem().is_some());
     assert_eq!(feed.problem().as_deref(), Some("trace: disk said no"));
     assert!(feed.offer(rec(2)));
     assert!(feed.stop(30 * SECONDS));

@@ -3,7 +3,7 @@
 use super::{TraceOpener, TraceRecord, TraceSink, TraceWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Closed until [`Gate::release`]. Records that a caller reached it.
 pub(in crate::sysload) struct Gate {
@@ -33,11 +33,7 @@ impl Gate {
 
     /// Waits up to `within` for something to reach the gate.
     pub(in crate::sysload) fn wait_entered(&self, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while !self.entered() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        self.entered()
+        crate::test_support::wait_until(within, || self.entered())
     }
 
     fn pass(&self) {

@@ -789,10 +789,7 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let sampler = start(options).unwrap();
-        let deadline = Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(20));
-        while ticks.load(Ordering::SeqCst) < 6 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_support::wait_until(Duration::from_secs(20), || ticks.load(Ordering::SeqCst) >= 6);
         sampler.stop();
         let record = snapshot::read(&dir.path().join(snapshot::SNAPSHOT_FILE_NAME)).unwrap();
         assert_eq!(record.version, snapshot::VERSION);
@@ -831,10 +828,7 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let writer = start(options).unwrap();
-        let deadline = Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(30));
-        while ticks.load(Ordering::SeqCst) < 16 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_support::wait_until(Duration::from_secs(30), || ticks.load(Ordering::SeqCst) >= 16);
         let status = writer.status().expect("a status");
         assert_eq!(status.role, Role::Writer, "{:?}", status.problems);
         // A second sampler in the same directory loses the election and
@@ -894,16 +888,12 @@ mod tests {
         let ticks_when_blocked = sampler.status().expect("a status").tick.ticks;
 
         // Thirty cadences later, with the write still blocked.
-        let deadline = Instant::now() + wait;
         let mut dropping = false;
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        crate::test_support::wait_until(Duration::from_secs(30), || {
             let status = sampler.status().expect("a status");
             dropping = status.problems.iter().any(|p| p.contains("dropped while the trace write was blocked"));
-            if dropping && status.tick.ticks >= ticks_when_blocked + 30 {
-                break;
-            }
-        }
+            dropping && status.tick.ticks >= ticks_when_blocked + 30
+        });
         let status = sampler.status().expect("a status");
         let record = snapshot::read(&snapshot_path).unwrap();
         assert!(
@@ -945,16 +935,11 @@ mod tests {
         let snapshot_path = dir.path().join(snapshot::SNAPSHOT_FILE_NAME);
         // The open is attempted in the tick that wins the election, before
         // that tick's first publish: wait for the first snapshot to exist.
-        let deadline = Instant::now() + wait;
         let seq = || snapshot::read(&snapshot_path).map_or(0, |s| s.seq);
-        while seq() == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_support::wait_until(Duration::from_secs(30), || seq() > 0);
         let first = seq();
         assert!(first > 0, "no snapshot was ever published");
-        while seq() < first + 15 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        crate::test_support::wait_until(Duration::from_secs(30), || seq() >= first + 15);
         assert!(
             seq() >= first + 15,
             "snapshots stopped while the open was blocked"
