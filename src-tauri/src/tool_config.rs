@@ -518,9 +518,17 @@ where
 /// `host-load.v1` without ever reading this file, and a flip reaches them on
 /// the next tick. Off still publishes — a heartbeat with no readings — so
 /// "switched off" never reads as "no sampler".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HostLoadSettings {
+    /// What the governor decides on besides pressure: swap, load, disk and
+    /// the rest (`sysload::thresholds`). Carried over IPC with the switches
+    /// but stored at the top level of the file as `host_load_thresholds`
+    /// (see [`ToolConfig::host_load_thresholds`]), never inside `host_load`:
+    /// this struct refuses unknown fields, so an older build that met one in
+    /// the block would discard the whole block, `enabled` included.
+    #[serde(default)]
+    pub thresholds: crate::sysload::Thresholds,
     #[serde(default = "host_load_enabled_default")]
     pub enabled: bool,
     /// Whether severe memory pressure (critical, or a thrashing compressor)
@@ -538,6 +546,7 @@ fn host_load_enabled_default() -> bool {
 impl Default for HostLoadSettings {
     fn default() -> Self {
         Self {
+            thresholds: crate::sysload::Thresholds::default(),
             enabled: true,
             govern_launches: true,
         }
@@ -545,9 +554,45 @@ impl Default for HostLoadSettings {
 }
 
 impl HostLoadSettings {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
+    /// Whether the two switches are at their defaults: what decides whether
+    /// the `host_load` block is written. The thresholds are stored apart.
+    pub fn switches_default(&self) -> bool {
+        self.enabled && self.govern_launches
     }
+}
+
+/// Writes only the two switches into the `host_load` block.
+fn write_host_load<S>(settings: &HostLoadSettings, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeStruct;
+    let mut block = serializer.serialize_struct("HostLoadSettings", 2)?;
+    block.serialize_field("enabled", &settings.enabled)?;
+    block.serialize_field("govern_launches", &settings.govern_launches)?;
+    block.end()
+}
+
+/// Reads `host_load_thresholds` one input at a time
+/// ([`crate::sysload::Thresholds::from_stored`]): a bad input keeps its own
+/// default and costs nothing else.
+fn lenient_thresholds<'de, D>(deserializer: D) -> Result<crate::sysload::Thresholds, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(crate::sysload::Thresholds::from_stored(raw))
+}
+
+/// Writes only the inputs that differ from their default.
+fn write_thresholds<S>(
+    thresholds: &crate::sysload::Thresholds,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    thresholds.to_stored().serialize(serializer)
 }
 
 /// Read leniently, like `lappi`: a malformed block keeps the default (on)
@@ -659,7 +704,7 @@ where
     }))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolConfig {
     pub version: u32,
     #[serde(default)]
@@ -716,9 +761,20 @@ pub struct ToolConfig {
     #[serde(
         default,
         deserialize_with = "lenient_host_load",
-        skip_serializing_if = "HostLoadSettings::is_default"
+        serialize_with = "write_host_load",
+        skip_serializing_if = "HostLoadSettings::switches_default"
     )]
     pub host_load: HostLoadSettings,
+    /// The governor's per-input modes and thresholds, a sibling of
+    /// `host_load` so an older build keeps it: it lands in `unknown`, which is
+    /// written back as it was read.
+    #[serde(
+        default,
+        deserialize_with = "lenient_thresholds",
+        serialize_with = "write_thresholds",
+        skip_serializing_if = "crate::sysload::Thresholds::is_default"
+    )]
+    pub host_load_thresholds: crate::sysload::Thresholds,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -740,6 +796,7 @@ impl Default for ToolConfig {
             review_gate: ReviewGateSettings::default(),
             verify_status: VerifyStatusSettings::default(),
             host_load: HostLoadSettings::default(),
+            host_load_thresholds: crate::sysload::Thresholds::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1419,11 +1476,23 @@ pub fn set_verify_status(common_dir: &str, enabled: bool) -> Result<(), String> 
 /// broken config must not be what silently blinds every consumer of it. The
 /// read error is surfaced through [`view`].
 pub fn host_load_settings() -> HostLoadSettings {
-    load().map(|cfg| cfg.host_load).unwrap_or_default()
+    load()
+        .map(|cfg| HostLoadSettings {
+            thresholds: cfg.host_load_thresholds,
+            ..cfg.host_load
+        })
+        .unwrap_or_default()
 }
 
+/// Stores the switches and the thresholds. A threshold that fails validation
+/// is refused with the reason, so the Settings row can show it; nothing is
+/// written then.
 pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
+    if let Some(problem) = next.thresholds.problem() {
+        return Err(problem);
+    }
     let mut cfg = load()?;
+    cfg.host_load_thresholds = next.thresholds.clone();
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -1637,6 +1706,122 @@ mod tests {
                 load().map(|c| c.devmap.binary).unwrap_or_default(),
                 Some("/tmp/fake".to_owned())
             );
+        });
+    }
+
+    /// The thresholds ride beside the switches over IPC but are stored as a
+    /// top-level `host_load_thresholds` key holding only what differs from the
+    /// defaults. Nothing goes inside `host_load`, whose strict reader in an
+    /// older build would discard the block (and `enabled` with it); an older
+    /// build keeps the top-level key as an unknown one.
+    #[test]
+    fn host_load_thresholds_round_trip_beside_the_switches_and_outside_their_block() {
+        use crate::sysload::{InputMode, Thresholds};
+        with_temp_config(|path| {
+            let mut thresholds = Thresholds::default();
+            thresholds.swap.mode = InputMode::Shed;
+            thresholds.disk.severe_at = 5.0;
+            set_host_load_settings(HostLoadSettings {
+                enabled: false,
+                thresholds: thresholds.clone(),
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            let loaded = host_load_settings();
+            assert!(!loaded.enabled);
+            assert_eq!(loaded.thresholds, thresholds);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load"], serde_json::json!({"enabled": false, "govern_launches": true}));
+            let keys: Vec<_> = stored["host_load_thresholds"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            let mut keys = keys;
+            keys.sort();
+            assert_eq!(keys, ["disk", "swap"], "only what differs is written");
+
+            // Back to defaults writes neither key.
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load").is_none());
+            assert!(stored.get("host_load_thresholds").is_none());
+
+            // Thresholds alone differ: the switches block is still not written.
+            set_host_load_settings(HostLoadSettings {
+                thresholds,
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load").is_none());
+            assert!(stored.get("host_load_thresholds").is_some());
+        });
+    }
+
+    #[test]
+    fn a_malformed_or_invalid_thresholds_block_costs_only_what_it_touches() {
+        use crate::sysload::{InputMode, Thresholds};
+        with_temp_config(|path| {
+            // One invalid input (severe below elevated), one malformed, one good.
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load":{"enabled":false},
+                    "host_load_thresholds":{"swap":{"mode":"off","elevated_at":0.9,"severe_at":0.5},
+                                            "load":"nope",
+                                            "battery":{"mode":"shed"}}}"#,
+            );
+            let settings = host_load_settings();
+            let defaults = Thresholds::default();
+            assert!(!settings.enabled, "the switches are untouched");
+            assert_eq!(settings.thresholds.swap, defaults.swap, "invalid: its default");
+            assert_eq!(settings.thresholds.load, defaults.load, "malformed: its default");
+            assert_eq!(settings.thresholds.battery.mode, InputMode::Shed, "the good one stands");
+            assert_eq!(
+                load().map(|c| c.devmap.binary).unwrap_or_default(),
+                Some("/tmp/fake".to_owned())
+            );
+
+            // A block that is not an object is all defaults, nothing else lost.
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load_thresholds":[1,2]}"#,
+            );
+            assert_eq!(host_load_settings().thresholds, defaults);
+            assert_eq!(
+                load().map(|c| c.devmap.binary).unwrap_or_default(),
+                Some("/tmp/fake".to_owned())
+            );
+
+            // Saving an invalid value is refused with the reason, writing nothing.
+            let mut bad = HostLoadSettings::default();
+            bad.thresholds.disk.severe_at = 99.0;
+            let error = set_host_load_settings(bad).unwrap_err();
+            assert!(error.starts_with("disk:"), "{error}");
+        });
+    }
+
+    /// What an older build does with the new key is the unknown-key
+    /// round trip: it is read into `unknown` and written back as it was.
+    #[test]
+    fn an_older_reader_keeps_a_top_level_key_it_does_not_know() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"some_future_key":{"a":1},"host_load":{"enabled":false}}"#,
+            );
+            let cfg = load().unwrap();
+            assert!(cfg.unknown.contains_key("some_future_key"));
+            save(&cfg).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["some_future_key"], serde_json::json!({"a": 1}));
+            assert_eq!(stored["host_load"]["enabled"], false);
         });
     }
 

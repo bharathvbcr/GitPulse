@@ -573,6 +573,7 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
             })
         }),
         compressed_bytes: get_reading(buf, S_COMPRESSED, |b| Some(get_u64(b, OFF_COMPRESSED))),
+        compressor_segments: Reading::default(),
         load: get_reading(buf, S_LOAD, |b| {
             let at = |i: usize| f64::from(get_u32(b, OFF_LOAD + 4 * i)) / 1000.0;
             Some([at(0), at(1), at(2)])
@@ -902,6 +903,7 @@ mod tests {
                 major_compaction_segments_freed: 1_109_273,
             }),
             compressed_bytes: Reading::Value(10 << 30),
+            compressor_segments: Reading::default(),
             load: Reading::Value([12.5, 9.25, 4.0]),
             cores: Reading::Value(Cores {
                 logical: 18,

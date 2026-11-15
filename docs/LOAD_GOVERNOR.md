@@ -182,6 +182,7 @@ procargs buffer) are allocated once and reused.
 | Swap used / total | `vm.swapusage` | `/proc/meminfo` |
 | Compressor counters | `vm.compressor.swapper.wakeups.thrashing_detected` / `free_below_reserved`, `vm.compressor.swapper.swapouts_pressure`, `vm.compressor.compactor.major_compaction_segments_freed` | unsupported |
 | Compressor bytes | `host_statistics64` `compressor_page_count` × page size | unsupported |
+| Compressor segments | `vm.compressor.segment.total` and `vm.compressor.segment.limit` | unsupported |
 | Load 1/5/15 | `getloadavg` | `/proc/loadavg` |
 | CPUs | `hw.logicalcpu`, `hw.perflevel0/1.logicalcpu`; no levels on Intel or Rosetta | logical count |
 | Open files | `kern.num_files` / `kern.maxfiles` | `/proc/sys/fs/file-nr` |
@@ -189,8 +190,15 @@ procargs buffer) are allocated once and reused.
 | Thermal state | `NSProcessInfo.thermalState` | unsupported |
 | Power source | `IOPSGetTimeRemainingEstimate` (−2 = external power) | unsupported |
 
-No `compressor_bytes_used` or segment-limit sysctl exists. The counters above
-are what there is.
+No `compressor_bytes_used` sysctl exists, and the counters above are the
+cumulative ones. This document used to say a segment-limit sysctl did not
+exist either; that was wrong. Verified on 2026-11-14 on the 64 GiB host that
+crashed that day (`sysctl vm.compressor.segment.total
+vm.compressor.segment.limit`): they print `256816` and `1677721`, and later
+`254515` and `1677721`, so the compressor was using about 15 % of its segment
+limit when read. Both are plain integers (`sysctl_uint` reads them whether
+declared 32 or 64 bits wide). The governor's `compressor_segments` input is
+`total / limit`; see What binds.
 
 **`compressor_thrash`** is raised when thrashing wakeups or pressure swapouts
 rise in **each of three consecutive samples**. One quiet sample clears it. A
@@ -345,18 +353,58 @@ the same way by cards 3 and 4. The two callers are thin:
 | pressure `normal`, no thrash | nothing shed, launches admitted |
 | pressure `warn` | background work shed, launches admitted |
 | pressure `critical` **or** `compressor_thrash` | background and reactive work shed, launches refused |
+| any input below at its elevated threshold, in mode `shed` or `refuse` | background work shed, launches admitted |
+| any input below at its severe threshold, in mode `refuse` | background and reactive work shed, launches refused |
+| an input in mode `off`, or one whose reading was never provided | ignored, no warning |
+| an input in mode `shed` or `refuse` whose reading could not be taken | no tier, and the verdict carries "swap is unreadable: not governed on" |
 | sensor stale-recent (at most 120 s) | govern on the last-known level, with a "stale Ns" warning |
 | sensor stale-old or dead, level unreadable | admit with a warning, nothing shed; ledger `host_load.sensor_unavailable`; Health says "ungoverned" |
 | `host_load.enabled` off, or a platform that is not governed | admit, nothing shed |
 
-**What binds.** Two inputs, each named in the reason with its value:
-the kernel pressure level, and the sensor's `compressor_thrash` flag (the
-2026-10-07 panic was compressor exhaustion while the level lagged, so the level
-alone would have admitted into it). The ruling left this as a user decision
-(memory pressure only, or also the compressor); this build takes the second
-option and puts it in one clearly named place, `Binding::CompressorThrash`.
-Swap at or above a quarter of RAM, which the same ruling listed, is not an
-input.
+**What binds.** Eight inputs, each named in the reason with its value and the
+threshold it crossed. The first two have no setting:
+
+1. the kernel pressure level (`memory_pressure`);
+2. the sensor's `compressor_thrash` flag (the 2026-10-07 panic was compressor
+   exhaustion while the level lagged, so the level alone would have admitted
+   into it).
+
+The other six were added on 2026-11-14, after the owner's Mac (64 GiB, 18
+logical CPUs) hung and reset with swap used at 0.9 times physical memory, a
+1-minute load of 120 (6.7 per CPU) and about 32 Claude processes, while the
+kernel level read only `warn` and the governor said "launches admitted". The
+sensor already published every one of those readings and nothing decided on
+them. Each has a mode and two thresholds, changeable in Settings. **The
+defaults are provisional: they were set from that one incident.**
+
+| Input (`Binding`) | Measures | Default mode | Elevated | Severe |
+|---|---|---|---|---|
+| `compressor_segments` | `vm.compressor.segment.total / vm.compressor.segment.limit` | refuse | 0.60 | 0.80 |
+| `swap` | swap USED / PHYSICAL memory (never swap total: macOS grows swap on demand, so the total reads 0 after boot) | refuse | 0.50x | 0.75x |
+| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below 20 GiB | below 10 GiB |
+| `thermal` | `NSProcessInfo.thermalState` | shed | serious | critical (refuse mode only) |
+| `cpu_load` | 1-minute load average / logical CPUs | shed | 3.0 | 6.0 |
+| `battery` | running on battery | off | on battery | never |
+
+Modes: **off** ignores the input; **shed** lets it raise the tier to Elevated at
+most (GitPulse slows its own background work, launches are admitted);
+**refuse** lets it reach Severe too (reactive work is shed and launches are
+refused). Refusal is still subject to `host_load.govern_launches`: with that
+off nothing ever refuses.
+
+The verdict takes the highest tier any input reaches. On equal tiers the
+binding is the first of: memory pressure, compressor thrash, compressor
+segments, swap, low disk, thermal, CPU load, battery. The sentence names the
+resource, its value and the threshold, for example "swap used is 0.83x
+physical memory (53.4 GiB of 64.0 GiB), at or above 0.75x". While the
+hysteresis still holds a tier the reading has already left, it says "now back
+under 0.75x" instead of claiming a crossed threshold.
+
+An input that is on and could not be read contributes no tier and adds one
+warning ("swap is unreadable: not governed on"); a reading the platform never
+provides (unsupported, or not published by an older writer) is not a failed
+check and adds no warning. A zero or unreadable denominator (physical memory,
+CPU count, segment limit) makes the input unreadable, never infinite or zero.
 
 **Hysteresis.** A tier is entered after 3 consecutive sensor ticks at or above
 it and left after 5 consecutive ticks below it, so a level flapping at a
@@ -426,10 +474,46 @@ the sampler keeps publishing a snapshot that says "switched off", so readers
 can tell that apart from a sampler that died. A malformed `host_load` block
 leaves the switch on and costs no other setting.
 
-**Settings → Agents → Host load → "Refuse agent launches under severe memory
-pressure"** (`host_load.govern_launches`, on by default, written only when
-off). Off still sheds GitPulse's own work under pressure but never refuses a
+**Settings → Agents → Host load → "Refuse agent launches when the machine is
+overloaded"** (`host_load.govern_launches`, on by default, written only when
+off). Off still sheds GitPulse's own work under load but never refuses a
 launch; it is what the 30-minute notice flips.
+
+**Settings → Agents → Host load inputs.** One row per input (swap, memory
+compressor, CPU load, heat, battery power, free disk space), each its own
+Settings search entry: a mode ("Off", "Slow GitPulse's background work", "Also
+refuse agent launches"), its two thresholds with units, the live reading beside
+it ("now 0.12x"), and a per-row reset. "Reset to defaults" in the Host load card
+resets them all. A value that fails validation is refused with the rule it
+broke and nothing is saved.
+
+Storage: the thresholds are **not** inside `host_load`. They are a top-level
+`host_load_thresholds` key in `tools.json`, holding only the inputs that differ
+from their default (so a later build that changes a default reaches a person who
+never chose a value), written only when something differs. Reading is lenient
+per input: a value that cannot be read or fails validation falls back to that
+input's own default with a warning, and a block that is not an object is all
+defaults; neither costs any other setting. Why not inside `host_load`: that
+block refuses unknown fields and is read leniently, so an older build that met a
+`thresholds` field in it would discard the whole block, `enabled: false`
+included, and its next save would delete the field. A top-level key lands in the
+older build's `unknown` map, which it writes back as it read it. What an older
+build does with a newer `tools.json`: ignores `host_load_thresholds`, loses no
+other setting, keeps the key across its own saves, and governs on the old two
+inputs only.
+
+## Disk: two owner decisions
+
+2026-10-21: low disk is advice, never a refusal. It can skip the optional
+build-cache copy of a worktree (`LOW_DISK_FLOOR`, `Advisory::LowDisk`), which is
+unchanged.
+
+2026-11-14: the governor's guards become configurable with protective defaults.
+Free disk is one of them (`low_disk`): with mode `refuse` (the default) and free
+space below the severe threshold (10 GiB) a launch is refused with that binding;
+with `off` or `shed` no launch is ever refused on disk, which is the 2026-10-21
+behaviour. The test that pinned the old rule is rewritten to pin both
+(`governor::tests::low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode`).
 
 ## Part 0: what was settled before building
 

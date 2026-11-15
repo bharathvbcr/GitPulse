@@ -54,6 +54,7 @@
 //! override.
 
 use super::disk::LowDisk;
+use super::thresholds::{Readings, Thresholds};
 use super::{Level, Platform, SensorReport, SensorState, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -77,6 +78,18 @@ pub enum Binding {
     /// `compressor_thrash`: thrashing or pressure swapouts rising over three
     /// samples.
     CompressorThrash,
+    /// The compressor's segments in use against its segment limit.
+    CompressorSegments,
+    /// Swap used over physical memory.
+    Swap,
+    /// Free disk space on the volume holding GitPulse's state.
+    LowDisk,
+    /// `NSProcessInfo.thermalState`.
+    Thermal,
+    /// The 1-minute load average per logical CPU.
+    CpuLoad,
+    /// Running on battery.
+    Battery,
 }
 
 /// How hard the machine is pressed, as the verdict sees it.
@@ -144,6 +157,10 @@ pub struct Input {
     pub largest_foreign: Option<u64>,
     /// `host_load.govern_launches`: whether severe pressure refuses launches.
     pub govern_launches: bool,
+    /// The host readings the thresholds decide on (swap, load, disk, ...).
+    pub readings: Readings,
+    /// Each of those inputs' mode and thresholds, as this process reads them.
+    pub thresholds: Thresholds,
 }
 
 impl Input {
@@ -152,6 +169,7 @@ impl Input {
         report: &SensorReport,
         snapshot: Option<&Snapshot>,
         govern_launches: bool,
+        thresholds: Thresholds,
     ) -> Self {
         Self {
             platform: snapshot.map_or_else(Platform::current, |s| s.platform),
@@ -168,6 +186,8 @@ impl Input {
                 .map(|d| d.swapouts_pressure),
             largest_foreign: snapshot.and_then(|s| s.largest_foreign.value()),
             govern_launches,
+            readings: snapshot.map_or_else(Readings::default, |s| Readings::of(&s.host)),
+            thresholds,
         }
     }
 
@@ -234,21 +254,32 @@ fn availability(input: &Input) -> Availability {
     }
 }
 
-/// One sample's tier and the resource that put it there.
+/// One sample's tier and the resource that put it there: the highest tier any
+/// input reaches, and on equal tiers the first of memory pressure, compressor
+/// thrash, compressor segments, swap, low disk, thermal, CPU load, battery.
 fn sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
     if !matches!(availability(input), Availability::Governing) {
         return None;
     }
+    let mut best = (Tier::Clear, None);
+    let mut consider = |tier: Tier, binding: Binding| {
+        if tier > best.0 {
+            best = (tier, Some(binding));
+        }
+    };
     if input.level == Some(Level::Critical) {
-        return Some((Tier::Severe, Some(Binding::MemoryPressure)));
+        consider(Tier::Severe, Binding::MemoryPressure);
     }
     if input.compressor_thrash {
-        return Some((Tier::Severe, Some(Binding::CompressorThrash)));
+        consider(Tier::Severe, Binding::CompressorThrash);
     }
     if input.level == Some(Level::Warn) {
-        return Some((Tier::Elevated, Some(Binding::MemoryPressure)));
+        consider(Tier::Elevated, Binding::MemoryPressure);
     }
-    Some((Tier::Clear, None))
+    for c in input.thresholds.assess(&input.readings).contributions {
+        consider(c.tier, c.binding);
+    }
+    Some(best)
 }
 
 fn level_words(level: Option<Level>) -> String {
@@ -261,7 +292,13 @@ fn level_words(level: Option<Level>) -> String {
 }
 
 /// The binding resource and its value, in words.
-fn describe(binding: Binding, input: &Input) -> String {
+fn describe(binding: Binding, input: &Input, held: Tier) -> String {
+    if let Some(words) = input
+        .thresholds
+        .describe(binding, &input.readings, held)
+    {
+        return words;
+    }
     match binding {
         Binding::MemoryPressure => format!("memory pressure {}", level_words(input.level)),
         Binding::CompressorThrash => {
@@ -276,6 +313,8 @@ fn describe(binding: Binding, input: &Input) -> String {
                 level_words(input.level)
             )
         }
+        // The readings behind it are gone (a stale held tier): say so.
+        _ => "a host reading crossed its threshold (it can no longer be read)".to_string(),
     }
 }
 
@@ -338,6 +377,9 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
             "stale {seconds}s: governing on the last-known level"
         ));
     }
+    // A governed input that could not be read is said so: a check that could
+    // not run must never read like one that passed.
+    warnings.extend(input.thresholds.assess(&input.readings).warnings);
     let binding = held_binding.unwrap_or(Binding::MemoryPressure);
     match held {
         Tier::Clear => base(
@@ -356,7 +398,7 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
                 Some(binding),
                 format!(
                     "{}: background work is shed, launches are admitted",
-                    describe(binding, input)
+                    describe(binding, input, Tier::Elevated)
                 ),
                 warnings,
             );
@@ -364,7 +406,7 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
             verdict
         }
         Tier::Severe => {
-            let what = describe(binding, input);
+            let what = describe(binding, input, Tier::Severe);
             let mut verdict = if input.govern_launches {
                 base(
                     Reason::Pressure,
@@ -555,6 +597,8 @@ impl Governor {
                     swapouts: None,
                     largest_foreign: None,
                     govern_launches: true,
+                    readings: Readings::default(),
+                    thresholds: Thresholds::default(),
                 },
                 Tier::Clear,
                 None,
@@ -973,6 +1017,8 @@ impl Input {
             swapouts: None,
             largest_foreign: None,
             govern_launches: true,
+            readings: Readings::calm(),
+            thresholds: Thresholds::default(),
         }
     }
 }
@@ -1048,11 +1094,11 @@ pub fn admit_anyway(confirm: &dyn Fn(&str, &str) -> bool) -> Result<String, Stri
         return Ok("Nothing is refusing agent launches right now.".to_string());
     }
     let question = format!(
-        "GitPulse is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now competes for the memory the machine is short of.",
+        "GitPulse is refusing agent launches because {}.\n\nAdmit launches for the next {} seconds anyway? An agent started now adds to the load the machine is already struggling with.",
         verdict.message,
         OVERRIDE_WINDOW.as_secs()
     );
-    if !confirm("Admit agent launches under memory pressure?", &question) {
+    if !confirm("Admit agent launches while the machine is overloaded?", &question) {
         return Err("Not admitted: launches stay refused while the pressure lasts.".to_string());
     }
     grant_override()?;
@@ -1170,5 +1216,7 @@ fn write_ledger(
 
 #[cfg(test)]
 mod adv2;
+#[cfg(test)]
+mod threshold_tests;
 #[cfg(test)]
 mod tests;

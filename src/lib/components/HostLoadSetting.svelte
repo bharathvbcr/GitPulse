@@ -1,6 +1,8 @@
 <script lang="ts">
   /**
-   * The host-load sensor's kill switch (`host_load.enabled`), on by default.
+   * The host-load sensor's kill switch (`host_load.enabled`), on by default,
+   * the launch-refusal switch, and a reset for the per-input thresholds below
+   * them (each input is its own row, `HostLoadInputSetting`).
    *
    * Off stops the readings, not the heartbeat: the sampler keeps publishing
    * a snapshot that says "switched off", so other GitPulse processes can tell
@@ -10,15 +12,20 @@
   import SettingToggle from "./SettingToggle.svelte";
   import {
     DEFAULT_HOST_LOAD_SETTINGS,
+    DEFAULT_THRESHOLDS,
+    hostLoadSettings,
     loadHostLoadSettings,
-    saveHostLoadSettings,
+    updateHostLoadSettings,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
   import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
 
-  let settings = $state<HostLoadSettings>(DEFAULT_HOST_LOAD_SETTINGS);
+  // The shared copy: the input rows save through the same store, so a toggle
+  // here never saves their thresholds back stale.
+  const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
+  const thresholdsAreDefault = $derived(JSON.stringify(settings.thresholds) === JSON.stringify(DEFAULT_THRESHOLDS));
   let busy = $state(false);
   let error = $state("");
   // False until a read succeeds: before that `settings` is the defaults, and a
@@ -29,7 +36,7 @@
     busy = true;
     error = "";
     try {
-      settings = await loadHostLoadSettings();
+      await loadHostLoadSettings();
       readOk = true;
     } catch (cause) {
       error = explainError(cause);
@@ -43,7 +50,7 @@
     busy = true;
     error = "";
     try {
-      settings = await saveHostLoadSettings({ ...settings, ...change });
+      await updateHostLoadSettings(change);
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -69,12 +76,26 @@
     onchange={(next) => void save({ enabled: next })}
   />
   <SettingToggle
-    label="Refuse agent launches under severe memory pressure"
-    description="On by default. When the kernel reports critical memory pressure, or the memory compressor is thrashing, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still sheds GitPulse's own background and refresh work under pressure, but never refuses a launch. Needs the measurement above."
+    label="Refuse agent launches when the machine is overloaded"
+    description="On by default. When the kernel reports critical memory pressure, the memory compressor is thrashing, or an input below is set to refuse launches and reaches its limit, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still slows GitPulse's own background and refresh work under load, but never refuses a launch. Needs the measurement above."
     checked={settings.govern_launches}
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
+  <div class="flex items-center gap-2 pt-1">
+    <p class="text-textMuted text-micro leading-snug flex-1">
+      Each input below can slow GitPulse's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.
+    </p>
+    <button
+      type="button"
+      class="gp-btn text-meta px-2 py-0.5 shrink-0"
+      disabled={!readOk || busy || thresholdsAreDefault}
+      data-testid="host-load-reset-thresholds"
+      onclick={() => void save({ thresholds: DEFAULT_THRESHOLDS })}
+    >
+      Reset to defaults
+    </button>
+  </div>
   {#if error}
     <p class="text-warn">{error}</p>
     <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Try again</button>

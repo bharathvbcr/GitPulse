@@ -222,6 +222,7 @@
       <dl class="grid grid-cols-2 @2xl:grid-cols-4 gap-2" data-testid="host-load-readings">
         <div><dt class="text-textMuted">Swap used</dt><dd class="text-textPrimary">{describeReading(host.swap_used, bytes)} of {describeReading(host.swap_total, bytes)}</dd></div>
         <div><dt class="text-textMuted">Compressor</dt><dd class="text-textPrimary">{describeReading(host.compressed_bytes, bytes)}{snap.compressor_thrash ? " · thrashing" : ""}</dd></div>
+        <div><dt class="text-textMuted">Compressor segments</dt><dd class="text-textPrimary" data-testid="host-load-segments">{describeReading(host.compressor_segments, (s) => `${s.total.toLocaleString()} of ${s.limit.toLocaleString()}`)}</dd></div>
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>
         <div><dt class="text-textMuted">CPUs</dt><dd class="text-textPrimary">{describeReading(host.cores, (c) => c.levels > 0 ? `${c.logical} (${c.perf0} + ${c.perf1} by level)` : `${c.logical}`)}</dd></div>
         <div><dt class="text-textMuted">Open files</dt><dd class="text-textPrimary">{describeReading(host.open_files, String)} of {describeReading(host.max_files, String)}</dd></div>

@@ -44,6 +44,9 @@ pub(crate) mod procscan;
 mod sampler;
 mod sensor;
 mod snapshot;
+mod thresholds;
+
+pub use thresholds::{InputMode, ModeRule, Readings, Rule, Thresholds};
 
 pub use disk::{block_size, free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
 pub use governor::{

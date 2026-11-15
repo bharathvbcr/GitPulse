@@ -89,7 +89,7 @@ fn replay(counters: &[(u64, u64)], level: Level, written: u64, read: u64) -> Inp
     let mut writer = SnapshotWriter::elect(dir.path()).unwrap().unwrap();
     writer.publish(&snap).unwrap();
     let (report, snap) = snapshot::report(&dir.path().join(SNAPSHOT_FILE_NAME), clock(read));
-    Input::from_report(&report, snap.as_ref(), true)
+    Input::from_report(&report, snap.as_ref(), true, Thresholds::default())
 }
 
 #[test]
@@ -678,11 +678,15 @@ fn a_run_leaves_to_the_highest_tier_it_held_and_enters_with_its_binding() {
     assert_eq!(seen.verdict.binding, Some(Binding::MemoryPressure));
 }
 
-/// Low disk is advice only (owner decision 2026-10-21): with a low_disk
-/// advisory held, every gated site is still admitted, the verdict is the
-/// healthy one, and no deny binding names disk.
+/// The low-disk advisory (a skipped build-cache copy) is still only advice:
+/// with one held, every gated site is admitted, the verdict is the healthy
+/// one, and no deny binding names disk. Since owner instruction 2026-11-14 the
+/// separate `disk` setting may refuse a launch, but only in `refuse` mode and
+/// only below its severe threshold; `off` and `shed` keep the 2026-10-21
+/// behaviour of never refusing on disk. The owner decision of 2026-10-21 is
+/// recorded in `disk.rs` beside the new one.
 #[test]
-fn low_disk_is_advice_only_at_every_gated_site() {
+fn low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode() {
     let repo = tempfile::tempdir().unwrap();
     let repo_path = repo.path().to_str().unwrap();
     let low = Advisory::LowDisk(LowDisk {
@@ -712,6 +716,29 @@ fn low_disk_is_advice_only_at_every_gated_site() {
     assert_eq!(seen.verdict.binding, Some(Binding::CompressorThrash));
     note_launch_advisory(repo_path, None);
     assert_eq!(crate::sysload::governor_report().advisory, None);
+
+    // The disk setting: 1 GiB free is below the default severe threshold.
+    use crate::sysload::InputMode;
+    let starved = |mode| {
+        let mut input = input(Level::Normal);
+        input.readings.free_disk = Reading::Value(1 << 30);
+        input.thresholds.disk.mode = mode;
+        let mut governor = Governor::default();
+        feed(&mut governor, Instant::now(), vec![input; 3]).0.verdict
+    };
+    for mode in [InputMode::Off, InputMode::Shed] {
+        let verdict = starved(mode);
+        for site in Site::ALL {
+            let report = GovernorReport {
+                verdict: verdict.clone(),
+                ..GovernorReport::ungoverned()
+            };
+            assert!(admit_on(site, &report).is_ok(), "{mode:?} refused {}", site.name());
+        }
+    }
+    let refused = starved(InputMode::Refuse);
+    assert!(!refused.admit);
+    assert_eq!(refused.binding, Some(Binding::LowDisk));
 }
 
 // ---- adversarial W4-L3 (adv-w4l3) ----

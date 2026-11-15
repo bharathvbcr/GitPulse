@@ -1,12 +1,22 @@
 //! Free space on the volume a path lives on, and what a launch is told when
 //! there is not enough of it.
 //!
-//! Low disk is advice, never a refusal (owner decision, 2026-10-21): it can
-//! skip the optional build-cache copy of a worktree, which only saves a
-//! rebuild, and it can never stop a launch, a checkout or a worktree being
-//! made. [`governor::Site`](super::Site) has no disk site and
-//! `Reason`/`Refused` have no disk variant; `tests::low_disk_is_advice_only`
-//! holds that.
+//! Two decisions are recorded here, in order:
+//!
+//! * 2026-10-21 (owner): low disk is advice, never a refusal. It can skip the
+//!   optional build-cache copy of a worktree, which only saves a rebuild, and
+//!   it could never stop a launch, a checkout or a worktree being made. That
+//!   is still true of the advisory below ([`LOW_DISK_FLOOR`],
+//!   `Advisory::LowDisk`), which is unchanged.
+//! * 2026-11-14 (owner instruction, after the machine hung and reset): the
+//!   governor's guards become configurable with protective defaults. Free
+//!   disk is now one of them: the `disk` rule (`thresholds.rs`) refuses agent
+//!   launches below its severe threshold when its mode is `refuse` (the
+//!   default), and never refuses when it is `off` or `shed`, which is the
+//!   2026-10-21 behaviour. The binding is `Binding::LowDisk`.
+//!
+//! `governor::tests::low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode`
+//! holds both: the advisory never refuses, the setting does only in `refuse`.
 
 use super::sensor::{Reading, Why};
 use serde::{Deserialize, Serialize};

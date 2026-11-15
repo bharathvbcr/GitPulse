@@ -6,6 +6,10 @@ import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
+  DEFAULT_THRESHOLDS,
+  ensureHostLoadSettings,
+  hostLoadSettings,
+  updateHostLoadSettings,
   HOST_LOAD_PULSE_EVENT,
   hostLoadPulse,
   hostPressure,
@@ -129,14 +133,34 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    vi.mocked(invoke).mockResolvedValue({ enabled: false, govern_launches: true });
-    await expect(saveHostLoadSettings({ enabled: false, govern_launches: true })).resolves.toEqual({
-      enabled: false,
-      govern_launches: true,
+    const stored = { enabled: false, govern_launches: true, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValue(stored);
+    await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
+    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
+  });
+
+  it("saves one row's change on top of the latest settings, not a stale copy", async () => {
+    const first = { enabled: true, govern_launches: true, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    // A row saves a new swap rule; the store takes what the backend returns.
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ thresholds: { ...DEFAULT_THRESHOLDS, swap } });
+    // A toggle elsewhere carries only its own change: the swap edit survives.
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ govern_launches: false });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { enabled: true, govern_launches: false, thresholds: { ...DEFAULT_THRESHOLDS, swap } },
     });
-    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: false, govern_launches: true },
-    });
+    expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
+  });
+
+  it("reads the settings once however many rows ask at the same time", async () => {
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, thresholds: DEFAULT_THRESHOLDS });
+    await Promise.all([ensureHostLoadSettings(), ensureHostLoadSettings(), ensureHostLoadSettings()]);
+    expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings")).toHaveLength(1);
   });
 
   it("carries the governor's verdict from the status into the pulse", () => {

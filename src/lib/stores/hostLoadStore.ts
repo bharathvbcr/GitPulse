@@ -74,6 +74,12 @@ export interface CompressorDelta {
   major_compaction_segments_freed: number;
 }
 
+/** `sysload::CompressorSegments`: segments in use against the compressor's limit. */
+export interface CompressorSegments {
+  total: number;
+  limit: number;
+}
+
 export interface Cores {
   logical: number;
   levels: number;
@@ -87,6 +93,7 @@ export interface HostSample {
   swap_total: Reading<number>;
   compressor: Reading<Compressor>;
   compressed_bytes: Reading<number>;
+  compressor_segments: Reading<CompressorSegments>;
   load: Reading<[number, number, number]>;
   cores: Reading<Cores>;
   memsize: Reading<number>;
@@ -213,7 +220,15 @@ export interface ProcView {
 }
 
 /** What the governor says is binding (`sysload::Binding`). */
-export type Binding = "memory_pressure" | "compressor_thrash";
+export type Binding =
+  | "memory_pressure"
+  | "compressor_thrash"
+  | "compressor_segments"
+  | "swap"
+  | "low_disk"
+  | "thermal"
+  | "cpu_load"
+  | "battery";
 export type Tier = "clear" | "elevated" | "severe";
 export type Reason =
   | "healthy"
@@ -322,11 +337,50 @@ export interface HostLoadPulse {
   governor: GovernorPulse;
 }
 
+/** `sysload::InputMode`: what one input may do to the governor's verdict. */
+export type InputMode = "off" | "shed" | "refuse";
+
+/** `sysload::Rule`: a mode and two thresholds (disk is GiB free, lower is worse). */
+export interface Rule {
+  mode: InputMode;
+  elevated_at: number;
+  severe_at: number;
+}
+
+/** `sysload::ModeRule`: an input whose states are fixed. */
+export interface ModeRule {
+  mode: InputMode;
+}
+
+/** `sysload::Thresholds`: every input the governor decides on besides pressure. */
+export interface Thresholds {
+  swap: Rule;
+  compressor_segments: Rule;
+  load: Rule;
+  thermal: ModeRule;
+  battery: ModeRule;
+  disk: Rule;
+}
+
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
   govern_launches: boolean;
+  thresholds: Thresholds;
 }
+
+/**
+ * Mirrors `Thresholds::default` in Rust. Provisional: each default was set
+ * from the 2026-11-14 incident alone (see `sysload/thresholds.rs`).
+ */
+export const DEFAULT_THRESHOLDS: Thresholds = {
+  swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
+  compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },
+  load: { mode: "shed", elevated_at: 3, severe_at: 6 },
+  thermal: { mode: "shed" },
+  battery: { mode: "off" },
+  disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+};
 
 /** The event the app's sampler emits after every tick. */
 export const HOST_LOAD_PULSE_EVENT = "host-load-pulse";
@@ -470,16 +524,61 @@ export async function admitAnyway(): Promise<string> {
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
+  thresholds: DEFAULT_THRESHOLDS,
 };
+
+/**
+ * The settings as last read or saved, shared by every Settings row that edits
+ * them. Each row saves through {@link updateHostLoadSettings}, which merges
+ * onto this and not onto a component's older copy, so a toggle never saves
+ * stale thresholds over a row's edit. Null until a read has succeeded.
+ */
+const settingsStore = writable<HostLoadSettings | null>(null);
+export const hostLoadSettings: Readable<HostLoadSettings | null> = { subscribe: settingsStore.subscribe };
 
 export async function loadHostLoadSettings(): Promise<HostLoadSettings> {
   if (!isTauri()) return DEFAULT_HOST_LOAD_SETTINGS;
-  return invoke<HostLoadSettings>("cmd_host_load_settings");
+  const settings = await invoke<HostLoadSettings>("cmd_host_load_settings");
+  settingsStore.set(settings);
+  return settings;
 }
 
 export async function saveHostLoadSettings(settings: HostLoadSettings): Promise<HostLoadSettings> {
-  if (!isTauri()) return settings;
-  return invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  if (!isTauri()) {
+    settingsStore.set(settings);
+    return settings;
+  }
+  const saved = await invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  settingsStore.set(saved);
+  return saved;
+}
+
+let loadingSettings: Promise<HostLoadSettings> | null = null;
+
+/**
+ * The settings, read once however many Settings rows ask at the same time.
+ * A row that mounts after a read has succeeded gets the stored copy.
+ */
+export function ensureHostLoadSettings(): Promise<HostLoadSettings> {
+  let have: HostLoadSettings | null = null;
+  settingsStore.subscribe((value) => (have = value))();
+  if (have) return Promise.resolve(have);
+  if (!loadingSettings) {
+    const flight = loadHostLoadSettings().finally(() => {
+      if (loadingSettings === flight) loadingSettings = null;
+    });
+    loadingSettings = flight;
+  }
+  return loadingSettings;
+}
+
+/** Saves `change` on top of the latest settings read or saved anywhere. */
+export function updateHostLoadSettings(change: Partial<HostLoadSettings>): Promise<HostLoadSettings> {
+  let latest: HostLoadSettings = DEFAULT_HOST_LOAD_SETTINGS;
+  settingsStore.subscribe((value) => {
+    if (value) latest = value;
+  })();
+  return saveHostLoadSettings({ ...latest, ...change });
 }
 
 export const hostLoadPulse: Readable<HostLoadPulse | null> = { subscribe: pulseStore.subscribe };
@@ -503,4 +602,5 @@ export function resetHostLoadForTests(): void {
   noticeShown = false;
   pulseStore.set(null);
   statusStore.set(null);
+  settingsStore.set(null);
 }

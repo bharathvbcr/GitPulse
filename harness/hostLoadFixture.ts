@@ -53,6 +53,7 @@ export function hostLoadStatusFixture(): HostLoadStatus {
         swap_total: value(2048 << 20),
         compressor: value({ thrashing_detected: 0, free_below_reserved: 0, swapouts_pressure: 0, major_compaction_segments_freed: 0 }),
         compressed_bytes: value(1_200_000_000),
+        compressor_segments: value({ total: 254_515, limit: 1_677_721 }),
         load: value([3.1, 2.8, 2.5]),
         cores: value({ logical: 12, levels: 2, perf0: 8, perf1: 4 }),
         memsize: value(36 * 2 ** 30),

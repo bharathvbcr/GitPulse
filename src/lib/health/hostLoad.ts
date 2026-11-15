@@ -9,6 +9,7 @@
  */
 import { humanBytes } from "../storage/format";
 import type {
+  Binding,
   GovernorPulse,
   Advisory,
   GovernorReport,
@@ -124,6 +125,17 @@ export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
       title: "The memory compressor has been thrashing for three samples in a row.",
     };
   }
+  // A resource other than the kernel's pressure level can bind (swap, disk,
+  // load, ...): the bar must not stay silent while the governor is acting.
+  const refused = !pulse.governor.admit && !pulse.governor.overridden;
+  if (refused || pulse.governor.shed_background || pulse.governor.shed_reactive) {
+    return {
+      text: `Host load: ${bindingLabel(pulse.governor.binding)}${governing}${stale}`,
+      tone: refused ? "danger" : "warn",
+      title:
+        "GitPulse is acting on a host reading other than memory pressure. Open Health for which one, its value and the threshold it crossed. Thresholds are in Settings, Agents, Host load.",
+    };
+  }
   return null;
 }
 
@@ -226,9 +238,54 @@ export function refusalNotice(governor: GovernorPulse): string {
     governor.largest_foreign === null
       ? "largest foreign footprint unknown"
       : `largest foreign footprint ${bytes(governor.largest_foreign)}`;
-  const cause =
-    governor.binding === "compressor_thrash" ? "a thrashing memory compressor" : "memory pressure";
+  const cause = bindingCause(governor.binding);
   return `Refusing agent launches for ${minutes} min under ${cause}; ${largest}.`;
+}
+
+/** The binding resource as a phrase after "under", for the refusal notice. */
+function bindingCause(binding: Binding | null): string {
+  switch (binding) {
+    case "compressor_thrash":
+      return "a thrashing memory compressor";
+    case "compressor_segments":
+      return "a nearly full memory compressor";
+    case "swap":
+      return "heavy swap use";
+    case "low_disk":
+      return "low disk space";
+    case "thermal":
+      return "heat";
+    case "cpu_load":
+      return "heavy CPU load";
+    case "battery":
+      return "battery power";
+    case "memory_pressure":
+    case null:
+      return "memory pressure";
+  }
+}
+
+/** What the binding resource is, in two or three words, for the status chip. */
+export function bindingLabel(binding: Binding | null): string {
+  switch (binding) {
+    case "compressor_thrash":
+      return "compressor thrashing";
+    case "compressor_segments":
+      return "compressor full";
+    case "swap":
+      return "swap";
+    case "low_disk":
+      return "low disk";
+    case "thermal":
+      return "heat";
+    case "cpu_load":
+      return "CPU load";
+    case "battery":
+      return "on battery";
+    case "memory_pressure":
+    case null:
+      return "memory";
+  }
 }
 
 /** What the governor adds to the status chip: refused launches outrank shedding. */

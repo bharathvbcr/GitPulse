@@ -118,8 +118,8 @@ impl Level {
 
 /// Cumulative compressor counters, monotonic within one boot.
 ///
-/// There is no `compressor_bytes_used` or segment-limit sysctl; these are the
-/// counters that exist (`vm.compressor.swapper.wakeups.*`,
+/// There is no `compressor_bytes_used` sysctl; the segment use is
+/// [`CompressorSegments`], and these are the counters that exist (`vm.compressor.swapper.wakeups.*`,
 /// `vm.compressor.swapper.swapouts_pressure`,
 /// `vm.compressor.compactor.major_compaction_segments_freed`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +128,15 @@ pub struct Compressor {
     pub free_below_reserved: u64,
     pub swapouts_pressure: u64,
     pub major_compaction_segments_freed: u64,
+}
+
+/// The compressor's segment use: `vm.compressor.segment.total` against
+/// `vm.compressor.segment.limit`. The 2026-10-07 panic was this reaching its
+/// limit while the pressure level still read normal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressorSegments {
+    pub total: u64,
+    pub limit: u64,
 }
 
 /// How much each compressor counter rose since the previous sample.
@@ -203,6 +212,8 @@ pub struct HostSample {
     /// Physical memory the compressor occupies (`host_statistics64`
     /// `compressor_page_count` × page size).
     pub compressed_bytes: Reading<u64>,
+    /// Segments in use against the compressor's segment limit.
+    pub compressor_segments: Reading<CompressorSegments>,
     pub load: Reading<[f64; 3]>,
     pub cores: Reading<Cores>,
     pub memsize: Reading<u64>,

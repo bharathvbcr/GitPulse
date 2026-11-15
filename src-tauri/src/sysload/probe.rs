@@ -271,6 +271,7 @@ mod imp {
                 swap_total: self.swap().map(|s| s.1),
                 compressor: compressor(),
                 compressed_bytes: self.compressed_bytes(),
+                compressor_segments: Reading::Unavailable(Why::Unsupported),
                 load: load(),
                 cores: self.cores,
                 memsize: self.memsize,
@@ -568,6 +569,7 @@ mod imp {
                 swap_total,
                 compressor: Reading::Unavailable(Why::Unsupported),
                 compressed_bytes: Reading::Unavailable(Why::Unsupported),
+                compressor_segments: Reading::Unavailable(Why::Unsupported),
                 load: match read_small("/proc/loadavg") {
                     Ok(text) => {
                         let mut it = text.split_whitespace().map(|v| v.parse::<f64>().ok());

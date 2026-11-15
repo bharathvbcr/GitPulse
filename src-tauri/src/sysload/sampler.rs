@@ -124,6 +124,9 @@ pub struct SamplerOptions {
     /// `host_load.govern_launches`, read once per tick: whether severe
     /// pressure refuses agent launches.
     pub govern_launches: Box<dyn Fn() -> bool + Send>,
+    /// Each input's mode and thresholds, read once per tick like
+    /// `govern_launches`.
+    pub thresholds: Box<dyn Fn() -> super::Thresholds + Send>,
     /// Called after every tick with that tick's pulse.
     pub on_tick: Option<Box<dyn Fn(HostLoadPulse) + Send>>,
     /// Begins the App Nap opt-out; dropping what it returns ends it. A seam so
@@ -138,6 +141,7 @@ impl SamplerOptions {
             cadence: Duration::from_millis(CADENCE_MS),
             enabled: Box::new(|| true),
             govern_launches: Box::new(|| true),
+            thresholds: Box::new(super::Thresholds::default),
             on_tick: None,
             begin_activity: Box::new(|| {
                 super::probe::Activity::begin("GitPulse host-load sampler")
@@ -465,14 +469,19 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         };
 
         let govern_launches = (options.govern_launches)();
+        let thresholds = (options.thresholds)();
         let mut status = status;
         {
             let mut governor = shared
                 .governor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let input =
-                Input::from_report(&status.sensor, status.snapshot.as_ref(), govern_launches);
+            let input = Input::from_report(
+                &status.sensor,
+                status.snapshot.as_ref(),
+                govern_launches,
+                thresholds,
+            );
             let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
                 governor.observe(Instant::now(), input)
             } else {
@@ -481,7 +490,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             if observation.notice_raised {
                 log::warn!(
                     target: "host_load",
-                    "refusing agent launches for {} min under pressure: {}",
+                    "refusing agent launches for {} min under host load: {}",
                     governor::REFUSAL_NOTICE_AFTER.as_secs() / 60,
                     observation.verdict.message
                 );
