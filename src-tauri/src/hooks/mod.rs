@@ -3218,6 +3218,12 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
 /// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
 /// says (`load_gate::brief_line_live`), and the running app's fact source and
 /// age (`app_age_ms`) when the snapshot came from the app.
+/// Where throwaway build output goes. `.gitpulse/` is per repository, on the
+/// repository's own volume, ignored by git here and not on DevCouncil's
+/// preserved-name list (`tmp`, `.cache` and `.claude` are), and the cleaner's
+/// agent scratch scope knows it, so output kept there is accounted for.
+const SCRATCH_BUILD_LINE: &str = "scratch builds: put throwaway build output in .gitpulse/scratch/target-<label> (CARGO_TARGET_DIR); never under .claude/, which new worktrees copy whole";
+
 fn session_brief_with(
     snapshot: &InsightsSnapshot,
     here: &str,
@@ -3242,6 +3248,8 @@ fn session_brief_with(
     if let Some(age_ms) = app_age_ms {
         out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
     }
+    out.push_str(SCRATCH_BUILD_LINE);
+    out.push('\n');
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
     // have filled are partial rather than empty.
@@ -8908,6 +8916,34 @@ done
             .map(|i| WorktreeSummary {
                 path: format!("/repo/wt/{i}"),
                 name: format!("worktree-with-a-long-name-{i}"),
+    /// Agents put scratch builds wherever they like unless the brief names a
+    /// place; the one place GitPulse accounts for is named once, short, and
+    /// survives the cap that cuts the long lists below it.
+    #[test]
+    fn the_brief_names_the_scratch_build_root_once() {
+        let brief = session_brief(&snapshot_fixture(), "/repo", "startup");
+        let named: Vec<&str> = brief
+            .lines()
+            .filter(|l| l.contains(".gitpulse/scratch/target-"))
+            .collect();
+        assert_eq!(named.len(), 1, "{brief}");
+        assert!(named[0].len() < 180, "{}", named[0]);
+        assert!(named[0].contains("never under .claude/"), "{}", named[0]);
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let cut = session_brief(&snapshot, "/repo", "startup");
+        assert!(cut.ends_with("… truncated"));
+        assert!(cut.contains(".gitpulse/scratch/target-"), "{cut}");
+    }
+
                 branch: Some(format!("branch/{i}")),
                 is_main: false,
                 is_bare: false,
