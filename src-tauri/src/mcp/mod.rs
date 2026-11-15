@@ -673,6 +673,9 @@ tool_args! {
         overwrite: Option<bool> = Spec::flag(
             "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours.",
         ),
+        expected_revision: Option<i64> = revision_spec(
+            "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+        ),
         reviewed_related: Option<Vec<String>> = Spec::chars_array(
             "item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work",
             intake::MAX_REVIEWED_RELATED,
@@ -2048,7 +2051,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_add_task",
             "Add task",
-            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
+            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. When you overwrite a task you read earlier, pass expected_revision (its revision from gitpulse_get_task or gitpulse_list_tasks): if the task changed since, nothing is written and revision_conflict names the current revision, so you re-read and merge instead of replacing someone else's edit. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
             AddTaskArgs::properties(),
             &AddTaskArgs::required(),
             json!({
@@ -3860,12 +3863,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let reviewed = a.reviewed_related.unwrap_or_default();
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            let mut result = intake::add_task(
+            let mut result = intake::add_task_guarded(
                 &store,
                 &a.repo_path,
                 task,
                 a.overwrite.unwrap_or(false),
                 &reviewed,
+                a.expected_revision,
             )
             .map_err(workbench_message)?;
 
@@ -10304,6 +10308,239 @@ mod tests {
             error && stale.as_str().unwrap().contains("revision_conflict"),
             "{stale}"
         );
+    }
+
+    /// A task filed through the tool, then edited by the person so it sits at
+    /// revision 2. Returns the board and the task's item_id.
+    fn filed_then_edited(
+        dir: &tempfile::TempDir,
+        profile: &tempfile::TempDir,
+        repo: &str,
+    ) -> (crate::workbench::WorkbenchState, String) {
+        crate::test_support::trust_repo(dir.path());
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Held card" }),
+        );
+        assert!(!error, "{added}");
+        assert_eq!(added["revision"], 1, "{added}");
+        let id = added["item_id"].as_str().unwrap().to_string();
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        person_edits(&board, &id);
+        assert_eq!(board_item(&board, &id)["revision"], 2);
+        (board, id)
+    }
+
+    /// What an overwrite did before `expected_revision` existed, and still does
+    /// when it is not passed: it replaces the content whatever revision the
+    /// card has reached, so a person's edit made after the agent last read it
+    /// is overwritten.
+    #[test]
+    fn add_task_overwrite_without_a_revision_replaces_a_card_edited_since_it_was_read() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, replaced) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite", "overwrite": true }),
+        );
+        assert!(!error, "{replaced}");
+        assert_eq!(replaced["outcome"], "updated", "{replaced}");
+        assert_eq!(replaced["revision"], 3, "{replaced}");
+        assert_eq!(board_item(&board, &id)["title"], "Agent rewrite");
+    }
+
+    #[test]
+    fn add_task_overwrite_held_to_a_stale_revision_is_refused_and_writes_nothing() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, stale) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        let message = stale.as_str().unwrap_or_default();
+        assert!(
+            error && message.contains("revision_conflict") && message.contains("revision 2"),
+            "{stale}"
+        );
+        let after = board_item(&board, &id);
+        assert_eq!(after["title"], "Edited by the person");
+        assert_eq!(after["revision"], 2, "nothing was written");
+    }
+
+    #[test]
+    fn add_task_overwrite_held_to_the_current_revision_goes_through() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, saved) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2.0 }),
+        );
+        assert!(!error, "{saved}");
+        assert_eq!(saved["outcome"], "updated", "{saved}");
+        assert_eq!(saved["revision"], 3, "{saved}");
+        assert_eq!(board_item(&board, &id)["title"], "Agent rewrite");
+    }
+
+    /// A revision names a card that exists, and only an overwrite can be held
+    /// to one: both other readings are refused instead of guessed at, so a
+    /// caller never believes a write was guarded when it was not.
+    #[test]
+    fn add_task_expected_revision_without_an_overwrite_or_without_a_card_is_refused() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "expected_revision": 2 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(error && message.contains("invalid_input"), "{refused}");
+        assert_eq!(board_item(&board, &id)["title"], "Edited by the person");
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-never-filed", "title": "Brand new card",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(error && message.contains("not_found"), "{refused}");
+        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert_eq!(listed["total"], 1, "no card was created: {listed}");
+    }
+
+    /// Folding into a card the person made on the board is an overwrite by its
+    /// board item_id, which takes a different path through the owner than a
+    /// card the tool filed; the held revision applies to it the same way.
+    #[test]
+    fn add_task_overwrite_by_board_item_id_is_held_to_the_revision_too() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, _) = board_task(profile.path(), &repo, "board-keep");
+        person_edits(&board, "board-keep");
+
+        let (error, stale) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        assert_eq!(
+            board_item(&board, "board-keep")["title"],
+            "Edited by the person"
+        );
+
+        let (error, saved) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2 }),
+        );
+        assert!(!error, "{saved}");
+        assert_eq!(saved["outcome"], "updated", "{saved}");
+        assert_eq!(board_item(&board, "board-keep")["title"], "Agent rewrite");
+        assert_eq!(board_item(&board, "board-keep")["position"], 7);
+    }
+
+    /// A card deleted since the agent read it is named as deleted, with the
+    /// reason, as the other tools name it; it is not reported as never filed.
+    #[test]
+    fn add_task_overwrite_held_to_a_revision_names_a_card_deleted_since() {
+        let (dir, profile, repo) = task_fixture();
+        let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "reason": "Obsolete work." }),
+        );
+        assert!(!error, "{deleted}");
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(
+            error && message.contains("task_deleted") && message.contains("Obsolete work."),
+            "{refused}"
+        );
+    }
+
+    /// Deliberately stricter than complete and delete, which answer a retry
+    /// whose state already matches as `unchanged` before looking at the
+    /// revision: a held overwrite is refused at any revision but the one named,
+    /// even when its content equals what is stored, so a stale view is always
+    /// told to re-read.
+    #[test]
+    fn add_task_held_overwrite_at_a_stale_revision_is_refused_even_with_identical_content() {
+        let (dir, profile, repo) = task_fixture();
+        let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
+        let identical = json!({ "repo_path": repo, "task_id": "gp-held",
+                                "title": "Edited by the person", "overwrite": true });
+        let (error, same) = tool_json("gitpulse_add_task", identical.clone());
+        assert!(!error, "{same}");
+        assert_eq!(same["outcome"], "unchanged", "{same}");
+
+        let mut held = identical;
+        held["expected_revision"] = json!(1);
+        let (error, stale) = tool_json("gitpulse_add_task", held);
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn add_task_expected_revision_is_held_to_the_same_bounds_as_the_other_tools() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_add_task")
+            .expect("gitpulse_add_task is advertised")["inputSchema"]
+            .clone();
+        let property = &schema["properties"]["expected_revision"];
+        assert_eq!(property["type"], "integer", "{property}");
+        assert_eq!(
+            (property["minimum"].as_u64(), property["maximum"].as_u64()),
+            (Some(1), Some(MAX_REVISION)),
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "expected_revision"),
+            "the argument is optional"
+        );
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("2"),
+            json!(MAX_REVISION + 1),
+        ] {
+            let arguments = json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                                    "overwrite": true, "expected_revision": bad });
+            let (error, refused) = tool_json("gitpulse_add_task", arguments);
+            assert!(
+                error
+                    && refused
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("expected_revision"),
+                "{bad} was accepted: {refused}"
+            );
+        }
+        assert_eq!(board_item(&board, &id)["title"], "Edited by the person");
     }
 
     fn ledger_repo_with_events(count: usize) -> (tempfile::TempDir, String) {

@@ -533,6 +533,12 @@
         "minLength": 1,
         "type": "string"
       },
+      "expected_revision": {
+        "description": "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
       "kind": {
         "description": "Type, e.g. feature (default), bug, refactor, chore, spike",
         "maxLength": 64,
