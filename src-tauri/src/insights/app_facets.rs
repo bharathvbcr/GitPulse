@@ -639,6 +639,15 @@ pub fn snapshot_from_app(
                     partial.join(", ")
                 ));
             }
+            if !worktrees.truncated {
+                let member_paths: Vec<&str> = worktrees
+                    .items
+                    .iter()
+                    .filter(|w| !w.is_bare)
+                    .map(|w| w.path.as_str())
+                    .collect();
+                crate::engine::worktree::remember_verified_member_paths(repo_path, &member_paths);
+            }
             Ok(complete_snapshot(
                 repo_path,
                 started,

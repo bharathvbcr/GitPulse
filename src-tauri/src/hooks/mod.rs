@@ -2333,6 +2333,11 @@ fn judged_by_app(_cwd: &str, _command: &str) -> Option<ScopedVerdict> {
 #[cfg(target_os = "macos")]
 const COLLISION_APP_DEADLINE: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "macos")]
+const SESSION_BRIEF_APP_DEADLINE: Duration = COLLISION_APP_DEADLINE;
+#[cfg(not(target_os = "macos"))]
+const SESSION_BRIEF_APP_DEADLINE: Duration = Duration::from_secs(2);
+
 /// The oldest app answer a hook believes, in milliseconds: twice the age the
 /// app promises to serve ([`insights::COLLISION_MEMO_TTL`]), so a clock hiccup
 /// does not discard a good answer and a wedged or foreign peer cannot hand over
@@ -2378,16 +2383,34 @@ pub fn serve_insights(repo: &str) -> Result<Value, String> {
 /// ledger and the code graph are read here, and neither starts a `git` child.
 #[cfg(target_os = "macos")]
 pub fn insights_from_app(repo: &str) -> Result<(insights::InsightsSnapshot, u64), String> {
+    insights_from_app_within(repo, COLLISION_APP_DEADLINE)
+}
+
+/// [`insights_from_app`] bounded by `deadline`, used by [`run_session_brief`]
+/// so a slow app leaves room inside [`BUDGET`] for the hook's own scan.
+#[cfg(target_os = "macos")]
+pub(crate) fn insights_from_app_within(
+    repo: &str,
+    deadline: Duration,
+) -> Result<(insights::InsightsSnapshot, u64), String> {
     insights_from_app_in(
         scan_profile(repo).ok_or("no profile directory to find the app in")?,
         repo,
-        COLLISION_APP_DEADLINE,
+        deadline,
     )
 }
 
 /// There is no mailbox off macOS; the caller scans for itself.
 #[cfg(not(target_os = "macos"))]
 pub fn insights_from_app(_repo: &str) -> Result<(insights::InsightsSnapshot, u64), String> {
+    Err("only the macOS app answers an insights read".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn insights_from_app_within(
+    _repo: &str,
+    _deadline: Duration,
+) -> Result<(insights::InsightsSnapshot, u64), String> {
     Err("only the macOS app answers an insights read".into())
 }
 
@@ -2700,11 +2723,20 @@ mod test_apps {
     static APPS: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
     pub(super) fn profile_for(root: &str) -> Option<PathBuf> {
-        APPS.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .find(|(repo, _)| repo == Path::new(root))
-            .map(|(_, profile)| profile.clone())
+        let entries = APPS.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let target = Path::new(root);
+        if let Some((_, profile)) = entries.iter().find(|(repo, _)| repo == target) {
+            return Some(profile.clone());
+        }
+        let target_common = crate::engine::git_cli::resolve_git_common_dir(target).ok()?;
+        entries
+            .into_iter()
+            .find(|(repo, _)| {
+                crate::engine::git_cli::resolve_git_common_dir(repo)
+                    .ok()
+                    .is_some_and(|common| common == target_common)
+            })
+            .map(|(_, profile)| profile)
     }
 
     /// Registers `profile` for `repo` until the returned guard drops.
@@ -3121,6 +3153,17 @@ fn shared_dirt_clause(snapshot: &InsightsSnapshot, shared: &insights::SharedWork
 /// `git status` that never ran would be the same lie this module refuses to
 /// tell about collisions, one line further down the page.
 pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> String {
+    session_brief_served(snapshot, here, source, None)
+}
+
+/// [`session_brief`] with the running app's fact source and age (`age_ms`)
+/// included when the snapshot came from the app.
+pub fn session_brief_served(
+    snapshot: &InsightsSnapshot,
+    here: &str,
+    source: &str,
+    app_age_ms: Option<u64>,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "GitPulse brief ({})\nrepo: {}\n",
@@ -3131,6 +3174,9 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         },
         snapshot.repo_path
     ));
+    if let Some(age_ms) = app_age_ms {
+        out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
+    }
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
     // have filled are partial rather than empty.
@@ -3299,6 +3345,16 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
 
 /// Gathers, then renders. The impure half of session-brief.
 pub fn run_session_brief(input: &HookInput) -> HookOutput {
+    run_session_brief_with(input, BUDGET, SESSION_BRIEF_APP_DEADLINE)
+}
+
+/// [`run_session_brief`] with explicit wall-clock budget and app-ask deadline,
+/// so tests exercise timeout and slow-app fallback without waiting seconds.
+fn run_session_brief_with(
+    input: &HookInput,
+    budget: Duration,
+    app_deadline: Duration,
+) -> HookOutput {
     if input.cwd.is_empty() {
         return HookOutput::notice("GitPulse could not brief this session: no cwd was supplied.");
     }
@@ -3309,16 +3365,35 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
     };
     let here = root.to_string_lossy().into_owned();
     let arg = here.clone();
-    let Some(snapshot) = within_budget(BUDGET, move || insights::snapshot(&arg)) else {
+    let effective_budget = clamp_to_total(budget, STARTED.get().copied());
+    let Some((snapshot, app_age_ms)) = within_budget(budget, move || {
+        let started = std::time::Instant::now();
+        let ask_limit = app_deadline.min(effective_budget / 2);
+        match insights_from_app_within(&arg, ask_limit) {
+            Ok((snapshot, age_ms)) => (snapshot, Some(age_ms)),
+            Err(why) => {
+                log::debug!(
+                    target: "hooks",
+                    "session brief: scanning here, the app did not: {why}"
+                );
+                let left = effective_budget.saturating_sub(started.elapsed());
+                let scan_limit = left
+                    .saturating_sub(Duration::from_millis(150))
+                    .max(Duration::from_millis(100))
+                    .min(left);
+                (insights::snapshot_bounded(&arg, scan_limit), None)
+            }
+        }
+    }) else {
         report_agent_session_meta(&here, input);
         return HookOutput::notice(format!(
             "GitPulse could not read this repository within {}s, so this session starts \
              without a repository brief.",
-            BUDGET.as_secs()
+            budget.as_secs()
         ));
     };
     report_agent_session_meta(&here, input);
-    let brief = session_brief(&snapshot, &here, &input.source);
+    let brief = session_brief_served(&snapshot, &here, &input.source, app_age_ms);
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
     let brief = match worktree::setup_failure(&root) {
@@ -3355,6 +3430,9 @@ fn report_agent_session_meta(repo_root: &str, input: &HookInput) {
     let Some(dir) = scan_profile(repo_root) else {
         return;
     };
+    if ask_backoff::holding(&dir, std::time::Instant::now()).is_some() {
+        return;
+    }
     let agent = if input.is_antigravity()
         || std::env::var(AGENT_KIND_ENV)
             .ok()
@@ -8813,6 +8891,376 @@ done
             ..Default::default()
         });
         assert!(output.is_silent());
+    }
+
+    #[cfg(unix)]
+    fn session_start_input(cwd: &str) -> HookInput {
+        HookInput {
+            hook_event_name: SESSION_START.to_string(),
+            cwd: cwd.to_string(),
+            source: "startup".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn brief_context(output: &HookOutput) -> &str {
+        output
+            .hook_specific_output
+            .as_ref()
+            .expect("SessionStart hookSpecificOutput")
+            .additional_context
+            .as_deref()
+            .expect("SessionStart additionalContext")
+    }
+
+    /// AC1 & AC4: with a fresh answer from the running app, session start
+    /// spawns zero `git` children for worktree listing or status (even from a
+    /// linked worktree or a cold hook process on a bound ledger), and states
+    /// the app source and age in the brief. Trust is checked first: an
+    /// untrusted repository is refused by the app and gets nothing more than
+    /// the hook's own fail-closed read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_session_start_with_a_fresh_app_spawns_no_git_children_and_states_its_source_and_age() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let farm = farm(false);
+        std::fs::write(Path::new(&farm.repo).join("here.txt"), "dirty here").expect("dirty main");
+        let mut canned = serve_insights(&farm.repo).expect("the app reads");
+        canned["age_ms"] = json!(340);
+
+        let app = app_for(&farm.repo, false);
+        let reply = canned.clone();
+        app._owner
+            .attach_insights(Arc::new(move |_| Ok(reply.clone())));
+
+        let marks = spawn_marks(&farm.dirs);
+        let output = run_session_brief_with(
+            &session_start_input(&farm.repo),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let with_app = spawn_cost(&farm.dirs, &marks);
+        assert_eq!(
+            (with_app.worktree_list, with_app.status, with_app.other),
+            (0, 0, 0),
+            "app-served SessionStart must spawn zero git children: {with_app:?}"
+        );
+        let brief = brief_context(&output);
+        assert!(
+            brief.contains("served by: app (age 340 ms)"),
+            "brief must state app source and age: {brief}"
+        );
+        assert!(
+            brief.contains("worktrees: 7 total, 7 of 7 scanned, 7 with uncommitted work"),
+            "{brief}"
+        );
+        assert!(brief.contains("uncommitted here: 1 file(s)"), "{brief}");
+
+        // Live `serve_insights` handler end-to-end from a linked worktree:
+        // shared test registration resolves the repo's common directory.
+        let linked = farm.sibling_dirs[0].to_string_lossy().into_owned();
+        let mut linked_canned = serve_insights(&linked).expect("app reads linked worktree");
+        linked_canned["age_ms"] = json!(125);
+        app._owner
+            .attach_insights(Arc::new(move |_| Ok(linked_canned.clone())));
+        let marks = spawn_marks(&farm.dirs);
+        let linked_output =
+            run_session_brief_with(&session_start_input(&linked), unhurried(), unhurried() / 2);
+        let linked_cost = spawn_cost(&farm.dirs, &marks);
+        assert_eq!(
+            (
+                linked_cost.worktree_list,
+                linked_cost.status,
+                linked_cost.other
+            ),
+            (0, 0, 0),
+            "linked-worktree app-served SessionStart must spawn zero git children: {linked_cost:?}"
+        );
+        let linked_brief = brief_context(&linked_output);
+        assert!(
+            linked_brief.contains("served by: app (age 125 ms)"),
+            "{linked_brief}"
+        );
+        assert!(linked_brief.contains("branch here: b0"), "{linked_brief}");
+        assert!(
+            linked_brief.contains("main worktree branch: main"),
+            "{linked_brief}"
+        );
+        assert!(
+            linked_brief.contains("uncommitted here: 1 file(s)"),
+            "{linked_brief}"
+        );
+
+        // Real live `serve_insights` handler across main and linked worktree:
+        app._owner.attach_insights(Arc::new(serve_insights));
+        let live_main = run_session_brief_with(
+            &session_start_input(&farm.repo),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let live_brief = brief_context(&live_main);
+        assert!(live_brief.contains("served by: app (age "), "{live_brief}");
+
+        // Bound repository with an initialized ledger, simulating a brand-new
+        // hook process whose in-process and on-disk family caches were cleared:
+        // `snapshot_from_app` verifies the listing from metadata and spawns 0 git children.
+        let bound = BoundFarm::new(2);
+        let mut bound_canned = serve_insights(&bound.farm.repo).expect("app reads bound farm");
+        bound_canned["age_ms"] = json!(80);
+        bound.fresh_process();
+        let empty_memory = tempfile::tempdir().expect("empty family memory");
+        std::fs::set_permissions(empty_memory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private dir");
+        let _clean_disk = crate::engine::worktree::family_disk_dir::set(empty_memory.path());
+        let bound_app = app_for(&bound.farm.repo, false);
+        bound_app
+            ._owner
+            .attach_insights(Arc::new(move |_| Ok(bound_canned.clone())));
+        let marks = spawn_marks(&bound.farm.dirs);
+        let bound_out = run_session_brief_with(
+            &session_start_input(&bound.farm.repo),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let bound_cost = spawn_cost(&bound.farm.dirs, &marks);
+        assert_eq!(
+            (
+                bound_cost.worktree_list,
+                bound_cost.status,
+                bound_cost.other
+            ),
+            (0, 0, 0),
+            "bound cold SessionStart must spawn zero git children: {bound_cost:?}"
+        );
+        let bound_brief = brief_context(&bound_out);
+        assert!(
+            bound_brief.contains("served by: app (age 80 ms)"),
+            "{bound_brief}"
+        );
+        assert!(bound_brief.contains("ledger: readable"), "{bound_brief}");
+
+        // `validate_repo` first: an untrusted repository gets no app answer
+        // and no more information than when no app is running.
+        let untrusted = tempfile::tempdir().expect("untrusted repo");
+        crate::test_support::git_in(untrusted.path(), &["init", "-b", "main"]);
+        let untrusted_path = untrusted
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        crate::repository_trust::revoke(&untrusted_path).expect("revoke trust");
+        let alone_untrusted = run_session_brief_with(
+            &session_start_input(&untrusted_path),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let untrusted_app = app_for(&untrusted_path, false);
+        untrusted_app
+            ._owner
+            .attach_insights(Arc::new(serve_insights));
+        let with_app_untrusted = run_session_brief_with(
+            &session_start_input(&untrusted_path),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let untrusted_brief = brief_context(&with_app_untrusted);
+        assert!(
+            !untrusted_brief.contains("served by: app"),
+            "an untrusted repo must never be served by the app: {untrusted_brief}"
+        );
+        assert_eq!(
+            untrusted_brief,
+            brief_context(&alone_untrusted),
+            "untrusted repo brief differed with app attached"
+        );
+    }
+
+    /// AC2: with the app absent or slow, session start still produces the
+    /// full brief by its own scan within budget, and a slow app costs only
+    /// one deadline (never one per facet, nor a second wait on follow-up).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_session_start_with_an_absent_or_slow_app_scans_within_budget_and_pays_one_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let farm = farm(false);
+        std::fs::write(Path::new(&farm.repo).join("here.txt"), "dirty").expect("dirty main");
+
+        // Absent app: hook scans itself and produces a complete brief.
+        let marks = spawn_marks(&farm.dirs);
+        let absent_out = run_session_brief_with(
+            &session_start_input(&farm.repo),
+            unhurried(),
+            Duration::from_millis(200),
+        );
+        let absent_cost = spawn_cost(&farm.dirs, &marks);
+        assert!(
+            absent_cost.worktree_list >= 1 && absent_cost.status > SIBLINGS,
+            "absent app fallback did not scan: {absent_cost:?}"
+        );
+        let absent_brief = brief_context(&absent_out);
+        assert!(!absent_brief.contains("served by: app"), "{absent_brief}");
+        assert!(
+            absent_brief.contains("worktrees: 7 total, 7 of 7 scanned, 7 with uncommitted work"),
+            "{absent_brief}"
+        );
+        assert!(
+            absent_brief.contains("uncommitted here: 1 file(s)"),
+            "{absent_brief}"
+        );
+
+        // Slow app: blocks past `app_deadline`, paid at most once, then the
+        // hook finishes its own scan well before `budget` runs out.
+        let app = app_for(&farm.repo, false);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let app_deadline = crate::test_support::coverage_relaxed(Duration::from_millis(200));
+        let budget = crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let lateness = app_deadline * 12;
+        let (_gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
+        app._owner.attach_insights(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::AcqRel);
+            let _ = gate_rx.lock().expect("gate").recv_timeout(lateness);
+            Err("too late".into())
+        }));
+
+        let started = std::time::Instant::now();
+        let slow_out =
+            run_session_brief_with(&session_start_input(&farm.repo), budget, app_deadline);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            asked.load(Ordering::Acquire),
+            1,
+            "a slow app must cost one deadline, never one per facet"
+        );
+        assert!(
+            elapsed < lateness,
+            "hook waited {elapsed:?} past one app deadline ({lateness:?})"
+        );
+        assert!(
+            elapsed < budget,
+            "hook exceeded budget {budget:?}: {elapsed:?}"
+        );
+        assert!(
+            slow_out.system_message.is_none(),
+            "expected a real brief rather than timeout notice: {:?}",
+            slow_out.system_message
+        );
+        let slow_brief = brief_context(&slow_out);
+        assert!(!slow_brief.contains("served by: app"), "{slow_brief}");
+        assert!(
+            slow_brief.contains("worktrees: 7 total, 7 of 7 scanned, 7 with uncommitted work"),
+            "{slow_brief}"
+        );
+        assert!(
+            slow_brief.contains("uncommitted here: 1 file(s)"),
+            "{slow_brief}"
+        );
+
+        // Immediate follow-up against the same wedged socket skips asking altogether.
+        let follow_out =
+            run_session_brief_with(&session_start_input(&farm.repo), budget, app_deadline);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+        assert!(brief_context(&follow_out).contains("7 of 7 scanned"));
+    }
+
+    /// AC3: a partial or missing-facet answer from the app leaves the missing
+    /// facets to the hook's own scan and never renders an unscannable facet or
+    /// worktree as clean.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_partial_app_answer_leaves_missing_facets_to_the_hooks_own_scan_and_never_renders_them_as_clean(
+    ) {
+        use std::sync::Arc;
+
+        let farm = farm(false);
+        std::fs::write(Path::new(&farm.repo).join("here.txt"), "dirty").expect("dirty main");
+        let canned = serve_insights(&farm.repo).expect("app reads");
+
+        let partials: [fn(&mut Value); 6] = [
+            |r| {
+                r["changes"] = Value::Null;
+                r["not_scanned"] = json!([{"facet": "changes", "reason": "status failed"}]);
+            },
+            |r| {
+                r["worktrees"] = Value::Null;
+                r["agents"] = Value::Null;
+                r["collisions"] = Value::Null;
+                r["not_scanned"] = json!([
+                    {"facet": "worktrees", "reason": "worktree list failed"},
+                    {"facet": "agents", "reason": "worktree list failed"},
+                    {"facet": "collisions", "reason": "worktree list failed"}
+                ]);
+            },
+            |r| r["deadline_expired"] = json!(true),
+            |r| r["collisions"]["unscanned_worktrees"] = json!(2),
+            |r| r["collisions"]["failed_worktrees"] = json!(1),
+            |r| r["worktrees"]["dirty_unknown"] = json!(1),
+        ];
+
+        for edit in partials {
+            let mut reply = canned.clone();
+            edit(&mut reply);
+            let app = app_for(&farm.repo, false);
+            app._owner
+                .attach_insights(Arc::new(move |_| Ok(reply.clone())));
+
+            let marks = spawn_marks(&farm.dirs);
+            let output = run_session_brief_with(
+                &session_start_input(&farm.repo),
+                unhurried(),
+                unhurried() / 2,
+            );
+            let cost = spawn_cost(&farm.dirs, &marks);
+            assert!(
+                cost.status > 0,
+                "partial app answer did not fall back to the hook's own scan: {cost:?}"
+            );
+            let brief = brief_context(&output);
+            assert!(!brief.contains("served by: app"), "{brief}");
+            assert!(
+                brief.contains("uncommitted here: 1 file(s)"),
+                "fallback must measure real uncommitted work: {brief}"
+            );
+            assert!(
+                brief.contains("worktrees: 7 total, 7 of 7 scanned, 7 with uncommitted work"),
+                "{brief}"
+            );
+        }
+
+        // When one sibling worktree genuinely cannot be scanned on disk, neither
+        // the app nor the hook may ever render it as clean or `7 of 7 scanned`.
+        let broken_dotgit = farm.sibling_dirs[0].join(".git");
+        std::fs::write(&broken_dotgit, "gitdir: /nonexistent/broken-wt\n")
+            .expect("break sibling gitdir");
+        let app = app_for(&farm.repo, false);
+        app._owner.attach_insights(Arc::new(serve_insights));
+        let partial_out = run_session_brief_with(
+            &session_start_input(&farm.repo),
+            unhurried(),
+            unhurried() / 2,
+        );
+        let partial_brief = brief_context(&partial_out);
+        assert!(
+            !partial_brief.contains("served by: app"),
+            "partial app answer must not report served by: app: {partial_brief}"
+        );
+        assert!(
+            partial_brief.contains("6 of 7 scanned") && partial_brief.contains("1 unmeasured"),
+            "unreadable worktree must stay unmeasured, never scanned/clean: {partial_brief}"
+        );
+        assert!(
+            partial_brief.contains("[partial scan]")
+                || partial_brief.contains("collisions: UNAVAILABLE"),
+            "collision line must disclose partial scan: {partial_brief}"
+        );
     }
 
     /* ── wire shape and dispatch ──────────────────────────────────────────── */

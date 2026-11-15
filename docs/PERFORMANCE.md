@@ -851,6 +851,72 @@ on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
 
+## 2026-11-14: SessionStart brief asks the running app first (ft-d8b01d55)
+
+Previously, every `SessionStart` hook (`hooks::run_session_brief`) called
+`insights::snapshot` directly, listing all worktrees and running `git status`
+across every checkout even when GitPulse was running and already held a fresh
+read of the same facts (`17` worktrees on this repository on 2026-11-10, `24`
+`git` children per session start on a 17-worktree synthetic repository).
+
+**Shape and single-deadline bound.** `hooks::run_session_brief`
+(`src-tauri/src/hooks/mod.rs`) delegates to `run_session_brief_with`, which asks
+the running app once over the collision-guard mailbox (`Request::InsightsRead`)
+via `insights_from_app_within(&arg, ask_limit)` where
+`ask_limit = SESSION_BRIEF_APP_DEADLINE.min(effective_budget / 2)`
+(`SESSION_BRIEF_APP_DEADLINE` is 2 s, `BUDGET` is 5 s, `TOTAL_BUDGET` is 8 s).
+When the app answers with all four facets (`worktrees`, `agents`, `changes`,
+`collisions`) within `INSIGHTS_MAX_AGE_MS` (4 s), `session_brief_served` renders
+`served by: app (age <N> ms)` immediately below `repo:`. When the app is absent,
+slow, stale, or partial, the hook falls back to
+`insights::snapshot_bounded(&arg, scan_limit)` within the remaining wall-clock
+budget so a slow app costs at most one deadline (never one per facet), and
+`report_agent_session_meta` checks `ask_backoff::holding` so a slow or absent
+app does not incur a second mailbox wait on session metadata registration.
+
+**Zero-`git`-child completion and linked-worktree sharing.** Inside a cold hook
+process, `ledger::bindings::repository_status_readonly` resolves the repository's
+worktree family, which previously fell back to `git worktree list` because the
+per-process disk cache was empty. `insights::app_facets::snapshot_from_app`
+(`src-tauri/src/insights/app_facets.rs`) now passes non-truncated app worktree
+member paths to `engine::worktree::remember_verified_member_paths`
+(`src-tauri/src/engine/worktree.rs`), which checks `admit_worktree_pair` and
+set equality against `.git/worktrees/*/gitdir` metadata
+(`registered_checkouts`) before populating the in-process and disk family
+caches with zero `git` spawns. `CollisionMemo::memo_key`
+(`src-tauri/src/insights/collision_memo.rs`) runs `validate_repo` first and keys
+trusted checkouts on `resolve_git_common_dir` so linked worktrees share the
+family's listing memo instead of miskeying by checkout path.
+
+**Trust and honesty invariants.** `validate_repo` runs first in both the hook's
+ledger/graph steps and `insights::app_facets::serve`; an untrusted repository
+is refused by the app and produces the exact same brief as when no app is running.
+Partial or uncounted replies (`not_scanned` non-empty, `deadline_expired`,
+`unscanned_worktrees > 0`, `failed_worktrees > 0`, or `dirty_unknown > 0`) are
+rejected by `snapshot_from_app`, leaving missing facets to the hook's own scan
+so `N of N scanned`, `[partial scan]`, and `UNAVAILABLE` remain truthful.
+
+**Measured** (`src-tauri/tests/session_brief_bench.rs`,
+`session_brief_cost_before_and_after`, release `gitpulse-hook` binaries built
+from `HEAD` before vs this change, `n = 15` interleaved pairs alternating order
+across 17 worktrees = 1 main + 16 dirty linked siblings, per-process caches
+cleared before every sample, load average `{ 31.59 36.82 39.64 }` before and
+`{ 30.29 36.05 39.24 }` after):
+
+| variant | `n` | min ms | p50 ms | max ms | `worktree list` / call | `status` / call | other `git` / call | total `git` (`15` calls) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before (hook scans itself) | 15 | 258.02 ms | 305.58 ms | 507.30 ms | 1 | 17 | 6 | 360 (`24` / call) |
+| after (served by running app) | 15 | 38.49 ms | 50.22 ms | 557.14 ms | 0 | 0 | 0 | 0 (`0` / call) |
+
+The cold linked-worktree probe (`sibling-0`) in the same run also spawned `0`
+`git` children and rendered `served by: app (age ...)`. Reproduce with:
+
+```text
+GITPULSE_BENCH_HOOK_BEFORE="$BEFORE_HOOK" \
+GITPULSE_BENCH_HOOK_AFTER="$AFTER_HOOK" \
+cargo test --release --manifest-path src-tauri/Cargo.toml --test session_brief_bench session_brief_cost_before_and_after -- --ignored --nocapture
+```
+
 ## 2026-11-09: `gitpulse_insights` asks the app first (perf1109-mcp-asks-app)
 
 Every agent session has its own `gitpulse-mcp`, and each keeps its own
@@ -1000,11 +1066,12 @@ request to take UI-priority git slots, and a handler that cannot finish in
 1.6 s answers "not scanned" and frees its slot (the readings it abandons are
 capped at four).
 
-**Why a hook process scanned while the app was up (still unproven for the
-sampled pid).** One path never asks: `run_session_brief` calls
-`insights::snapshot` directly, so every SessionStart hook runs a full worktree
-scan whatever the app is doing. The other ways collision-guard itself scans are
-all logged at debug level (`collision guard: scanning here, the app did not:
+**Why a hook process scanned while the app was up (historical, 2026-11-09).** At
+the time of the 2026-11-09 sample, one path never asked: `run_session_brief`
+called `insights::snapshot` directly, so every `SessionStart` hook ran a full
+worktree scan whatever the app was doing (fixed in `ft-d8b01d55`, which routes
+`run_session_brief` through the ask-the-app-first path above). The other ways
+collision-guard itself scans are all logged at debug level (`collision guard: scanning here, the app did not:
 why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
 verdicts), the mailbox's 24-connection admission (a connection past it is closed
 without a greeting), an answer older than 10 s, a reply that read no worktree,

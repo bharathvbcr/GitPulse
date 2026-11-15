@@ -1054,6 +1054,13 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
     snapshot_within(repo_path, SNAPSHOT_DEADLINE, MAX_SNAPSHOT_WORKTREES)
 }
 
+/// [`snapshot`] bounded by `deadline` instead of [`SNAPSHOT_DEADLINE`], for a
+/// caller whose own budget is shorter (such as `SessionStart` after waiting on
+/// a slow app).
+pub(crate) fn snapshot_bounded(repo_path: &str, deadline: Duration) -> InsightsSnapshot {
+    snapshot_within(repo_path, deadline, MAX_SNAPSHOT_WORKTREES)
+}
+
 /// [`snapshot`] with the deadline and the worktree cap as arguments, so both
 /// partial-snapshot paths are reachable in a test without a pathological
 /// repository. Sixty-five real worktrees to prove one boolean would be a slow,

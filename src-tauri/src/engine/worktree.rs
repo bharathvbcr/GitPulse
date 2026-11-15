@@ -401,6 +401,61 @@ fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFam
     );
 }
 
+/// Remembers a worktree family from an already-completed non-bare listing (such
+/// as `list_worktrees_lite` or a running app's `AppFacets` answer) when
+/// repository trust, the common directory and filesystem metadata independently
+/// confirm every member. Costs zero `git` children and silently no-ops whenever
+/// metadata cannot prove the set whole, leaving [`resolve_worktree_family`] to
+/// ask Git.
+pub(crate) fn remember_verified_member_paths(repo_path: &str, member_paths: &[&str]) {
+    let Ok(pair) = admit_worktree_pair(repo_path, repo_path) else {
+        return;
+    };
+    let Some(registered) = pair.registered_checkouts() else {
+        return;
+    };
+    let Some(anchor) = registered.first().cloned() else {
+        return;
+    };
+    let mut registry = registered;
+    registry.sort();
+    registry.dedup();
+    if !registry.contains(&pair.repo) {
+        return;
+    }
+
+    let mut canonical_members = Vec::with_capacity(member_paths.len());
+    for member in member_paths {
+        match std::fs::canonicalize(member) {
+            Ok(canonical) => canonical_members.push(canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return,
+        }
+    }
+    let mut as_set = canonical_members.clone();
+    as_set.sort();
+    as_set.dedup();
+    if as_set != registry {
+        return;
+    }
+
+    let mut members = Vec::with_capacity(canonical_members.len().max(1));
+    members.push(anchor.clone());
+    for member in canonical_members {
+        if member != anchor && !members.contains(&member) {
+            members.push(member);
+        }
+    }
+
+    let family = WorktreeFamily {
+        anchor,
+        worktree: pair.worktree,
+        members,
+    };
+    super::worktree_family_disk::store(&pair.common, &registry, &family.members);
+    remember_family(pair.common, registry, &family);
+}
+
 /// Largest repository `config` [`AdmittedPair::metadata_checkouts`] reads.
 const MAX_CONFIG_SCAN: u64 = 64 * 1024;
 
@@ -2172,6 +2227,14 @@ fn scan_listing(
     let repo = validate_repo(repo_path)?;
     let pass = ScanPass::asked_at(not_before);
     let parsed = read_worktree_entries(&repo)?;
+    let member_paths: Vec<&str> = parsed
+        .iter()
+        .filter(|entry| !entry.is_bare)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    if let Some(repo_str) = repo.to_str() {
+        remember_verified_member_paths(repo_str, &member_paths);
+    }
     if depth == ScanDepth::Listing {
         return Ok(parsed
             .into_iter()
