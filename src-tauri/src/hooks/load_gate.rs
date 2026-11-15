@@ -235,20 +235,28 @@ fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) ->
     }
     let Some(heavy) = classified.heavy.as_ref() else {
         if classified.unreadable {
-            return advice(
-                "GitPulse did NOT load-check this command: it could not read the command line \
-                 (an unterminated quote, or longer than it reads).",
-            );
+            let why = "it could not read the command line (an unterminated quote, or longer than it reads)";
+            return match first_notice(g, input, why) {
+                Notice::Repeat => HookOutput::silent(),
+                notice => advice(&format!(
+                    "GitPulse did NOT load-check this command: {why}.{}",
+                    notice.suffix()
+                )),
+            };
         }
         return advise_rows(classified, &g.availability);
     };
     match &g.availability {
-        Availability::Unavailable(why) => advice(&format!(
-            "GitPulse did NOT load-check this heavy command ({}): {why}. The host may be \
-             overloaded; run it once, not alongside other builds{}.",
-            heavy.label,
-            cap_sentence(heavy)
-        )),
+        Availability::Unavailable(why) => match first_notice(g, input, why) {
+            Notice::Repeat => HookOutput::silent(),
+            notice => advice(&format!(
+                "GitPulse did NOT load-check this heavy command ({}): {why}. The host may be \
+                 overloaded; run it once, not alongside other builds{}.{}",
+                heavy.label,
+                cap_sentence(heavy),
+                notice.suffix()
+            )),
+        },
         Availability::Verdict {
             verdict,
             state,
@@ -365,6 +373,51 @@ fn deny_count(g: &Gathered, input: &HookInput) -> Option<usize> {
         &input.command,
         g.now,
     )
+}
+
+/// Whether a "did NOT load-check" notice has been said already.
+enum Notice {
+    /// Said before in this session for this reason: say nothing now.
+    Repeat,
+    /// Said now, and will not be again in this session.
+    Once,
+    /// Said now, and may be said again: there is no session to count it
+    /// against, or the marker could not be kept. Never silence.
+    Always,
+}
+
+impl Notice {
+    fn suffix(&self) -> &'static str {
+        match self {
+            Self::Once => " This will not repeat for this session unless the reason changes.",
+            Self::Repeat | Self::Always => "",
+        }
+    }
+}
+
+/// An exclusive marker per (session, reason) in the same private directory as
+/// the loop breaker's, so a notice that cannot change is said once rather than
+/// on every heavy command. Every way of not knowing (no session id, a directory
+/// that cannot be made private, a marker that cannot be written) says it
+/// again: a repeat is the safe direction to be wrong in, and silence is the
+/// failure this notice exists to prevent.
+fn first_notice(g: &Gathered, input: &HookInput, reason: &str) -> Notice {
+    if !plain_token(&input.session_id) || private_dir(&g.state_dir).is_err() {
+        return Notice::Always;
+    }
+    let name = format!("loadnote-{}-{:016x}", input.session_id, fnv1a(reason));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(g.state_dir.join(name))
+    {
+        Ok(_) => {
+            prune(&g.state_dir, g.now);
+            Notice::Once
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Notice::Repeat,
+        Err(_) => Notice::Always,
+    }
 }
 
 fn plain_token(text: &str) -> bool {

@@ -562,8 +562,8 @@ gate are combined, so the harness's 5 s budget expiring cannot drop it.
 | heavy | not admitted; sensor fresh or stale-recent | `enforce`: **deny** with a reason; `advise`: the same text as context |
 | heavy | elevated, admitted | one line of advice, with the capped form |
 | heavy | clear | nothing |
-| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older GitPulse), measurement switched off | one line: **not** load-checked, and why. Never a refusal |
-| heavy, but the line could not be read | | the same "not load-checked" line |
+| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older GitPulse), measurement switched off | one line: **not** load-checked, and why, said once per session per distinct reason (an exclusive `loadnote-<session>-<reason>` marker in the same private directory as the loop breaker's; the line says it will not repeat). With no session id, or a directory that cannot keep the marker, it is said every time, never dropped. Never a refusal |
+| heavy, but the line could not be read | | the same "not load-checked" line, once per session |
 | `grep -r` with `-z`/`-a`/`--null-data` or no `--exclude-dir`; `rg -uu`/`--no-ignore` with no `-g '!…'`; `go test ./...` or `-fuzz` with no `-timeout`; `python` with `train` or `bench` in its argv | elevated or severe | one line of advice. Never a refusal; silent on a quiet host |
 
 Heavy is a table (`ROWS`), not branching: `cargo` build/b/check/c/clippy/test/t/

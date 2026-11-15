@@ -884,3 +884,97 @@ fn the_session_brief_line_says_what_the_snapshot_says_and_what_it_could_not_read
         assert!(line.contains("not load-checked"), "{line}");
     }
 }
+
+fn advises(out: &HookOutput) -> bool {
+    decision_of(out).is_none() && context(out).contains("did NOT load-check")
+}
+
+#[test]
+fn a_not_checked_notice_is_said_once_per_session_per_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let no_sampler = gathered(Availability::Unavailable("no sampler".into()), dir.path());
+    let first = judged("cargo test", &no_sampler);
+    assert!(advises(&first), "{first:?}");
+    assert!(
+        context(&first).contains("will not repeat for this session"),
+        "{}",
+        context(&first)
+    );
+    // The same reason, the same session, even for a different heavy command.
+    assert!(judged("cargo test", &no_sampler).is_silent());
+    assert!(judged("npm run test:browser", &no_sampler).is_silent());
+    // A different reason is news.
+    let older = gathered(
+        Availability::Unavailable("the snapshot carries no governor verdict".into()),
+        dir.path(),
+    );
+    assert!(advises(&judged("cargo test", &older)));
+    assert!(judged("cargo test", &older).is_silent());
+    // A different session is told again.
+    let mut other = call("cargo test");
+    other.session_id = "00000000-aaaa-4bbb-8ccc-dddddddddddd".into();
+    assert!(advises(&judge(&other, || no_sampler.clone())));
+    // The unreadable-line notice follows the same rule, with its own reason.
+    let unreadable = judged("cargo test \"oops", &no_sampler);
+    assert!(advises(&unreadable) && context(&unreadable).contains("will not repeat"));
+    assert!(judged("cargo test \"oops", &no_sampler).is_silent());
+    // A refusal is never muted by any of this.
+    assert_eq!(
+        decision_of(&judged("cargo test", &severe(dir.path()))),
+        Some(PermissionDecision::Deny)
+    );
+}
+
+#[test]
+fn a_notice_that_cannot_be_counted_is_said_every_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = gathered(Availability::Unavailable("no sampler".into()), dir.path());
+    // No session id: nothing to count against.
+    let mut anonymous = call("cargo test");
+    anonymous.session_id.clear();
+    for _ in 0..3 {
+        let out = judge(&anonymous, || g.clone());
+        assert!(
+            advises(&out) && !context(&out).contains("will not repeat"),
+            "{out:?}"
+        );
+    }
+    // A session id that is not a plain token cannot name a marker.
+    let mut odd = call("cargo test");
+    odd.session_id = "../escape".into();
+    assert!(advises(&judge(&odd, || g.clone())) && advises(&judge(&odd, || g.clone())));
+    // A dedupe directory that is a file, or that anyone can write, or cannot be read.
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let mut broken = g.clone();
+    broken.state_dir = file;
+    for _ in 0..2 {
+        assert!(advises(&judged("cargo test", &broken)));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut shared = g.clone();
+        shared.state_dir = open;
+        for _ in 0..2 {
+            assert!(advises(&judged("cargo test", &shared)));
+        }
+        let sealed = dir.path().join("sealed");
+        let mut locked = g.clone();
+        locked.state_dir = sealed.clone();
+        assert!(advises(&judged("cargo test", &locked)));
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // The marker for this reason exists; a read-only directory cannot take a new one.
+        let mut other = call("cargo build");
+        other.session_id = "11111111-aaaa-4bbb-8ccc-dddddddddddd".into();
+        let out = judge(&other, || locked.clone());
+        assert!(
+            advises(&out),
+            "an unwritable directory must advise, not go silent: {out:?}"
+        );
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
