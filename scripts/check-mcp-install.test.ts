@@ -9,6 +9,9 @@ import {
   SERVER_BIN,
   classify,
   classifyHook,
+  classifyLease,
+  formatReport,
+  probeLease,
   classifyPluginCache,
   declaredHookSubcommands,
   parseArgs,
@@ -573,5 +576,62 @@ describe("the installed plugin cache", () => {
     expect(classifyPluginCache(install(repo), repo).status).toBe("ok");
     expect(parseArgs(["--claude-dir", "/tmp/x"]).claudeDir).toBe("/tmp/x");
     expect(parseArgs([]).claudeDir).toBeUndefined();
+  });
+});
+
+describe("the lease row", () => {
+  const binDir = "/c/lease-bin";
+  const link = "/c/lease-bin/cargo";
+
+  it("passes only when a login shell finds the wrapper's own link first", () => {
+    expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: link, error: null }).status).toBe("gated");
+  });
+
+  it("never prints ok for a cargo that shadows the link", () => {
+    const verdict = classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: "/home/u/.claude-bin/cargo", error: null });
+    expect(verdict.status).toBe("shadowed");
+    expect(verdict.detail).toContain("/home/u/.claude-bin/cargo");
+    const report = formatReport({
+      binPath: null, version: null, storeSchema: null, expected: "1", expectedSchema: 1, status: "absent", violations: [],
+      lease: { ...verdict, resolved: "/home/u/.claude-bin/cargo", ok: false },
+    } as never);
+    expect(report).toContain("shadowed by /home/u/.claude-bin/cargo");
+    expect(report).toContain("FAIL (shadowed)");
+    expect(report).not.toContain("a login shell runs GitPulse's lease wrapper");
+  });
+
+  it("says absent when the app made no links, and unverifiable when the shell could not be asked", () => {
+    expect(classifyLease({ binDir, linkTarget: null, resolved: null, error: null }).status).toBe("absent");
+    expect(classifyLease({ binDir, linkTarget: "/x", resolved: null, error: "exit 1" }).status).toBe("unverifiable");
+  });
+
+  it("asks a real login shell, and sees a profile that puts another cargo first", async () => {
+    const root = await scratchDir("lease");
+    const bin = path.join(root, "lease-bin");
+    const other = path.join(root, "other");
+    await mkdir(bin);
+    await mkdir(other);
+    const hook = path.join(root, "gitpulse-hook");
+    await writeFile(hook, "#!/bin/sh\n");
+    await chmod(hook, 0o755);
+    const { symlink } = await import("node:fs/promises");
+    await symlink(hook, path.join(bin, "cargo"));
+    const shim = path.join(other, "cargo");
+    await writeFile(shim, "#!/bin/sh\n");
+    await chmod(shim, 0o755);
+    // A shell whose "profile" prepends the other folder, as the owner's does.
+    const shell = path.join(root, "fakeshell");
+    await writeFile(shell, `#!/bin/sh\nPATH="${other}:$PATH"\nexec /bin/sh -c "$2"\n`);
+    await chmod(shell, 0o755);
+    const shadowed = probeLease(bin, { shell });
+    expect(classifyLease(shadowed).status).toBe("shadowed");
+    expect(shadowed.resolved).toBe(shim);
+    // And a shell that leaves PATH alone finds the link first.
+    const plain = path.join(root, "plainshell");
+    await writeFile(plain, '#!/bin/sh\nexec /bin/sh -c "$2"\n');
+    await chmod(plain, 0o755);
+    expect(classifyLease(probeLease(bin, { shell: plain })).status).toBe("gated");
+    // No link: absent, and the shell is never run.
+    expect(classifyLease(probeLease(path.join(root, "nowhere"), { shell })).status).toBe("absent");
   });
 });

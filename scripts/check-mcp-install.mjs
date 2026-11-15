@@ -60,8 +60,8 @@
  *   --timeout <ms>     identity budget (default 10000)
  *   --json             machine-readable result
  */
-import { spawn } from "node:child_process";
-import { accessSync, constants, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -806,6 +806,80 @@ export function readRepoHooks(root = REPO_ROOT) {
   }
 }
 
+
+/**
+ * Where the app keeps its per-user state (`tool_config::default_config_dir`).
+ *
+ * @param {{ home?: string, platform?: string, xdg?: string | undefined }} [env]
+ */
+export function appConfigDir({ home = homedir(), platform = process.platform, xdg = process.env.XDG_CONFIG_HOME } = {}) {
+  if (platform === "darwin") return path.join(home, "Library", "Application Support", "GitPulse");
+  return path.join(xdg || path.join(home, ".config"), "gitpulse");
+}
+
+/**
+ * Whether a `cargo` an agent runs would go through GitPulse's build-lease
+ * wrapper: `lease-bin/cargo` is a link the app makes, and an agent's PATH
+ * starts with that folder. Whether it still does by the time a shell runs the
+ * build is a question for a login shell (a profile that puts another `cargo`
+ * ahead, such as the owner's own slot-gate shim, shadows it), so `resolved` is
+ * what such a shell finds for `cargo` with the folder put first.
+ *
+ *   gated      the shell finds the wrapper's link first
+ *   shadowed   it finds another cargo first (named): builds are not leased
+ *   absent     the app has not made the link (not running, or never installed)
+ *   unverifiable  the shell could not be asked
+ *
+ * Only `gated` is a pass. `absent` is a note that this half did not run, as
+ * for the plugin cache; `shadowed` and `unverifiable` fail.
+ *
+ * @param {{ binDir: string, linkTarget: string | null, resolved: string | null, error: string | null }} observed
+ * @returns {{ status: "gated" | "shadowed" | "absent" | "unverifiable", detail: string }}
+ */
+export function classifyLease({ binDir, linkTarget, resolved, error }) {
+  const link = path.join(binDir, "cargo");
+  if (linkTarget === null) {
+    return { status: "absent", detail: `${link} does not exist: GitPulse has not made its lease links, so builds are not leased` };
+  }
+  if (resolved === null) {
+    return { status: "unverifiable", detail: `could not ask a login shell which cargo it runs${error ? ` (${error})` : ""}` };
+  }
+  if (resolved === link) return { status: "gated", detail: `cargo resolves to ${link}` };
+  return {
+    status: "shadowed",
+    detail: `a login shell runs ${resolved} before ${link}: builds through it are not leased (put ${binDir} ahead of it in the profile, or retire that shim)`,
+  };
+}
+
+/**
+ * Asks a login shell what `cargo` is with the lease folder put first, the way
+ * an agent's PATH is set, so a profile that prepends another folder shows.
+ *
+ * @param {string} binDir
+ * @param {{ shell?: string, timeoutMs?: number }} [opts]
+ */
+export function probeLease(binDir, { shell = process.env.SHELL || "/bin/zsh", timeoutMs = 15_000 } = {}) {
+  /** @type {string | null} */
+  let linkTarget = null;
+  try {
+    linkTarget = realpathSync(path.join(binDir, "cargo"));
+    readlinkSync(path.join(binDir, "cargo"));
+  } catch {
+    linkTarget = null;
+  }
+  if (linkTarget === null) return { binDir, linkTarget, resolved: null, error: null };
+  const asked = spawnSync(shell, ["-lc", "command -v cargo"], {
+    env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
+    encoding: "utf8",
+    timeout: timeoutMs,
+  });
+  const out = (asked.stdout ?? "").trim().split("\n").pop() ?? "";
+  if (asked.error || asked.status !== 0 || out === "") {
+    return { binDir, linkTarget, resolved: null, error: asked.error?.message ?? `exit ${asked.status}` };
+  }
+  return { binDir, linkTarget, resolved: out, error: null };
+}
+
 /**
  * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] } }} result
  */
@@ -851,6 +925,12 @@ export function formatReport(result) {
       for (const violation of pluginCache.violations) lines.push(`    ${pluginCache.status === "absent" ? "" : "- "}${violation}`);
     }
   }
+  const lease = result.lease;
+  if (lease) {
+    lines.push("", "  build leases", "");
+    lines.push(`  ${"lease: ".trim().padEnd(26)} : ${lease.status === "gated" ? "gated" : lease.status === "shadowed" ? `shadowed by ${lease.resolved}` : lease.status}`);
+    lines.push(`  ${"detail".padEnd(26)} : ${lease.detail}`);
+  }
   // Each half gets its own verdict line. Collapsing them into one would let a
   // healthy server report a clean pass over silently disabled hooks, which is
   // the exact substitution this doctor exists to refuse.
@@ -883,6 +963,15 @@ export function formatReport(result) {
           : `FAIL (${pluginCache.status}): the hooks the host loads from its plugin cache are not the ones this tree ships.`,
     );
   }
+  if (lease) {
+    lines.push(
+      lease.status === "gated"
+        ? "OK: a login shell runs GitPulse's lease wrapper for cargo, so heavy builds take a slot."
+        : lease.status === "absent"
+          ? "NOTE (absent): no lease links to check, so this half did not run; it is not a pass."
+          : `FAIL (${lease.status}): heavy cargo builds from an agent session are not leased.`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -896,6 +985,8 @@ export function parseArgs(argv) {
   let expect;
   /** @type {string | undefined} */
   let claudeDir;
+  /** @type {string | undefined} */
+  let configDir;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let json = false;
 
@@ -912,6 +1003,7 @@ export function parseArgs(argv) {
     else if (arg === "--hook-bin") hookBin = path.resolve(next(arg));
     else if (arg === "--expect") expect = next(arg);
     else if (arg === "--claude-dir") claudeDir = path.resolve(next(arg));
+    else if (arg === "--config-dir") configDir = path.resolve(next(arg));
     else if (arg === "--timeout") {
       const raw = next(arg);
       const parsed = Number(raw);
@@ -921,7 +1013,7 @@ export function parseArgs(argv) {
       timeoutMs = parsed;
     } else throw new Error(`unknown argument: ${arg}`);
   }
-  return { bin, hookBin, expect, claudeDir, timeoutMs, json };
+  return { bin, hookBin, expect, claudeDir, configDir, timeoutMs, json };
 }
 
 export function usage() {
@@ -933,11 +1025,12 @@ export function usage() {
       { flag: "--hook-bin <path>", description: `probe this executable instead of resolving ${HOOK_BIN} on PATH` },
       { flag: "--expect <ver>", description: "version to require instead of package.json's" },
       { flag: "--claude-dir <path>", description: "Claude config directory holding plugins/ (default $CLAUDE_CONFIG_DIR, else ~/.claude)" },
+      { flag: "--config-dir <path>", description: "GitPulse's per-user config directory holding lease-bin/ (default: the app's own)" },
       { flag: "--timeout <ms>", description: `handshake budget (default ${DEFAULT_TIMEOUT_MS})` },
       { flag: "--json", description: "print the result as JSON" },
       { flag: "--help, -h", description: "print this message and exit 0" },
     ],
-    exits: "0 the installed server matches · 1 absent, stale, unresponsive, unverifiable, or the installed plugin cache has drifted · 2 the check could not run",
+    exits: "0 the installed server matches · 1 absent, stale, unresponsive, unverifiable, the installed plugin cache has drifted, or a login shell would not run the lease wrapper for cargo · 2 the check could not run",
   });
 }
 
@@ -1007,6 +1100,16 @@ export async function main(argv = process.argv.slice(2)) {
       ok: cacheVerdict.status === "ok" || cacheVerdict.status === "absent",
     };
 
+    const leaseProbe = probeLease(path.join(opts.configDir ?? appConfigDir(), "lease-bin"));
+    const leaseVerdict = classifyLease(leaseProbe);
+    const lease = {
+      status: leaseVerdict.status,
+      detail: leaseVerdict.detail,
+      resolved: leaseProbe.resolved,
+      // Absent is neither a pass nor a failure: the app has made no links.
+      ok: leaseVerdict.status === "gated" || leaseVerdict.status === "absent",
+    };
+
     const result = {
       binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema,
       status, violations,
@@ -1016,7 +1119,8 @@ export async function main(argv = process.argv.slice(2)) {
       hook,
       provenance,
       pluginCache,
-      ok: status === "ok" && hook.ok && provenance.ok && pluginCache.ok,
+      lease,
+      ok: status === "ok" && hook.ok && provenance.ok && pluginCache.ok && lease.ok,
     };
     if (opts.json) console.log(JSON.stringify(result, null, 2));
     else console.log(formatReport(result));
