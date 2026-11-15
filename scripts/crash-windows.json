@@ -1,0 +1,935 @@
+{
+  "scope": {
+    "dirs": [
+      "src-tauri/src/ledger"
+    ],
+    "files": [
+      "src-tauri/src/engine/git_writer.rs",
+      "src-tauri/src/engine/git_writer_adv_l1_tests.rs",
+      "src-tauri/src/engine/git_writer_adv_tests.rs",
+      "src-tauri/src/engine/git_writer_commit_graph_adv_tests.rs",
+      "src-tauri/src/engine/git_writer_commit_graph_tests.rs",
+      "src-tauri/src/engine/worktree.rs",
+      "src-tauri/src/engine/merge_tree.rs",
+      "src-tauri/src/engine/object_quarantine.rs"
+    ]
+  },
+  "paths": [
+    "ledger",
+    "ops-log",
+    "worktree-merge"
+  ],
+  "ignoredHooks": [
+    {
+      "kind": "fn",
+      "name": "clone_repo_with",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "takes a progress callback, not a fault seam; cloning is none of the three write paths"
+    },
+    {
+      "kind": "fn",
+      "name": "identity_with",
+      "file": "src-tauri/src/engine/git_writer.rs",
+      "reason": "takes an environment lookup to read a commit identity; a read, no durable step"
+    },
+    {
+      "kind": "fn",
+      "name": "active_commit_hooks_with",
+      "file": "src-tauri/src/engine/merge_tree.rs",
+      "reason": "takes the policy gate for a read-only probe of git hooks; no durable step"
+    },
+    {
+      "kind": "fn",
+      "name": "adopt_with",
+      "file": "src-tauri/src/ledger/anchor.rs",
+      "reason": "injects the approval and the path prober of a ledger adoption. Per its doc comment the re-anchor record and the audit row are written in one transaction, and a ledger that moved during the probe retries (STALE_PROBE): a race, not a kill between two durable steps. Inferred from the doc comment, not from a test."
+    }
+  ],
+  "rows": [
+    {
+      "id": "LEDGER-REFLOG-KILL-MID-BATCH",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "every reflog row and watermark of earlier committed batches; this batch's rows N-1..1 sit only inside its one open write transaction",
+        "notYetWritten": "the commit of this batch's rows and of the reflog watermark that names the last of them"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "a child test process SIGKILLs itself once the batch has inserted GITPULSE_TEST_KILL_AFTER_RECORDED rows (crash_point, compiled only under cfg(all(test, unix))); the test sets it to 6 of 11",
+        "hooks": [
+          {
+            "kind": "env",
+            "name": "GITPULSE_TEST_KILL_AFTER_RECORDED",
+            "file": "src-tauri/src/ledger/mod.rs"
+          },
+          {
+            "kind": "fn",
+            "name": "crash_point",
+            "file": "src-tauri/src/ledger/mod.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ingest/reflog_replay_tests.rs",
+          "name": "a_replay_killed_mid_pass_leaves_no_duplicates_and_no_gaps",
+          "cfg": [
+            "unix"
+          ]
+        }
+      ],
+      "recovery": "the killed transaction leaves zero rows; the next pass records every entry exactly once, including both identical resets",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-REFLOG-KILL-AFTER-LAST-ROW",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "every earlier committed batch; this batch's last row is inserted inside the open transaction",
+        "notYetWritten": "the watermark upsert and the commit, which follow the last insert"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "the same crash_point is reachable here: setting GITPULSE_TEST_KILL_AFTER_RECORDED to the number of rows the batch appends kills after the last insert and before the watermark upsert",
+        "hooks": [
+          {
+            "kind": "env",
+            "name": "GITPULSE_TEST_KILL_AFTER_RECORDED",
+            "file": "src-tauri/src/ledger/mod.rs"
+          },
+          {
+            "kind": "fn",
+            "name": "crash_point",
+            "file": "src-tauri/src/ledger/mod.rs"
+          }
+        ]
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/ingest/reflog_replay_tests.rs",
+          "name": "a_replay_killed_mid_pass_leaves_no_duplicates_and_no_gaps",
+          "cfg": [
+            "unix"
+          ]
+        }
+      ],
+      "recovery": "expected to match the mid-batch case (rows and watermark share one transaction, so neither survives), but nothing has shown it for this boundary",
+      "status": "uncovered",
+      "reason": "the hook can reach this boundary but no test sets it to the batch size; the one kill test uses 6 of 11 rows"
+    },
+    {
+      "id": "LEDGER-MIGRATION-ERROR-MIDWAY",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "an old (writer generation 1) ledger with every row and the old stamp; the migration has added columns and tables inside one immediate transaction",
+        "notYetWritten": "the ordinal backfill, the new user_version stamp and the commit"
+      },
+      "injection": {
+        "kind": "data",
+        "detail": "no production hook: the test plants a SQL trigger in the old ledger file that aborts the migration's UPDATE, after the ALTERs have run",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ledger/schema_bump_tests.rs",
+          "name": "a_migration_interrupted_midway_leaves_the_old_ledger_and_the_next_open_finishes"
+        },
+        {
+          "file": "src-tauri/src/ledger/schema_bump_adv_tests.rs",
+          "name": "a_failed_migration_leaves_stamp_1_and_the_old_shape_and_both_generations_can_write"
+        }
+      ],
+      "recovery": "the whole migration rolls back (stamp 1, old shape, no row lost); once the fault is gone the next open completes it",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-MIGRATION-SIGKILL",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "an old ledger with every row and the old stamp",
+        "notYetWritten": "the commit of the one transaction that adds the schema, backfills ordinals and stamps the new generation"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "a child process opens the ledger and the parent kills it after a 400 ms sleep; no hook pins where the kill lands",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/ledger/schema_bump_adv_tests.rs",
+          "name": "a_child_killed_mid_migration_leaves_a_ledger_the_next_open_finishes"
+        }
+      ],
+      "recovery": "SQLite rolls the open transaction back; the next open migrates from the old stamp",
+      "status": "uncovered",
+      "reason": "the nearest test kills on a timer and prints, without asserting, the stamp it found, so it never shows the kill landed inside the migration transaction (it can land before the child opens the ledger, or after the commit)"
+    },
+    {
+      "id": "LEDGER-TRANSCRIPT-CURSOR-BEHIND-ROWS",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "a transcript pass's events, already committed together with the cursor that names them",
+        "notYetWritten": "nothing of this writer: events and cursor share one transaction, so a kill of it cannot split them. The window is the next read finding the cursor lost, stale or behind rows the ledger already holds"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "not a kill: the same advance is offered twice, and in the second test the cursor row is deleted with forget_transcripts before the same rows are offered again",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ingest/mod.rs",
+          "name": "an_advance_overtaken_by_another_pass_records_nothing"
+        },
+        {
+          "file": "src-tauri/src/ingest/codex_tests/adv_w4l1.rs",
+          "name": "a2c_the_stored_identity_is_the_drafted_identity_under_redaction_and_caps"
+        }
+      ],
+      "recovery": "rows the ledger already holds are refused by identity, so a re-read after a lost or stale cursor records nothing twice",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-CONSOLIDATE-FAILS-MID-SOURCE",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "the anchor holds the sibling ledger's rows for every page imported so far (1000 rows per page, each page its own transaction) and the initial-pass marker",
+        "notYetWritten": "the remaining pages of that sibling, the sibling's import cursor beyond the last page, and the settling of the initial pass"
+      },
+      "injection": {
+        "kind": "data",
+        "detail": "no production hook: the test sets one row's ts_utc to garbage in the sibling ledger so the import fails at the start of page two, mid page two, or the start of page three, then repairs the row",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial2_tests.rs",
+          "name": "crash_at_page_two_start_keeps_the_legacy_binding"
+        },
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial2_tests.rs",
+          "name": "crash_mid_page_two_keeps_the_legacy_binding"
+        },
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial2_tests.rs",
+          "name": "crash_at_page_three_start_keeps_the_legacy_binding"
+        },
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial2_tests.rs",
+          "name": "crash_at_page_two_start_with_only_a_late_bind_keeps_the_binding_and_the_fence"
+        }
+      ],
+      "recovery": "while the pass is cut short the worktree stays fenced; after repair the next consolidation resumes and the legacy binding resolves",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-CONSOLIDATE-BETWEEN-SOURCES",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "one sibling ledger fully imported into the anchor, with its cursor",
+        "notYetWritten": "the second sibling, whose import fails on its first row"
+      },
+      "injection": {
+        "kind": "data",
+        "detail": "no production hook: the test poisons row 1 of one of two siblings (each order), then repairs it",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial2_tests.rs",
+          "name": "crash_between_siblings_keeps_both_legacy_bindings"
+        }
+      ],
+      "recovery": "after repair both siblings' legacy bindings resolve, whichever sibling failed",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-FAMILY-PASS-BEFORE-SETTLE",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "every sibling imported and the initial-pass marker recorded as in progress (source_cursor 0)",
+        "notYetWritten": "settle_family_pass, which sets the marker to settled"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook and no test fails between the last import and the settle",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/ledger/bindings/adversarial_tests.rs",
+          "name": "forgery_first_import_after_a_crash_of_a_post_anchor_sibling_is_history_only"
+        }
+      ],
+      "recovery": "the pass stays the initial one and resumes next read; sibling rows are judged by birth time, so a post-anchor sibling should still import as history only",
+      "status": "uncovered",
+      "reason": "the nearest test builds the state of a sibling born after the anchor with no import cursor; it does not cut the pass between the last import and the settle"
+    },
+    {
+      "id": "LEDGER-PRUNE-PASS-STOPS-BEFORE-FIRST-BATCH",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "the expired backlog, every row still in the ledger",
+        "notYetWritten": "the first retention batch: one pass starts no batch, the other has its first batch aborted"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "one test passes a deadline that already expired so no batch starts; the other plants a BEFORE DELETE trigger that aborts the first batch",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/ledger/reliability_tests.rs",
+          "name": "an_unfinished_prune_pass_does_not_defer_the_next"
+        },
+        {
+          "file": "src-tauri/src/ledger/reliability_tests.rs",
+          "name": "a_failing_prune_is_surfaced_on_the_catch_up_report"
+        }
+      ],
+      "recovery": "an unfinished pass is not remembered as clean, so the next pass prunes the whole backlog; a failing pass reports its error instead of reading as nothing to prune",
+      "status": "covered"
+    },
+    {
+      "id": "LEDGER-PRUNE-BETWEEN-BATCHES",
+      "path": "ledger",
+      "boundary": {
+        "durableBefore": "retention batches 1..k of a pass, each its own committed transaction of up to 5000 rows",
+        "notYetWritten": "batch k+1 onward, and the memo that the ledger is clean"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook or test stops a pass after a batch has committed; prune_with_policy loops over prune_events",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/ledger/reliability_tests.rs",
+          "name": "an_unfinished_prune_pass_does_not_defer_the_next"
+        }
+      ],
+      "recovery": "expected: each batch is complete on its own and the next pass resumes, since nothing is remembered as clean",
+      "status": "uncovered",
+      "reason": "the nearest tests stop a pass before any batch commits; none leaves earlier batches committed and cuts the pass after them"
+    },
+    {
+      "id": "OPSLOG-SNAPSHOT-FAILS-BEFORE-ANY-WRITE",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "the repository exactly as the agent's git command will find it; no snapshot object, no op ref",
+        "notYetWritten": "the pre-operation snapshot (commit object, refs/gitpulse/ops/<n>) and its ledger row"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "inject_next_op_snapshot_failure_for_test queues a failure that record_op_snapshot_with_limits returns before it takes the lock; serve_op_record turns it into an unsnapshotted ledger row. A second leg of the test uses an unreachable app mailbox",
+        "hooks": [
+          {
+            "kind": "fn",
+            "name": "inject_next_op_snapshot_failure_for_test",
+            "file": "src-tauri/src/engine/git_writer.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/hooks/mod.rs",
+          "name": "failed_or_unreachable_snapshot_logs_unsnapshotted_row_and_emits_non_silent_warning",
+          "cfg": [
+            "target_os=\"macos\""
+          ]
+        }
+      ],
+      "recovery": "the failure is never silent: the ledger gets an unsnapshotted row for the command and the hook output carries a visible warning",
+      "status": "covered"
+    },
+    {
+      "id": "OPSLOG-SNAPSHOT-OBJECT-BEFORE-REF",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "the snapshot commit object, written by git commit-tree",
+        "notYetWritten": "git update-ref of refs/gitpulse/ops/<n>, so no ref reaches the object"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook between commit-tree and update-ref in record_op_snapshot_with_limits",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "expected: an unreachable object that git gc collects, and the next snapshot reuses the same sequence number",
+      "status": "uncovered",
+      "reason": "no injection point exists between the object write and the ref write"
+    },
+    {
+      "id": "OPSLOG-SNAPSHOT-REF-BEFORE-PRUNE",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "refs/gitpulse/ops/<n> written by a compare-and-set update-ref",
+        "notYetWritten": "retention pruning (expiry and over-cap eviction), which can fail and is propagated with ?"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook makes the prune fail or kills between update-ref and the prune",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/engine/git_writer.rs",
+          "name": "op_log_evicts_oldest_over_cap_expires_old_and_never_writes_git_config",
+          "cfg": [
+            "all(test,unix)"
+          ]
+        }
+      ],
+      "recovery": "unknown: a prune error after the ref exists makes record_op_snapshot return Err, so serve_op_record writes an unsnapshotted row for a snapshot that does exist",
+      "status": "uncovered",
+      "reason": "the only prune test is the success path; no test fails the prune after the ref is written, and the code appears to report that as unsnapshotted"
+    },
+    {
+      "id": "OPSLOG-SNAPSHOT-REF-BEFORE-LEDGER-ROW",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "the snapshot ref and its retention pass",
+        "notYetWritten": "the ledger row for the snapshot (record_op_snapshot_event, best effort: it returns an Option and the caller ignores it)"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook between the prune and the ledger append",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "expected: a snapshot ref with no ledger row; list_op_snapshots still finds it because it reads refs, not the ledger",
+      "status": "uncovered",
+      "reason": "no injection point, and no test makes the ledger append fail after the ref is written"
+    },
+    {
+      "id": "OPSLOG-UNDO-REFS-BEFORE-HEAD",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "every recorded ref restored by one atomic update-ref --stdin transaction",
+        "notYetWritten": "the move of HEAD to the recorded symbolic ref or detached oid"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook between the update-ref transaction and the HEAD update in undo_op_snapshot_with_gate",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/engine/git_writer.rs",
+          "name": "op_log_undo_restores_refs_atomically_via_cas_refuses_moved_ref_and_logs_before_after_refs",
+          "cfg": [
+            "all(test,unix)"
+          ]
+        }
+      ],
+      "recovery": "unknown: refs are restored while HEAD still names the old branch; a second undo would find the refs equal to the snapshot, not to the plan",
+      "status": "uncovered",
+      "reason": "the nearest test covers the refusals before any write and the full success path, never a stop between the ref restore and the HEAD move"
+    },
+    {
+      "id": "OPSLOG-UNDO-HEAD-BEFORE-READ-TREE",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "refs restored and HEAD moved to the snapshot's branch or commit",
+        "notYetWritten": "git read-tree --reset -u HEAD, which brings the index and working tree to the restored HEAD"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook between the HEAD update and read-tree",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "unknown: HEAD and refs match the snapshot while the index and files still hold the pre-undo state, which would read as local modifications",
+      "status": "uncovered",
+      "reason": "no injection point and no test stops or fails the read-tree"
+    },
+    {
+      "id": "OPSLOG-UNDO-RESTORED-BEFORE-LEDGER-ROW",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "refs, HEAD, index and working tree restored",
+        "notYetWritten": "the git.op.undo ledger row with before_ref and after_ref (record_op_undo_event)"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no hook between read-tree and the ledger append",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "expected: the undo happened and the ledger has no row for it",
+      "status": "uncovered",
+      "reason": "no injection point, and no test makes the ledger append fail after the restore"
+    },
+    {
+      "id": "WTMERGE-PIPE-OBJECTS-BEFORE-TARGET-REF",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the merged tree and the squash or merge commit objects (merge-tree --write-tree, commit-tree); source branch, target ref and worktree untouched",
+        "notYetWritten": "the move of the target branch (ff-only merge in its checkout, or update-ref with a compare-and-set)"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "merge_worktree_pipeline, the engine behind the gitpulse_worktree_merge MCP tool, takes no seam and has no hook",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "test_merge_worktree_pipeline_preserves_divergent_target_and_refuses_dirty_or_conflicting_lanes"
+        }
+      ],
+      "recovery": "expected: unreachable objects only; a rerun builds the merge again",
+      "status": "uncovered",
+      "reason": "no injection point in the pipeline; the nearest test runs it to completion or to a refusal and never stops it between steps",
+      "engine": "pipeline"
+    },
+    {
+      "id": "WTMERGE-PIPE-TARGET-MOVED-BEFORE-CLEANUP",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the target branch moved to the merge or squash commit",
+        "notYetWritten": "removal of the source worktree, deletion of the source branch and release of its lane claim"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no seam between the target move and the cleanup block in merge_worktree_pipeline",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "test_merge_worktree_pipeline_preserves_divergent_target_and_refuses_dirty_or_conflicting_lanes"
+        }
+      ],
+      "recovery": "unknown: a rerun depends on verify_branch_integration reporting the source as already integrated (for a squash, content-equal rather than an ancestor) and then only doing cleanup",
+      "status": "uncovered",
+      "reason": "no injection point in the pipeline and no test reruns it over a target that already holds the merge; the desktop teardown engine has such a test, this one does not",
+      "engine": "pipeline"
+    },
+    {
+      "id": "WTMERGE-PIPE-WORKTREE-REMOVED-BEFORE-BRANCH-DELETE",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the source worktree removed (renamed aside, record removed, files deleted)",
+        "notYetWritten": "git branch -d or -D of the source branch"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no seam between remove_worktree and the branch delete in merge_worktree_pipeline",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "expected: a merged branch with no worktree remains; rerun finds the branch integrated and deletes it",
+      "status": "uncovered",
+      "reason": "no injection point and no test in the pipeline for this boundary",
+      "engine": "pipeline"
+    },
+    {
+      "id": "WTMERGE-PIPE-BRANCH-DELETED-BEFORE-LANE-RELEASE",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "worktree removed and branch deleted",
+        "notYetWritten": "agent_bus::release_lanes_matching, which drops the lane claims that name the worktree or branch"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no seam before the lane release in merge_worktree_pipeline",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "unknown: a claim for a lane whose worktree and branch are gone stays registered, and a rerun finds no source branch to clean up",
+      "status": "uncovered",
+      "reason": "no injection point, no test, and a rerun has no branch left that would trigger the release",
+      "engine": "pipeline"
+    },
+    {
+      "id": "WTMERGE-PIPE-QUARANTINE-LEFT",
+      "path": "worktree-merge",
+      "engine": "pipeline",
+      "boundary": {
+        "durableBefore": "a gitpulse-quarantine-* directory under the temp directory, holding the objects of the conflict check",
+        "notYetWritten": "its removal by the owner's Drop guard, which a SIGKILL never runs"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the test plants aged and fresh quarantine-named directories and runs the sweep; it does not kill a merge",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/object_quarantine_tests.rs",
+          "name": "a_sweep_removes_only_old_directories_named_as_a_quarantine_names_them",
+          "cfg": [
+            "unix"
+          ]
+        },
+        {
+          "file": "src-tauri/src/engine/object_quarantine_tests.rs",
+          "name": "one_sweep_removes_a_bounded_number_and_the_next_continues",
+          "cfg": [
+            "unix"
+          ]
+        }
+      ],
+      "recovery": "the next ObjectQuarantine::new sweeps directories older than an hour, bounded per sweep, and follows no symlink",
+      "status": "covered"
+    },
+    {
+      "id": "WTMERGE-TD-MERGED-BEFORE-TEARDOWN",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the lane's work merged into the target (fast-forward, or a squash commit made by hand)",
+        "notYetWritten": "worktree removal and branch delete of the desktop merge-and-teardown engine (merge_and_teardown_configured)"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the test performs the merge itself with git (merge --ff-only, or merge --squash plus commit), then calls the teardown as the recovery call would",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_recovers_after_a_crash_between_merge_and_teardown"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_recovers_after_a_squash_commit_that_landed_before_teardown"
+        }
+      ],
+      "recovery": "the next call reports merged, removes the worktree and deletes the branch; the squash case may instead refuse cleanly, but never leaves a half state (the squash test accepts either)",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-MERGE-PARKED",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "a git merge started in the target checkout and stopped on a conflict (MERGE_HEAD present)",
+        "notYetWritten": "the conclusion of that merge, and the teardown"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the test runs a conflicting git merge in the target checkout and leaves it parked",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_a_crash_mid_merge_makes_the_next_call_refuse_without_touching_it"
+        }
+      ],
+      "recovery": "the next teardown is refused, MERGE_HEAD and the conflicted file are left exactly as they were",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-RENAMED-BEFORE-RECORD-REMOVED",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the worktree directory renamed into the teardown holding directory",
+        "notYetWritten": "removal of git's worktree record (and, when that step fails, the put-back rename)"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "the test renames the directory by hand and calls again; a second test passes try_rename_aside_with a record-removal step that fails after the record is gone and a put-back that fails",
+        "hooks": [
+          {
+            "kind": "fn",
+            "name": "try_rename_aside_with",
+            "file": "src-tauri/src/engine/worktree.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_crash_between_rename_and_record_removal_recovers"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_the_same_removal_retried_after_a_crash_finishes"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "a_failed_put_back_keeps_the_files_from_the_sweep"
+        }
+      ],
+      "recovery": "the stale record is cleared by the next removal or prune, the aside is swept; files whose put-back failed are held back from the sweep and named in the error",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-RECORD-REMOVED-BEFORE-DELETE",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "git no longer lists the worktree; its files sit in the holding directory (whole, or half deleted)",
+        "notYetWritten": "the deletion of those files"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the tests prune the record by hand, or plant a partly deleted aside, then run the sweep",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_crash_after_record_removal_leaves_only_an_aside_the_sweep_takes"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_a_partially_deleted_tree_is_swept"
+        }
+      ],
+      "recovery": "the next teardown's sweep deletes the aside, a partial tree included",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-DELETE-FAILS",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the lane merged, its record gone, its branch deleted, its files in the holding directory",
+        "notYetWritten": "the deletion of the files, which fails"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "the closure passed as delete_aside returns an error, through merge_and_teardown_with_seams and remove_worktree_with",
+        "hooks": [
+          {
+            "kind": "fn",
+            "name": "merge_and_teardown_with_seams",
+            "file": "src-tauri/src/engine/worktree.rs"
+          },
+          {
+            "kind": "fn",
+            "name": "remove_worktree_with",
+            "file": "src-tauri/src/engine/worktree.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "a_failed_delete_is_reported_and_swept_by_the_next_teardown"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_panel_removal_with_a_failing_delete_reports_the_path"
+        }
+      ],
+      "recovery": "the merge still reports merged, the cleanup error names the aside path, and the next removal sweeps it",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-BRANCH-DELETE-REFUSED-AFTER-REMOVAL",
+      "path": "worktree-merge",
+      "boundary": {
+        "durableBefore": "the lane merged and its worktree removed",
+        "notYetWritten": "deletion of the source branch, refused by the policy gate"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the gate closure passed to merge_and_teardown_worktree refuses git branch; this is a policy refusal, not a hook symbol",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_branch_delete_refused_after_removal"
+        }
+      ],
+      "recovery": "the call is Ok with worktree_removed true, branch_deleted false and the gate's reason in branch_error",
+      "status": "covered",
+      "engine": "teardown"
+    },
+    {
+      "id": "WTMERGE-TD-REMOVAL-RETRIES-EXHAUST",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "the lane's work merged into the target",
+        "notYetWritten": "removal of the worktree, which fails on every bounded retry (a locked lane), and so the branch delete"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "a locked worktree makes every removal attempt fail; merge_and_teardown_with takes the sleep closure so the retries are counted instead of waited",
+        "hooks": [
+          {
+            "kind": "fn",
+            "name": "merge_and_teardown_with",
+            "file": "src-tauri/src/engine/worktree.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv_a_locked_lane_is_reported_after_bounded_retries"
+        }
+      ],
+      "recovery": "the call is Ok with merged true, the removal error and branch error set, the worktree and branch kept, after exactly the bounded retries",
+      "status": "covered"
+    },
+    {
+      "id": "WTMERGE-TD-DELETE-WALK-VANISHES",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "the moved-aside files, being deleted while another sweep deletes the same tree",
+        "notYetWritten": "the end of the delete, because children vanish under the walk"
+      },
+      "injection": {
+        "kind": "hook",
+        "detail": "delete_dir_tree_with takes the single-pass remover, which the tests make report NotFound once, or on every pass",
+        "hooks": [
+          {
+            "kind": "fn",
+            "name": "delete_dir_tree_with",
+            "file": "src-tauri/src/engine/worktree.rs"
+          }
+        ]
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "deleting_an_aside_survives_children_vanishing_mid_walk"
+        },
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "adv22_a_walk_that_keeps_vanishing_is_bounded_and_returns_an_error"
+        }
+      ],
+      "recovery": "a vanished tree counts as deleted; a walk that keeps vanishing is retried a bounded number of times and then returned as an error with the aside kept",
+      "status": "covered"
+    },
+    {
+      "id": "WTMERGE-TD-LAND-ADVANCE-FAILS",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "the target ref moved to the candidate by compare-and-set, and zero or more checkouts holding the target already advanced by read-tree",
+        "notYetWritten": "the remaining checkouts' index and files, which fail to follow"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the gate closure fails the read-tree, or edits the checkouts when update-index is judged; a failed step, not a kill. The tests assert the injection point was reached",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/merge_tree_adversarial_tests.rs",
+          "name": "dirt_after_the_check_is_never_clobbered"
+        },
+        {
+          "file": "src-tauri/src/engine/merge_tree_adversarial_tests.rs",
+          "name": "the_revert_never_overwrites_another_actors_ref_move"
+        },
+        {
+          "file": "src-tauri/src/engine/merge_tree_adversarial_tests.rs",
+          "name": "a_holder_that_cannot_be_moved_back_is_reported_and_its_work_kept"
+        },
+        {
+          "file": "src-tauri/src/engine/merge_tree_adversarial_tests.rs",
+          "name": "a_restore_is_byte_identical_for_every_holder"
+        }
+      ],
+      "recovery": "the ref and every advanced checkout are put back (a ref another actor moved is left alone), HEAD, index and files match what the person left, and a restore that cannot finish says which checkout to inspect",
+      "status": "covered"
+    },
+    {
+      "id": "WTMERGE-TD-LAND-KILL-BETWEEN-REF-AND-CHECKOUT",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "refs/heads/<target> moved to the candidate",
+        "notYetWritten": "read-tree in each checkout that holds the target, so HEAD names the new commit while index and files still hold the old tree"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "restore_after_failed_advance runs only when the advance returns an error; a process that dies between update-ref and read-tree runs nothing",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [
+        {
+          "file": "src-tauri/src/engine/merge_tree_adversarial_tests.rs",
+          "name": "a_restore_is_byte_identical_for_every_holder"
+        }
+      ],
+      "recovery": "unknown: the checkout would show the merge's changes as local modifications, and nothing records that a landing was cut short",
+      "status": "uncovered",
+      "reason": "the nearest tests fail the step and let the restore run; no hook or test kills the process between the ref move and the checkout advance"
+    },
+    {
+      "id": "WTMERGE-TD-VERIFY-SCRATCH-LEFT",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "a detached scratch worktree gitpulse-candidate-<pid>-<n> under the temp directory, registered with git, while the candidate is verified outside the lock",
+        "notYetWritten": "its removal, and the landing of the candidate"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "verify_in_scratch takes the verifier as a closure but nothing kills the process while it runs",
+        "hooks": []
+      },
+      "tests": [],
+      "nearestTests": [],
+      "recovery": "unknown: a search for gitpulse-candidate finds only the creation site and two tests that no scratch is left after a normal run; no sweep of a scratch left by a dead process",
+      "status": "uncovered",
+      "reason": "no injection point, and no code or test that sweeps a scratch worktree a killed process left behind"
+    },
+    {
+      "id": "WTMERGE-TD-LANE-CHANGED-AFTER-MERGE",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "the merge landed on the target",
+        "notYetWritten": "the removal of the worktree and the deletion of the branch, which re-read the lane and refuse if a file appeared or the branch moved after the merge was checked"
+      },
+      "injection": {
+        "kind": "none",
+        "detail": "no seam between the landing and the unchanged_since_merge re-check",
+        "hooks": []
+      },
+      "tests": [],
+      "recovery": "by the code: the merge stands, the worktree and branch are kept and the reason is reported; no test shows it",
+      "status": "uncovered",
+      "reason": "no test asserts either of the two refusals (a search of the sources finds their text only in worktree.rs)"
+    },
+    {
+      "id": "WTMERGE-TD-POST-MERGE-HOOK-FAILS",
+      "path": "worktree-merge",
+      "engine": "teardown",
+      "boundary": {
+        "durableBefore": "merge landed, worktree removed, branch deleted",
+        "notYetWritten": "the repository's post_merge hook, which exits non-zero"
+      },
+      "injection": {
+        "kind": "data",
+        "detail": "the repository's gitpulse config declares a post_merge command that exits 4",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/worktree.rs",
+          "name": "a_failed_post_merge_hook_is_reported_after_a_completed_teardown",
+          "cfg": [
+            "unix"
+          ]
+        }
+      ],
+      "recovery": "the call stays Ok with the teardown complete, and hook_error carries the hook's output",
+      "status": "covered"
+    }
+  ]
+}
