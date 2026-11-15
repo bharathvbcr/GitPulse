@@ -1,6 +1,7 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, readable, writable, type Readable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
+import { interfaceStore } from "./interfaceStore";
 import { formatErrorRaw } from "../ui/formatError";
 import { describeError, mirrorUserFacingError } from "../ui/copy/describeFailure";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -534,6 +535,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     applyToSession,
     refresh,
     holdsPath: (path) => mutationRunner.holdsPath(path),
+    watchScope: () => get(interfaceStore).watchScope,
+  });
+
+  // A changed watch scope applies to the live watches now, not at the next
+  // 60 s re-assert. The first emission only records the starting scope.
+  let appliedWatchScope: string | undefined;
+  interfaceStore.subscribe(({ watchScope }) => {
+    const changed = appliedWatchScope !== undefined && appliedWatchScope !== watchScope;
+    appliedWatchScope = watchScope;
+    if (changed) void watchCoordinator.reassertWatches();
   });
 
   const statusPoller = createStatusPoller({

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod ancestors;
 /// The door `benches/watcher.rs` measures the event classifier through.
 #[doc(hidden)]
 pub mod bench_seam;
@@ -5,11 +7,13 @@ pub mod debouncer;
 pub(crate) mod filter;
 #[cfg(test)]
 mod registration_timing;
+pub(crate) mod scope;
 pub(crate) mod skip;
 #[cfg(all(test, unix))]
 mod storm;
 
 pub use debouncer::RepoFileWatcher;
+pub use scope::WatchScope;
 
 use crate::engine::git_cli::{
     git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
@@ -97,6 +101,10 @@ pub struct WatchSession {
     /// The callback filter and the poll-skip state it feeds; see [`skip`].
     /// `None` only for a slot reserved without a backend.
     filter: Option<Arc<filter::EventFilter>>,
+    /// The native registration, so a later `start_watch` with another scope
+    /// can re-register this live watch. `None` only for a slot reserved
+    /// without a backend.
+    registration: Option<Arc<debouncer::Registration>>,
 }
 
 impl Drop for WatchSession {
@@ -313,6 +321,7 @@ fn insert_watch_session(
             retired,
             aliases,
             filter: None,
+            registration: None,
         },
     );
     Ok(Some(stop))
@@ -382,6 +391,10 @@ pub(crate) struct IgnoreRules {
     /// [`filter::EventFilter::admit`]. Bounded by [`MAX_IGNORE_FILES`] and
     /// [`MAX_IGNORE_FILE_BYTES`].
     files: HashSet<String>,
+    /// The same ignored directories as `prefixes`, with their ORIGINAL case, as
+    /// the narrowed watch's candidates for exclusion ([`scope`]). Bounded by
+    /// [`MAX_IGNORE_PREFIXES`] like `prefixes`.
+    dirs: Vec<String>,
     /// `None` only when the query finished and the prefix list was complete.
     load_error: Option<String>,
     /// True when the query finished and the list was cut at
@@ -400,6 +413,7 @@ impl IgnoreRules {
         Self {
             prefixes: HashSet::new(),
             files: HashSet::new(),
+            dirs: Vec::new(),
             load_error: None,
             truncated: false,
         }
@@ -424,6 +438,7 @@ impl IgnoreRules {
             Ok(stdout) => {
                 let (prefixes, truncated) = parse_ignored_directories(&stdout);
                 let files = parse_ignored_files(&stdout);
+                let dirs = parse_ignored_directory_names(&stdout);
                 if truncated {
                     let error = format!(
                         "ignore directory list truncated at {MAX_IGNORE_PREFIXES}; further ignored directories were not recorded"
@@ -432,6 +447,7 @@ impl IgnoreRules {
                     Self {
                         prefixes,
                         files,
+                        dirs,
                         load_error: Some(error),
                         truncated: true,
                     }
@@ -439,6 +455,7 @@ impl IgnoreRules {
                     Self {
                         prefixes,
                         files,
+                        dirs,
                         load_error: None,
                         truncated: false,
                     }
@@ -453,6 +470,7 @@ impl IgnoreRules {
                 Self {
                     prefixes: HashSet::new(),
                     files: HashSet::new(),
+                    dirs: Vec::new(),
                     load_error: Some(error.into_message()),
                     truncated: false,
                 }
@@ -482,6 +500,26 @@ fn parse_ignored_directories(stdout: &str) -> (HashSet<String>, bool) {
         prefixes.insert(folded);
     }
     (prefixes, truncated)
+}
+
+/// The directories of the listing with their original case, `/`-separated and
+/// without the trailing separator, up to [`MAX_IGNORE_PREFIXES`].
+fn parse_ignored_directory_names(stdout: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    for field in stdout.split('\0') {
+        if !(field.ends_with('/') || field.ends_with('\\')) {
+            continue;
+        }
+        let name = field.trim_end_matches(['/', '\\']).trim_start_matches("./");
+        if name.is_empty() {
+            continue;
+        }
+        if dirs.len() >= MAX_IGNORE_PREFIXES {
+            break;
+        }
+        dirs.push(name.to_string());
+    }
+    dirs
 }
 
 /// The ignored files the listing printed one by one (the entries that do not
@@ -992,6 +1030,18 @@ fn is_noise_leaf_name(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `event` names this checkout's own index, which every git command
+/// that stages, resets or commits rewrites. (The common directory's `index` is
+/// the main checkout's, not a linked worktree's.)
+fn event_writes_own_index(event: &Event, internal_roots: &[PathBuf]) -> bool {
+    let Some(own) = internal_roots.first() else {
+        return false;
+    };
+    event.paths.iter().any(|path| {
+        path.starts_with(own) && git_path_kind(path, internal_roots) == ChangeKind::Index
+    })
+}
+
 /// Whether the loop owes an emission at `now`: events have been quiet for
 /// [`DEBOUNCE_QUIET`], or the oldest unemitted event has waited
 /// [`DEBOUNCE_MAX_WAIT`] — whichever comes first.
@@ -1147,12 +1197,25 @@ where
         filter.publish_rules(Arc::clone(&loaded));
         loaded
     };
-    let mut rules = load_rules();
+    // The registration may already have listed the rules to plan its first
+    // stream (one RPC to the file-event daemon, not two); that load was
+    // published when it was made, so it is not listed or published again.
+    let registration = watcher.registration();
+    let mut rules = match registration.take_initial_rules() {
+        Some(rules) => rules,
+        None => load_rules(),
+    };
+    registration.apply_rules(&rules);
     let mut last_rules_load = Instant::now();
     // A rule file or a new directory was seen since the last load. Remembered
     // until the coalesce window allows the reload, so an edit made just after a
     // load is not lost.
     let mut reload_wanted = false;
+    // This checkout's index was written while directories are excluded from the
+    // stream: a `git add -f` may have made an exclusion wrong. Asked again at
+    // most once per coalesce window, like the reload above.
+    let mut revalidate_wanted = false;
+    let mut last_revalidate: Option<Instant> = None;
     // When the watched git directory is deleted (repo moved/removed), notify
     // keeps delivering remove/error events forever, and the settle timer would
     // still fire one last `repo-changed` for the corpse. Liveness is therefore
@@ -1182,6 +1245,13 @@ where
             pending = true;
             last_event = Instant::now();
         }
+        if revalidate_wanted && last_revalidate.is_none_or(|at| at.elapsed() >= SCAN_COALESCE) {
+            revalidate_wanted = false;
+            last_revalidate = Some(Instant::now());
+            registration.revalidate();
+        }
+        // A re-registration the rate bound held back, whose window has ended.
+        registration.run_pending();
         let wait = next_wait(&WaitPlan {
             now: Instant::now(),
             pending,
@@ -1192,6 +1262,9 @@ where
             rules_retry_at: [
                 rules_retry_at(&rules, last_rules_load),
                 reload_wanted.then(|| last_rules_load + SCAN_COALESCE),
+                revalidate_wanted
+                    .then(|| last_revalidate.map_or_else(Instant::now, |at| at + SCAN_COALESCE)),
+                registration.pending_at(),
             ]
             .into_iter()
             .flatten()
@@ -1213,6 +1286,8 @@ where
                 let worktree_canonical = worktree.canonicalize().ok();
                 reload_wanted |=
                     event_may_change_ignore_rules(&event, &internal_roots, filter.recursive());
+                revalidate_wanted |= event_writes_own_index(&event, &internal_roots)
+                    && registration.has_exclusions();
                 let mut significant = record_event_signal(
                     &event,
                     &internal_roots,
@@ -1229,6 +1304,8 @@ where
                                 &internal_roots,
                                 filter.recursive(),
                             );
+                            revalidate_wanted |= event_writes_own_index(&event, &internal_roots)
+                                && registration.has_exclusions();
                             record_event_signal(
                                 &event,
                                 &internal_roots,
@@ -1246,6 +1323,7 @@ where
                 }
                 if rules_due(&rules, last_rules_load, Instant::now(), reload_wanted) {
                     rules = load_rules();
+                    registration.apply_rules(&rules);
                     last_rules_load = Instant::now();
                     reload_wanted = false;
                 }
@@ -1301,6 +1379,7 @@ where
                 }
                 if rules_due(&rules, last_rules_load, Instant::now(), reload_wanted) {
                     rules = load_rules();
+                    registration.apply_rules(&rules);
                     last_rules_load = Instant::now();
                     reload_wanted = false;
                 }
@@ -1377,11 +1456,13 @@ pub fn start_watch(
     app: AppHandle,
     state: &WatcherState,
     repo_path: String,
+    scope: Option<WatchScope>,
 ) -> Result<String, CommandError> {
     let gone_app = app.clone();
-    start_watch_observed(
+    start_watch_scoped(
         state,
         repo_path,
+        scope,
         move |payload| {
             if let Err(e) = app.emit("repo-changed", &payload) {
                 log::warn!(target: "watcher", "repo-changed emit failed for {}: {e}", payload.path);
@@ -1423,6 +1504,24 @@ where
     F: Fn(RepoChangedPayload) + Send + 'static,
     G: FnOnce(RepoGonePayload) + Send + 'static,
 {
+    start_watch_scoped(state, repo_path, None, on_change, on_gone)
+}
+
+/// [`start_watch_observed`] with the scope the caller asked for. `None` is "no
+/// preference": a new watch is [`WatchScope::Narrow`] and a live one is left as
+/// it is. A scope that differs from the one a live watch was last asked for is
+/// applied to its registration (re-registering it) before this returns.
+pub(crate) fn start_watch_scoped<F, G>(
+    state: &WatcherState,
+    repo_path: String,
+    scope: Option<WatchScope>,
+    on_change: F,
+    on_gone: G,
+) -> Result<String, CommandError>
+where
+    F: Fn(RepoChangedPayload) + Send + 'static,
+    G: FnOnce(RepoGonePayload) + Send + 'static,
+{
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: validate repository");
     let canonical = validate_repo(&repo_path)?;
@@ -1440,14 +1539,25 @@ where
         Some(canonical.clone())
     };
 
-    {
+    let existing = {
         let guard = state.lock_sessions()?;
-        if guard.contains_key(&key) {
-            return Ok(key);
+        match guard.get(&key) {
+            Some(session) => Some(session.registration.clone()),
+            None => {
+                if guard.len() >= MAX_WATCHES {
+                    return Err(format!("Too many watched repositories (max {MAX_WATCHES})").into());
+                }
+                None
+            }
         }
-        if guard.len() >= MAX_WATCHES {
-            return Err(format!("Too many watched repositories (max {MAX_WATCHES})").into());
+    };
+    if let Some(registration) = existing {
+        // A live watch: apply the scope now asked for, outside the sessions
+        // lock (it re-registers, which is an RPC to the file-event daemon).
+        if let (Some(registration), Some(scope)) = (registration, scope) {
+            registration.set_scope(scope);
         }
+        return Ok(key);
     }
 
     // Linked worktrees keep refs/heads in the COMMON dir; watch it too so
@@ -1466,8 +1576,12 @@ where
     };
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: register native backend");
-    let mut watcher =
-        RepoFileWatcher::watch_repo(&git_dir, worktree_root.as_deref(), common_dir.as_deref())?;
+    let mut watcher = RepoFileWatcher::watch_repo_scoped(
+        &git_dir,
+        worktree_root.as_deref(),
+        common_dir.as_deref(),
+        scope.unwrap_or_default(),
+    )?;
 
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: reserve and launch session");
@@ -1484,6 +1598,7 @@ where
             Some(stop) => {
                 if let Some(session) = guard.get_mut(&key) {
                     session.filter = Some(watcher.filter());
+                    session.registration = Some(watcher.registration());
                 }
                 stop
             }
@@ -1661,10 +1776,21 @@ where
     let skip = filter.skip();
     let started = Instant::now();
     let begun = skip.begin(started, may_reuse);
+    // A convicted watch that leaves directories out of its stream cannot be
+    // trusted about them either: the whole worktree, for the rest of its life.
+    filter.note_conviction();
     if let Some(rows) = begun.served {
         return Ok(rows.as_ref().clone());
     }
     let rows = read()?;
+    // `git status` never reports inside a directory git ignores, so a row
+    // under one the stream leaves out proves the exclusion wrong. That read is
+    // not kept (it was taken without the stream's say-so about that
+    // directory), and the stream covers the whole worktree from now on.
+    if let Some(dir) = filter.row_under_excluded(&rows) {
+        filter.widen_for_evidence(&format!("a status row lies under the excluded `{dir}`"));
+        return Ok(rows);
+    }
     if let Some(epoch) = begun.keep_under {
         skip.settle(epoch, &rows, started);
     }
@@ -1734,6 +1860,9 @@ mod tests {
     }
 
     use crate::test_support::git_in;
+
+    /// The narrowed registration through the real stream and loop.
+    mod scope_tests;
 
     fn init_linked_worktree() -> (TempDir, TempDir, std::path::PathBuf) {
         let main = TempDir::new().unwrap();
@@ -5246,6 +5375,7 @@ mod tests {
         let mut rules = IgnoreRules {
             prefixes: HashSet::new(),
             files: HashSet::new(),
+            dirs: Vec::new(),
             load_error: None,
             truncated: false,
         };

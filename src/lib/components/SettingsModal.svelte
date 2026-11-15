@@ -91,6 +91,7 @@
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
   import HostLoadSetting from "./HostLoadSetting.svelte";
+  import WatchScopeSetting from "./WatchScopeSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -1184,6 +1185,11 @@
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["host-load"])}>
                   <div data-setting="host-load" hidden={!shown("host-load")}>
                     <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["watch-scope"])}>
+                  <div data-setting="watch-scope" hidden={!shown("watch-scope")}>
+                    <WatchScopeSetting />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["mcp-plugin"])}>

@@ -1150,6 +1150,26 @@ pub(crate) fn git_captured_with_stdin(
     git_captured_inner(repo, args, Some(stdin_bytes), MAX_OUTPUT_BYTES)
 }
 
+/// [`git_captured_with_stdin`] under a caller-owned deadline, for a question
+/// whose answer is worth less than the default ninety seconds (the watcher's
+/// ignore queries).
+pub(crate) fn git_captured_with_stdin_timeout(
+    repo: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+) -> Result<BoundedRun, CommandError> {
+    crate::repository_trust::require(repo)?;
+    let label = format!("git {}", subcommand(args));
+    run_bounded_capped(
+        git_command(Some(repo), args),
+        &label,
+        timeout,
+        Some(stdin_bytes),
+        MAX_OUTPUT_BYTES,
+    )
+}
+
 /// What a [`read_objects_batch`] caller expects to find at each id: the object
 /// type git must report, and the noun its error messages use for it.
 #[derive(Debug, Clone, Copy)]

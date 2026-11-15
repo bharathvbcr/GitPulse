@@ -409,6 +409,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability",
   },
   {
+    id: "watch-scope",
+    section: "agents",
+    label: "Watch scope",
+    keywords: "watch scope narrow whole worktree fsevents fseventsd file events macos build target node_modules ignored folders cpu cargo nested worktrees",
+    requires: "macos",
+  },
+  {
     id: "manvi-policy",
     section: "agents",
     label: "Manvi policy",
