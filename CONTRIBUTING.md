@@ -558,6 +558,21 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 5. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
    subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). GitPulse parses
    these in its own commit filter, so the repository holds itself to them.
+6. Sign off every commit (`git commit -s`). See "Licence of contributions" below.
+
+### Licence of contributions
+
+GitPulse is under the [MIT License](LICENSE), and a contribution is accepted
+under that same licence. Signing off a commit adds a `Signed-off-by:` line with
+your name and email, which states that you agree to the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/): you
+wrote the change, or otherwise have the right to submit it under the
+project's licence. Use your real name. A pull request with an unsigned commit
+is asked to amend it (`git commit --amend -s`, or
+`git rebase --signoff main` for several commits).
+
+The GitPulse name and logo are not covered by the MIT License; see
+[TRADEMARKS.md](TRADEMARKS.md).
 
 ### Looking for something to work on?
 
