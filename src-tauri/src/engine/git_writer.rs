@@ -1195,19 +1195,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
-        let run = git_captured(repo, &["config", "--get", name])?;
-        match run.status_code {
-            0 => Ok(
-                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
-                    .filter(|value| !value.is_empty()),
-            ),
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read {name} from git config (exit {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )
-            .into()),
-        }
+        Ok(config_get_exact(repo, name)?.filter(|value| !value.is_empty()))
     }
 
     /// The identity a commit in `repo` would be recorded under, resolved as
@@ -3742,25 +3730,86 @@ pub(crate) fn summarize_git_failure(raw: &str) -> String {
 
 const PUSH_DETACHED: &str = "Cannot push: HEAD is detached. Check out a branch, then push.";
 const PUSH_NO_REMOTES: &str = "This repository has no remotes. Add a remote before pushing.";
+const PUSH_UPSTREAM_UNKNOWN: &str = "Cannot push: the upstream could not be determined";
 
-fn branch_has_upstream(repo: &Path) -> bool {
-    git_text(
-        repo,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .map(|text| !text.trim().is_empty())
-    .unwrap_or(false)
+/// What a read of one git config key reported, before any caller decides what
+/// absence means.
+///
+/// `git config --get` exits 1 for a key that is unset, and also for a key git
+/// refuses as invalid; the second prints to stderr, so exit 1 with output on
+/// stderr is a failed read, not an absent key. Every other non-zero exit, a
+/// stream cut short, and a cancelled run are failed reads too. The value is
+/// returned as git printed it, trimmed: an empty value is `Some("")`, which is
+/// not the same answer as `None`.
+fn config_get_outcome(name: &str, run: BoundedRun) -> Result<Option<String>, CommandError> {
+    let run = run.require_complete("git config")?;
+    if run.cancelled {
+        return Err(format!("Reading {name} from git config was cancelled").into());
+    }
+    match run.status_code {
+        0 => Ok(Some(
+            String::from_utf8_lossy(&run.stdout).trim().to_string(),
+        )),
+        1 if String::from_utf8_lossy(&run.stderr).trim().is_empty() => Ok(None),
+        code => Err(format!(
+            "Could not read {name} from git config (exit {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into()),
+    }
 }
 
-fn current_branch_name(repo: &Path) -> Result<String, CommandError> {
-    crate::engine::git_reader::head_branch(repo)?
-        .ok_or_else(|| PUSH_DETACHED.to_string())
-        .map_err(CommandError::from)
+fn config_get_exact(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
+    config_get_outcome(name, git_captured(repo, &["config", "--get", name])?)
+}
+
+/// Whether a branch publishes somewhere by its own configuration.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchUpstream {
+    /// `branch.<name>.remote` and `branch.<name>.merge` are both set. Git, not
+    /// GitPulse, decides what a bare `git push` does with them, whether or not
+    /// the tracking ref exists yet and whether or not the remote still does.
+    Configured,
+    /// Neither key is set: git read the configuration and found no upstream.
+    Unconfigured,
+}
+
+/// Reads a branch's upstream from its configuration. `Err` is the third answer,
+/// "could not be determined": a failed read, or a configuration that sets only
+/// part of an upstream (one key, or an empty value). Neither may be planned as
+/// an unpublished branch, because `-u <default remote> <branch>` would send the
+/// branch to a remote it was not configured for and rewrite its upstream.
+fn branch_upstream(repo: &Path, branch: &str) -> Result<BranchUpstream, CommandError> {
+    let read = |key: &str| {
+        let name = format!("branch.{branch}.{key}");
+        config_get_exact(repo, &name).map_err(|err| {
+            CommandError::from(format!(
+                "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: {}",
+                err.message()
+            ))
+        })
+    };
+    let remote = read("remote")?;
+    let merge = read("merge")?;
+    let set = |value: &Option<String>| value.as_deref().is_some_and(|text| !text.trim().is_empty());
+    match (&remote, &merge) {
+        (None, None) => Ok(BranchUpstream::Unconfigured),
+        _ if set(&remote) && set(&merge) => Ok(BranchUpstream::Configured),
+        _ => Err(format!(
+            "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: its upstream is only partly configured \
+             (branch.{branch}.remote and branch.{branch}.merge must both be set, or both \
+             removed). Fix the configuration or name the remote to push to."
+        )
+        .into()),
+    }
+}
+
+/// The branch HEAD is on; `None` when HEAD is detached. The name is not
+/// validated for argv here: a branch that is only read for its configuration
+/// is never put on a command line, and the callers that do put it there
+/// validate it themselves.
+fn read_head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
+    crate::engine::git_reader::head_branch_name(repo)
 }
 
 /// Remote to publish an unpublished branch to when the caller did not name one.
@@ -3774,10 +3823,9 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, CommandError> {
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
     }
-    if let Ok(configured) = git_text(repo, &["config", "--get", "checkout.defaultRemote"]) {
-        let name = configured.trim();
-        if remotes.iter().any(|remote| remote == name) {
-            return Ok(name.to_string());
+    if let Some(configured) = config_get_exact(repo, "checkout.defaultRemote")? {
+        if remotes.contains(&configured) {
+            return Ok(configured);
         }
     }
     if remotes.iter().any(|remote| remote == "origin") {
@@ -3881,8 +3929,8 @@ fn plan_push_argv(
     }
     match (remote, branch) {
         (None, None) => {
-            if !branch_has_upstream(repo) {
-                let branch = current_branch_name(repo)?;
+            let branch = read_head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())?;
+            if branch_upstream(repo, &branch)? == BranchUpstream::Unconfigured {
                 let remote = unpublished_push_remote(repo)?;
                 validate_ref_name(&remote)?;
                 validate_push_branch(&branch)?;
@@ -3922,15 +3970,13 @@ fn plan_push_argv(
 /// branch's own `branch.<name>.remote` when it names a configured remote,
 /// else the same choice an unpublished branch makes.
 fn implicit_push_remote(repo: &Path) -> Result<String, CommandError> {
-    if let Ok(branch) = current_branch_name(repo) {
+    // Detached HEAD is an answer (no branch, so no branch remote); a HEAD or
+    // config read that failed is not, and must not fall through to a default.
+    if let Some(branch) = read_head_branch(repo)? {
         let key = format!("branch.{branch}.remote");
-        if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
-            let name = configured.trim();
-            if crate::engine::remotes::list_names(repo)?
-                .iter()
-                .any(|remote| remote == name)
-            {
-                return Ok(name.to_string());
+        if let Some(configured) = config_get_exact(repo, &key)? {
+            if crate::engine::remotes::list_names(repo)?.contains(&configured) {
+                return Ok(configured);
             }
         }
     }
@@ -7476,6 +7522,282 @@ mod tests {
         let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
             .unwrap_err();
         assert!(err.contains("victim.git"), "{err}", err = err.message());
+    }
+
+    /// A repository with `origin` (the default remote) and `team`, neither
+    /// fetched, on `main`. The bare repositories are returned so they outlive
+    /// the test body.
+    fn two_remote_repo() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let origin = init_bare();
+        let team = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "team", team.path().to_str().unwrap()],
+        );
+        (repo, origin, team)
+    }
+
+    const FORCE_PAIR: [&str; 2] = ["--force-with-lease", "--force-if-includes"];
+
+    fn plan_plain_and_forced(repo: &tempfile::TempDir) -> [Result<Vec<String>, CommandError>; 2] {
+        [false, true].map(|force| GitWriter::plan_push(&repo_path(repo), None, None, force))
+    }
+
+    #[test]
+    fn a_configured_upstream_whose_tracking_ref_is_missing_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        // Configured, never fetched: `@{upstream}` cannot resolve, the
+        // configuration still names `team` as the destination.
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        let mut expected = vec!["push".to_string()];
+        expected.extend(FORCE_PAIR.map(String::from));
+        assert_eq!(forced.unwrap(), expected);
+    }
+
+    #[test]
+    fn an_upstream_naming_a_remote_that_no_longer_exists_is_never_replaced_by_the_default() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "gone"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        for planned in plan_plain_and_forced(&repo) {
+            let argv = planned.unwrap();
+            assert!(!argv.iter().any(|arg| arg == "-u"), "{argv:?}");
+            assert!(!argv.iter().any(|arg| arg == "origin"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_local_upstream_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["branch", "base"]);
+        git_in(repo.path(), &["config", "branch.main.remote", "."]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/base"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_branch_with_no_upstream_still_plans_set_upstream_to_the_default_remote() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+        assert_eq!(
+            forced.unwrap(),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "main"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_healthy_upstream_on_a_non_default_remote_is_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["push", "-q", "-u", "team", "main"]);
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        assert!(!forced.unwrap().iter().any(|arg| arg == "-u"));
+    }
+
+    #[test]
+    fn a_half_configured_upstream_is_refused_and_never_replaced_by_the_default_remote() {
+        // (remote, merge) as configured; `None` leaves the key unset.
+        let cases: [(Option<&str>, Option<&str>); 8] = [
+            (Some("team"), None),
+            (None, Some("refs/heads/main")),
+            (Some(""), Some("refs/heads/main")),
+            (Some("team"), Some("")),
+            (Some("  "), Some("refs/heads/main")),
+            (Some("team"), Some("  ")),
+            (Some(""), Some("")),
+            (Some(""), None),
+        ];
+        for (remote, merge) in cases {
+            let (repo, _origin, _team) = two_remote_repo();
+            if let Some(remote) = remote {
+                git_in(repo.path(), &["config", "branch.main.remote", remote]);
+            }
+            if let Some(merge) = merge {
+                git_in(repo.path(), &["config", "branch.main.merge", merge]);
+            }
+            for planned in plan_plain_and_forced(&repo) {
+                let err = planned.unwrap_err();
+                assert!(
+                    err.contains("upstream"),
+                    "{remote:?}/{merge:?}: {err}",
+                    err = err.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_name_with_slashes_plans_by_its_own_upstream_configuration() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "-b", "feat/x/y"]);
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "feat/x/y"]);
+        git_in(repo.path(), &["config", "branch.feat/x/y.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.feat/x/y.merge", "refs/heads/feat/x/y"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_flag_shaped_configuration_value_never_reaches_the_planned_argv() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "--mirror"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        // A default-remote setting that names no configured remote is not a
+        // destination; the unpublished path still resolves `origin`.
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(
+            repo.path(),
+            &["config", "checkout.defaultRemote", "--mirror"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+    }
+
+    #[test]
+    fn a_detached_head_keeps_the_detached_refusal_whatever_the_branch_configuration_says() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(
+                err.contains("HEAD is detached"),
+                "{err}",
+                err = err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_configuration_plans_nothing() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let config = repo.path().join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[branch \"main\"]\n\tremote = team\n\tmerge = refs/heads/main\n[bad\n");
+        std::fs::write(&config, text).unwrap();
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(!err.message().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_config_read_separates_unset_from_empty_from_failed() {
+        let run = |code: i32, out: &str, err: &str, cancelled: bool| BoundedRun {
+            stdout: out.as_bytes().to_vec(),
+            stderr: err.as_bytes().to_vec(),
+            success: code == 0,
+            status_code: code,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled,
+        };
+        let key = "branch.main.remote";
+        assert_eq!(
+            config_get_outcome(key, run(0, "team\n", "", false)).unwrap(),
+            Some("team".into())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(0, "\n", "", false)).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(1, "", "", false)).unwrap(),
+            None
+        );
+        for failed in [
+            run(1, "", "error: invalid key: branch.main.re mote\n", false),
+            run(128, "", "fatal: bad config line 3\n", false),
+            run(139, "", "", false),
+            run(0, "team\n", "", true),
+        ] {
+            assert!(config_get_outcome(key, failed).is_err());
+        }
+    }
+
+    #[test]
+    fn an_upstream_read_that_cannot_run_is_undetermined_not_unconfigured() {
+        let missing = tempfile::TempDir::new().unwrap();
+        let err = branch_upstream(&missing.path().join("absent"), "main").unwrap_err();
+        assert!(
+            err.contains(PUSH_UPSTREAM_UNKNOWN),
+            "{err}",
+            err = err.message()
+        );
+        let (repo, _origin, _team) = two_remote_repo();
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Unconfigured
+        );
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let err = branch_upstream(repo.path(), "main").unwrap_err();
+        assert!(
+            err.contains("partly configured"),
+            "{err}",
+            err = err.message()
+        );
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Configured
+        );
+    }
+
+    #[test]
+    fn a_branch_named_alone_resolves_the_remote_its_own_configuration_names() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "team", "feat"]);
+        git_in(repo.path(), &["config", "--unset", "branch.main.remote"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "feat"]);
+    }
+
+    #[test]
+    fn a_branch_named_alone_from_a_detached_head_still_plans() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("main"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "main"]);
     }
 
     #[test]
