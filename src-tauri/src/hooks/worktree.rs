@@ -397,7 +397,7 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
     }
 
     mark_write_started(progress);
-    let selection = CacheSelection::default();
+    let selection = CacheSelection::for_new_worktree();
     let created = match add_worktree_with_devmap(
         &root_text,
         &target,

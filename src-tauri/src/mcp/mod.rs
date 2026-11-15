@@ -4181,7 +4181,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .is_some_and(|dirs| dirs.iter().any(|d| d == ".venv" || d == "venv"));
             let selection = crate::engine::cow_clone::CacheSelection {
                 include_virtualenvs,
-                ..Default::default()
+                ..crate::engine::cow_clone::CacheSelection::for_new_worktree()
             };
             let anchor = &family.anchor;
             let target = &family.worktree;
