@@ -60,7 +60,7 @@
 </script>
 
 <div class="space-y-1 text-meta" data-testid="host-load-settings">
-  <div class="text-textMuted text-micro mb-1.5">Host load</div>
+  <h3 class="gp-label mb-1.5">Host load</h3>
   <SettingToggle
     label="Measure memory pressure and agent sessions"
     description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."

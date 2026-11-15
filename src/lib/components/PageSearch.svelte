@@ -161,11 +161,15 @@
   });
 </script>
 
+<!-- `bg-background/90`, not bare `bg-background`: on macOS a bare one inside the
+     shell's own plate is a repaint and goes transparent (app.css, nested
+     bg-background rule), which left the field a faint outline on the glass.
+     /80 and /90 are the floating-field fills that keep their cover. -->
 <div
   bind:this={pill}
   role="search"
   aria-label={label}
-  class="flex h-7 min-w-24 @min-[1400px]:min-w-40 max-w-4xl flex-[3] items-center gap-0.5 rounded-full border border-edgeStrong bg-background pl-2.5 pr-0.5 text-xs"
+  class="flex h-7 min-w-24 @min-[1400px]:min-w-40 max-w-4xl flex-[3] items-center gap-0.5 rounded-full border border-edgeStrong bg-background/90 pl-2.5 pr-0.5 text-xs"
   data-page-search={inPalette ? "palette" : provider?.kind}
 >
   <Search size={13} class="shrink-0 text-textMuted" aria-hidden="true" />
