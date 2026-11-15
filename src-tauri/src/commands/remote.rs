@@ -179,7 +179,7 @@ pub async fn cmd_push(
         // A user action from here on, so the version probe a force push makes
         // while planning is admitted rather than shed under load; the command
         // guard would only mark it after the plan.
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
         let argv: Vec<&str> = std::iter::once("git")
             .chain(args.iter().map(String::as_str))

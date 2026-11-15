@@ -1070,7 +1070,7 @@ impl Cleaner {
                     );
                     return;
                 }
-                let Ok(path) = crate::engine::git_cli::canonicalize_plain(Path::new(&info.path))
+                let Ok(path) = crate::engine::process::canonicalize_plain(Path::new(&info.path))
                 else {
                     continue;
                 };
@@ -1154,7 +1154,7 @@ impl Cleaner {
                     }
                     for row in report.worktrees.into_iter().filter(|w| w.stale) {
                         let Ok(path) =
-                            crate::engine::git_cli::canonicalize_plain(Path::new(&row.path))
+                            crate::engine::process::canonicalize_plain(Path::new(&row.path))
                         else {
                             continue;
                         };

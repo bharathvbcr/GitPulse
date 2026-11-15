@@ -53,7 +53,7 @@ mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session, TerminalSessions,
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session,
     };
     use std::time::{Duration, Instant};
     use tauri::Listener;
@@ -108,7 +108,7 @@ mod imp {
     const SHORT_TMP: &str = "/tmp";
 
     pub fn main() {
-        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("idle_wakeups");
         let window = if report.opts.smoke {
             Duration::from_millis(1500)
@@ -118,7 +118,7 @@ mod imp {
         let app = tauri::test::mock_builder()
             .build(gitpulse_lib::context())
             .expect("mock app");
-        let state = TerminalSessions::default();
+        let state = super::common::terminals();
         {
             let state = state.clone();
             app.listen("terminal-output", move |event| {

@@ -117,40 +117,42 @@ site | src/docs/rename_tests.rs | counting_gate_rename | 0 | fixture-delay
 
 # src/engine/git_cli.rs
 site | src/engine/git_cli.rs | a_hook_running_command_is_never_shared_so_it_stays_cancellable | 0 | bounded-poll
-site | src/engine/git_cli.rs | a_queued_command_still_gets_its_full_runtime_after_a_slot | 0 | hold
-site | src/engine/git_cli.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 0 | spacing
-site | src/engine/git_cli.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 1 | spacing
-site | src/engine/git_cli.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 0 | race-widen
-site | src/engine/git_cli.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 1 | spacing
-site | src/engine/git_cli.rs | a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh | 1 | hold
 site | src/engine/git_cli.rs | create_refuses_existing_tracked_untracked_ignored_lf_crlf_empty | 0 | mtime-gap
-site | src/engine/git_cli.rs | mixed_class_stress_holds_every_gate_invariant | 0 | hold
-site | src/engine/git_cli.rs | run_bounded_never_exceeds_the_spawn_limit_under_fan_out | 0 | spacing
-
-# src/engine/git_cli/budget_adversarial_tests.rs
-site | src/engine/git_cli/budget_adversarial_tests.rs | a_local_bucket_waiter_does_not_spin_on_a_stale_shared_ask_time | 0 | race-widen
-site | src/engine/git_cli/budget_adversarial_tests.rs | reactive_waiters_are_served_in_arrival_order | 0 | clock-seam-needed
-
-# src/engine/git_cli/grace_adversarial.rs
-site | src/engine/git_cli/grace_adversarial.rs | reap_leak | 0 | bounded-poll
-
-# src/engine/git_cli/pipe_drain.rs
-site | src/engine/git_cli/pipe_drain.rs | unfinished_pipe_keeps_bytes_and_closes_its_read_descriptor | 0 | bounded-poll
 
 # src/engine/git_cli/run_errors_adversarial_tests.rs
 # hold_ms is 120-150 ms against a retry budget of MAX_LOCK_RETRIES=3 (50/150/300 ms backoff, about 500 ms): a 10x stretch outlasts it and the "git succeeds after release" assertions fail. Needs an injectable backoff.
 site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | clock-seam-needed
 
-# src/engine/git_cli/shared_budget.rs
-site | src/engine/git_cli/shared_budget.rs | SharedBudget::lock | 0 | bounded-poll
+# src/engine/process/budget_adversarial_tests.rs
+site | src/engine/process/budget_adversarial_tests.rs | a_local_bucket_waiter_does_not_spin_on_a_stale_shared_ask_time | 0 | race-widen
+site | src/engine/process/budget_adversarial_tests.rs | reactive_waiters_are_served_in_arrival_order | 0 | clock-seam-needed
 
-# src/engine/git_cli/thread_io.rs
-site | src/engine/git_cli/thread_io.rs | Slow::read_cancellable | 0 | fixture-delay
-site | src/engine/git_cli/thread_io.rs | a_child_that_closes_stdin_early_fails_the_feed_with_a_broken_pipe_not_a_hang | 1 | bounded-poll
-site | src/engine/git_cli/thread_io.rs | an_empty_payload_closes_stdin_so_the_child_sees_eof | 0 | bounded-poll
-site | src/engine/git_cli/thread_io.rs | fallback_handles_simultaneous_input_stdout_and_stderr | 0 | bounded-poll
-site | src/engine/git_cli/thread_io.rs | nonblocking_mode_never_reaches_the_childs_end | 0 | bounded-poll
-site | src/engine/git_cli/thread_io.rs | settle_or_report | 0 | bounded-poll
+# src/engine/process/grace_adversarial_tests.rs
+site | src/engine/process/grace_adversarial_tests.rs | reap_leak | 0 | bounded-poll
+
+# src/engine/process/pipe_drain.rs
+site | src/engine/process/pipe_drain.rs | unfinished_pipe_keeps_bytes_and_closes_its_read_descriptor | 0 | bounded-poll
+
+# src/engine/process/shared_budget.rs
+site | src/engine/process/shared_budget.rs | SharedBudget::lock | 0 | bounded-poll
+
+# src/engine/process/tests.rs
+site | src/engine/process/tests.rs | a_queued_command_still_gets_its_full_runtime_after_a_slot | 0 | hold
+site | src/engine/process/tests.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 0 | spacing
+site | src/engine/process/tests.rs | a_shared_read_never_answers_with_a_child_older_than_its_caller | 1 | spacing
+site | src/engine/process/tests.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 0 | race-widen
+site | src/engine/process/tests.rs | a_user_action_does_not_queue_behind_the_shared_budget_io | 1 | spacing
+site | src/engine/process/tests.rs | a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh | 1 | hold
+site | src/engine/process/tests.rs | mixed_class_stress_holds_every_gate_invariant | 0 | hold
+site | src/engine/process/tests.rs | run_bounded_never_exceeds_the_spawn_limit_under_fan_out | 0 | spacing
+
+# src/engine/process/thread_io.rs
+site | src/engine/process/thread_io.rs | Slow::read_cancellable | 0 | fixture-delay
+site | src/engine/process/thread_io.rs | a_child_that_closes_stdin_early_fails_the_feed_with_a_broken_pipe_not_a_hang | 1 | bounded-poll
+site | src/engine/process/thread_io.rs | an_empty_payload_closes_stdin_so_the_child_sees_eof | 0 | bounded-poll
+site | src/engine/process/thread_io.rs | fallback_handles_simultaneous_input_stdout_and_stderr | 0 | bounded-poll
+site | src/engine/process/thread_io.rs | nonblocking_mode_never_reaches_the_childs_end | 0 | bounded-poll
+site | src/engine/process/thread_io.rs | settle_or_report | 0 | bounded-poll
 
 # src/engine/git_writer.rs
 site | src/engine/git_writer.rs | a_cancelled_commit_leaves_no_index_lock | 0 | bounded-poll

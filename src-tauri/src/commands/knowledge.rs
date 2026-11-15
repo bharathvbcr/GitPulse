@@ -364,7 +364,7 @@ done
         let serial = test_serial();
         let _binary = bind_test_binary(&serial, script.to_string_lossy());
 
-        let (guarded, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (guarded, labels) = crate::engine::process::spawn_labels_during(|| {
             docs_rename_guarded(&repo, "docs/Roadmap.md", "plans/Roadmap.md")
         });
         let guarded = guarded.expect("rename");

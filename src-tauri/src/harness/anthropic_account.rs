@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::git_cli::{find_external_tool_with, run_bounded_capped};
+use crate::engine::process::{find_external_tool_with, run_bounded_capped};
 
 /// The launcher Manvi installs beside `manvi`.
 pub(crate) const PROGRAM: &str = "anthropic-account";

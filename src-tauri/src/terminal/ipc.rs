@@ -5,7 +5,9 @@
 //! blocking function there, so none of them touches tokio's blocking pool, the
 //! git admission scope that pool's wrapper sets up, or an async-runtime worker.
 
-use super::{resize_session, write_binary_to_session, write_to_session, TerminalSessions};
+use super::TerminalSessions;
+#[cfg(not(unix))]
+use super::{resize_session, write_binary_to_session, write_to_session};
 
 /// Keystrokes for a session the terminal host holds: the same conversion and
 /// bound as in-process, then one request, answered once the host's lane for
@@ -46,19 +48,22 @@ pub async fn write_async(
     binary: bool,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return write_to_host(host, session_id, data, binary).await;
+    {
+        write_to_host(&state.host, session_id, data, binary).await
     }
-    let lane = state.input_lane(&session_id)?;
-    let state = state.clone();
-    lane.run("terminal_write", move || {
-        if binary {
-            write_binary_to_session(&state, &session_id, &data)
-        } else {
-            write_to_session(&state, &session_id, &data)
-        }
-    })
-    .await
+    #[cfg(not(unix))]
+    {
+        let lane = state.input_lane(&session_id)?;
+        let state = state.clone();
+        lane.run("terminal_write", move || {
+            if binary {
+                write_binary_to_session(&state, &session_id, &data)
+            } else {
+                write_to_session(&state, &session_id, &data)
+            }
+        })
+        .await
+    }
 }
 
 /// Verifies unread peer messages exist in `agent_mailbox` (without claiming
@@ -70,15 +75,8 @@ pub async fn deliver_peer_wake_async(
     provider_session_id: String,
 ) -> Result<bool, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        let lane = host.input_lane(&session_id)?;
-        let state = state.clone();
-        return lane
-            .run("terminal_deliver_peer", move || {
-                super::deliver_peer_wake(&state, &session_id, &provider_session_id)
-            })
-            .await;
-    }
+    let lane = state.host.input_lane(&session_id)?;
+    #[cfg(not(unix))]
     let lane = state.input_lane(&session_id)?;
     let state = state.clone();
     lane.run("terminal_deliver_peer", move || {
@@ -95,21 +93,23 @@ pub async fn resize_async(
     cols: u16,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        let lane = host.geometry_lane(&session_id)?;
-        let host = host.clone();
-        return lane
-            .run("terminal_resize", move || {
-                host.resize_blocking(&session_id, rows, cols)
-            })
-            .await;
+    {
+        let lane = state.host.geometry_lane(&session_id)?;
+        let host = state.host.clone();
+        lane.run("terminal_resize", move || {
+            host.resize_blocking(&session_id, rows, cols)
+        })
+        .await
     }
-    let lane = state.geometry_lane(&session_id)?;
-    let state = state.clone();
-    lane.run("terminal_resize", move || {
-        resize_session(&state, &session_id, rows, cols)
-    })
-    .await
+    #[cfg(not(unix))]
+    {
+        let lane = state.geometry_lane(&session_id)?;
+        let state = state.clone();
+        lane.run("terminal_resize", move || {
+            resize_session(&state, &session_id, rows, cols)
+        })
+        .await
+    }
 }
 
 /// Runs a slower terminal command (reading a session's context, closing or

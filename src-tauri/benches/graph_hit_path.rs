@@ -335,7 +335,7 @@ fn stage_breakdown(source: &Path, scratch: &Path, window: usize, rounds: usize, 
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("graph_hit_path");
     let smoke = report.opts.smoke;
     // `--breakdown-only` skips the paired arms and prints only where a cold

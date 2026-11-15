@@ -272,7 +272,7 @@ impl<T: Clone> BinaryProbeCache<T> {
         // other test's earlier success would otherwise answer past it. What
         // is probed under the refusal is not kept either.
         #[cfg(test)]
-        if crate::engine::git_cli::forced_failure_active() {
+        if crate::engine::process::forced_failure_active() {
             return probe().0;
         }
         let path = PathBuf::from(program);
@@ -357,7 +357,7 @@ mod tests {
         let program = bin.to_str().unwrap();
         let cache: BinaryProbeCache<&'static str> = BinaryProbeCache::new();
         assert_eq!(cache.get_or_probe(program, || ("real", true)), "real");
-        let forced = crate::engine::git_cli::with_forced_spawn_failure(|| {
+        let forced = crate::engine::process::with_forced_spawn_failure(|| {
             cache.get_or_probe(program, || ("refused", true))
         });
         assert_eq!(forced, "refused", "the warm entry answered past the seam");
@@ -367,7 +367,7 @@ mod tests {
             "a probe made under the refusal replaced the real answer"
         );
         cache.clear();
-        let _ = crate::engine::git_cli::with_forced_spawn_failure(|| {
+        let _ = crate::engine::process::with_forced_spawn_failure(|| {
             cache.get_or_probe(program, || ("refused", true))
         });
         assert_eq!(

@@ -105,11 +105,27 @@ fn a_trusted_repository_gets_a_gitpulse_worktree_and_an_untrusted_one_a_plain_on
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
-    let path = repo.join(".claude/worktrees/bold-oak-a3f2");
+    let path = repo.join(".gitpulse/worktrees/bold-oak-a3f2");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", path.display()),
         "{stderr}"
+    );
+    let ignored = Command::new("git")
+        .args(["check-ignore", "-q", ".gitpulse/worktrees/bold-oak-a3f2"])
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .output_locked()
+        .expect("git check-ignore runs");
+    assert!(
+        ignored.status.success(),
+        ".gitpulse/worktrees/bold-oak-a3f2 must be ignored: {}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    let status = git(&repo, &["status", "--porcelain"]);
+    assert!(
+        !status.lines().any(|line| line.contains(".gitpulse")),
+        "lane must not dirty git status: {status}"
     );
     assert!(stderr.contains("through GitPulse"), "{stderr}");
     assert!(
@@ -140,7 +156,7 @@ fn a_trusted_repository_gets_a_gitpulse_worktree_and_an_untrusted_one_a_plain_on
         let b = scope.spawn(|| launch(&home, "worktree-create", payload.clone(), &repo));
         (a.join().unwrap(), b.join().unwrap())
     });
-    let twin = format!("{}\n", repo.join(".claude/worktrees/twin").display());
+    let twin = format!("{}\n", repo.join(".gitpulse/worktrees/twin").display());
     for out in [&a, &b] {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{stderr}");

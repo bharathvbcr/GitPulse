@@ -527,6 +527,17 @@ tool_args! {
 }
 
 tool_args! {
+    struct SessionsArgs {
+        repo_path: String = repo_spec(),
+        limit: Option<u32> = Spec::int(
+            "Maximum live sessions to return (default 64, max 256)",
+            1,
+            256,
+        ),
+    }
+}
+
+tool_args! {
     /// The code-intelligence tools that answer one budgeted question about a
     /// repository.
     struct BudgetArgs {
@@ -798,6 +809,10 @@ tool_args! {
             256,
         ),
         zero_copy: Option<bool> = Spec::flag("Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite"),
+        layout: Option<String> = Spec::one_of(
+            "Worktree path layout: 'lane' (default, <repo>/.gitpulse/worktrees/<slug>) or 'sibling' (../<Repo>.<slug>)",
+            crate::engine::worktree::WorktreeLayout::VALUES,
+        ),
         execute_command: Option<String> = Spec::chars("Optional command to execute in worktree upon completion", 1, 1024),
     }
 }
@@ -1763,6 +1778,68 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
+            "gitpulse_sessions",
+            "Live agent sessions",
+            "List live agent sessions (Claude Code and Codex) running inside this repository's worktrees, without spawning git. Reads the OS process table, Claude Code session registries, CARD 11 file claims / worktree locks, ledger run bindings, and the running GitPulse desktop app's hook-report hub snapshot (`agent-session-state.json`). Marks `is_caller: true` on the nearest agent ancestor of this MCP server (`pid` + `start_us`), carries `run_id`, `tree`, and `task_id` when known, and reports `state` (`working` | `blocked` | `done` | `idle` | `unknown`), `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`. Codex sessions with no hub entry report `state: \"unknown\"` (never `\"idle\"`); sessions with no registry or hub entry report `state_source: \"none\"`. When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process table and registry. Results are sorted caller-first and bounded by `limit` (`cap`, `total`, `returned`, `truncated`).",
+            SessionsArgs::properties(),
+            &SessionsArgs::required(),
+            ok_error_output(
+                json!({
+                    "repo_path": { "type": "string" },
+                    "app_state": ok_error_output(
+                        json!({
+                            "updated_ms": { "type": "integer", "minimum": 0 }
+                        }),
+                        &[],
+                    ),
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "ok": { "type": "boolean" },
+                                "error": { "type": "string" },
+                                "sessions": { "type": "integer", "minimum": 0 },
+                                "unverified": { "type": "integer", "minimum": 0 },
+                                "truncated": { "type": "boolean" }
+                            },
+                            "required": ["kind", "ok", "error", "sessions", "unverified", "truncated"]
+                        }
+                    },
+                    "cap": { "type": "integer", "minimum": 1 },
+                    "total": { "type": "integer", "minimum": 0 },
+                    "returned": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "sessions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "pid": { "type": "integer", "minimum": 0 },
+                                "start_us": { "type": "integer", "minimum": 0 },
+                                "is_caller": { "type": "boolean" },
+                                "worktree": { "type": "string" },
+                                "cwd": { "type": "string" },
+                                "tree": { "type": "string" },
+                                "run_id": { "type": "string" },
+                                "task_id": { "type": "string" },
+                                "parent_pid": { "type": "integer", "minimum": 0 },
+                                "session_id": { "type": "string" },
+                                "entrypoint": { "type": "string" },
+                                "state": { "type": "string", "enum": ["working", "blocked", "done", "idle", "unknown"] },
+                                "state_source": { "type": "string", "enum": ["hub", "registry", "none", "unknown"] },
+                                "state_age_s": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": ["kind", "pid", "is_caller", "worktree", "cwd", "state", "state_source"]
+                        }
+                    }
+                }),
+                &["repo_path", "app_state", "kinds", "cap", "total", "returned", "truncated", "sessions"],
+            ),
+        ),
+        tool(
             "gitpulse_status",
             "Repository status",
             "Inspect repository status, worktrees, ledger, and code graph availability",
@@ -2138,7 +2215,7 @@ fn build_tools() -> Vec<Value> {
         open_world(mutating_tool(
             "gitpulse_worktree_create",
             "Create worktree",
-            "Create a new git branch and linked worktree with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
+            "Create a new git branch and linked worktree under <repo>/.gitpulse/worktrees/<slug> by default (or ../<Repo>.<slug> with `layout: \"sibling\"`), with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
             WorktreeCreateArgs::properties(),
             &WorktreeCreateArgs::required(),
             json!({
@@ -3377,6 +3454,39 @@ fn open_shared_profile(
     Ok(Some(store))
 }
 
+/// Fail-soft read-only lookup from `run_id` to board `task_id`.
+///
+/// Opens the shared profile store at most once per `gitpulse_sessions` call
+/// with `SQLITE_OPEN_READ_ONLY` and `refuse_workbench_upgrades`, returning
+/// `None` if the store is absent or requires a schema upgrade rather than
+/// failing a read-only session listing.
+fn with_sessions_run_lookup<T>(f: impl FnOnce(&dyn Fn(&str) -> Option<String>) -> T) -> T {
+    let store_cell: std::cell::OnceCell<Option<dc_store::Store>> = std::cell::OnceCell::new();
+    let lookup = |run_id: &str| -> Option<String> {
+        let store = store_cell
+            .get_or_init(|| {
+                let path = task_profile_path().ok()?;
+                if !path.exists() {
+                    return None;
+                }
+                let mut store = dc_store::Store::open_readonly(&path).ok()?;
+                store.refuse_workbench_upgrades();
+                Some(store)
+            })
+            .as_ref()?;
+        let raw = store
+            .workbench_request("runs.get", &json!({ "id": run_id }).to_string())
+            .ok()?;
+        let res: Value = serde_json::from_str(&raw).ok()?;
+        res.get("item")
+            .and_then(|item| item.get("task_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    f(&lookup)
+}
+
 #[cfg(not(test))]
 fn task_profile_path() -> Result<std::path::PathBuf, String> {
     crate::workbench::intake::default_profile_path().map_err(|e| e.message)
@@ -3443,7 +3553,7 @@ const DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_sec
 pub const WORST_CASE_DEFERRED_READ: std::time::Duration = std::time::Duration::from_secs(
     DEFERRAL_RETRY_WINDOW.as_secs()
         + 2 * (insights::SNAPSHOT_DEADLINE.as_secs()
-            + crate::engine::git_cli::SPAWN_QUEUE_BUDGET.as_secs()),
+            + crate::engine::process::SPAWN_QUEUE_BUDGET.as_secs()),
 );
 
 /// A value in `0..bound` that differs between processes and between calls.
@@ -3660,6 +3770,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             Ok(with_production_retry(|retry| {
                 read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
+        }
+        "gitpulse_sessions" => {
+            let a: SessionsArgs = parse(name, arguments)?;
+            let report = with_sessions_run_lookup(|lookup| {
+                insights::sessions(&a.repo_path, a.limit, lookup)
+            })?;
+            serde_json::to_value(report).map_err(|e| format!("serialize sessions report: {e}"))
         }
         "gitpulse_status" => {
             let a: RepoArgs = parse(name, arguments)?;
@@ -3902,12 +4019,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }
             let share_cache = a.share_cache.unwrap_or(true);
             let zero_copy = a.zero_copy.unwrap_or(false);
-            let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
-                &a.repo_path,
-                &a.branch,
-                None,
-            )
-            .map_err(CommandError::into_message)?;
+            let layout = crate::engine::worktree::WorktreeLayout::parse(a.layout.as_deref())
+                .map_err(CommandError::into_message)?;
+            let target_path =
+                crate::engine::worktree::resolve_worktree_path_for_branch_with_layout(
+                    &a.repo_path,
+                    &a.branch,
+                    layout,
+                )
+                .map_err(CommandError::into_message)?;
             let target_str = target_path
                 .to_str()
                 .ok_or_else(|| "invalid target path".to_string())?;
@@ -3934,6 +4054,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             if let Some(argv) = command_argv.as_deref() {
                 crate::harness::guard_command(&a.repo_path, argv)?;
             }
+            if layout == crate::engine::worktree::WorktreeLayout::Lane {
+                crate::engine::worktree::ensure_gitpulse_lane_excluded(std::path::Path::new(
+                    &a.repo_path,
+                ))
+                .map_err(CommandError::into_message)?;
+            }
 
             let mut gate = |args: &[&str]| -> Result<(), CommandError> {
                 let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
@@ -3944,15 +4070,30 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let selection = crate::engine::cow_clone::CacheSelection::default();
             let (worktree_path, devmap, sparse_cone, cache_error, low_disk, hook_error) =
                 if let Some(ref sparse) = a.sparse_paths.filter(|p| !p.is_empty()) {
-                    let created = crate::engine::worktree::add_sparse_worktree_zero_copy(
-                        &a.repo_path,
-                        target_str,
-                        &a.branch,
-                        a.base.as_deref(),
-                        sparse,
-                        share_cache,
-                        &mut gate,
-                    )
+                    let created = match layout {
+                        crate::engine::worktree::WorktreeLayout::Lane => {
+                            crate::engine::worktree::add_sparse_worktree_zero_copy_for_lane(
+                                &a.repo_path,
+                                target_str,
+                                &a.branch,
+                                a.base.as_deref(),
+                                sparse,
+                                share_cache,
+                                &mut gate,
+                            )
+                        }
+                        crate::engine::worktree::WorktreeLayout::Sibling => {
+                            crate::engine::worktree::add_sparse_worktree_zero_copy(
+                                &a.repo_path,
+                                target_str,
+                                &a.branch,
+                                a.base.as_deref(),
+                                sparse,
+                                share_cache,
+                                &mut gate,
+                            )
+                        }
+                    }
                     .map_err(CommandError::into_message)?;
                     (
                         created.path,
@@ -3997,7 +4138,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let mut command_exit_code = None;
             let mut command_error = None;
             if let Some(argv) = command_argv.as_deref() {
-                match crate::engine::git_cli::capture_command(
+                match crate::engine::process::capture_command(
                     argv[0],
                     &argv[1..],
                     Some(std::path::Path::new(&worktree_path)),
@@ -4103,12 +4244,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     crate::engine::git_writer::validate_ref_name(base)
                         .map_err(CommandError::into_message)?;
                 }
-                let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
-                    &a.repo_path,
-                    &a.branch,
-                    None,
-                )
-                .map_err(CommandError::into_message)?;
+                let target_path =
+                    crate::engine::worktree::resolve_worktree_path_for_branch_with_layout(
+                        &a.repo_path,
+                        &a.branch,
+                        crate::engine::worktree::WorktreeLayout::Lane,
+                    )
+                    .map_err(CommandError::into_message)?;
                 let target_str = target_path
                     .to_str()
                     .ok_or_else(|| "invalid target path".to_string())?;
@@ -4120,6 +4262,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 );
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 crate::harness::guard_command(&a.repo_path, &argv_refs)?;
+                crate::engine::worktree::ensure_gitpulse_lane_excluded(std::path::Path::new(
+                    &a.repo_path,
+                ))
+                .map_err(CommandError::into_message)?;
                 let selection = crate::engine::cow_clone::CacheSelection::default();
                 let created = crate::engine::worktree::add_worktree_with_devmap(
                     &a.repo_path,
@@ -10775,6 +10921,7 @@ mod tests {
         use devmap_parity as dm;
         rows![
             ("gitpulse_insights", RepoArgs),
+            ("gitpulse_sessions", SessionsArgs),
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
             ("gitpulse_collision_risk", CollisionRiskArgs),
@@ -10906,6 +11053,7 @@ mod tests {
             use devmap_parity as dm;
             rows![
                 ("gitpulse_insights", RepoArgs),
+                ("gitpulse_sessions", SessionsArgs),
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
                 ("gitpulse_collision_risk", CollisionRiskArgs),
@@ -12129,6 +12277,211 @@ mod tests {
     }
 
     #[test]
+    fn worktree_create_defaults_to_gitpulse_lane_and_allows_explicit_sibling() {
+        let (_sandbox, repo) = honesty_repo();
+        let canon_repo = std::path::Path::new(&repo).canonicalize().unwrap();
+
+        // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
+        //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
+        let (err, created) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/auth-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "create failed: {created}");
+        let actual = std::path::PathBuf::from(created["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let expected = canon_repo.join(".gitpulse/worktrees/feat-auth-lane");
+        assert_eq!(actual, expected, "{created}");
+        let resolved = crate::engine::worktree::resolve_worktree_path(
+            &canon_repo,
+            "feat-auth-lane",
+            crate::engine::worktree::WorktreeLayout::Lane,
+        )
+        .unwrap();
+        assert_eq!(actual, resolved);
+        assert_eq!(
+            crate::hooks::worktree::plan_create(&canon_repo, "feat-auth-slug")
+                .unwrap()
+                .target,
+            canon_repo.join(".gitpulse/worktrees/feat-auth-slug")
+        );
+        let lane_ignored = crate::engine::git_cli::git_captured(
+            &canon_repo,
+            &["check-ignore", "-q", ".gitpulse/worktrees/feat-auth-lane"],
+        )
+        .expect("check-ignore");
+        assert_eq!(lane_ignored.status_code, 0, "lane dir must be git-ignored");
+        let status = crate::engine::git_cli::git_text(&canon_repo, &["status", "--porcelain"])
+            .unwrap();
+        assert!(
+            !status.lines().any(|line| line.contains(".gitpulse")),
+            "lane must not dirty git status: {status}"
+        );
+
+        // 2. Creating from inside an existing linked lane still anchors at the main checkout.
+        let (err, nested) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": actual.to_str().unwrap(),
+                "branch": "feat/from-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "create from inside lane failed: {nested}");
+        let nested_actual = std::path::PathBuf::from(nested["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            nested_actual,
+            canon_repo.join(".gitpulse/worktrees/feat-from-lane"),
+            "{nested}"
+        );
+        assert!(!actual.join(".gitpulse").exists());
+
+        // 3. Sparse checkout without `layout` also lands inside <repo>/.gitpulse/worktrees/<slug>.
+        let sub_dir = canon_repo.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("b.txt"), "b\n").unwrap();
+        git_ok(&["-C", &repo, "add", "sub/b.txt"]);
+        git_ok(&[
+            "-C",
+            &repo,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "add sub",
+        ]);
+        let (err, sparse) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/sparse-lane",
+                "sparse_paths": ["sub"],
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sparse create failed: {sparse}");
+        let sparse_actual = std::path::PathBuf::from(sparse["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            sparse_actual,
+            canon_repo.join(".gitpulse/worktrees/feat-sparse-lane"),
+            "{sparse}"
+        );
+
+        // 4. Explicit `layout: "sibling"` places the worktree at ../<Repo>.<slug>.
+        let (err, sibling) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/sibling-opt",
+                "layout": "sibling",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sibling create failed: {sibling}");
+        let sibling_actual = std::path::PathBuf::from(sibling["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let sibling_expected = crate::engine::worktree::resolve_worktree_path(
+            &canon_repo,
+            "feat-sibling-opt",
+            crate::engine::worktree::WorktreeLayout::Sibling,
+        )
+        .unwrap();
+        assert_eq!(sibling_actual, sibling_expected, "{sibling}");
+
+        // 5. Invalid layout values fail closed, and the schema change stays additive.
+        let (err, invalid) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/invalid-layout",
+                "layout": "elsewhere",
+                "share_cache": false
+            }),
+        );
+        assert!(err, "invalid layout must be rejected: {invalid}");
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_worktree_create")
+            .unwrap();
+        assert_eq!(
+            schema["inputSchema"]["required"],
+            json!(["repo_path", "branch"])
+        );
+    }
+
+    #[test]
+    fn worktree_create_default_lane_is_writable_under_default_manvi_gate() {
+        let (_sandbox, repo) = honesty_repo();
+        let (err, created_lane) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/gate-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "lane create failed: {created_lane}");
+        let lane_file = std::path::Path::new(created_lane["worktree_path"].as_str().unwrap())
+            .join("gate_probe.txt");
+
+        let (err, created_sibling) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/gate-sibling",
+                "layout": "sibling",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sibling create failed: {created_sibling}");
+        let sibling_file =
+            std::path::Path::new(created_sibling["worktree_path"].as_str().unwrap())
+                .join("gate_probe.txt");
+
+        let lane_verdict =
+            crate::harness::policy::check_file(&repo, lane_file.to_str().unwrap(), "write", None);
+        assert!(
+            lane_verdict.checked,
+            "manvi gate did not run: {lane_verdict:?}"
+        );
+        assert!(
+            !lane_verdict.status.blocks(),
+            "default lane must be writable under default gate: {lane_verdict:?}"
+        );
+        std::fs::write(&lane_file, "allowed\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&lane_file).unwrap(), "allowed\n");
+
+        let sibling_verdict = crate::harness::policy::check_file(
+            &repo,
+            sibling_file.to_str().unwrap(),
+            "write",
+            None,
+        );
+        assert!(
+            sibling_verdict.checked,
+            "manvi gate did not run for sibling: {sibling_verdict:?}"
+        );
+        assert!(
+            sibling_verdict.status.blocks(),
+            "sibling layout must be blocked by default gate: {sibling_verdict:?}"
+        );
+        assert_eq!(sibling_verdict.rule, "path.outside_root", "{sibling_verdict:?}");
+    }
+
+    #[test]
     fn test_task_subtask_decomposition_and_inbox_mcp_lifecycle() {
         let (dir, _profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
@@ -12467,7 +12820,7 @@ mod deferral_retry_tests {
         let repo = crate::test_support::git_repo();
         let path = repo.path().to_str().unwrap();
         for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
-            let answer = crate::engine::git_cli::with_forced_deferral(|| {
+            let answer = crate::engine::process::with_forced_deferral(|| {
                 handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
             });
             assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
@@ -12582,7 +12935,7 @@ mod deferral_retry_tests {
     fn a_ledger_read_that_stays_shed_names_the_deferral_after_one_retry() {
         let repo = crate::test_support::git_repo();
         let harness = Harness::new(0, ROOMY);
-        let error = crate::engine::git_cli::with_forced_deferral(|| {
+        let error = crate::engine::process::with_forced_deferral(|| {
             harness.run(|retry| read_address(repo.path().to_str().unwrap(), retry))
         })
         .expect_err("a shed read cannot resolve");

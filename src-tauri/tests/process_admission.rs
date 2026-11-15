@@ -9,7 +9,7 @@ use common::{env, shipped_binaries};
 
 use std::path::Path;
 
-use gitpulse_lib::engine::git_cli::{
+use gitpulse_lib::engine::process::{
     current_admission_name, run_process_as_background, run_process_with_shared_spawn_budget,
 };
 
@@ -49,14 +49,14 @@ fn leading_switches(bin: &str) -> Vec<String> {
         .skip(1)
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .take_while(|line| line.starts_with("gitpulse_lib::engine::git_cli::run_process_"))
+        .take_while(|line| line.starts_with("gitpulse_lib::engine::process::run_process_"))
         .map(str::to_string)
         .collect()
 }
 
-const BACKGROUND_SWITCH: &str = "gitpulse_lib::engine::git_cli::run_process_as_background();";
+const BACKGROUND_SWITCH: &str = "gitpulse_lib::engine::process::run_process_as_background();";
 const SHARED_BUDGET_SWITCH: &str =
-    "gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();";
+    "gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();";
 
 /// The binaries whose work is optional must make the switch, and make it
 /// before anything else in `main` can start a thread.
@@ -87,7 +87,7 @@ fn the_agent_server_and_the_daemon_run_as_background() {
 #[test]
 fn the_agent_server_waits_for_background_budget_and_the_daemon_does_not() {
     const AWAIT_SWITCH: &str =
-        "gitpulse_lib::engine::git_cli::run_process_awaiting_background_budget();";
+        "gitpulse_lib::engine::process::run_process_awaiting_background_budget();";
     assert!(leading_switches("src/bin/gitpulse-mcp.rs")
         .iter()
         .any(|s| s == AWAIT_SWITCH));
@@ -189,7 +189,7 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
 /// and why each one need not: it measures the gate, runs in a child process of
 /// its own (its own gate), or calls only library code that spawns nothing
 /// through it. A suite that calls a module that does spawn through
-/// `git_cli`'s gate (`engine`, `graph`, `repo_op`, `worktree`, `stash`,
+/// `engine::process`'s gate (`engine`, `graph`, `repo_op`, `worktree`, `stash`,
 /// `submodules`, `analyzer::{coverage, deps}`, `storage`, `desktop::
 /// cmd_resolve_git_root`, `harness`, `devmap`, `ops`, `ingest`, `ledger`,
 /// `terminal` sessions and `run_terminal`) belongs in neither this list nor
@@ -212,7 +212,7 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
 ///
 /// Each needs the call graph, which `devmap` has and this test does not.
 /// The run-time answer is the instrumented gate: patch the library's spawn gate
-/// (`git_cli`'s `SpawnGate::acquire_judged`, where `rate_limited` is decided) to
+/// (`engine::process`'s `SpawnGate::acquire_judged`, where `rate_limited` is decided) to
 /// append the test executable's name, the thread's name and the admission class
 /// (and a backtrace, to name the call) to a log whenever a spawn is made under
 /// the production rate by a process whose executable sits in `target/debug/deps`
@@ -447,7 +447,7 @@ fn a_real_lift_is_seen_however_it_is_spelled() {
         "fn f() {\n    common::unmetered_spawns();\n}\n"
     ));
     assert!(lifts_the_cap(
-        "fn f() {\n    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();\n}\n"
+        "fn f() {\n    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();\n}\n"
     ));
     assert!(!lifts_the_cap("fn f() {\n    let _ = 1;\n}\n"));
 }

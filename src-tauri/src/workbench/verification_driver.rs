@@ -728,7 +728,7 @@ pub(crate) fn run_at(
     }
     let spec = format!("{head}^");
     let parent = base_from_parent_read(
-        crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+        crate::engine::process::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
             crate::engine::git_cli::git_text(
                 Path::new(&local.path),
                 &["rev-parse", "--verify", "--end-of-options", &spec],
@@ -886,8 +886,8 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
 /// deferred it under load, or the child never got a process slot. The command
 /// did not run, so the error is not an answer about the repository.
 pub(crate) fn git_question_unasked(err: &str) -> bool {
-    crate::engine::git_cli::is_deferred_under_load(err)
-        || crate::engine::git_cli::is_slot_wait_timeout(err)
+    crate::engine::process::is_deferred_under_load(err)
+        || crate::engine::process::is_slot_wait_timeout(err)
 }
 
 /// What the driver writes before a head read's error in a `could_not_run`
@@ -960,7 +960,7 @@ pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, C
         &[crate::engine::ref_cache::ALL_REFS],
         &["verification-base", head],
         || {
-            crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+            crate::engine::process::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
                 verification_base_uncached(worktree, head)
             })
             .map(|base| (base, true))

@@ -13,8 +13,9 @@ use super::{
     discover_github_remote, gh_cli_reported_present, gh_unavailable_reason, probe_gh_cli,
     GitHubRepoRef, MAX_GH_ERROR_BYTES,
 };
-use crate::engine::git_cli::{capture_command, validate_repo};
+use crate::engine::git_cli::validate_repo;
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::process::capture_command;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -124,7 +125,7 @@ pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = capture_command("gh", &refs, None, GH_CALL_TIMEOUT, &[])?;
     if !stdout.success {
-        let err = crate::engine::git_cli::byte_tail(&stdout.stderr, MAX_GH_ERROR_BYTES);
+        let err = crate::engine::process::byte_tail(&stdout.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
             format!("gh exited {}", stdout.status_code).into()
         } else {
@@ -262,7 +263,7 @@ pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, Comm
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let output = capture_command("gh", &refs, Some(&repo), GH_CALL_TIMEOUT, &[])?;
     if !output.success {
-        let err = crate::engine::git_cli::byte_tail(&output.stderr, MAX_GH_ERROR_BYTES);
+        let err = crate::engine::process::byte_tail(&output.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
             format!("gh exited {}", output.status_code).into()
         } else {

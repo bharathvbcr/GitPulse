@@ -10,7 +10,7 @@ metadata:
 
 # GitPulse insights
 
-GitPulse's MCP read tools (`gitpulse_insights`, `gitpulse_status`, `gitpulse_ledger_events`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar`, and the rest of the `readOnlyHint: true` set) never touch git or task state: they create and migrate nothing. Writes on the server are restricted to five task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and nine repository-trust-gated worktree lifecycle and coordination tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with git mutations additionally gated through `harness::guard_command`.
+GitPulse's MCP read tools (`gitpulse_insights`, `gitpulse_sessions`, `gitpulse_status`, `gitpulse_ledger_events`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar`, and the rest of the `readOnlyHint: true` set) never touch git or task state: they create and migrate nothing. Writes on the server are restricted to five task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and nine repository-trust-gated worktree lifecycle and coordination tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with git mutations additionally gated through `harness::guard_command`.
 
 It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process DevMap). Policy and agent hosting go through **Manvi**, not this server.
 
@@ -26,6 +26,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | Tool | When |
 | --- | --- |
 | `gitpulse_insights` | First look at a repo |
+| `gitpulse_sessions` | Who is running here, which session is me (`is_caller`), `run_id`, and live `state` (`working`/`blocked`/`done`/`idle`/`unknown`) without spawning git |
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
 | `gitpulse_active_changes` | Need the file list, not just counts |
@@ -54,5 +55,6 @@ The SessionStart brief that `gitpulse_insights` accompanies carries a `host load
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
 - `agents.ok: false` is "the worktree listing failed", not "no agents"; `agents.truncated: true` means the counts came from a capped sample, so `agents.sessions` is a floor and a kind whose worktrees all fall past the cap is absent from `agents.kinds` rather than undercounted.
 - An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running Claude Code sessions per worktree with their status. A kind that keeps no readable registry (Codex) is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
+- `gitpulse_sessions` spawns no `git` and reports each attributed session's `is_caller`, `run_id`, `tree`, `task_id`, `state`, `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`, bounded by `(cap, total, returned, truncated)` (caller first). When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process scan and Claude registry; Codex sessions with no hub entry report `state: "unknown"` (never `"idle"`), and sessions with no registry or hub entry report `state_source: "none"`.
 
 Pass `repo_path` as an absolute filesystem path on every call. The protocol is MCP `2026-07-28`: include `_meta.io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on each request. Legacy `initialize` still works for older clients.

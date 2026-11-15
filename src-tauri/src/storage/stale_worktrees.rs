@@ -311,7 +311,7 @@ mod tests {
     /// clean, one with a fresh unmerged commit, one dirty.
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let root = git_cli::canonicalize_plain(temp.path()).unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         git_cli::git_global(&["init", "-q", "-b", "main", repo.to_str().unwrap()]).unwrap();

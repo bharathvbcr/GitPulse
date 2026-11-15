@@ -950,7 +950,7 @@ mod mac {
         let app = tauri::Builder::default()
             // What GitPulse's page-load handler reads (step 9).
             .manage(gitpulse_lib::desktop::DesktopState::default())
-            .manage(gitpulse_lib::terminal::TerminalSessions::default())
+            .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
             .on_page_load(gitpulse_lib::desktop::handle_page_load)
             // The browser commands as `lib.rs` registers them (step 10).
             .invoke_handler(tauri::generate_handler![

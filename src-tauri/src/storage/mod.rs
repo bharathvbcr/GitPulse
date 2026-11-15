@@ -20,9 +20,8 @@
 //! degrade into notes on the report; only an invalid repository fails the
 //! command.
 
-use crate::engine::git_cli::{
-    git_text, is_deferred_under_load, resolve_git_common_dir, validate_repo,
-};
+use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
+use crate::engine::process::is_deferred_under_load;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

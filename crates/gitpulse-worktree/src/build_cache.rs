@@ -26,7 +26,7 @@
 
 use devmap_query::{blake3_hash, write_atomic};
 use gitpulse_lib::engine::cow_clone::reflink_copy_file;
-use gitpulse_lib::engine::git_cli::capture_command;
+use gitpulse_lib::engine::process::capture_command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};

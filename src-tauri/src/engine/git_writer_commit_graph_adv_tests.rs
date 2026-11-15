@@ -13,7 +13,7 @@ fn text(path: &Path) -> String {
 }
 
 fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, CommandError> {
-    crate::engine::git_cli::mark_user_action(repo);
+    crate::engine::process::mark_user_action(repo);
     GitWriter::commit_graph_write(repo, confirmed)
 }
 

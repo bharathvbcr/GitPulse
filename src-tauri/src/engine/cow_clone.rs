@@ -1608,8 +1608,8 @@ fn other_worktrees(anchor: &Path, worktree: &Path) -> Vec<PathBuf> {
             .filter(|info| !info.is_main && !info.is_bare)
             .map(|info| PathBuf::from(info.path))
             .filter(|path| {
-                crate::engine::git_cli::canonicalize_plain(path).ok()
-                    != crate::engine::git_cli::canonicalize_plain(worktree).ok()
+                crate::engine::process::canonicalize_plain(path).ok()
+                    != crate::engine::process::canonicalize_plain(worktree).ok()
             })
             .collect(),
         Err(error) => {
@@ -2127,7 +2127,7 @@ mod tests {
         let anchor = main.path().canonicalize().unwrap();
         fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
         fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
-        let synced = crate::engine::git_cli::with_forced_spawn_failure_of("check-ignore", || {
+        let synced = crate::engine::process::with_forced_spawn_failure_of("check-ignore", || {
             reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
         });
         let error = synced.expect_err("an unchecked cache was copied or skipped silently");

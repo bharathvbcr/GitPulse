@@ -341,7 +341,13 @@ impl CollisionMemo {
             };
             let read = changed_paths_since(path, None, not_before)?;
             oldest.fetch_max(read.age.as_millis() as u64, Ordering::Relaxed);
-            Ok((read.paths, read.truncated))
+            let mut paths = read.paths;
+            crate::engine::worktree::fold_status_paths_for_focus(
+                std::path::Path::new(path),
+                focus,
+                &mut paths,
+            );
+            Ok((paths, read.truncated))
         };
         let live = live_in(observation, &list);
         (
@@ -360,8 +366,17 @@ impl CollisionMemo {
     }
 }
 
-/// The key a repository's memory is kept under: its canonical path.
+/// The key a repository's memory is kept under: its common git directory when
+/// trusted (so linked worktrees share the family's listing memo), or its
+/// canonical path otherwise. Trust is validated before resolving the common
+/// directory so an untrusted path cannot collide with a trusted slot.
 pub(super) fn memo_key(repo_path: &str) -> String {
+    if let Ok(repo) = crate::engine::git_cli::validate_repo(repo_path) {
+        if let Ok(common) = crate::engine::git_cli::resolve_git_common_dir(&repo) {
+            return common.to_string_lossy().into_owned();
+        }
+        return repo.to_string_lossy().into_owned();
+    }
     std::fs::canonicalize(repo_path)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| repo_path.to_string())
@@ -457,9 +472,9 @@ mod tests {
             );
         }
 
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        let before = crate::engine::process::spawn_log::spawns_in(&kept_path);
         memo.risk_for_path(&kept_path.to_string_lossy(), "src/planned.rs", &observation);
-        let after = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        let after = crate::engine::process::spawn_log::spawns_in(&kept_path);
         assert!(
             after.len() >= before.len(),
             "spawn log dropped {kept_path:?}; cannot prove the listing was kept"

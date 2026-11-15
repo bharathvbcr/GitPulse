@@ -104,7 +104,7 @@ impl Fixture {
         );
         git(dir.path(), &["push", "-u", "origin", "main"]);
 
-        let repo = crate::engine::git_cli::canonicalize_plain(dir.path())
+        let repo = crate::engine::process::canonicalize_plain(dir.path())
             .expect("canonical checkout")
             .to_string_lossy()
             .into_owned();
@@ -130,7 +130,7 @@ impl Fixture {
     ) -> (Result<T, IpcError>, Observed) {
         let cursor = crate::ledger::latest_cursor(&self.repo).expect("ledger cursor");
         let spawned_before =
-            crate::engine::git_cli::spawn_log::spawns_in(Path::new(&self.repo)).len();
+            crate::engine::process::spawn_log::spawns_in(Path::new(&self.repo)).len();
         let result = tauri::async_runtime::block_on(command);
         let judged = crate::ledger::tail(&self.repo, cursor, 1_000)
             .expect("ledger tail")
@@ -141,7 +141,7 @@ impl Fixture {
             .filter_map(|row| row.argv_json)
             .map(|json| serde_json::from_str::<Vec<String>>(&json).expect("argv_json is an argv"))
             .collect();
-        let spawned = crate::engine::git_cli::spawn_log::spawns_in(Path::new(&self.repo))
+        let spawned = crate::engine::process::spawn_log::spawns_in(Path::new(&self.repo))
             [spawned_before..]
             .iter()
             .map(|argv| without_pins(argv))

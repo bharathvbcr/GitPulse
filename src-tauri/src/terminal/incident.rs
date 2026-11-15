@@ -451,7 +451,7 @@ fn local_log_time(ms: u64) -> Option<String> {
 
 /// Asks the macOS unified log who signalled launchd's jobs around `incident`.
 /// Blocking: call it off the UI and async-runtime threads. Runs through
-/// `git_cli::run_captured`, the project's bounded spawn path (procguard
+/// `crate::engine::process::run_captured`, the project's bounded spawn path (procguard
 /// registration, deadline, capped output).
 #[cfg(target_os = "macos")]
 pub fn attribute_sender(incident: &Incident) -> Attribution {
@@ -472,7 +472,7 @@ pub fn attribute_sender(incident: &Incident) -> Attribution {
             "--predicate",
             r#"process == "launchd" AND eventMessage CONTAINS "sent by""#,
         ];
-        match crate::engine::git_cli::run_captured(
+        match crate::engine::process::run_captured(
             "/usr/bin/log",
             &args,
             None,
@@ -480,14 +480,14 @@ pub fn attribute_sender(incident: &Incident) -> Attribution {
             &[],
             QUERY_OUTPUT_CAP,
         ) {
-            Ok(crate::engine::git_cli::RunOutcome::TimedOut(_)) => LogQuery::TimedOut,
-            Ok(crate::engine::git_cli::RunOutcome::Finished(run)) if run.success => {
+            Ok(crate::engine::process::RunOutcome::TimedOut(_)) => LogQuery::TimedOut,
+            Ok(crate::engine::process::RunOutcome::Finished(run)) if run.success => {
                 LogQuery::Output {
                     bytes: run.stdout_tail.into_bytes(),
                     truncated: run.truncated,
                 }
             }
-            Ok(crate::engine::git_cli::RunOutcome::Finished(run)) => LogQuery::Failed(format!(
+            Ok(crate::engine::process::RunOutcome::Finished(run)) => LogQuery::Failed(format!(
                 "exit status {}: {}",
                 run.status_code,
                 run.stderr_tail.chars().take(160).collect::<String>()

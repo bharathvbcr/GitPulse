@@ -5,11 +5,11 @@
 //!
 //! A child of `shared_budget` so it can drive the private `take_at`.
 
-use super::*;
-use crate::engine::git_cli::{
+use super::super::{
     is_deferred_under_load, refusal_message_at, with_admission, Admission, BucketLevel, Refusal,
     RefusingBucket, SpawnGate,
 };
+use super::*;
 use crate::test_support::coverage_relaxed;
 
 const SEC: u64 = 1_000_000_000;
@@ -130,15 +130,6 @@ fn model(seed: u64, burst: u32, per_sec: u32, steps: u64) -> ModelResult {
         lane_grant_oracle_denied: diverge,
         steps,
     }
-}
-
-fn stamped(version: u32, tokens: u32, at_ns: u64) -> Vec<u8> {
-    let mut record = vec![0u8; RECORD_LEN];
-    record[0..4].copy_from_slice(&MAGIC);
-    record[4..8].copy_from_slice(&version.to_le_bytes());
-    record[8..12].copy_from_slice(&tokens.to_le_bytes());
-    record[16..24].copy_from_slice(&at_ns.to_le_bytes());
-    record
 }
 
 /// ATTACK 1a. Model check: total grants stay within burst + rate * (sum of

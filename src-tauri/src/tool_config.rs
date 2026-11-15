@@ -200,9 +200,10 @@ impl AgentDefaults {
         self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
     }
 
-    /// Whether terminals live in the terminal host rather than the app.
+    /// Whether managed agent runs live in a hosted Manvi rather than closing
+    /// with the app. (On Unix, terminal sessions always live in `gitpulse-ptyd`.)
     pub fn keeps_terminals_running(&self) -> bool {
-        self.keep_terminals_running.unwrap_or(false)
+        self.keep_terminals_running.unwrap_or(true)
     }
 
     /// The terminal session limit to apply: the stored one, or the default.
@@ -2249,16 +2250,37 @@ mod tests {
     /// How many terminal sessions may be open is the user's: stored where the
     /// last release does not look, refused outside the terminal module's
     /// bounds at save, and degraded alone when a hand-edited value is bad.
-    /// "Keep terminals running when GitPulse quits": stored under
-    /// `agent_launch`, off when absent or unreadable, and what picks the
-    /// backend the app's registry is built on.
+    /// "Keep managed agent runs running when GitPulse quits": stored under
+    /// `agent_launch.keep_terminals_running`, on when absent or unreadable, and
+    /// independent of the terminal backend (which is unconditionally `host` on Unix).
     #[test]
-    fn keeping_terminals_running_is_stored_and_selects_the_terminal_host() {
+    fn keeping_terminals_running_is_stored_and_host_backend_stays_unconditional() {
         with_temp_config(|path| {
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
+            );
+            #[cfg(not(unix))]
             assert_eq!(
                 crate::terminal::TerminalSessions::from_settings().backend(),
                 "in-process"
+            );
+            let off = AgentDefaults {
+                keep_terminals_running: Some(false),
+                ..AgentDefaults::default()
+            };
+            set_agent_defaults(off.clone()).unwrap();
+            assert_eq!(agent_defaults(), off);
+            assert!(!agent_defaults().keeps_terminals_running());
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["keep_terminals_running"], false);
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
             );
             let on = AgentDefaults {
                 keep_terminals_running: Some(true),
@@ -2270,17 +2292,12 @@ mod tests {
             let written: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(written["agent_launch"]["keep_terminals_running"], true);
-            #[cfg(unix)]
-            assert_eq!(
-                crate::terminal::TerminalSessions::from_settings().backend(),
-                "host"
-            );
             // A value this build cannot read costs this setting alone.
             let mut text: serde_json::Value = written;
             text["agent_launch"]["keep_terminals_running"] = serde_json::json!("yes");
             text["agent_launch"]["max_terminal_sessions"] = serde_json::json!(40);
             fs::write(path, text.to_string()).unwrap();
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
             assert_eq!(agent_defaults().terminal_sessions(), 40);
         });
     }

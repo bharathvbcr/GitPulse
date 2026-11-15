@@ -30,7 +30,7 @@
 //! tokens included, so only the human line naming the email is ever parsed.
 
 use super::MAX_FIREBASE_ERROR_BYTES;
-use crate::engine::git_cli::{byte_tail, capture_command, CapturedOutput};
+use crate::engine::process::{byte_tail, capture_command, CapturedOutput};
 use crate::ipc_error::CommandError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};

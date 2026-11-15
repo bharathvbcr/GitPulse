@@ -49,7 +49,7 @@ mod imp {
     const TICK: Duration = Duration::from_millis(250);
 
     pub fn main() {
-        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("live_index");
         // The same storm in smoke and full mode (only the sample count differs),
         // so the row name and its `ticks` counter match the baseline's.

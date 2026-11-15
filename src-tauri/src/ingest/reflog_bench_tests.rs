@@ -88,12 +88,12 @@ fn bench_catch_up_on_a_five_thousand_entry_reflog() {
     for n in 0..PASSES {
         file.write_all(line(ENTRIES + n).as_bytes())
             .expect("write entry");
-        let children = crate::engine::git_cli::spawn_log::spawns_in(std::path::Path::new(&repo));
+        let children = crate::engine::process::spawn_log::spawns_in(std::path::Path::new(&repo));
         let started = std::time::Instant::now();
         let out = catch_up_into_bounded(&repo, &repo, None);
         times.push(started.elapsed().as_secs_f64() * 1000.0);
         recorded += out.recorded;
-        spawned = crate::engine::git_cli::spawn_log::spawns_in(std::path::Path::new(&repo))
+        spawned = crate::engine::process::spawn_log::spawns_in(std::path::Path::new(&repo))
             .into_iter()
             .skip(children.len())
             .map(|argv| argv.join(" "))

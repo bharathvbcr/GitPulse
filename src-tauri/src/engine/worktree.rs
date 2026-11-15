@@ -8,13 +8,13 @@
 //! write.
 
 use crate::engine::git_cli::{
-    git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, resolve_git_dir,
-    validate_repo,
+    git_text, git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
 use crate::engine::git_writer::is_full_oid;
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
+use crate::engine::process::plain_path_text;
 use crate::ipc_error::CommandError;
 use crate::lru_map::LruMap;
 use serde::{Deserialize, Serialize};
@@ -125,8 +125,16 @@ impl AdmittedPair {
     /// [`Self::metadata_checkouts`] without the admitted pair: the primary
     /// working tree first, then each linked worktree the registry names. What
     /// the metadata says is registered, whatever the caller asked about.
-    fn registered_checkouts(&self) -> Option<Vec<PathBuf>> {
+    pub(crate) fn registered_checkouts(&self) -> Option<Vec<PathBuf>> {
         self.scan_checkouts(false)
+    }
+
+    pub(crate) fn repo_path(&self) -> &Path {
+        &self.repo
+    }
+
+    pub(crate) fn common_dir(&self) -> &Path {
+        &self.common
     }
 
     fn scan_checkouts(&self, with_pair: bool) -> Option<Vec<PathBuf>> {
@@ -399,6 +407,61 @@ fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFam
             members: family.members.clone(),
         },
     );
+}
+
+/// Remembers a worktree family from an already-completed non-bare listing (such
+/// as `list_worktrees_lite` or a running app's `AppFacets` answer) when
+/// repository trust, the common directory and filesystem metadata independently
+/// confirm every member. Costs zero `git` children and silently no-ops whenever
+/// metadata cannot prove the set whole, leaving [`resolve_worktree_family`] to
+/// ask Git.
+pub(crate) fn remember_verified_member_paths(repo_path: &str, member_paths: &[&str]) {
+    let Ok(pair) = admit_worktree_pair(repo_path, repo_path) else {
+        return;
+    };
+    let Some(registered) = pair.registered_checkouts() else {
+        return;
+    };
+    let Some(anchor) = registered.first().cloned() else {
+        return;
+    };
+    let mut registry = registered;
+    registry.sort();
+    registry.dedup();
+    if !registry.contains(&pair.repo) {
+        return;
+    }
+
+    let mut canonical_members = Vec::with_capacity(member_paths.len());
+    for member in member_paths {
+        match std::fs::canonicalize(member) {
+            Ok(canonical) => canonical_members.push(canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return,
+        }
+    }
+    let mut as_set = canonical_members.clone();
+    as_set.sort();
+    as_set.dedup();
+    if as_set != registry {
+        return;
+    }
+
+    let mut members = Vec::with_capacity(canonical_members.len().max(1));
+    members.push(anchor.clone());
+    for member in canonical_members {
+        if member != anchor && !members.contains(&member) {
+            members.push(member);
+        }
+    }
+
+    let family = WorktreeFamily {
+        anchor,
+        worktree: pair.worktree,
+        members,
+    };
+    super::worktree_family_disk::store(&pair.common, &registry, &family.members);
+    remember_family(pair.common, registry, &family);
 }
 
 /// Largest repository `config` [`AdmittedPair::metadata_checkouts`] reads.
@@ -853,13 +916,55 @@ pub fn gitpulse_lane_container(main_checkout: &Path) -> PathBuf {
         .join(WORKTREES_SEGMENT)
 }
 
+pub const LANE_EXCLUDE_MARKER: &str =
+    "# GitPulse: task agent worktrees (machine-generated, never committed)";
+
+/// Placement layout for newly created worktrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeLayout {
+    /// `<main_checkout>/.gitpulse/worktrees/<slug>` (default).
+    #[default]
+    Lane,
+    /// `<main_checkout_parent>/<repo>.<slug>` (explicit opt-in).
+    Sibling,
+}
+
+impl WorktreeLayout {
+    pub const VALUES: &[&'static str] = &["lane", "sibling"];
+
+    pub fn parse(raw: Option<&str>) -> Result<Self, CommandError> {
+        match raw {
+            None | Some("lane") => Ok(Self::Lane),
+            Some("sibling") => Ok(Self::Sibling),
+            Some(other) => Err(CommandError::plain(format!(
+                "invalid worktree layout {other:?} (expected \"lane\" or \"sibling\")"
+            ))),
+        }
+    }
+}
+
+/// Ensures `.gitpulse/worktrees/` is excluded via `$GIT_COMMON_DIR/info/exclude`
+/// anchored at the main checkout so lanes stay out of `git status`.
+pub fn ensure_gitpulse_lane_excluded(repo_or_worktree: &Path) -> Result<(), CommandError> {
+    let anchor = resolve_main_checkout(repo_or_worktree)?;
+    let outcome =
+        crate::devmap::init::ensure_dir_excluded(&anchor, GITPULSE_LANE_DIR, LANE_EXCLUDE_MARKER);
+    if !outcome.is_clean() {
+        return Err(CommandError::plain(format!(
+            "GitPulse could not keep {GITPULSE_LANE_DIR}/ out of git status: {outcome:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a hand-made worktree inside GitPulse's task-worktree container.
 ///
-/// `workbench::agent_worktree` is the one creator of worktrees there: it
-/// excludes the container from `git status` before adding, names the branch
-/// after the attempt, and removes what a refused attempt made. A worktree added
-/// there by hand got none of that — `git add -A` in the main checkout would
-/// stage it — and was then labelled "GitPulse task" with no task behind it.
+/// GitPulse's own lane creators (`workbench::agent_worktree`,
+/// `gitpulse_worktree_create`, and `hooks::worktree`) exclude the container
+/// from `git status` before adding and anchor at the main checkout. Hand-supplied
+/// target paths (`cmd_add_worktree`, raw `base_target`) remain refused so
+/// manual worktrees do not leak into `git add -A` in the main checkout.
 /// Read from the path text, so it holds whether or not the target exists yet.
 pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError> {
     match agent_layout(target_path) {
@@ -982,7 +1087,7 @@ pub(crate) const STATUS_CELL_CAP: usize = status_cell::MAX_CELLS;
 /// - Trust is checked before the cell is consulted, as at the spawn.
 mod status_cell {
     use super::{spawn_porcelain, ScanDeadline, DEADLINE_PASSED};
-    use crate::engine::git_cli::{current_admission, is_timed_out, Admission};
+    use crate::engine::process::{current_admission, is_timed_out, Admission};
     use crate::ipc_error::CommandError;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1285,11 +1390,12 @@ fn volume_ignores_case(repo: &Path) -> bool {
     }
 }
 
-/// The proper ancestors of `path` that are nested repositories in `repo`
-/// (a submodule, or any directory with its own `.git`). A status of the file
-/// inside one reports nothing, because the superproject sees only the gitlink
-/// row, so the gitlink is asked about as well.
-fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
+/// Proper ancestors of `path` in `repo` that prevent Git from descending to
+/// `path`: a nested repository (`.git` entry inside the ancestor) or a
+/// non-directory entry (file or symlink where `path` expects a parent
+/// directory). Pathspec-limited status of `path` emits nothing for those, so
+/// the blocker itself must be queried as well.
+fn blocking_ancestors(repo: &Path, path: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut prefix = String::new();
     let mut parts = path.split('/').peekable();
@@ -1301,11 +1407,57 @@ fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
             prefix.push('/');
         }
         prefix.push_str(part);
-        if repo.join(&prefix).join(".git").exists() {
+        let candidate = repo.join(&prefix);
+        let is_non_dir =
+            std::fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir());
+        if is_non_dir || candidate.join(".git").exists() {
             found.push(prefix.clone());
         }
     }
     found
+}
+
+/// Folds status entries in `paths` that represent `focus` in `repo` onto
+/// `focus` itself so callers matching by exact path see:
+/// - case-variant spellings on case-insensitive volumes,
+/// - descendant files when the other worktree has an untracked directory at
+///   `focus` (e.g. `focus/inner.txt`), and
+/// - blocking ancestor entries when the other worktree holds a file, symlink,
+///   or nested repository / submodule along `focus`'s parent prefix.
+pub(crate) fn fold_status_paths_for_focus(repo: &Path, focus: &str, paths: &mut Vec<String>) {
+    let clean_focus = focus.trim_end_matches('/');
+    if clean_focus.is_empty() {
+        return;
+    }
+    let ignore_case = volume_ignores_case(repo);
+    let eq_seg = |a: &str, b: &str| {
+        if ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let has_dir_prefix = |full: &str, dir: &str| {
+        !dir.is_empty()
+            && full.len() > dir.len()
+            && full.as_bytes().get(dir.len()) == Some(&b'/')
+            && full.is_char_boundary(dir.len())
+            && eq_seg(&full[..dir.len()], dir)
+    };
+    for entry in paths.iter_mut() {
+        let clean_entry = entry.trim_end_matches('/');
+        if clean_entry.is_empty() {
+            continue;
+        }
+        if eq_seg(clean_entry, clean_focus)
+            || has_dir_prefix(clean_entry, clean_focus)
+            || has_dir_prefix(clean_focus, clean_entry)
+        {
+            *entry = focus.to_string();
+        }
+    }
+    let mut seen = std::collections::HashSet::with_capacity(paths.len());
+    paths.retain(|p| seen.insert(p.clone()));
 }
 
 /// Why a status that never started did not.
@@ -1468,9 +1620,9 @@ pub fn changed_paths_only(
         return Err(format!("worktree path is not a directory: {}", repo.display()).into());
     }
     let ignore_case = volume_ignores_case(&repo);
-    let nested = nested_repository_ancestors(&repo, path);
+    let ancestors = blocking_ancestors(&repo, path);
     let mut asked: Vec<&str> = vec![path];
-    asked.extend(nested.iter().map(String::as_str));
+    asked.extend(ancestors.iter().map(String::as_str));
     let stdout = spawn_porcelain(
         &repo,
         deadline,
@@ -1480,22 +1632,10 @@ pub fn changed_paths_only(
         }),
     )?;
     let (mut paths, truncated) = bounded_status_paths(stdout.as_bytes());
-    // A row for the file under another spelling of its name, or for the nested
-    // repository that contains it, is a row for this file: the caller matches
-    // rows by the path it asked about.
-    for entry in &mut paths {
-        let same = |other: &str| {
-            if ignore_case {
-                entry.eq_ignore_ascii_case(other)
-            } else {
-                entry == other
-            }
-        };
-        if same(path) || nested.iter().any(|ancestor| same(ancestor)) {
-            *entry = path.to_string();
-        }
-    }
-    paths.dedup();
+    // A row for another case spelling, a descendant under an untracked
+    // directory, or an ancestor blocking descent (file, symlink, submodule) is
+    // a row for this file: the caller matches rows by the path it asked about.
+    fold_status_paths_for_focus(&repo, path, &mut paths);
     Ok((paths, truncated))
 }
 
@@ -1939,7 +2079,7 @@ pub fn list_worktrees_scanned(
     let repo = validate_repo(repo_path)?;
     let key = FlightKey {
         repo,
-        class: crate::engine::git_cli::current_admission(),
+        class: crate::engine::process::current_admission(),
     };
     let (flight, leader, previous) = {
         let mut lanes = flight_lanes()
@@ -2040,7 +2180,7 @@ struct FlightKey {
     repo: PathBuf,
     /// A background caller never shares a user-facing one's scan, nor the
     /// other way round: the class decides what the gate may refuse.
-    class: crate::engine::git_cli::Admission,
+    class: crate::engine::process::Admission,
 }
 
 #[derive(Default)]
@@ -2137,6 +2277,14 @@ fn scan_listing(
     let repo = validate_repo(repo_path)?;
     let pass = ScanPass::asked_at(not_before);
     let parsed = read_worktree_entries(&repo)?;
+    let member_paths: Vec<&str> = parsed
+        .iter()
+        .filter(|entry| !entry.is_bare)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    if let Some(repo_str) = repo.to_str() {
+        remember_verified_member_paths(repo_str, &member_paths);
+    }
     if depth == ScanDepth::Listing {
         return Ok(parsed
             .into_iter()
@@ -2153,7 +2301,7 @@ fn scan_listing(
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    let class = crate::engine::git_cli::current_admission();
+    let class = crate::engine::process::current_admission();
     // Asked once for the whole listing, whenever any scanned worktree is on a
     // branch: without the base no branch is known to be it, so even a lone
     // checkout of the default needs the answer to be called "no divergence".
@@ -2219,7 +2367,7 @@ fn scan_listing(
 /// by the same deadline inside their own status read.
 fn scan_in_waves<F>(
     targets: &[usize],
-    class: crate::engine::git_cli::Admission,
+    class: crate::engine::process::Admission,
     deadline: Option<&ScanDeadline>,
     scan: F,
 ) -> HashMap<usize, WorktreeScan>
@@ -2237,7 +2385,7 @@ where
                 .map(|&idx| {
                     let scan = &scan;
                     let handle = scope
-                        .spawn(move || crate::engine::git_cli::with_admission(class, || scan(idx)));
+                        .spawn(move || crate::engine::process::with_admission(class, || scan(idx)));
                     (idx, handle)
                 })
                 .collect();
@@ -2332,7 +2480,7 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
             ..ParsedWorktree::default()
         })
         .collect();
-    let class = crate::engine::git_cli::current_admission();
+    let class = crate::engine::process::current_admission();
     // The pass began when its clock did, so a status any stage of it read since
     // (the main checkout's, for one) is this stage's answer too.
     let pass = ScanPass::asked_at(deadline.started());
@@ -2791,7 +2939,7 @@ fn scan_worktree(
     // The measurements below swallow their own errors as "absent"; the
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
-    let failures = crate::engine::git_cli::process_failures();
+    let failures = crate::engine::process::process_failures();
     let status = match read_status_since(dir, deadline, pass.not_before) {
         Ok(read) => read.bytes,
         Err(reason) if reason == DEADLINE_PASSED => return WorktreeScan::cut_off(),
@@ -2860,10 +3008,10 @@ fn scan_worktree(
             reason = reason.message()
         ));
     }
-    if crate::engine::git_cli::process_failures() != failures {
+    if crate::engine::process::process_failures() != failures {
         scan.note = Some(format!(
             "some measurements were not taken: {}",
-            crate::engine::git_cli::last_process_failure()
+            crate::engine::process::last_process_failure()
                 .map(CommandError::into_message)
                 .unwrap_or_else(|| "a git read produced no answer".into())
         ));
@@ -3801,6 +3949,7 @@ pub fn add_worktree_configured(
             &cleaned_sparse,
             cow_caches,
             zero_copy_devmap,
+            false,
             gate,
         )?;
         let mut created = WorktreeCreated {
@@ -6714,6 +6863,106 @@ pub fn render_branch_template(
     Ok(rendered)
 }
 
+/// Resolves the main checkout anchor for `worktree_or_repo` (canonicalized,
+/// never nested inside a linked worktree). Bare repositories and separate
+/// gitdirs without a `.git` checkout parent return the canonicalized input.
+pub fn resolve_main_checkout(worktree_or_repo: &Path) -> Result<PathBuf, CommandError> {
+    let canon = worktree_or_repo.canonicalize().map_err(|e| {
+        CommandError::plain(format!("cannot resolve {}: {e}", worktree_or_repo.display()))
+    })?;
+    let canon = PathBuf::from(plain_path_text(&canon.to_string_lossy()));
+    if let Ok((_, common)) = crate::repository_trust::git_directories(&canon) {
+        let common = common.canonicalize().unwrap_or(common);
+        if common.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            if let Some(parent) = common.parent() {
+                let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                return Ok(PathBuf::from(plain_path_text(&parent.to_string_lossy())));
+            }
+        }
+    }
+    Ok(canon)
+}
+
+fn validate_worktree_slug(slug: &str) -> Result<(), CommandError> {
+    if slug.is_empty()
+        || matches!(slug, "." | "..")
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains('\0')
+    {
+        return Err(CommandError::plain(format!(
+            "Invalid worktree directory slug: {slug:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Canonical worktree path resolver shared across MCP worktree creation and
+/// Claude Code's `WorktreeCreate` hook.
+pub fn resolve_worktree_path(
+    repo_or_worktree: &Path,
+    slug: &str,
+    layout: WorktreeLayout,
+) -> Result<PathBuf, CommandError> {
+    validate_worktree_slug(slug)?;
+    let anchor = resolve_main_checkout(repo_or_worktree)?;
+    match layout {
+        WorktreeLayout::Lane => {
+            let mut container = anchor;
+            for segment in [format!(".{GITPULSE_LANE_KIND}"), WORKTREES_SEGMENT.to_string()] {
+                container.push(segment);
+                match container.symlink_metadata() {
+                    Ok(meta) if meta.file_type().is_dir() => {}
+                    Ok(_) => {
+                        return Err(CommandError::plain(format!(
+                            "{} is not a directory (Claude Code and GitPulse refuse a worktree path through a link inside the repository)",
+                            container.display()
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(CommandError::plain(format!(
+                            "cannot read {}: {e}",
+                            container.display()
+                        )));
+                    }
+                }
+            }
+            Ok(container.join(slug))
+        }
+        WorktreeLayout::Sibling => {
+            let parent = anchor.parent().ok_or_else(|| {
+                CommandError::plain(format!(
+                    "Repository {} has no parent directory for sibling worktree placement",
+                    anchor.display()
+                ))
+            })?;
+            let repo_name = anchor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("repo");
+            let target = parent.join(format!("{repo_name}.{slug}"));
+            let target_s = target.to_string_lossy();
+            validate_target_path(&target_s)?;
+            refuse_gitpulse_lane_target(&target_s)?;
+            Ok(target)
+        }
+    }
+}
+
+/// Resolves a deterministic target worktree path for a branch in a repository
+/// using the specified placement layout.
+pub fn resolve_worktree_path_for_branch_with_layout(
+    repo_path: &str,
+    branch: &str,
+    layout: WorktreeLayout,
+) -> Result<PathBuf, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let slug = sanitize_branch_name(branch);
+    validate_worktree_slug(&slug)?;
+    resolve_worktree_path(&repo, &slug, layout)
+}
+
 /// Resolves a deterministic target worktree path for a branch in a repository.
 pub fn resolve_worktree_path_for_branch(
     repo_path: &str,
@@ -6725,23 +6974,7 @@ pub fn resolve_worktree_path_for_branch(
         refuse_gitpulse_lane_target(target)?;
         return Ok(PathBuf::from(target));
     }
-    let repo = validate_repo(repo_path)?;
-    let anchor = resolve_worktree_family(repo_path, repo_path)
-        .ok()
-        .and_then(|f| f.anchor.to_str().and_then(|s| validate_repo(s).ok()))
-        .unwrap_or(repo);
-    let repo_name = anchor
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
-    let template = "../{{ repo }}.{{ branch | sanitize }}";
-    let rendered = render_branch_template(template, repo_name, branch, None, None, None)?;
-    let parent = anchor.parent().unwrap_or(&anchor);
-    let target = parent.join(rendered.trim_start_matches("../"));
-    if let Some(target_str) = target.to_str() {
-        refuse_gitpulse_lane_target(target_str)?;
-    }
-    Ok(target)
+    resolve_worktree_path_for_branch_with_layout(repo_path, branch, WorktreeLayout::Sibling)
 }
 
 /// Results of the Six-Point Branch Integration Verification Algorithm.
@@ -6815,7 +7048,7 @@ pub fn verify_branch_integration(
                 repo,
                 &target_sha,
                 &branch_sha,
-                Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+                Instant::now() + crate::engine::process::DEFAULT_TIMEOUT,
             ) {
                 Ok(crate::engine::object_quarantine::MergeOutcome::Clean { tree }) => {
                     tree == target_tree
@@ -7152,7 +7385,7 @@ pub fn merge_worktree_pipeline(
                     &anchor,
                     &target_sha,
                     &source_sha,
-                    Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+                    Instant::now() + crate::engine::process::DEFAULT_TIMEOUT,
                 )
                 .map_err(|e| CommandError::plain(e.to_string()))?
             {
@@ -7626,6 +7859,34 @@ pub fn add_sparse_worktree_zero_copy(
         scope_paths,
         selective_cache,
         true,
+        false,
+        gate,
+    )
+}
+
+/// Authorized sparse zero-copy creation inside `<main_checkout>/.gitpulse/worktrees/`,
+/// used only by GitPulse's own managed lane creators after policy admission and
+/// `info/exclude` setup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_sparse_worktree_zero_copy_for_lane(
+    repo_path: &str,
+    target_path: &str,
+    branch: &str,
+    base: Option<&str>,
+    scope_paths: &[String],
+    selective_cache: bool,
+    gate: GitWriteGate<'_>,
+) -> Result<SparseWorktreeCreated, CommandError> {
+    add_sparse_worktree_zero_copy_optional_branch(
+        repo_path,
+        target_path,
+        Some(branch),
+        base,
+        false,
+        scope_paths,
+        selective_cache,
+        true,
+        true,
         gate,
     )
 }
@@ -7640,16 +7901,21 @@ fn add_sparse_worktree_zero_copy_optional_branch(
     scope_paths: &[String],
     selective_cache: bool,
     zero_copy_devmap: bool,
+    allow_lane_target: bool,
     gate: GitWriteGate<'_>,
 ) -> Result<SparseWorktreeCreated, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_target_path(target_path)?;
-    refuse_gitpulse_lane_target(target_path)?;
     if let Some(branch) = new_branch {
         validate_ref_name(branch)?;
     }
     if let Some(start) = base {
         validate_oid_or_revision(start)?;
+    }
+    if allow_lane_target {
+        ensure_gitpulse_lane_excluded(&repo)?;
+    } else {
+        refuse_gitpulse_lane_target(target_path)?;
     }
 
     let anchor = resolve_worktree_family(repo_path, repo_path)
@@ -8044,7 +8310,7 @@ mod tests {
     /// nothing on Windows and a "spawned zero" assertion passes or fails for
     /// the wrong reason. Plain `canonicalize` off Windows.
     fn plain(path: impl AsRef<Path>) -> PathBuf {
-        crate::engine::git_cli::canonicalize_plain(path.as_ref()).unwrap()
+        crate::engine::process::canonicalize_plain(path.as_ref()).unwrap()
     }
 
     /// The fixtures below are written in `--porcelain`'s newline layout for
@@ -8393,7 +8659,7 @@ some-future-field whatever
 
     /// `diff` children a listing started in `dir`.
     fn diff_spawns_in(dir: &Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(dir)
+        crate::engine::process::spawn_log::spawns_in(dir)
             .iter()
             .filter(|argv| argv.iter().any(|arg| arg == "diff"))
             .count()
@@ -8554,7 +8820,7 @@ some-future-field whatever
             ..ParsedWorktree::default()
         };
         let repo = plain(main.path());
-        let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
+        let scan = crate::engine::process::with_forced_spawn_failure_of("diff", || {
             scan_worktree(
                 &repo,
                 &entry,
@@ -8604,7 +8870,7 @@ some-future-field whatever
     /// background work competed as refresh traffic.
     #[test]
     fn worktree_scans_keep_the_callers_admission_class() {
-        use crate::engine::git_cli::{spawn_log, with_admission, Admission};
+        use crate::engine::process::{spawn_log, with_admission, Admission};
         let (main, _parent, linked) = repo_with_worktrees(6);
         // Changed, so each scan starts both its children (status and diff):
         // a clean worktree's diff is not asked for.
@@ -9035,6 +9301,53 @@ some-future-field whatever
         }
     }
 
+    #[test]
+    fn resolve_worktree_path_supports_lane_default_and_explicit_sibling() {
+        assert_eq!(WorktreeLayout::parse(None).unwrap(), WorktreeLayout::Lane);
+        assert_eq!(
+            WorktreeLayout::parse(Some("lane")).unwrap(),
+            WorktreeLayout::Lane
+        );
+        assert_eq!(
+            WorktreeLayout::parse(Some("sibling")).unwrap(),
+            WorktreeLayout::Sibling
+        );
+        assert!(WorktreeLayout::parse(Some("elsewhere")).is_err());
+
+        let repo = dirty_repo();
+        let canon = repo.path().canonicalize().unwrap();
+        let canon_str = canon.to_str().unwrap();
+
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(
+                resolve_worktree_path(&canon, bad, WorktreeLayout::Lane).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+
+        let lane_path = resolve_worktree_path(&canon, "feat-a", WorktreeLayout::Lane).unwrap();
+        assert_eq!(lane_path, canon.join(".gitpulse/worktrees/feat-a"));
+
+        let sibling_path =
+            resolve_worktree_path(&canon, "feat-a", WorktreeLayout::Sibling).unwrap();
+        let name = canon.file_name().unwrap().to_str().unwrap();
+        assert_eq!(sibling_path, canon.parent().unwrap().join(format!("{name}.feat-a")));
+
+        assert_eq!(
+            resolve_worktree_path_for_branch(canon_str, "feat/a", None).unwrap(),
+            sibling_path
+        );
+        assert_eq!(
+            resolve_worktree_path_for_branch_with_layout(
+                canon_str,
+                "feat/a",
+                WorktreeLayout::Lane
+            )
+            .unwrap(),
+            lane_path
+        );
+    }
+
     fn dirty_repo() -> tempfile::TempDir {
         use crate::test_support::git_in;
         let dir = tempfile::tempdir().expect("repo");
@@ -9062,19 +9375,30 @@ some-future-field whatever
         assert_eq!(paths, ["new/dir/x.rs", "new/y.rs"]);
     }
 
-    /// S3-08. A tree of untracked files far past the path cap stays within it,
-    /// and says it was cut.
+    /// S3-08. A 100k-file untracked tree stays within the path cap, reports
+    /// `truncated: true`, and still lets a path-scoped check past the cap find
+    /// a late path without truncation.
     #[test]
     fn a_huge_untracked_tree_stays_within_the_path_cap_and_says_it_was_cut() {
         let repo = dirty_repo();
-        let dir = repo.path().join("gen");
-        std::fs::create_dir_all(&dir).unwrap();
-        for n in 0..(MAX_CHANGED_PATHS * 8) {
-            std::fs::write(dir.join(format!("f{n:05}.txt")), "").unwrap();
+        let root = repo.path().join("gen");
+        for d in 0..1_000usize {
+            let sub = root.join(format!("d{d:04}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            let first = sub.join("f000.txt");
+            std::fs::write(&first, "").unwrap();
+            for f in 1..100usize {
+                std::fs::hard_link(&first, sub.join(format!("f{f:03}.txt"))).unwrap();
+            }
         }
-        let (paths, truncated) = changed_paths_within(repo.path().to_str().unwrap(), None).unwrap();
+        let repo_str = repo.path().to_str().unwrap();
+        let (paths, truncated) = changed_paths_within(repo_str, None).unwrap();
         assert_eq!(paths.len(), MAX_CHANGED_PATHS);
         assert!(truncated);
+        assert_eq!(
+            changed_paths_only(repo_str, "gen/d0999/f099.txt", None).unwrap(),
+            (vec!["gen/d0999/f099.txt".to_string()], false)
+        );
     }
 
     /// The path-limited read is limited to exactly that path: glob characters
@@ -10124,7 +10448,7 @@ some-future-field whatever
         };
 
         let (dir, wt) = teardown_fixture_on(None, "develop");
-        let refused = crate::engine::git_cli::with_forced_spawn_failure_of(
+        let refused = crate::engine::process::with_forced_spawn_failure_of(
             "refs/remotes/origin/HEAD",
             || merge(&dir, &wt),
         )
@@ -10203,7 +10527,7 @@ some-future-field whatever
         assert_eq!(measured(&batched), Some(expected), "batched");
         // The same counts when the batch is refused and each worktree walks.
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+        let walked = crate::engine::process::with_forced_spawn_failure_of(&format, || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -10271,13 +10595,13 @@ some-future-field whatever
         let base = rev(&root, "main");
         let arg = format!("--format=%(refname)%00%(ahead-behind:{base})");
         let retries = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&root)
+            crate::engine::process::spawn_log::spawns_in(&root)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "--format=%(refname)"))
                 .count()
         };
         let before = retries();
-        let got = crate::engine::git_cli::with_forced_spawn_failure_of(&arg, || {
+        let got = crate::engine::process::with_forced_spawn_failure_of(&arg, || {
             batch_divergence(&root, &base, &["main"])
         });
         assert_eq!(got, None);
@@ -11129,7 +11453,7 @@ some-future-field whatever
 
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
         cwds.iter()
-            .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+            .flat_map(|cwd| crate::engine::process::spawn_log::spawns_in(cwd))
             .filter(|argv| argv.iter().any(|arg| arg == needle))
             .count()
     }
@@ -11196,7 +11520,7 @@ some-future-field whatever
             rev(&root, "main")
         );
         let before = spawned_with(std::slice::from_ref(&root), "rev-list");
-        let walked = crate::engine::git_cli::with_forced_spawn_failure_of(&format, || {
+        let walked = crate::engine::process::with_forced_spawn_failure_of(&format, || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -11245,7 +11569,7 @@ some-future-field whatever
     fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
         let (main, _parent, _linked) = repo_with_worktrees(2);
         let root = plain(main.path());
-        let listed = crate::engine::git_cli::with_forced_spawn_failure_of("for-each-ref", || {
+        let listed = crate::engine::process::with_forced_spawn_failure_of("for-each-ref", || {
             list_worktrees(root.to_str().unwrap())
         })
         .expect("list");
@@ -11367,7 +11691,7 @@ some-future-field whatever
 
     /// `worktree list` processes run in `root`.
     fn listings_in(root: &Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(root)
+        crate::engine::process::spawn_log::spawns_in(root)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|a| a == "list") && argv.iter().any(|a| a == "--porcelain")
@@ -11379,7 +11703,7 @@ some-future-field whatever
     fn gathering(root: &Path) -> bool {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         lanes.get(&key).is_some_and(|lane| lane.open.is_some())
@@ -11389,7 +11713,7 @@ some-future-field whatever
     fn sharing(root: &Path) -> usize {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         // The lane and the leader hold one reference each; every joiner, one.
@@ -11532,7 +11856,7 @@ some-future-field whatever
     /// round, and a `Listing`-depth ask never waits for a scan.
     #[test]
     fn listings_share_only_within_one_admission_class_and_depth_listing_never_waits() {
-        use crate::engine::git_cli::{with_admission, Admission};
+        use crate::engine::process::{with_admission, Admission};
         let (main, _parent, _linked) = repo_with_worktrees(1);
         let root = plain(main.path());
         let before = listings_in(&root);
@@ -14214,12 +14538,12 @@ some-future-field whatever
             // Never panics: this also runs while another failure unwinds.
             let mut cmd = std::process::Command::new("hdiutil");
             cmd.args(["detach", "-force"]).arg(&self.mount);
-            let _ = crate::engine::git_cli::run_bounded(
+            let _ = crate::engine::process::run_bounded(
                 cmd,
                 "hdiutil detach",
                 // Held to the runner's ceiling: relaxed past it, the detach is refused unrun.
                 crate::test_support::coverage_relaxed(HDIUTIL_BUDGET)
-                    .min(crate::engine::git_cli::NETWORK_TIMEOUT),
+                    .min(crate::engine::process::NETWORK_TIMEOUT),
                 None,
             );
         }
@@ -14518,7 +14842,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         for name in ["main", "master", "feat/x"] {
@@ -14591,7 +14915,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         let branches = crate::engine::git_reader::GitReader::list_branches(repo).expect("branches");
         let b = branches.iter().find(|b| b.name == "unrelated").unwrap();
@@ -14625,7 +14949,7 @@ some-future-field whatever
         let batched = list_worktrees(repo).expect("list");
         let format = format!("--format=%(refname)%00%(ahead-behind:{develop})");
         let walked =
-            crate::engine::git_cli::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
+            crate::engine::process::with_forced_spawn_failure_of(&format, || list_worktrees(repo))
                 .expect("list");
         assert_eq!(adv_measured(&batched, "lane"), Some((2, 0)), "batched");
         assert_eq!(
@@ -14644,7 +14968,7 @@ some-future-field whatever
         let _keep = (&main, &parent);
         let root = plain(main.path());
         let count = |needle: &str| {
-            crate::engine::git_cli::spawn_log::spawns_in(&root)
+            crate::engine::process::spawn_log::spawns_in(&root)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == needle))
                 .count()
@@ -14653,10 +14977,10 @@ some-future-field whatever
             let cold = list_worktrees(root.to_str().unwrap()).expect("list");
             assert_eq!(cold.len(), 51);
             assert_eq!(count("refs/remotes/origin/HEAD"), 1, "cold lookups");
-            let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let spawned = crate::engine::process::spawn_log::spawns_in(&root).len();
             let _ = list_worktrees(root.to_str().unwrap()).expect("list");
             assert_eq!(count("refs/remotes/origin/HEAD"), 1, "warm lookups");
-            let again = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let again = crate::engine::process::spawn_log::spawns_in(&root).len();
             eprintln!("root spawns cold={spawned} warm-extra={}", again - spawned);
         });
         let _ = linked;
@@ -15712,6 +16036,7 @@ some-future-field whatever
             &["src".to_string()],
             false,
             false,
+            false,
             &mut |_| Ok(()),
         )
         .expect("add_sparse_worktree");
@@ -15889,12 +16214,12 @@ some-future-field whatever
 #[cfg(test)]
 mod scan_once_tests {
     use super::*;
-    use crate::engine::git_cli::spawn_log::spawns_in;
+    use crate::engine::process::spawn_log::spawns_in;
     use crate::engine::ref_cache::ManualClock;
     use crate::test_support::{git_in, repo_with_worktrees};
 
     fn plain(path: &Path) -> PathBuf {
-        crate::engine::git_cli::canonicalize_plain(path).unwrap()
+        crate::engine::process::canonicalize_plain(path).unwrap()
     }
 
     fn spawned(cwds: &[PathBuf], needle: &str) -> usize {
@@ -15919,7 +16244,7 @@ mod scan_once_tests {
     fn gathering(root: &Path) -> bool {
         let key = FlightKey {
             repo: validate_repo(root.to_str().unwrap()).unwrap(),
-            class: crate::engine::git_cli::current_admission(),
+            class: crate::engine::process::current_admission(),
         };
         let lanes = flight_lanes().lock().unwrap();
         lanes.get(&key).is_some_and(|lane| lane.open.is_some())

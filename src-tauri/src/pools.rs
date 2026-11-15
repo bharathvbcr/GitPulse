@@ -10,7 +10,7 @@
 //!
 //! * The async runtime gets [`async_workers`] workers (2 to 4) and at most
 //!   [`MAX_BLOCKING_THREADS`] blocking threads. Every blocking body is also a
-//!   child-process wait, and `engine::git_cli` admits only a bounded number of
+//!   child-process wait, and `engine::process` admits only a bounded number of
 //!   those, so the blocking pool is not what limits git; it exists to keep a
 //!   runaway from taking the machine.
 //! * Rayon's global pool gets [`rayon_threads`] threads, half the logical cores
@@ -88,7 +88,7 @@ pub(crate) fn install_async_runtime() -> Option<String> {
 /// and default classes the UI, WebKit and the PTY threads run at. Rayon's
 /// workers keep it for life ([`install_rayon_pool`]); the tokio blocking pool
 /// is shared with user actions, so a blocking thread takes it only for the
-/// span of one `Admission::Background` scope (`engine::git_cli::with_admission`)
+/// span of one `Admission::Background` scope (`engine::process::with_admission`)
 /// and gives it back, never to leave a user's next click on a lowered thread.
 ///
 /// `pthread_set_qos_class_self_np` and `pthread_get_qos_class_np` are

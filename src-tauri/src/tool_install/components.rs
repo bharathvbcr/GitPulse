@@ -37,7 +37,7 @@
 //! chosen to have no side effects.
 
 use super::ExternalTool;
-use crate::engine::git_cli;
+use crate::engine::process;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -233,7 +233,7 @@ fn run_probe(path: &str, id: &str, args: &[&str]) -> Result<(bool, String), Stri
     cmd.args(args);
     cmd.current_dir(probe_dir());
     // A component probe is a status line, not a command's error.
-    let run = git_cli::run_bounded_capped(cmd, id, PROBE_TIMEOUT, None, PROBE_CAP)
+    let run = process::run_bounded_capped(cmd, id, PROBE_TIMEOUT, None, PROBE_CAP)
         .and_then(|run| run.require_complete(id))
         .map_err(CommandError::into_message)?;
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -269,8 +269,8 @@ fn host_located(id: &str, host_choice: Option<&std::ffi::OsStr>) -> Option<Strin
         Some(choice) if std::path::Path::new(choice).components().count() > 1 => {
             Some(choice.to_string_lossy().into_owned())
         }
-        Some(choice) => git_cli::find_external_tool(&choice.to_string_lossy()),
-        None => git_cli::find_external_tool(id),
+        Some(choice) => process::find_external_tool(&choice.to_string_lossy()),
+        None => process::find_external_tool(id),
     }
 }
 
@@ -384,7 +384,7 @@ fn probe_located(spec: &Spec<'_>, located: Option<String>) -> ComponentStatus {
 /// load. A fake runner also reaches answers a stub cannot give reliably — a
 /// probe that timed out, output on the stream the reader does not prefer.
 ///
-/// `git_cli::run_bounded_capped` owns the other half: that a real child runs,
+/// `crate::engine::process::run_bounded_capped` owns the other half: that a real child runs,
 /// and that its status and output come back.
 fn probe_located_with(
     spec: &Spec<'_>,
@@ -762,7 +762,7 @@ mod tests {
     /// and one string. What the stub added was a wait on the host getting a
     /// `#!/bin/sh` child to `main` inside [`PROBE_TIMEOUT`] — five seconds that
     /// measure machine load, and that a busy machine loses, reporting an
-    /// installed component as absent. `git_cli::run_bounded_capped`'s own tests
+    /// installed component as absent. `crate::engine::process::run_bounded_capped`'s own tests
     /// own the half that needs a real child.
     fn probed(
         id: &'static str,

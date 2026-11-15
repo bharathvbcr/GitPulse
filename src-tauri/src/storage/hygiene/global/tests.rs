@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 fn fixture() -> (tempfile::TempDir, Arc<Cleaner>, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
+    let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
     let code = root.join("code");
     fs::create_dir(&code).unwrap();
     let cleaner = Arc::new(Cleaner::new(root.join("state")));
@@ -144,7 +144,7 @@ fn discovery_deduplicates_overlapping_roots_preserves_exclusions_and_finds_close
 #[test]
 fn discovery_accepts_a_repo_whose_validate_repo_root_is_verbatim() {
     let (_temp, _cleaner, root) = fixture();
-    let walked = crate::engine::git_cli::canonicalize_plain(&repo(&root, "a")).unwrap();
+    let walked = crate::engine::process::canonicalize_plain(&repo(&root, "a")).unwrap();
     let validated = crate::engine::git_cli::validate_repo(walked.to_str().unwrap()).unwrap();
     #[cfg(windows)]
     {
@@ -463,7 +463,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("execution-state"),
     );
@@ -979,7 +979,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("mixed-state"),
     );
@@ -1160,7 +1160,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("inside-state"),
     );
@@ -1316,7 +1316,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("truncated-state"),
     );
@@ -1474,7 +1474,7 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("all-unread-state"),
     );
@@ -1611,7 +1611,7 @@ fn refused_candidates_do_not_use_up_the_target_count() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("refusals-state"),
     );
@@ -1667,7 +1667,7 @@ fn a_run_of_many_refusals_keeps_its_history_readable_and_counts_what_it_did_not_
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("many-refusals-state"),
     );
@@ -1723,7 +1723,7 @@ fn a_check_the_host_shed_is_reported_unexamined_not_skipped() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("shed-state"),
     );
@@ -1770,7 +1770,7 @@ fn a_briefly_shed_check_is_asked_again_within_the_run() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("brief-shed-state"),
     );
@@ -2011,7 +2011,7 @@ fn a_worktree_cache_is_reclaimed_only_after_its_scope_was_previewed() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("scope-state"),
     );
@@ -2099,7 +2099,7 @@ fn a_lease_on_the_worktrees_branch_in_either_task_store_holds_its_cache() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("lease-state"),
     );
@@ -2164,7 +2164,7 @@ fn the_worktree_scope_vetoes_on_the_worktree_not_the_main_checkout() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("veto-state"),
     );
@@ -2206,7 +2206,7 @@ fn per_tree_vetoes_judge_the_producing_project_only() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("per-tree-state"),
     );
@@ -2247,7 +2247,7 @@ fn the_prune_scope_removes_only_a_stale_worktree_and_never_forces() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("prune-state"),
     );
@@ -2328,7 +2328,7 @@ fn dry_run_reclaim_table() {
     let Some(root) = std::env::var_os("GITPULSE_DRY_RUN_ROOT") else {
         return;
     };
-    let root = crate::engine::git_cli::canonicalize_plain(std::path::Path::new(&root)).unwrap();
+    let root = crate::engine::process::canonicalize_plain(std::path::Path::new(&root)).unwrap();
     crate::test_support::trust_repo(&root);
     let infos = crate::engine::worktree::list_worktrees_lite(root.to_str().unwrap()).unwrap();
     for info in infos.iter().filter(|i| !i.is_main) {
@@ -2434,7 +2434,7 @@ fn an_inspection_cut_short_does_not_count_as_a_preview() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("cut-short-state"),
     );

@@ -43,7 +43,7 @@ fn main() {
     // A hook runs git for the user's own agent, so it spends the per-user
     // spawn budget the app and the agent servers spend. First, before any
     // spawn builds the gate; this only records the choice and blocks on nothing.
-    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
+    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     // The one deadline for the whole process starts here, before anything that
     // can block, so every later wait is cut to what the host's timeout leaves.
     hooks::start_deadline();
