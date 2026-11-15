@@ -15,6 +15,15 @@
 //!   (`serve_turn_checkpoint`), never by the decide-only hook, which only sends
 //!   `Request::RecordTurnCheckpoint` over the UID-authenticated single-instance
 //!   mailbox and only when `turn_checkpoints.enabled` is set (off by default).
+//!   The app does not trust the hook for that: `serve_turn_checkpoint` reads
+//!   the setting itself and, when it is off or unreadable, answers `skipped`
+//!   before any Git process, ref or ledger row, so a hook of another version
+//!   (or any local process that can reach the mailbox) cannot make a worktree
+//!   capture while the person has the feature off. Requests are also bounded:
+//!   at most [`crate::desktop::instance`]'s `MAX_CHECKPOINT_HANDLERS` (2)
+//!   captures are in flight at once, a share of the mailbox's gate slots, and
+//!   a further one is answered busy, so a burst of turn boundaries across many
+//!   worktrees cannot occupy the mailbox or run unbounded Git work.
 //!   `<key>` hashes the branch ref name together with the worktree's own Git
 //!   directory (or, for a detached `HEAD`, that directory alone), so two
 //!   worktrees of one repository never read each other's checkpoints, even
@@ -34,8 +43,9 @@
 //!   secret the person typed into a tracked file and has not committed. It
 //!   stays in the repository's own object store, under a ref no UI lists, and
 //!   is bounded by retention (50 per worktree, 7 days). An untracked file is
-//!   admitted only if its name is not `.env` or
-//!   `.env.*` and `dc_redact` (the one detector the commit-path leak scan and
+//!   admitted only if its leaf name does not start with `.env` (so `.env`,
+//!   `.env.local`, `.envrc`, `.env-local` and `.env_prod` are all omitted) and
+//!   `dc_redact` (the one detector the commit-path leak scan and
 //!   the ledger redactor read) finds no credential shape in its bytes. A file
 //!   that cannot be read, is larger than the per-file scan limit, or is not a
 //!   regular file or symlink (a FIFO is never opened) is omitted. If the scan
@@ -168,7 +178,7 @@ pub struct Omissions {
     pub untracked_found: usize,
     /// Of those, how many are in the checkpoint's tree.
     pub untracked_admitted: usize,
-    /// `.env` and `.env.*` files.
+    /// Files whose leaf name starts with `.env`.
     pub env_files: usize,
     /// Files in which the leak scanner found a credential shape.
     pub secret_flagged: usize,
@@ -462,6 +472,21 @@ impl TempIndex {
             .map_err(|e| format!("cannot open the private index: {e}"))?;
         std::io::copy(&mut input, &mut output)
             .map_err(|e| format!("cannot copy the index: {e}"))?;
+        // Git decides whether an index entry may be trusted by comparing the
+        // entry's timestamps with the index file's own modified time (the
+        // "racily clean" rule). A copy stamped "now" is newer than every
+        // entry, so each entry would be rehashed, and an entry that is only
+        // racily clean in the original is not. Carrying the source's time over
+        // keeps the copy exactly as trustworthy as the original. If the time
+        // cannot be carried, the copy is unusable as a stat cache, so this is a
+        // seed failure and the caller falls back to `read-tree HEAD`.
+        let modified = input
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map_err(|e| format!("cannot read the index modified time: {e}"))?;
+        output
+            .set_modified(modified)
+            .map_err(|e| format!("cannot set the private index modified time: {e}"))?;
         Ok(true)
     }
 }
@@ -675,7 +700,7 @@ enum Candidate {
 }
 
 fn is_env_name(name: &[u8]) -> bool {
-    name == b".env" || name.starts_with(b".env.")
+    name.starts_with(b".env")
 }
 
 /// Reads at most `limit` bytes of a regular file without ever blocking on a
@@ -1437,10 +1462,23 @@ pub fn diff_turn_checkpoint(
 // ── the app-side handler ──────────────────────────────────────────────────────
 
 /// Handles [`crate::desktop::instance::Request::RecordTurnCheckpoint`] inside
-/// the primary desktop process. Every attempt that reaches here writes one
-/// ledger row naming its outcome; the reply carries the same result.
+/// the primary desktop process. The app owns the decision, not the hook: with
+/// `turn_checkpoints.enabled` off or unreadable the answer is `skipped`, and no
+/// git process runs, no ref is written and no ledger row is appended (the row
+/// needs the repository's address, which reads Git). Otherwise every attempt
+/// writes one ledger row naming its outcome; the reply carries the same result.
 pub fn serve_turn_checkpoint(
     request: &crate::desktop::instance::Request,
+) -> Result<serde_json::Value, String> {
+    serve_turn_checkpoint_with(request, &|| {
+        crate::tool_config::turn_checkpoint_settings().enabled
+    })
+}
+
+/// [`serve_turn_checkpoint`] with where the setting is read from passed in.
+pub(crate) fn serve_turn_checkpoint_with(
+    request: &crate::desktop::instance::Request,
+    enabled: &dyn Fn() -> bool,
 ) -> Result<serde_json::Value, String> {
     let crate::desktop::instance::Request::RecordTurnCheckpoint {
         cwd,
@@ -1453,6 +1491,14 @@ pub fn serve_turn_checkpoint(
         return Err("not a turn-checkpoint request".into());
     };
     let event = TurnEvent::parse(event).ok_or("unknown turn checkpoint event")?;
+    if !enabled() {
+        return serde_json::to_value(CaptureResult::bare(
+            CaptureOutcome::Skipped,
+            event,
+            Some("turn checkpoints are off: turn_checkpoints.enabled is not set".into()),
+        ))
+        .map_err(|e| e.to_string());
+    }
     let root = find_git_root(Path::new(cwd))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| cwd.clone());

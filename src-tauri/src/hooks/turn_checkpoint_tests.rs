@@ -223,9 +223,11 @@ fn wired(enabled: bool, trusted: bool) -> Wired {
     else {
         panic!("expected to own the mailbox");
     };
-    owner.attach_turn_checkpointer(std::sync::Arc::new(
-        crate::engine::turn_checkpoint::serve_turn_checkpoint,
-    ));
+    // The app's own setting read is injected: this fixture's `tools.json` is
+    // the hook's, and the developer's real one must not be consulted.
+    owner.attach_turn_checkpointer(std::sync::Arc::new(|request| {
+        crate::engine::turn_checkpoint::serve_turn_checkpoint_with(request, &|| true)
+    }));
     let registered: Box<dyn std::any::Any> =
         Box::new(super::super::test_apps::register(&repo, profile.path()));
     Wired {

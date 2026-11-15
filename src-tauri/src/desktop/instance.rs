@@ -84,6 +84,14 @@ const MAX_ORCHESTRATE_HANDLERS: usize = 8;
 /// Agent A2A deliveries/kickoffs in flight at once: a share of
 /// [`MAX_GATE_HANDLERS`], bounded inside [`HANDLER_TIMEOUT`].
 const MAX_DELIVER_HANDLERS: usize = 4;
+/// Turn checkpoint captures in flight at once: a share of
+/// [`MAX_GATE_HANDLERS`], so the 14 slots left are always a verdict's. A capture
+/// outlives its hook's 1 s wait (scan bound plus git calls of up to 90 s each)
+/// and is asked at both boundaries of every turn, so it must not be able to
+/// hold more than a sliver. Two lets one worktree's start and another's end
+/// overlap; a third request is answered "busy" and its hook reports "not
+/// captured". Captures of one worktree already coalesce in the engine.
+const MAX_CHECKPOINT_HANDLERS: usize = 2;
 /// Longest prompt text an unattended `gitpulse_kickoff_agent` spawn may pass.
 const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
 /// Requests held for an owner whose window is not up yet.
@@ -1088,6 +1096,8 @@ struct Shared {
     orchestrate: Mutex<Option<OrchestrateSink>>,
     /// Agent deliveries in flight, a share of `gating` of their own.
     delivering: AtomicUsize,
+    /// Turn checkpoint captures in flight, a share of `gating` of their own.
+    checkpointing: AtomicUsize,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -1114,6 +1124,7 @@ impl Shared {
             reading: AtomicUsize::new(0),
             orchestrate: Mutex::new(None),
             delivering: AtomicUsize::new(0),
+            checkpointing: AtomicUsize::new(0),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -1763,9 +1774,33 @@ fn answer_turn_checkpoint(
     id: &str,
     request: &Request,
 ) -> Result<(), String> {
+    let capturing = CheckpointSlot::take(shared);
     answer_asked(stream, shared, id, "the turn checkpoint", || {
+        if capturing.is_none() {
+            return Err("the turn checkpoint is busy".to_string());
+        }
         attached(&shared.turn_checkpoint, "the turn checkpoint")?(request)
     })
+}
+
+/// One of the [`MAX_CHECKPOINT_HANDLERS`] turn checkpoints in flight, released
+/// on drop.
+struct CheckpointSlot<'a>(&'a Shared);
+
+impl<'a> CheckpointSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.checkpointing.fetch_add(1, Ordering::AcqRel) >= MAX_CHECKPOINT_HANDLERS {
+            shared.checkpointing.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for CheckpointSlot<'_> {
+    fn drop(&mut self) {
+        self.0.checkpointing.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The sink in `slot`, cloned out so its lock is not held while the answer is

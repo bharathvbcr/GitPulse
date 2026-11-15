@@ -435,6 +435,58 @@ fn the_private_index_is_removed_when_a_panic_unwinds_through_it() {
 }
 
 #[test]
+fn the_private_index_carries_the_real_indexs_modified_time() {
+    let dir = init();
+    let real = dir.path().join(".git/index");
+    // A time far from "now", so a copy stamped at copy time cannot match by luck.
+    let stamp = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&real)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+    let index_dir = tempfile::TempDir::new().unwrap();
+    let temp = TempIndex::create(Some(index_dir.path())).unwrap();
+    assert!(temp.seed_from(&real).unwrap());
+    let seeded = std::fs::metadata(&temp.path).unwrap().modified().unwrap();
+    assert_eq!(seeded, stamp, "the copy keeps the source's modified time");
+    assert_eq!(
+        std::fs::read(&temp.path).unwrap(),
+        std::fs::read(&real).unwrap(),
+        "and its bytes"
+    );
+}
+
+#[test]
+fn untracked_files_named_env_anything_are_omitted_and_counted() {
+    let dir = init();
+    let root = dir.path();
+    for name in [".envrc", ".env-local", ".env_prod", ".env", ".env.local"] {
+        std::fs::write(root.join(name), "A=1\n").unwrap();
+    }
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/.envrc"), "A=2\n").unwrap();
+    std::fs::write(root.join("environment.txt"), "not an env file\n").unwrap();
+    let rig = rig(1_000_000);
+    let result = take(&dir, &rig.cfg);
+    assert_eq!(result.outcome, CaptureOutcome::Captured, "{result:?}");
+    let names = tree_names(root, &result.commit.unwrap());
+    for left_out in [
+        ".envrc",
+        ".env-local",
+        ".env_prod",
+        ".env",
+        ".env.local",
+        "sub/.envrc",
+    ] {
+        assert!(!names.contains(&left_out.to_string()), "{names:?}");
+    }
+    assert!(names.contains(&"environment.txt".to_string()), "{names:?}");
+    assert_eq!(result.omissions.env_files, 6, "{:?}", result.omissions);
+}
+
+#[test]
 fn a_worktree_with_no_index_file_is_seeded_from_head_not_from_nothing() {
     let dir = init();
     let root = dir.path();
@@ -970,21 +1022,69 @@ fn request(root: &Path, event: &str) -> crate::desktop::instance::Request {
     }
 }
 
+/// The handler with the setting on, without reading the developer's real
+/// `tools.json`.
+fn serve_on(request: &crate::desktop::instance::Request) -> Result<serde_json::Value, String> {
+    serve_turn_checkpoint_with(request, &|| true)
+}
+
+#[test]
+fn the_app_refuses_to_capture_when_the_setting_is_off() {
+    let dir = init();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(root.join("new.txt"), "n\n").unwrap();
+    for event in ["turn_start", "turn_end"] {
+        let reply = serve_turn_checkpoint_with(&request(&root, event), &|| false).unwrap();
+        assert_eq!(reply["outcome"], "skipped", "{reply}");
+        assert!(
+            reply["reason"]
+                .as_str()
+                .unwrap()
+                .contains("turn checkpoints are off"),
+            "{reply}"
+        );
+        assert!(reply["commit"].is_null(), "{reply}");
+    }
+    assert!(
+        refs_under(&root, TURN_REF_PREFIX).is_empty(),
+        "no ref is written while the setting is off"
+    );
+    let rows = crate::ledger::tail(root.to_str().unwrap(), 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.action == crate::ledger::TURN_CHECKPOINT_ACTION)
+        .count();
+    assert_eq!(rows, 0, "an off setting leaves no ledger row either");
+
+    // No git process: a directory that is not a repository is answered
+    // `skipped` for being off, not failed for being unreadable by git.
+    let nowhere = tempfile::TempDir::new().unwrap();
+    let nowhere_root = std::fs::canonicalize(nowhere.path()).unwrap();
+    let reply =
+        serve_turn_checkpoint_with(&request(&nowhere_root, "turn_start"), &|| false).unwrap();
+    assert_eq!(reply["outcome"], "skipped");
+    assert!(reply["reason"].as_str().unwrap().contains("are off"));
+
+    // The same request with the setting on is served.
+    let reply = serve_turn_checkpoint_with(&request(&root, "turn_start"), &|| true).unwrap();
+    assert_eq!(reply["outcome"], "captured", "{reply}");
+}
+
 #[test]
 fn every_attempt_that_reaches_the_app_leaves_one_ledger_row_with_its_outcome() {
     let dir = init();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     std::fs::write(root.join("new.txt"), "n\n").unwrap();
-    let reply = serve_turn_checkpoint(&request(&root, "turn_start")).unwrap();
+    let reply = serve_on(&request(&root, "turn_start")).unwrap();
     assert_eq!(reply["outcome"], "captured");
-    let again = serve_turn_checkpoint(&request(&root, "turn_end")).unwrap();
+    let again = serve_on(&request(&root, "turn_end")).unwrap();
     assert_eq!(again["outcome"], "unchanged");
 
     let unborn = tempfile::TempDir::new().unwrap();
     git_ok(unborn.path(), &["init", "-q", "-b", "main"]);
     crate::test_support::trust_repo(unborn.path());
     let unborn_root = std::fs::canonicalize(unborn.path()).unwrap();
-    let skipped = serve_turn_checkpoint(&request(&unborn_root, "turn_start")).unwrap();
+    let skipped = serve_on(&request(&unborn_root, "turn_start")).unwrap();
     assert_eq!(skipped["outcome"], "skipped");
 
     let rows = |repo: &Path| -> Vec<crate::ledger::LedgerEvent> {
@@ -1029,7 +1129,7 @@ fn every_attempt_that_reaches_the_app_leaves_one_ledger_row_with_its_outcome() {
 #[test]
 fn an_unknown_event_is_refused_by_the_handler() {
     let dir = init();
-    assert!(serve_turn_checkpoint(&request(dir.path(), "turn_middle")).is_err());
+    assert!(serve_on(&request(dir.path(), "turn_middle")).is_err());
     assert!(request(dir.path(), "turn_middle").validate().is_err());
     assert!(request(dir.path(), "turn_end").validate().is_ok());
     let relative = crate::desktop::instance::Request::RecordTurnCheckpoint {
@@ -1069,7 +1169,7 @@ mod mailbox {
     fn the_owner_answers_a_request_on_its_connection_and_coalesces_a_second() {
         let profile = tempfile::tempdir().unwrap();
         let owner = primary(profile.path());
-        owner.attach_turn_checkpointer(Arc::new(serve_turn_checkpoint));
+        owner.attach_turn_checkpointer(Arc::new(serve_on));
         let dir = init();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let reply = reach_owner(profile.path(), Duration::from_secs(2))
@@ -1109,7 +1209,7 @@ mod mailbox {
     fn an_owner_that_does_not_know_the_kind_refuses_without_hanging_or_dying() {
         let profile = tempfile::tempdir().unwrap();
         let owner = primary(profile.path());
-        owner.attach_turn_checkpointer(Arc::new(serve_turn_checkpoint));
+        owner.attach_turn_checkpointer(Arc::new(serve_on));
         let mut stream = UnixStream::connect(profile.path().join(SOCKET_FILE)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
