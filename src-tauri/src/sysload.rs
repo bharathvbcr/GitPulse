@@ -66,11 +66,13 @@ pub use sampler::{
     SamplerOptions, StopHandle,
 };
 pub use sensor::{
-    Compressor, CompressorDelta, CompressorTrend, Cores, HostSample, Level, OsSensor, Power,
+    Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, HostSample, Level,
+    OsSensor, Power,
     Reading, ReplaySensor, Sensor, Thermal, Why,
 };
 pub use snapshot::{
-    read, report, Snapshot, SnapshotError, TickStats, Writer as SnapshotWriter, WriterIdentity,
+    read, report, PublishedVerdict, Snapshot, SnapshotError, TickStats, Writer as SnapshotWriter,
+    WriterIdentity, EXTENDED_LEN,
     LOCK_FILE_NAME, RECORD_LEN, SNAPSHOT_FILE_NAME, VERSION,
 };
 

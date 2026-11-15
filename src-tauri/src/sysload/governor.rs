@@ -70,7 +70,7 @@ pub const REFUSAL_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 pub const OVERRIDE_WINDOW: Duration = Duration::from_secs(120);
 
 /// The resource whose value is the reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Binding {
     /// The kernel's memory-pressure level.
@@ -92,8 +92,62 @@ pub enum Binding {
     Battery,
 }
 
+impl Binding {
+    /// The byte a binding is stored as in `host-load.v1` and the trace; 0 is
+    /// "no binding". Never reused for another binding.
+    pub(super) fn code_of(binding: Option<Self>) -> u8 {
+        match binding {
+            None => 0,
+            Some(Self::MemoryPressure) => 1,
+            Some(Self::CompressorThrash) => 2,
+            Some(Self::CompressorSegments) => 3,
+            Some(Self::Swap) => 4,
+            Some(Self::LowDisk) => 5,
+            Some(Self::Thermal) => 6,
+            Some(Self::CpuLoad) => 7,
+            Some(Self::Battery) => 8,
+        }
+    }
+
+    /// The binding a stored byte names. `None` for a code this build does not
+    /// know: refused rather than read as "no binding".
+    pub(super) fn of_code(code: u8) -> Option<Option<Self>> {
+        Some(match code {
+            0 => None,
+            1 => Some(Self::MemoryPressure),
+            2 => Some(Self::CompressorThrash),
+            3 => Some(Self::CompressorSegments),
+            4 => Some(Self::Swap),
+            5 => Some(Self::LowDisk),
+            6 => Some(Self::Thermal),
+            7 => Some(Self::CpuLoad),
+            8 => Some(Self::Battery),
+            _ => return None,
+        })
+    }
+}
+
+impl Tier {
+    pub(super) fn code(self) -> u8 {
+        match self {
+            Self::Clear => 0,
+            Self::Elevated => 1,
+            Self::Severe => 2,
+        }
+    }
+
+    pub(super) fn of_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Clear),
+            1 => Some(Self::Elevated),
+            2 => Some(Self::Severe),
+            _ => None,
+        }
+    }
+}
+
 /// How hard the machine is pressed, as the verdict sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Clear,

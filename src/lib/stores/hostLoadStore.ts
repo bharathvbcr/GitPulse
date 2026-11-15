@@ -135,6 +135,22 @@ export interface Snapshot {
   memguard_pid: number;
   orphans: number;
   tick: TickStats;
+  /**
+   * The app's held governor verdict, for readers with no history (the hook,
+   * `gitpulse-mcp`). One tick behind the readings: the sampler publishes, then
+   * counts the sample. Pending on a writer's first tick; unsupported in a
+   * record an older build wrote.
+   */
+  verdict: Reading<PublishedVerdict>;
+}
+
+/** `sysload::PublishedVerdict`. */
+export interface PublishedVerdict {
+  tier: Tier;
+  binding: Binding | null;
+  admit: boolean;
+  shed_background: boolean;
+  shed_reactive: boolean;
 }
 
 export interface AgentSession {

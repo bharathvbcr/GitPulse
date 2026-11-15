@@ -16,8 +16,8 @@
 
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
-use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor};
-use super::snapshot::{self, Snapshot, TickStats, Writer, WriterIdentity};
+use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
+use super::snapshot::{self, PublishedVerdict, Snapshot, TickStats, Writer, WriterIdentity};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -426,6 +426,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut slot: u64 = 0;
     let mut tick = TickStats::default();
     let mut last_sample = None;
+    // The governor's held verdict after the last tick's count, for the next
+    // record to carry; pending until there has been a count.
+    let mut held_verdict: Reading<PublishedVerdict> = Reading::Unavailable(Why::NotYet);
 
     while !shared.stop.load(Ordering::Acquire) {
         let began = Instant::now();
@@ -456,6 +459,10 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                     trend = CompressorTrend::default();
                 }
                 snap.tick = tick;
+                // The verdict the previous tick's count produced (pending on
+                // the first): the record is published before this tick's
+                // sample is counted.
+                snap.verdict = if enabled { held_verdict } else { Reading::default() };
                 if let Err(why) = w.publish(&snap) {
                     tick_problems.push(format!("publish: {why}"));
                 }
@@ -496,6 +503,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 );
             }
             status.governor = governor.report(Instant::now());
+            held_verdict = Reading::Value(PublishedVerdict::of(&status.governor.verdict));
         }
 
         let took = began.elapsed();
@@ -670,6 +678,41 @@ mod tests {
         first.stop();
         let pulses = ticks.lock().unwrap();
         assert!(pulses.iter().all(|p| p.role == Role::Writer));
+    }
+
+    /// Real: the governor's held verdict rides in the snapshot a reader with
+    /// no history can read. The record is published before the tick's sample
+    /// is counted, so the first one has none and later ones carry the verdict
+    /// the previous count produced.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_publishes_the_held_verdict_one_tick_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ticks.clone();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(50);
+        options.on_tick = Some(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let sampler = start(options).unwrap();
+        let deadline = Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(20));
+        while ticks.load(Ordering::SeqCst) < 6 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sampler.stop();
+        let record = snapshot::read(&dir.path().join(snapshot::SNAPSHOT_FILE_NAME)).unwrap();
+        assert_eq!(record.version, snapshot::VERSION);
+        let Reading::Value(verdict) = record.verdict else {
+            panic!("no verdict after six ticks: {:?}", record.verdict);
+        };
+        // A host this test runs on may be under load; what must hold is that
+        // the published fields agree with each other.
+        if verdict.tier == super::governor::Tier::Clear {
+            assert!(verdict.admit && !verdict.shed_background && !verdict.shed_reactive);
+            assert_eq!(verdict.binding, None);
+        }
+        assert!(!verdict.shed_reactive || verdict.shed_background);
     }
 
     /// Real: a tick that panics does not end the sampler. A raw thread died

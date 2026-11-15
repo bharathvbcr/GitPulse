@@ -107,7 +107,8 @@ otherwise it is `unavailable`, never a guessed `normal`.
 
 ## The snapshot, `host-load.v1`
 
-A fixed-size record of 664 bytes in the per-user config directory
+A fixed-size record of 712 bytes (version 2: the 664 bytes of version 1, then a
+48-byte extension; see Compatibility) in the per-user config directory
 (`~/Library/Application Support/GitPulse/host-load.v1`), beside
 `spawn-budget.v2`. It sits in the config directory rather than `TMPDIR` because
 agent hosts give their children a private `TMPDIR`. It opens through the same
@@ -126,6 +127,19 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   decoded as zero.
 - **Sampler observability:** ticks, overruns, missed ticks, last and slowest
   tick, and the sampler thread's own CPU time.
+- **Extension (version 2, bytes 664 to 712):** the compressor's segment
+  readings (`total` and `limit`, from `vm.compressor.segment.total` and
+  `.limit`, which read as plain integers in-process; each with a status byte
+  like every other reading) and **the governor's published verdict**: tier,
+  binding, whether launches are admitted, whether background work is shed and
+  whether reactive work is shed. It is the hysteresis-held verdict of the app's
+  sampler, so a reader with no history (the hook, `gitpulse-mcp`) can use it
+  without reading settings. **It is one tick behind the readings beside it**:
+  the sampler publishes, then counts the sample, so a record carries the
+  verdict the previous count produced (pending on a writer's first tick, and
+  unsupported while the sensor is switched off). No reader consumes it yet; the
+  hook is not wired to it. The extension opens with the magic `GPX2` and ends
+  with a checksum of its own, which also covers the sequence.
 
 **Sequence lock.** The writer makes the head sequence odd, writes the body and
 a tail copy of the next even sequence, then makes the head even. A reader reads
@@ -144,6 +158,25 @@ any `VERSION` at or above its minimum whose length covers every field it
 knows. Anything else is a typed error (`UnsupportedVersion`, `Short`,
 `BadMagic`, `Unsafe`, `Missing`, `Torn`). Tests decode a v2-shaped record with
 a v1 reader, and a v1 record with a v2 reader.
+
+Version 2 appends after byte 664 and leaves every version-1 byte, the tail
+sequence at 656 and the version-1 checksum formula where they were, so:
+
+- **An older build reading this build's record** accepts it (version 2 is at or
+  above its minimum 1, the length covers every field it knows, the tail and
+  checksum are where it looks) and reads the same readings it always did. It
+  never sees the extension.
+- **This build reading an older build's 664-byte record** also accepts it. The
+  extension is optional here: its fields read as unsupported, never as zero. (A
+  reader that *required* the new length would have read an older writer's record
+  as `Short`, so the sensor would read dead and nothing would be governed while
+  an older build still writes; this build does not do that.)
+- A record that does not open its extension with `GPX2` (a longer record from
+  some other newer writer) reads the same way. One that does but fails the
+  extension's checksum is `Torn`, never decoded.
+- A writer that wins the election sizes the file to its own length, so an older
+  writer's shorter record is grown (zero-filled until the first publish, which
+  readers see as "not yet written") and a newer one's longer record is cut.
 
 **One writer.** Writing requires an exclusive advisory lock on
 `host-load.v1.lock`, held for the writer's whole life. The per-profile
