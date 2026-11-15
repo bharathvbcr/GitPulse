@@ -7,6 +7,13 @@
 //! so. Betterleaks and dc-redact (through [`Tally`], the path the commit gate
 //! runs) are then scored on the same files.
 //!
+//! Some rules are reported only when one of Kingfisher's hidden helper rules
+//! matches the same file (a client secret beside its client id). A rule
+//! confirmed on no candidate alone is planted again after samples of the
+//! hidden helpers sharing its vendor stem and scanned a second time. Those
+//! plants are reported in their own table, never in the comparable one, and
+//! a detector is credited on them only for a hit on the secret's lines.
+//!
 //! Nothing here is a token. Plants are produced at run time into a temporary
 //! directory that is deleted afterwards, the oracles run with `--redact`, and
 //! the report names rules, never values; [`assert_no_plant_in`] checks that
@@ -79,16 +86,75 @@ struct Rule {
     pattern: String,
 }
 
+/// One candidate file: the rule's sampled secret, after the samples of the
+/// hidden helper rules it is planted beside (none for a plain candidate).
 #[derive(Debug, Clone)]
 struct Candidate {
     rule: usize,
     length: Length,
-    text: String,
+    /// Helper samples, each ending in a newline; empty for a plain candidate.
+    prefix: String,
+    secret: String,
+    /// Indices into the hidden helper rules sampled into `prefix`.
+    helpers: Vec<usize>,
 }
 
 impl Candidate {
+    fn plain(rule: usize, length: Length, secret: String) -> Self {
+        Self {
+            rule,
+            length,
+            prefix: String::new(),
+            secret,
+            helpers: Vec::new(),
+        }
+    }
+
     fn file_name(&self, index: usize) -> String {
-        format!("c{index:05}-r{:04}-{}.txt", self.rule, self.length.label())
+        let kind = if self.helpers.is_empty() { 'c' } else { 'p' };
+        format!(
+            "{kind}{index:05}-r{:04}-{}.txt",
+            self.rule,
+            self.length.label()
+        )
+    }
+
+    fn text(&self) -> String {
+        format!("{}{}", self.prefix, self.secret)
+    }
+
+    fn secret_line(&self) -> u32 {
+        secret_line_after(&self.prefix)
+    }
+}
+
+/// The 1-based line a secret starts on when `prefix` precedes it. Counted
+/// from the prefix's newlines, not its helpers: a helper sample can span
+/// lines (`(?:.|[\n\r])` in several helper patterns).
+fn secret_line_after(prefix: &str) -> u32 {
+    1 + u32::try_from(prefix.matches('\n').count()).unwrap_or(u32::MAX - 1)
+}
+
+/// Where a detector's hits in one file fell, relative to the secret's first
+/// line: on the secret (that line or later), or only on helper lines before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Placed {
+    secret: bool,
+    helper_only: bool,
+}
+
+fn place(hit_lines: impl IntoIterator<Item = u32>, secret_line: u32) -> Placed {
+    let (mut secret, mut helper) = (false, false);
+    for line in hit_lines {
+        if line >= secret_line {
+            secret = true;
+        } else {
+            helper = true;
+        }
+    }
+    Placed {
+        secret,
+        helper_only: helper && !secret,
     }
 }
 
@@ -247,9 +313,9 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Kingfisher's visible rules, and the ids of the ones it hides (helper
-/// rules other rules depend on, never reported on their own).
-fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, Vec<String>), String> {
+/// Kingfisher's visible rules, and the ones it hides (helper rules, never
+/// reported on their own).
+fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, Vec<Rule>), String> {
     let ran = run(
         bin,
         &["rules", "list", "--format", "json"],
@@ -269,15 +335,16 @@ fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, Vec<String
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("kingfisher rule without `{k}`"))
         };
-        if row.get("visible").and_then(Value::as_bool) == Some(false) {
-            hidden.push(field("id")?.to_string());
-            continue;
-        }
-        rules.push(Rule {
+        let rule = Rule {
             id: field("id")?.to_string(),
             confidence: Confidence::parse(field("confidence")?)?,
             pattern: field("pattern")?.to_string(),
-        });
+        };
+        if row.get("visible").and_then(Value::as_bool) == Some(false) {
+            hidden.push(rule);
+        } else {
+            rules.push(rule);
+        }
     }
     if rules.is_empty() {
         return Err("kingfisher listed no rules".into());
@@ -285,11 +352,30 @@ fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, Vec<String
     Ok((rules, hidden))
 }
 
-/// file name -> rule id -> the confidence Kingfisher gave that finding.
-type KingfisherFindings = HashMap<String, BTreeMap<String, Confidence>>;
+/// One rule's findings in one file: the confidence Kingfisher gave the first,
+/// and the 1-based lines of all of them.
+#[derive(Debug, Clone)]
+struct KfFinding {
+    confidence: Confidence,
+    lines: BTreeSet<u32>,
+}
 
-fn kingfisher_scan(bin: &Path, dir: &Path, scratch: &Path) -> Result<KingfisherFindings, String> {
-    let report = scratch.join("kf-scan.json");
+/// file name -> rule id -> its findings there.
+type KingfisherFindings = HashMap<String, BTreeMap<String, KfFinding>>;
+
+/// A finding's 1-based line, which both oracles report as a JSON number.
+fn line_of(v: Option<&Value>) -> Option<u32> {
+    v.and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+fn kingfisher_scan(
+    bin: &Path,
+    dir: &Path,
+    scratch: &Path,
+    tag: &str,
+) -> Result<KingfisherFindings, String> {
+    let report = scratch.join(format!("{tag}.json"));
     let dir_arg = dir.to_string_lossy();
     let report_arg = report.to_string_lossy();
     let ran = run(
@@ -312,7 +398,7 @@ fn kingfisher_scan(bin: &Path, dir: &Path, scratch: &Path) -> Result<KingfisherF
             "--quiet",
         ],
         scratch,
-        "kf-scan",
+        tag,
     )?;
     if !crate::secrets::SUCCESS_EXITS.contains(&ran.status) {
         return Err(failure(bin, "scan", &ran));
@@ -330,13 +416,22 @@ fn kingfisher_scan(bin: &Path, dir: &Path, scratch: &Path) -> Result<KingfisherF
         let rule = f.pointer("/rule/id").and_then(Value::as_str);
         let path = f.pointer("/finding/path").and_then(Value::as_str);
         let confidence = f.pointer("/finding/confidence").and_then(Value::as_str);
-        let (Some(rule), Some(path), Some(confidence)) = (rule, path, confidence) else {
-            return Err("kingfisher finding without rule id, path or confidence".into());
+        let line = line_of(f.pointer("/finding/line"));
+        let (Some(rule), Some(path), Some(confidence), Some(line)) = (rule, path, confidence, line)
+        else {
+            return Err("kingfisher finding without rule id, path, confidence or line".into());
         };
+        let confidence = Confidence::parse(confidence)?;
         by_file
             .entry(file_name_of(path))
             .or_default()
-            .insert(rule.to_string(), Confidence::parse(confidence)?);
+            .entry(rule.to_string())
+            .or_insert_with(|| KfFinding {
+                confidence,
+                lines: BTreeSet::new(),
+            })
+            .lines
+            .insert(line);
     }
     Ok(by_file)
 }
@@ -358,12 +453,12 @@ fn betterleaks_rule_ids(bin: &Path, scratch: &Path) -> Result<BTreeSet<String>, 
     Ok(ids)
 }
 
-/// file name -> rule ids Betterleaks reported in it.
+/// file name -> the 1-based start lines of Betterleaks' findings in it.
 fn betterleaks_scan(
     bin: &Path,
     dir: &Path,
     scratch: &Path,
-) -> Result<HashMap<String, BTreeSet<String>>, String> {
+) -> Result<HashMap<String, Vec<u32>>, String> {
     // Betterleaks exits 0 on a directory that does not exist.
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", dir.display()));
@@ -401,17 +496,15 @@ fn betterleaks_scan(
         &std::fs::read(&report).map_err(|e| format!("betterleaks wrote no report: {e}"))?,
     )
     .map_err(|e| format!("betterleaks report is not a JSON array: {e}"))?;
-    let mut by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut by_file: HashMap<String, Vec<u32>> = HashMap::new();
     for row in &rows {
         let rule = row.get("RuleID").and_then(Value::as_str);
         let path = row.get("File").and_then(Value::as_str);
-        let (Some(rule), Some(path)) = (rule, path) else {
-            return Err("betterleaks finding without RuleID or File".into());
+        let line = line_of(row.get("StartLine"));
+        let (Some(_), Some(path), Some(line)) = (rule, path, line) else {
+            return Err("betterleaks finding without RuleID, File or StartLine".into());
         };
-        by_file
-            .entry(file_name_of(path))
-            .or_default()
-            .insert(rule.to_string());
+        by_file.entry(file_name_of(path)).or_default().push(line);
     }
     Ok(by_file)
 }
@@ -460,14 +553,10 @@ fn sample_rule(index: usize, rule: &Rule, salt: u64) -> Result<(Vec<Candidate>, 
             let seed = base ^ (attempt + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ length as u64;
             let text = plant_sampler::sample(&pattern, &mut Seeded(seed), length);
             let matches = check.as_ref().is_none_or(|re| re.is_match(&text));
-            if text.trim().is_empty() || !matches || out.iter().any(|c| c.text == text) {
+            if text.trim().is_empty() || !matches || out.iter().any(|c| c.secret == text) {
                 continue;
             }
-            out.push(Candidate {
-                rule: index,
-                length,
-                text,
-            });
+            out.push(Candidate::plain(index, length, text));
             got += 1;
         }
     }
@@ -485,9 +574,24 @@ fn write_file(dir: &Path, name: &str, text: &str) -> Result<(), String> {
 /// dc-redact through the commit gate's own entry point. The shape it named,
 /// when it found one.
 fn dc_redact(name: &str, text: &str) -> Option<&'static str> {
+    dc_redact_hits(name, text).first().map(|(_, shape)| *shape)
+}
+
+/// Every line dc-redact flags in `text`, with the shape it named there.
+fn dc_redact_hits(name: &str, text: &str) -> Vec<(u32, &'static str)> {
     let mut tally = Tally::default();
     tally.scan_blob(name, format!("{text}\n").as_bytes());
-    tally.hits.first().map(|h| h.rule)
+    tally.hits.iter().map(|h| (h.line, h.rule)).collect()
+}
+
+/// dc-redact on a candidate file: the shape it named on the secret's lines,
+/// and whether it flagged only helper lines.
+fn dc_redact_placed(name: &str, c: &Candidate) -> (Option<&'static str>, bool) {
+    let hits = dc_redact_hits(name, &c.text());
+    let line = c.secret_line();
+    let placed = place(hits.iter().map(|(l, _)| *l), line);
+    let shape = hits.iter().find(|(l, _)| *l >= line).map(|(_, s)| *s);
+    (shape, placed.helper_only)
 }
 
 // ---------------------------------------------------------------- vendors --
@@ -881,15 +985,32 @@ fn claimed_by<'a>(vendor: &str, shapes: &'a BTreeSet<String>) -> Option<&'a str>
 
 // ---------------------------------------------------------------- scoring --
 
-/// One rule's confirmed plant and what each detector made of it.
+/// One rule's confirmed plant and what each detector made of it. For a plant
+/// beside helper rules, a detector is credited only for a hit on the secret's
+/// lines.
 struct Scored {
     rule: usize,
     plant_length: Length,
+    /// Hidden helper rules planted before the secret; empty for a plain plant.
+    helpers: Vec<usize>,
     betterleaks: bool,
     dc_redact: Option<&'static str>,
+    /// The detector flagged only helper lines of this plant:
+    /// (Betterleaks, dc-redact).
+    helper_line_only: (bool, bool),
     /// The first confirmed realistic-length candidate, when the plant is a
     /// minimum-length one: (Betterleaks, dc-redact) on it.
     realistic: Option<(bool, Option<&'static str>)>,
+}
+
+impl Scored {
+    fn plant_label(&self) -> String {
+        if self.helpers.is_empty() {
+            self.plant_length.label().to_string()
+        } else {
+            format!("{} + helper", self.plant_length.label())
+        }
+    }
 }
 
 /// A plant under the reconstructed 2026-11-14 method: the first candidate
@@ -904,7 +1025,10 @@ struct Measurement {
     kingfisher_version: String,
     betterleaks_version: String,
     rules: Vec<Rule>,
-    hidden_rules: Vec<String>,
+    hidden_rules: Vec<Rule>,
+    /// Rules unconfirmed alone whose vendor stem has hidden helper rules ->
+    /// which helpers were planted beside them, and which could not be sampled.
+    paired: BTreeMap<usize, Pairing>,
     any: Vec<AnyScored>,
     betterleaks_rule_count: usize,
     validated: Vec<bool>,
@@ -961,9 +1085,9 @@ fn measure() -> Result<Measurement, String> {
         return Err("the sampler produced no candidate for any rule".into());
     }
     for (n, c) in candidates.iter().enumerate() {
-        write_file(&candidates_dir, &c.file_name(n), &c.text)?;
+        write_file(&candidates_dir, &c.file_name(n), &c.text())?;
     }
-    let kf = kingfisher_scan(&kingfisher, &candidates_dir, &scratch)?;
+    let kf = kingfisher_scan(&kingfisher, &candidates_dir, &scratch, "kf-scan")?;
     if kf.is_empty() {
         return Err(format!(
             "kingfisher reported nothing in {} candidates; refusing to score",
@@ -982,8 +1106,8 @@ fn measure() -> Result<Measurement, String> {
         if let Some(ids) = found {
             let confidence = ids
                 .get(&rules[c.rule].id)
-                .or_else(|| ids.values().min())
-                .copied()
+                .map(|f| f.confidence)
+                .or_else(|| ids.values().map(|f| f.confidence).min())
                 .expect("non-empty findings");
             any_plant.entry(c.rule).or_insert((n, confidence));
         }
@@ -997,13 +1121,7 @@ fn measure() -> Result<Measurement, String> {
             }
             continue;
         }
-        let entry = chosen.entry(c.rule).or_insert((n, None));
-        if c.length == Length::Realistic
-            && candidates[entry.0].length == Length::Min
-            && entry.1.is_none()
-        {
-            entry.1 = Some(n);
-        }
+        choose(&mut chosen, &candidates, n);
     }
     for (i, n) in sampled.iter().enumerate() {
         if *n > 0 && !chosen.contains_key(&i) {
@@ -1013,6 +1131,74 @@ fn measure() -> Result<Measurement, String> {
                     kingfisher_reported: reported_elsewhere.remove(&i).unwrap_or_default(),
                 },
             );
+        }
+    }
+
+    // Rules Kingfisher confirmed on no candidate alone: plant every candidate
+    // again after one sample of each hidden helper rule with the same vendor
+    // stem, scanned on its own. Appended, so the plain candidates' indices,
+    // names and plants do not move.
+    let first_scan = candidates.len();
+    let mut helper_samples: BTreeMap<usize, Option<String>> = BTreeMap::new();
+    let mut paired: BTreeMap<usize, Pairing> = BTreeMap::new();
+    let unconfirmed: Vec<usize> = no_plant
+        .iter()
+        .filter(|(_, why)| matches!(why, NoPlant::NotConfirmed { .. }))
+        .map(|(i, _)| *i)
+        .collect();
+    for i in unconfirmed {
+        let helpers = helper_indices(&rules[i].id, &hidden_rules);
+        if helpers.is_empty() {
+            continue;
+        }
+        let mut prefix = String::new();
+        let mut pairing = Pairing::default();
+        for h in helpers {
+            let sample = helper_samples.entry(h).or_insert_with(|| {
+                sample_rule(h, &hidden_rules[h], salt)
+                    .ok()
+                    .and_then(|(c, _)| c.into_iter().next())
+                    .map(|c| c.secret)
+            });
+            match sample {
+                Some(s) => {
+                    prefix.push_str(s);
+                    prefix.push('\n');
+                    pairing.planted.push(h);
+                }
+                None => pairing.unsampled.push(h),
+            }
+        }
+        if !pairing.planted.is_empty() {
+            let beside: Vec<Candidate> = candidates[..first_scan]
+                .iter()
+                .filter(|c| c.rule == i)
+                .map(|c| Candidate {
+                    prefix: prefix.clone(),
+                    helpers: pairing.planted.clone(),
+                    ..c.clone()
+                })
+                .collect();
+            candidates.extend(beside);
+        }
+        paired.insert(i, pairing);
+    }
+    if candidates.len() > first_scan {
+        let paired_dir = tmp.path().join("paired");
+        std::fs::create_dir(&paired_dir).map_err(|e| format!("{}: {e}", paired_dir.display()))?;
+        for (n, c) in candidates.iter().enumerate().skip(first_scan) {
+            write_file(&paired_dir, &c.file_name(n), &c.text())?;
+        }
+        let kf_paired = kingfisher_scan(&kingfisher, &paired_dir, &scratch, "kf-scan-paired")?;
+        for (n, c) in candidates.iter().enumerate().skip(first_scan) {
+            let own = kf_paired
+                .get(&c.file_name(n))
+                .and_then(|ids| ids.get(&rules[c.rule].id))
+                .is_some_and(|f| f.lines.iter().any(|l| *l >= c.secret_line()));
+            if own {
+                choose(&mut chosen, &candidates, n);
+                no_plant.remove(&c.rule);
+            }
         }
     }
 
@@ -1028,7 +1214,7 @@ fn measure() -> Result<Measurement, String> {
     to_score.dedup();
     for n in &to_score {
         let c = &candidates[*n];
-        write_file(&plants_dir, &c.file_name(*n), &c.text)?;
+        write_file(&plants_dir, &c.file_name(*n), &c.text())?;
     }
     let bl = betterleaks_scan(&betterleaks, &plants_dir, &scratch)?;
     if bl.is_empty() {
@@ -1037,41 +1223,65 @@ fn measure() -> Result<Measurement, String> {
             to_score.len()
         ));
     }
-    let judge = |n: usize| {
+    // (Betterleaks, dc-redact, hits on helper lines only) for one plant.
+    let judge = |n: usize| -> Result<Judged, String> {
         let c = &candidates[n];
         let name = c.file_name(n);
-        (bl.contains_key(&name), dc_redact(&name, &c.text))
+        let bl_lines = bl.get(&name);
+        if c.helpers.is_empty() {
+            return Ok((
+                bl_lines.is_some(),
+                dc_redact(&name, &c.secret),
+                (false, false),
+            ));
+        }
+        let b = place(bl_lines.into_iter().flatten().copied(), c.secret_line());
+        let (dc, dc_helper_only) = dc_redact_placed(&name, c);
+        // dc-redact reads one line at a time, so the helpers beside the
+        // secret must not change its verdict on the secret.
+        if dc.is_some() != dc_redact(&name, &c.secret).is_some() {
+            return Err(format!(
+                "dc-redact judged {name}'s secret differently beside its helpers than alone"
+            ));
+        }
+        Ok((b.secret, dc, (b.helper_only, dc_helper_only)))
     };
-    let scored: Vec<Scored> = chosen
-        .iter()
-        .map(|(rule, (plant, realistic))| {
-            let (betterleaks, dc_redact) = judge(*plant);
-            Scored {
-                rule: *rule,
-                plant_length: candidates[*plant].length,
-                betterleaks,
-                dc_redact,
-                realistic: realistic.map(judge),
+    let mut scored: Vec<Scored> = Vec::new();
+    for (rule, (plant, realistic)) in &chosen {
+        let (betterleaks, dc_redact, helper_line_only) = judge(*plant)?;
+        let realistic = match realistic {
+            Some(n) => {
+                let (b, d, _) = judge(*n)?;
+                Some((b, d))
             }
-        })
-        .collect();
-    let any: Vec<AnyScored> = any_plant
-        .values()
-        .map(|(n, confidence)| {
-            let (betterleaks, dc) = judge(*n);
-            AnyScored {
-                confidence: *confidence,
-                betterleaks,
-                dc_redact: dc.is_some(),
-            }
-        })
-        .collect();
+            None => None,
+        };
+        scored.push(Scored {
+            rule: *rule,
+            plant_length: candidates[*plant].length,
+            helpers: candidates[*plant].helpers.clone(),
+            betterleaks,
+            dc_redact,
+            helper_line_only,
+            realistic,
+        });
+    }
+    let mut any: Vec<AnyScored> = Vec::new();
+    for (n, confidence) in any_plant.values() {
+        let (betterleaks, dc, _) = judge(*n)?;
+        any.push(AnyScored {
+            confidence: *confidence,
+            betterleaks,
+            dc_redact: dc.is_some(),
+        });
+    }
 
     Ok(Measurement {
         kingfisher_version: first_line(&kf_version.stdout),
         betterleaks_version: first_line(&bl_version.stdout),
         rules,
         hidden_rules,
+        paired,
         any,
         betterleaks_rule_count: betterleaks_ids.len(),
         validated,
@@ -1080,9 +1290,39 @@ fn measure() -> Result<Measurement, String> {
         no_plant,
         betterleaks_ids,
         shapes: dc_redact_shape_names(),
-        plants: candidates.into_iter().map(|c| c.text).collect(),
+        plants: candidates.iter().map(Candidate::text).collect(),
         salt,
     })
+}
+
+/// The hidden helper rules sharing an unconfirmed rule's vendor stem.
+#[derive(Debug, Clone, Default)]
+struct Pairing {
+    /// Sampled and planted on the lines before the rule's candidates.
+    planted: Vec<usize>,
+    /// The sampler produced no candidate matching the helper's regex.
+    unsampled: Vec<usize>,
+}
+
+/// (Betterleaks on the secret, dc-redact's shape on the secret, and whether
+/// each flagged only helper lines).
+type Judged = (bool, Option<&'static str>, (bool, bool));
+
+/// Record candidate `n` as its rule's plant when it is the first confirmed,
+/// or as the plant's realistic-length counterpart.
+fn choose(
+    chosen: &mut BTreeMap<usize, (usize, Option<usize>)>,
+    candidates: &[Candidate],
+    n: usize,
+) {
+    let c = &candidates[n];
+    let entry = chosen.entry(c.rule).or_insert((n, None));
+    if c.length == Length::Realistic
+        && candidates[entry.0].length == Length::Min
+        && entry.1.is_none()
+    {
+        entry.1 = Some(n);
+    }
 }
 
 // ----------------------------------------------------------------- report --
@@ -1093,6 +1333,11 @@ fn dc_reason(m: &Measurement, s: &Scored) -> Option<String> {
     }
     let id = &m.rules[s.rule].id;
     let (vendor, _) = vendor_of(id);
+    let helper_note = if s.helper_line_only.1 {
+        " (it flags only a planted helper line, which is not credited)"
+    } else {
+        ""
+    };
     if let Some((_, Some(shape))) = s.realistic {
         return Some(format!(
             "dc-redact: the minimum-length plant is under its floor; the realistic-length plant is found as `{shape}` (artefact)"
@@ -1100,9 +1345,9 @@ fn dc_reason(m: &Measurement, s: &Scored) -> Option<String> {
     }
     Some(match claimed_by(&vendor, &m.shapes) {
         Some(shape) => format!(
-            "dc-redact: names {vendor} (`{shape}`) but has no shape for this format (heuristic)"
+            "dc-redact: names {vendor} (`{shape}`) but has no shape for this format (heuristic){helper_note}"
         ),
-        None => format!("dc-redact: no shape for {vendor}"),
+        None => format!("dc-redact: no shape for {vendor}{helper_note}"),
     })
 }
 
@@ -1120,6 +1365,11 @@ fn betterleaks_reason(m: &Measurement, s: &Scored) -> Option<String> {
     if !m.betterleaks_ids.contains(bl_id) {
         return Some(format!("Betterleaks: no rule `{bl_id}` in its config"));
     }
+    if s.helper_line_only.0 {
+        return Some(format!(
+            "Betterleaks: has `{bl_id}` but reports only a planted helper line, which is not credited"
+        ));
+    }
     if let Some((true, _)) = s.realistic {
         return Some(
             "Betterleaks: misses the minimum-length plant, finds the realistic-length one".into(),
@@ -1131,17 +1381,31 @@ fn betterleaks_reason(m: &Measurement, s: &Scored) -> Option<String> {
 }
 
 /// Kingfisher's hidden helper rules for the same vendor stem as `rule_id`.
-fn helpers_for<'a>(rule_id: &str, hidden: &'a [String]) -> Vec<&'a str> {
+/// Choosing helpers by stem is a heuristic; Kingfisher confirming the rule
+/// beside them is the evidence.
+fn helpers_for<'a>(rule_id: &str, hidden: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let stem = |id: &str| -> String {
         let s = slug(id);
         s.split('-').next().unwrap_or(s).to_string()
     };
     let own = stem(rule_id);
-    hidden
-        .iter()
-        .filter(|h| stem(h) == own)
-        .map(String::as_str)
+    hidden.into_iter().filter(|h| stem(h) == own).collect()
+}
+
+/// [`helpers_for`] as indices into `hidden`.
+fn helper_indices(rule_id: &str, hidden: &[Rule]) -> Vec<usize> {
+    let ids = helpers_for(rule_id, hidden.iter().map(|h| h.id.as_str()));
+    (0..hidden.len())
+        .filter(|i| ids.contains(&hidden[*i].id.as_str()))
         .collect()
+}
+
+fn helper_names(m: &Measurement, helpers: &[usize]) -> String {
+    helpers
+        .iter()
+        .map(|h| format!("`{}`", m.hidden_rules[*h].id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn no_plant_reason(m: &Measurement, rule: usize, why: &NoPlant) -> String {
@@ -1152,31 +1416,75 @@ fn no_plant_reason(m: &Measurement, rule: usize, why: &NoPlant) -> String {
         }
         NoPlant::NotConfirmed {
             kingfisher_reported,
-        } if kingfisher_reported.is_empty() => {
-            let helpers = helpers_for(&m.rules[rule].id, &m.hidden_rules);
-            if helpers.is_empty() {
-                "Kingfisher reported nothing on any candidate; no hidden helper rule shares its vendor, so the cause is not established (a filter the regex does not show)".into()
+        } => {
+            let alone = if kingfisher_reported.is_empty() {
+                "Kingfisher reported nothing on any candidate".to_string()
             } else {
                 format!(
-                    "Kingfisher reported nothing on any candidate; it hides helper rule(s) {} for this vendor, which this rule likely needs on the same input (inferred from ids)",
-                    helpers
+                    "Kingfisher reported other rules on its candidates: {}",
+                    kingfisher_reported
                         .iter()
-                        .map(|h| format!("`{h}`"))
+                        .map(|r| format!("`{r}`"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
+            };
+            let unsampled = |p: &Pairing| {
+                if p.unsampled.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; the sampler could not produce helper(s) {}, which were not planted",
+                        helper_names(m, &p.unsampled)
+                    )
+                }
+            };
+            match m.paired.get(&rule) {
+                Some(p) if p.planted.is_empty() => format!(
+                    "{alone}{}, so no helper was planted and the cause is not established",
+                    unsampled(p)
+                ),
+                Some(p) => format!(
+                    "{alone}; not confirmed beside hidden helper(s) {} either{}, so the cause is not established",
+                    helper_names(m, &p.planted),
+                    unsampled(p)
+                ),
+                None if kingfisher_reported.is_empty() => format!(
+                    "{alone}; no hidden helper rule shares its vendor, so the cause is not established (a filter the regex does not show)"
+                ),
+                None => alone,
             }
         }
-        NoPlant::NotConfirmed {
-            kingfisher_reported,
-        } => format!(
-            "Kingfisher reported other rules on its candidates: {}",
-            kingfisher_reported
-                .iter()
-                .map(|r| format!("`{r}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    }
+}
+
+/// Plants, and each detector's hits on them, per rule confidence, over the
+/// scored rules `keep` selects.
+fn recall_table(
+    r: &mut String,
+    m: &Measurement,
+    confidences: &BTreeSet<Confidence>,
+    keep: impl Fn(&Scored) -> bool,
+) {
+    let _ = writeln!(
+        r,
+        "| confidence | plants | Kingfisher | Betterleaks | dc-redact |"
+    );
+    let _ = writeln!(r, "| --- | ---: | ---: | ---: | ---: |");
+    for conf in confidences {
+        let rows: Vec<&Scored> = m
+            .scored
+            .iter()
+            .filter(|s| m.rules[s.rule].confidence == *conf && keep(s))
+            .collect();
+        let n = rows.len();
+        let bl = rows.iter().filter(|s| s.betterleaks).count();
+        let dc = rows.iter().filter(|s| s.dc_redact.is_some()).count();
+        let _ = writeln!(
+            r,
+            "| {} | {n} | {n}/{n} | {bl}/{n} | {dc}/{n} |",
+            conf.label()
+        );
     }
 }
 
@@ -1218,14 +1526,26 @@ fn render(m: &Measurement) -> String {
          as that rule, minimum-length first, so **Kingfisher is 100% by construction**.",
         m.salt
     );
+    let _ = writeln!(
+        r,
+        "- Helper rules: a rule Kingfisher confirms on no candidate alone is planted again with one sample of each hidden \
+         helper rule of the same vendor stem on the lines before it, and scanned again ({} rules have such a helper; {} \
+         were planted beside at least one). Those plants are reported apart from the comparable table; on them a \
+         detector is credited only for a hit on the secret's lines.",
+        m.paired.len(),
+        m.paired.values().filter(|p| !p.planted.is_empty()).count()
+    );
     let _ = writeln!(r, "- No live validation: Kingfisher `--no-validate`, Betterleaks without `--validation`, both `--redact`.\n");
 
     let _ = writeln!(r, "## Funnel\n");
     let _ = writeln!(
         r,
-        "| confidence | visible rules | sampler refused | no sample matched | regex crate rejects (unchecked) | not confirmed by Kingfisher | plants |"
+        "| confidence | visible rules | sampler refused | no sample matched | regex crate rejects (unchecked) | not confirmed by Kingfisher | plants | confirmed beside a helper | still unplanted |"
     );
-    let _ = writeln!(r, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let _ = writeln!(
+        r,
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
     for conf in &confidences {
         let in_conf = |i: &usize| m.rules[*i].confidence == *conf;
         let rules = (0..m.rules.len()).filter(in_conf).count();
@@ -1237,15 +1557,27 @@ fn render(m: &Measurement) -> String {
         };
         let refused = count(&|w| matches!(w, NoPlant::Unsupported(_)));
         let unmatched = count(&|w| matches!(w, NoPlant::NoMatchingSample));
-        let unconfirmed = count(&|w| matches!(w, NoPlant::NotConfirmed { .. }));
+        let still = count(&|w| matches!(w, NoPlant::NotConfirmed { .. }));
         let unchecked = (0..m.rules.len())
             .filter(|i| in_conf(i) && m.sampled[*i] > 0 && !m.validated[*i])
             .count();
-        let plants = m.scored.iter().filter(|s| in_conf(&s.rule)).count();
+        let plants = m
+            .scored
+            .iter()
+            .filter(|s| in_conf(&s.rule) && s.helpers.is_empty())
+            .count();
+        let beside = m
+            .scored
+            .iter()
+            .filter(|s| in_conf(&s.rule) && !s.helpers.is_empty())
+            .count();
+        // Unconfirmed alone: still unplanted, or confirmed beside a helper.
+        let unconfirmed = still + beside;
         let _ = writeln!(
             r,
-            "| {} | {rules} | {refused} | {unmatched} | {unchecked} | {unconfirmed} | {plants} |",
-            conf.label()
+            "| {} | {rules} | {refused} | {unmatched} | {unchecked} | {unconfirmed} | {plants} | {beside} | {} |",
+            conf.label(),
+            refused + unmatched + still
         );
     }
 
@@ -1254,26 +1586,7 @@ fn render(m: &Measurement) -> String {
         r,
         "The comparable table: each rule's first confirmed candidate, at minimum length unless only a realistic-length one was confirmed.\n"
     );
-    let _ = writeln!(
-        r,
-        "| confidence | plants | Kingfisher | Betterleaks | dc-redact |"
-    );
-    let _ = writeln!(r, "| --- | ---: | ---: | ---: | ---: |");
-    for conf in &confidences {
-        let rows: Vec<&Scored> = m
-            .scored
-            .iter()
-            .filter(|s| m.rules[s.rule].confidence == *conf)
-            .collect();
-        let n = rows.len();
-        let bl = rows.iter().filter(|s| s.betterleaks).count();
-        let dc = rows.iter().filter(|s| s.dc_redact.is_some()).count();
-        let _ = writeln!(
-            r,
-            "| {} | {n} | {n}/{n} | {bl}/{n} | {dc}/{n} |",
-            conf.label()
-        );
-    }
+    recall_table(&mut r, m, &confidences, |s| s.helpers.is_empty());
 
     let _ = writeln!(r, "\n## At realistic length\n");
     let _ = writeln!(
@@ -1289,7 +1602,7 @@ fn render(m: &Measurement) -> String {
         let rows: Vec<(&Scored, (bool, Option<&'static str>))> = m
             .scored
             .iter()
-            .filter(|s| m.rules[s.rule].confidence == *conf)
+            .filter(|s| m.rules[s.rule].confidence == *conf && s.helpers.is_empty())
             .filter_map(|s| s.realistic.map(|real| (s, real)))
             .collect();
         let n = rows.len();
@@ -1303,6 +1616,65 @@ fn render(m: &Measurement) -> String {
             conf.label()
         );
     }
+
+    let _ = writeln!(r, "\n## Beside their helper rules\n");
+    let _ = writeln!(
+        r,
+        "Rules Kingfisher confirmed on no candidate alone, confirmed once the samples of their vendor's hidden helper \
+         rules were planted on the lines before them. Each is verified as needing a helper on the same input; which \
+         helper was chosen by vendor stem, a heuristic. Not part of the comparable table above. A detector that flags \
+         only a helper line is not credited; the last two columns count those.\n"
+    );
+    let _ = writeln!(
+        r,
+        "| confidence | plants | Kingfisher | Betterleaks | dc-redact | Betterleaks on a helper line only | dc-redact on a helper line only |"
+    );
+    let _ = writeln!(r, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for conf in &confidences {
+        let rows: Vec<&Scored> = m
+            .scored
+            .iter()
+            .filter(|s| m.rules[s.rule].confidence == *conf && !s.helpers.is_empty())
+            .collect();
+        let n = rows.len();
+        let bl = rows.iter().filter(|s| s.betterleaks).count();
+        let dc = rows.iter().filter(|s| s.dc_redact.is_some()).count();
+        let bl_helper = rows.iter().filter(|s| s.helper_line_only.0).count();
+        let dc_helper = rows.iter().filter(|s| s.helper_line_only.1).count();
+        let _ = writeln!(
+            r,
+            "| {} | {n} | {n}/{n} | {bl}/{n} | {dc}/{n} | {bl_helper} | {dc_helper} |",
+            conf.label()
+        );
+    }
+
+    let _ = writeln!(
+        r,
+        "\n| rule | confidence | helper rule(s) planted | Betterleaks | dc-redact |"
+    );
+    let _ = writeln!(r, "| --- | --- | --- | --- | --- |");
+    for s in m.scored.iter().filter(|s| !s.helpers.is_empty()) {
+        let rule = &m.rules[s.rule];
+        let dc = s
+            .dc_redact
+            .map(|shape| format!("yes (`{shape}`)"))
+            .unwrap_or_else(|| yes(false).into());
+        let _ = writeln!(
+            r,
+            "| `{}` | {} | {} | {} | {dc} |",
+            rule.id,
+            rule.confidence.label(),
+            helper_names(m, &s.helpers),
+            yes(s.betterleaks),
+        );
+    }
+
+    let _ = writeln!(r, "\n## Every measured rule\n");
+    let _ = writeln!(
+        r,
+        "The two tables above together: every rule with a confirmed plant, alone or beside its helpers.\n"
+    );
+    recall_table(&mut r, m, &confidences, |_| true);
 
     // Vendors dc-redact misses, ranked.
     // (tier, position in VENDORS, vendor) -> (rules missed, rules with no
@@ -1423,7 +1795,7 @@ fn render(m: &Measurement) -> String {
             "| `{}` | {} | {} | yes | {} | {dc} | {realistic} |",
             rule.id,
             rule.confidence.label(),
-            s.plant_length.label(),
+            s.plant_label(),
             yes(s.betterleaks),
         );
     }
@@ -1452,7 +1824,7 @@ fn render(m: &Measurement) -> String {
             "| `{}` | {} | {} | yes | {} | {dc} | {} |",
             rule.id,
             rule.confidence.label(),
-            s.plant_length.label(),
+            s.plant_label(),
             yes(s.betterleaks),
             reasons.join("; ")
         );
@@ -1593,15 +1965,81 @@ fn oracle_stderr_is_redacted_before_it_reaches_a_message() {
 
 #[test]
 fn helper_rules_are_matched_by_vendor_stem() {
-    let hidden = vec![
-        "betterleaks.aikido-client-id".to_string(),
-        "betterleaks.azure-tenant-id".to_string(),
+    let hidden = [
+        "betterleaks.aikido-client-id",
+        "betterleaks.azure-tenant-id",
     ];
     assert_eq!(
-        helpers_for("betterleaks.aikido-client-secret", &hidden),
+        helpers_for("betterleaks.aikido-client-secret", hidden),
         vec!["betterleaks.aikido-client-id"]
     );
-    assert!(helpers_for("betterleaks.slack-webhook-url", &hidden).is_empty());
+    assert!(helpers_for("betterleaks.slack-webhook-url", hidden).is_empty());
+
+    let rules: Vec<Rule> = hidden
+        .iter()
+        .map(|id| Rule {
+            id: (*id).to_string(),
+            confidence: Confidence::High,
+            pattern: String::new(),
+        })
+        .collect();
+    assert_eq!(
+        helper_indices("betterleaks.azure-client-secret", &rules),
+        vec![1]
+    );
+}
+
+#[test]
+fn the_secret_line_counts_newlines_not_helpers() {
+    assert_eq!(secret_line_after(""), 1);
+    assert_eq!(secret_line_after("first helper\nsecond helper\n"), 3);
+    // One helper whose sample spans two lines.
+    assert_eq!(secret_line_after("vendor id\n= value\n"), 3);
+
+    let mut c = Candidate::plain(0, Length::Min, "the secret".into());
+    assert_eq!(c.secret_line(), 1);
+    assert_eq!(c.text(), "the secret");
+    c.prefix = "helper\n".into();
+    c.helpers = vec![0];
+    assert_eq!(c.secret_line(), 2);
+    assert_eq!(c.text(), "helper\nthe secret");
+    assert!(c.file_name(7).starts_with("p00007-"));
+}
+
+#[test]
+fn hits_are_placed_on_the_secret_or_only_on_a_helper() {
+    let none = place([], 3);
+    assert_eq!(none, Placed::default());
+    let helper = place([1, 2], 3);
+    assert!(!helper.secret && helper.helper_only);
+    let both = place([1, 3], 3);
+    assert!(both.secret && !both.helper_only);
+    // A secret that spans lines: a hit past its first line is still its own.
+    let later = place([4], 3);
+    assert!(later.secret && !later.helper_only);
+}
+
+#[test]
+fn a_helper_line_hit_is_not_credited_to_the_secret() {
+    // A PEM header dc-redact flags, built at run time, as the helper line.
+    let header = format!("{} RSA PRIVATE KEY-----", "-----BEGIN");
+    let mut c = Candidate::plain(0, Length::Min, "no credential on this line".into());
+    c.prefix = format!("{header}\n");
+    c.helpers = vec![0];
+    let (shape, helper_only) = dc_redact_placed("p.txt", &c);
+    assert_eq!(shape, None);
+    assert!(helper_only);
+
+    // The same header as the secret is credited.
+    let c = Candidate {
+        prefix: "an ordinary helper line\n".into(),
+        secret: header,
+        helpers: vec![0],
+        ..Candidate::plain(0, Length::Min, String::new())
+    };
+    let (shape, helper_only) = dc_redact_placed("p.txt", &c);
+    assert!(shape.is_some());
+    assert!(!helper_only);
 }
 
 #[test]
