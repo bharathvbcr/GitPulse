@@ -4065,6 +4065,17 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
 //   `user.email`, `commit.gpgsign=false`) and cap/expiry eviction deletes refs via
 //   `git update-ref -d` without ever modifying `.git/config`.
 
+/// Identity flags for objects GitPulse writes on its own behalf (op-log
+/// snapshots, turn checkpoints): inline `-c`, never `.git/config`.
+pub(crate) const SNAPSHOT_IDENTITY_ARGS: [&str; 6] = [
+    "-c",
+    "user.name=GitPulse",
+    "-c",
+    "user.email=gitpulse@local",
+    "-c",
+    "commit.gpgsign=false",
+];
+
 /// Ref prefix under which pre-op agent snapshots are stored.
 pub const OP_REF_PREFIX: &str = "refs/gitpulse/ops/";
 /// Maximum number of retained snapshots per repository before oldest are evicted.
@@ -4155,7 +4166,7 @@ struct LiveRefRow {
     commit_oid: Option<String>,
 }
 
-fn absent_oid_for_len(oid_len: usize) -> &'static str {
+pub(crate) fn absent_oid_for_len(oid_len: usize) -> &'static str {
     if oid_len == 64 {
         "0000000000000000000000000000000000000000000000000000000000000000"
     } else {
@@ -4515,16 +4526,11 @@ impl GitWriter {
             }
         }
 
-        let mut args: Vec<String> = vec![
-            "-c".into(),
-            "user.name=GitPulse".into(),
-            "-c".into(),
-            "user.email=gitpulse@local".into(),
-            "-c".into(),
-            "commit.gpgsign=false".into(),
-            "commit-tree".into(),
-            tree_oid,
-        ];
+        let mut args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .chain(["commit-tree".to_string(), tree_oid])
+            .collect();
         for p in &parents {
             args.push("-p".into());
             args.push(p.clone());
