@@ -5,6 +5,7 @@ import { isTauri } from "../platform";
 import { refusalNotice } from "../health/hostLoad";
 import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
+import type { ResourceBudgets } from "../resourceBudgets";
 
 /**
  * Host load as the app's sampler publishes it (`src-tauri/src/sysload`,
@@ -293,6 +294,25 @@ export interface GovernorPulse {
   largest_foreign: number | null;
 }
 
+/** `sysload::ProfileTier`: how much headroom the machine has. */
+export type ProfileTier = "compact" | "standard" | "roomy";
+/** `host_load.profile`: `auto` derives the tier from memory, the others pin it. */
+export type ProfileChoice = "auto" | ProfileTier;
+/**
+ * `sysload::ProfileBasis`: how the tier was decided. `memory_unreadable` is a
+ * default (`standard`), not a derived answer.
+ */
+export type ProfileBasis = "memory" | "override" | "memory_unreadable";
+
+/** `sysload::ResourceProfile`: the capacity budgets this machine allows. */
+export interface ResourceProfile {
+  tier: ProfileTier;
+  basis: ProfileBasis;
+  memory_bytes: number | null;
+  logical_cores: number | null;
+  budgets: ResourceBudgets;
+}
+
 /** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
 export const HOST_PRESSURE_REFUSAL = "host_pressure";
 
@@ -302,6 +322,7 @@ export interface HostLoadStatus {
   sensor: SensorReport;
   pressure: PressureInput;
   governor: GovernorReport;
+  profile: ResourceProfile;
   snapshot_path: string | null;
   writer: WriterIdentity | null;
   writer_is_self: boolean;
@@ -326,6 +347,8 @@ export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
   govern_launches: boolean;
+  /** Which resource profile sizes GitPulse's caches (`host_load.profile`). */
+  profile: ProfileChoice;
 }
 
 /** The event the app's sampler emits after every tick. */
@@ -466,10 +489,11 @@ export async function admitAnyway(): Promise<string> {
   return message;
 }
 
-/** Mirrors `HostLoadSettings::default` in Rust: on. */
+/** Mirrors `HostLoadSettings::default` in Rust: on, profile derived. */
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
+  profile: "auto",
 };
 
 export async function loadHostLoadSettings(): Promise<HostLoadSettings> {
@@ -479,13 +503,27 @@ export async function loadHostLoadSettings(): Promise<HostLoadSettings> {
 
 export async function saveHostLoadSettings(settings: HostLoadSettings): Promise<HostLoadSettings> {
   if (!isTauri()) return settings;
-  return invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  const stored = await invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  // The profile is part of the status: reread it so a change of tier reaches
+  // every consumer now, not on a restart.
+  refreshAfterChange();
+  return stored;
 }
 
 export const hostLoadPulse: Readable<HostLoadPulse | null> = { subscribe: pulseStore.subscribe };
 export const hostLoadStatus: Readable<HostLoadStatus | null> = {
   subscribe: statusStore.subscribe,
 };
+
+/**
+ * The resource profile the backend derived, or null until the first status
+ * arrives. A consumer sizing itself from it uses `COMPACT_BUDGETS` while it
+ * is null, never a roomy default (`resourceBudgets.ts`).
+ */
+export const resourceProfile: Readable<ResourceProfile | null> = derived(
+  statusStore,
+  (status) => status?.profile ?? null,
+);
 
 /**
  * The memory-pressure input for features that defer background work under

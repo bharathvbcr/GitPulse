@@ -35,6 +35,13 @@ export function hostLoadStatusFixture(): HostLoadStatus {
       largest_foreign: null,
       override_remaining_s: null,
     },
+    profile: {
+      tier: "roomy",
+      basis: "memory",
+      memory_bytes: 36 * 2 ** 30,
+      logical_cores: 12,
+      budgets: { gpu_contexts: 8, gpu_hide_grace_ms: 300_000, graph_cache_repositories: 6 },
+    },
     snapshot_path: "/Users/fixture/Library/Application Support/GitPulse/host-load.v1",
     writer,
     writer_is_self: false,

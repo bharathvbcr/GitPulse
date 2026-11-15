@@ -41,6 +41,7 @@ mod disk;
 mod governor;
 mod probe;
 pub(crate) mod procscan;
+mod profile;
 mod sampler;
 mod sensor;
 mod snapshot;
@@ -58,9 +59,13 @@ pub use procscan::{
     observe_sessions, terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree,
     MemguardHealth, Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
 };
+pub use profile::{
+    derive as derive_profile, of_host as profile_of_host, ProfileBasis, ProfileChoice, ProfileTier,
+    ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES, STANDARD_MAX_BYTES,
+};
 pub use sampler::{
-    pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput, Role,
-    SamplerOptions, StopHandle,
+    profile, pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput,
+    Role, SamplerOptions, StopHandle,
 };
 pub use sensor::{
     Compressor, CompressorDelta, CompressorTrend, Cores, HostSample, Level, OsSensor, Power,

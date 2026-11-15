@@ -8,6 +8,7 @@ import {
   GPU_LOSS_BUDGET,
   GPU_LOSS_WINDOW_MS,
   GPU_RECOVER_DELAY_MS,
+  gpuPolicy,
   type GpuAddon,
   type GpuRenderer,
   type GpuSlots,
@@ -161,6 +162,9 @@ function session(page: FakePage, slots: GpuSlots, options: { failAttach?: () => 
       return addon;
     },
     slots,
+    // These suites are written against the roomy grace; the shared policy
+    // starts at the compact one until a resource profile arrives.
+    policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
     onChange: (state) => changes.push(state),
     refresh: () => {
       refreshes.count += 1;

@@ -12,11 +12,13 @@ import {
   pulseOf,
   refreshHostLoad,
   resetHostLoadForTests,
+  resourceProfile,
   saveHostLoadSettings,
   startHostLoad,
   terminateOrphan,
   type HostLoadPulse,
   type HostLoadStatus,
+  type ResourceProfile,
 } from "./hostLoadStore";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -59,6 +61,13 @@ function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
     sensor: { state: "fresh", age_ms: 500, level: "warn", enabled: true, reason: null },
     pressure: "warn",
     governor: calmGovernor,
+    profile: {
+      tier: "roomy",
+      basis: "memory",
+      memory_bytes: 32 * 2 ** 30,
+      logical_cores: 10,
+      budgets: { gpu_contexts: 8, gpu_hide_grace_ms: 300_000, graph_cache_repositories: 6 },
+    },
     snapshot_path: "/x/host-load.v1",
     writer: { pid: 1, start_us: 2, version: "1.5.0", path: "/a/gitpulse" },
     writer_is_self: true,
@@ -129,14 +138,49 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    vi.mocked(invoke).mockResolvedValue({ enabled: false, govern_launches: true });
-    await expect(saveHostLoadSettings({ enabled: false, govern_launches: true })).resolves.toEqual({
+    vi.mocked(invoke).mockResolvedValue({ enabled: false, govern_launches: true, profile: "auto" });
+    await expect(
+      saveHostLoadSettings({ enabled: false, govern_launches: true, profile: "auto" }),
+    ).resolves.toEqual({
       enabled: false,
       govern_launches: true,
+      profile: "auto",
     });
     expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: false, govern_launches: true },
+      settings: { enabled: false, govern_launches: true, profile: "auto" },
     });
+  });
+
+  it("has no resource profile until a status arrives, then carries the backend's", async () => {
+    expect(get(resourceProfile)).toBeNull();
+    const derived: ResourceProfile = {
+      tier: "compact",
+      basis: "memory",
+      memory_bytes: 8 * 2 ** 30,
+      logical_cores: 8,
+      budgets: { gpu_contexts: 2, gpu_hide_grace_ms: 15_000, graph_cache_repositories: 2 },
+    };
+    vi.mocked(invoke).mockResolvedValue(status({ profile: derived }));
+    await refreshHostLoad();
+    expect(get(resourceProfile)).toEqual(derived);
+  });
+
+  it("rereads the status after the profile is saved, so the page follows without a restart", async () => {
+    const roomy: ResourceProfile = {
+      tier: "roomy",
+      basis: "override",
+      memory_bytes: 8 * 2 ** 30,
+      logical_cores: 8,
+      budgets: { gpu_contexts: 8, gpu_hide_grace_ms: 300_000, graph_cache_repositories: 6 },
+    };
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "cmd_host_load_settings_save"
+        ? { enabled: true, govern_launches: true, profile: "roomy" }
+        : status({ profile: roomy }),
+    );
+    await saveHostLoadSettings({ enabled: true, govern_launches: true, profile: "roomy" });
+    await vi.waitFor(() => expect(get(resourceProfile)?.tier).toBe("roomy"));
+    expect(invoke).toHaveBeenCalledWith("cmd_host_load_status");
   });
 
   it("carries the governor's verdict from the status into the pulse", () => {

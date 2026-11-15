@@ -529,6 +529,11 @@ pub struct HostLoadSettings {
     /// what the "refusing launches for 30 minutes" notice flips.
     #[serde(default = "host_load_enabled_default")]
     pub govern_launches: bool,
+    /// Which resource profile sizes GitPulse's own caches (`auto` derives it
+    /// from physical memory; the others pin it). Capacity only: it never
+    /// changes another stored setting.
+    #[serde(default)]
+    pub profile: crate::sysload::ProfileChoice,
 }
 
 fn host_load_enabled_default() -> bool {
@@ -540,6 +545,7 @@ impl Default for HostLoadSettings {
         Self {
             enabled: true,
             govern_launches: true,
+            profile: crate::sysload::ProfileChoice::Auto,
         }
     }
 }
@@ -1636,6 +1642,61 @@ mod tests {
             assert_eq!(
                 load().map(|c| c.devmap.binary).unwrap_or_default(),
                 Some("/tmp/fake".to_owned())
+            );
+        });
+    }
+
+    /// `host_load.profile` is `auto` for a tools.json written before it
+    /// existed, round-trips when chosen, is not written while `auto`, and an
+    /// unrecognised value reads as `auto` without costing the block's other
+    /// switches.
+    #[test]
+    fn the_host_load_profile_defaults_to_auto_and_round_trips() {
+        use crate::sysload::ProfileChoice;
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"host_load":{"enabled":false,"govern_launches":false}}"#,
+            );
+            let old = host_load_settings();
+            assert_eq!(
+                old.profile,
+                ProfileChoice::Auto,
+                "an old file reads as auto"
+            );
+            assert!(
+                !old.enabled && !old.govern_launches,
+                "its other switches survive"
+            );
+
+            set_host_load_settings(HostLoadSettings {
+                profile: ProfileChoice::Compact,
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_settings().profile, ProfileChoice::Compact);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load"]["profile"], "compact");
+
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored.get("host_load").is_none(),
+                "auto is the default and is not written"
+            );
+
+            write_raw(
+                path,
+                r#"{"version":1,"host_load":{"enabled":false,"profile":"tiny"}}"#,
+            );
+            let unknown = host_load_settings();
+            assert_eq!(unknown.profile, ProfileChoice::Auto);
+            assert!(
+                !unknown.enabled,
+                "an unknown profile does not reset the block"
             );
         });
     }

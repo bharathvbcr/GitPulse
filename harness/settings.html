@@ -267,7 +267,7 @@
           }
           // Lappi reloads each time the Agents panel becomes active, so a null
           // answer here crashes the modal on the second visit.
-          if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true };
+          if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true, profile: "auto" };
           if (cmd === "cmd_host_load_status") return hostLoadStatus;
           if (cmd === "cmd_lappi_settings") {
             return {

@@ -63,6 +63,7 @@
  * Nothing here imports xterm: `attach` is the caller's, so the decisions are
  * testable without a WebGL context.
  */
+import { COMPACT_BUDGETS } from "../resourceBudgets";
 import { MAX_VISIBLE_SESSIONS } from "./attendance";
 
 /**
@@ -72,7 +73,11 @@ import { MAX_VISIBLE_SESSIONS } from "./attendance";
  */
 export type GpuState = "dom" | "webgl" | "reset" | "lost";
 
-/** How long a hidden session keeps its context before giving it back. */
+/**
+ * How long a hidden session keeps its context before giving it back, on a
+ * machine with room (the `roomy` resource profile). `gpuPolicy.hideGraceMs`
+ * follows the profile (`resourceBudgets.ts`) and starts at the compact value.
+ */
 export const GPU_HIDE_GRACE_MS = 5 * 60_000;
 /** After a loss, how long before the session attaches again. */
 export const GPU_RECOVER_DELAY_MS = 1_500;
@@ -89,9 +94,14 @@ export interface GpuPolicy {
   lossWindowMs: number;
 }
 
-/** Read at each decision; the harness narrows it, nothing else writes to it. */
+/**
+ * Read at each decision; the harness narrows it and the resource profile sets
+ * the grace (`applyResourceBudgets`). Until a profile arrives the grace is the
+ * compact one, so a small machine never starts out holding hidden contexts for
+ * the roomy five minutes.
+ */
 export const gpuPolicy: GpuPolicy = {
-  hideGraceMs: GPU_HIDE_GRACE_MS,
+  hideGraceMs: COMPACT_BUDGETS.gpu_hide_grace_ms,
   recoverDelayMs: GPU_RECOVER_DELAY_MS,
   lossBudget: GPU_LOSS_BUDGET,
   lossWindowMs: GPU_LOSS_WINDOW_MS,
@@ -150,6 +160,16 @@ export interface GpuSlots {
   give(): void;
   /** Slots held now, including those a hidden session is holding. */
   held(): number;
+  /** The most contexts the pool lets live at once. */
+  cap(): number;
+  /**
+   * Changes the cap (floored, at least one; a value that is not a finite
+   * number is ignored). A larger cap takes effect at once and wakes refused
+   * sessions. A smaller one gives up hidden holders beyond it, longest-hidden
+   * first; an on-screen session is never taken from, so the pool may stay
+   * over a smaller cap until those leave, and nobody new is admitted meanwhile.
+   */
+  setCap(next: number): void;
   /**
    * Offers a held slot to whoever needs it: `release` must free the context
    * and `give()` its slot. Returns a function that withdraws the offer.
@@ -162,7 +182,8 @@ export interface GpuSlots {
   wait(retry: () => void): () => void;
 }
 
-export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
+export function createGpuSlots(initialCap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
+  let cap = initialCap;
   let held = 0;
   /** Hidden holders, longest-hidden first (a Set keeps insertion order). */
   const idles = new Set<() => void>();
@@ -211,6 +232,16 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
       if (reclaiming === 0) notify();
     },
     held: () => held,
+    cap: () => cap,
+    setCap(next) {
+      if (!Number.isFinite(next)) return;
+      cap = Math.max(1, Math.floor(next));
+      // Give up hidden holders beyond the cap, longest-hidden first. An
+      // on-screen session is not in `idles`, so it is never taken from.
+      while (held > cap && idles.size > 0) reclaimOldest();
+      // A larger cap, or a freed slot, may be what a refused session waits for.
+      notify();
+    },
     idle(release) {
       idles.add(release);
       notify();
@@ -227,8 +258,11 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
   };
 }
 
-/** Every terminal in the window draws from this one pool. */
-export const gpuSlots = createGpuSlots();
+/**
+ * Every terminal in the window draws from this one pool. It starts at the
+ * compact cap and follows the resource profile (`applyResourceBudgets`).
+ */
+export const gpuSlots = createGpuSlots(COMPACT_BUDGETS.gpu_contexts);
 
 export interface GpuRenderer {
   /**

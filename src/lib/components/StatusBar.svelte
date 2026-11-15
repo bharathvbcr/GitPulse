@@ -26,6 +26,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { resolveStatusBarMode } from "../ui/statusBarMode";
   import { hostLoadPulse, startHostLoad } from "../stores/hostLoadStore";
+  import { startResourceBudgets } from "../stores/resourceBudgetWiring";
   import { statusChip } from "../health/hostLoad";
   import { onMount } from "svelte";
   import { Gauge } from "@lucide/svelte";
@@ -77,7 +78,10 @@
    * nothing to the bar (`health/hostLoad.ts` owns the rule).
    */
   let loadChip = $derived(statusChip($hostLoadPulse));
-  onMount(() => startHostLoad());
+  onMount(() => {
+    startHostLoad();
+    startResourceBudgets();
+  });
   let watchLabel = $derived(watchMarker(watchState));
 
   let operationState = $derived($repoStore.operation);

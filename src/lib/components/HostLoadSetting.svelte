@@ -11,9 +11,11 @@
   import {
     DEFAULT_HOST_LOAD_SETTINGS,
     loadHostLoadSettings,
+    resourceProfile,
     saveHostLoadSettings,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
+  import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
   import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
@@ -75,6 +77,28 @@
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
+  <div class="space-y-1 pt-1">
+    <label class="text-textPrimary" for="gp-host-load-profile">Memory profile</label>
+    <select
+      id="gp-host-load-profile"
+      class="gp-select text-meta w-full min-w-0"
+      data-size="sm"
+      data-testid="host-load-profile"
+      disabled={busy || !readOk}
+      value={settings.profile}
+      onchange={(event) => void save({ profile: asProfileChoice(event.currentTarget.value) })}
+    >
+      {#each PROFILE_CHOICES as choice (choice.value)}
+        <option value={choice.value}>{choice.label}</option>
+      {/each}
+    </select>
+    <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
+      Sizes how much GitPulse keeps warm: terminals drawn with the GPU, how long a hidden terminal keeps its GPU
+      context, and how many repositories keep their commit graph in memory. It never changes your session limits or
+      scrollback. Automatic picks from this computer's memory.
+      {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
+    </p>
+  </div>
   {#if error}
     <p class="text-warn">{error}</p>
     <button type="button" class="gp-btn text-meta px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Try again</button>

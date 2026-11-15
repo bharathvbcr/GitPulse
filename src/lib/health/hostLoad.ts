@@ -15,7 +15,9 @@ import type {
   HostLoadPulse,
   Level,
   MemguardHealth,
+  ProfileChoice,
   Reading,
+  ResourceProfile,
   SensorState,
   Why,
 } from "../stores/hostLoadStore";
@@ -245,4 +247,34 @@ export function memguardLine(memguard: MemguardHealth): string {
   const log = describeReading(memguard.log_path, (path) => path);
   const beat = describeReading(memguard.heartbeat_age_s, (s) => `${formatAge(s * 1000)} ago`);
   return `memguard running${pid} · log ${log} · last written ${beat}`;
+}
+
+/** The memory profile select's options (`host_load.profile`), in the order shown. */
+export const PROFILE_CHOICES: readonly { value: ProfileChoice; label: string }[] = [
+  { value: "auto", label: "Automatic (from this computer's memory)" },
+  { value: "compact", label: "Compact (8 GB of memory or less)" },
+  { value: "standard", label: "Standard (up to 16 GB)" },
+  { value: "roomy", label: "Roomy (more than 16 GB)" },
+];
+
+/** A select's value as a choice; anything that is not one reads as automatic. */
+export function asProfileChoice(value: string): ProfileChoice {
+  return PROFILE_CHOICES.find((choice) => choice.value === value)?.value ?? "auto";
+}
+
+/**
+ * Which tier is in use and why. An unreadable memory size is said so rather
+ * than shown as a derived answer.
+ */
+export function profileNote(profile: ResourceProfile): string {
+  switch (profile.basis) {
+    case "override":
+      return `In use: ${profile.tier}, as you chose.`;
+    case "memory_unreadable":
+      return `In use: ${profile.tier}, because this computer's memory could not be read.`;
+    case "memory":
+      return profile.memory_bytes === null
+        ? `In use: ${profile.tier}.`
+        : `In use: ${profile.tier}, from ${bytes(profile.memory_bytes)} of memory.`;
+  }
 }

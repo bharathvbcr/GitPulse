@@ -16,6 +16,7 @@
 
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
+use super::profile::{of_host as profile_of_host, ProfileChoice, ResourceProfile};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor};
 use super::snapshot::{self, Snapshot, TickStats, Writer, WriterIdentity};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
@@ -72,6 +73,9 @@ pub struct HostLoadStatus {
     /// What the governor decided from this sensor: admission, shedding and
     /// why (`sysload::governor`).
     pub governor: GovernorReport,
+    /// What this machine can afford GitPulse to hold, sized from the memory
+    /// this sensor reads and `host_load.profile` (`sysload::profile`).
+    pub profile: ResourceProfile,
     pub snapshot_path: Option<String>,
     pub writer: Option<WriterIdentity>,
     pub writer_is_self: bool,
@@ -124,6 +128,8 @@ pub struct SamplerOptions {
     /// `host_load.govern_launches`, read once per tick: whether severe
     /// pressure refuses agent launches.
     pub govern_launches: Box<dyn Fn() -> bool + Send>,
+    /// `host_load.profile`, read once per tick: the tier the user asked for.
+    pub profile_choice: Box<dyn Fn() -> ProfileChoice + Send>,
     /// Called after every tick with that tick's pulse.
     pub on_tick: Option<Box<dyn Fn(HostLoadPulse) + Send>>,
     /// Begins the App Nap opt-out; dropping what it returns ends it. A seam so
@@ -138,6 +144,7 @@ impl SamplerOptions {
             cadence: Duration::from_millis(CADENCE_MS),
             enabled: Box::new(|| true),
             govern_launches: Box::new(|| true),
+            profile_choice: Box::new(|| ProfileChoice::Auto),
             on_tick: None,
             begin_activity: Box::new(|| {
                 super::probe::Activity::begin("GitPulse host-load sampler")
@@ -274,15 +281,35 @@ pub fn status() -> HostLoadStatus {
         {
             // Aged to now, not to the tick that stored it: a sampler that
             // stopped ticking must not leave a fresh-looking verdict.
+            // The profile is re-derived from the stored choice too: a change in
+            // Settings must reach the page on its next read, not after the
+            // sampler's next tick.
+            let profile = profile_of_host(
+                status.snapshot.as_ref().map(|s| &s.host),
+                stored_profile_choice(),
+            );
             return HostLoadStatus {
                 governor: governor::report(),
+                profile,
                 ..status
             };
         }
-        return reader_status(&shared.dir, Role::Reader, Vec::new(), TickStats::default());
+        return reader_status(
+            &shared.dir,
+            Role::Reader,
+            Vec::new(),
+            TickStats::default(),
+            stored_profile_choice(),
+        );
     }
     match crate::tool_config::default_config_dir() {
-        Some(dir) => reader_status(&dir, Role::NotSampling, Vec::new(), TickStats::default()),
+        Some(dir) => reader_status(
+            &dir,
+            Role::NotSampling,
+            Vec::new(),
+            TickStats::default(),
+            stored_profile_choice(),
+        ),
         None => HostLoadStatus {
             platform: Platform::current(),
             role: Role::NotSampling,
@@ -295,6 +322,7 @@ pub fn status() -> HostLoadStatus {
             },
             pressure: PressureInput::Unavailable,
             governor: governor::report(),
+            profile: profile_of_host(None, stored_profile_choice()),
             snapshot_path: None,
             writer: None,
             writer_is_self: false,
@@ -306,7 +334,26 @@ pub fn status() -> HostLoadStatus {
     }
 }
 
-fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats) -> HostLoadStatus {
+/// The user's `host_load.profile`, as stored.
+fn stored_profile_choice() -> ProfileChoice {
+    crate::tool_config::host_load_settings().profile
+}
+
+/// What this machine can afford GitPulse to hold: the latest status's memory
+/// reading under the stored `host_load.profile`. Like [`governor::shed`], it
+/// answers in every process; one with no sample reads as unreadable memory
+/// (`standard`, basis `memory_unreadable`), never as a derived answer.
+pub fn profile() -> ResourceProfile {
+    status().profile
+}
+
+fn reader_status(
+    dir: &Path,
+    role: Role,
+    problems: Vec<String>,
+    tick: TickStats,
+    choice: ProfileChoice,
+) -> HostLoadStatus {
     let path = dir.join(snapshot::SNAPSHOT_FILE_NAME);
     let (sensor, snap) = snapshot::report(&path, Clock::now());
     let role = if Platform::current() == Platform::Unavailable {
@@ -319,6 +366,7 @@ fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats)
         role,
         pressure: PressureInput::of(&sensor),
         governor: governor::report(),
+        profile: profile_of_host(snap.as_ref().map(|s| &s.host), choice),
         sensor,
         snapshot_path: Some(path.to_string_lossy().into_owned()),
         writer: snap.as_ref().map(|s| s.writer.clone()),
@@ -455,13 +503,25 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 if let Err(why) = w.publish(&snap) {
                     tick_problems.push(format!("publish: {why}"));
                 }
-                let mut status = reader_status(&shared.dir, Role::Writer, tick_problems, tick);
+                let mut status = reader_status(
+                    &shared.dir,
+                    Role::Writer,
+                    tick_problems,
+                    tick,
+                    (options.profile_choice)(),
+                );
                 status.writer_is_self = true;
                 status.snapshot_path = Some(w.path().to_string_lossy().into_owned());
                 status.procs = procs;
                 status
             }
-            None => reader_status(&shared.dir, Role::Reader, tick_problems, tick),
+            None => reader_status(
+                &shared.dir,
+                Role::Reader,
+                tick_problems,
+                tick,
+                (options.profile_choice)(),
+            ),
         };
 
         let govern_launches = (options.govern_launches)();
@@ -563,6 +623,31 @@ mod tests {
         assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
     }
 
+    /// A status with no snapshot behind it has no memory reading, and says so
+    /// rather than passing a default off as a derived answer; a chosen tier
+    /// is carried through whatever the reading.
+    #[test]
+    fn a_status_with_no_snapshot_has_an_underived_profile() {
+        use super::super::profile::{ProfileBasis, ProfileTier};
+        let dir = tempfile::tempdir().unwrap();
+        let none = |choice| {
+            reader_status(
+                dir.path(),
+                Role::NotSampling,
+                Vec::new(),
+                TickStats::default(),
+                choice,
+            )
+            .profile
+        };
+        let auto = none(ProfileChoice::Auto);
+        assert_eq!(auto.tier, ProfileTier::Standard);
+        assert_eq!(auto.basis, ProfileBasis::MemoryUnreadable);
+        let pinned = none(ProfileChoice::Compact);
+        assert_eq!(pinned.tier, ProfileTier::Compact);
+        assert_eq!(pinned.basis, ProfileBasis::Override);
+    }
+
     fn report(state: SensorState, level: Option<Level>, enabled: bool) -> SensorReport {
         SensorReport {
             state,
@@ -636,6 +721,12 @@ mod tests {
             status.sensor
         );
         assert_eq!(status.writer.as_ref().unwrap().pid, std::process::id());
+        assert_eq!(
+            status.profile.basis,
+            super::super::profile::ProfileBasis::Memory,
+            "a real host reads its own memory: {:?}",
+            status.profile
+        );
         let procs = status
             .procs
             .as_ref()
