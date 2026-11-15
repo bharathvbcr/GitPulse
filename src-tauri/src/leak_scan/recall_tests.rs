@@ -192,7 +192,41 @@ fn run(bin: &Path, args: &[&str], scratch: &Path, tag: &str) -> Result<Ran, Stri
 fn failure(bin: &Path, tag: &str, ran: &Ran) -> String {
     let stderr = String::from_utf8_lossy(&ran.stderr);
     let tail: String = stderr.chars().take(600).collect();
-    format!("{} {tag} exited {}: {tail}", bin.display(), ran.status)
+    format!(
+        "{} {tag} exited {}: {}",
+        bin.display(),
+        ran.status,
+        redact_runs(&tail)
+    )
+}
+
+/// Replace every run of 16 or more token characters with a marker, so an
+/// oracle's stderr cannot carry a plant into a panic message.
+fn redact_runs(text: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 16 {
+            out.push_str("[run redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if is_token_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "+/=_-.".contains(c)
 }
 
 fn first_line(bytes: &[u8]) -> String {
@@ -213,9 +247,9 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Kingfisher's rules, with how many it hides (helper rules other rules
-/// depend on, never reported on their own).
-fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, usize), String> {
+/// Kingfisher's visible rules, and the ids of the ones it hides (helper
+/// rules other rules depend on, never reported on their own).
+fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, Vec<String>), String> {
     let ran = run(
         bin,
         &["rules", "list", "--format", "json"],
@@ -228,7 +262,7 @@ fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, usize), St
     let rows: Vec<Value> = serde_json::from_slice(&ran.stdout)
         .map_err(|e| format!("kingfisher rules list is not a JSON array: {e}"))?;
     let mut rules = Vec::new();
-    let mut hidden = 0;
+    let mut hidden = Vec::new();
     for row in &rows {
         let field = |k: &str| {
             row.get(k)
@@ -236,7 +270,7 @@ fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, usize), St
                 .ok_or_else(|| format!("kingfisher rule without `{k}`"))
         };
         if row.get("visible").and_then(Value::as_bool) == Some(false) {
-            hidden += 1;
+            hidden.push(field("id")?.to_string());
             continue;
         }
         rules.push(Rule {
@@ -251,12 +285,10 @@ fn kingfisher_rules(bin: &Path, scratch: &Path) -> Result<(Vec<Rule>, usize), St
     Ok((rules, hidden))
 }
 
-/// file name -> rule ids Kingfisher reported in it.
-fn kingfisher_scan(
-    bin: &Path,
-    dir: &Path,
-    scratch: &Path,
-) -> Result<HashMap<String, BTreeSet<String>>, String> {
+/// file name -> rule id -> the confidence Kingfisher gave that finding.
+type KingfisherFindings = HashMap<String, BTreeMap<String, Confidence>>;
+
+fn kingfisher_scan(bin: &Path, dir: &Path, scratch: &Path) -> Result<KingfisherFindings, String> {
     let report = scratch.join("kf-scan.json");
     let dir_arg = dir.to_string_lossy();
     let report_arg = report.to_string_lossy();
@@ -293,17 +325,18 @@ fn kingfisher_scan(
         .get("findings")
         .and_then(Value::as_array)
         .ok_or("kingfisher report has no `findings` array")?;
-    let mut by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut by_file: KingfisherFindings = HashMap::new();
     for f in findings {
         let rule = f.pointer("/rule/id").and_then(Value::as_str);
         let path = f.pointer("/finding/path").and_then(Value::as_str);
-        let (Some(rule), Some(path)) = (rule, path) else {
-            return Err("kingfisher finding without rule id or path".into());
+        let confidence = f.pointer("/finding/confidence").and_then(Value::as_str);
+        let (Some(rule), Some(path), Some(confidence)) = (rule, path, confidence) else {
+            return Err("kingfisher finding without rule id, path or confidence".into());
         };
         by_file
             .entry(file_name_of(path))
             .or_default()
-            .insert(rule.to_string());
+            .insert(rule.to_string(), Confidence::parse(confidence)?);
     }
     Ok(by_file)
 }
@@ -859,11 +892,20 @@ struct Scored {
     realistic: Option<(bool, Option<&'static str>)>,
 }
 
+/// A plant under the reconstructed 2026-11-14 method: the first candidate
+/// Kingfisher reports anything on, binned by that finding's confidence.
+struct AnyScored {
+    confidence: Confidence,
+    betterleaks: bool,
+    dc_redact: bool,
+}
+
 struct Measurement {
     kingfisher_version: String,
     betterleaks_version: String,
     rules: Vec<Rule>,
-    hidden_rules: usize,
+    hidden_rules: Vec<String>,
+    any: Vec<AnyScored>,
     betterleaks_rule_count: usize,
     validated: Vec<bool>,
     sampled: Vec<usize>,
@@ -932,15 +974,26 @@ fn measure() -> Result<Measurement, String> {
     // The plant: the first candidate Kingfisher reports as its own rule.
     let mut chosen: BTreeMap<usize, (usize, Option<usize>)> = BTreeMap::new();
     let mut reported_elsewhere: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    // The reconstructed old method: first candidate with any finding, binned
+    // by the confidence of the finding (its own rule's when reported).
+    let mut any_plant: BTreeMap<usize, (usize, Confidence)> = BTreeMap::new();
     for (n, c) in candidates.iter().enumerate() {
-        let found = kf.get(&c.file_name(n));
-        let own = found.is_some_and(|ids| ids.contains(&rules[c.rule].id));
+        let found = kf.get(&c.file_name(n)).filter(|ids| !ids.is_empty());
+        if let Some(ids) = found {
+            let confidence = ids
+                .get(&rules[c.rule].id)
+                .or_else(|| ids.values().min())
+                .copied()
+                .expect("non-empty findings");
+            any_plant.entry(c.rule).or_insert((n, confidence));
+        }
+        let own = found.is_some_and(|ids| ids.contains_key(&rules[c.rule].id));
         if !own {
             if let Some(ids) = found {
                 reported_elsewhere
                     .entry(c.rule)
                     .or_default()
-                    .extend(ids.iter().cloned());
+                    .extend(ids.keys().cloned());
             }
             continue;
         }
@@ -970,6 +1023,9 @@ fn measure() -> Result<Measurement, String> {
         to_score.push(*plant);
         to_score.extend(realistic);
     }
+    to_score.extend(any_plant.values().map(|(n, _)| *n));
+    to_score.sort_unstable();
+    to_score.dedup();
     for n in &to_score {
         let c = &candidates[*n];
         write_file(&plants_dir, &c.file_name(*n), &c.text)?;
@@ -999,12 +1055,24 @@ fn measure() -> Result<Measurement, String> {
             }
         })
         .collect();
+    let any: Vec<AnyScored> = any_plant
+        .values()
+        .map(|(n, confidence)| {
+            let (betterleaks, dc) = judge(*n);
+            AnyScored {
+                confidence: *confidence,
+                betterleaks,
+                dc_redact: dc.is_some(),
+            }
+        })
+        .collect();
 
     Ok(Measurement {
         kingfisher_version: first_line(&kf_version.stdout),
         betterleaks_version: first_line(&bl_version.stdout),
         rules,
         hidden_rules,
+        any,
         betterleaks_rule_count: betterleaks_ids.len(),
         validated,
         sampled,
@@ -1062,7 +1130,21 @@ fn betterleaks_reason(m: &Measurement, s: &Scored) -> Option<String> {
     ))
 }
 
-fn no_plant_reason(why: &NoPlant) -> String {
+/// Kingfisher's hidden helper rules for the same vendor stem as `rule_id`.
+fn helpers_for<'a>(rule_id: &str, hidden: &'a [String]) -> Vec<&'a str> {
+    let stem = |id: &str| -> String {
+        let s = slug(id);
+        s.split('-').next().unwrap_or(s).to_string()
+    };
+    let own = stem(rule_id);
+    hidden
+        .iter()
+        .filter(|h| stem(h) == own)
+        .map(String::as_str)
+        .collect()
+}
+
+fn no_plant_reason(m: &Measurement, rule: usize, why: &NoPlant) -> String {
     match why {
         NoPlant::Unsupported(e) => format!("sampler refuses the pattern: {e}"),
         NoPlant::NoMatchingSample => {
@@ -1071,7 +1153,19 @@ fn no_plant_reason(why: &NoPlant) -> String {
         NoPlant::NotConfirmed {
             kingfisher_reported,
         } if kingfisher_reported.is_empty() => {
-            "Kingfisher reported nothing on any candidate (a dependent rule, or a filter the regex does not show)".into()
+            let helpers = helpers_for(&m.rules[rule].id, &m.hidden_rules);
+            if helpers.is_empty() {
+                "Kingfisher reported nothing on any candidate; no hidden helper rule shares its vendor, so the cause is not established (a filter the regex does not show)".into()
+            } else {
+                format!(
+                    "Kingfisher reported nothing on any candidate; it hides helper rule(s) {} for this vendor, which this rule likely needs on the same input (inferred from ids)",
+                    helpers
+                        .iter()
+                        .map(|h| format!("`{h}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         }
         NoPlant::NotConfirmed {
             kingfisher_reported,
@@ -1110,7 +1204,7 @@ fn render(m: &Measurement) -> String {
         "- Kingfisher: `{}`, {} visible rules ({} helper rules not reported on their own)",
         m.kingfisher_version,
         m.rules.len(),
-        m.hidden_rules
+        m.hidden_rules.len()
     );
     let _ = writeln!(
         r,
@@ -1211,56 +1305,100 @@ fn render(m: &Measurement) -> String {
     }
 
     // Vendors dc-redact misses, ranked.
-    // (tier, position in VENDORS, vendor) -> rule ids missed.
+    // (tier, position in VENDORS, vendor) -> (rules missed, rules with no
+    // plant). A rule with no plant was never measured, so its vendor must not
+    // read as covered.
     type MissKey = (Tier, usize, String);
-    let mut misses: BTreeMap<MissKey, Vec<&str>> = BTreeMap::new();
+    type MissRow<'a> = (Vec<&'a str>, Vec<&'a str>);
+    let mut misses: BTreeMap<MissKey, MissRow> = BTreeMap::new();
+    let key = |id: &str| {
+        let (vendor, tier, position) = vendor_rank(id);
+        (tier, position, vendor)
+    };
     for s in &m.scored {
         let real_hit = matches!(s.realistic, Some((_, Some(_))));
         if s.dc_redact.is_none() && !real_hit {
             let id = m.rules[s.rule].id.as_str();
-            let (vendor, tier, position) = vendor_rank(id);
-            misses.entry((tier, position, vendor)).or_default().push(id);
+            misses.entry(key(id)).or_default().0.push(id);
         }
     }
-    let mut ranked: Vec<(MissKey, Vec<&str>)> = misses.into_iter().collect();
+    for i in m.no_plant.keys() {
+        let id = m.rules[*i].id.as_str();
+        misses.entry(key(id)).or_default().1.push(id);
+    }
+    let mut ranked: Vec<(MissKey, MissRow)> = misses.into_iter().collect();
     // Tier, then the curated commonness order; unlisted vendors by rules
     // missed, then name.
     ranked.sort_by(|((ta, pa, va), a), ((tb, pb, vb), b)| {
         ta.cmp(tb)
             .then(pa.cmp(pb))
-            .then(b.len().cmp(&a.len()))
+            .then((b.0.len() + b.1.len()).cmp(&(a.0.len() + a.1.len())))
             .then(va.cmp(vb))
     });
-    let ranked: Vec<_> = ranked
-        .into_iter()
-        .map(|((tier, _, vendor), ids)| ((tier, vendor), ids))
-        .collect();
     let _ = writeln!(r, "\n## Vendors dc-redact misses, ranked\n");
     let _ = writeln!(
         r,
-        "Misses at both lengths (length artefacts excluded). Ranked by tier — cloud, CI and packages, payments, AI providers, databases first — then by rules missed. \
+        "Misses at both lengths (length artefacts excluded), and rules with no confirmed plant, which were **not measured** \
+         (see the last section for why). Ranked by tier — cloud, CI and packages, payments, AI providers, databases first — \
+         then by the curated commonness order of `VENDORS` in `recall_tests.rs`. \
          \"dc-redact names it\" is a heuristic: a shape name in the vendored table mentions the vendor.\n"
     );
     let _ = writeln!(
         r,
-        "| rank | tier | vendor | rules missed | dc-redact names it | rules |"
+        "| rank | tier | vendor | rules missed | not measured | dc-redact names it | rules missed | rules not measured |"
     );
-    let _ = writeln!(r, "| ---: | --- | --- | ---: | --- | --- |");
-    for (rank, ((tier, vendor), ids)) in ranked.iter().enumerate() {
+    let _ = writeln!(r, "| ---: | --- | --- | ---: | ---: | --- | --- | --- |");
+    let list = |ids: &[&str]| {
+        if ids.is_empty() {
+            "—".to_string()
+        } else {
+            ids.iter()
+                .map(|i| format!("`{i}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    for (rank, ((tier, _, vendor), (missed, unmeasured))) in ranked.iter().enumerate() {
         let named = claimed_by(vendor, &m.shapes)
             .map(|s| format!("`{s}`"))
             .unwrap_or_else(|| "no".into());
-        let missed = ids.len();
-        let ids = ids
-            .iter()
-            .map(|i| format!("`{i}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let _ = writeln!(
             r,
-            "| {} | {} | {vendor} | {missed} | {named} | {ids} |",
+            "| {} | {} | {vendor} | {} | {} | {named} | {} | {} |",
             rank + 1,
             tier.label(),
+            missed.len(),
+            unmeasured.len(),
+            list(missed),
+            list(unmeasured),
+        );
+    }
+
+    let _ = writeln!(
+        r,
+        "\n## The 2026-11-14 method, reconstructed (hypothesis)\n"
+    );
+    let _ = writeln!(
+        r,
+        "That corpus is lost. This is one guess at how it counted: a rule's plant is its first candidate Kingfisher reports \
+         *anything* on (a sibling rule included), binned by the confidence of that finding rather than the rule listing. \
+         It differs from the tables above only for rules whose bytes a sibling rule claims.\n"
+    );
+    let _ = writeln!(
+        r,
+        "| finding confidence | plants | Kingfisher | Betterleaks | dc-redact |"
+    );
+    let _ = writeln!(r, "| --- | ---: | ---: | ---: | ---: |");
+    let any_confidences: BTreeSet<Confidence> = m.any.iter().map(|a| a.confidence).collect();
+    for conf in &any_confidences {
+        let rows: Vec<&AnyScored> = m.any.iter().filter(|a| a.confidence == *conf).collect();
+        let n = rows.len();
+        let bl = rows.iter().filter(|a| a.betterleaks).count();
+        let dc = rows.iter().filter(|a| a.dc_redact).count();
+        let _ = writeln!(
+            r,
+            "| {} | {n} | {n}/{n} | {bl}/{n} | {dc}/{n} |",
+            conf.label()
         );
     }
 
@@ -1330,7 +1468,7 @@ fn render(m: &Measurement) -> String {
             "| `{}` | {} | {} |",
             rule.id,
             rule.confidence.label(),
-            no_plant_reason(why)
+            no_plant_reason(m, *i, why)
         );
     }
     r
@@ -1339,9 +1477,8 @@ fn render(m: &Measurement) -> String {
 /// Fail when any credential-looking run of a plant (16 or more characters of
 /// a token alphabet) appears in `report`.
 fn assert_no_plant_in(report: &str, plants: &[String]) {
-    let token_char = |c: char| c.is_ascii_alphanumeric() || "+/=_-.".contains(c);
     for (n, plant) in plants.iter().enumerate() {
-        for run in plant.split(|c: char| !token_char(c)) {
+        for run in plant.split(|c: char| !is_token_char(c)) {
             assert!(
                 run.len() < 16 || !report.contains(run),
                 "the report carries part of plant {n}; refusing to print or write it"
@@ -1443,6 +1580,28 @@ fn a_report_that_carries_a_plant_is_refused() {
     let report = format!("value {token} in a row");
     let leaked = std::panic::catch_unwind(|| assert_no_plant_in(&report, &plants));
     assert!(leaked.is_err());
+}
+
+#[test]
+fn oracle_stderr_is_redacted_before_it_reaches_a_message() {
+    let run = "Ab1".repeat(7);
+    let text = format!("error: bad input near {run}: stop");
+    let out = redact_runs(&text);
+    assert!(!out.contains(&run), "{out}");
+    assert_eq!(out, "error: bad input near [run redacted]: stop");
+}
+
+#[test]
+fn helper_rules_are_matched_by_vendor_stem() {
+    let hidden = vec![
+        "betterleaks.aikido-client-id".to_string(),
+        "betterleaks.azure-tenant-id".to_string(),
+    ];
+    assert_eq!(
+        helpers_for("betterleaks.aikido-client-secret", &hidden),
+        vec!["betterleaks.aikido-client-id"]
+    );
+    assert!(helpers_for("betterleaks.slack-webhook-url", &hidden).is_empty());
 }
 
 #[test]

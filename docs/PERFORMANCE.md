@@ -3055,6 +3055,19 @@ The run takes about 15 s after the build.
 - **No committed tokens:** plants live in a temporary directory, and both oracles run with `--redact`. The report names rules only, and `assert_no_plant_in` refuses to print or write it if any 16-character run of a plant appears in it.
 - **Fails loudly, never scores zero:** a missing binary, an unexpected exit status, a missing or unparseable report, or an oracle that finds nothing in a non-empty corpus fails the run. Betterleaks exits 0 on a directory that does not exist, which is why the directory is checked first.
 - **Spread:** `GITPULSE_LEAK_RECALL_SALT=<n>` draws a different deterministic corpus, for measuring how much the numbers move.
+- **Stderr in failures:** a failure message carries the oracle's stderr with every run of 16 or more token characters redacted.
+
+**Old-table column.** Swap the older table in, run the command above, then restore:
+
+```bash
+git checkout b07f2d9b -- src-tauri/vendored/dc-redact
+```
+
+```bash
+git checkout HEAD -- src-tauri/vendored/dc-redact
+```
+
+`ENGINE` is a constant and reads `devcouncil@cbd51369` in both runs. To tell the runs apart, use the report header's table fingerprint, an FNV-1a of the vendored source: `1c12c06020db8cec` for the old table, `8d1f4ea6dc4a1dc0` for cbd51369.
 
 ### Measured (kingfisher 2.16.0, betterleaks 1.10.1, salt 0)
 
@@ -3076,12 +3089,32 @@ The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the fi
 
 **Against the lost 2026-11-14 corpus (41/308 high, 14/75 medium):**
 - **High reproduces:** 42/316 on the old table is 13.3%, the same as 41/308.
-- **Medium does not.** It comes out at 9–10 out of 76–77 on every salt, not 14. The old generator is lost, so the cause is not established. On the old table, the realistic-length plants get 12/76, the closest figure to 14.
+- **Medium does not reproduce with this table's method.** It comes out at 9–10 out of 76–77 on every salt, not 14.
+- **One reconstruction comes close but not exactly** (the report's "reconstructed" section). It counts a plant when Kingfisher reports any rule on it, and bins it by that finding's confidence.
+  - On the old table this gives dc-redact **14/83** medium, which matches 14.
+  - But it gives 83 plants, not 75, and Betterleaks 65, not the earlier 62.
+  - The extra medium hits are high-confidence Betterleaks rules whose bytes Kingfisher hands to a medium Veles rule (npm, DigitalOcean, OpenRouter).
+  - So the earlier corpus probably counted sibling-claimed plants under medium. That is inferred, not established, since the generator is lost.
+  - On cbd51369 the reconstruction gives 15/83.
 
-**Rules without a confirmed plant: 62 (52 high, 10 medium).** Each is listed with its reason in the report:
-- Most depend on a helper rule (a client secret needs its client id), so Kingfisher reports nothing on a single plant.
-- Seven lose their bytes to a sibling rule. For example, Kingfisher reports the Veles npm rule instead of Betterleaks' `npm-access-token`, and `generic-credential-uri` instead of `sidekiq-sensitive-url`.
-- Three never produced a sample matching their own regex.
+**Rules without a confirmed plant: 62 (52 high, 10 medium).** None of them is measured. The ranked list in the report shows them per vendor in a "not measured" column, so a vendor is never read as covered because its rules went unplanted. Each rule's reason is in the report:
+
+| reason | rules |
+| --- | ---: |
+| Kingfisher reported nothing, and it hides a helper rule with the same vendor stem (for example `aikido-client-id` for `aikido-client-secret`). The rule likely needs the helper's match on the same input; this is inferred from ids. | 35 |
+| Kingfisher reported nothing, and no helper shares the vendor, so the cause is not established. Examples: `slack-webhook-url`, `twilio-api-key`, `gcp-application-default-credentials`, `kubernetes-secret-yaml`, `resend-api-key`. | 17 |
+| A sibling rule claims the bytes. For example, Kingfisher reports the Veles npm rule instead of Betterleaks' `npm-access-token`, and `generic-credential-uri` instead of `sidekiq-sensitive-url`. | 7 |
+| No sample matched the rule's own regex. | 3 |
+
+Unmeasured rules for common vendors include:
+- AWS: `aws-session-token`, CodeCommit and CodeCatalyst git credentials;
+- Azure: AD client secret, storage account key;
+- `gcp-application-default-credentials`;
+- PayPal, MongoDB Atlas, Snowflake and Twilio;
+- `slack-webhook-url`;
+- Supabase `supabase-project-api-key`.
+
+Planting a helper and its dependent secret together would measure the 35; that is a follow-up, not built.
 
 ### Where dc-redact misses (current table)
 
@@ -3123,4 +3156,4 @@ Each tier is ranked by how common the credential is (the order of `VENDORS` in `
 - a rule it has, whose filters drop the plant;
 - a plant at minimum length only, which it finds at realistic length.
 
-**Report sections:** the funnel, per-rule results for all three tools, the ranked vendor list, every disagreement with its reason, and every rule without a plant with its reason.
+**Report sections:** the funnel, per-rule results for all three tools, the ranked vendor list (misses and not-measured rules), the reconstructed old method, every disagreement with its reason, and every rule without a plant with its reason.
