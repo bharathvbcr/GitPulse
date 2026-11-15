@@ -20,10 +20,12 @@ use serde::Serialize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The detector and the version of the vendored table, named in every report
-/// so a finding can be traced to the rules that produced it. Kept equal to
-/// `vendored/dc-redact/Cargo.toml` by test.
-pub const ENGINE: &str = "dc-redact 0.2.5";
+/// The detector, the version of the vendored table and the DevCouncil commit
+/// it was vendored from, named in every report so a finding can be traced to
+/// the rules that produced it. The commit is there because the table changes
+/// without the version moving. Kept equal to `vendored/dc-redact/Cargo.toml`
+/// and `vendored/VENDOR.json` by test.
+pub const ENGINE: &str = "dc-redact 0.2.5 (devcouncil@b9b2314d)";
 
 /// Rows carried in a refusal. A diff full of fixtures can match thousands of
 /// lines; past this the count still says how many there were.

@@ -21,7 +21,17 @@ fn the_engine_names_the_vendored_table_version() {
         .find_map(|l| l.strip_prefix("version = \""))
         .and_then(|v| v.strip_suffix('"'))
         .expect("dc-redact manifest has a version");
-    assert_eq!(ENGINE, format!("dc-redact {version}"));
+    let vendor: serde_json::Value =
+        serde_json::from_str(include_str!("../../vendored/VENDOR.json")).expect("VENDOR.json");
+    let commit = vendor["crates"]
+        .as_array()
+        .and_then(|crates| crates.iter().find(|c| c["name"] == "dc-redact"))
+        .and_then(|c| c["origin"]["commit"].as_str())
+        .expect("VENDOR.json records dc-redact's commit");
+    assert_eq!(
+        ENGINE,
+        format!("dc-redact {version} (devcouncil@{})", &commit[..8])
+    );
 }
 
 #[test]

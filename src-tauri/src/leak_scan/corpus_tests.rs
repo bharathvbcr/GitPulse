@@ -388,6 +388,114 @@ pub(super) fn planted() -> Vec<(&'static str, String)> {
         "credential assigned to a named key",
         format!("aws_secret_access_key = \"{}\"", r.take(ALNUM, 40)),
     );
+    // Shapes measured missing against Kingfisher and Betterleaks and added in
+    // DevCouncil cbd51369. Appended, so the seeded values above keep theirs.
+    add(
+        "gitlab deploy token",
+        format!("token {}-{}", "gldt", r.take(URLSAFE, 20)),
+    );
+    add(
+        "slack refresh token",
+        format!("refresh={}-1-{}", "xoxe", r.take(ALNUM, 140)),
+    );
+    add(
+        "slack rotated bot token",
+        format!("token={}.{}-1-{}", "xoxe", "xoxb", r.take(ALNUM, 140)),
+    );
+    add(
+        "aws sts service bearer token id",
+        format!("id={}{}", "ABIA", r.take(UPPER_ALNUM, 16)),
+    );
+    add(
+        "aws context-specific credential id",
+        format!("id={}{}", "ACCA", r.take(UPPER_ALNUM, 16)),
+    );
+    add(
+        "aws access key id",
+        format!("aws_access_key_id={}{}", "A3TX", r.take(UPPER_ALNUM, 16)),
+    );
+    add(
+        "huggingface organization token",
+        format!("HF_TOKEN={}_{}_{}", "api", "org", r.take(ALNUM, 34)),
+    );
+    // Batch 1 of the recall harness's ranked misses, added in DevCouncil
+    // b9b2314d: formats missing for vendors the table already named.
+    add(
+        "aws bedrock short-term api key",
+        format!(
+            "AWS_BEARER_TOKEN_BEDROCK={}-api-key-{}{}",
+            "bedrock",
+            "YmVkcm9jay5hbWF6b25hd3MuY29t",
+            r.take(ALNUM, 100)
+        ),
+    );
+    add(
+        "aws bedrock long-term api key",
+        format!("key={}{}", "ABSK", r.take(ALNUM, 132)),
+    );
+    add(
+        "google gemini api key",
+        format!("GEMINI_API_KEY={}{}", "AQ.Ab8RN6", r.take(ALNUM, 44)),
+    );
+    add(
+        "gitlab runner registration token",
+        format!("registration-token: {}{}", "GR1348941", r.take(ALNUM, 20)),
+    );
+    add(
+        "gitlab session cookie",
+        format!("Cookie: {}={}", "_gitlab_session", r.take(HEX, 32)),
+    );
+    add(
+        "gitlab incoming email token",
+        format!(
+            "reply_to = {}+acme-app-1234-{}-issue@gitlab.example.com",
+            "incoming",
+            r.take(ALNUM, 26)
+        ),
+    );
+    add(
+        "stripe prod key",
+        format!("STRIPE_KEY={}_{}", "sk_prod", r.take(ALNUM, 24)),
+    );
+    add(
+        "stripe restricted prod key",
+        format!("STRIPE_KEY={}_{}", "rk_prod", r.take(ALNUM, 24)),
+    );
+    add(
+        "slack legacy token",
+        format!(
+            "token={}-{}-{}-{}-{}",
+            "xoxo",
+            r.take("0123456789", 10),
+            r.take("0123456789", 10),
+            r.take("0123456789", 12),
+            r.take(HEX, 32)
+        ),
+    );
+    add(
+        "slack legacy workspace token",
+        format!("token={}-2-{}", "xoxr", r.take(ALNUM, 12)),
+    );
+    add(
+        "slack session token",
+        format!(
+            "d={}-{}-{}-{}-{}",
+            "xoxc",
+            r.take("0123456789", 11),
+            r.take("0123456789", 11),
+            r.take("0123456789", 12),
+            r.take(HEX, 64)
+        ),
+    );
+    add(
+        "slack session cookie",
+        format!(
+            "Cookie: d={}-{}%2F{}",
+            "xoxd",
+            r.take(ALNUM, 90),
+            r.take(ALNUM, 20)
+        ),
+    );
     v
 }
 
@@ -419,6 +527,18 @@ pub(super) fn benign() -> Vec<String> {
         format!("cache-key: {}-{}", r.take(LOWER, 8), r.take(HEX, 40)),
         "The scanner reads every added line and names the shape it found, never the value.".into(),
         "fn risk_score(task: &Task) -> u32 { task.disk_usage / 1024 }".into(),
+        // Lines from this checkout the table used to flag (measured
+        // 2026-11-14), fixed in DevCouncil cbd51369.
+        "fn npm_scan_reports_unreadable_files() {".into(),
+        "const MIN_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);".into(),
+        "    const token = ++latest;".into(),
+        "    log::warn!(\"leaked bearer token: {scrubbed}\");".into(),
+        format!("let url = format!(\"https://{{}}:{{}}@{{host}}/{{path}}\", user, {});", "token"),
+        // Near-misses of the DevCouncil b9b2314d shapes.
+        format!("let loader = {}_fixture_loader_for_payments();", "sk_test"),
+        format!("const view = {}_dashboardView;", "sk_live"),
+        format!("reply_to = {}+acme-app-1234-<your-token>-issue@gitlab.example.com", "incoming"),
+        format!("struct {}Config {{ region: String }}", "ABSK"),
     ]
 }
 
