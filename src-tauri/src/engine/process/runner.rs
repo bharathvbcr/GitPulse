@@ -630,6 +630,10 @@ pub(crate) struct BoundedRun {
     pub stderr: Vec<u8>,
     pub success: bool,
     pub status_code: i32,
+    /// The signal that ended the child, on Unix, when one did. `status_code`
+    /// is -1 for that death and for "no status at all" alike, so a caller that
+    /// must tell a crash from a deadline or a cancel reads this.
+    pub signal: Option<i32>,
     /// Why `stdout` is a prefix, when it is; `None` when it is the whole
     /// stream. Carried as a reason rather than a flag so no caller has to
     /// guess which of the two causes it is looking at.
@@ -1429,8 +1433,23 @@ fn run_admitted_inner(
             && status.is_some_and(|status| status.success())
             && !cancelled,
         status_code: status.and_then(|status| status.code()).unwrap_or(-1),
+        signal: terminating_signal(status),
         incomplete,
         stderr_incomplete,
         cancelled,
     })
+}
+
+/// The signal that ended a child, where the platform reports one.
+fn terminating_signal(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }

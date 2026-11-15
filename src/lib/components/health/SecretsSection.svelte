@@ -3,6 +3,7 @@
   import { invoke } from "../../ipc/invoke";
   import { parseSecretsReport, type SecretsReport } from "../../secrets/types";
   import { shouldCache } from "../../secrets/summary";
+  import { createScanJoin } from "../../runtime/autoScan";
 
   // Survives the per-tab remount so revisiting Health renders the last scan
   // instantly. Written by every scan that finishes, including one whose
@@ -19,22 +20,16 @@
    * new instance see no cache and start a second full Kingfisher scan beside
    * the first; now it joins the one already running.
    */
-  const inflightScans = new Map<string, Promise<SecretsReport>>();
+  const inflightScans = createScanJoin<SecretsReport>();
 
   function scanRepository(repoPath: string): Promise<SecretsReport> {
-    const running = inflightScans.get(repoPath);
-    if (running) return running;
-    const started = invoke<unknown>("cmd_scan_secrets", { repoPath })
-      .then((payload) => {
+    return inflightScans.run(repoPath, () =>
+      invoke<unknown>("cmd_scan_secrets", { repoPath }).then((payload) => {
         const next = parseSecretsReport(payload);
         if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
         return next;
-      })
-      .finally(() => {
-        if (inflightScans.get(repoPath) === started) inflightScans.delete(repoPath);
-      });
-    inflightScans.set(repoPath, started);
-    return started;
+      }),
+    );
   }
 </script>
 
@@ -70,6 +65,7 @@
     findingKey,
     groupSizes,
     isStale,
+    isSuperseded,
     locationChips,
     locationLabel,
     scopeNotes,
@@ -81,6 +77,14 @@
   import { formatError } from "../../ui/formatError";
   import { formatRelativeTime, plural } from "../../format";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
+  import {
+    activeScanBackoff,
+    clearScanFailure,
+    describeBackoff,
+    noteScanFailure,
+    scheduleAutoScan,
+    type AutoScanBackoff,
+  } from "../../runtime/autoScan";
   import { revealInFileManager } from "../../desktop/openInShell";
   import { toastStore } from "../../stores/toastStore";
 
@@ -161,25 +165,55 @@
     };
   });
 
+  /**
+   * An automatic scan waiting for this pane to settle (runtime/autoScan.ts).
+   * Any scan that starts, a click included, ends the wait: the wait is only
+   * for a scan nobody asked for.
+   */
+  let cancelPending: (() => void) | null = null;
+  let pending = $state(false);
+  /**
+   * The failure holding automatic scans off for this repository, when one is.
+   * It is printed, so a scan that could not complete never reads as a clean
+   * result or as "not scanned yet".
+   */
+  let held = $state<AutoScanBackoff | null>(null);
+  function stopPending() {
+    cancelPending?.();
+    cancelPending = null;
+    pending = false;
+  }
+
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
+    stopPending();
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
     errorMsg = null;
+    held = null;
+    const failureKey = `secrets:${repoPath}`;
     try {
       const next = await scanRepository(repoPath);
       if (!next.ok) recordFailure(scanFailureCopy(next));
+      // Per repository, not per pane: it must be recorded even when this pane
+      // was left before the scan returned. A scan a newer one replaced is
+      // neither a success nor a failure of this repository.
+      if (next.ok) clearScanFailure(failureKey);
+      else if (!isSuperseded(next)) noteScanFailure(failureKey, scanFailureCopy(next));
       if (!guard.isLive()) return;
       report = next;
+      held = next.ok ? null : activeScanBackoff(failureKey);
       nowMs = Date.now();
     } catch (err) {
+      noteScanFailure(failureKey, formatError(err));
       if (!guard.isLive()) return;
       // Keep the last report on screen: its age is printed beside it, and
       // the error says this refresh did not replace it.
       errorMsg = formatError(err);
+      held = activeScanBackoff(failureKey);
       recordFailure(errorMsg);
     } finally {
       // A cancelled scan must still release the spinner when nothing newer
@@ -201,13 +235,45 @@
     const cached = secretsCache.get(path);
     report = cached ?? null;
     errorMsg = null;
-    // First open of this repo, a scan already running for it, or a cached
-    // result old enough that rendering it as the answer would be stale: scan
-    // (joining the running one). A fresh cache is shown as-is, with its age.
+    held = null;
     untrack(() => {
-      if (!cached || inflightScans.has(path) || isStale(cached, Date.now())) void scan(path);
+      if (inflightScans.has(path)) {
+        // A scan is already running for this repository: join it now, it costs
+        // nothing to listen.
+        void scan(path);
+      } else if (!cached || isStale(cached, Date.now())) {
+        const hold = activeScanBackoff(`secrets:${path}`);
+        if (hold) {
+          // The last automatic scan failed a moment ago. Starting another would
+          // run the same scan into the same failure on every visit, so it waits
+          // out the interval; the failure is shown, and a click retries now.
+          held = hold;
+          errorMsg = hold.reason;
+          return;
+        }
+        // No result, or one too old to stand as the answer. Scanning is the
+        // expensive part, so it waits for the pane to stay put. A visit
+        // shorter than the settle starts nothing; a fresh cache is shown
+        // as-is, with its age, and starts nothing either.
+        pending = true;
+        cancelPending = scheduleAutoScan({
+          key: `secrets:${path}`,
+          stillNeeded: () => {
+            const latest = secretsCache.get(path);
+            if (latest && !isStale(latest, Date.now())) {
+              // A sibling pane finished it while this one waited.
+              report = latest;
+              stopPending();
+              return false;
+            }
+            return true;
+          },
+          run: () => void scan(path),
+        });
+      }
     });
     return () => {
+      stopPending();
       inflight?.cancel();
     };
   });
@@ -333,8 +399,13 @@
     </div>
   {/snippet}
 
+  {#if held}
+    <p class="text-meta text-textMuted" data-testid="secrets-backoff">{describeBackoff(held)}</p>
+  {/if}
   {#if !$repoStore.currentPath}
     <p class="text-textMuted">No repository open. Open one to scan its working tree with Kingfisher.</p>
+  {:else if pending && !report && !loading}
+    <p class="text-textMuted">The working-tree scan starts once you stay on this page. Rescan starts it now.</p>
   {:else if loading && !report}
     <!-- A full Kingfisher scan outlasts a second, so the wait is a skeleton;
          the spinner lives only inside the busy Rescan button above. -->

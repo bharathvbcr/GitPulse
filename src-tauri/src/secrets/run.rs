@@ -187,7 +187,22 @@ pub fn failed_report(reason: &str, version: Option<String>) -> SecretsReport {
 /// The one reason a non-success exit is reported with. A signal has no exit
 /// status on Unix (`code()` is `None`, carried as -1), and saying "exited
 /// with status -1" names a status that never existed.
-fn exit_reason(status: i32) -> String {
+///
+/// When the signal is known it is named, and a fault the scanner raised itself
+/// (SIGBUS, SIGSEGV, ...) is a crash, not a termination: a crash repeats on
+/// the same input, a termination does not, and the person reading the banner
+/// needs to know which they are looking at. A scan GitPulse stopped never gets
+/// here (it is reported as superseded first), nor does one that hit its
+/// deadline.
+fn exit_reason(status: i32, signal: Option<i32>) -> String {
+    if let Some(signal) = signal {
+        let name = signal_name(signal);
+        return if is_crash_signal(signal) {
+            format!("kingfisher crashed ({name})")
+        } else {
+            format!("kingfisher was stopped by {name} before it finished")
+        };
+    }
     if cfg!(unix) && status == -1 {
         "kingfisher was terminated before it finished".into()
     } else {
@@ -195,10 +210,56 @@ fn exit_reason(status: i32) -> String {
     }
 }
 
+/// Whether `signal` is one a process raises on itself by faulting, as opposed
+/// to one somebody sent it.
+fn is_crash_signal(signal: i32) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            signal,
+            libc::SIGBUS
+                | libc::SIGSEGV
+                | libc::SIGILL
+                | libc::SIGABRT
+                | libc::SIGFPE
+                | libc::SIGTRAP
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        false
+    }
+}
+
+fn signal_name(signal: i32) -> String {
+    #[cfg(unix)]
+    {
+        let known = [
+            (libc::SIGBUS, "SIGBUS"),
+            (libc::SIGSEGV, "SIGSEGV"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGTRAP, "SIGTRAP"),
+            (libc::SIGKILL, "SIGKILL"),
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGHUP, "SIGHUP"),
+            (libc::SIGPIPE, "SIGPIPE"),
+        ];
+        if let Some((_, name)) = known.iter().find(|(number, _)| *number == signal) {
+            return (*name).to_string();
+        }
+    }
+    format!("signal {signal}")
+}
+
 /// Map a finished child (any exit) into a report without retaining stdout,
 /// locating findings under `root` with `view`.
 pub(crate) fn report_from_run(
     status: i32,
+    signal: Option<i32>,
     stdout: &[u8],
     version: Option<String>,
     root: &Path,
@@ -206,7 +267,7 @@ pub(crate) fn report_from_run(
     facts: RunFacts,
 ) -> SecretsReport {
     if !SUCCESS_EXITS.contains(&status) {
-        return failed_report(&exit_reason(status), version);
+        return failed_report(&exit_reason(status, signal), version);
     }
     match parse_kingfisher_json(stdout, version.clone()) {
         Ok(envelope) => assemble(
@@ -225,6 +286,7 @@ pub(crate) fn report_from_run(
 pub fn report_from_exit(status: i32, stdout: &[u8], version: Option<String>) -> SecretsReport {
     report_from_run(
         status,
+        None,
         stdout,
         version,
         Path::new("/repo"),
@@ -427,14 +489,18 @@ pub fn scan_with_binary(
         stdout,
         stderr: _stderr,
         status_code,
+        signal,
         incomplete,
         cancelled,
         ..
     } = run;
 
     // Before the exit status: a cancelled child was killed by us, and its
-    // status (-1) is not something Kingfisher said.
-    if cancelled || ticket.superseded() {
+    // status (-1) is not something Kingfisher said. A child that died by a
+    // signal nobody here sent (`cancelled` is false) crashed before any newer
+    // scan could have mattered, so it is reported as that and not as
+    // superseded.
+    if cancelled || (ticket.superseded() && signal.is_none()) {
         return failed_report(SUPERSEDED, version);
     }
     if let Some(incomplete) = incomplete {
@@ -456,6 +522,7 @@ pub fn scan_with_binary(
 
     let mut report = report_from_run(
         status_code,
+        signal,
         &stdout,
         version.clone(),
         repo,
