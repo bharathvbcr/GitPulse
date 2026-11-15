@@ -169,7 +169,9 @@ export function main(argv = process.argv.slice(2)) {
     const { missing, unlisted, duplicated } = compare(expected, shards);
     const sizes = shards.map((shard) => shard.length).join(" + ");
     if (missing.length || unlisted.length || duplicated.length) {
-      for (const [label, ids] of [["not run by any shard", missing], ["run but not listed", unlisted], ["run by more than one shard", duplicated]]) {
+      /** @type {[string, string[]][]} */
+      const groups = [["not run by any shard", missing], ["run but not listed", unlisted], ["run by more than one shard", duplicated]];
+      for (const [label, ids] of groups) {
         if (ids.length) console.error(`FAIL: ${ids.length} test(s) ${label}:\n  ${ids.slice(0, 20).join("\n  ")}${ids.length > 20 ? `\n  … and ${ids.length - 20} more` : ""}`);
       }
       return 1;
