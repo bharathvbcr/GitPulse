@@ -201,6 +201,8 @@
       // or "throw" for a backend that could not answer.
       window.__gpClaudeStatus = { key_saved: false, account: null, account_error: null };
       localStorage.removeItem("gitpulse_ai_model");
+      // Host-load commands in the order the page made them.
+      window.__gpHostLoadCalls = [];
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "cmd_agent_defaults") return agentView();
@@ -268,7 +270,14 @@
           // Lappi reloads each time the Agents panel becomes active, so a null
           // answer here crashes the modal on the second visit.
           if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true, profile: "auto" };
-          if (cmd === "cmd_host_load_status") return hostLoadStatus;
+          if (cmd === "cmd_host_load_settings_save") {
+            window.__gpHostLoadCalls.push(`save:${args.settings.profile}`);
+            return args.settings;
+          }
+          if (cmd === "cmd_host_load_status") {
+            window.__gpHostLoadCalls.push("status");
+            return hostLoadStatus;
+          }
           if (cmd === "cmd_lappi_settings") {
             return {
               settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
@@ -385,7 +394,19 @@
           check("the policy card lists the operations the gate covers", ["commit", "push", "merge"].every((op) => agents.textContent.includes(op)));
           check("the scoped runner reads as guarded while connected", agents.textContent.includes("Scoped action runner") && agents.textContent.includes("Guarded"));
           check("the interactive shell is marked user only", agents.textContent.includes("Interactive shell") && agents.textContent.includes("User only"));
-          const externalHeadings = [...agents.querySelectorAll("h4")].filter((h) => h.textContent.trim() === "External CLIs");
+          // Choosing a resource profile saves it and then rereads the status, which is
+          // what restarts the profile reread's backoff (`refreshAfterChange`).
+          const profileSelect = agents.querySelector('[data-testid="host-load-profile"]');
+          check("Agents carries the resource profile choice", !!profileSelect);
+          if (profileSelect) {
+            window.__gpHostLoadCalls.length = 0;
+            profileSelect.value = "compact";
+            profileSelect.dispatchEvent(new Event("change", { bubbles: true }));
+            await until(() => window.__gpHostLoadCalls.includes("save:compact") && window.__gpHostLoadCalls.at(-1) === "status");
+            const calls = window.__gpHostLoadCalls;
+            check("choosing a profile saves it, then rereads the status", calls.indexOf("save:compact") >= 0 && calls.lastIndexOf("status") > calls.indexOf("save:compact"));
+          }
+          const externalHeadings =[...agents.querySelectorAll("h4")].filter((h) => h.textContent.trim() === "External CLIs");
           check("External CLIs renders exactly once", externalHeadings.length === 1);
           check("the model card lists the resolved local endpoint", document.getElementById("manvi-section-model").textContent.includes("llama3.2:3b"));
           check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1);

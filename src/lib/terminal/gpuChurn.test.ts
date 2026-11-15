@@ -7,6 +7,7 @@ import {
   GPU_CHURN_FORGIVE_AT,
   GPU_CHURN_WINDOW_MS,
   GPU_LOSS_BUDGET,
+  GPU_LOSS_FORGIVEN_MAX,
   GPU_RECOVER_DELAY_MS,
   type GpuAddon,
   type GpuSlots,
@@ -256,6 +257,13 @@ function transcript(slots: GpuSlots, seed: number, steps: number): string[] {
   return out;
 }
 
+/**
+ * Covers the pool's decisions only (take, idle, notify, trim) for a recorded
+ * sequence that never reaches the churn rates. It says nothing about the
+ * renderer: a loss while the page is creating contexts in a burst is forgiven
+ * on every tier, roomy included, which the base renderer did not do. That
+ * behaviour is tested below.
+ */
 describe("the roomy pool decides exactly as the pool that shipped", () => {
   for (const cap of [8, 3, 1]) {
     it(`(${cap}, ${cap}) matches the base pool for a recorded sequence, seed by seed`, () => {
@@ -327,6 +335,47 @@ describe("a loss the page's own churn caused is not the session's fault", () => 
       vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
       expect(renderer.state(), `after loss ${loss + 1}`).toBe("webgl");
     }
+  });
+
+  it("a session shown again within the recovery delay of a forgiven loss still waits out the delay", () => {
+    const slots = createGpuSlots(2, 8);
+    for (let n = 0; n < GPU_CHURN_FORGIVE_AT; n += 1) slots.noteCreated();
+    const { renderer, made } = sessions(slots);
+    renderer.sync(true);
+    made.at(-1)?.fireLoss();
+    expect(renderer.state()).toBe("reset");
+    const attached = made.length;
+    renderer.sync(false);
+    vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS / 2);
+    renderer.sync(true);
+    expect(made, "shown again inside the delay: no attach yet").toHaveLength(attached);
+    vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+    expect(made).toHaveLength(attached + 1);
+    expect(renderer.state()).toBe("webgl");
+  });
+
+  it("stops forgiving after GPU_LOSS_FORGIVEN_MAX losses: the next ones count and the session ends on the DOM renderer", () => {
+    const slots = createGpuSlots(2, 8);
+    for (let n = 0; n < GPU_CHURN_FORGIVE_AT; n += 1) slots.noteCreated();
+    const { renderer, made } = sessions(slots);
+    renderer.sync(true);
+    for (let loss = 0; loss < GPU_LOSS_FORGIVEN_MAX; loss += 1) {
+      made.at(-1)?.fireLoss();
+      expect(renderer.state(), `forgiven loss ${loss + 1}`).toBe("reset");
+      vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      expect(renderer.state()).toBe("webgl");
+    }
+    expect(slots.recentCreations(), "the page is still in its burst").toBeGreaterThanOrEqual(GPU_CHURN_FORGIVE_AT);
+    // The loss after the last forgiven one counts, and so does each after it.
+    for (let counted = 1; counted <= GPU_LOSS_BUDGET; counted += 1) {
+      made.at(-1)?.fireLoss();
+      expect(renderer.state(), `counted loss ${counted}`).toBe("reset");
+      vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      expect(renderer.state()).toBe("webgl");
+    }
+    made.at(-1)?.fireLoss();
+    expect(renderer.state()).toBe("lost");
+    expect(made.at(-1)?.disposed).toBe(1);
   });
 
   it("counts losses again once the burst has aged out, and earlier forgiven ones stay forgiven", () => {

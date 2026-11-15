@@ -97,8 +97,9 @@
       (up to 8, about 49 MB each), whatever you pick here. Only terminals that are out of sight are limited:
       the number allowed to keep theirs is
       {#if $resourceProfile}{$resourceProfile.budgets.gpu_contexts}{:else}this setting's limit{/if}
-      minus the terminals on screen, never below zero, and each is let go after a while. While you switch
-      terminals very quickly, hidden ones may keep theirs a little longer. It also sets how many repositories
+      minus the terminals on screen, never below zero, and each is let go after a while. While you
+      switch terminals quickly (about six new ones in a minute), hidden terminals keep theirs for the full
+      hold time (15 seconds, 1 minute or 5 minutes, by size), up to 8 in all, and the limit applies again once you slow down. It also sets how many repositories
       keep their commit graph.
       It never changes your session limits or scrollback. Automatic picks from this computer's memory.
       {#if $resourceProfile}{profileNote($resourceProfile)}{/if}

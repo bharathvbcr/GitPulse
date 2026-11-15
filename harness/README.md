@@ -589,3 +589,13 @@ node harness/runPage.mjs chrome /harness/appearance.html   # or: webkit
 
 `frame-rate.html` takes `?blur=<0..40>` to measure the float at a chosen blur radius
 the way Settings sets it (`--gp-float-blur`, or `data-float-blur="off"` at 0).
+
+## Slow-switching context bench
+
+`node scripts/churn-bench.mjs --tier compact|roomy --output idle|stream [--phases 20:600,30:600] [--out result.json]`
+runs `harness/churn-bench.html` in WebKit for twenty minutes by default. It is not part of `test:browser` or CI.
+One idle on-screen pane and five docks, on the real pool and hold of the chosen tier, switched at a human pace
+(a dock every 20 s for 10 minutes, then every 30 s for 10 minutes). It records each context creation and each
+loss the engine forced, with the pane it hit, and the idle pane's final renderer. Check the machine's load first
+(under 30), and run it with the page otherwise idle and with steady output into the shown dock. `--phases 2:16`
+is a smoke run.

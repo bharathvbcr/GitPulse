@@ -118,6 +118,13 @@ export const GPU_CHURN_FORGIVE_AT = 12;
  * Losses one session may have forgiven in the loss window. Forgiveness is for
  * a burst; a session that keeps losing while the page keeps creating is
  * counted again past this, so it cannot recover in a loop for ever.
+ *
+ * Deliberately looser than the old limit: a session that loses about 1.2 times
+ * a minute while the page stays at 12 or more creations a minute (this many
+ * forgiven losses plus the budget's worth of counted ones, per loss window) is
+ * never finalized, where the old limit of the budget alone ended a session that
+ * lost 0.4 times a minute. The page creating that fast is the cause the pool
+ * blames, and a finalized session draws on the slower DOM renderer for good.
  */
 export const GPU_LOSS_FORGIVEN_MAX = 3 * GPU_LOSS_BUDGET;
 
@@ -606,7 +613,7 @@ export function createGpuRenderer(deps: {
         }
         return state;
       }
-      if (state === "reset" && (losses.at(-1) ?? 0) + policy().recoverDelayMs > Date.now()) {
+      if (state === "reset" && lastLossAt + policy().recoverDelayMs > Date.now()) {
         if (!recoverTimer) scheduleRecover();
         return state;
       }
