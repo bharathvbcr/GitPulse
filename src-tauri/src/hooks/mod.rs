@@ -1378,6 +1378,12 @@ pub const BYPASS_PERMISSIONS: &str = "bypassPermissions";
 /// waived, and the sessions that hung this Mac on 2026-11-14 ran in bypass mode.
 /// A person turns it down in Settings → Agents → Host load → Command gate
 /// (Advise says the same thing and refuses nothing; Off says nothing).
+///
+/// The host is documented to enforce a hook `deny` in this mode: "A hook deny
+/// applies even in `bypassPermissions` mode."
+/// (`https://code.claude.com/docs/en/agent-sdk/permissions`, fetched 2026-11-15).
+/// That is the documentation only; it has not been exercised against a live
+/// bypass session.
 fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
     if input.permission_mode != BYPASS_PERMISSIONS {
         return output;

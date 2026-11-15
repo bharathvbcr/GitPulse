@@ -592,19 +592,14 @@ comment on `under_bypass` states the same exception. A person turns it down in
 **Settings → Agents → Host load → Command gate**: Advise gives the model the same
 text and refuses nothing, Off says nothing about load.
 
-Whether the host itself blocks a call on a hook `deny` in `bypassPermissions`
-mode is **not confirmed from the docs**. Read on 2026-11-15:
-`https://code.claude.com/docs/en/hooks` says only "`"deny"` prevents the tool
-call" and that "[d]eny and ask rules are still evaluated regardless of what the
-hook returns"; it never mentions `bypassPermissions` in connection with a hook
-decision (about 100,000 of its 293,529 characters were readable through the
-fetch, not all of it). `https://code.claude.com/docs/en/permission-modes` says
-"Deny rules block in every mode, including `bypassPermissions`", which is about
-permission rules, not hooks, and that no `PreToolUse` hook that returns
-`"allow"` approves a critical-path removal. It was not run against a live
-bypass session. If the host does not enforce a hook `deny` there, this
-feature's refusal is advice-only in bypass sessions, and the `additionalContext`
-and `systemMessage` it also carries are all that reach the model.
+The host enforces a hook `deny` in `bypassPermissions` mode. Confirmed by
+`https://code.claude.com/docs/en/agent-sdk/permissions` (fetched 2026-11-15):
+its numbered evaluation flow lists "1. Hooks" ahead of "4. Permission mode", and
+it says "A hook deny applies even in `bypassPermissions` mode." (The same page
+also says hooks "still execute and can block operations if needed" there.) That
+is the Agent SDK page; the hooks and permission-modes pages read the same day
+did not state it. This is documentation only: it was not exercised against a
+live bypass session.
 
 **The loop breaker.** The fifth refusal of the same command (compared trimmed)
 in one session inside ten minutes says "STOP: you are looping", tells the person
