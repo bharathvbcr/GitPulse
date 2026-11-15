@@ -161,6 +161,7 @@ fn a_board_that_changes_between_the_scan_and_the_write_is_scanned_again() {
         &task("gp-new", "Rebuild the exporter pipeline stages"),
         false,
         &[],
+        None,
         &mut racer,
     )
     .expect_err("the rescan finds the card that landed in between");
@@ -212,6 +213,7 @@ fn a_board_that_keeps_changing_is_reported_after_one_retry() {
         &task("gp-new", "Wholly unrelated card"),
         false,
         &[],
+        None,
         &mut racer,
     )
     .expect_err("the board moved under both attempts");
@@ -264,6 +266,7 @@ fn a_placement_with_no_scan_is_not_held_to_one() {
         false,
         2,
         Some(0),
+        None,
     ) else {
         panic!("a scan from before the first write must be stale");
     };
