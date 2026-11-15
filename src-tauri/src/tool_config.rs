@@ -665,13 +665,32 @@ impl HostLoadLeases {
         field(object, "wait_max_s", &mut leases.wait_max_s);
         field(object, "wait_hard_s", &mut leases.wait_hard_s);
         field(object, "incremental_off", &mut leases.incremental_off);
-        if let Some(problem) = leases.problem() {
+        // Validated one field at a time: a value out of range falls back to
+        // its own default and leaves the others as stored. (A block reset as
+        // a whole would turn leasing back on for `{"mode":"off","slots":12}`.)
+        let default = Self::default();
+        if !(1..=crate::sysload::lease::MAX_SLOTS).contains(&leases.slots) {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.slots {}: out of range", leases.slots);
+            leases.slots = default.slots;
+        }
+        if leases.wait_max_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.wait_max_s {}: too long", leases.wait_max_s);
+            leases.wait_max_s = default.wait_max_s;
+        }
+        if leases.wait_hard_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.wait_hard_s {}: too long", leases.wait_hard_s);
+            leases.wait_hard_s = default.wait_hard_s;
+        }
+        if leases.wait_hard_s < leases.wait_max_s {
             log::warn!(
                 target: "tool_config",
-                "ignoring an invalid host_load_leases ({problem}), keeping the defaults"
+                "host_load_leases.wait_hard_s {} is shorter than wait_max_s {}: raising it",
+                leases.wait_hard_s,
+                leases.wait_max_s
             );
-            return Self::default();
+            leases.wait_hard_s = default.wait_hard_s.max(leases.wait_max_s);
         }
+        debug_assert!(leases.problem().is_none());
         leases
     }
 
@@ -788,13 +807,26 @@ impl HostLoadIdle {
         }
         field(object, "idle_after_s", &mut idle.idle_after_s);
         field(object, "park_after_s", &mut idle.park_after_s);
-        if let Some(problem) = idle.problem() {
+        // One field at a time, as for the leases: a bad value costs only itself.
+        let default = Self::default();
+        if !(60..=MAX_LEASE_WAIT_S).contains(&idle.idle_after_s) {
+            log::warn!(target: "tool_config", "ignoring host_load_idle.idle_after_s {}: out of range", idle.idle_after_s);
+            idle.idle_after_s = default.idle_after_s;
+        }
+        if idle.park_after_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_idle.park_after_s {}: too long", idle.park_after_s);
+            idle.park_after_s = default.park_after_s;
+        }
+        if idle.park_after_s < idle.idle_after_s {
             log::warn!(
                 target: "tool_config",
-                "ignoring an invalid host_load_idle ({problem}), keeping the defaults"
+                "host_load_idle.park_after_s {} is shorter than idle_after_s {}: raising it",
+                idle.park_after_s,
+                idle.idle_after_s
             );
-            return Self::default();
+            idle.park_after_s = default.park_after_s.max(idle.idle_after_s);
         }
+        debug_assert!(idle.problem().is_none());
         idle
     }
 
@@ -2318,12 +2350,42 @@ mod tests {
         });
     }
 
+    /// `{"mode":"off","slots":12}` must not turn leasing back on: the bad slot
+    /// count falls back alone, and the other stored fields stand.
+    #[test]
+    fn an_out_of_range_field_resets_only_itself() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_leases":{"mode":"off","slots":12,"wait_max_s":600,"incremental_off":true},
+                    "host_load_idle":{"idle_after_s":120,"park_after_s":999999}}"#,
+            );
+            let leases = host_load_leases();
+            assert_eq!(leases.mode, LeaseMode::Off, "the stored mode stands");
+            assert_eq!(leases.slots, 4, "the bad count is its default");
+            assert_eq!(leases.wait_max_s, 600);
+            assert!(leases.incremental_off);
+            let idle = host_load_idle();
+            assert_eq!(idle.idle_after_s, 120, "the stored time stands");
+            assert_eq!(idle.park_after_s, 3_600, "the bad time is its default");
+            // A pair that contradicts itself keeps the stored first value and
+            // raises the second.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_leases":{"wait_max_s":20000,"wait_hard_s":100}}"#,
+            );
+            let leases = host_load_leases();
+            assert_eq!((leases.wait_max_s, leases.wait_hard_s), (20_000, 20_000));
+            assert_eq!(leases.problem(), None);
+        });
+    }
+
     #[test]
     fn a_bad_lease_or_idle_value_costs_only_itself_and_a_bad_save_is_refused() {
         with_temp_config(|path| {
-            // One field unreadable, one out of range: each keeps its default
-            // (or the whole block does when the combination is invalid), and
-            // the other settings in the file are untouched.
+            // One field unreadable, one out of range: each keeps its own
+            // default, and the other fields and settings in the file are
+            // untouched.
             write_raw(
                 path,
                 r#"{"version":1,"host_load":{"enabled":false},
@@ -2337,7 +2399,7 @@ mod tests {
             assert_eq!(
                 host_load_idle(),
                 HostLoadIdle::default(),
-                "an invalid block is all defaults"
+                "the one bad field falls back to its default"
             );
             assert!(!host_load_settings().enabled);
             write_raw(path, r#"{"version":1,"host_load_leases":[1,2]}"#);
