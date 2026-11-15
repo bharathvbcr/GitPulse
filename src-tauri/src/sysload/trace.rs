@@ -137,7 +137,13 @@ const R_OBSERVED_N: usize = 76;
 const R_FOREIGN: usize = 80;
 const R_LAUNCHED_FP: usize = 88;
 const R_SEGMENTS: usize = 96;
-// Bytes 100..104 stay spare. A record written before the feed existed has
+// Byte 100 is the exact binding when `R_BINDING` holds the nearest one an
+// older build knows (`Binding::wire`), else 0: such a build rejects a record
+// whose binding code it does not know, which would drop exactly the records
+// that explain a disk filling. The checksum covers it, so older builds still
+// validate the record.
+const R_BINDING_EXACT: usize = 100;
+// Bytes 101..104 stay spare. A record written before the feed existed has
 // zeros here and in the next 16 bytes, which read as "nothing dropped", so
 // the layout needs no version bump and an older build still validates a record
 // that carries them (its checksum covers 0..120).
@@ -302,7 +308,9 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
     b[R_PRESSURE] = r.pressure.map_or(NONE8, |l| l.kernel() as u8);
     b[R_TIER] = r.tier.map_or(NONE8, Tier::code);
     // 0 is "no binding", a real value; an unknowable binding is not stored.
-    b[R_BINDING] = Binding::code_of(r.binding);
+    let (base, exact) = Binding::wire_codes(r.binding);
+    b[R_BINDING] = base;
+    b[R_BINDING_EXACT] = exact;
     b[R_ADMIT] = r.admit.map_or(NONE8, u8::from);
     b[R_THERMAL] = r.thermal.map_or(NONE8, Thermal::code);
     b[R_POWER] = r.power.map_or(NONE8, |p| match p {
@@ -363,7 +371,7 @@ fn decode_record(b: &[u8]) -> Option<(u64, TraceRecord)> {
                 raw => Level::from_kernel(u32::from(raw)),
             },
             tier: Tier::of_code(b[R_TIER]),
-            binding: Binding::of_code(b[R_BINDING])?,
+            binding: Binding::of_wire(b[R_BINDING], b[R_BINDING_EXACT])?,
             admit: match b[R_ADMIT] {
                 0 => Some(false),
                 1 => Some(true),

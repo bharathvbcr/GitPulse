@@ -600,6 +600,18 @@ impl Default for HostLoadSettings {
 }
 
 impl HostLoadSettings {
+    /// These settings with the automatic disk floors worked out for this
+    /// machine's memory, so what a surface shows is what the governor decides
+    /// on. While the floors are automatic the numbers are not stored or read
+    /// back (`Thresholds::disk_auto`), so showing them costs nothing.
+    fn with_resolved_disk_floors(mut self) -> Self {
+        self.thresholds = self.thresholds.resolved(
+            crate::sysload::physical_memory()
+                .map_or(crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed), crate::sysload::Reading::Value),
+        );
+        self
+    }
+
     /// Whether the two switches are at their defaults: what decides whether
     /// the `host_load` block is written. The thresholds are stored apart.
     pub fn switches_default(&self) -> bool {
@@ -639,6 +651,27 @@ where
     S: serde::Serializer,
 {
     thresholds.to_stored().serialize(serializer)
+}
+
+/// Reads `host_load_disk_guard` one guard at a time
+/// ([`crate::sysload::DiskGuard::from_stored`]).
+fn lenient_disk_guard<'de, D>(deserializer: D) -> Result<crate::sysload::DiskGuard, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(crate::sysload::DiskGuard::from_stored(raw))
+}
+
+/// Writes only the guards that differ from their default.
+fn write_disk_guard<S>(
+    guard: &crate::sysload::DiskGuard,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    guard.to_stored().serialize(serializer)
 }
 
 /// Read leniently, like `lappi`: a malformed block keeps the default (on)
@@ -829,6 +862,16 @@ pub struct ToolConfig {
         skip_serializing_if = "is_default_hook_mode"
     )]
     pub host_load_hook_mode: HostLoadHookMode,
+    /// The disk fill-rate horizon and the coverage headroom, a sibling of
+    /// `host_load_thresholds` rather than inside it: a build that predates them
+    /// rewrites that key from the inputs it knows and would drop these.
+    #[serde(
+        default,
+        deserialize_with = "lenient_disk_guard",
+        serialize_with = "write_disk_guard",
+        skip_serializing_if = "crate::sysload::DiskGuard::is_default"
+    )]
+    pub host_load_disk_guard: crate::sysload::DiskGuard,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -852,6 +895,7 @@ impl Default for ToolConfig {
             host_load: HostLoadSettings::default(),
             host_load_thresholds: crate::sysload::Thresholds::default(),
             host_load_hook_mode: HostLoadHookMode::default(),
+            host_load_disk_guard: crate::sysload::DiskGuard::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1532,12 +1576,17 @@ pub fn set_verify_status(common_dir: &str, enabled: bool) -> Result<(), String> 
 /// read error is surfaced through [`view`].
 pub fn host_load_settings() -> HostLoadSettings {
     load()
-        .map(|cfg| HostLoadSettings {
-            thresholds: cfg.host_load_thresholds,
-            hook_mode: cfg.host_load_hook_mode,
-            ..cfg.host_load
+        .map(|cfg| {
+            let mut thresholds = cfg.host_load_thresholds;
+            thresholds.disk_guard = cfg.host_load_disk_guard;
+            HostLoadSettings {
+                thresholds,
+                hook_mode: cfg.host_load_hook_mode,
+                ..cfg.host_load
+            }
         })
         .unwrap_or_default()
+        .with_resolved_disk_floors()
 }
 
 /// What the `command-gate` hook does about load, or the default (enforce).
@@ -1561,6 +1610,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     }
     let mut cfg = load()?;
     cfg.host_load_thresholds = next.thresholds.clone();
+    cfg.host_load_disk_guard = next.thresholds.disk_guard;
     cfg.host_load_hook_mode = next.hook_mode;
     cfg.host_load = next;
     save(&cfg)?;

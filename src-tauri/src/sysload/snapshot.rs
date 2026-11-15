@@ -139,6 +139,17 @@ const OFF_X_SHED_BG: usize = 673;
 const OFF_X_SHED_REACTIVE: usize = 674;
 const OFF_X_SEG_TOTAL: usize = 676;
 const OFF_X_SEG_LIMIT: usize = 684;
+// Spare bytes of the version-2 extension, used without a version change: an
+// older reader hashes them with the rest of the block and reads nothing from
+// them. Zero (what every earlier writer left) means "not published".
+//
+// The exact binding when the byte at `OFF_X_BINDING` is the nearest one older
+// readers know (`Binding::wire`); 0 when that byte is the whole truth.
+const OFF_X_BINDING_EXACT: usize = 692;
+// How the disk fill rate reads: 0 not published, 1 a value, 2 not yet, 3 failed.
+const OFF_X_FILL_STATUS: usize = 693;
+// Bytes of free disk lost per minute, when `OFF_X_FILL_STATUS` is 1.
+const OFF_X_FILL_RATE: usize = 696;
 const OFF_X_CHECKSUM: usize = 704;
 
 // One status byte per reading: 0 is a value, else a `Why` code.
@@ -173,7 +184,8 @@ const _: () = assert!(OFF_WRITER_VERSION + VERSION_FIELD_LEN == OFF_WRITER_PATH)
 const _: () = assert!(OFF_WRITER_PATH + PATH_FIELD_LEN == OFF_STATUS);
 const _: () = assert!(S_MAX_TREE_WRATE < OFF_PRESSURE - OFF_STATUS);
 const _: () = assert!(OFF_SAMPLER_CPU + 8 == OFF_CHECKSUM);
-const _: () = assert!(OFF_X_SEG_LIMIT + 8 <= OFF_X_CHECKSUM);
+const _: () = assert!(OFF_X_SEG_LIMIT + 8 <= OFF_X_BINDING_EXACT);
+const _: () = assert!(OFF_X_FILL_RATE + 8 == OFF_X_CHECKSUM);
 const _: () = assert!(OFF_X_CHECKSUM + 8 == EXTENDED_LEN);
 
 const FLAG_ENABLED: u32 = 1;
@@ -272,6 +284,11 @@ pub struct Snapshot {
     pub memguard_pid: u32,
     pub orphans: u32,
     pub tick: TickStats,
+    /// Bytes of free disk lost per minute (`diskrate`), measured by the
+    /// writer, which alone holds the history: a reader with none (the hook, a
+    /// second GitPulse) still has the rate. Unsupported in a record that
+    /// predates it, or while the sensor is switched off.
+    pub disk_fill_rate: Reading<u64>,
     /// The app's held governor verdict (see [`PublishedVerdict`]). Pending on
     /// a writer's first tick, unsupported in a version-1 record or while the
     /// sensor is switched off.
@@ -308,6 +325,7 @@ impl Snapshot {
             memguard_pid: 0,
             orphans: 0,
             tick: TickStats::default(),
+            disk_fill_rate: Reading::default(),
             verdict: Reading::default(),
         }
     }
@@ -468,12 +486,26 @@ fn encode_extension(b: &mut [u8], snap: &Snapshot, seq: u64) {
         Reading::Value(v) => {
             b[OFF_X_VERDICT_STATUS] = 0;
             b[OFF_X_TIER] = v.tier.code();
-            b[OFF_X_BINDING] = Binding::code_of(v.binding);
+            // Older readers refuse a code they do not know and so read no
+            // verdict at all; they get the nearest binding they do know, and
+            // this build reads the exact one beside it.
+            let (base, exact) = Binding::wire_codes(v.binding);
+            b[OFF_X_BINDING] = base;
+            b[OFF_X_BINDING_EXACT] = exact;
             b[OFF_X_ADMIT] = u8::from(v.admit);
             b[OFF_X_SHED_BG] = u8::from(v.shed_background);
             b[OFF_X_SHED_REACTIVE] = u8::from(v.shed_reactive);
         }
         Reading::Unavailable(why) => b[OFF_X_VERDICT_STATUS] = why.code(),
+    }
+    match snap.disk_fill_rate {
+        Reading::Value(rate) => {
+            b[OFF_X_FILL_STATUS] = 1;
+            put_u64(b, OFF_X_FILL_RATE, rate);
+        }
+        Reading::Unavailable(Why::NotYet) => b[OFF_X_FILL_STATUS] = 2,
+        Reading::Unavailable(Why::Unreadable | Why::Failed) => b[OFF_X_FILL_STATUS] = 3,
+        Reading::Unavailable(Why::Unsupported) => b[OFF_X_FILL_STATUS] = 0,
     }
     let sum = ext_checksum(b, seq);
     put_u64(b, OFF_X_CHECKSUM, sum);
@@ -665,7 +697,7 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
     {
         return Err(SnapshotError::Torn);
     }
-    let (segments, verdict) = decode_extension(buf, version, length, seq)?;
+    let (segments, verdict, disk_fill_rate) = decode_extension(buf, version, length, seq)?;
     let flags = get_u32(buf, OFF_FLAGS);
     let platform = Platform::from_code((flags & FLAG_PLATFORM_MASK) >> FLAG_PLATFORM_SHIFT)
         .unwrap_or(Platform::Unavailable);
@@ -769,6 +801,7 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
             max_us: get_u32(buf, OFF_TICK_MAX),
             cpu_ns: get_u64(buf, OFF_SAMPLER_CPU),
         },
+        disk_fill_rate,
         verdict,
     })
 }
@@ -791,13 +824,20 @@ fn decode_extension(
     version: u32,
     length: usize,
     seq: u64,
-) -> Result<(Reading<CompressorSegments>, Reading<PublishedVerdict>), SnapshotError> {
+) -> Result<
+    (
+        Reading<CompressorSegments>,
+        Reading<PublishedVerdict>,
+        Reading<u64>,
+    ),
+    SnapshotError,
+> {
     if version < 2
         || length < EXTENDED_LEN
         || buf.len() < EXTENDED_LEN
         || buf[OFF_EXT..OFF_EXT + 4] != EXT_MAGIC
     {
-        return Ok((Reading::default(), Reading::default()));
+        return Ok((Reading::default(), Reading::default(), Reading::default()));
     }
     if get_u64(buf, OFF_X_CHECKSUM) != ext_checksum(buf, seq) {
         return Err(SnapshotError::Torn);
@@ -816,13 +856,19 @@ fn decode_extension(
         };
         Some(PublishedVerdict {
             tier: Tier::of_code(buf[OFF_X_TIER])?,
-            binding: Binding::of_code(buf[OFF_X_BINDING])?,
+            binding: Binding::of_wire(buf[OFF_X_BINDING], buf[OFF_X_BINDING_EXACT])?,
             admit: flag(OFF_X_ADMIT)?,
             shed_background: flag(OFF_X_SHED_BG)?,
             shed_reactive: flag(OFF_X_SHED_REACTIVE)?,
         })
     });
-    Ok((segments, verdict))
+    let fill = match buf[OFF_X_FILL_STATUS] {
+        1 => Reading::Value(get_u64(buf, OFF_X_FILL_RATE)),
+        2 => Reading::Unavailable(Why::NotYet),
+        3 => Reading::Unavailable(Why::Failed),
+        _ => Reading::default(),
+    };
+    Ok((segments, verdict, fill))
 }
 
 #[cfg(unix)]

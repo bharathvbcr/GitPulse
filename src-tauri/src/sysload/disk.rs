@@ -92,6 +92,33 @@ pub fn block_size(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Physical memory in bytes, read once: what the automatic disk floors scale
+/// with in a process that has no sensor sample to ask (Settings, the hook).
+/// `None` where it cannot be read.
+#[cfg(unix)]
+pub fn physical_memory() -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(|| {
+        // SAFETY: sysconf has no memory preconditions.
+        let (pages, page) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        let bytes = u64::try_from(pages)
+            .ok()?
+            .checked_mul(u64::try_from(page).ok()?)?;
+        (bytes > 0).then_some(bytes)
+    })
+}
+
+/// Windows has no reader here: the automatic floors are the fixed ones.
+#[cfg(not(unix))]
+pub fn physical_memory() -> Option<u64> {
+    None
+}
+
 /// Windows has no reader here: unknown, so nothing is skipped on a guess.
 #[cfg(not(unix))]
 pub fn free_bytes(_path: &Path) -> Reading<u64> {

@@ -88,6 +88,148 @@ pub struct ModeRule {
     pub mode: InputMode,
 }
 
+/// How soon the disk is projected to reach its severe floor, as a mode and two
+/// horizons in minutes. A projection under `elevated_within_min` is elevated and
+/// under `severe_within_min` severe, so `severe_within_min <= elevated_within_min`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HorizonRule {
+    pub mode: InputMode,
+    pub elevated_within_min: f64,
+    pub severe_within_min: f64,
+}
+
+/// The free space a coverage build needs before it starts, in GiB, and what the
+/// command gate does about a build that starts without it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HeadroomRule {
+    pub mode: InputMode,
+    pub headroom_gib: f64,
+}
+
+/// The disk guards that are not one level threshold: the fill-rate horizon and
+/// the coverage headroom. Stored apart from `host_load_thresholds` (see
+/// `tool_config`): a build that predates them rewrites that key from the inputs
+/// it knows, and would drop these.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiskGuard {
+    pub fill: HorizonRule,
+    pub coverage: HeadroomRule,
+}
+
+impl Default for DiskGuard {
+    fn default() -> Self {
+        Self {
+            fill: HorizonRule {
+                mode: InputMode::Refuse,
+                elevated_within_min: 30.0,
+                severe_within_min: 10.0,
+            },
+            coverage: HeadroomRule {
+                mode: InputMode::Refuse,
+                headroom_gib: 60.0,
+            },
+        }
+    }
+}
+
+impl DiskGuard {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Reads a stored block one guard at a time: one that cannot be read or is
+    /// invalid keeps its default, with a warning, and costs the other nothing.
+    pub fn from_stored(raw: serde_json::Value) -> Self {
+        let mut out = Self::default();
+        let serde_json::Value::Object(map) = raw else {
+            log::warn!(
+                target: "tool_config",
+                "ignoring unreadable host_load_disk_guard block, both guards keep their defaults"
+            );
+            return out;
+        };
+        if let Some(value) = map.get("fill") {
+            match serde_json::from_value::<HorizonRule>(value.clone()) {
+                Ok(rule) if fill_problem(&rule).is_none() => out.fill = rule,
+                Ok(rule) => log::warn!(
+                    target: "tool_config",
+                    "ignoring invalid host_load_disk_guard.fill, it keeps its default: {}",
+                    fill_problem(&rule).unwrap_or_default()
+                ),
+                Err(error) => log::warn!(
+                    target: "tool_config",
+                    "ignoring unreadable host_load_disk_guard.fill, it keeps its default: {error}"
+                ),
+            }
+        }
+        if let Some(value) = map.get("coverage") {
+            match serde_json::from_value::<HeadroomRule>(value.clone()) {
+                Ok(rule) if coverage_problem(&rule).is_none() => out.coverage = rule,
+                Ok(rule) => log::warn!(
+                    target: "tool_config",
+                    "ignoring invalid host_load_disk_guard.coverage, it keeps its default: {}",
+                    coverage_problem(&rule).unwrap_or_default()
+                ),
+                Err(error) => log::warn!(
+                    target: "tool_config",
+                    "ignoring unreadable host_load_disk_guard.coverage, it keeps its default: {error}"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Only what differs from the default, so a later build that changes a
+    /// default reaches a person who never chose a value.
+    pub fn to_stored(&self) -> serde_json::Map<String, serde_json::Value> {
+        let base = Self::default();
+        let mut out = serde_json::Map::new();
+        if self.fill != base.fill {
+            if let Ok(value) = serde_json::to_value(self.fill) {
+                out.insert("fill".to_string(), value);
+            }
+        }
+        if self.coverage != base.coverage {
+            if let Ok(value) = serde_json::to_value(self.coverage) {
+                out.insert("coverage".to_string(), value);
+            }
+        }
+        out
+    }
+}
+
+/// The longest horizon that can be set: a week.
+const MAX_HORIZON_MIN: f64 = 10_080.0;
+
+fn fill_problem(rule: &HorizonRule) -> Option<String> {
+    let (elevated, severe) = (rule.elevated_within_min, rule.severe_within_min);
+    if !elevated.is_finite() || !severe.is_finite() {
+        return Some("disk_fill: horizons must be finite numbers".to_string());
+    }
+    if elevated <= 0.0 || severe <= 0.0 || elevated > MAX_HORIZON_MIN || severe > MAX_HORIZON_MIN {
+        return Some(format!(
+            "disk_fill: horizons must be above 0 and at most {MAX_HORIZON_MIN} minutes"
+        ));
+    }
+    if severe > elevated {
+        return Some(
+            "disk_fill: the severe horizon must not be longer than the elevated one".to_string(),
+        );
+    }
+    None
+}
+
+fn coverage_problem(rule: &HeadroomRule) -> Option<String> {
+    let gib = rule.headroom_gib;
+    if !gib.is_finite() || gib <= 0.0 || gib > MAX_DISK_GIB {
+        return Some(format!(
+            "coverage: the headroom must be above 0 and at most {MAX_DISK_GIB} GiB"
+        ));
+    }
+    None
+}
+
 /// Every input's rule. A missing input reads as its default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -100,8 +242,16 @@ pub struct Thresholds {
     pub load: Rule,
     pub thermal: ModeRule,
     pub battery: ModeRule,
-    /// Free disk, in GiB; lower is worse.
+    /// Free disk, in GiB; lower is worse. While `disk_auto` the two numbers
+    /// are not read: the floors follow physical memory ([`auto_disk_floors`]).
     pub disk: Rule,
+    /// Whether the disk floors are the automatic ones, which scale with
+    /// physical memory because swap shares the free-space pool. A person who
+    /// sets a number turns it off; their numbers then win, always.
+    pub disk_auto: bool,
+    /// The disk guards beyond the level: the fill-rate horizon and the
+    /// coverage headroom.
+    pub disk_guard: DiskGuard,
 }
 
 impl Default for Thresholds {
@@ -130,11 +280,31 @@ impl Default for Thresholds {
             },
             disk: Rule {
                 mode: InputMode::Refuse,
-                elevated_at: 20.0,
-                severe_at: 10.0,
+                elevated_at: DISK_ELEVATED_FLOOR_GIB,
+                severe_at: DISK_SEVERE_FLOOR_GIB,
             },
+            disk_auto: true,
+            disk_guard: DiskGuard::default(),
         }
     }
+}
+
+/// The least the automatic disk floors ever are, in GiB, and what they are
+/// when physical memory cannot be read.
+pub const DISK_ELEVATED_FLOOR_GIB: f64 = 20.0;
+pub const DISK_SEVERE_FLOOR_GIB: f64 = 10.0;
+
+/// The automatic disk floors `(elevated, severe)` in GiB for a machine with
+/// `memsize` bytes of memory: swap files share the free-space pool with user
+/// data, so a fixed 10 GiB leaves a 64 GiB Mac with less free than it may swap.
+/// Severe is a quarter of memory and elevated a half, never below the fixed
+/// floors, which are also what an unreadable memory size gets.
+pub fn auto_disk_floors(memsize: Option<u64>) -> (f64, f64) {
+    let ram_gib = memsize.filter(|m| *m > 0).map_or(0.0, |m| m as f64 / GIB);
+    (
+        (ram_gib / 2.0).clamp(DISK_ELEVATED_FLOOR_GIB, MAX_DISK_GIB),
+        (ram_gib / 4.0).clamp(DISK_SEVERE_FLOOR_GIB, MAX_DISK_GIB),
+    )
 }
 
 /// The inputs in the order their stored keys are written and read.
@@ -176,15 +346,33 @@ fn rule_problem(name: &str, rule: &Rule, max: f64, lower_is_worse: bool) -> Opti
 }
 
 impl Thresholds {
+    /// Whether nothing is stored for the inputs `host_load_thresholds` holds.
+    /// The disk guards are stored apart ([`DiskGuard::to_stored`]).
     pub fn is_default(&self) -> bool {
-        *self == Self::default()
+        self.to_stored().is_empty()
+    }
+
+    /// These thresholds with the automatic disk floors worked out for a
+    /// machine with `memsize` bytes of memory. What a surface that has no
+    /// readings (Settings) shows, and what the pure path decides on.
+    pub fn resolved(&self, memsize: Reading<u64>) -> Self {
+        let mut out = self.clone();
+        if self.disk_auto {
+            let (elevated, severe) = auto_disk_floors(memsize.value());
+            out.disk.elevated_at = elevated;
+            out.disk.severe_at = severe;
+        }
+        out
     }
 
     /// The first problem with any rule, or `None`. Used by the save path so a
     /// bad value is refused with a reason; a stored one is read leniently
     /// ([`Thresholds::from_stored`]).
     pub fn problem(&self) -> Option<String> {
-        self.problems().into_iter().next()
+        self.problems()
+            .into_iter()
+            .chain(self.guard_problems())
+            .next()
     }
 
     fn problems(&self) -> Vec<String> {
@@ -192,7 +380,23 @@ impl Thresholds {
             rule_problem("swap", &self.swap, MAX_SWAP_RATIO, false),
             rule_problem("compressor_segments", &self.compressor_segments, 1.0, false),
             rule_problem("load", &self.load, MAX_LOAD_PER_CPU, false),
-            rule_problem("disk", &self.disk, MAX_DISK_GIB, true),
+            // Automatic floors are never read from `disk`, so what it holds
+            // then cannot be wrong.
+            if self.disk_auto {
+                None
+            } else {
+                rule_problem("disk", &self.disk, MAX_DISK_GIB, true)
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn guard_problems(&self) -> Vec<String> {
+        [
+            fill_problem(&self.disk_guard.fill),
+            coverage_problem(&self.disk_guard.coverage),
         ]
         .into_iter()
         .flatten()
@@ -223,7 +427,13 @@ impl Thresholds {
                 "load" => serde_json::from_value(value.clone()).map(|r| candidate.load = r),
                 "thermal" => serde_json::from_value(value.clone()).map(|r| candidate.thermal = r),
                 "battery" => serde_json::from_value(value.clone()).map(|r| candidate.battery = r),
-                _ => serde_json::from_value(value.clone()).map(|r| candidate.disk = r),
+                _ => serde_json::from_value(value.clone()).map(|r| {
+                    candidate.disk = r;
+                    // A value stored before the floors scaled has no `auto`:
+                    // a person set it, so it stays theirs.
+                    candidate.disk_auto = value.get("auto").and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                }),
             };
             if let Err(error) = parsed {
                 log::warn!(
@@ -284,11 +494,29 @@ impl Thresholds {
             self.battery != base.battery,
             serde_json::to_value(self.battery),
         );
-        put(
-            "disk",
-            self.disk != base.disk,
-            serde_json::to_value(self.disk),
-        );
+        // Automatic floors store only a changed mode, with the fixed numbers
+        // a build that predates them reads, and `auto` so this one does not
+        // take them for a choice. Floors a person set are always stored, even
+        // when they equal the old defaults: on a large Mac those are not the
+        // automatic ones.
+        let disk = if self.disk_auto {
+            (self.disk.mode != base.disk.mode).then(|| {
+                serde_json::to_value(Rule {
+                    mode: self.disk.mode,
+                    elevated_at: DISK_ELEVATED_FLOOR_GIB,
+                    severe_at: DISK_SEVERE_FLOOR_GIB,
+                })
+                .map(|mut value| {
+                    value["auto"] = serde_json::Value::Bool(true);
+                    value
+                })
+            })
+        } else {
+            Some(serde_json::to_value(self.disk))
+        };
+        if let Some(Ok(value)) = disk {
+            out.insert("disk".to_string(), value);
+        }
         out
     }
 }
@@ -305,6 +533,10 @@ pub struct Readings {
     pub power: Reading<Power>,
     pub free_disk: Reading<u64>,
     pub segments: Reading<CompressorSegments>,
+    /// Bytes of free disk lost per minute, as the writer's tracker measured it
+    /// (`diskrate`): not part of a host sample, because one sample cannot have
+    /// a rate. `NotYet` while the tracker warms up or after a gap.
+    pub disk_fill: Reading<u64>,
 }
 
 impl Readings {
@@ -318,6 +550,7 @@ impl Readings {
             power: host.power,
             free_disk: host.free_disk,
             segments: host.compressor_segments,
+            disk_fill: Reading::default(),
         }
     }
 
@@ -342,6 +575,7 @@ impl Readings {
                 total: 1,
                 limit: 100,
             }),
+            disk_fill: Reading::Value(0),
         }
     }
 
@@ -432,10 +666,75 @@ fn low_tier(value: f64, rule: &Rule) -> Tier {
     }
 }
 
+/// A fall slower than this is noise, not a trend worth a projection.
+const MIN_FILL_BYTES_PER_MIN: u64 = 256 << 20;
+
+/// Where the disk is heading: the rate it loses space at and how long that
+/// leaves before the severe floor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct DiskFill {
+    /// Bytes of free space lost per minute.
+    pub rate_bytes_per_min: u64,
+    /// Minutes until free space reaches the severe floor at that rate; 0 when
+    /// it is there already.
+    pub eta_min: f64,
+    pub free_bytes: u64,
+    pub floor_bytes: u64,
+    /// The tier the projection alone reaches, before the rule's mode caps it.
+    pub tier: Tier,
+}
+
 impl Thresholds {
+    /// The projection from the writer's measured rate, for these (already
+    /// resolved) thresholds. `Ok(None)` when the disk is not falling fast
+    /// enough to project.
+    fn fill_projection(&self, readings: &Readings) -> Result<Option<DiskFill>, Gap> {
+        let rate = value_or_gap(readings.disk_fill)?;
+        let free = value_or_gap(readings.free_disk)?;
+        if rate < MIN_FILL_BYTES_PER_MIN {
+            return Ok(None);
+        }
+        let floor = self.disk.severe_at * GIB;
+        let eta_min = if (free as f64) <= floor {
+            0.0
+        } else {
+            (free as f64 - floor) / rate as f64
+        };
+        let guard = &self.disk_guard.fill;
+        let tier = if eta_min < guard.severe_within_min {
+            Tier::Severe
+        } else if eta_min < guard.elevated_within_min {
+            Tier::Elevated
+        } else {
+            Tier::Clear
+        };
+        Ok(Some(DiskFill {
+            rate_bytes_per_min: rate,
+            eta_min,
+            free_bytes: free,
+            floor_bytes: floor as u64,
+            tier,
+        }))
+    }
+
+    /// What Health shows of the fill rule: the projection, when the rule is on
+    /// and the projection is at least elevated.
+    pub fn disk_fill(&self, readings: &Readings) -> Option<DiskFill> {
+        if self.disk_guard.fill.mode == InputMode::Off {
+            return None;
+        }
+        self.resolved(readings.memsize)
+            .fill_projection(readings)
+            .ok()
+            .flatten()
+            .filter(|fill| fill.tier >= Tier::Elevated)
+    }
+
     /// Each input's tier (capped by its mode) and the warnings for inputs
     /// that are governed on but unreadable. Pure.
     pub fn assess(&self, readings: &Readings) -> Assessment {
+        let resolved = self.resolved(readings.memsize);
+        let this = &resolved;
         let mut out = Assessment::default();
         let mut take = |binding: Binding, mode: InputMode, label: &str, tier: Result<Tier, Gap>| {
             if mode == InputMode::Off {
@@ -468,9 +767,16 @@ impl Thresholds {
         );
         take(
             Binding::LowDisk,
-            self.disk.mode,
+            this.disk.mode,
             "free disk space",
-            readings.free_gib().map(|v| low_tier(v, &self.disk)),
+            readings.free_gib().map(|v| low_tier(v, &this.disk)),
+        );
+        take(
+            Binding::DiskFilling,
+            this.disk_guard.fill.mode,
+            "the disk fill rate",
+            this.fill_projection(readings)
+                .map(|fill| fill.map_or(Tier::Clear, |fill| fill.tier)),
         );
         take(
             Binding::Thermal,
@@ -552,10 +858,40 @@ impl Thresholds {
                     crossing(per_cpu >= at, format!("{at:.2}"))
                 )
             }
+            Binding::DiskFilling => {
+                let this = self.resolved(readings.memsize);
+                let horizon = match held {
+                    Tier::Severe => this.disk_guard.fill.severe_within_min,
+                    _ => this.disk_guard.fill.elevated_within_min,
+                };
+                let Some(fill) = this.fill_projection(readings).ok().flatten() else {
+                    return Some(
+                        "free disk space is no longer falling fast enough to project, held until it stays clear"
+                            .to_string(),
+                    );
+                };
+                let (free, floor) = (
+                    fill.free_bytes as f64 / GIB,
+                    fill.floor_bytes as f64 / GIB,
+                );
+                let rate = fill.rate_bytes_per_min as f64 / GIB;
+                let verdict = if fill.eta_min < horizon {
+                    format!("inside the {horizon:.0} minute horizon")
+                } else {
+                    format!(
+                        "now outside the {horizon:.0} minute horizon, held until it stays clear"
+                    )
+                };
+                format!(
+                    "free disk space is {free:.1} GiB and falling by {rate:.1} GiB a minute, about {:.0} minutes until the {floor:.0} GiB floor, {verdict}",
+                    fill.eta_min
+                )
+            }
             Binding::LowDisk => {
+                let this = self.resolved(readings.memsize);
                 let at = match held {
-                    Tier::Severe => self.disk.severe_at,
-                    _ => self.disk.elevated_at,
+                    Tier::Severe => this.disk.severe_at,
+                    _ => this.disk.elevated_at,
                 };
                 let free = readings.free_gib().ok()?;
                 let verdict = if free < at {

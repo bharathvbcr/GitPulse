@@ -14,6 +14,7 @@
 //! switch on and ends on the tick that sees it off. Either request failing is
 //! recorded in the status, not hidden.
 
+use super::diskrate::FillTracker;
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
@@ -438,6 +439,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
     let mut trend = CompressorTrend::default();
+    // The free-space history behind the disk fill rate. Only the writer keeps
+    // one; its rate rides in the snapshot for everyone else.
+    let mut fill_tracker = FillTracker::default();
     let mut writer: Option<Writer> = None;
     let identity = own_identity();
     let cadence = options.cadence.max(Duration::from_millis(10));
@@ -520,11 +524,16 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 if enabled {
                     let view = scanner.scan(&ScanContext::here());
                     fill(&mut snap, &mut sensor, &mut trend, &view);
+                    let at_ms = snap.written.mono_ns / 1_000_000;
+                    fill_tracker.observe(snap.written.boot_id, at_ms, snap.host.free_disk);
+                    snap.disk_fill_rate = fill_tracker.rate(at_ms);
                     procs = Some(view);
                 } else {
                     // Off is not calm: the next run starts its thrash count
-                    // from nothing rather than from samples hours old.
+                    // and its free-space history from nothing rather than from
+                    // samples hours old.
                     trend = CompressorTrend::default();
+                    fill_tracker.reset();
                 }
                 snap.tick = tick;
                 // The verdict the previous tick's count produced (pending on

@@ -54,7 +54,7 @@
 //! override.
 
 use super::disk::LowDisk;
-use super::thresholds::{Readings, Thresholds};
+use super::thresholds::{DiskFill, Readings, Thresholds};
 use super::{Level, Platform, SensorReport, SensorState, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -84,6 +84,10 @@ pub enum Binding {
     Swap,
     /// Free disk space on the volume holding GitPulse's state.
     LowDisk,
+    /// Free disk space is falling fast enough to reach the severe floor within
+    /// the horizon (`diskrate`, the `disk_fill` rule). Published to older
+    /// readers as [`Binding::LowDisk`]; see [`Binding::wire`].
+    DiskFilling,
     /// `NSProcessInfo.thermalState`.
     Thermal,
     /// The 1-minute load average per logical CPU.
@@ -106,6 +110,7 @@ impl Binding {
             Some(Self::Thermal) => 6,
             Some(Self::CpuLoad) => 7,
             Some(Self::Battery) => 8,
+            Some(Self::DiskFilling) => 9,
         }
     }
 
@@ -122,8 +127,64 @@ impl Binding {
             6 => Some(Self::Thermal),
             7 => Some(Self::CpuLoad),
             8 => Some(Self::Battery),
+            9 => Some(Self::DiskFilling),
             _ => return None,
         })
+    }
+
+    /// The binding a build that predates this one understands this as. Such a
+    /// reader refuses a code it does not know by treating the whole published
+    /// verdict as unreadable, which for the command gate means "not
+    /// load-checked" and no refusal: the very moment the disk is filling would
+    /// be the one the installed hook stopped protecting. So the byte every
+    /// version reads carries this, and the exact binding rides beside it
+    /// ([`Binding::of_wire`]).
+    pub(super) fn wire(self) -> Self {
+        match self {
+            Self::DiskFilling => Self::LowDisk,
+            other => other,
+        }
+    }
+
+    /// The pair stored for `binding`: the byte every version reads, and a byte
+    /// that is 0 unless that one is not the whole truth.
+    pub(super) fn wire_codes(binding: Option<Self>) -> (u8, u8) {
+        let base = Self::code_of(binding.map(Self::wire));
+        match binding {
+            Some(exact) if exact.wire() != exact => (base, Self::code_of(Some(exact))),
+            _ => (base, 0),
+        }
+    }
+
+    /// The binding a stored pair names: the detail byte when this build knows
+    /// it, otherwise what the base byte says. `None` only when the base byte is
+    /// one this build does not know.
+    pub(super) fn of_wire(base: u8, detail: u8) -> Option<Option<Self>> {
+        let general = Self::of_code(base)?;
+        if detail == 0 {
+            return Some(general);
+        }
+        Some(match Self::of_code(detail) {
+            Some(exact @ Some(_)) => exact,
+            _ => general,
+        })
+    }
+
+    /// What is wrong, as the end of a sentence about work that is shed or
+    /// refused: "background work is shed while {this}". Names the cause the
+    /// verdict names, never memory pressure for a disk or a swap.
+    pub fn cause_phrase(self) -> &'static str {
+        match self {
+            Self::MemoryPressure => "the kernel reports memory pressure",
+            Self::CompressorThrash => "the memory compressor is thrashing",
+            Self::CompressorSegments => "the memory compressor is nearly out of segments",
+            Self::Swap => "swap in use is above GitPulse's limit for it",
+            Self::LowDisk => "free disk space is below GitPulse's floor",
+            Self::DiskFilling => "free disk space is falling fast toward GitPulse's floor",
+            Self::Thermal => "the Mac is thermally throttled",
+            Self::CpuLoad => "the CPU load average is above GitPulse's limit for it",
+            Self::Battery => "the Mac is running on battery",
+        }
     }
 }
 
@@ -190,6 +251,19 @@ impl Reason {
 pub struct Shed {
     pub background: bool,
     pub reactive: bool,
+    /// What put the host in the tier that sheds: the binding of the verdict.
+    /// `None` when nothing is shed. A caller that says why it refused reads
+    /// this rather than assuming memory.
+    pub cause: Option<Binding>,
+}
+
+impl Shed {
+    /// [`Binding::cause_phrase`] of the cause, for the sentence a refusal
+    /// says. Memory pressure when no cause was recorded: the only cause a
+    /// verdict published before causes were carried could have had.
+    pub fn cause_phrase(&self) -> &'static str {
+        self.cause.unwrap_or(Binding::MemoryPressure).cause_phrase()
+    }
 }
 
 /// What the governor decides from, copied out of a sensor report so the
@@ -240,7 +314,10 @@ impl Input {
                 .map(|d| d.swapouts_pressure),
             largest_foreign: snapshot.and_then(|s| s.largest_foreign.value()),
             govern_launches,
-            readings: snapshot.map_or_else(Readings::default, |s| Readings::of(&s.host)),
+            readings: snapshot.map_or_else(Readings::default, |s| Readings {
+                disk_fill: s.disk_fill_rate,
+                ..Readings::of(&s.host)
+            }),
             thresholds,
         }
     }
@@ -453,7 +530,11 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
                 ),
                 warnings,
             );
-            verdict.shed.background = true;
+            verdict.shed = Shed {
+                background: true,
+                reactive: false,
+                cause: Some(binding),
+            };
             verdict
         }
         Tier::Severe => {
@@ -481,6 +562,7 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
             verdict.shed = Shed {
                 background: true,
                 reactive: true,
+                cause: Some(binding),
             };
             verdict
         }
@@ -690,8 +772,15 @@ impl Governor {
             .refusing_since
             .filter(|_| refusing)
             .map(|since| now.saturating_duration_since(since));
+        let disk_fill = self.last.as_ref().and_then(|(_, input)| {
+            input
+                .thresholds
+                .disk_fill(&input.readings)
+                .filter(|_| input.state.governs())
+        });
         GovernorReport {
             verdict,
+            disk_fill,
             refusing_for_s: refusing_for.map(|d| d.as_secs()),
             notice: self.noticed && refusing,
             largest_foreign: self
@@ -708,6 +797,11 @@ impl Governor {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GovernorReport {
     pub verdict: GovernorVerdict,
+    /// Where the disk is heading, while the fill-rate rule is on and the
+    /// projection is at least elevated: its rate and the minutes it leaves
+    /// before the severe floor. Shown even when the rule's mode keeps it from
+    /// binding, so a person sees the fall that is not being acted on.
+    pub disk_fill: Option<DiskFill>,
     /// Seconds of continuous pressure refusal, `None` when not refusing.
     pub refusing_for_s: Option<u64>,
     /// Refusal has run past [`REFUSAL_NOTICE_AFTER`]: tell the person.
@@ -725,6 +819,7 @@ impl GovernorReport {
     /// The report of a process that does not govern.
     fn ungoverned() -> Self {
         Self {
+            disk_fill: None,
             verdict: GovernorVerdict {
                 admit: true,
                 shed: Shed::default(),
@@ -1102,6 +1197,10 @@ fn governed_report() -> GovernorReport {
 /// Which of the spawn gate's classes to refuse right now. The gate asks this
 /// per spawn, so it takes one short lock and does no IO.
 pub fn shed() -> Shed {
+    shed_now()
+}
+
+fn shed_now() -> Shed {
     let now = Instant::now();
     #[cfg(test)]
     if let Some(shed) =
@@ -1118,6 +1217,14 @@ pub fn shed() -> Shed {
             .verdict(now)
             .shed
     })
+}
+
+/// What put the host in the tier that sheds, or `None` when nothing is shed.
+/// The same verdict [`shed`] answers from, for a caller that says why it
+/// refused and has no business scheduling by it (`tests/governor_sites.rs`
+/// pins [`shed`] to the spawn gate).
+pub fn shed_cause() -> Option<Binding> {
+    shed_now().cause
 }
 
 /// A person's "Admit anyway": launches pass for [`OVERRIDE_WINDOW`]. Only the

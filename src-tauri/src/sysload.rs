@@ -38,6 +38,7 @@
 //! [`Platform`].
 
 mod disk;
+mod diskrate;
 mod governor;
 mod probe;
 pub(crate) mod procscan;
@@ -47,13 +48,18 @@ mod snapshot;
 mod thresholds;
 mod trace;
 
-pub use thresholds::{InputMode, ModeRule, Readings, Rule, Thresholds};
+pub use thresholds::{
+    auto_disk_floors, DiskFill, DiskGuard, HeadroomRule, HorizonRule, InputMode, ModeRule,
+    Readings, Rule, Thresholds,
+};
 pub use trace::{PreviousBoot, TracePeaks, TraceRecord};
 
-pub use disk::{block_size, free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
+pub use disk::{
+    block_size, free_bytes, physical_memory, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR,
+};
 pub use governor::{
     admit, admit_anyway, admit_on, decide, grant_override, note_launch_advisory,
-    report as governor_report, shed, Admitted, Advisory, Binding, Governor, GovernorPulse,
+    report as governor_report, shed, shed_cause, Admitted, Advisory, Binding, Governor, GovernorPulse,
     GovernorReport, GovernorVerdict, Input as GovernorInput, Observation, Reason, Refused, Shed,
     Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
 };
