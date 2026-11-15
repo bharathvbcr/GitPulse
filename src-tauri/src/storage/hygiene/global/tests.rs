@@ -2146,6 +2146,12 @@ fn a_lease_on_the_worktrees_branch_in_either_task_store_holds_its_cache() {
     let saved = cleaner.state().unwrap().config;
     let run = run_now(&cleaner, &saved, "own-lease-run");
     assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(
+        run.items
+            .iter()
+            .any(|item| item.message.contains("active task leases")),
+        "{run:?}"
+    );
 }
 
 /// The worktree scopes judge the worktree, not the repository: uncommitted

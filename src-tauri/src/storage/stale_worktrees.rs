@@ -100,10 +100,8 @@ pub(crate) fn stale_worktrees_with(
 ) -> Result<StaleWorktreeReport, CommandError> {
     let repo = git_cli::validate_repo(repo_path)?;
     let infos = crate::engine::worktree::list_worktrees_lite(&repo.to_string_lossy())?;
-    let main_branch = infos
-        .iter()
-        .find(|i| i.is_main)
-        .and_then(|i| i.branch.clone());
+    let main = infos.iter().find(|i| i.is_main);
+    let main_branch = main.and_then(|i| i.branch.clone());
     let linked: Vec<_> = infos.iter().filter(|i| !i.is_main && !i.is_bare).collect();
     let mut report = StaleWorktreeReport {
         repo_path: repo.to_string_lossy().into_owned(),
@@ -118,7 +116,15 @@ pub(crate) fn stale_worktrees_with(
             "The main worktree is not on a branch, so no worktree can be judged integrated".into(),
         );
     }
-    let tasks = crate::tasks::view(&repo.to_string_lossy());
+    // The task store is per checkout: branch leases for the lanes live in the
+    // main checkout's, whichever worktree of the repository was named.
+    let tasks = match main {
+        Some(main) => crate::tasks::view(&main.path),
+        None => crate::tasks::TaskView {
+            error: "the main checkout could not be found".into(),
+            ..crate::tasks::view(&repo.to_string_lossy())
+        },
+    };
     if !tasks.error.is_empty() {
         report.issues.push(format!(
             "Task leases could not be read, so no worktree is called stale: {}",
@@ -498,6 +504,41 @@ mod tests {
         assert!(!done.stale, "{done:?}");
         assert!(
             done.reasons.iter().any(|r| r.contains("own task store")),
+            "{done:?}"
+        );
+    }
+    /// Asked from a linked worktree, the report still reads the main
+    /// checkout's task store for branch leases, not the named worktree's.
+    #[test]
+    fn a_report_asked_from_a_linked_worktree_reads_the_main_checkouts_leases() {
+        let (_temp, root) = fixture();
+        std::fs::write(root.join("repo/.git/info/exclude"), ".devcouncil/\n").unwrap();
+        let db = crate::tasks::store_path(root.join("repo").to_str().unwrap());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO task_leases (id, task_id, owner, lease_token, status, branch, created_at, expires_at)
+                 VALUES ('l', 'TASK-1', 'agent', 'token', 'active', 'done', '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let none: ProcessesIn<'_> = &|_| Ok(vec![]);
+        let report = stale_worktrees_with(
+            root.join("busy").to_str().unwrap(),
+            7,
+            none,
+            false,
+            later(2),
+        )
+        .unwrap();
+        let done = row(&report, "done");
+        assert!(!done.stale, "{done:?}");
+        assert!(
+            done.reasons
+                .iter()
+                .any(|r| r.contains("may name its branch")),
             "{done:?}"
         );
     }
