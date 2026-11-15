@@ -6,9 +6,11 @@
   import { createLiveLoader, liveOnScreen } from "../workbench/liveLoader";
   import { formatRelativeTime } from "../format";
   import { buriedUnread, notificationPile, pileToggleLabel } from "../ui/notificationPile";
+  import { X } from "@lucide/svelte";
   import { automaticUpdates, explainError, sameAutomaticUpdate, getAttention, listAttention, type Attention, type AttentionFilter, type AttentionRow, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
+  import { createAttentionDismiss, withAttentionUpdate, type DismissAction } from "../workbench/attentionDismiss";
 
-  let { scope, active = true, onopen }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void> } = $props();
+  let { scope, active = true, onopen, onchange }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void>; onchange?: () => void } = $props();
   let filter = $state<AttentionFilter>("active"), result = $state<Page<AttentionRow> | null>(null);
   let busy = $state(false), error = $state(""), notice = $state("");
   let visible = $state(liveOnScreen());
@@ -70,7 +72,28 @@
       await onopen(current.task_id);
     } catch (cause) { error = explainError(cause); } finally { busy = false; }
   }
+  const dismissal = createAttentionDismiss();
+  async function setDismissed(item: AttentionRow, action: DismissAction) {
+    if (busy) return;
+    busy = true; error = "";
+    const readFilter = filter;
+    try {
+      const updated = await dismissal.apply(item, action);
+      // A filter switch mid-write reloads the list anyway; folding this receipt into it would apply the old filter.
+      if (result && readFilter === filter) result = withAttentionUpdate(result, updated, filter);
+      onchange?.();
+    } catch (cause) { error = explainError(cause); } finally { busy = false; }
+  }
 </script>
+
+<!-- Dismissing hides a notice from Active and Unread; it stays under All, where Restore brings it back. -->
+{#snippet dismissControl(item: AttentionRow)}
+  {#if item.dismissed_at === null}
+    <button type="button" class="gp-icon-btn dismiss" aria-label="Dismiss notification" title="Dismiss" onclick={() => setDismissed(item, "dismiss")} disabled={busy}><X size={13} /></button>
+  {:else}
+    <button type="button" class="gp-btn" onclick={() => setDismissed(item, "restore")} disabled={busy}>Restore</button>
+  {/if}
+{/snippet}
 
 <section class="inbox gp-glass bg-surface" aria-label="Inbox">
   <header>
@@ -98,11 +121,12 @@
           <!-- A kind this version does not know. Said plainly as a row of its own: dropping it would hide that
                something happened, and failing the page would hide everything else. Nothing to open, since what
                it targets is not known either. -->
-          <article class="gp-card unreadable" class:unread={item.read_at === null} data-notice-unreadable={item.kind}>
+          <article class="gp-card unreadable" class:unread={item.read_at === null} class:dismissed={item.dismissed_at !== null} data-notice-unreadable={item.kind}>
             <div class="summary"><strong>{item.title}</strong><span>Kind “{item.kind}” · {formatRelativeTime(item.created_at)} · update GitPulse to read it</span></div>
+            {@render dismissControl(item)}
           </article>
         {:else}
-          <article class="gp-card" class:unread={item.read_at === null} data-notice-kind={item.kind}>
+          <article class="gp-card" class:unread={item.read_at === null} class:dismissed={item.dismissed_at !== null} data-notice-kind={item.kind}>
             <div class="summary">
               <strong>{item.title}</strong>
               {#if item.signal}
@@ -115,6 +139,7 @@
               <!-- Puts this result back into the agent that pushed the branch: previewed, then confirmed. Never automatic. -->
               <SendToAgent runId={item.target_id} signal={item.signal} />
             {/if}
+            {@render dismissControl(item)}
           </article>
         {/if}
       {/each}
@@ -134,10 +159,12 @@
   .pile:not(.open){padding-bottom:16px}
   article{position:relative;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
   article.unreadable{border-style:dashed}
+  article.dismissed{opacity:.6}
   article.unread{box-shadow:var(--shadow-card),inset 3px 0 0 rgb(var(--c-accent))}
   .peek{position:absolute;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
   .pile + button{margin-top:8px}
-  .summary{display:flex;flex-direction:column;gap:2px;min-width:0}
+  /* The summary takes the slack so the dismiss control sits at the row's end, after Open. */
+  .summary{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
   .summary strong{font-weight:500}
   .summary span{color:rgb(var(--c-text-muted))}
   details{margin:8px 0}
