@@ -307,10 +307,6 @@ pub(super) struct Hit {
     pub row: &'static Row,
     /// The program and its verb, as in `cargo test`: never the whole line.
     pub label: String,
-    /// `cargo llvm-cov` that builds: it writes instrumented output many times
-    /// the size of an ordinary build's, so the load gate asks for disk headroom
-    /// before it starts (`load_gate`).
-    pub coverage_build: bool,
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +315,11 @@ pub(super) struct Classified {
     pub heavy: Option<Hit>,
     /// Every advise-only row it matched, once each.
     pub advise: Vec<Hit>,
+    /// Some command in the line is a `cargo llvm-cov` that builds, whichever
+    /// heavy command came first: it writes instrumented output many times the
+    /// size of an ordinary build's, so the load gate asks for disk headroom
+    /// before the line starts (`load_gate`).
+    pub coverage_build: bool,
     /// A word of the table was in the line but the line could not be read, so
     /// nothing above says anything about it. Never a refusal.
     pub unreadable: bool,
@@ -458,8 +459,8 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
         let hit = Hit {
             row,
             label: label_of(program, args, row),
-            coverage_build: coverage == Some(true),
         };
+        out.coverage_build |= coverage == Some(true);
         match row.kind {
             Kind::Heavy if out.heavy.is_none() => out.heavy = Some(hit),
             Kind::Heavy => {}
@@ -476,25 +477,112 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
 const LLVM_COV_NON_BUILDING: &[&str] = &["clean", "report", "show-env"];
 
 /// Options of `cargo llvm-cov` that take a value, so the value is not mistaken
-/// for the subcommand.
+/// for the subcommand. This is the `<ARG>` options of `cargo llvm-cov --help`
+/// (cargo-llvm-cov 0.8.x), not a recollection of them.
 const LLVM_COV_VALUE_FLAGS: &[&str] = &[
-    "--manifest-path",
-    "--package",
-    "-p",
-    "--profile",
-    "--target",
-    "--features",
-    "-F",
-    "--target-dir",
-    "--output-dir",
     "--output-path",
+    "--output-dir",
+    "--failure-mode",
     "--ignore-filename-regex",
-    "--jobs",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--dep-coverage",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-p",
+    "--package",
+    "--exclude",
+    "--exclude-from-test",
+    "--exclude-from-report",
     "-j",
+    "--jobs",
+    "--profile",
+    "-F",
+    "--features",
+    "--target",
+    "--color",
+    "--manifest-path",
+    "-Z",
 ];
+
+/// The rest of its options, which take no value.
+const LLVM_COV_PLAIN_FLAGS: &[&str] = &[
+    "--json",
+    "--lcov",
+    "--cobertura",
+    "--codecov",
+    "--text",
+    "--html",
+    "--open",
+    "--summary-only",
+    "--show-instantiations",
+    "--no-cfg-coverage",
+    "--no-cfg-coverage-nightly",
+    "--no-report",
+    "--no-clean",
+    "--no-rustc-wrapper",
+    "--show-missing-lines",
+    "--include-build-script",
+    "--skip-functions",
+    "--branch",
+    "--mcdc",
+    "--doctests",
+    "--no-run",
+    "--no-fail-fast",
+    "--ignore-run-fail",
+    "-q",
+    "--quiet",
+    "--lib",
+    "--bins",
+    "--examples",
+    "--tests",
+    "--benches",
+    "--all-targets",
+    "--doc",
+    "--workspace",
+    "--all",
+    "-r",
+    "--release",
+    "--all-features",
+    "--no-default-features",
+    "--coverage-target-only",
+    "--coverage-host-only",
+    "-v",
+    "--verbose",
+    "--remap-path-prefix",
+    "--include-ffi",
+    "--keep-going",
+    "--ignore-rust-version",
+    "--frozen",
+    "--locked",
+    "--offline",
+];
+
+/// What `cargo llvm-cov` is asked to do, read from the words after it.
+enum LlvmCov {
+    /// A subcommand that reads or removes output (`clean`, `report`,
+    /// `show-env`), or `--help` / `--version`: it compiles nothing.
+    Reads,
+    /// Anything else, including every line this cannot read with certainty.
+    Builds,
+}
 
 /// For `cargo llvm-cov`: whether the invocation builds (`Some(true)`) or only
 /// reads or removes output (`Some(false)`); `None` for anything else.
+///
+/// Reads only when the subcommand is certainly one of the non-building ones.
+/// The subcommand is the first word that is not an option or an option's
+/// value; the scan stops at `--` (what follows is for the test binary), and at
+/// an option it does not know (it may take a value that is then mistaken for
+/// the subcommand), and both mean a build: a wrong "reads" lets a 60 GiB
+/// build start on a full disk, a wrong "builds" only asks for the headroom.
 fn llvm_cov(program: &str, args: &[String], row: &Row) -> Option<bool> {
     if row.id != "cargo" || program != "cargo" {
         return None;
@@ -503,9 +591,45 @@ fn llvm_cov(program: &str, args: &[String], row: &Row) -> Option<bool> {
     if args[at] != "llvm-cov" {
         return None;
     }
-    let sub = skip_options(args, at + 1, LLVM_COV_VALUE_FLAGS);
-    let sub = args.get(sub).map(String::as_str);
-    Some(!sub.is_some_and(|word| LLVM_COV_NON_BUILDING.contains(&word)))
+    Some(matches!(llvm_cov_reading(&args[at + 1..]), LlvmCov::Builds))
+}
+
+fn llvm_cov_reading(words: &[String]) -> LlvmCov {
+    let mut i = 0;
+    while let Some(word) = words.get(i) {
+        i += 1;
+        if word == "--" {
+            return LlvmCov::Builds;
+        }
+        if matches!(word.as_str(), "-h" | "--help" | "-V" | "--version") {
+            return LlvmCov::Reads;
+        }
+        if !word.starts_with('-') || word == "-" {
+            return if LLVM_COV_NON_BUILDING.contains(&word.as_str()) {
+                LlvmCov::Reads
+            } else {
+                LlvmCov::Builds
+            };
+        }
+        // `--name=value` carries its value; a short option may too (`-j4`).
+        let (name, inline) = match word.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (word.as_str(), false),
+        };
+        if LLVM_COV_VALUE_FLAGS.contains(&name) {
+            i += usize::from(!inline);
+        } else if LLVM_COV_PLAIN_FLAGS.contains(&name)
+            || (!word.starts_with("--")
+                && word
+                    .get(..2)
+                    .is_some_and(|short| LLVM_COV_VALUE_FLAGS.contains(&short)))
+        {
+            continue;
+        } else {
+            return LlvmCov::Builds;
+        }
+    }
+    LlvmCov::Builds
 }
 
 /// The operand after `-c` in a shell's own options, when there is one.

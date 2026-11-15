@@ -53,6 +53,8 @@ fn plenty_of_disk() -> DiskFacts {
         floor_mode: InputMode::Refuse,
         coverage_headroom_bytes: 60 * GIB,
         coverage_mode: InputMode::Refuse,
+        measuring: true,
+        refusing: true,
     }
 }
 
@@ -733,7 +735,7 @@ fn load_stage_cost() {
     let long = format!("echo {}", "a".repeat(10_000));
     let heavy_line = "cd src-tauri && cargo test --lib -- hooks::";
     let live = |state: &Path| {
-        let mut g = gather_live();
+        let mut g = gather_live("");
         g.state_dir = state.to_path_buf();
         g
     };
@@ -1202,5 +1204,120 @@ fn an_older_reader_that_cannot_place_the_binding_fails_open_which_is_why_the_byt
         reason(&out).contains("free disk space is below"),
         "{}",
         reason(&out)
+    );
+}
+
+#[test]
+fn with_launch_refusal_off_the_disk_checks_advise_and_never_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 9);
+    g.disk.refusing = false;
+    for command in ["cargo build", "cargo llvm-cov --lib"] {
+        let out = judged(command, &g);
+        assert_eq!(decision_of(&out), None, "{command}: {out:?}");
+        assert!(
+            context(&out).contains("Free disk space is low"),
+            "{command}: {}",
+            context(&out)
+        );
+    }
+}
+
+#[test]
+fn with_host_load_measurement_off_the_disk_checks_say_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 9);
+    g.disk.measuring = false;
+    for command in ["cargo build", "cargo llvm-cov --lib"] {
+        let out = judged(command, &g);
+        assert!(out.is_silent(), "{command}: {out:?}");
+    }
+    g.disk.free_bytes = None;
+    assert!(
+        judged("cargo build", &g).is_silent(),
+        "nothing is measured, so an unreadable disk is not worth a notice"
+    );
+}
+
+#[test]
+fn a_coverage_build_after_another_heavy_command_gets_the_coverage_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    for command in [
+        "cargo check && cargo llvm-cov --lib",
+        "cargo test --lib; cargo llvm-cov",
+    ] {
+        let out = judged(command, &with_free(dir.path(), 30));
+        assert_eq!(
+            decision_of(&out),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+        assert!(
+            reason(&out).contains("coverage build"),
+            "{command}: {}",
+            reason(&out)
+        );
+    }
+    assert!(judged("cargo check && cargo build", &with_free(dir.path(), 30)).is_silent());
+}
+
+#[test]
+fn a_real_coverage_build_behind_a_subcommand_word_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for command in [
+        "cargo llvm-cov -- clean",
+        "cargo llvm-cov --test clean",
+        "cargo llvm-cov --bin report",
+        "cargo llvm-cov --exclude show-env",
+        "cargo llvm-cov -p clean",
+    ] {
+        assert_eq!(
+            decision_of(&judged(command, &with_free(dir.path(), 30))),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        decision_of(&judged(
+            "cargo llvm-cov clean && cargo build",
+            &with_free(dir.path(), 5)
+        )),
+        Some(PermissionDecision::Deny)
+    );
+}
+
+#[test]
+fn free_space_is_read_where_the_command_runs_not_where_the_hook_does() {
+    let there = Path::new("/volumes/small/work");
+    let here = std::env::current_dir().unwrap();
+    let read = |path: &Path| {
+        if path == there {
+            Some(5 * GIB)
+        } else if path == here {
+            Some(500 * GIB)
+        } else {
+            None
+        }
+    };
+    assert_eq!(
+        live_free_bytes("/volumes/small/work", Some(300 * GIB), read),
+        Some(5 * GIB),
+        "the command's own directory wins"
+    );
+    assert_eq!(live_free_bytes("", Some(300 * GIB), read), Some(500 * GIB));
+    assert_eq!(
+        live_free_bytes("/gone", Some(300 * GIB), read),
+        Some(500 * GIB),
+        "an unreadable directory falls back to the process's"
+    );
+    assert_eq!(
+        live_free_bytes("/gone", Some(300 * GIB), |_| None),
+        Some(300 * GIB),
+        "then to the snapshot"
+    );
+    assert_eq!(
+        live_free_bytes("/gone", None, |_| None),
+        None,
+        "could not read is not has room"
     );
 }

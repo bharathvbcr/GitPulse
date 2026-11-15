@@ -223,7 +223,77 @@ fn the_prefilter_does_not_hide_a_row_from_the_table() {
 }
 
 fn coverage(command: &str) -> Option<bool> {
-    classify(command).heavy.map(|hit| hit.coverage_build)
+    let classified = classify(command);
+    classified.heavy.map(|_| classified.coverage_build)
+}
+
+#[test]
+fn a_coverage_build_after_another_heavy_command_in_the_line_is_still_a_coverage_build() {
+    for command in [
+        "cargo check && cargo llvm-cov --lib",
+        "cargo test --lib; cargo llvm-cov",
+        "cargo build | cargo llvm-cov --no-report",
+        "bash -c 'cargo check && cargo llvm-cov --lib'",
+        "cargo llvm-cov --lib && cargo check",
+    ] {
+        assert_eq!(coverage(command), Some(true), "{command}");
+    }
+    assert_eq!(coverage("cargo check && cargo build"), Some(false));
+}
+
+#[test]
+fn what_follows_double_dash_or_is_an_options_value_is_never_the_subcommand() {
+    for command in [
+        "cargo llvm-cov -- clean",
+        "cargo llvm-cov --lib -- report",
+        "cargo llvm-cov --test clean",
+        "cargo llvm-cov --bin report",
+        "cargo llvm-cov --exclude show-env",
+        "cargo llvm-cov -p clean",
+        "cargo llvm-cov --package report --lib",
+        "cargo llvm-cov --features=clean",
+        "cargo llvm-cov -F report",
+        "cargo llvm-cov --bench show-env",
+        "cargo llvm-cov --example clean",
+        "cargo llvm-cov --exclude-from-test report",
+        "cargo llvm-cov --jobs 4 --test clean",
+        // An option this does not know may take a value: when in doubt it builds.
+        "cargo llvm-cov --made-up-option clean",
+        "cargo llvm-cov --target-dir clean",
+    ] {
+        assert_eq!(coverage(command), Some(true), "{command}");
+    }
+}
+
+#[test]
+fn the_documented_non_building_subcommands_stay_exempt_after_the_documented_options() {
+    for command in [
+        "cargo llvm-cov clean",
+        "cargo llvm-cov report",
+        "cargo llvm-cov show-env",
+        "cargo llvm-cov --workspace clean",
+        "cargo llvm-cov --manifest-path src-tauri/Cargo.toml report",
+        "cargo llvm-cov --color never clean",
+        "cargo llvm-cov --profile=dev report",
+        "cargo llvm-cov -j4 clean",
+        "cargo llvm-cov -Zbuild-std clean",
+        "cargo llvm-cov --version",
+        "cargo llvm-cov --help",
+    ] {
+        assert_eq!(heavy(command), None, "{command}");
+    }
+}
+
+#[test]
+fn a_clean_followed_by_a_build_is_still_heavy() {
+    assert_eq!(
+        heavy("cargo llvm-cov clean && cargo build").as_deref(),
+        Some("cargo build")
+    );
+    assert_eq!(
+        coverage("cargo llvm-cov clean && cargo llvm-cov --lib"),
+        Some(true)
+    );
 }
 
 #[test]

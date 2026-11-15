@@ -2180,7 +2180,7 @@ fn command_gate_call(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
-    command_gate_call_with(input, run, load_gate::gather_live)
+    command_gate_call_with(input, run, || load_gate::gather_live(&input.cwd))
 }
 
 /// [`command_gate_call`] with what the load stage reads from the world

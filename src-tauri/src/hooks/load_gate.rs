@@ -20,14 +20,21 @@
 //! # Disk headroom
 //!
 //! One thing is read live rather than from the verdict: free disk space on the
-//! volume the command runs in. A coverage build (`cargo llvm-cov` that builds)
-//! needs [`DiskFacts::coverage_headroom_bytes`] free before it starts, and any
-//! heavy build needs the disk rule's severe floor: on 2026-11-15 one coverage
-//! build took 145 GiB in about twenty minutes, and the published verdict is two
-//! seconds old by the time a build that writes 3 GiB a minute reads it. Each is
-//! its own input with a mode (refuse, shed = say so, off) from the settings,
-//! under the hook's `hook_mode` like every other refusal here. A reading that
-//! could not be taken is said once per session, never a pass.
+//! volume the command writes to (the `cwd` the hook was given, not the hook
+//! process's own: for an orchestrated child terminal the hook runs inside the
+//! GitPulse app). A coverage build (any `cargo llvm-cov` in the line that
+//! builds) needs [`DiskFacts::coverage_headroom_bytes`] free before it starts,
+//! and any heavy build needs the disk rule's severe floor: on 2026-11-15 a
+//! coverage build took the disk from about 150 GiB to nothing in about fifteen
+//! minutes, and the published verdict is two seconds old by the time a build
+//! that writes 10 GiB a minute reads it. Each is its own input with a mode
+//! (refuse, shed = say so, off) from the settings, under the hook's `hook_mode`
+//! like every other refusal here. A reading that could not be taken is said
+//! once per session, never a pass.
+//!
+//! The two master switches bind it as they bind the load check:
+//! `host_load.enabled` off means nothing is measured and it says nothing, and
+//! `host_load.govern_launches` off means it advises and never refuses.
 //!
 //! # The answers
 //!
@@ -122,13 +129,20 @@ pub(super) struct DiskFacts {
     /// The headroom a coverage build needs, and its mode.
     pub coverage_headroom_bytes: u64,
     pub coverage_mode: InputMode,
+    /// `host_load.enabled`: whether GitPulse measures the host at all. Off,
+    /// the disk checks say nothing, as the load check does.
+    pub measuring: bool,
+    /// `host_load.govern_launches`: whether GitPulse refuses anything for
+    /// host pressure. Off, the disk checks advise and never refuse.
+    pub refusing: bool,
 }
 
 impl DiskFacts {
     /// The facts the settings say, for `free_bytes` free. The numbers are the
     /// resolved ones: the automatic floors already follow this machine's memory.
     fn from_settings(free_bytes: Option<u64>) -> Self {
-        let thresholds = crate::tool_config::host_load_settings().thresholds;
+        let settings = crate::tool_config::host_load_settings();
+        let thresholds = settings.thresholds;
         let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
         Self {
             free_bytes,
@@ -136,6 +150,8 @@ impl DiskFacts {
             floor_mode: thresholds.disk.mode,
             coverage_headroom_bytes: gib(thresholds.disk_guard.coverage.headroom_gib),
             coverage_mode: thresholds.disk_guard.coverage.mode,
+            measuring: settings.enabled,
+            refusing: settings.govern_launches,
         }
     }
 }
@@ -196,7 +212,7 @@ pub(super) fn brief_line(report: &SensorReport, snapshot: Option<&Snapshot>) -> 
 }
 
 /// What the real world says. Called only for a command that is in the table.
-pub(super) fn gather_live() -> Gathered {
+pub(super) fn gather_live(cwd: &str) -> Gathered {
     let mode = crate::tool_config::host_load_hook_mode();
     let live = |availability, exempt, disk| Gathered {
         mode,
@@ -232,18 +248,31 @@ pub(super) fn gather_live() -> Gathered {
     live(
         availability,
         exempt,
-        DiskFacts::from_settings(live_free_bytes(snapshot_free)),
+        DiskFacts::from_settings(live_free_bytes(cwd, snapshot_free, |path| {
+            crate::sysload::free_bytes(path).value()
+        })),
     )
 }
 
-/// Free bytes on the volume the hook runs in (its working directory is the
-/// session's, where a build writes), read now. The snapshot's reading (two
-/// seconds old, and of the volume holding GitPulse's state) is the fallback.
-fn live_free_bytes(fallback: Option<u64>) -> Option<u64> {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| crate::sysload::free_bytes(&cwd).value())
-        .or(fallback)
+/// Free bytes on the volume the command writes to, read now: the working
+/// directory the hook was given (`cwd`, which is the session's, and for an
+/// orchestrated child terminal is not this process's: the hook then runs inside
+/// the GitPulse app). When there is none, or it cannot be read, this process's
+/// own working directory, then the snapshot's reading (two seconds old, and of
+/// the volume holding GitPulse's state). `None` only when none of them can be
+/// read: never a number that was not measured.
+fn live_free_bytes(
+    cwd: &str,
+    snapshot: Option<u64>,
+    read: impl Fn(&Path) -> Option<u64>,
+) -> Option<u64> {
+    let own = || std::env::current_dir().ok();
+    Some(cwd)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+        .and_then(|dir| read(&dir))
+        .or_else(|| own().and_then(|dir| read(&dir)))
+        .or(snapshot)
 }
 
 /// What a sensor report and its snapshot allow the hook to act on.
@@ -312,7 +341,7 @@ fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) ->
         }
         return advise_rows(classified, &g.availability);
     };
-    let disk = disk_check(input, heavy, g);
+    let disk = disk_check(input, classified, heavy, g);
     if let DiskCall::Refuse(output) = disk {
         return output;
     }
@@ -337,13 +366,21 @@ fn gib(bytes: u64) -> String {
 
 /// Whether the free space on the volume allows a heavy command to start: a
 /// coverage build needs its headroom and any heavy build the severe floor.
-fn disk_check(input: &HookInput, heavy: &Hit, g: &Gathered) -> DiskCall {
+///
+/// Both master switches bind it as they bind the load check: with measurement
+/// off it says nothing, and with launch refusal off it advises and never
+/// refuses, whatever each rule's own mode says.
+fn disk_check(input: &HookInput, classified: &Classified, heavy: &Hit, g: &Gathered) -> DiskCall {
     let d = &g.disk;
-    let covers = heavy.coverage_build && d.coverage_mode != InputMode::Off;
+    if !d.measuring {
+        return DiskCall::Nothing;
+    }
+    let covers = classified.coverage_build && d.coverage_mode != InputMode::Off;
     let floors = d.floor_mode != InputMode::Off;
     if !covers && !floors {
         return DiskCall::Nothing;
     }
+    let refuses = |mode: InputMode| d.refusing && mode == InputMode::Refuse;
     let Some(free) = d.free_bytes else {
         let why = "free disk space could not be read";
         return match first_notice(g, input, why) {
@@ -364,7 +401,7 @@ fn disk_check(input: &HookInput, heavy: &Hit, g: &Gathered) -> DiskCall {
             gib(free),
             gib(d.coverage_headroom_bytes)
         ));
-        refuse |= d.coverage_mode == InputMode::Refuse;
+        refuse |= refuses(d.coverage_mode);
     }
     if floors && free < d.floor_bytes {
         reasons.push(format!(
@@ -372,7 +409,7 @@ fn disk_check(input: &HookInput, heavy: &Hit, g: &Gathered) -> DiskCall {
             gib(free),
             gib(d.floor_bytes)
         ));
-        refuse |= d.floor_mode == InputMode::Refuse;
+        refuse |= refuses(d.floor_mode);
     }
     if reasons.is_empty() {
         return DiskCall::Nothing;
