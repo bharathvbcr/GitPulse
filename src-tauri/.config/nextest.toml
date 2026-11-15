@@ -14,3 +14,29 @@
 # all 6734 passing; `cargo test --lib` took 3051 s and 1672 s.
 [profile.default]
 test-threads = 4
+
+# What a CI shard runs under (`--profile ci`): ci.yml's macOS legs, each one
+# bucket of `--partition hash:M/3`.
+#
+# One test at a time, in its own process. The parallelism comes from the three
+# jobs, not from inside one: sidecar hello is a 20 s window and shebang/stub
+# fixtures time out under even four-way contention on a 3-4 core runner, which
+# is why ci.yml's `cargo test` line is `--test-threads=1`.
+#
+# `fail-fast = false` runs every test after a failure, so a red shard reports
+# all of its failures. The JUnit report holds one <testcase> per test the shard
+# ran (skipped tests are not written), which scripts/check-shard-coverage.mjs
+# sets against the full list to prove no test fell between buckets.
+#
+# `slow-timeout` ends a hung test after 5 x 120 s instead of letting it hold
+# the job to its 120-minute limit. The slowest test measured on a runner took
+# 96 s, so a test that is only slow is untouched; one past ten minutes is hung,
+# and fails, as a timeout does by default.
+[profile.ci]
+test-threads = 1
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[profile.ci.junit]
+path = "junit.xml"

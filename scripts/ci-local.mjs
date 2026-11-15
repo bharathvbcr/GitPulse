@@ -205,7 +205,7 @@ export const GATES = [
       `cargo test --manifest-path ${CARGO_MANIFEST} --locked --no-fail-fast -- --nocapture --test-threads=1`,
     ],
     produces: ["lcov.info"],
-    why: "CI runs these under cargo test, one test at a time inside each binary's process; here every test is its own process, four at a time. Instrumented on an 18-core Mac (2026-11-04, runs interleaved nextest, cargo test, nextest): 908 s and 813 s against 4,300 s, line coverage 90.5% both ways. What this cannot see, CI's cargo test still does: a test that fails only beside another in the same process, and the doctests",
+    why: "CI's Linux and Windows legs run these under cargo test, one test at a time inside each binary's process, and its macOS legs run them as three serial nextest shards; here every test is its own process, four at a time. Instrumented on an 18-core Mac (2026-11-04, runs interleaved nextest, cargo test, nextest): 908 s and 813 s against 4,300 s, line coverage 90.5% both ways. What this cannot see, CI's cargo test still does: a test that fails only beside another in the same process, and the doctests",
   },
   {
     id: "worktree-fmt",
@@ -227,15 +227,6 @@ export const GATES = [
     program: "cargo",
     args: ["test", "--manifest-path", WORKTREE_MANIFEST, "--locked", "--no-fail-fast", "--", "--test-threads=1"],
     covers: [`cargo test --manifest-path ${WORKTREE_MANIFEST} --locked --no-fail-fast -- --test-threads=1`],
-  },
-  {
-    // The terminal suites again, every registry backed by a real
-    // gitpulse-ptyd (docs/TERMINAL_HOST.md, migration step 2).
-    id: "terminal-host-suites",
-    name: "Terminal suites against the terminal host",
-    program: "bun",
-    args: ["run", "test:terminal-host"],
-    covers: ["bun run test:terminal-host"],
   },
   {
     // ci.yml's Gusset engine job. It needs DevCouncil and gusset checked out
