@@ -726,7 +726,9 @@ or `gitpulse-hook lease -- <program> ...`. It runs before the hook's own start
 deadline. It leases a `cargo` verb that compiles or tests (build, check,
 clippy, test, bench, doc, rustc, rustdoc, fix, install, nextest, llvm-cov,
 mutants, fuzz, miri, and the short aliases) and `go build` and `go test`. It
-never leases `cargo run`, `clean`, `fmt`, `metadata`, `tree` or `help`, `go
+never leases `cargo run`, `clean`, `fmt`, `metadata`, `tree` or `help`,
+`cargo llvm-cov clean`, `report` or `show-env` (the owner's shim lets these
+through too), a call that only asks for `--help` or `-h` before any `--`, `go
 run`, `env`, `mod` or `version`, a nested call (`GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD`), a `mac_heavy` job
 (`MAC_HEAVY_LABEL`), or anything with `host_load_leases.mode` off.
 
@@ -739,18 +741,29 @@ for leased builds; nothing is deleted.
 **A build the wrapper cannot lease still runs, and says so.** A lease directory
 it cannot use, or a verdict it cannot read, prints "did NOT lease this build:
 <why>" and writes a `leasemiss-` marker; Health counts markers from the last 15
-minutes. Health also counts running `cargo` and `go` processes that hold no
-slot ("N cargo processes hold no slot"), or says it could not count them.
+minutes (a read looks at a bounded number of entries, and when the folder holds
+more, Health says "At least N" and never "No build"). Health also counts running
+`cargo` and `go` processes that hold no slot ("N cargo processes hold no slot"),
+or says it could not count them. A wrapper that is still waiting for a slot, a
+build's own children, and a proxy's child (rustup's `cargo`) are not counted.
 
 ### How a session reaches the wrapper
 
 - GitPulse terminal and task-run PTYs for an agent launcher get `lease-bin`
-  first on `PATH` and `GITPULSE_LEASE_BIN` (`sysload::lease::launch_env`).
-- An observed Claude session gets `export PATH="<lease-bin>:$PATH"` appended to
-  `$CLAUDE_ENV_FILE` by the SessionStart hook, and a `leasepath-<session>`
-  record is kept. The command gate says once per session when builds are not
-  gated, and, when every slot is held, "Every build slot is held (...)" with
-  the ways forward.
+  first on `PATH` and `GITPULSE_LEASE_BIN` (`sysload::lease::launch_env`), and
+  only when the `cargo` and `go` links resolve to a file.
+- Every Claude session, launched or observed, gets `export PATH="<lease-bin>:$PATH"`
+  appended once to `$CLAUDE_ENV_FILE` by the SessionStart hook (a repeat start
+  does not stack copies), and a `leasepath-<session>` record is kept. The launch
+  environment alone is not enough: a shell startup file such as `~/.zshenv`
+  can put another `cargo` ahead of it for every `zsh`, `zsh -c` included, and
+  only the env-file line puts the folder back before each Bash command.
+- **A session is called gated only on that record.** `GITPULSE_LEASE_BIN` is
+  not evidence. Without the record, the session brief says "NOT gating this
+  session's builds: <why>" and the command gate says once per session "did NOT
+  lease-gate this build". When every slot is held it says "Every build slot is
+  held (...)", and when load refuses new builds it says so and how long the
+  wrapper may wait; neither promises a Bash timeout.
 
 Session key: `terminal:<GITPULSE_TERMINAL_SESSION>`, `run:<GITPULSE_RUN_ID>`,
 `agent:<pid>-<start>` (the nearest agent ancestor), or `process:<ppid>-<start>`.
@@ -788,8 +801,11 @@ and sessions with no hook reports are always "not known".
 
 **Park** closes a GitPulse-launched Claude session's terminal and keeps its
 conversation so the existing reopen offer ("Resume") brings it back. It is not
-SIGSTOP. It is offered once a session has been idle for
-`host_load_idle.park_after_s` (default 3600); it is a click in Health, then a
+SIGSTOP. It is offered, and enforced by the backend, once a session has been
+idle for `host_load_idle.park_after_s` (default 3600). Only a terminal that
+GitPulse launched as that agent can be parked: a plain shell tab with `claude`
+typed into it carries a GitPulse session id too, and closing it would close the
+shell, so it is refused, as is a terminal that hosts two agents. It is a click in Health, then a
 native system dialog that page script cannot answer, with the session checked
 again before the dialog and after it. It is **not reachable over MCP** and
 nothing is parked on its own. An observed session is never parked, and Codex
@@ -808,6 +824,12 @@ prepends another folder shows: `gated` (that is the wrapper), `shadowed by
 <path>` (another `cargo` comes first; this never reads as ok) or `absent` (the
 links do not exist yet). A login shell that could not be run is `unverifiable`,
 not ok.
+
+On this machine `~/.zshenv` re-prepends `~/.claude-bin` for every zsh, so the
+row honestly reports `shadowed` until the owner moves that line behind the
+lease folder (or `~/.zprofile` reorders it), or retires the shim. GitPulse does
+not edit either file. Until then a session is gated through the env-file line
+alone, and a build from a shell that line does not reach is not.
 
 ### Not verified
 

@@ -340,6 +340,11 @@ describe("hostLoadStore", () => {
     expect(await loadIdleReport()).toMatchObject({ idle: 0 });
     expect(await parkSession("term-1")).toBe("Parked.");
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_park", { sessionId: "term-1" });
+    // The terminal pill asks for the queue alone: no process-table read.
+    await loadLeaseStatus(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: true });
+    await loadLeaseStatus();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: false });
   });
 
   it("does not swallow a refused park: a No or a changed session rejects", async () => {

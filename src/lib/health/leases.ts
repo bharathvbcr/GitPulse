@@ -52,6 +52,10 @@ export function missesLine(status: LeaseStatus): string {
   if (status.misses === null) {
     return `Builds that ran without a lease couldn't be counted: ${status.misses_error ?? "unknown"}.`;
   }
+  if (status.misses_truncated) {
+    // A capped read: a floor, never "none".
+    return `At least ${status.misses} build${status.misses === 1 ? "" : "s"} ran without a lease in the last 15 minutes (the marker folder holds more than one read looks at).`;
+  }
   return status.misses === 0
     ? "No build ran without a lease in the last 15 minutes."
     : `${status.misses} build${status.misses === 1 ? "" : "s"} ran without a lease in the last 15 minutes.`;

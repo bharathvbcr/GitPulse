@@ -240,7 +240,7 @@
       void (async () => {
         const next: Record<string, TerminalContext | null> = {};
         try {
-          const leases = await loadLeaseStatus();
+          const leases = await loadLeaseStatus(true);
           if (!cancelled) buildQueue = leases?.queue ?? [];
         } catch {
           // An unread queue says nothing: no session is called queued on a guess.

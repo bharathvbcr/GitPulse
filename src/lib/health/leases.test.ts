@@ -38,6 +38,7 @@ const status = (over: Partial<LeaseStatus> = {}): LeaseStatus => ({
   error: null,
   links_missing: null,
   misses: 0,
+  misses_truncated: false,
   misses_error: null,
   unleased_running: 0,
   unleased_error: null,
@@ -63,6 +64,11 @@ describe("lease wording", () => {
     expect(missesLine(status({ misses: null, misses_error: "no such directory" }))).toContain("couldn't be counted: no such directory");
     expect(missesLine(status({ misses: 0 }))).toContain("No build ran without a lease");
     expect(missesLine(status({ misses: 2 }))).toBe("2 builds ran without a lease in the last 15 minutes.");
+    // A capped read is a floor and never says "No build".
+    const capped = missesLine(status({ misses: 0, misses_truncated: true }));
+    expect(capped).toContain("At least 0 builds");
+    expect(capped).not.toContain("No build ran");
+    expect(missesLine(status({ misses: 3, misses_truncated: true }))).toContain("At least 3 builds");
     expect(unleasedLine(status({ unleased_running: null, unleased_error: "the process table couldn't be read" }))).toContain("couldn't be counted");
     expect(unleasedLine(status({ unleased_running: 0 }))).toContain("Every running heavy build holds a slot");
     expect(unleasedLine(status({ unleased_running: 3 }))).toContain("3 cargo or go builds running hold no slot");

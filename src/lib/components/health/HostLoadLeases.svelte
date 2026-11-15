@@ -31,7 +31,10 @@
   import { describeFailure, type FailureCopy } from "../../ui/copy/describeFailure";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
 
-  const REFRESH_MS = 4_000;
+  // Slower than the card above it: this reads the process table and the lease
+  // folder, and a build slot changes hands over minutes. The timer stops while
+  // the window is hidden and reads once when it returns.
+  const REFRESH_MS = 10_000;
   const HOLDER_COLUMNS = Object.freeze([
     { label: "Slot" },
     { label: "Build" },

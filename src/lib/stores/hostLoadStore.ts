@@ -682,16 +682,22 @@ export interface LeaseStatus {
   error: string | null;
   links_missing: string | null;
   misses: number | null;
+  /** The marker directory held more than one read looks at: `misses` is a floor. */
+  misses_truncated: boolean;
   misses_error: string | null;
   unleased_running: number | null;
   unleased_error: string | null;
   now_mono_ns: number;
 }
 
-/** Reads the build leases; never writes. */
-export function loadLeaseStatus(): Promise<LeaseStatus | null> {
+/**
+ * Reads the build leases; never writes. `queueOnly` skips the process-table
+ * read and the miss count (what the terminal pill needs is the queue), and
+ * the fields it skipped say so instead of reading zero.
+ */
+export function loadLeaseStatus(queueOnly = false): Promise<LeaseStatus | null> {
   if (!isTauri()) return Promise.resolve(null);
-  return invoke<LeaseStatus>("cmd_host_load_leases");
+  return invoke<LeaseStatus>("cmd_host_load_leases", { queueOnly });
 }
 
 /** `sysload::activity::SessionActivity`. */

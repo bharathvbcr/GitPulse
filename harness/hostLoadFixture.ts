@@ -128,6 +128,7 @@ export function leaseStatusFixture(): LeaseStatus {
     error: null,
     links_missing: null,
     misses: 0,
+    misses_truncated: false,
     misses_error: null,
     unleased_running: 0,
     unleased_error: null,
