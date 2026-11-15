@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import CommitDetails from "./CommitDetails.svelte";
-import { deriveAiReadiness, describeAiTarget } from "../stores/harnessStore";
+import { deriveAiReadiness, describeAiTarget, type AiStatus } from "../stores/harnessStore";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "CommitDetails.svelte"),
@@ -27,8 +27,12 @@ describe("CommitDetails", () => {
     expect(source).toContain("`Explain this commit with ${aiTarget}`");
     // Cloud ready, no local server answering: the readiness the button reads.
     const readiness = deriveAiReadiness({
-      manviClaude: { model: "claude-sonnet-5-5" },
-      ai: null,
+      ai: {
+        ready: false,
+        detail: "No local model server answered.",
+        selected: null,
+        manvi: { state: "ready", mode: "cloud", model: "claude-sonnet-5-5", selection: { provider: "anthropic", model: "claude-sonnet-5-5" } },
+      } as unknown as AiStatus,
       claudeCredential: { status: { keySaved: true, account: null, accountError: null }, error: null },
     });
     expect(readiness.ready).toBe(true);

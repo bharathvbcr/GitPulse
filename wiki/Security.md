@@ -20,7 +20,7 @@ flowchart TD
 
 **GitHub credentials.** GitPulse never requests, reads, stores, or transmits GitHub tokens. PR / Actions / Dependabot / code scanning features delegate to the `gh` CLI you already authenticated. Dependabot and code scanning alerts are fetched when a repository opens (Settings → Analysis; on by default). Critical and high findings warn; a check that did not run is not an all-clear.
 
-**Local AI transport.** Built-in local completions and model probes reject remote base URLs; choosing Claude in the Manvi pane routes GitPulse's own AI features to the Claude API through Manvi instead. Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
+**Local AI transport.** Built-in local completions and model probes reject remote base URLs; GitPulse's own AI features go through Manvi's `work.assist.complete`, which follows Manvi's own `manvi use` setting (a local server, or the Claude API in cloud mode; the loopback client is only the fallback when Manvi is missing or too old). Profile Manvi task suggestions and explicitly launched agents use their configured provider and run settings; the loopback restriction does not apply to those separate execution paths.
 
 **Terminal sessions.** Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit agent launchers and task handoffs start dedicated PTY sessions under the provider's permissions. Worktrees are not OS sandboxes. Remediation actions (`cmd_manvi_run_action`) use a command allowlist and require confirmation. See [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 

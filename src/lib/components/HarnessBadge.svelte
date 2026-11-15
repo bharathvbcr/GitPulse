@@ -65,15 +65,20 @@
   }
 
   /**
-   * Manvi on Claude ("cloud"): the pill shows that instead of local-model
-   * discovery. The same choice routes GitPulse's own AI features to Claude
-   * (see `aiReadiness`), so local discovery is only what applies when Manvi is
-   * not on Claude. The credential answer lives in `harnessStore` (it is asked
-   * for when Claude is chosen and at startup) and again here when the menu
-   * opens, so a fix made in Settings or with `anthropic-account` shows up.
+   * What Manvi itself is set to run on (`manvi use`, read by the backend into
+   * `ai.manvi`): the pill shows "Cloud · model" or "Local · model" from it. The
+   * same choice carries GitPulse's own AI features (see `aiReadiness`), so the
+   * local model picker only shows when Manvi is not on cloud. The Claude
+   * credential answer lives in `harnessStore` (asked when the status says
+   * cloud) and again here when the menu opens, so a fix made in Settings or
+   * with `anthropic-account` shows up.
    */
-  let manviClaude = $derived($harnessStore.manviClaude);
-  let onCloud = $derived(Boolean(manviClaude));
+  let manvi = $derived($harnessStore.ai?.manvi ?? null);
+  let cloudChoice = $derived(
+    manvi?.state === "ready" && manvi.mode === "cloud" ? { model: manvi.model } : null,
+  );
+  let manviLocal = $derived(manvi?.state === "ready" && manvi.mode === "local");
+  let onCloud = $derived(Boolean(cloudChoice));
   let cloudCredential = $derived<ClaudeCredentialStatus | null>($harnessStore.claudeCredential.status);
   let cloudReadError = $derived($harnessStore.claudeCredential.error);
   function loadCloudCredential() {
@@ -86,17 +91,17 @@
         : cloudCredential ? claudeCredentialProblem(cloudCredential) : null,
   );
   let cloudAccount = $derived(cloudCredential?.account ?? null);
-  let cloudModel = $derived(manviClaude ? claudeModelLabel(manviClaude.model) : "");
+  let cloudModel = $derived(cloudChoice ? claudeModelLabel(cloudChoice.model) : "");
   let cloudStatus = $derived(
-    !manviClaude ? ""
-      : cloudReadError ? `Manvi is set to cloud (${manviClaude.model}). ${cloudProblem}`
-      : cloudProblem ? `Manvi is set to cloud (${manviClaude.model}) but cannot run: ${cloudProblem}`
+    !cloudChoice ? ""
+      : cloudReadError ? `Manvi is set to cloud (${cloudChoice.model}). ${cloudProblem}`
+      : cloudProblem ? `Manvi is set to cloud (${cloudChoice.model}) but cannot run: ${cloudProblem}`
         : cloudAccount
-          ? `Manvi uses cloud: ${manviClaude.model}, billed to Anthropic account ${cloudAccount.name}${
+          ? `Manvi uses cloud: ${cloudChoice.model}, billed to Anthropic account ${cloudAccount.name}${
             cloudAccount.workspace ? ` (workspace ${cloudAccount.workspace})` : ""}.`
           : cloudCredential?.keySaved
-            ? `Manvi uses cloud: ${manviClaude.model}, billed to the key saved in GitPulse.`
-            : `Manvi uses cloud: ${manviClaude.model}. Checking its credential…`,
+            ? `Manvi uses cloud: ${cloudChoice.model}, billed to the key saved in GitPulse.`
+            : `Manvi uses cloud: ${cloudChoice.model}. Checking its credential…`,
   );
 
   /** Focus moves into the menu on open so the keyboard lands on the model list. */
@@ -187,8 +192,10 @@
               ? "No models"
               : "Not checked",
   );
-  /** The pill's face: "Cloud · <model>" while Manvi is on Claude, else the local model. */
-  let closedFace = $derived(onCloud ? `Cloud · ${cloudModel}` : localFace);
+  /** The pill's face: Manvi's own mode, "Cloud · <model>" or "Local · <model>", else local discovery's. */
+  let closedFace = $derived(
+    onCloud ? `Cloud · ${cloudModel}` : manviLocal ? `Local · ${manvi?.model || localFace}` : localFace,
+  );
   /** The Automatic choice. When it is selected, its label is the local face. */
   let automaticOption = $derived(preferred ? "Automatic" : localFace);
   let discoveryNote = $derived(
@@ -343,12 +350,12 @@
       aria-label="Manvi and local model"
     >
       <div role="none" class="flex flex-col gap-1.5 p-1.5">
-        {#if manviClaude}
+        {#if cloudChoice}
           <p class="gp-label px-1">Manvi's model</p>
           <div role="none" class="flex items-start gap-2 px-1" data-manvi-cloud-row title={cloudStatus}>
             <Cloud size={12} class="mt-0.5 shrink-0 {cloudProblem ? "text-danger" : "text-accent"}" aria-hidden="true" />
             <div role="none" class="min-w-0">
-              <div class="truncate">Cloud · {manviClaude.model}</div>
+              <div class="truncate">Cloud · {cloudChoice.model}</div>
               <div class="truncate text-textMuted">
                 {#if cloudProblem}
                   <span class="text-danger">{cloudProblem}</span>
@@ -375,7 +382,8 @@
           </button>
           <span class="gp-menu-sep" role="separator"></span>
         {/if}
-        <p class="gp-label px-1">{manviClaude ? "Local model · when Manvi is not on Claude" : "Local model"}</p>
+        {#if !cloudChoice}
+        <p class="gp-label px-1">Local model</p>
         <div role="none" class="flex items-center gap-1.5">
           <!-- Native selection supplies keyboard navigation, typeahead and
                dismissal. The select stays for the model list, but it is drawn
@@ -426,6 +434,7 @@
           </button>
         </div>
         <span class="gp-menu-sep" role="separator"></span>
+        {/if}
         {#if verdict && !verdictInline}
           {@render verdictButton(false)}
         {/if}

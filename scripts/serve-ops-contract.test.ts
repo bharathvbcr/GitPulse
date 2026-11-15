@@ -386,7 +386,7 @@ describe("the ops GitPulse names are served", () => {
     expect(aiRs).toContain('pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";');
     expect(contract.ops.optional).toContain("work.assist.complete");
     // Both the capability call and the real call, from run_cloud.
-    const body = aiRs.slice(aiRs.indexOf("fn run_cloud("));
+    const body = aiRs.slice(aiRs.indexOf("fn run_manvi("));
     const sent = [...body.matchAll(/serde_json::json!\(\{([^}]*)\}\)/g)]
       .map((m) => [...m[1].matchAll(/"(\w+)":/g)].map((k) => k[1]))
       .filter((keys) => keys.includes("max_output_tokens"));

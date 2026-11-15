@@ -248,8 +248,8 @@
   });
   let previewTruncated = $derived(selectedDiffText.split("\n").length > PREVIEW_LINE_CAP);
 
-  // Explain-this-commit, answered by the model the Manvi pane chose: a local
-  // server by default, or Claude through Manvi.
+  // Explain-this-commit, answered by whatever Manvi is set to run on (`manvi use`): a
+  // local server, or Claude in cloud mode.
   let explanation = $state<AiGeneration | null>(null);
   let explanationFor = $state<string | null>(null);
   let isExplaining = $state(false);
@@ -563,9 +563,9 @@
           <div class="px-2 py-1 text-meta text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
         {/if}
 
-        <!-- Explanation of the commit. With a local model nothing leaves the machine:
-             the diff goes to a server on loopback. When the Manvi pane chose Claude, the
-             diff goes to the Claude API through Manvi, and the tooltip says so. -->
+        <!-- Explanation of the commit. In local mode the diff goes to a local server;
+             in cloud mode (Manvi set to Claude) it goes to the Claude API through Manvi,
+             and the tooltip names the destination. -->
         <div class="px-2 py-1.5">
           <button
             onclick={explainCommit}

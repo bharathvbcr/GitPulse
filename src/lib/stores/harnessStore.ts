@@ -9,7 +9,7 @@ import {
   claudeCredentialStatus,
   type ClaudeCredentialStatus,
 } from "../workbench/claudeKey";
-import { effectiveSelection } from "../workbench/taskModel";
+import type { ModelSelection } from "../workbench/taskModel";
 import {
   ledgerStatus,
   type LedgerEvent,
@@ -122,6 +122,33 @@ export interface AiSelection {
   model: string;
 }
 
+/**
+ * What `manvi use --json` said, read by the backend (`cmd_ai_status`). `state`
+ * is `ready` when Manvi answered; `not_installed`, `needs_update` (a Manvi
+ * without `manvi use`) and `failed` carry why in `detail`.
+ */
+export interface ManviStatus {
+  state: "ready" | "not_installed" | "needs_update" | "failed";
+  detail: string;
+  /** `cloud`, `local` or `other`. */
+  mode: string;
+  provider: string;
+  provider_from: string;
+  model: string;
+  model_from: string;
+  /** Environment variables that override the saved choice for this process. */
+  shadowed_by: string[];
+  user_config: string;
+  local_base_url: string;
+  local_model: string;
+  cloud_model: string;
+  warnings: string[];
+  /** Why GitPulse cannot use this mode; empty when `selection` is set. */
+  unsupported: string;
+  /** What the worker is spawned with, in the wire shape of a model selection. */
+  selection: ModelSelection | null;
+}
+
 export interface AiStatus {
   harness: HarnessStatus;
   endpoints: DiscoveredEndpoint[];
@@ -130,6 +157,7 @@ export interface AiStatus {
   model_detail: string;
   ready: boolean;
   detail: string;
+  manvi: ManviStatus;
 }
 
 export interface BudgetReport {
@@ -168,8 +196,13 @@ export interface ClaudeCredentialState {
 /** Whether GitPulse's AI features can run right now, and on what. */
 export interface AiReadiness {
   ready: boolean;
-  /** Where a request goes: the Claude API through Manvi, or a loopback server. */
+  /** What answers: the Claude API (cloud) or a model server on this machine (local). */
   target: "cloud" | "local";
+  /**
+   * Who carries the request: Manvi (`work.assist.complete`, in both modes), or
+   * GitPulse's own loopback client when Manvi cannot be used.
+   */
+  via: "manvi" | "loopback";
   /** The model that would answer ("" when none is chosen). */
   model: string;
   /** Why it is not ready; empty when it is. */
@@ -177,34 +210,50 @@ export interface AiReadiness {
 }
 
 /**
- * The one answer to "can an AI feature run?". Cloud when the Manvi pane chose
- * Claude: ready only when the credential check answered with no problem (an
- * unanswered check is not ready, never assumed fine). Otherwise local
- * discovery's own verdict. Pure, so it is testable without Svelte.
+ * The one answer to "can an AI feature run?", from what Manvi itself is set to
+ * run on (`ai.manvi`, read by the backend from `manvi use`).
+ *
+ * - Cloud: ready only when the Claude credential check answered with no
+ *   problem (an unanswered check is not ready, never assumed fine).
+ * - Local through Manvi: ready when the local server is up (local discovery
+ *   follows Manvi's own server and model).
+ * - A mode GitPulse cannot use: not ready, and says so.
+ * - Manvi unreadable (not installed, no `manvi use`, failed) or not asked yet:
+ *   GitPulse's own loopback client, with local discovery's verdict.
+ *
+ * Pure, so it is testable without Svelte.
  */
-export function deriveAiReadiness(
-  state: Pick<HarnessState, "manviClaude" | "ai" | "claudeCredential">,
-): AiReadiness {
-  if (state.manviClaude) {
-    const chosen = state.manviClaude.model;
-    const model = effectiveSelection({ preferred: null, ai: null, manviClaude: state.manviClaude });
-    if (!model || model.provider !== "anthropic") {
-      return { ready: false, target: "cloud", model: chosen, reason: `"${chosen}" is not a Claude model id.` };
-    }
-    const { status, error } = state.claudeCredential;
-    if (error) {
-      return { ready: false, target: "cloud", model: chosen, reason: `Couldn't check the Claude credential. ${error}` };
-    }
-    if (!status) {
-      return { ready: false, target: "cloud", model: chosen, reason: "Checking the Claude credential…" };
-    }
-    const problem = claudeCredentialProblem(status);
-    return { ready: problem === null, target: "cloud", model: chosen, reason: problem ?? "" };
-  }
+export function deriveAiReadiness(state: Pick<HarnessState, "ai" | "claudeCredential">): AiReadiness {
   const ai = state.ai;
+  const manvi = ai?.manvi;
+  if (ai && manvi?.state === "ready") {
+    const target = manvi.mode === "cloud" ? "cloud" : "local";
+    if (!manvi.selection) {
+      return { ready: false, target, via: "manvi", model: manvi.model, reason: manvi.unsupported };
+    }
+    if (manvi.mode === "cloud") {
+      const { status, error } = state.claudeCredential;
+      if (error) {
+        return { ready: false, target, via: "manvi", model: manvi.model, reason: `Couldn't check the Claude credential. ${error}` };
+      }
+      if (!status) {
+        return { ready: false, target, via: "manvi", model: manvi.model, reason: "Checking the Claude credential…" };
+      }
+      const problem = claudeCredentialProblem(status);
+      return { ready: problem === null, target, via: "manvi", model: manvi.model, reason: problem ?? "" };
+    }
+    return {
+      ready: ai.ready,
+      target,
+      via: "manvi",
+      model: manvi.model,
+      reason: ai.ready ? "" : ai.detail || "The local model server Manvi uses did not answer.",
+    };
+  }
   return {
     ready: ai?.ready ?? false,
     target: "local",
+    via: "loopback",
     model: ai?.selected?.model ?? "",
     reason: ai?.detail || (ai ? "" : "Local models have not been checked."),
   };
@@ -212,28 +261,27 @@ export function deriveAiReadiness(
 
 /** How AI features name where a request goes, for tooltips and notes. */
 export function describeAiTarget(readiness: AiReadiness): string {
+  if (readiness.via === "loopback") return "the local model";
   return readiness.target === "cloud"
     ? `${readiness.model} (Claude API, via Manvi)`
-    : "the local model";
+    : `${readiness.model || "the local model"} (local model, via Manvi)`;
 }
 
 export interface HarnessState {
   harness: HarnessStatus | null;
   ai: AiStatus | null;
-  /** Model the user pinned, or null to let discovery choose. */
+  /**
+   * The local model the user pinned, or null to let discovery choose. Manvi's
+   * own config (`ai.manvi`, from `manvi use`) decides what GitPulse's AI
+   * features and task enhancements run on; this is what GitPulse's own
+   * loopback client uses when Manvi cannot be read, and picking one here also
+   * writes it to Manvi (`useManvi`).
+   */
   preferred: AiSelection | null;
   /**
-   * The Claude model chosen in the Manvi pane, or null to stay on the local
-   * selection. It decides where everything goes: task enhancements and
-   * GitPulse's own AI features (explain a commit, commit messages, branch
-   * names, health and coverage plans) all use it when it is set, and only then
-   * does a diff leave this machine (to the Claude API, through Manvi).
-   */
-  manviClaude: { model: string } | null;
-  /**
-   * What the last credential check for that Claude choice answered. Owned
-   * here, next to the choice, so the Manvi pill and every AI control read one
-   * answer ([`deriveAiReadiness`]) instead of each asking the Keychain.
+   * What the last credential check answered, for a cloud Manvi. Owned here so
+   * the Manvi pill and every AI control read one answer
+   * ([`deriveAiReadiness`]) instead of each asking the Keychain.
    */
   claudeCredential: ClaudeCredentialState;
   isProbing: boolean;
@@ -269,7 +317,8 @@ export interface HarnessState {
 }
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
-const STORAGE_KEY_MANVI_CLAUDE = "gitpulse_manvi_claude_model";
+/** Where GitPulse once kept its own copy of the Claude choice; Manvi's config owns it now. */
+const RETIRED_KEY_MANVI_CLAUDE = "gitpulse_manvi_claude_model";
 
 type RepositoryProjectionState = Pick<
   HarnessState,
@@ -384,25 +433,6 @@ function loadPreferred(): AiSelection | null {
   return null;
 }
 
-/** The persisted Claude choice. Only the model id is stored; the key is in the Keychain. */
-function loadManviClaude(): { model: string } | null {
-  try {
-    const model = localStorage.getItem(STORAGE_KEY_MANVI_CLAUDE);
-    return model ? { model } : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveManviClaude(choice: { model: string } | null) {
-  try {
-    if (choice) localStorage.setItem(STORAGE_KEY_MANVI_CLAUDE, choice.model);
-    else localStorage.removeItem(STORAGE_KEY_MANVI_CLAUDE);
-  } catch {
-    /* ignore quota / private-mode failures */
-  }
-}
-
 function savePreferred(selection: AiSelection | null) {
   try {
     if (selection) {
@@ -476,6 +506,11 @@ export function unconfirmedEndpoint(
 export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   const invokeFn = deps.invoke ?? invoke;
   const confirmFn = deps.confirm ?? askConfirm;
+  try {
+    localStorage.removeItem(RETIRED_KEY_MANVI_CLAUDE);
+  } catch {
+    /* no storage: nothing was kept there */
+  }
   const pathIdentityOptions: PathIdentityOptions = {
     caseInsensitive: isCaseInsensitiveFs(),
   };
@@ -492,7 +527,6 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     harness: null,
     ai: null,
     preferred: loadPreferred(),
-    manviClaude: loadManviClaude(),
     claudeCredential: { status: null, error: null },
     isProbing: false,
     lastVerdict: null,
@@ -796,36 +830,6 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     }
   }
 
-  /**
-   * Runs one of GitPulse's own AI commands on the route the Manvi pane chose.
-   *
-   * `effectiveSelection` is the one owner of "Claude when chosen". It is asked
-   * with `ai: null` on purpose: a server merely discovered on loopback is not
-   * the user's choice (the consent gate in `withEndpointConsent` handles that),
-   * so only the Claude choice and the saved `preferred` selection count here.
-   * A Claude choice that is not a valid model id throws instead of falling
-   * through to a local server the user did not pick.
-   */
-  async function runAi<T>(send: (route: Record<string, unknown>) => Promise<T>): Promise<T> {
-    const state = get({ subscribe });
-    if (state.manviClaude) {
-      const selection = effectiveSelection({
-        preferred: null,
-        ai: null,
-        manviClaude: state.manviClaude,
-      });
-      if (!selection || selection.provider !== "anthropic") {
-        throw new Error(
-          `"${state.manviClaude.model}" is not a Claude model id. Choose another in Manvi's settings.`,
-        );
-      }
-      return send({ provider: "anthropic", model: selection.model });
-    }
-    return withEndpointConsent((preferred) =>
-      send({ baseUrl: preferred?.base_url ?? null, model: preferred?.model ?? null }),
-    );
-  }
-
   let credentialToken = 0;
   /** Asks the backend which credential a Claude-selected Manvi would use. */
   async function refreshClaudeCredential(): Promise<void> {
@@ -836,15 +840,12 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       update((s) => ({ ...s, claudeCredential: { status, error: null } }));
     } catch (err: unknown) {
       if (token !== credentialToken) return;
-      const error = err instanceof Error ? err.message : String(err);
+      const error = formatDisplayFailure(err, "manvi");
       update((s) => ({ ...s, claudeCredential: { status: null, error } }));
     }
   }
 
   async function probeAi(token: number): Promise<AiStatus | null> {
-    // Every refresh path ends here, so a restored Claude choice, Refresh and
-    // Reconnect all re-ask the credential and clear a stale or stuck answer.
-    if (get({ subscribe }).manviClaude) void refreshClaudeCredential();
     const preferred = currentPreferred();
     update((s) => ({ ...s, isProbing: true }));
     try {
@@ -860,6 +861,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         isProbing: false,
         error: null,
       }));
+      // Cloud bills a credential GitPulse checks itself. Every refresh path
+      // (startup, Refresh, Reconnect, a change of mode) ends here, so a stale
+      // or stuck answer clears.
+      if (ai.manvi?.state === "ready" && ai.manvi.mode === "cloud") void refreshClaudeCredential();
       return ai;
     } catch (err: unknown) {
       if (token !== probeToken) return null;
@@ -871,6 +876,26 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       }));
       return null;
     }
+  }
+
+  /** `manvi use <mode>`; see `store.useManvi`. */
+  async function useManvi(
+    mode: "cloud" | "local",
+    options: { model?: string; baseUrl?: string } = {},
+  ): Promise<ManviStatus> {
+    const manvi = await invokeFn<ManviStatus>("cmd_manvi_use", {
+      mode,
+      model: options.model ?? null,
+      baseUrl: options.baseUrl ?? null,
+    });
+    update((s) => ({
+      ...s,
+      ai: s.ai ? { ...s.ai, manvi } : s.ai,
+      // A new choice invalidates the last credential answer.
+      claudeCredential: { status: null, error: null },
+    }));
+    void probeAi(++probeToken);
+    return manvi;
   }
 
   async function syncLedgerRun(run: LedgerRun): Promise<void> {
@@ -1032,23 +1057,33 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       return probeAi(token);
     },
 
-    selectModel: (selection: AiSelection | null) => {
+    /**
+     * Picks a local model. Saved as GitPulse's own selection (the loopback
+     * fallback uses it) and, when Manvi can be written, made Manvi's choice
+     * too: `manvi use local --base-url U --model M`. `null` (Automatic) only
+     * clears the saved selection; Manvi's config is left as it is.
+     */
+    selectModel: async (selection: AiSelection | null) => {
       savePreferred(selection);
       update((s) => ({ ...s, preferred: selection }));
+      if (selection && get({ subscribe }).ai?.manvi?.state === "ready") {
+        try {
+          await useManvi("local", { baseUrl: selection.base_url, model: selection.model });
+          return get({ subscribe }).ai;
+        } catch (err: unknown) {
+          update((s) => ({ ...s, error: statusFailure(err) }));
+        }
+      }
       return probeAi(++probeToken);
     },
 
-    /** Points Manvi at a Claude model, or back at the local selection with null. */
-    selectManviClaude: (choice: { model: string } | null) => {
-      saveManviClaude(choice);
-      // A new choice invalidates the last answer: not ready until re-checked.
-      update((s) => ({
-        ...s,
-        manviClaude: choice,
-        claudeCredential: { status: null, error: null },
-      }));
-      if (choice) void refreshClaudeCredential();
-    },
+    /**
+     * The one writer of Manvi's own choice (`manvi use cloud|local …`), called
+     * only from a person's action in the Manvi pane. The backend validates the
+     * shapes and retires the live worker; this re-reads status afterwards so
+     * every control shows what Manvi now says.
+     */
+    useManvi,
 
     /** Re-asks which Claude credential applies (after a fix in Settings). */
     refreshClaudeCredential,
@@ -1188,32 +1223,73 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
      */
     syncLedger,
 
-    generateCommitMessage: (repoPath: string): Promise<AiGeneration> =>
-      runAi((route) =>
-        invokeFn<AiGeneration>("cmd_ai_generate_commit_message", { repoPath, ...route }),
-      ),
+    // Where these go is the backend's call: Manvi's own choice (`manvi use`),
+    // through `work.assist.complete`, in either mode. `baseUrl`/`model` here
+    // are only what GitPulse's own loopback client needs when Manvi cannot be
+    // used; the consent flow below belongs to that fallback path alone.
+    generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_generate_commit_message", {
+          repoPath,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
+    },
 
-    explainCommit: (repoPath: string, commitId: string): Promise<AiGeneration> =>
-      runAi((route) =>
-        invokeFn<AiGeneration>("cmd_ai_explain_commit", { repoPath, commitId, ...route }),
-      ),
+    explainCommit: async (
+      repoPath: string,
+      commitId: string,
+    ): Promise<AiGeneration> => {
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_explain_commit", {
+          repoPath,
+          commitId,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
+    },
 
-    suggestBranchName: (repoPath: string): Promise<AiGeneration> =>
-      runAi((route) =>
-        invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", { repoPath, ...route }),
-      ),
+    suggestBranchName: async (repoPath: string): Promise<AiGeneration> => {
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", {
+          repoPath,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
+    },
 
     /** Turns a rendered dependency-health report into a remediation plan. */
-    fixHealth: (repoPath: string, report: string): Promise<AiGeneration> =>
-      runAi((route) =>
-        invokeFn<AiGeneration>("cmd_ai_fix_health", { repoPath, report, ...route }),
-      ),
+    fixHealth: async (
+      repoPath: string,
+      report: string,
+    ): Promise<AiGeneration> => {
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_fix_health", {
+          repoPath,
+          report,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
+    },
 
     /** Turns a rendered coverage report into an analysis by the selected model. */
-    coverageReport: (repoPath: string, report: string): Promise<AiGeneration> =>
-      runAi((route) =>
-        invokeFn<AiGeneration>("cmd_ai_coverage_report", { repoPath, report, ...route }),
-      ),
+    coverageReport: async (
+      repoPath: string,
+      report: string,
+    ): Promise<AiGeneration> => {
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_coverage_report", {
+          repoPath,
+          report,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
+    },
   };
 
   return store;

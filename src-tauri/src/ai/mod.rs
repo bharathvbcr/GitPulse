@@ -1,21 +1,23 @@
 //! GitPulse's own AI features: commit messages, commit explanations, branch
 //! names, health plans and coverage reports.
 //!
-//! By default they run against a model server on this machine (loopback). When
-//! the Manvi pane has chosen a Claude model ("cloud"), the caller passes a
-//! [`Route::Claude`] and the same features go to the Claude API through
-//! Manvi's `work.assist.complete` op instead. A request never goes to both: a
-//! Claude route never sweeps, probes or touches loopback, and a local route
-//! never reaches Manvi's cloud op. Commit messages are classified from the staged
+//! Manvi's own config decides what they run on (`manvi use`: cloud, meaning
+//! Claude through the Anthropic API, or a local model server), and in either
+//! mode they go through Manvi's `work.assist.complete` op as a
+//! [`Route::Manvi`]. That route never sweeps, probes or touches loopback from
+//! this process. GitPulse's own loopback client ([`Route::Local`]) is only the
+//! fallback for a Manvi that is not installed or lacks the op, and a request
+//! never goes both ways. Commit messages are classified from the staged
 //! patch first (`commit_brief`); a model only phrases that classification, and
 //! the classified text is the message when no model can be reached. The pieces
 //! are split three ways, and the split is the point:
 //!
 //! * `discovery` and `http` find the server and carry the request. Loopback
 //!   only — the transport itself refuses any other address, so a diff cannot
-//!   leave the machine through a mistyped setting. The Claude route does not
-//!   use them; it is the one deliberate way a diff leaves the machine, and
-//!   only after the user chose Claude for Manvi.
+//!   leave the machine through a mistyped setting. They are the fallback
+//!   path. When Manvi is on its cloud mode the request goes to the Claude API
+//!   through Manvi: that is the one deliberate way a diff leaves the machine,
+//!   and only after the user chose cloud in Manvi's config.
 //! * The MANVI harness answers the questions a host cannot answer for itself:
 //!   how large this model's context really is and where that number came from
 //!   (`capability.probe`), whether the assembled request fits (`chat.prepare`),
@@ -90,25 +92,23 @@ pub struct AiSelection {
     pub model: String,
 }
 
-/// The Manvi op that carries every Claude-routed request.
+/// The Manvi op that carries every Manvi-routed request, in both modes.
 pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";
 /// Manvi's own bounds on `work.assist.complete` input, mirrored so an oversized
 /// request is refused here instead of by the worker.
 const ASSIST_MAX_SYSTEM_BYTES: usize = 32_768;
 const ASSIST_MAX_USER_BYTES: usize = 2_097_152;
-/// What a Claude-routed generation reports as its destination.
-pub const CLAUDE_DESTINATION: &str = "Claude API via Manvi";
 /// What the user reads when Manvi predates the op.
-const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to use Claude for GitPulse's AI features.";
+pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to use Claude for GitPulse's AI features.";
 
 /// A failed `work.assist.complete` call: the worker's code and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloudError {
+pub struct ManviError {
     pub code: String,
     pub message: String,
 }
 
-impl CloudError {
+impl ManviError {
     /// The sentence shown to the user. A worker that does not serve the op gets
     /// the one clear update instruction instead of a transport message.
     fn user_message(&self) -> String {
@@ -117,39 +117,47 @@ impl CloudError {
         } else if self.code == "E_BUSY" {
             "Manvi is busy with two other AI requests; try again.".to_string()
         } else {
-            format!("Claude via Manvi: {}", self.message)
+            format!("Manvi: {}", self.message)
         }
     }
 }
 
-/// How a Claude-routed request reaches Manvi. The app wires the profile worker
+/// How a Manvi-routed request reaches Manvi. The app wires the profile worker
 /// in; a test wires a fake, so this module is testable without Manvi.
-pub type CloudComplete = Arc<dyn Fn(Value) -> Result<Value, CloudError> + Send + Sync>;
+pub type ManviComplete = Arc<dyn Fn(Value) -> Result<Value, ManviError> + Send + Sync>;
 
-/// The Claude route: the selected model id and the way to call Manvi.
+/// The Manvi route: what Manvi runs the request on, and the way to call it.
 #[derive(Clone)]
-pub struct CloudRoute {
+pub struct ManviRoute {
+    /// The model id the request is for.
     pub model: String,
-    pub complete: CloudComplete,
+    /// The provider Manvi must answer from: `anthropic` or `local`. A reply
+    /// from any other is refused rather than shown as this model's.
+    pub provider: &'static str,
+    /// Where a generation says it went ("Claude API via Manvi").
+    pub destination: String,
+    pub complete: ManviComplete,
 }
 
-impl std::fmt::Debug for CloudRoute {
+impl std::fmt::Debug for ManviRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CloudRoute")
+        f.debug_struct("ManviRoute")
             .field("model", &self.model)
+            .field("provider", &self.provider)
             .finish_non_exhaustive()
     }
 }
 
 /// Where one request goes. One value decides it, so no code path can choose
-/// both loopback and Claude.
+/// both Manvi and the loopback client.
 #[derive(Debug, Clone)]
 pub enum Route {
-    /// A model server on this machine; `None` means nothing was chosen and the
-    /// consent gate ([`resolve_target`]) applies.
+    /// GitPulse's own loopback client. Only the fallback for a Manvi that is
+    /// not installed or lacks `work.assist.complete`; `None` means nothing was
+    /// chosen and the consent gate ([`resolve_target`]) applies.
     Local(Option<AiSelection>),
-    /// Claude through Manvi's `work.assist.complete`.
-    Claude(CloudRoute),
+    /// Manvi's `work.assist.complete`, on whatever Manvi is set to run on.
+    Manvi(ManviRoute),
 }
 
 impl From<Option<AiSelection>> for Route {
@@ -158,9 +166,9 @@ impl From<Option<AiSelection>> for Route {
     }
 }
 
-impl From<CloudRoute> for Route {
-    fn from(cloud: CloudRoute) -> Self {
-        Route::Claude(cloud)
+impl From<ManviRoute> for Route {
+    fn from(cloud: ManviRoute) -> Self {
+        Route::Manvi(cloud)
     }
 }
 
@@ -177,6 +185,10 @@ pub struct AiStatus {
     /// True when a request could be made right now.
     pub ready: bool,
     pub detail: String,
+    /// What Manvi itself is set to run on (`manvi use`), which decides where
+    /// GitPulse's own AI features go. Independent of the loopback discovery
+    /// above, which is what applies when Manvi cannot be used.
+    pub manvi: crate::harness::manvi_use::ManviStatus,
 }
 
 /// The token budget a request went out under.
@@ -417,7 +429,29 @@ fn test_probe_override(base_url: &str, model: &str) -> Option<Result<ProbeResult
 }
 
 /// Discovers what is available, without sending a prompt anywhere.
-pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) -> AiStatus {
+///
+/// When Manvi is on its local mode with a server GitPulse can use, that server
+/// and model are what discovery checks (Manvi's choice replaces the caller's),
+/// so the readiness shown is the readiness of what Manvi would actually use.
+pub fn status(
+    explicit_base_url: Option<&str>,
+    preferred_model: Option<&str>,
+    manvi: crate::harness::manvi_use::ManviStatus,
+) -> AiStatus {
+    let manvi_local = manvi
+        .selection
+        .as_ref()
+        .filter(|_| manvi.state == "ready" && manvi.mode == "local")
+        .and_then(|wire| {
+            Some((
+                wire.get("base_url")?.as_str()?.to_string(),
+                wire.get("model")?.as_str()?.to_string(),
+            ))
+        });
+    let (explicit_base_url, preferred_model) = match &manvi_local {
+        Some((base_url, model)) => (Some(base_url.as_str()), Some(model.as_str())),
+        None => (explicit_base_url, preferred_model),
+    };
     let harness = HarnessStatus::probe();
     let endpoints = discovery::sweep(explicit_base_url);
     let chosen = discovery::choose(&endpoints, preferred_model);
@@ -466,6 +500,7 @@ pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) ->
         model_detail,
         ready,
         detail,
+        manvi,
     }
 }
 
@@ -660,7 +695,7 @@ fn run_with(
 ) -> Result<AiGeneration, CommandError> {
     match route {
         Route::Local(selection) => run_local(feature, repo_path, selection, build, sweep),
-        Route::Claude(cloud) => run_cloud(feature, &cloud, build),
+        Route::Manvi(cloud) => run_manvi(feature, &cloud, build),
     }
 }
 
@@ -711,10 +746,11 @@ struct AssistReply {
     output_tokens: i64,
 }
 
-fn assist_call(cloud: &CloudRoute, params: Value) -> Result<AssistReply, CommandError> {
+fn assist_call(cloud: &ManviRoute, params: Value) -> Result<AssistReply, CommandError> {
     let raw = (cloud.complete)(params).map_err(|e| CommandError::from(e.user_message()))?;
-    let reply: AssistReply = serde_json::from_value(raw)
-        .map_err(|e| CommandError::from(format!("Manvi returned an unreadable Claude reply: {e}")))?;
+    let reply: AssistReply = serde_json::from_value(raw).map_err(|e| {
+        CommandError::from(format!("Manvi returned an unreadable Claude reply: {e}"))
+    })?;
     if !reply.ok {
         return Err("Manvi did not accept the Claude request.".into());
     }
@@ -723,9 +759,9 @@ fn assist_call(cloud: &CloudRoute, params: Value) -> Result<AssistReply, Command
 
 /// The Claude route: capability first (no model call), then one real call.
 /// Never sweeps, probes or touches loopback; nothing here falls back to it.
-fn run_cloud(
+fn run_manvi(
     feature: Feature,
-    cloud: &CloudRoute,
+    cloud: &ManviRoute,
     build: impl Fn(usize) -> Result<Turn, String>,
 ) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
@@ -781,10 +817,10 @@ fn run_cloud(
             "max_output_tokens": max_output,
         }),
     )?;
-    if !reply.provider.is_empty() && reply.provider != "anthropic" {
+    if !reply.provider.is_empty() && reply.provider != cloud.provider {
         return Err(format!(
-            "Manvi answered from provider '{}', not Claude; the reply was not used.",
-            reply.provider
+            "Manvi answered from provider '{}' when {} was asked for; the reply was not used.",
+            reply.provider, cloud.provider
         )
         .into());
     }
@@ -812,9 +848,12 @@ fn run_cloud(
         } else {
             reply.model
         },
-        base_url: CLAUDE_DESTINATION.to_string(),
+        base_url: cloud.destination.clone(),
         context_window,
-        context_source: format!("{context_window} tokens (from Manvi's Claude adapter)"),
+        context_source: format!(
+            "{context_window} tokens (from Manvi's {} adapter)",
+            cloud.provider
+        ),
         prompt_tokens: reply.input_tokens,
         completion_tokens: reply.output_tokens,
         truncated,
@@ -1216,7 +1255,7 @@ fn read_staged_patch(repo_path: &str) -> Result<(Vec<u8>, bool), CommandError> {
 enum CommitEngine {
     Local(AiSelection),
     /// Claude through Manvi: chosen by the route, never by `choose_commit_engine`.
-    Cloud(CloudRoute),
+    Manvi(ManviRoute),
     OnDevice,
     Patch,
 }
@@ -1377,7 +1416,7 @@ fn generate_commit_message_with(
     let engine = match route {
         // The user chose Claude for Manvi: no sweep, no consent gate, no
         // loopback. A failed call falls back to the patch message below.
-        Route::Claude(cloud) => CommitEngine::Cloud(cloud),
+        Route::Manvi(cloud) => CommitEngine::Manvi(cloud),
         Route::Local(selection) => {
             let (explicit, on_device) = match resolve_target(selection, sweep)? {
                 Target::Confirmed(selection) => (Some(selection), false),
@@ -1408,9 +1447,9 @@ fn generate_commit_message_with(
             &diff,
             started,
         )),
-        CommitEngine::Cloud(cloud) => Ok(finish_with_model(
+        CommitEngine::Manvi(cloud) => Ok(finish_with_model(
             repo_path,
-            Route::Claude(cloud),
+            Route::Manvi(cloud),
             &draft,
             &style,
             &branch,
@@ -1434,22 +1473,17 @@ fn finish_with_model(
     started: Instant,
 ) -> AiGeneration {
     let destination = match &route {
-        Route::Local(_) => "The model",
-        Route::Claude(_) => "Claude",
+        Route::Local(_) => "The model".to_string(),
+        Route::Manvi(manvi) => manvi.destination.clone(),
     };
-    let outcome = run(
-        Feature::CommitMessage,
-        repo_path,
-        route,
-        |budget| {
-            let budgeted = prompt::budget_diff(diff, budget);
-            Ok(Turn {
-                system: prompt::commit_message_system(style),
-                user: prompt::commit_message_user(branch, &draft.brief, &budgeted.text),
-                diff: budgeted,
-            })
-        },
-    );
+    let outcome = run(Feature::CommitMessage, repo_path, route, |budget| {
+        let budgeted = prompt::budget_diff(diff, budget);
+        Ok(Turn {
+            system: prompt::commit_message_system(style),
+            user: prompt::commit_message_user(branch, &draft.brief, &budgeted.text),
+            diff: budgeted,
+        })
+    });
     match outcome {
         Ok(mut generation) => {
             match commit_brief::guard_local_message(&generation.text, draft) {
@@ -1795,8 +1829,8 @@ const LOCAL_SCAN_TIMEOUT_MS: i64 = 1_500;
 mod tests {
     use super::*;
 
-    mod cloud_tests;
     mod consent_adversarial_tests;
+    mod manvi_route_tests;
     use crate::procguard::LockedSpawn;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2125,7 +2159,11 @@ mod tests {
 
         let error = crate::ipc_error::run_command(|| {
             with_isolated_tools_config(|| {
-                generate_commit_message_with(&repo.path().to_string_lossy(), Route::Local(None), sweep)
+                generate_commit_message_with(
+                    &repo.path().to_string_lossy(),
+                    Route::Local(None),
+                    sweep,
+                )
             })
         })
         .expect_err("no preferred selection: the first send needs confirmation");
@@ -2674,7 +2712,12 @@ mod tests {
     /// discovery, no sidecar, no HTTP — with the coverage-specific error.
     #[test]
     fn coverage_report_rejects_a_whitespace_only_report_without_a_server() {
-        let err = coverage_report("/definitely/not/a/repository", "   \n\t ", None::<AiSelection>).unwrap_err();
+        let err = coverage_report(
+            "/definitely/not/a/repository",
+            "   \n\t ",
+            None::<AiSelection>,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "The coverage report is empty, so there is nothing to analyze."

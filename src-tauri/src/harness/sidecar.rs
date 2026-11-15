@@ -1360,6 +1360,22 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
         && withheld.is_some_and(|names| names.iter().any(|name| name == CLAUDE_KEY_ENV))
 }
 
+/// A one-shot `manvi <args>` the host asks a question with: the environment
+/// cleared and rebuilt from [`sidecar_ambient_env`] (the same set a worker
+/// gets, so a `MANVI_*` setting that would shadow Manvi's config is visible to
+/// the question), and run from the temp directory so no checkout's own
+/// settings are read. The one owner of that shape for `manvi version --json`
+/// and `manvi use`.
+pub(crate) fn manvi_probe_command(binary: &str, args: &[&str]) -> Command {
+    let mut probe = Command::new(binary);
+    probe.args(args).env_clear();
+    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
+        probe.env(name, value);
+    }
+    probe.current_dir(std::env::temp_dir());
+    probe
+}
+
 /// The Claude credential for a spawn of `binary`, or why it may not have one.
 ///
 /// Manvi runs a model-driven tool loop in a repository the user may not trust,
@@ -1374,12 +1390,7 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
 /// never a quiet fall back to GitPulse's own key, which may belong to another
 /// organisation.
 fn claude_credential_for(binary: &str) -> Result<ClaudeCredential, HarnessError> {
-    let mut probe = Command::new(binary);
-    probe.args(["version", "--json"]).env_clear();
-    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
-        probe.env(name, value);
-    }
-    probe.current_dir(std::env::temp_dir());
+    let probe = manvi_probe_command(binary, &["version", "--json"]);
     let run = crate::engine::git_cli::run_bounded_capped(
         probe,
         "manvi version",

@@ -804,25 +804,75 @@ impl WorkbenchState {
         self.call_worker(worker, method, params)
     }
 
-    /// The Claude route for GitPulse's own AI features: `work.assist.complete`
+    /// The Manvi route for GitPulse's own AI features: `work.assist.complete`
     /// on the SAME profile worker (and fingerprint) task enhancements use for
-    /// this model, so explaining a commit never retires a live enhancement
-    /// worker. Manvi serves the op on a lane of its own.
-    pub(crate) fn assist_route(&self, model: String) -> crate::ai::CloudRoute {
-        let state = self.clone();
-        let selection = crate::harness::sidecar::ModelSelection::Claude {
-            model: model.clone(),
+    /// this selection, so explaining a commit never retires a live enhancement
+    /// worker. Manvi serves the op on a lane of its own. The selection is
+    /// Manvi's own choice (`manvi use`), cloud or local.
+    pub(crate) fn assist_route(
+        &self,
+        selection: crate::harness::sidecar::ModelSelection,
+    ) -> crate::ai::ManviRoute {
+        use crate::harness::sidecar::ModelSelection;
+        let (model, provider, destination) = match &selection {
+            ModelSelection::Claude { model } => (
+                model.clone(),
+                "anthropic",
+                "Claude API via Manvi".to_string(),
+            ),
+            ModelSelection::Local { base_url, model } => (
+                model.clone(),
+                "local",
+                format!("Local model via Manvi ({base_url})"),
+            ),
         };
-        crate::ai::CloudRoute {
+        let state = self.clone();
+        crate::ai::ManviRoute {
             model,
+            provider,
+            destination,
             complete: std::sync::Arc::new(move |params| {
                 state
-                    .worker_call(crate::ai::OP_ASSIST_COMPLETE, params, Some(selection.clone()))
-                    .map_err(|e| crate::ai::CloudError {
+                    .worker_call(
+                        crate::ai::OP_ASSIST_COMPLETE,
+                        params,
+                        Some(selection.clone()),
+                    )
+                    .map_err(|e| crate::ai::ManviError {
                         code: e.code,
                         message: e.message,
                     })
             }),
+        }
+    }
+
+    /// Whether the worker for `selection` serves `work.assist.complete`
+    /// (its handshake lists the op). Builds that worker, which is the one the
+    /// call would use anyway. An error is the worker not starting (Manvi not
+    /// installed, a credential problem), never "the op is missing".
+    pub(crate) fn assist_served(
+        &self,
+        selection: &crate::harness::sidecar::ModelSelection,
+    ) -> Result<bool, WorkbenchError> {
+        let worker = self.worker(Some(selection.clone()))?;
+        let (_, hello) = worker
+            .handshake()
+            .map_err(|error| worker_error(&self.profile_label(), error))?;
+        Ok(crate::harness::sidecar::serves(
+            &hello,
+            crate::ai::OP_ASSIST_COMPLETE,
+        ))
+    }
+
+    /// Stops the live profile worker whatever it was spawned with, so the next
+    /// call spawns one for Manvi's choice as it is now. Called after the model
+    /// choice is written.
+    pub(crate) fn retire_worker(&self) {
+        let previous = crate::supervisor::lock_or_recover(&self.0.worker).take();
+        if let Some((_, worker)) = previous {
+            if !worker.retire() {
+                log::warn!(target: "workbench", "profile worker retire could not acquire the active request; it stops when that request ends");
+            }
         }
     }
 
@@ -1015,21 +1065,6 @@ struct ConfigurationInput {
 struct HostControl {
     params: Value,
     selection: Option<crate::harness::sidecar::ModelSelection>,
-}
-
-/// The one parser for a selection that arrives as loose parts, for the AI
-/// commands (`cmd_ai_*`) that carry `provider`, `base_url` and `model` as
-/// separate arguments. Same rules as the workbench's own `model` object.
-pub(crate) fn parse_model_selection_parts(
-    provider: Option<String>,
-    base_url: Option<String>,
-    model: Option<String>,
-) -> Result<Option<crate::harness::sidecar::ModelSelection>, WorkbenchError> {
-    parse_model_selection(model.map(|model| ModelSelectionInput {
-        provider,
-        base_url,
-        model,
-    }))
 }
 
 fn parse_model_selection(
@@ -1565,33 +1600,6 @@ mod tests {
         ] {
             assert_eq!(
                 generation_input("enhancements.wake", input)
-                    .unwrap_err()
-                    .code,
-                "invalid_input"
-            );
-        }
-    }
-
-    /// The AI commands' loose `provider`/`base_url`/`model` arguments go through
-    /// the same parser as the workbench's `model` object, so the two cannot
-    /// disagree about what a Claude selection is.
-    #[test]
-    fn ai_command_selection_parts_use_the_one_parser() {
-        let s = |v: &str| Some(v.to_string());
-        assert_eq!(
-            crate::workbench::parse_model_selection_parts(s("anthropic"), None, s("claude-sonnet-5-5")).unwrap(),
-            Some(crate::harness::sidecar::ModelSelection::Claude {
-                model: "claude-sonnet-5-5".into()
-            })
-        );
-        assert_eq!(crate::workbench::parse_model_selection_parts(s("anthropic"), None, None).unwrap(), None);
-        for (provider, base_url, model) in [
-            (s("anthropic"), s("http://127.0.0.1:1/v1"), s("claude-x")),
-            (s("anthropic"), None, s("gpt-5")),
-            (s("openai"), None, s("claude-x")),
-        ] {
-            assert_eq!(
-                crate::workbench::parse_model_selection_parts(provider, base_url, model)
                     .unwrap_err()
                     .code,
                 "invalid_input"

@@ -246,11 +246,14 @@ flowchart TD
 - Built-in local AI completions (commit messages, explanations and branch names)
   and local model probes restrict their transport to loopback addresses
   (`127.0.0.1`, `localhost`, `[::1]`); remote base URLs are rejected on that path.
-- When the Manvi pane has chosen a Claude model, the same features are sent to the
-  Claude API through Manvi's `work.assist.complete` instead; that route never sweeps,
-  probes or falls back to loopback, and a local selection never reaches it. Manvi does
-  not redact the prompt (`redactions` is always 0), so the staged diff or commit goes
-  as GitPulse built it.
+- Manvi's own config (`manvi use --json`) owns the local/cloud switch. In both modes
+  the same features go through Manvi's `work.assist.complete`; that route never
+  sweeps, probes or falls back to loopback after a failed call. In cloud mode the
+  request reaches the Claude API. Manvi does not redact the prompt (`redactions` is
+  always 0), so the staged diff or commit goes as GitPulse built it. GitPulse's own
+  loopback client (and its consent flow) is used only when Manvi is not installed or
+  lacks the op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
+  `manvi use cloud|local` only on a human action in the Manvi pane.
 - Commit messages are classified in the app from the staged patch. When no
   loopback model is selected, a supported Mac may ask Apple Intelligence only
   for the subject, and only from that classified brief — the patch itself is

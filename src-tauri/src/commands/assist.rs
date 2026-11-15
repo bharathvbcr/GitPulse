@@ -5,10 +5,16 @@ use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_ai_status(base_url: Option<String>, model: Option<String>) -> crate::ai::AiStatus {
-    // Endpoint discovery probes local HTTP servers with real timeouts.
+    // Asking Manvi what it runs on spawns it, and endpoint discovery probes
+    // local HTTP servers with real timeouts.
     off_thread(move || {
-        Ok::<_, String>(crate::ai::status(base_url.as_deref(), model.as_deref()))
-            .map_err(CommandError::from)
+        let manvi = crate::harness::manvi_use::read();
+        Ok::<_, String>(crate::ai::status(
+            base_url.as_deref(),
+            model.as_deref(),
+            manvi,
+        ))
+        .map_err(CommandError::from)
     })
     .await
     .map_err(|e| e.message)
@@ -20,7 +26,36 @@ pub async fn cmd_ai_status(base_url: Option<String>, model: Option<String>) -> c
         model_detail: String::new(),
         ready: false,
         detail: e.to_string(),
+        manvi: crate::harness::manvi_use::ManviStatus {
+            state: "failed".into(),
+            detail: e.to_string(),
+            ..Default::default()
+        },
     })
+}
+
+/// Changes what Manvi runs on (`manvi use cloud|local …`), the one writer of
+/// that choice, and answers what Manvi now reports. Human-initiated: only the
+/// Manvi pane's model controls call it, never a background path. The shapes
+/// are checked before Manvi is asked ([`crate::harness::manvi_use::validate`]):
+/// a `claude-` model id for cloud; a loopback base URL and a plain model id
+/// for local. The live profile worker is retired so the next call spawns for
+/// the new choice.
+#[tauri::command(async)]
+pub async fn cmd_manvi_use(
+    mode: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<crate::harness::manvi_use::ManviStatus, IpcError> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let status =
+            crate::harness::manvi_use::write(&mode, model.as_deref(), base_url.as_deref())?;
+        workbench.retire_worker();
+        Ok(status)
+    })
+    .await
 }
 
 /// Whether Apple Intelligence can write a task on this Mac, and if not, why.
@@ -80,135 +115,385 @@ pub(super) fn selection(
     }
 }
 
+/// Where one AI request goes, and why it did not go where Manvi says when it
+/// did not.
+///
+/// Manvi's own config decides (`manvi use`): in either mode the request goes
+/// through Manvi's `work.assist.complete` on the worker for that selection,
+/// the same worker task enhancements use. GitPulse's own loopback client
+/// ([`Route::Local`], with the caller's saved selection and the consent gate)
+/// is only the fallback for a Manvi that is not installed, has no `manvi use`,
+/// or lacks the op in local mode, and the reason comes back as a warning to
+/// put on the result. A mode GitPulse cannot use, a cloud Manvi without the
+/// op, and any other failure to start the worker are errors, never a quiet
+/// move to loopback.
+pub(super) fn resolve_route(
+    status: &crate::harness::manvi_use::ManviStatus,
+    served: impl FnOnce(&crate::harness::sidecar::ModelSelection) -> Result<bool, (String, String)>,
+    manvi_route: impl FnOnce(crate::harness::sidecar::ModelSelection) -> crate::ai::ManviRoute,
+    fallback: Option<crate::ai::AiSelection>,
+) -> Result<(crate::ai::Route, Option<String>), String> {
+    use crate::ai::Route;
+    let fall_back = |why: String| {
+        Ok((
+            Route::Local(fallback.clone()),
+            Some(format!(
+                "{why} GitPulse used its own connection to a local model server instead."
+            )),
+        ))
+    };
+    match status.state.as_str() {
+        "ready" => {}
+        "not_installed" | "needs_update" | "failed" => return fall_back(status.detail.clone()),
+        other => return Err(format!("Manvi reported an unknown state `{other}`.")),
+    }
+    let Some(selection) = status.typed.clone() else {
+        return Err(status.unsupported.clone());
+    };
+    let cloud = status.mode == "cloud";
+    match served(&selection) {
+        Ok(true) => Ok((Route::Manvi(manvi_route(selection)), None)),
+        Ok(false) if cloud => Err(crate::ai::OLD_MANVI_MESSAGE.to_string()),
+        Ok(false) => fall_back(
+            "This Manvi does not offer work.assist.complete (update Manvi to send local-model requests through it)."
+                .into(),
+        ),
+        Err((code, message)) if code == "not_installed" && !cloud => fall_back(message),
+        Err((_, message)) => Err(message),
+    }
+}
 
-/// Where one AI request goes. `provider` `None` or `"local"` is today's
-/// behavior exactly: the saved loopback selection (or the consent gate when
-/// there is none). Anything else goes through the workbench's one selection
-/// parser, so a Claude choice means what it means for task enhancements (no
-/// `base_url`, a `claude-` model id) and is carried by the same profile worker.
-pub(super) fn route(
-    provider: Option<String>,
+/// [`resolve_route`] for the running app: reads Manvi's choice and asks the
+/// workbench's worker for that selection whether it serves the op.
+fn route_for(
     base_url: Option<String>,
     model: Option<String>,
     workbench: &crate::workbench::WorkbenchState,
-) -> Result<crate::ai::Route, IpcError> {
-    if matches!(provider.as_deref(), None | Some("local")) {
-        return Ok(crate::ai::Route::Local(selection(base_url, model)));
-    }
-    match crate::workbench::parse_model_selection_parts(provider, base_url, model) {
-        Ok(Some(crate::harness::sidecar::ModelSelection::Claude { model })) => {
-            Ok(crate::ai::Route::Claude(workbench.assist_route(model)))
+) -> Result<(crate::ai::Route, Option<String>), CommandError> {
+    let status = crate::harness::manvi_use::read();
+    resolve_route(
+        &status,
+        |selection| {
+            workbench
+                .assist_served(selection)
+                .map_err(|e| (e.code, e.message))
+        },
+        |selection| workbench.assist_route(selection),
+        selection(base_url, model),
+    )
+    .map_err(CommandError::from)
+}
+
+/// Puts the reason for a fallback at the head of a result's warnings.
+fn with_route_warning(
+    result: Result<crate::ai::AiGeneration, CommandError>,
+    warning: Option<String>,
+) -> Result<crate::ai::AiGeneration, CommandError> {
+    result.map(|mut generation| {
+        if let Some(warning) = warning {
+            generation.warnings.insert(0, warning);
         }
-        Ok(_) => Err("A model is required for a Claude selection.".into()),
-        Err(error) => Err(error.message.into()),
-    }
+        generation
+    })
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_generate_commit_message(
     repo_path: String,
-    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    let route = route(provider, base_url, model, workbench.inner())?;
-    off_thread(move || crate::ai::generate_commit_message(&repo_path, route)).await
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let (route, warning) = route_for(base_url, model, &workbench)?;
+        with_route_warning(
+            crate::ai::generate_commit_message(&repo_path, route),
+            warning,
+        )
+    })
+    .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_explain_commit(
     repo_path: String,
     commit_id: String,
-    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    let route = route(provider, base_url, model, workbench.inner())?;
-    off_thread(move || crate::ai::explain_commit(&repo_path, &commit_id, route)).await
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let (route, warning) = route_for(base_url, model, &workbench)?;
+        with_route_warning(
+            crate::ai::explain_commit(&repo_path, &commit_id, route),
+            warning,
+        )
+    })
+    .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_fix_health(
     repo_path: String,
     report: String,
-    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    let route = route(provider, base_url, model, workbench.inner())?;
-    off_thread(move || crate::ai::fix_health(&repo_path, &report, route)).await
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let (route, warning) = route_for(base_url, model, &workbench)?;
+        with_route_warning(crate::ai::fix_health(&repo_path, &report, route), warning)
+    })
+    .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_coverage_report(
     repo_path: String,
     report: String,
-    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    let route = route(provider, base_url, model, workbench.inner())?;
-    off_thread(move || crate::ai::coverage_report(&repo_path, &report, route)).await
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let (route, warning) = route_for(base_url, model, &workbench)?;
+        with_route_warning(
+            crate::ai::coverage_report(&repo_path, &report, route),
+            warning,
+        )
+    })
+    .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_ai_suggest_branch_name(
     repo_path: String,
-    provider: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    let route = route(provider, base_url, model, workbench.inner())?;
-    off_thread(move || crate::ai::suggest_branch_name(&repo_path, route)).await
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        let (route, warning) = route_for(base_url, model, &workbench)?;
+        with_route_warning(crate::ai::suggest_branch_name(&repo_path, route), warning)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod assist_tests {
     use super::*;
     use crate::ai::Route;
+    use crate::harness::manvi_use::ManviStatus;
+    use crate::harness::sidecar::ModelSelection;
+    use std::sync::Arc;
 
-    fn pick(
-        provider: Option<&str>,
-        base_url: Option<&str>,
-        model: Option<&str>,
-    ) -> Result<Route, IpcError> {
-        route(
-            provider.map(str::to_string),
-            base_url.map(str::to_string),
-            model.map(str::to_string),
-            &crate::workbench::WorkbenchState::default(),
-        )
-    }
-
-    #[test]
-    fn no_provider_or_local_keeps_todays_loopback_behavior() {
-        for provider in [None, Some("local")] {
-            match pick(provider, Some("http://127.0.0.1:11434/v1"), Some("qwen")).unwrap() {
-                Route::Local(Some(selection)) => assert_eq!(selection.model, "qwen"),
-                other => panic!("expected a local selection, got {other:?}"),
+    fn ready(mode: &str, typed: Option<ModelSelection>) -> ManviStatus {
+        ManviStatus {
+            state: "ready".into(),
+            mode: mode.into(),
+            provider: if mode == "cloud" {
+                "anthropic"
+            } else {
+                "local"
             }
-            assert!(matches!(pick(provider, None, None).unwrap(), Route::Local(None)));
+            .into(),
+            unsupported: if typed.is_none() {
+                "unsupported mode".into()
+            } else {
+                String::new()
+            },
+            typed,
+            ..Default::default()
+        }
+    }
+
+    fn claude() -> ModelSelection {
+        ModelSelection::Claude {
+            model: "claude-sonnet-5-5".into(),
+        }
+    }
+
+    fn local() -> ModelSelection {
+        ModelSelection::Local {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen3".into(),
+        }
+    }
+
+    fn fake_route(selection: ModelSelection) -> crate::ai::ManviRoute {
+        let (model, provider) = match selection {
+            ModelSelection::Claude { model } => (model, "anthropic"),
+            ModelSelection::Local { model, .. } => (model, "local"),
+        };
+        crate::ai::ManviRoute {
+            model,
+            provider,
+            destination: "via Manvi".into(),
+            complete: Arc::new(|_| {
+                Err(crate::ai::ManviError {
+                    code: "x".into(),
+                    message: "x".into(),
+                })
+            }),
+        }
+    }
+
+    fn fallback() -> Option<crate::ai::AiSelection> {
+        Some(crate::ai::AiSelection {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "saved".into(),
+        })
+    }
+
+    #[test]
+    fn local_mode_routes_to_assist_complete_and_never_to_the_loopback_client() {
+        let (route, warning) = resolve_route(
+            &ready("local", Some(local())),
+            |_| Ok(true),
+            fake_route,
+            fallback(),
+        )
+        .unwrap();
+        match route {
+            Route::Manvi(manvi) => {
+                assert_eq!((manvi.provider, manvi.model.as_str()), ("local", "qwen3"))
+            }
+            other => panic!("expected the Manvi route, got {other:?}"),
+        }
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn cloud_mode_routes_to_assist_complete_with_the_claude_selection() {
+        let (route, _) = resolve_route(
+            &ready("cloud", Some(claude())),
+            |_| Ok(true),
+            fake_route,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(route, Route::Manvi(m) if m.provider == "anthropic"));
+    }
+
+    #[test]
+    fn a_local_manvi_without_the_op_falls_back_with_a_warning_naming_why() {
+        let (route, warning) = resolve_route(
+            &ready("local", Some(local())),
+            |_| Ok(false),
+            fake_route,
+            fallback(),
+        )
+        .unwrap();
+        assert!(matches!(route, Route::Local(Some(s)) if s.model == "saved"));
+        let warning = warning.unwrap();
+        assert!(warning.contains("work.assist.complete"), "{warning}");
+        assert!(warning.contains("its own connection"), "{warning}");
+    }
+
+    #[test]
+    fn a_cloud_manvi_without_the_op_is_an_error_not_a_loopback_fallback() {
+        let error = resolve_route(
+            &ready("cloud", Some(claude())),
+            |_| Ok(false),
+            fake_route,
+            fallback(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, crate::ai::OLD_MANVI_MESSAGE);
+    }
+
+    #[test]
+    fn manvi_not_installed_or_without_use_falls_back_naming_why() {
+        for (state, detail) in [
+            (
+                "not_installed",
+                "Manvi is not installed, so its model choice cannot be read.",
+            ),
+            (
+                "needs_update",
+                "This Manvi has no working `manvi use --json`. Update Manvi.",
+            ),
+            ("failed", "Could not ask Manvi: timed out"),
+        ] {
+            let status = ManviStatus {
+                state: state.into(),
+                detail: detail.into(),
+                ..Default::default()
+            };
+            let (route, warning) = resolve_route(
+                &status,
+                |_| panic!("no worker is asked when Manvi cannot be read"),
+                fake_route,
+                fallback(),
+            )
+            .unwrap();
+            assert!(matches!(route, Route::Local(Some(_))), "{state}");
+            assert!(warning.unwrap().starts_with(detail), "{state}");
         }
     }
 
     #[test]
-    fn a_claude_choice_routes_to_manvi_and_never_to_loopback() {
-        match pick(Some("anthropic"), None, Some("claude-sonnet-5-5")).unwrap() {
-            Route::Claude(cloud) => assert_eq!(cloud.model, "claude-sonnet-5-5"),
-            other => panic!("expected the Claude route, got {other:?}"),
-        }
+    fn a_worker_that_cannot_start_is_an_error_in_cloud_and_a_fallback_only_when_not_installed() {
+        let cloud = ready("cloud", Some(claude()));
+        let error = resolve_route(
+            &cloud,
+            |_| Err(("unavailable".into(), "no key".into())),
+            fake_route,
+            fallback(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "no key");
+        let cloud_missing = resolve_route(
+            &cloud,
+            |_| Err(("not_installed".into(), "gone".into())),
+            fake_route,
+            fallback(),
+        );
+        assert!(cloud_missing.is_err(), "cloud never falls back to loopback");
+
+        let local_status = ready("local", Some(local()));
+        let (route, warning) = resolve_route(
+            &local_status,
+            |_| Err(("not_installed".into(), "Manvi is not installed.".into())),
+            fake_route,
+            fallback(),
+        )
+        .unwrap();
+        assert!(matches!(route, Route::Local(_)));
+        assert!(warning.unwrap().starts_with("Manvi is not installed."));
+        let other = resolve_route(
+            &local_status,
+            |_| Err(("busy".into(), "busy".into())),
+            fake_route,
+            fallback(),
+        );
+        assert!(other.is_err());
     }
 
     #[test]
-    fn a_claude_choice_that_names_an_endpoint_or_a_non_claude_model_is_refused() {
-        assert!(pick(Some("anthropic"), Some("http://127.0.0.1:1/v1"), Some("claude-x")).is_err());
-        assert!(pick(Some("anthropic"), None, Some("gpt-5")).is_err());
-        assert!(pick(Some("anthropic"), None, None).is_err());
-        assert!(pick(Some("openai"), None, Some("claude-x")).is_err());
+    fn a_mode_gitpulse_cannot_use_is_an_error() {
+        let error = resolve_route(&ready("other", None), |_| Ok(true), fake_route, fallback())
+            .err()
+            .unwrap();
+        assert_eq!(error, "unsupported mode");
+    }
+
+    #[test]
+    fn the_saved_loopback_selection_is_read_as_before() {
+        let some = selection(
+            Some("http://127.0.0.1:11434/v1".into()),
+            Some("qwen".into()),
+        )
+        .unwrap();
+        assert_eq!(some.model, "qwen");
+        assert!(selection(None, None).is_none());
+        assert!(selection(Some(String::new()), Some("m".into())).is_none());
     }
 }
