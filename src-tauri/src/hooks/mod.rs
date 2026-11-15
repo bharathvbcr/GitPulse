@@ -2029,9 +2029,10 @@ fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
                 // (paths from the repository root, no `cd`), so the next
                 // command is judged rather than waved through again.
                 additional_context: Some(format!(
-                    "{note} To have GitPulse judge commands, run them from the repository \
-                     root with root-relative paths instead of changing directory, and write \
-                     file contents with the editing tools rather than heredocs."
+                    "{note} To have GitPulse judge commands, run from the repository root with \
+                     root-relative paths or `git -C <registered-worktree>` instead of changing \
+                     directory, read files with `jq`, `cat`, `head`, or `sed -n`, and write file \
+                     contents with the editing tools rather than heredocs."
                 )),
             }),
             system_message: Some(note),
@@ -2183,7 +2184,34 @@ fn command_gate_call(
 /// when a scope applies, because there is only this.
 pub(crate) fn judge_command(lane: harness::Lane, cwd: &str, command: &str) -> ScopedVerdict {
     match find_git_root(Path::new(cwd)) {
-        Some(root) => harness::check_command_in_scope(lane, &root.to_string_lossy(), command),
+        Some(root) => {
+            if harness::has_divergent_relative_git_c(Path::new(cwd), &root, command) {
+                return ScopedVerdict {
+                    bound: false,
+                    unscoped: None,
+                    verdict: harness::PolicyVerdict {
+                        status: PolicyStatus::Blocked,
+                        checked: false,
+                        target: command.to_string(),
+                        rule: "command.directory_change".to_string(),
+                        severity: "hard".to_string(),
+                        reason: "`git -C` with a relative path from a subdirectory does not match \
+                                 the repository root; run from the repository root or pass \
+                                 `git -C <absolute-registered-worktree>`."
+                            .to_string(),
+                        demoted: String::new(),
+                        grant_id: String::new(),
+                        granted_by: String::new(),
+                        widened: String::new(),
+                        degraded: Vec::new(),
+                        task_id: String::new(),
+                        detail: String::new(),
+                        detail_code: String::new(),
+                    },
+                };
+            }
+            harness::check_command_in_scope(lane, &root.to_string_lossy(), command)
+        }
         None => ScopedVerdict {
             verdict: harness::policy::check_command_on(lane, cwd, command, None, &[]),
             bound: false,
@@ -6067,6 +6095,64 @@ mod tests {
                 "{rule}: the reason's own full stop was doubled: {note:?}"
             );
         }
+
+        let dir_ctx = decide_in(&unreadable("command.directory_change"), false)
+            .hook_specific_output
+            .unwrap()
+            .additional_context
+            .unwrap();
+        assert!(
+            dir_ctx.contains("git -C"),
+            "directory_change hint must name git -C: {dir_ctx}"
+        );
+        assert!(!dir_ctx.contains(".."), "{dir_ctx}");
+
+        let op_ctx = decide_in(&unreadable("command.operand.unverifiable"), false)
+            .hook_specific_output
+            .unwrap()
+            .additional_context
+            .unwrap();
+        assert!(
+            op_ctx.contains("jq") && op_ctx.contains("cat") && op_ctx.contains("sed -n"),
+            "operand.unverifiable hint must name judged readers: {op_ctx}"
+        );
+        assert!(!op_ctx.contains(".."), "{op_ctx}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_command_from_subdirectory_rejects_relative_git_c_divergence() {
+        use crate::test_support::git_in;
+        let base = tempfile::tempdir().expect("tempdir");
+        let main = base.path().join("main");
+        let wt_b = base.path().join("wt-b");
+        std::fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        std::fs::write(main.join("seed.txt"), "seed").unwrap();
+        git_in(&main, &["add", "seed.txt"]);
+        git_in(&main, &["commit", "-m", "seed"]);
+        git_in(
+            &main,
+            &["worktree", "add", "-b", "feat", wt_b.to_str().unwrap()],
+        );
+        let sub = main.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_wt = main.join("wt-b");
+        std::fs::create_dir_all(&sub_wt).unwrap();
+
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_manvi(base.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+
+        let judged = judge_command(
+            harness::Lane::Shared,
+            &sub.to_string_lossy(),
+            "git -C ../wt-b status",
+        );
+        assert!(
+            judged.verdict.blocks() && judged.verdict.rule == "command.directory_change",
+            "relative -C from subdirectory must refuse instead of resolving against repo root: {judged:?}"
+        );
+        assert!(!judged.verdict.reason.contains(".."), "{judged:?}");
     }
 
     /// What does not soften. A declared task scope is a person asking for
