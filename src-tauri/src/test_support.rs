@@ -209,8 +209,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         && dir.join(".githooks/pre-commit").is_file()
     {
         panic!(
-            "refusing to persist {} in {}; this checkout rejects fixture identities",
-            args[1],
+            "refusing to persist a fixture identity in {}; this checkout rejects it",
             dir.display()
         );
     }
@@ -240,8 +239,8 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "git {args:?} failed with {}",
+        output.status
     );
     if args.first() == Some(&"init") {
         trust_repo(&dir);

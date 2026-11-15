@@ -685,7 +685,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
                 .unwrap()
                 .get(id)
                 .is_some_and(|marks| !marks.is_empty())),
-            "session {id} never reported its tty raw"
+            "a session never reported its tty raw"
         );
     };
     let echo = || {

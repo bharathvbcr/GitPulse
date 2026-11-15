@@ -564,7 +564,7 @@ fn transcript_text(
             String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
             tail,
         ),
-        other => panic!("expected a transcript for {session}, got {other:?}"),
+        _other => panic!("expected a transcript, got another read"),
     }
 }
 
