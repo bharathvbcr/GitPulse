@@ -2269,6 +2269,39 @@
     ],
     "type": "object"
   },
+  "gitpulse_turn_checkpoints": {
+    "additionalProperties": false,
+    "properties": {
+      "against": {
+        "description": "With `id`: another of this worktree's checkpoint ids to compare against, instead of the checkpoint's parent commit",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "id": {
+        "description": "A checkpoint id from the list (the digits of its stamp). With it, returns that checkpoint's patch instead of the list",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum number of checkpoints listed (default 20, max 50)",
+        "maximum": 50,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_worktree_claim": {
     "additionalProperties": false,
     "properties": {

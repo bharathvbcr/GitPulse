@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -4069,6 +4070,17 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
 //   `user.email`, `commit.gpgsign=false`) and cap/expiry eviction deletes refs via
 //   `git update-ref -d` without ever modifying `.git/config`.
 
+/// Identity flags for objects GitPulse writes on its own behalf (op-log
+/// snapshots, turn checkpoints): inline `-c`, never `.git/config`.
+pub(crate) const SNAPSHOT_IDENTITY_ARGS: [&str; 6] = [
+    "-c",
+    "user.name=GitPulse",
+    "-c",
+    "user.email=gitpulse@local",
+    "-c",
+    "commit.gpgsign=false",
+];
+
 /// Ref prefix under which pre-op agent snapshots are stored.
 pub const OP_REF_PREFIX: &str = "refs/gitpulse/ops/";
 /// Maximum number of retained snapshots per repository before oldest are evicted.
@@ -4159,7 +4171,7 @@ struct LiveRefRow {
     commit_oid: Option<String>,
 }
 
-fn absent_oid_for_len(oid_len: usize) -> &'static str {
+pub(crate) fn absent_oid_for_len(oid_len: usize) -> &'static str {
     if oid_len == 64 {
         "0000000000000000000000000000000000000000000000000000000000000000"
     } else {
@@ -4426,16 +4438,60 @@ fn take_injected_op_snapshot_failure(repo: &Path) -> Option<String> {
     Some(guard.remove(pos).1)
 }
 
+/// The moment an op snapshot's asker stops waiting, read from a clock that a
+/// test can script. The asker lets its git write run at that moment, so state
+/// captured at or after it may already include the write.
+#[derive(Clone, Copy)]
+pub(crate) struct AskerDeadline {
+    expires_at: Instant,
+    now: fn() -> Instant,
+}
+
+impl AskerDeadline {
+    /// `budget` from `start`, on the real clock.
+    pub(crate) fn new(start: Instant, budget: Duration) -> Self {
+        Self {
+            expires_at: start + budget,
+            now: Instant::now,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
+        Self { expires_at, now }
+    }
+
+    /// The instant itself counts as passed: the asker's read deadline fires at
+    /// exactly the budget, so an answer at that instant is already unwanted.
+    fn has_passed(&self) -> bool {
+        (self.now)() >= self.expires_at
+    }
+}
+
+/// What an op snapshot's asker told the app: the request's id, which ties every
+/// ledger row for one write together, and the deadline it will stop waiting at.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OpAsk<'a> {
+    pub(crate) request_id: Option<&'a str>,
+    pub(crate) deadline: Option<AskerDeadline>,
+}
+
+/// The failure an app answers when the asker's deadline passed before the state
+/// to snapshot was captured. No ref and no snapshotted row exist for it.
+pub(crate) const OP_DEADLINE_PASSED: &str =
+    "the asker's op-snapshot deadline passed before the repository state was captured; no snapshot was recorded";
+
 impl GitWriter {
     /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
     /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
-    pub fn record_op_snapshot(
+    pub(crate) fn record_op_snapshot(
         repo_path: &str,
         command: &str,
         session_id: Option<&str>,
         task_id: Option<&str>,
+        ask: &OpAsk<'_>,
     ) -> Result<OpSnapshotSummary, CommandError> {
-        Self::record_op_snapshot_with_limits(
+        Self::record_op_snapshot_with_limits_asked(
             repo_path,
             command,
             session_id,
@@ -4443,10 +4499,12 @@ impl GitWriter {
             crate::ledger::ids::now_millis(),
             MAX_OPS,
             OP_EXPIRY_SECS,
+            ask,
         )
     }
 
-    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits.
+    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits,
+    /// for a caller with no asker waiting on it.
     pub fn record_op_snapshot_with_limits(
         repo_path: &str,
         command: &str,
@@ -4456,6 +4514,41 @@ impl GitWriter {
         max_ops: usize,
         expiry_secs: u64,
     ) -> Result<OpSnapshotSummary, CommandError> {
+        Self::record_op_snapshot_with_limits_asked(
+            repo_path,
+            command,
+            session_id,
+            task_id,
+            now_ms,
+            max_ops,
+            expiry_secs,
+            &OpAsk::default(),
+        )
+    }
+
+    /// The snapshot itself, for an asker that may have stopped waiting.
+    ///
+    /// The rule: a snapshot is a true pre-op state only if its state was
+    /// captured before the asker's deadline, because at the deadline the asker
+    /// lets its git write run. So the deadline is checked before the lock, after
+    /// the lock is acquired, and again once the state has been read and
+    /// immediately before the ref is written. A pass at any of them writes no
+    /// ref and no snapshotted row and answers [`OP_DEADLINE_PASSED`]. A ref
+    /// whose state was captured in time is a valid pre-op snapshot even if its
+    /// write finishes a moment past the deadline, and is kept as a normal one;
+    /// there are no late-marked refs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_op_snapshot_with_limits_asked(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        now_ms: u64,
+        max_ops: usize,
+        expiry_secs: u64,
+        ask: &OpAsk<'_>,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        let deadline_passed = || ask.deadline.is_some_and(|deadline| deadline.has_passed());
         if command.trim().is_empty() {
             return Err("Operation command must not be empty".into());
         }
@@ -4464,10 +4557,19 @@ impl GitWriter {
         if let Some(reason) = take_injected_op_snapshot_failure(&repo) {
             return Err(reason.into());
         }
+        // Cheap early refusal: no lock to wait for, no state to read.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
         let lock = repo_mutation_lock(&repo);
         let _guard = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lock may have been held by another write for as long as it took
+        // for the asker to give up.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
 
         let head_ref = read_head_symbolic_ref(&repo)?;
         let head_oid = read_head_oid(&repo)?;
@@ -4519,16 +4621,11 @@ impl GitWriter {
             }
         }
 
-        let mut args: Vec<String> = vec![
-            "-c".into(),
-            "user.name=GitPulse".into(),
-            "-c".into(),
-            "user.email=gitpulse@local".into(),
-            "-c".into(),
-            "commit.gpgsign=false".into(),
-            "commit-tree".into(),
-            tree_oid,
-        ];
+        let mut args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .chain(["commit-tree".to_string(), tree_oid])
+            .collect();
         for p in &parents {
             args.push("-p".into());
             args.push(p.clone());
@@ -4549,6 +4646,13 @@ impl GitWriter {
             .to_string();
         validate_oid(&snapshot_oid)?;
 
+        // The state was read above. If the asker has stopped waiting, its write
+        // may already have changed the repository, so what was read is not a
+        // pre-op state: leave the commit object unreferenced (git gc collects
+        // it) and write no ref.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
         let ref_run = git_captured(&repo, &["update-ref", &op_ref, &snapshot_oid, absent_oid])?;
         if !ref_run.success {
             return Err(format!(
@@ -4559,7 +4663,20 @@ impl GitWriter {
         }
 
         let keep = if max_ops > 0 { Some(next_seq) } else { None };
-        prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep)?;
+        // The ref is durable now, so the snapshot exists whatever retention
+        // does next: a failed prune is reported on the snapshot's own ledger
+        // row, never as a failed snapshot.
+        let prune_error =
+            match prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep) {
+                Ok(_) => None,
+                Err(err) => {
+                    log::warn!(
+                        "op snapshot {op_ref} was recorded but retention pruning failed: {}",
+                        err.message()
+                    );
+                    Some(err.message().to_string())
+                }
+            };
 
         crate::ledger::record_op_snapshot_event(
             repo_path,
@@ -4571,6 +4688,8 @@ impl GitWriter {
             next_seq,
             stash_oid.as_deref(),
             live_refs.len(),
+            prune_error.as_deref(),
+            ask.request_id,
             now_ms,
         );
 
@@ -4859,15 +4978,25 @@ impl GitWriter {
     /// Handles [`crate::desktop::instance::Request::RecordGitOp`] inside the
     /// primary desktop process. Snapshot failures append `"unsnapshotted"` to
     /// the ledger and return `snapshotted: false` so the hook never stays silent.
+    ///
+    /// `not_after_send` is an instant no later than the asker's send (the
+    /// mailbox takes it before greeting the asker). The asker waits a full
+    /// [`crate::desktop::instance::OP_RECORD_DEADLINE`] after its send, so the
+    /// same budget counted from this instant ends no later than the asker's
+    /// wait does: app start <= asker's send, asker waits >= budget after send,
+    /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
+    /// logged like any other failure (under the request's id), which is also
+    /// what settles the hook's "unknown" row for the same write.
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
+        not_after_send: Instant,
     ) -> Result<serde_json::Value, String> {
         let crate::desktop::instance::Request::RecordGitOp {
+            id,
             cwd,
             command,
             session_id,
             task_id,
-            ..
         } = request
         else {
             return Err("not an op-record request".into());
@@ -4875,7 +5004,20 @@ impl GitWriter {
         let root = crate::engine::git_cli::find_git_root(Path::new(cwd))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.clone());
-        match Self::record_op_snapshot(&root, command, session_id.as_deref(), task_id.as_deref()) {
+        let ask = OpAsk {
+            request_id: Some(id.as_str()),
+            deadline: Some(AskerDeadline::new(
+                not_after_send,
+                crate::desktop::instance::OP_RECORD_DEADLINE,
+            )),
+        };
+        match Self::record_op_snapshot(
+            &root,
+            command,
+            session_id.as_deref(),
+            task_id.as_deref(),
+            &ask,
+        ) {
             Ok(summary) => Ok(serde_json::json!({
                 "snapshotted": true,
                 "seq": summary.seq,
@@ -4892,6 +5034,7 @@ impl GitWriter {
                     task_id.as_deref(),
                     head_before.as_deref(),
                     err.message(),
+                    Some(id.as_str()),
                     crate::ledger::ids::now_millis(),
                 );
                 Ok(serde_json::json!({
@@ -9377,6 +9520,135 @@ mod bound_to_checked_state {
             "pruning must write no .git/config"
         );
     }
+
+    /// A repository holding an expired snapshot 1 whose ref cannot be deleted:
+    /// a leftover `refs/gitpulse/ops/1.lock` makes `git update-ref -d` fail for
+    /// real, the way a concurrent or crashed git does. The next snapshot's
+    /// prune must evict snapshot 1, so it fails after the new ref is written.
+    fn repo_with_unprunable_expired_snapshot() -> (tempfile::TempDir, String) {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+        let repo = p.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git commit --allow-empty -m old",
+            None,
+            None,
+            1_700_000_000_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("record the old snapshot");
+        std::fs::write(p.join(".git/refs/gitpulse/ops/1.lock"), b"").expect("plant ref lock");
+        (dir, repo)
+    }
+
+    #[test]
+    fn a_prune_failure_after_the_snapshot_ref_is_written_still_reports_the_snapshot() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+
+        let summary = GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git rebase main",
+            None,
+            None,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("the snapshot exists once its ref is written, so the call succeeds");
+        assert_eq!(summary.seq, 2);
+        assert_eq!(summary.op_ref, "refs/gitpulse/ops/2");
+        let listed = GitWriter::list_op_snapshots(&repo, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 1],
+            "the new ref exists; the locked one stayed"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        let row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("refs/gitpulse/ops/2"))
+            .expect("the snapshot's own ledger row is written");
+        let detail = row.detail_json.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("\"prune_error\"") && detail.contains("refs/gitpulse/ops/1"),
+            "the row must carry the prune failure: {detail}"
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "an existing snapshot must not be logged as unsnapshotted"
+        );
+    }
+
+    #[test]
+    fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+        let request = crate::desktop::instance::Request::RecordGitOp {
+            id: "op-1".to_string(),
+            cwd: repo.clone(),
+            command: "git reset --hard HEAD".to_string(),
+            session_id: None,
+            task_id: None,
+        };
+
+        let answer = GitWriter::serve_op_record(&request, Instant::now()).expect("served");
+        assert_eq!(answer["snapshotted"], true, "answer: {answer}");
+        assert_eq!(answer["seq"], 2);
+        assert_eq!(answer["op_ref"], "refs/gitpulse/ops/2");
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "no unsnapshotted row for a snapshot that exists"
+        );
+        assert!(
+            page.events.iter().any(|row| {
+                row.object.as_deref() == Some("refs/gitpulse/ops/2")
+                    && row
+                        .detail_json
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("\"prune_error\"")
+            }),
+            "the prune failure is recorded on the snapshot's row"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9386,6 +9658,10 @@ mod adv_tests;
 #[cfg(test)]
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
+
+#[cfg(test)]
+#[path = "git_writer_op_deadline_tests.rs"]
+mod op_deadline_tests;
 
 #[cfg(test)]
 #[path = "git_writer_commit_graph_tests.rs"]

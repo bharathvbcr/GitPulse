@@ -57,6 +57,7 @@ pub use notify_input::SESSION_END_HOST_TIMEOUT;
 use notify_outcome::send_unsupported as notify_send;
 pub use notify_outcome::{diagnostic, Diagnostic, HookError, SendError};
 pub mod signal_guard;
+mod turn_checkpoint;
 pub mod worktree;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -2845,19 +2846,34 @@ fn command_gate_with(
     maybe_record_git_op(input, output)
 }
 
-#[cfg(target_os = "macos")]
-const OP_RECORD_APP_DEADLINE: Duration = Duration::from_secs(2);
-
+/// What came of asking the app for a pre-op snapshot.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum OpRecordOutcome {
     Snapshotted,
+    /// The app answered that it took none, and logged that itself.
     FailedAlreadyLogged(String),
+    /// The request never reached a decision: not sent (the app is unreachable,
+    /// the write failed, or there was no time left to ask), or the app refused
+    /// it. No snapshot was taken.
     TransportFailed(String),
+    /// The request was sent and no usable answer came back. The app may or may
+    /// not have recorded a snapshot, and if it did it was captured before the
+    /// deadline. Never reported as unsnapshotted.
+    Unknown(String),
+}
+
+/// An [`OpRecordOutcome`] and the id of the request it is about, which every
+/// ledger row for the same write carries.
+struct OpRecordAttempt {
+    request_id: Option<String>,
+    outcome: OpRecordOutcome,
 }
 
 /// Forwards every allowed gated git write command to the desktop app mailbox
 /// so the app (never this decide-only hook) records the pre-op snapshot and
-/// op-log ledger row. Failures always write `"unsnapshotted"` and emit a
-/// non-silent warning.
+/// op-log ledger row. A failure writes `"unsnapshotted"` and an unanswered
+/// request writes `"unknown"`; both emit a non-silent warning.
 fn maybe_record_git_op(input: &HookInput, output: HookOutput) -> HookOutput {
     let blocked = output.hook_specific_output.as_ref().is_some_and(|s| {
         matches!(
@@ -2872,60 +2888,200 @@ fn maybe_record_git_op(input: &HookInput, output: HookOutput) -> HookOutput {
         return output;
     };
     let root_str = root.to_string_lossy().into_owned();
-    match record_op_by_app(&root_str, input) {
+    let attempt = record_op_by_app(&root_str, input);
+    let request_id = attempt.request_id.as_deref();
+    let session = (!input.session_id.trim().is_empty()).then_some(input.session_id.as_str());
+    match attempt.outcome {
         OpRecordOutcome::Snapshotted => output,
-        OpRecordOutcome::FailedAlreadyLogged(why) => attach_unsnapshotted_notice(output, &why),
+        OpRecordOutcome::FailedAlreadyLogged(why) => {
+            attach_op_notice(output, unsnapshotted_notice(&why))
+        }
         OpRecordOutcome::TransportFailed(why) => {
             crate::ledger::record_unsnapshotted_git_op(
                 &root_str,
                 &input.command,
-                (!input.session_id.trim().is_empty()).then_some(input.session_id.as_str()),
+                session,
                 None,
                 None,
                 &why,
+                request_id,
                 crate::ledger::ids::now_millis(),
             );
-            attach_unsnapshotted_notice(output, &why)
+            attach_op_notice(output, unsnapshotted_notice(&why))
+        }
+        OpRecordOutcome::Unknown(why) => {
+            crate::ledger::record_unknown_snapshot_git_op(
+                &root_str,
+                &input.command,
+                session,
+                None,
+                None,
+                &why,
+                request_id,
+                crate::ledger::ids::now_millis(),
+            );
+            attach_op_notice(output, unknown_notice(&why))
         }
     }
 }
 
+/// How long the hook waits for the app to greet it before it asks for an op
+/// snapshot. The same number the command gate gives the same mailbox
+/// ([`GATE_APP_DEADLINE`]): a loaded but live app has answered the gate inside
+/// it in production, and a wedged one costs the write under a second before the
+/// existing "unsnapshotted" fallback. The wait for the answer is separate and a
+/// full [`crate::desktop::instance::OP_RECORD_DEADLINE`]; a slow greeting never
+/// shortens it.
 #[cfg(target_os = "macos")]
-fn record_op_by_app(root: &str, input: &HookInput) -> OpRecordOutcome {
+const OP_RECORD_REACH: Duration = GATE_APP_DEADLINE;
+
+/// The waits of one op-record ask.
+///
+/// The invariant they keep, with the app's half stated at
+/// `desktop::instance::answer`: the app counts its budget from an instant no
+/// later than the asker's send; the asker waits at least `answer_wait` after its
+/// send (the socket's read timeout, which starts when the write completes); so
+/// the app's deadline never falls after the asker has stopped waiting. `outer`
+/// is the one timer around reach and ask together, and is long enough that it
+/// cannot end the answer wait early: a send is only allowed within `reach` of
+/// the start ([`send_window_open`]), so `outer` ends no sooner than
+/// `answer_wait` plus the margin after any send.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpRecordBudgets {
+    reach: Duration,
+    answer_wait: Duration,
+    outer: Duration,
+}
+
+#[cfg(target_os = "macos")]
+fn op_record_budgets(reach: Duration, answer_wait: Duration) -> OpRecordBudgets {
+    OpRecordBudgets {
+        reach,
+        answer_wait,
+        // The margin `within_budget` adds to every wait on the app.
+        outer: reach + answer_wait + Duration::from_millis(100),
+    }
+}
+
+/// Whether a request may still be sent: only within `reach` of the start of
+/// the ask. A connect that blocks past it must not send afterwards, because the
+/// outer timer would then end the wait before a full answer budget after the
+/// send, and the app's deadline could fall after the hook gave up.
+#[cfg(target_os = "macos")]
+fn send_window_open(cutoff: std::time::Instant, now: std::time::Instant) -> bool {
+    now < cutoff
+}
+
+/// Whether the hook's own total budget still holds the whole ask: reach, the
+/// answer wait and the margin.
+///
+/// `within_budget` clamps its wait to what is left of [`TOTAL_BUDGET`]
+/// ([`clamp_to_total`]), and no request field can tell the app. A clamped wait
+/// would end before a full budget after the send, so the app could capture state
+/// after the write began. A hook without the room does not ask. `elapsed` is how
+/// much of [`TOTAL_BUDGET`] is already spent.
+#[cfg(target_os = "macos")]
+fn op_record_wait_fits(elapsed: Duration, budgets: &OpRecordBudgets) -> bool {
+    budgets.outer <= TOTAL_BUDGET.saturating_sub(elapsed)
+}
+
+#[cfg(target_os = "macos")]
+fn record_op_by_app(root: &str, input: &HookInput) -> OpRecordAttempt {
     let Some(dir) = scan_profile(root) else {
-        return OpRecordOutcome::TransportFailed(
-            "no GitPulse app profile directory to record op snapshot".into(),
-        );
+        return OpRecordAttempt {
+            request_id: None,
+            outcome: OpRecordOutcome::TransportFailed(
+                "no GitPulse app profile directory to record op snapshot".into(),
+            ),
+        };
     };
-    record_op_by_app_in(dir, root, input, OP_RECORD_APP_DEADLINE)
+    record_op_by_app_in(
+        dir,
+        root,
+        input,
+        op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        ),
+        STARTED.get().copied(),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
-fn record_op_by_app(_root: &str, _input: &HookInput) -> OpRecordOutcome {
-    OpRecordOutcome::TransportFailed("app-side op recorder is unavailable off macOS".into())
+fn record_op_by_app(_root: &str, _input: &HookInput) -> OpRecordAttempt {
+    OpRecordAttempt {
+        request_id: None,
+        outcome: OpRecordOutcome::TransportFailed(
+            "app-side op recorder is unavailable off macOS".into(),
+        ),
+    }
 }
 
+/// [`record_op_by_app`] against the app that owns profile directory `dir`,
+/// within `budgets`. `started` is when this process began (`None` where nothing
+/// called [`start_deadline`]).
 #[cfg(target_os = "macos")]
 fn record_op_by_app_in(
     dir: PathBuf,
     root: &str,
     input: &HookInput,
-    deadline: Duration,
-) -> OpRecordOutcome {
-    use crate::desktop::instance::{reach_owner, Request};
+    budgets: OpRecordBudgets,
+    started: Option<std::time::Instant>,
+) -> OpRecordAttempt {
+    use crate::desktop::instance::{reach_owner, AskFailure, Request};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    let request_id = mailbox_id("op");
+    let attempt = |outcome: OpRecordOutcome| OpRecordAttempt {
+        request_id: Some(request_id.clone()),
+        outcome,
+    };
+    if !started.is_none_or(|started| op_record_wait_fits(started.elapsed(), &budgets)) {
+        return attempt(OpRecordOutcome::TransportFailed(
+            "there was no time left to wait for a snapshot, so none was asked for".into(),
+        ));
+    }
     let request = Request::RecordGitOp {
-        id: mailbox_id("op"),
+        id: request_id.clone(),
         cwd: root.to_string(),
         command: input.command.clone(),
         session_id: (!input.session_id.trim().is_empty()).then(|| input.session_id.clone()),
         task_id: None,
     };
-    let answer = within_budget(deadline + Duration::from_millis(100), move || {
-        reach_owner(&dir, deadline)
-            .ok_or_else(|| "no GitPulse app is answering".to_string())?
-            .record_git_op(&request, deadline)
+    let sent = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_sent = std::sync::Arc::clone(&sent);
+    // The one place the hook's wait is set. App start <= asker's send; the
+    // asker waits `answer_wait` after its send (the read timeout runs from the
+    // completed write, whatever the reach took); so the app's deadline cannot
+    // fall after the hook has stopped waiting. A send after `cutoff` is not made.
+    let cutoff = std::time::Instant::now() + budgets.reach;
+    let answer = within_budget(budgets.outer, move || {
+        let owner = reach_owner(&dir, budgets.reach)
+            .ok_or_else(|| AskFailure::not_sent("no GitPulse app is answering"))?;
+        if !send_window_open(cutoff, std::time::Instant::now()) {
+            return Err(AskFailure::not_sent(
+                "the app greeted too late to leave a full wait for its answer",
+            ));
+        }
+        owner.record_git_op(&request, budgets.answer_wait, &worker_sent)
     });
+    attempt(classify_op_answer(answer, sent.load(Ordering::Acquire)))
+}
+
+/// Sorts what came back from the app into the one of three things that
+/// happened: never sent, answered (success, or a refusal, including the
+/// deadline one), or sent and not usably answered. Only the last is unknown.
+///
+/// `answer` is `None` when the hook's own wait ended first, and `sent` says
+/// whether the request had been completely written by then.
+#[cfg(target_os = "macos")]
+fn classify_op_answer(
+    answer: Option<Result<Value, crate::desktop::instance::AskFailure>>,
+    sent: bool,
+) -> OpRecordOutcome {
+    use crate::desktop::instance::Reached;
+
     match answer {
         Some(Ok(reply)) => {
             if reply
@@ -2943,15 +3099,38 @@ fn record_op_by_app_in(
                 OpRecordOutcome::FailedAlreadyLogged(err)
             }
         }
-        Some(Err(why)) => OpRecordOutcome::TransportFailed(why),
-        None => OpRecordOutcome::TransportFailed("the app missed its op-snapshot deadline".into()),
+        Some(Err(failure)) => match failure.reached {
+            Reached::NotSent | Reached::Refused => OpRecordOutcome::TransportFailed(failure.why),
+            Reached::SentUnanswered => OpRecordOutcome::Unknown(format!(
+                "the request was sent and the app gave no usable answer: {}",
+                failure.why
+            )),
+        },
+        None if sent => OpRecordOutcome::Unknown(
+            "the request was sent and the app missed its op-snapshot deadline".into(),
+        ),
+        None => OpRecordOutcome::TransportFailed(
+            "the app was not reached before its op-snapshot deadline".into(),
+        ),
     }
 }
 
-fn attach_unsnapshotted_notice(mut output: HookOutput, why: &str) -> HookOutput {
-    let note = format!(
+fn unsnapshotted_notice(why: &str) -> String {
+    format!(
         "GitPulse warning: pre-op snapshot is unsnapshotted ({why}). This git write is not recoverable via GitPulse op-log undo."
-    );
+    )
+}
+
+/// The agent's notice when the request left and no answer came back. It must
+/// not say the write is unrecoverable: if the app recorded a snapshot, it was
+/// captured before the deadline and is a true pre-op state.
+fn unknown_notice(why: &str) -> String {
+    format!(
+        "GitPulse warning: the pre-op snapshot's outcome is unknown ({why}). If the app recorded one, it was captured before the deadline; this git write may or may not be undoable via GitPulse op-log undo."
+    )
+}
+
+fn attach_op_notice(mut output: HookOutput, note: String) -> HookOutput {
     output.system_message = Some(match output.system_message.take() {
         Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{note}"),
         _ => note.clone(),
@@ -3797,8 +3976,12 @@ fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<
 /// CLI, and Antigravity IDE.
 pub fn run_peer_inbox(input: &HookInput) -> HookOutput {
     let owned = input.clone();
-    within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
-        .unwrap_or_else(HookOutput::silent)
+    let output = within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
+        .unwrap_or_else(HookOutput::silent);
+    if input.hook_event_name == "UserPromptSubmit" {
+        let _ = turn_checkpoint::at_turn_start(input);
+    }
+    output
 }
 
 fn trusted_hook_root(input: &HookInput) -> Option<PathBuf> {
@@ -4042,6 +4225,8 @@ pub(crate) fn stop_continue_in(
         let _ = mailbox.clear_stop_continue(&input.session_id);
     }
     let _ = upsert_hook_peer(&root, input, "idle");
+    // The turn really ends here: nothing continued it.
+    let _ = turn_checkpoint::at_turn_end(input);
     None
 }
 
@@ -11916,8 +12101,8 @@ done
             panic!("expected primary instance");
         };
         primary.attach_gate(std::sync::Arc::new(serve_gate));
-        primary.attach_op_recorder(std::sync::Arc::new(|req| {
-            crate::engine::GitWriter::serve_op_record(req)
+        primary.attach_op_recorder(std::sync::Arc::new(|req, received| {
+            crate::engine::GitWriter::serve_op_record(req, received)
         }));
         let _reg = test_apps::register(repo_path, profile.path());
 
@@ -12017,8 +12202,8 @@ done
         else {
             panic!("expected primary instance");
         };
-        primary.attach_op_recorder(std::sync::Arc::new(|req| {
-            crate::engine::GitWriter::serve_op_record(req)
+        primary.attach_op_recorder(std::sync::Arc::new(|req, received| {
+            crate::engine::GitWriter::serve_op_record(req, received)
         }));
         let _reg = test_apps::register(repo_path, profile.path());
         crate::engine::git_writer::inject_next_op_snapshot_failure_for_test(
@@ -12064,6 +12249,330 @@ done
             );
         }
 
+        primary.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_hook_asks_only_while_its_total_budget_holds_a_whole_op_record_wait() {
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
+        // Reach, the whole answer wait and the margin: the lot, not the wait alone.
+        let whole = OP_RECORD_REACH
+            + crate::desktop::instance::OP_RECORD_DEADLINE
+            + Duration::from_millis(100);
+        assert_eq!(budgets.outer, whole);
+        let last_good = TOTAL_BUDGET - whole;
+        assert!(op_record_wait_fits(Duration::ZERO, &budgets));
+        assert!(
+            op_record_wait_fits(last_good, &budgets),
+            "exactly enough still asks"
+        );
+        assert!(
+            !op_record_wait_fits(last_good + Duration::from_nanos(1), &budgets),
+            "a nanosecond short does not"
+        );
+        // The old requirement (the answer wait and margin alone) would have let
+        // this ask through, and `within_budget` would then have clamped the
+        // whole thing below what the answer wait needs after a slow reach.
+        let old_last_good = TOTAL_BUDGET
+            - (crate::desktop::instance::OP_RECORD_DEADLINE + Duration::from_millis(100));
+        assert!(last_good < old_last_good);
+        assert!(!op_record_wait_fits(old_last_good, &budgets));
+        assert!(!op_record_wait_fits(TOTAL_BUDGET, &budgets));
+        assert!(
+            !op_record_wait_fits(TOTAL_BUDGET * 2, &budgets),
+            "no underflow"
+        );
+        // What it guards: past the boundary `within_budget` would cut the outer
+        // timer below the whole ask.
+        let cut = clamp_to_total(
+            budgets.outer,
+            Some(std::time::Instant::now() - last_good - Duration::from_secs(1)),
+        );
+        assert!(
+            cut < budgets.outer,
+            "past the boundary the wait would be clamped: {cut:?}"
+        );
+    }
+
+    /// The answer wait after a slow reach is still a whole budget. Asserted on
+    /// the values the ask is built from, not on elapsed time: the exchange is
+    /// handed `answer_wait` (the socket's read timeout, which runs from the
+    /// completed write), and the one outer timer is the reach, that wait and the
+    /// margin together, so no reach, however slow, leaves the wait shorter.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_answer_wait_after_a_slow_reach_is_still_a_whole_budget() {
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
+        assert_eq!(
+            budgets.answer_wait,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+            "the exchange waits the shared budget in full"
+        );
+        assert_eq!(budgets.reach, OP_RECORD_REACH);
+        assert_eq!(OP_RECORD_REACH, GATE_APP_DEADLINE);
+        assert!(budgets.outer >= budgets.reach + budgets.answer_wait + Duration::from_millis(100));
+
+        // A send is only made within `reach` of the start, so the latest send
+        // still has the whole answer wait before the outer timer ends.
+        let start = std::time::Instant::now();
+        let cutoff = start + budgets.reach;
+        let slowest_send = cutoff - Duration::from_nanos(1);
+        assert!(send_window_open(cutoff, start));
+        assert!(send_window_open(cutoff, slowest_send));
+        assert!(
+            (start + budgets.outer) - slowest_send >= budgets.answer_wait,
+            "the outer timer never ends the wait short of a whole budget after a send"
+        );
+        assert!(
+            !send_window_open(cutoff, cutoff),
+            "a greeting that lands exactly at the cutoff sends nothing"
+        );
+        assert!(!send_window_open(cutoff, cutoff + Duration::from_secs(5)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hook_with_no_time_left_does_not_send_and_one_with_time_does() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_string_lossy().into_owned();
+        let profile = tempfile::tempdir().expect("profile");
+        let crate::desktop::instance::Claim::Primary(primary) =
+            crate::desktop::instance::claim(profile.path(), Duration::from_secs(2))
+        else {
+            panic!("expected primary instance");
+        };
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        primary.attach_op_recorder(std::sync::Arc::new(move |_, _| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({"snapshotted": true}))
+        }));
+        let input = HookInput {
+            command: "git reset --hard HEAD".to_string(),
+            cwd: root.clone(),
+            ..HookInput::default()
+        };
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
+
+        // Five and a half of the eight seconds are spent: a bare answer wait
+        // would still fit, the reach and the wait together do not.
+        let spent = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(5500))
+            .expect("the host has been up for seven seconds");
+        let refused = record_op_by_app_in(
+            profile.path().to_path_buf(),
+            &root,
+            &input,
+            budgets,
+            Some(spent),
+        );
+        match &refused.outcome {
+            OpRecordOutcome::TransportFailed(why) => {
+                assert!(why.contains("no time left"), "{why}")
+            }
+            other => panic!("expected the unsnapshotted outcome, got {other:?}"),
+        }
+        assert!(refused.request_id.is_some(), "the row still carries an id");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "not sent"
+        );
+
+        // A fresh process asks.
+        let asked_now = record_op_by_app_in(
+            profile.path().to_path_buf(),
+            &root,
+            &input,
+            budgets,
+            Some(std::time::Instant::now()),
+        );
+        assert_eq!(asked_now.outcome, OpRecordOutcome::Snapshotted);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        primary.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_answer_is_sorted_into_not_sent_answered_or_sent_and_unanswered() {
+        use crate::desktop::instance::{AskFailure, Reached};
+        let failure = |reached| AskFailure {
+            reached,
+            why: "why".to_string(),
+        };
+
+        // Never sent, or refused: the existing unsnapshotted outcome.
+        for reached in [Reached::NotSent, Reached::Refused] {
+            assert_eq!(
+                classify_op_answer(Some(Err(failure(reached))), true),
+                OpRecordOutcome::TransportFailed("why".into()),
+                "{reached:?}"
+            );
+        }
+        // The hook's own wait ended before it even sent.
+        assert!(matches!(
+            classify_op_answer(None, false),
+            OpRecordOutcome::TransportFailed(_)
+        ));
+        // Sent and then no usable answer: the only unknown.
+        assert!(matches!(
+            classify_op_answer(Some(Err(failure(Reached::SentUnanswered))), true),
+            OpRecordOutcome::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_op_answer(None, true),
+            OpRecordOutcome::Unknown(_)
+        ));
+        // Answered: success, and a failure the app answered (the deadline one
+        // among them), both as they always were.
+        assert_eq!(
+            classify_op_answer(Some(Ok(serde_json::json!({"snapshotted": true}))), true),
+            OpRecordOutcome::Snapshotted
+        );
+        assert_eq!(
+            classify_op_answer(
+                Some(Ok(serde_json::json!({
+                    "snapshotted": false,
+                    "error": crate::engine::git_writer::OP_DEADLINE_PASSED,
+                }))),
+                true
+            ),
+            OpRecordOutcome::FailedAlreadyLogged(
+                crate::engine::git_writer::OP_DEADLINE_PASSED.to_string()
+            )
+        );
+        assert!(matches!(
+            classify_op_answer(Some(Ok(serde_json::json!({}))), true),
+            OpRecordOutcome::FailedAlreadyLogged(_)
+        ));
+    }
+
+    #[test]
+    fn the_unknown_notice_does_not_claim_the_write_is_unrecoverable() {
+        let unknown = unknown_notice("sent, no answer");
+        assert!(unknown.contains("unknown"), "{unknown}");
+        assert!(!unknown.contains("not recoverable"), "{unknown}");
+        assert!(!unknown.contains("unsnapshotted"), "{unknown}");
+        assert!(unknown.contains("before the deadline"), "{unknown}");
+        assert!(unknown.contains("may or may not be undoable"), "{unknown}");
+        let failed = unsnapshotted_notice("boom");
+        assert!(failed.contains("unsnapshotted") && failed.contains("not recoverable"));
+    }
+
+    /// The hook's wait ends with the request sent and nothing back. Its row says
+    /// unknown, the agent is not told the write is unrecoverable, and when the
+    /// app finally serves the request it refuses (the deadline has passed) and
+    /// logs that under the same request id, which settles the unknown row.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sent_but_unanswered_snapshot_is_unknown_and_the_apps_late_refusal_settles_it() {
+        let (_dir, repo, _requests) = scoped_hook_fixture(false);
+        let bin_dir = tempfile::tempdir().expect("bin dir");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_manvi(
+            bin_dir.path(),
+            "allowing-manvi",
+            FAKE_ALLOWING_MANVI,
+            &serial,
+        );
+        let repo_path = Path::new(&repo);
+        crate::test_support::trust_repo(repo_path);
+
+        let profile = tempfile::tempdir().expect("profile");
+        let crate::desktop::instance::Claim::Primary(primary) =
+            crate::desktop::instance::claim(profile.path(), Duration::from_secs(2))
+        else {
+            panic!("expected primary instance");
+        };
+        // The app is busy: it holds the request until the test lets it go, so
+        // the hook's own wait is what ends. Once released it first waits (a
+        // spin that only makes the precondition true) until the asker's
+        // deadline has objectively passed, then serves the request for real.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let done_tx = std::sync::Mutex::new(done_tx);
+        primary.attach_op_recorder(std::sync::Arc::new(move |req, received| {
+            let _ = release_rx.lock().unwrap().recv();
+            while received.elapsed() <= crate::desktop::instance::OP_RECORD_DEADLINE {
+                std::thread::yield_now();
+            }
+            let answer = crate::engine::GitWriter::serve_op_record(req, received);
+            if let Ok(value) = &answer {
+                let _ = done_tx.lock().unwrap().send(value.clone());
+            }
+            answer
+        }));
+        let _reg = test_apps::register(repo_path, profile.path());
+
+        let out = gate_here(&bash_call(&repo, "git reset --hard HEAD"));
+        let notice = out
+            .system_message
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        assert!(notice.contains("unknown"), "{out:?}");
+        assert!(!notice.contains("not recoverable"), "{notice}");
+
+        release_tx.send(()).unwrap();
+        let served = done_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the app served the request in the end");
+        assert_eq!(served["snapshotted"], false, "{served}");
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        let detail = |row: &crate::ledger::LedgerEvent| -> serde_json::Value {
+            serde_json::from_str(row.detail_json.as_deref().unwrap_or("{}")).unwrap()
+        };
+        let hook_row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("unknown"))
+            .expect("the hook's row says unknown");
+        assert_eq!(detail(hook_row)["snapshot"], "unknown");
+        let app_row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("unsnapshotted"))
+            .expect("the app's late refusal is logged");
+        assert!(detail(app_row)["snapshot_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("deadline"));
+        let id = detail(hook_row)["request_id"].clone();
+        assert!(id.as_str().is_some_and(|id| id.starts_with("op-")), "{id}");
+        assert_eq!(detail(app_row)["request_id"], id, "one write, one id");
+        assert!(
+            page.events.iter().all(|row| !row
+                .object
+                .as_deref()
+                .is_some_and(|object| object.starts_with("refs/gitpulse/ops/"))),
+            "no snapshotted row"
+        );
+        assert!(crate::engine::GitWriter::list_op_snapshots(&repo, 10)
+            .expect("list")
+            .entries
+            .is_empty());
         primary.shutdown();
     }
 }

@@ -56,6 +56,14 @@ const NO_TS_MIRROR = new Map<string, string>([
     "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
   ],
   [
+    "TurnEvent",
+    "engine::turn_checkpoint wire type: the hook sends it as `event` inside `desktop::instance::Request::RecordTurnCheckpoint` over the profile's unix socket to the running owner, and `gitpulse_turn_checkpoints` returns it to agents over MCP; it has no frontend consumer (capture, list and diff only, no UI)",
+  ],
+  [
+    "CaptureOutcome",
+    "engine::turn_checkpoint wire type: the app answers the hook's `Request::RecordTurnCheckpoint` with it and `gitpulse_turn_checkpoints` returns it to agents over MCP; no frontend consumer reads it (no turn checkpoint UI)",
+  ],
+  [
     "PrWorktreeRefusalCode",
     "refusals stay typed in Rust until the command edge, which sends only the message (`From<PrWorktreeError> for CommandError`); the frontend never receives the code",
   ],
