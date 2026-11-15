@@ -3,8 +3,7 @@
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import SendToAgent from "./SendToAgent.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
-  import { readBackgroundDocument } from "../runtime/foreground";
-  import { createLiveLoader } from "../workbench/liveLoader";
+  import { createLiveLoader, liveOnScreen } from "../workbench/liveLoader";
   import { formatRelativeTime } from "../format";
   import { buriedUnread, notificationPile, pileToggleLabel } from "../ui/notificationPile";
   import { automaticUpdates, explainError, sameAutomaticUpdate, getAttention, listAttention, type Attention, type AttentionFilter, type AttentionRow, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
@@ -12,7 +11,7 @@
   let { scope, active = true, onopen }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void> } = $props();
   let filter = $state<AttentionFilter>("active"), result = $state<Page<AttentionRow> | null>(null);
   let busy = $state(false), error = $state(""), notice = $state("");
-  let visible = $state(!readBackgroundDocument());
+  let visible = $state(liveOnScreen());
   let expanded = $state(false);
   let pileKey = "";
   const loader = createLiveLoader<string>({
@@ -47,8 +46,8 @@
     if (key !== pileKey) { pileKey = key; expanded = false; }
   });
   $effect(() => {
-    // Not `visible`: a blur pauses loads and a return refreshes in place
-    // (`onForeground`), instead of emptying the list under the reader.
+    // Not `visible`: hiding the window pauses loads and showing it refreshes
+    // in place (`connect`), instead of emptying the list under the reader.
     scope; filter; active;
     loader.reset(); result = null;
     untrack(() => { void load(); });

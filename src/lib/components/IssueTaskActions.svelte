@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack, type Snippet } from "svelte";
   import { AlertTriangle, Bug, CheckCircle2, ListPlus, LoaderCircle, RefreshCw } from "@lucide/svelte";
-  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+  import { bindForegroundChanges } from "../runtime/foreground";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -13,7 +13,7 @@
   import { verdictLabel } from "../stores/harnessStore";
   import type { IssueInfo } from "../ops/model";
   import { registerRepository, subscribeWorkbenchChanges, type TaskCard } from "../workbench/client";
-  import { createLiveLoader } from "../workbench/liveLoader";
+  import { createLiveLoader, createLiveReturn, liveOnScreen } from "../workbench/liveLoader";
   import {
     batchCreateTasksFromIssues,
     createTaskFromIssue,
@@ -122,10 +122,10 @@
   let tasksFollowChanges = false;
   /**
    * Change-driven task reloads through the shared live loader: one at a time,
-   * spaced, and never while the window is behind.
+   * spaced, and never while the window is hidden (`liveOnScreen`).
    */
   const repoTaskLoader = createLiveLoader({
-    canRun: () => !readBackgroundDocument(),
+    canRun: () => liveOnScreen(),
     read: async () => {
       const repo = $repoStore.currentPath;
       if (repo) await loadRepoTasks(repo);
@@ -244,12 +244,14 @@
         },
       }));
     }
+    const returned = createLiveReturn();
     const onForeground = () => {
-      if (readBackgroundDocument()) {
+      const visible = liveOnScreen(), back = returned(visible);
+      if (!visible) {
         repoTaskLoader.reset();
         return;
       }
-      scheduleRefreshRepoTasks();
+      if (back) scheduleRefreshRepoTasks();
     };
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
