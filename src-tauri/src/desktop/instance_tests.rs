@@ -2526,7 +2526,10 @@ fn the_op_record_budget_starts_before_the_greeting_not_after_the_request_is_read
     let greeting_read = Instant::now();
     // A long gap between the greeting and the send, made by spinning until it
     // has really passed, so the order below does not depend on a fast host.
-    while greeting_read.elapsed() < Duration::from_millis(20) {
+    // It is a floor the test waits out, not a limit a loaded host could miss.
+    let gap = Duration::from_millis(20);
+    let send_no_earlier_than = greeting_read + gap;
+    while Instant::now() < send_no_earlier_than {
         std::thread::yield_now();
     }
     let sent = AtomicBool::new(false);
@@ -2544,7 +2547,7 @@ fn the_op_record_budget_starts_before_the_greeting_not_after_the_request_is_read
         "the budget must start before the asker could have sent, not when the request was parsed"
     );
     assert!(
-        send_completed.duration_since(at) >= Duration::from_millis(20),
+        send_completed.duration_since(at) >= gap,
         "the asker's gap is inside the app's budget: the app's deadline is the earlier one"
     );
     drop(owner);
