@@ -117,8 +117,9 @@ must still pass on their respective operating systems.
 
 The Rust test gate builds an instrumented copy of the crate (about 50 GiB in
 `<cargo target>/llvm-cov-target`). The runner deletes it itself once the coverage floor has
-read `lcov.info`, and also when a gate fails or the run is abandoned where the runner still
-has control; it prints what it removed and how much it freed. A Ctrl-C or `kill` that stops
+read `lcov.info`, and also when a gate fails, or when something later in the run throws after
+the Rust test gate has returned. If that gate's own runner throws, nobody knows whether cargo
+ran, so the directory is left. It prints what it removed and how much it freed. A Ctrl-C or `kill` that stops
 the runner itself is not covered, so check for the directory after one. Set
 `CI_LOCAL_KEEP_COVERAGE_BUILD=1` (or `true`, `yes`; any other value, `0` and `no` included,
 deletes) to keep it: an incremental coverage rebuild is about 15 minutes faster, at the cost of
@@ -148,6 +149,22 @@ What it will delete, and when it will not:
   cannot be read. The coverage run is serialised machine-wide but this delete happens after it,
   so with a shared target directory prefer `CI_LOCAL_KEEP_COVERAGE_BUILD=1` while others are
   building.
+
+Two ci:local runs, or a run and anything else, never delete each other's build because each
+run takes a lock file beside the directory (`llvm-cov-target.ci-local.lock`, created
+exclusively, holding its pid, its process start time and the resolved path) before the Rust
+test gate starts and removes it after cleanup, on every path including a throw. A lock whose
+process is alive and started when the lock says belongs to another run: this run refuses
+("another ci:local run (pid N) is using it") and leaves its lock alone. A lock whose process
+is gone, or whose pid was reused by a different process, is stale and is replaced, and the
+output says so. A lock that cannot be created (a read-only parent) is a refusal, never a
+removal. The lock applies inside and outside the repository, and the live-process check
+(every spelling of the path, including the `/private` form, on path boundaries) runs in both
+as a second guard. What stays uncovered: a bare `cargo llvm-cov` from another shell, which
+holds no lock, that is between child processes at that instant and reaches the directory
+through a symlink the runner does not resolve to the same path; and a lock file left by a
+crashed run whose pid is still alive and started at the recorded time is indistinguishable
+from a live one until that process exits.
 
 A build that could not be removed is reported as `COVERAGE BUILD NOT REMOVED` with the reason,
 in the run's log and its summary. That includes the case where the Rust test gate passed but

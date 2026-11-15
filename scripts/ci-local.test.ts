@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -351,11 +352,31 @@ let root: string;
 let outside: string;
 const cleanups: string[] = [];
 
+/** pid to start time of the processes the fake `ps` shows alive. */
+const liveProcesses = new Map<number, string>();
+const processStart = (pid: number) => liveProcesses.get(pid) ?? null;
+
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "ci-local-scratch-root-")));
   outside = realpathSync(mkdtempSync(join(tmpdir(), "ci-local-scratch-out-")));
   cleanups.push(root, outside);
+  liveProcesses.clear();
+  liveProcesses.set(process.pid, "this-run-started");
 });
+
+/**
+ * The only way a test reaches a real delete: inside a temp directory this test
+ * created, never the temp directory itself, never anything else. Every scratch
+ * context in this file gets it by default, so a test that points the runner at
+ * the real home directory (or anything else) hits a throw, not `rmSync`.
+ */
+const guardedRemove = (dir: string) => {
+  const real = realpathSync(dir);
+  if (![root, outside].some((base) => real.startsWith(`${base}/`))) {
+    throw new Error(`test guard: refusing to really delete ${dir}, which is not inside a temp directory this test made`);
+  }
+  rmSync(real, { recursive: true, force: false });
+};
 afterEach(() => {
   for (const dir of cleanups.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -377,6 +398,8 @@ const scratchOptions = (env: Record<string, string> = {}, cargoMetadata = metada
   cargoMetadata,
   home: join(outside, "home"),
   listProcesses: () => "",
+  processStart,
+  remove: guardedRemove,
 });
 
 const run = (
@@ -693,11 +716,10 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
   it("does not delete through a symlinked parent that leads outside the repository", () => {
     const real = join(outside, "real-target");
     plant(join(real, "llvm-cov-target"), { "keep.txt": "do not delete" });
+    mkdirSync(join(root, "src-tauri"), { recursive: true });
+    symlinkSync(real, join(root, "src-tauri", "target"));
     const { outcomes } = run([OWNER], {
-      onRun: () => {
-        mkdirSync(join(root, "src-tauri"), { recursive: true });
-        symlinkSync(real, join(root, "src-tauri", "target"));
-      },
+      onRun: () => {},
     });
     expect(readFileSync(join(real, "llvm-cov-target", "keep.txt"), "utf8")).toBe("do not delete");
     expect(first(outcomes).status).toBe("refused");
@@ -737,6 +759,7 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
         env: { CARGO_LLVM_COV_TARGET_DIR: homedir() },
         cargoMetadata: metadata(),
         listProcesses: () => "",
+        processStart,
         remove: (dir) => {
           removed.push(dir);
           throw new Error(`refusing to let a test delete ${dir}`);
@@ -1002,7 +1025,8 @@ describe("a shared directory is not deleted while anything may be using it", () 
         cargoMetadata: metadata(shared()),
         home: join(outside, "home"),
         listProcesses,
-        ...(remove === undefined ? {} : { remove }),
+        processStart,
+        remove: remove ?? guardedRemove,
       },
       run: () => {
         plant(build(), { "CACHEDIR.TAG": "x", "debug/x.rlib": "x" });
@@ -1051,6 +1075,207 @@ describe("a shared directory is not deleted while anything may be using it", () 
     expect(removed).toEqual([]);
     expect(existsSync(join(build(), "other-runs.bin"))).toBe(true);
     expect(firstCleanup(outcomes).detail).toMatch(/changed identity/);
+  });
+});
+
+describe("no test can reach a real delete outside its own temp directories", () => {
+  it("makes the default delete throw for the home directory and for the temp roots themselves", () => {
+    const options = scratchOptions();
+    expect(options.remove).toBe(guardedRemove);
+    expect(() => guardedRemove(homedir())).toThrow(/test guard/);
+    expect(() => guardedRemove(root)).toThrow(/test guard/);
+    expect(() => guardedRemove(tmpdir())).toThrow(/test guard/);
+  });
+});
+
+describe("a run lock keeps two ci:local runs from deleting each other's build", () => {
+  const lockFile = () => join(root, "src-tauri", "target", "llvm-cov-target.ci-local.lock");
+  const writeLock = (file: string, body: object) => {
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, JSON.stringify(body));
+  };
+
+  it("is taken before the gate runs, records pid, start and directory, and is gone after a clean run", () => {
+    const during: { pid: number; start: string; dir: string }[] = [];
+    run([OWNER, READER], {
+      onRun: (id) => {
+        if (id !== "owner") return;
+        during.push(JSON.parse(readFileSync(lockFile(), "utf8")));
+        plant(defaultDir());
+      },
+    });
+    expect(during).toHaveLength(1);
+    expect(during[0]).toMatchObject({ pid: process.pid, start: "this-run-started", dir: defaultDir() });
+    expect(existsSync(lockFile())).toBe(false);
+    expect(existsSync(defaultDir())).toBe(false);
+  });
+
+  it("is held through the gates that read the report, until the cleanup point", () => {
+    const seen: Record<string, boolean> = {};
+    run([OWNER, OTHER, READER], { onRun: (id) => (seen[id] = existsSync(lockFile())) });
+    expect(seen).toEqual({ owner: true, other: true, reader: true });
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("is removed after a gate failure", () => {
+    run([OWNER, READER], { results: { owner: bad }, onRun: (id) => id === "owner" && plant(defaultDir()) });
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("is removed when a later gate throws", () => {
+    expect(() =>
+      run([OWNER, gate("boom")], {
+        onRun: (id) => {
+          if (id === "boom") throw new Error("runner blew up");
+        },
+      }),
+    ).toThrow("runner blew up");
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("is removed when the owning gate's own runner throws", () => {
+    expect(() =>
+      run([OWNER], {
+        onRun: () => {
+          throw new Error("runner blew up");
+        },
+      }),
+    ).toThrow("runner blew up");
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("is removed when the build is kept on request", () => {
+    run([OWNER], { env: { [KEEP]: "1" }, onRun: () => plant(defaultDir()) });
+    expect(existsSync(lockFile())).toBe(false);
+    expect(existsSync(defaultDir())).toBe(true);
+  });
+
+  it("makes a second run sharing the directory refuse while the first is live, without taking the lock over", () => {
+    let nested: Outcome[] = [];
+    let depth = 0;
+    run([OWNER], {
+      onRun: (id) => {
+        if (id !== "owner" || depth > 0) return;
+        depth += 1;
+        plant(defaultDir());
+        // The other run: same directory, and it writes to it while the first run's lock is live.
+        nested = run([OWNER], { onRun: (inner) => inner === "owner" && writeFileSync(join(defaultDir(), "debug", "theirs.bin"), "t") }).outcomes;
+        expect(existsSync(lockFile())).toBe(true);
+        expect(existsSync(join(defaultDir(), "debug", "theirs.bin"))).toBe(true);
+      },
+    });
+    expect(firstCleanup(nested).status).toBe("refused");
+    expect(firstCleanup(nested).detail).toBe(`another ci:local run (pid ${process.pid}) is using it`);
+    // The first run, which holds the lock, cleans up as normal.
+    expect(existsSync(defaultDir())).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("refuses a directory whose lock belongs to a live process, and leaves that lock as it was", () => {
+    liveProcesses.set(4242, "Sun Nov 15 10:00:00 2026");
+    const held = { pid: 4242, start: "Sun Nov 15 10:00:00 2026", dir: defaultDir(), token: "theirs" };
+    writeLock(lockFile(), held);
+    const { outcomes, report } = run([OWNER], { onRun: () => plant(defaultDir()) });
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(report).toContain("another ci:local run (pid 4242) is using it");
+    expect(existsSync(defaultDir())).toBe(true);
+    expect(JSON.parse(readFileSync(lockFile(), "utf8"))).toEqual(held);
+  });
+
+  it("replaces a lock whose process is gone, says so, and deletes", () => {
+    writeLock(lockFile(), { pid: 424242, start: "gone", dir: defaultDir(), token: "old" });
+    const { outcomes, report } = run([OWNER], { onRun: () => plant(defaultDir()) });
+    expect(firstCleanup(outcomes).status).toBe("removed");
+    expect(report).toContain("replaced a stale run lock left by pid 424242");
+    expect(existsSync(defaultDir())).toBe(false);
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  it("treats a lock whose pid now belongs to a different process as stale", () => {
+    liveProcesses.set(4242, "Sun Nov 15 12:00:00 2026"); // a later process reused the pid
+    writeLock(lockFile(), { pid: 4242, start: "Sun Nov 15 10:00:00 2026", dir: defaultDir(), token: "old" });
+    const { outcomes, report } = run([OWNER], { onRun: () => plant(defaultDir()) });
+    expect(firstCleanup(outcomes).status).toBe("removed");
+    expect(report).toContain("replaced a stale run lock left by pid 4242");
+  });
+
+  it("refuses rather than guess when the lock file cannot be read", () => {
+    mkdirSync(join(lockFile(), ".."), { recursive: true });
+    writeFileSync(lockFile(), "not json");
+    const { outcomes } = run([OWNER], { onRun: () => plant(defaultDir()) });
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(firstCleanup(outcomes).detail).toMatch(/unreadable lock/);
+    expect(existsSync(defaultDir())).toBe(true);
+    expect(readFileSync(lockFile(), "utf8")).toBe("not json");
+  });
+
+  it.skipIf(process.getuid?.() === 0)("reports a lock that cannot be created as a refusal, never as removed", () => {
+    const parent = join(root, "src-tauri", "target");
+    plant(defaultDir());
+    chmodSync(parent, 0o555);
+    try {
+      const { outcomes, report } = run([OWNER], { onRun: () => writeFileSync(join(defaultDir(), "debug", "new.bin"), "n") });
+      expect(firstCleanup(outcomes).status).toBe("refused");
+      expect(firstCleanup(outcomes).detail).toMatch(/could not take the run lock/);
+      expect(report).toMatch(/NOT REMOVED/);
+      expect(existsSync(defaultDir())).toBe(true);
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+  });
+
+  it("applies outside the repository too, beside the shared directory", () => {
+    const shared = join(outside, "shared-target");
+    const sharedLock = join(shared, "llvm-cov-target.ci-local.lock");
+    liveProcesses.set(4242, "up");
+    writeLock(sharedLock, { pid: 4242, start: "up", dir: join(shared, "llvm-cov-target"), token: "theirs" });
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_TARGET_DIR: shared },
+      cargoMetadata: metadata(shared),
+      onRun: () => plant(join(shared, "llvm-cov-target"), { "CACHEDIR.TAG": "x", "debug/x": "x" }),
+    });
+    expect(firstCleanup(outcomes).detail).toMatch(/pid 4242/);
+    expect(existsSync(join(shared, "llvm-cov-target", "debug", "x"))).toBe(true);
+    expect(existsSync(sharedLock)).toBe(true);
+  });
+});
+
+describe("the live-process check matches every spelling of the path, on path boundaries", () => {
+  const build = () => defaultDir();
+  const alias = () => (build().startsWith("/private/") ? build().slice("/private".length) : `/private${build()}`);
+  const withListing = (listing: string) => {
+    const outcomes = runGates([OWNER], {
+      platform: "darwin",
+      root,
+      log: () => {},
+      scratch: { ...scratchOptions(), listProcesses: () => listing },
+      run: () => {
+        plant(build());
+        return ok;
+      },
+    });
+    return firstCleanup(outcomes);
+  };
+
+  it("sees a process inside the repository, where there used to be no check at all", () => {
+    expect(withListing(` 77 cargo llvm-cov --target-dir ${build()}\n`).status).toBe("refused");
+    expect(existsSync(build())).toBe(true);
+  });
+
+  it("sees the /private spelling of the same path", () => {
+    expect(withListing(` 77 ${alias()}/debug/deps/gitpulse_lib --nocapture\n`).status).toBe("refused");
+  });
+
+  it("sees the path inside --target-dir=...", () => {
+    expect(withListing(` 77 cargo test --target-dir=${build()}\n`).status).toBe("refused");
+  });
+
+  it("does not match a longer directory that merely contains the path after another prefix", () => {
+    expect(withListing(` 77 cp /other${build()}/a /somewhere\n`).status).toBe("removed");
+  });
+
+  it("does not match a sibling whose name starts with it", () => {
+    expect(withListing(` 77 tail ${build()}-2/log\n`).status).toBe("removed");
   });
 });
 

@@ -28,7 +28,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -356,14 +357,19 @@ export const EXIT_SCRATCH_NOT_REMOVED = 3;
  *   home?: string,
  *   remove?: (dir: string) => void,
  *   listProcesses?: () => string,
+ *   processStart?: (pid: number) => string | null,
  * }} ScratchContext
  * @typedef {"removed" | "absent" | "not-found" | "kept" | "refused" | "failed"} CleanupStatus
  * @typedef {{
  *   kind: string, status: CleanupStatus,
- *   dir: string | null, bytes: number | null, detail: string,
+ *   dir: string | null, bytes: number | null, detail: string, note?: string,
  * }} CleanupResult
+ * @typedef {{
+ *   file: string | null, token: string | null, otherPid: number | null,
+ *   note: string | null, error: string | null,
+ * }} RunLock
  * @typedef {{ id: string, state: string }} Fingerprint
- * @typedef {{ dir: string, named: boolean, optional: boolean, before: Fingerprint | null }} SnapshotCandidate
+ * @typedef {{ dir: string, named: boolean, optional: boolean, before: Fingerprint | null, lock: RunLock }} SnapshotCandidate
  * @typedef {{
  *   scratch: Scratch, cargo: CargoDirectories | null, candidates: SnapshotCandidate[],
  *   failure: CleanupResult | null,
@@ -406,7 +412,7 @@ export function cargoMetadata(manifest, runCargo = spawnCargo) {
 /** The real context `main` hands to `runGates`: the process environment, cargo itself, this user's home. */
 export function productionScratchContext() {
   /** @type {ScratchContext} */
-  const context = { env: process.env, cargoMetadata, home: homedir(), listProcesses: psSnapshot };
+  const context = { env: process.env, cargoMetadata, home: homedir(), listProcesses: psSnapshot, processStart: psStart };
   return context;
 }
 
@@ -625,29 +631,135 @@ function psSnapshot() {
 }
 
 /**
- * The first process line that names one of `dirs` (as a whole path, so
- * `.../llvm-cov-target` does not match `.../llvm-cov-target2`), other than this
- * runner. Arguments and the executable path are both in `command`; a process's
- * working directory is not, and is not checked.
+ * Every spelling of `dir` a process might use: as given, as resolved, and each
+ * with and without the `/private` prefix macOS puts on `/tmp`, `/var` and `/etc`.
+ *
+ * @param {string[]} dirs
+ * @returns {string[]}
+ */
+function pathSpellings(dirs) {
+  const out = new Set();
+  for (const dir of dirs) {
+    out.add(dir);
+    if (dir.startsWith("/private/")) out.add(dir.slice("/private".length));
+    else if (dir.startsWith("/")) out.add(`/private${dir}`);
+  }
+  return [...out];
+}
+
+/**
+ * The first process line that names one of `dirs`, other than this runner, in
+ * any spelling. The match must sit on path boundaries: `/x/llvm-cov-target` is
+ * not in `/other/x/llvm-cov-target/a` (a path character before it) nor in
+ * `/x/llvm-cov-target-2` (a name character after it), but is in
+ * `--target-dir=/x/llvm-cov-target/debug`. Arguments and the executable path are
+ * both in `command`; a process's working directory is not, and is not checked.
  *
  * @param {string} listing
  * @param {string[]} dirs
  * @returns {string | null}
  */
 function processNaming(listing, dirs) {
+  const spellings = pathSpellings(dirs);
   for (const line of listing.split("\n")) {
     const pid = /^\s*(\d+)\s/.exec(line)?.[1];
     if (pid === String(process.pid)) continue;
-    for (const dir of dirs) {
+    for (const dir of spellings) {
       let from = line.indexOf(dir);
       while (from !== -1) {
-        const next = line[from + dir.length];
-        if (next === undefined || !/[\w.-]/.test(next)) return line.trim();
+        const before = line[from - 1];
+        const after = line[from + dir.length];
+        const startsPath = before === undefined || !/[\w.\-/]/.test(before);
+        const endsPath = after === undefined || !/[\w.-]/.test(after);
+        if (startsPath && endsPath) return line.trim();
         from = line.indexOf(dir, from + 1);
       }
     }
   }
   return null;
+}
+
+/**
+ * A process's start time as `ps` prints it, or null when no such process
+ * exists. Throws when `ps` cannot be run: that is not "gone".
+ *
+ * @param {number} pid
+ * @returns {string | null}
+ */
+function psStart(pid) {
+  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 30_000 });
+  if (result.error) throw new Error(`ps could not run: ${result.error.message}`);
+  const out = (result.stdout ?? "").trim();
+  return result.status === 0 && out !== "" ? out : null;
+}
+
+const LOCK_SUFFIX = ".ci-local.lock";
+
+/**
+ * Claim a coverage build directory for this run by creating, exclusively, a lock
+ * file beside it that records this process's pid and start time. A lock whose
+ * process is alive and started when the lock says is another run's: it is not
+ * touched, and the directory is not this run's to delete. A lock whose process
+ * is gone, or is a different process that reused the pid, is stale and replaced.
+ * Never throws; a lock that could not be taken says why.
+ *
+ * @param {string} dir
+ * @param {ScratchContext} context
+ * @returns {RunLock}
+ */
+function acquireLock(dir, context) {
+  /** @type {RunLock} */
+  const lock = { file: null, token: null, otherPid: null, note: null, error: null };
+  const startOf = context.processStart ?? psStart;
+  try {
+    mkdirSync(path.dirname(dir), { recursive: true });
+    const resolved = path.join(realpathSync(path.dirname(dir)), path.basename(dir));
+    const file = `${resolved}${LOCK_SUFFIX}`;
+    const token = randomUUID();
+    const body = JSON.stringify({ pid: process.pid, start: startOf(process.pid) ?? "unknown", dir: resolved, token });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        writeFileSync(file, body, { flag: "wx" });
+        lock.file = file;
+        lock.token = token;
+        return lock;
+      } catch (error) {
+        if (!(error instanceof Error) || Reflect.get(error, "code") !== "EEXIST") throw error;
+      }
+      /** @type {unknown} */
+      let held;
+      try {
+        held = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        lock.error = `an unreadable lock file is there (${file}); remove it if no other ci:local run is going`;
+        return lock;
+      }
+      const pid = Number(Reflect.get(Object(held), "pid"));
+      const start = Reflect.get(Object(held), "start");
+      const current = Number.isInteger(pid) && pid > 0 ? startOf(pid) : null;
+      if (current !== null && (start === "unknown" || current === start)) {
+        lock.otherPid = pid;
+        return lock;
+      }
+      unlinkSync(file);
+      lock.note = `replaced a stale run lock left by pid ${Number.isInteger(pid) ? pid : "?"}`;
+    }
+    lock.error = "lost a race for the run lock";
+  } catch (error) {
+    lock.error = `could not take the run lock beside it: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return lock;
+}
+
+/** Remove the lock this run took, and only that one. @param {RunLock} lock */
+function releaseLock(lock) {
+  if (lock.file === null || lock.token === null) return;
+  try {
+    const held = JSON.parse(readFileSync(lock.file, "utf8"));
+    if (Reflect.get(Object(held), "token") === lock.token) unlinkSync(lock.file);
+  } catch {
+    // Already gone, or replaced by another run: not ours to remove.
+  }
 }
 
 /**
@@ -742,6 +854,7 @@ export function snapshotScratch(scratch, root, context) {
     const candidates = coverageBuildCandidates(root, context, cargo).map((candidate) => ({
       ...candidate,
       before: fingerprintOf(candidate.dir),
+      lock: acquireLock(candidate.dir, context),
     }));
     return { scratch, cargo, candidates, failure: null };
   } catch (error) {
@@ -766,6 +879,21 @@ export function snapshotScratch(scratch, root, context) {
  * @returns {CleanupResult[]}
  */
 export function cleanScratch(snapshot, root, context, evidence) {
+  try {
+    return cleanCandidates(snapshot, root, context, evidence);
+  } finally {
+    for (const candidate of snapshot.candidates) releaseLock(candidate.lock);
+  }
+}
+
+/**
+ * @param {ScratchSnapshot} snapshot
+ * @param {string} root
+ * @param {ScratchContext} context
+ * @param {OwnerEvidence} evidence
+ * @returns {CleanupResult[]}
+ */
+function cleanCandidates(snapshot, root, context, evidence) {
   const kind = snapshot.scratch.kind;
   /** @param {CleanupStatus} status @param {string | null} dir @param {string} detail @param {number | null} [bytes] @returns {CleanupResult} */
   const result = (status, dir, detail, bytes = null) => ({ kind, status, dir, bytes, detail });
@@ -777,6 +905,13 @@ export function cleanScratch(snapshot, root, context, evidence) {
     return [snapshot.failure ?? result("failed", null, "could not identify the coverage build directory")];
   }
   return snapshot.candidates.map((candidate) => {
+    const decided = cleanCandidate(candidate);
+    return candidate.lock.note === null ? decided : { ...decided, note: candidate.lock.note };
+  });
+
+  /** @param {SnapshotCandidate} candidate @returns {CleanupResult} */
+  function cleanCandidate(candidate) {
+    if (cargo === null) return result("failed", null, "could not identify the coverage build directory");
     const { dir } = candidate;
     const leaf = lstatOrNull(dir);
     if (leaf === null) {
@@ -789,6 +924,12 @@ export function cleanScratch(snapshot, root, context, evidence) {
         );
       }
       return result("absent", dir, "nothing to remove: the directory does not exist");
+    }
+    if (candidate.lock.otherPid !== null) {
+      return result("refused", dir, `another ci:local run (pid ${candidate.lock.otherPid}) is using it`);
+    }
+    if (candidate.lock.error !== null) {
+      return result("refused", dir, `${candidate.lock.error}, so another run cannot be ruled out`);
     }
     if (leaf.isSymbolicLink()) return result("refused", dir, "it is a symlink, which is never followed");
     if (!leaf.isDirectory()) return result("refused", dir, "it is not a directory");
@@ -805,14 +946,13 @@ export function cleanScratch(snapshot, root, context, evidence) {
     }
     // Sized before the last checks, so the checks and the delete sit close together.
     const bytes = measureBytes(verdict.real);
-    if (verdict.outside) {
-      try {
-        const using = processNaming((context.listProcesses ?? psSnapshot)(), [...new Set([dir, verdict.real])]);
-        if (using !== null) return result("refused", dir, `a live process names it, so another run may be using it: ${using.slice(0, 200)}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return result("refused", dir, `outside the repository, and it could not be shown to be unused: ${message}`);
-      }
+    // A second guard for a bare `cargo llvm-cov` that holds no run lock, inside the repository as well as outside it.
+    try {
+      const using = processNaming((context.listProcesses ?? psSnapshot)(), [dir, verdict.real]);
+      if (using !== null) return result("refused", dir, `a live process names it, so another run may be using it: ${using.slice(0, 200)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return result("refused", dir, `it could not be shown to be unused: ${message}`);
     }
     const last = lstatOrNull(verdict.real);
     if (last === null || last.isSymbolicLink() || !last.isDirectory() || `${last.dev}:${last.ino}` !== now.id) {
@@ -826,7 +966,7 @@ export function cleanScratch(snapshot, root, context, evidence) {
     }
     if (lstatOrNull(verdict.real) !== null) return result("failed", dir, "removal reported success but the directory is still there", bytes);
     return result("removed", dir, "removed", bytes);
-  });
+  }
 }
 
 /** Whether a cleanup left a coverage build on disk that should have gone, or could not be shown to be. */
@@ -837,15 +977,16 @@ export function cleanupProblem(/** @type {CleanupResult} */ cleanup) {
 /** @param {CleanupResult} cleanup */
 function describeCleanup(cleanup) {
   const where = cleanup.dir ?? cleanup.kind;
+  const note = cleanup.note === undefined ? "" : ` [${cleanup.note}]`;
   switch (cleanup.status) {
     case "removed":
-      return `removed ${where}${cleanup.bytes === null ? " (size unknown)" : `, freed ${formatBytes(cleanup.bytes)}`}`;
+      return `removed ${where}${cleanup.bytes === null ? " (size unknown)" : `, freed ${formatBytes(cleanup.bytes)}`}${note}`;
     case "absent":
-      return `${where}: ${cleanup.detail}`;
+      return `${where}: ${cleanup.detail}${note}`;
     case "kept":
-      return `kept: ${cleanup.detail}`;
+      return `kept: ${cleanup.detail}${note}`;
     default:
-      return `COVERAGE BUILD NOT REMOVED (${cleanup.status}): ${where}: ${cleanup.detail}`;
+      return `COVERAGE BUILD NOT REMOVED (${cleanup.status}): ${where}: ${cleanup.detail}${note}`;
   }
 }
 
