@@ -618,6 +618,17 @@ of `allow`/`deny`/`ask`/`defer`, `permissionDecisionReason` shown to Claude,
 at 10,000 characters; input `session_id`, `permission_mode`). Not confirmed from
 those pages, though the code reads it already: `tool_use_id` on the input.
 
+**`mcp:doctor` and the plugin cache.** The doctor (`scripts/check-mcp-install.mjs`)
+also compares the `hooks/hooks.json` the host has installed (found through
+`~/.claude/plugins/installed_plugins.json`, or `$CLAUDE_CONFIG_DIR`, or
+`--claude-dir`) with the one this tree ships, and names the events missing from
+the cache, declared differently, or only installed. A hook missing from the
+cache never runs in a session that loads the plugin from it, and nothing else
+says so; on 2026-11-14 the cache at 1.4.0 lacked eight events the repository
+declares. The verdicts are `ok`, `drift` and `unverifiable` (both fail), and
+`absent` (the plugin is not installed from the cache: reported as a note, not a
+pass). It only reads; refreshing the cache is the host's plugin update.
+
 **The session brief** (`session-brief`, SessionStart) carries one `host load:`
 line right under its header, where the brief's 2,000-byte cap never cuts: tier and
 what binds it with the sensor's state, or `UNKNOWN (why)` and that heavy commands
