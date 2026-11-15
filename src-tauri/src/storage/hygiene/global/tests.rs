@@ -1695,3 +1695,140 @@ fn a_run_of_many_refusals_keeps_its_history_readable_and_counts_what_it_did_not_
         .read()
         .expect("the saved history stays readable after the run");
 }
+
+/// A check the host-load governor refused, typed as the spawn gate types it.
+fn shed() -> crate::ipc_error::CommandError {
+    crate::ipc_error::CommandError::typed(
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        "git status deferred under load after 0.000s: reactive work is shed while the host is under memory pressure",
+    )
+}
+
+/// Measured 2026-11-14: 14 of 20 rows read "skipped ... deferred under load".
+/// A check that never ran is not a refusal, and must not read like one.
+#[cfg(unix)]
+#[test]
+fn a_check_the_host_shed_is_reported_unexamined_not_skipped() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("shed-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.quiet_override = Some(|repo| {
+        if repo.ends_with("/loaded") {
+            Err(shed())
+        } else {
+            super::quiet_repo(repo)
+        }
+    });
+    let cleaner = Arc::new(service);
+    let loaded = aged_bytecode_repo(&root, "loaded", &[""], 4096);
+    let calm = aged_bytecode_repo(&root, "calm", &[""], 100);
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "shed-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+
+    let row = run
+        .items
+        .iter()
+        .find(|r| r.repo_path.ends_with("/loaded"))
+        .expect("the shed candidate has a row");
+    assert_eq!(row.status, "unexamined", "{row:?}");
+    assert!(row.message.starts_with("Could not examine"), "{row:?}");
+    assert_eq!(run.unexamined, 1);
+    assert!(loaded.join("__pycache__/module.pyc").is_file());
+    assert!(!calm.join("__pycache__").exists(), "{run:?}");
+}
+
+static SHED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A host that sheds a check briefly is asked again within the same run
+/// instead of leaving the tree for a whole interval.
+#[cfg(unix)]
+#[test]
+fn a_briefly_shed_check_is_asked_again_within_the_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("brief-shed-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    SHED_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    service.quiet_override = Some(|repo| {
+        if SHED_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            Err(shed())
+        } else {
+            super::quiet_repo(repo)
+        }
+    });
+    let cleaner = Arc::new(service);
+    let r = aged_bytecode_repo(&root, "only", &[""], 100);
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "brief-shed-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+    assert!(!r.join("__pycache__").exists(), "{run:?}");
+    assert_eq!(run.unexamined, 0, "{run:?}");
+    assert!(SHED_CALLS.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+}
+
+/// A shed run brings an enabled schedule forward, backing off, and gives up
+/// after `MAX_DEFERRAL_RETRIES` in a row; a run that examined everything
+/// resets the count.
+#[cfg(unix)]
+#[test]
+fn a_shed_run_brings_the_schedule_forward_with_a_bounded_backoff() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, root) = fixture();
+    let now = crate::storage::hygiene::now();
+    let mut c = config(&cleaner, &root);
+    c.enabled = true;
+    c.interval_hours = 24;
+    c.next_run_at = now + 86_400;
+    let saved = cleaner.save_with_background(c, |_| Ok(())).unwrap();
+    let ran_with = saved.config;
+    let mut run = journaled_run(&cleaner, "shed-schedule-run");
+    run.unexamined = 3;
+    for step in 0..super::MAX_DEFERRAL_RETRIES {
+        // Each attempt is judged against the policy it ran with.
+        let current = cleaner.state().unwrap().config;
+        let mut ran = ran_with.clone();
+        ran.revision = current.revision;
+        let moved = cleaner.retry_sooner_after_shedding(&ran, &run, now).unwrap();
+        let delay = super::DEFERRAL_RETRY_FIRST_SECS << step;
+        assert_eq!(moved, Some(now + delay).filter(|at| *at < current.next_run_at));
+    }
+    let current = cleaner.state().unwrap().config;
+    assert_eq!(current.next_run_at, now + super::DEFERRAL_RETRY_FIRST_SECS);
+    let mut ran = ran_with.clone();
+    ran.revision = current.revision;
+    assert_eq!(
+        cleaner.retry_sooner_after_shedding(&ran, &run, now).unwrap(),
+        None,
+        "a host that stays loaded falls back to the interval"
+    );
+    assert_eq!(cleaner.read().unwrap().deferral_retries, super::MAX_DEFERRAL_RETRIES);
+    run.unexamined = 0;
+    cleaner.retry_sooner_after_shedding(&ran, &run, now).unwrap();
+    assert_eq!(cleaner.read().unwrap().deferral_retries, 0);
+    // A policy edited since the run is never moved by it.
+    run.unexamined = 1;
+    ran.revision = ran.revision.wrapping_sub(1);
+    assert_eq!(cleaner.retry_sooner_after_shedding(&ran, &run, now).unwrap(), None);
+}

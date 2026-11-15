@@ -335,8 +335,16 @@ fn local_checks(repo: &Path, relative: &str) -> Result<PathBuf, CommandError> {
         ],
         format!("{relative}/\0").as_bytes(),
     )
-    .map_err(|_| {
-        "Directory is not ignored, or the ignore check failed. Add a reviewed ignore rule first."
+    .map_err(|error| {
+        // A check the host shed under load answered nothing about the ignore
+        // rules; keep its kind so the cleaner reports it as unexamined.
+        if error.origin() == Some(crate::ipc_error::IpcErrorKind::DeferredUnderLoad) {
+            error
+        } else {
+            CommandError::from(
+                "Directory is not ignored, or the ignore check failed. Add a reviewed ignore rule first.",
+            )
+        }
     })?;
     if ignored.is_empty() {
         return Err("No ignore rule covers this directory".into());

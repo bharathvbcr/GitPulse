@@ -1,7 +1,7 @@
 //! App-wide policy, durable scheduling, bounded runs and shared UI state.
 //! No UI timer owns deletion; the native worker survives page changes.
 use super::{discovery, tree};
-use crate::ipc_error::CommandError;
+use crate::ipc_error::{CommandError, IpcErrorKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -13,6 +13,32 @@ use std::time::{Duration, Instant};
 
 const VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
+/// Pauses before asking a shed check again within one run.
+#[cfg(not(test))]
+const DEFERRAL_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(40),
+];
+#[cfg(test)]
+const DEFERRAL_BACKOFF: [Duration; 3] = [Duration::from_millis(20); 3];
+/// The most one run waits on a loaded host in all, inside the run's own
+/// five-minute limit and the headless worker's fifteen.
+const DEFERRAL_WAIT_BUDGET: Duration = Duration::from_secs(90);
+/// How soon the next scheduled run comes after one the host shed, doubled
+/// for each further shed run and never later than the saved interval.
+const DEFERRAL_RETRY_FIRST_SECS: u64 = 15 * 60;
+/// Shed runs in a row that bring the schedule forward before it falls back
+/// to the saved interval: 15, 30, 60 and 120 minutes. A full inventory is
+/// itself load, so a host that stays under pressure is not asked every few
+/// minutes all night.
+const MAX_DEFERRAL_RETRIES: u32 = 4;
+
+/// Whether the host-load governor refused this check: it was never judged.
+/// Read from the producer's typed kind, never from the words.
+fn shed_under_load(error: &CommandError) -> bool {
+    error.origin() == Some(IpcErrorKind::DeferredUnderLoad)
+}
 static SERVICE: OnceLock<Arc<Cleaner>> = OnceLock::new();
 static SCHEDULER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -114,6 +140,10 @@ pub struct CleanerInventory {
     /// against src/lib/storage/hygiene/globalTypes.ts unchanged.
     #[serde(skip)]
     pub incomplete_repos: BTreeSet<String>,
+    /// Of those, repositories whose scan the host shed under load: not read,
+    /// and not judged either. Internal to the run path like `incomplete_repos`.
+    #[serde(skip)]
+    pub shed_repos: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerItem {
@@ -168,6 +198,12 @@ struct Saved {
     cancel_run: Option<String>,
     #[serde(default)]
     background_error: Option<String>,
+    /// Consecutive runs that ended with checks the host shed under load, each
+    /// of which brought the next scheduled run forward. Reset by a run the
+    /// host let examine everything. Omitted while zero so an older build can
+    /// still read the file.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    deferral_retries: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerState {
@@ -251,6 +287,85 @@ impl Cleaner {
             return check(repo);
         }
         quiet_repo(repo)
+    }
+    /// [`Self::quiet`], asked again after a short pause when the host shed it,
+    /// while this run's wait budget lasts. Waits are cancellable and recheck
+    /// the run's authority. The check keeps its own admission class: raising
+    /// it to a user action would defeat the governor on a host that is
+    /// shedding work because it is near its limit.
+    fn quiet_with_backoff(
+        &self,
+        config: &CleanerConfig,
+        run_id: &str,
+        repo: &str,
+        waited: &mut Duration,
+    ) -> Result<(), CommandError> {
+        let mut pauses = DEFERRAL_BACKOFF.iter();
+        loop {
+            match self.quiet(repo) {
+                Err(error) if shed_under_load(&error) => {
+                    let Some(pause) = pauses
+                        .next()
+                        .filter(|pause| *waited + **pause <= DEFERRAL_WAIT_BUDGET)
+                    else {
+                        return Err(error);
+                    };
+                    self.pause(*pause, config, run_id)?;
+                    *waited += *pause;
+                }
+                other => return other,
+            }
+        }
+    }
+    fn pause(&self, total: Duration, config: &CleanerConfig, run_id: &str) -> Result<(), CommandError> {
+        let until = Instant::now() + total;
+        loop {
+            self.still_authorized(config, run_id)?;
+            let now = Instant::now();
+            if now >= until {
+                return Ok(());
+            }
+            std::thread::sleep((until - now).min(Duration::from_millis(200)));
+        }
+    }
+    /// After a run some of whose checks the host shed, brings an enabled
+    /// schedule's next run forward instead of leaving those trees for a whole
+    /// interval: 15 minutes, doubling per shed run in a row, at most
+    /// [`MAX_DEFERRAL_RETRIES`] times, never later than the saved next run.
+    /// A run that examined everything resets the count. Returns the new next
+    /// run time when it moved.
+    fn retry_sooner_after_shedding(
+        &self,
+        ran_with: &CleanerConfig,
+        run: &CleanerRun,
+        now: u64,
+    ) -> Result<Option<u64>, CommandError> {
+        self.update(|saved| {
+            if run.unexamined == 0 {
+                saved.deferral_retries = 0;
+                return Ok(None);
+            }
+            let config = &mut saved.config;
+            if !config.enabled
+                || config.revision != ran_with.revision
+                || saved.deferral_retries >= MAX_DEFERRAL_RETRIES
+            {
+                return Ok(None);
+            }
+            let delay = (DEFERRAL_RETRY_FIRST_SECS << saved.deferral_retries)
+                .min(u64::from(config.interval_hours) * 3600);
+            saved.deferral_retries += 1;
+            let at = now.saturating_add(delay);
+            if at >= config.next_run_at {
+                return Ok(None);
+            }
+            config.next_run_at = at;
+            config.revision = config
+                .revision
+                .checked_add(1)
+                .ok_or("Policy revision exhausted")?;
+            Ok(Some(at))
+        })
     }
     fn activity(&self, path: &Path) -> Result<(), CommandError> {
         #[cfg(test)]
@@ -524,6 +639,7 @@ impl Cleaner {
             issues: found.issues,
             candidates: vec![],
             incomplete_repos: BTreeSet::new(),
+            shed_repos: 0,
         };
         let start = Instant::now();
         for repo in found.repos {
@@ -638,6 +754,9 @@ impl Cleaner {
                 }
                 Err(e) => {
                     result.partial = true;
+                    if shed_under_load(&e) {
+                        result.shed_repos = result.shed_repos.saturating_add(1);
+                    }
                     // Includes REPOSITORY_TRUST_REQUIRED: a repository the user
                     // has never trusted in the UI is one whose contents were
                     // never read, not one known to hold nothing worth keeping.
@@ -743,6 +862,21 @@ impl Cleaner {
                 push_issue(&mut run.issues, error.into_message());
             }
             run.finished_at = super::now();
+            match service.retry_sooner_after_shedding(&config, &run, run.finished_at) {
+                Ok(Some(at)) => push_issue(
+                    &mut run.issues,
+                    format!(
+                        "{} check(s) were shed under load; the next scheduled run was brought forward to {} minute(s) from now",
+                        run.unexamined,
+                        at.saturating_sub(run.finished_at) / 60
+                    ),
+                ),
+                Ok(None) => {}
+                Err(e) => log::warn!(
+                    "Could not bring the schedule forward after a shed run: {e}",
+                    e = e.message()
+                ),
+            }
             if let Err(e) = service.record(&run) {
                 log::error!("Cleaner history could not be saved: {e}", e = e.message());
             }
@@ -809,6 +943,16 @@ impl Cleaner {
         // Refusing globally left 20 consecutive scheduled runs reclaiming 0
         // bytes: two repositories that were never trusted and a traversal
         // budget on six large ones held a 57-repository workspace hostage.
+        run.unexamined = inventory.shed_repos;
+        if inventory.shed_repos > 0 {
+            push_issue(
+                &mut run.issues,
+                format!(
+                    "{} repositor(ies) could not be scanned: the host was shedding work under load, so nothing in them was judged",
+                    inventory.shed_repos
+                ),
+            );
+        }
         let incomplete_repos = inventory.incomplete_repos;
         let (candidates, skipped) = eligible_candidates(inventory.candidates, &incomplete_repos);
         // The refusal below leans on this: a dropped candidate means its
@@ -851,6 +995,7 @@ impl Cleaner {
         // again before anything is deleted.
         let mut refused_repos: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut waited_on_host = Duration::ZERO;
         for candidate in candidates {
             if attempted_targets >= max_targets || started.elapsed() > Duration::from_secs(300) {
                 run.partial = true;
@@ -874,8 +1019,15 @@ impl Cleaner {
                 if let Some(reason) = refused_repos.get(&candidate.repo_path) {
                     return Err(CommandError::from(reason.clone()));
                 }
-                if let Err(error) = self.quiet(&candidate.repo_path) {
-                    refused_repos.insert(candidate.repo_path.clone(), error.message().to_string());
+                if let Err(error) =
+                    self.quiet_with_backoff(config, &run.id, &candidate.repo_path, &mut waited_on_host)
+                {
+                    // A shed check is not an answer about the repository, so
+                    // the next candidate in it asks again.
+                    if !shed_under_load(&error) {
+                        refused_repos
+                            .insert(candidate.repo_path.clone(), error.message().to_string());
+                    }
                     return Err(error);
                 }
                 let plan = super::prepare_with_activity(
@@ -926,8 +1078,19 @@ impl Cleaner {
                 Ok::<(), String>(()).map_err(CommandError::from)
             })();
             if let Err(e) = action {
-                row.status = "skipped".into();
-                row.message = e.into_message();
+                if shed_under_load(&e) {
+                    // Never judged: the governor refused the check before it
+                    // ran. A "skipped" row would read as a policy answer.
+                    row.status = "unexamined".into();
+                    row.message = format!(
+                        "Could not examine: {} Nothing was judged; GitPulse tries again sooner than the schedule.",
+                        e.message()
+                    );
+                    run.unexamined = run.unexamined.saturating_add(1);
+                } else {
+                    row.status = "skipped".into();
+                    row.message = e.into_message();
+                }
             }
             if let Some(last) = run
                 .items

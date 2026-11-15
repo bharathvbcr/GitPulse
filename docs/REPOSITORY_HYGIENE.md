@@ -128,6 +128,21 @@ the native contract; UI presets are intentionally narrower. The worker stops
 starting targets after five minutes; each operation keeps its own deadline.
 The headless process has a 15-minute outer deadline and cancels before exiting.
 
+The target limit counts removals attempted, not rows: a candidate refused for
+its repository's state, its age or the byte budget does not use it up, and a
+repository refused for its own state is asked once per run. A run lists at most
+100 rows, keeping room for every removal it may still attempt; refused rows
+past that are counted as "not listed", never dropped silently.
+
+A check the host-load governor sheds under memory pressure is not a refusal.
+The run asks again after 5, 15 and 40 seconds while 90 seconds of waiting
+remain, then reports the candidate as **could not examine** (`unexamined`)
+rather than skipped. A run that ends with any such row brings an enabled
+schedule forward by 15 minutes, doubling for each such run in a row, at most
+four times, after which the saved interval applies; a run that examined
+everything resets this. The check keeps its own admission class: it is never
+promoted to a user action to get past the governor.
+
 The newest 20 runs retain exact target paths, before/after logical bytes, skips,
 errors and partial outcomes. An item is journaled before mutation; failed journal
 writes stop further work. Interrupted operations are reported, never replayed.
