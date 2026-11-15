@@ -23,6 +23,7 @@ export const IPC_ERROR_KINDS = [
   "ledger_failed",
   "ai_endpoint_unconfirmed",
   "read_cancelled",
+  "secret_scan_blocked",
 ] as const;
 
 export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];

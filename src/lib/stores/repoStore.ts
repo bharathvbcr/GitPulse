@@ -795,13 +795,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
         { target, ...WORKTREE_ONLY },
       ),
-    commit: async (message: string, amend: boolean = false) =>
+    // `allowSecrets` is the person's "Commit anyway" after the secret scan
+    // refused this commit (`secret_scan_blocked`); nothing else passes it.
+    commit: async (message: string, amend: boolean = false, allowSecrets: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
-        invokeFn("cmd_commit", { repoPath: path, message, amend }),
+        invokeFn("cmd_commit", { repoPath: path, message, amend, allowSecrets }),
       ),
-    quickCommit: async (message: string) =>
+    quickCommit: async (message: string, allowSecrets: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
-        invokeFn("cmd_quick_commit", { repoPath: path, message }),
+        invokeFn("cmd_quick_commit", { repoPath: path, message, allowSecrets }),
       ),
     checkoutBranch: async (branchName: string) =>
       runMutating("checkout", branchName, (path) =>

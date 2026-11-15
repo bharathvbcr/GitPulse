@@ -106,7 +106,7 @@ jobs:
           done
           exit "$failed"
         env:
-          BENCHES: graph_diff watcher repo_read command_timings mcp_protocol terminal_pty idle_wakeups live_index worktree_teardown alerts_worker_throughput notify_stdin_bench
+          BENCHES: graph_diff watcher repo_read command_timings mcp_protocol terminal_pty idle_wakeups live_index worktree_teardown alerts_worker_throughput notify_stdin_bench leak_scan
 
       - name: Upload bench reports
         if: always()

@@ -79,12 +79,18 @@ pub enum IpcErrorKind {
     /// (`git_cli::read_cancel`), or was cancelled while it queued. Nobody is
     /// waiting for the answer, so the frontend never shows it as a fault.
     ReadCancelled,
+    /// A commit was refused by the secret scan of the staged changes: a
+    /// credential shape, a staged file the scan could not read, or a scan that
+    /// could not run. `detail` lists the rule, path and line of each finding
+    /// (never the value) and each skipped file; the commit view offers a person
+    /// "commit anyway".
+    SecretScanBlocked,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -94,6 +100,7 @@ impl IpcErrorKind {
         Self::LedgerFailed,
         Self::AiEndpointUnconfirmed,
         Self::ReadCancelled,
+        Self::SecretScanBlocked,
     ];
 }
 
