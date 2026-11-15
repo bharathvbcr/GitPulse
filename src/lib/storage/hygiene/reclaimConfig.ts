@@ -6,6 +6,8 @@ export const DEFAULT_SCOPES: ReclaimScopes = Object.freeze({
   per_tree_vetoes: false,
   prune_worktrees: false,
   worktree_idle_days: 7,
+  agent_scratch_builds: false,
+  agent_scratch_days: 7,
 });
 export const DEFAULT_CLONE_BUDGET: CloneBudget = Object.freeze({ max_target_clones: 0, max_private_bytes: 50 * 1024 ** 3 });
 
@@ -18,7 +20,7 @@ export function cloneBudgetOf(config: Pick<CleanerConfig, "clone_budget">): Clon
 }
 /** Whether any scope that widens what the cleaner may delete is on. */
 export function anyScopeOn(scopes: ReclaimScopes): boolean {
-  return scopes.worktree_caches || scopes.per_tree_vetoes || scopes.prune_worktrees;
+  return scopes.worktree_caches || scopes.per_tree_vetoes || scopes.prune_worktrees || scopes.agent_scratch_builds;
 }
 /** Sum of `private_bytes` over the worktrees that were sized; unsized ones add nothing. */
 export function privateBytesTotal(worktrees: ReadonlyArray<{ private_bytes?: number }>): { total: number; sized: number } {
@@ -30,5 +32,8 @@ export function privateBytesTotal(worktrees: ReadonlyArray<{ private_bytes?: num
 export function scopeLabel(scope: string): string {
   if (scope === "worktree-cache") return "worktree cache";
   if (scope === "prune-worktree") return "stale worktree";
+  if (scope === "agent-session-scratch") return "agent scratchpad";
+  if (scope === "agent-repo-scratch") return "scratch build";
+  if (scope === "agent-claude-target") return "build folder under .claude";
   return scope || "repository";
 }

@@ -61,10 +61,17 @@ describe("GlobalCleaner reclaim scopes and clone budget", () => {
       "Reclaim build caches in idle linked worktrees",
       "Judge uncommitted work per directory, not per repository",
       "Remove stale linked worktrees",
+      "Remove agent scratch builds",
     ]) expect(source).toContain(`ariaLabel="${label}"`);
-    for (const key of ["worktree_caches", "per_tree_vetoes", "prune_worktrees", "worktree_idle_days"]) expect(source).toContain(`"${key}"`);
+    for (const key of ["worktree_caches", "per_tree_vetoes", "prune_worktrees", "worktree_idle_days", "agent_scratch_builds", "agent_scratch_days"]) expect(source).toContain(`"${key}"`);
     expect(source).toContain("scopesOf(draft)");
     expect(source).toContain("[7, 14, 30, 90]");
+  });
+  it("shows the evidence for each agent scratch candidate, what was left alone, and temp directories it only lists", () => {
+    for (const marker of ["candidate-evidence", "kept-items", "leaked-temp", "never removed"]) expect(source).toContain(marker);
+    expect(source).toContain("row.evidence");
+    expect(source).toContain("inventory.kept");
+    expect(source).toContain("inventory.leaked_temp");
   });
 
   it("warns that no run uses a scope until the saved set was previewed", () => {

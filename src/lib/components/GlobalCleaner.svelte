@@ -156,6 +156,9 @@
       <label class="flex items-center gap-2"><Checkbox ariaLabel="Remove stale linked worktrees" checked={scopes.prune_worktrees} onchange={(next) => setScope("prune_worktrees", next)} />Remove stale linked worktrees</label>
       <p class="text-textMuted">Removes the whole worktree directory, source files included, when no process is inside it, it is clean and unlocked, and its commits are merged or idle past the period below. Branches are not deleted. Unpushed work in a clean worktree on its own branch is only protected if that branch is merged or idle.</p>
       <label>Idle period for these scopes <select aria-label="Worktree idle days" class="gp-select ml-1" value={scopes.worktree_idle_days} onchange={(e) => setScope("worktree_idle_days", Number(e.currentTarget.value))}>{#each withCurrent(IDLE_DAY_CHOICES, scopes.worktree_idle_days) as days}<option value={days}>{days} days</option>{/each}</select></label>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Remove agent scratch builds" checked={scopes.agent_scratch_builds} onchange={(next) => setScope("agent_scratch_builds", next)} />Remove agent scratch builds</label>
+      <p class="text-textMuted">Deletes Cargo build folders that agents leave in the scratchpad of a finished session, in scratch directories inside a repository that git ignores, and Cargo targets directly under a checkout's .claude folder (including the copies a new session worktree is seeded with). A folder qualifies only when Cargo made it, no running agent session has its id, no process uses it, and nothing in it changed within the period below. The scratchpad and every other file in it stay. Temp directories nobody can account for are listed and never removed.</p>
+      <label>Period for agent scratch builds <select aria-label="Agent scratch retention days" class="gp-select ml-1" value={scopes.agent_scratch_days} onchange={(e) => setScope("agent_scratch_days", Number(e.currentTarget.value))}>{#each withCurrent(IDLE_DAY_CHOICES, scopes.agent_scratch_days) as days}<option value={days}>{days} days</option>{/each}</select></label>
     </div>
     <div class="gp-card p-3 space-y-2" aria-label="Build-cache clones">
       <strong>Build-cache clones</strong>
@@ -178,7 +181,19 @@
         <strong>{inventory.repositories} repositories · {inventory.candidates.length} output candidates · {inventory.visited_entries.toLocaleString()} entries inspected</strong>
         {#if coverage}<p class="gp-notice" data-tone="warn">{coverage}</p>{/if}
         {#each inventory.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}
-        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted"><span class="gp-chip" data-kind="label" data-testid="candidate-scope">{scopeLabel(row.scope)}</span> {row.provider}</p></div><span class="shrink-0 text-right">{humanBytes(row.bytes)}{#if row.private_bytes !== undefined}<span class="block text-textMuted">frees {humanBytes(row.private_bytes)}</span>{/if}</span></div>{/each}</div>
+        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted"><span class="gp-chip" data-kind="label" data-testid="candidate-scope">{scopeLabel(row.scope)}</span> {row.provider}</p>{#if row.evidence?.length}<p class="text-textMuted break-all" data-testid="candidate-evidence">{row.evidence.join(" · ")}</p>{/if}</div><span class="shrink-0 text-right">{humanBytes(row.bytes)}{#if row.private_bytes !== undefined}<span class="block text-textMuted">frees {humanBytes(row.private_bytes)}</span>{/if}</span></div>{/each}</div>
+        {#if inventory.kept?.length}
+          <div class="space-y-1" data-testid="kept-items">
+            <strong>{inventory.kept.length} agent scratch folder{inventory.kept.length === 1 ? "" : "s"} left alone</strong>
+            <div class="max-h-40 overflow-y-auto">{#each inventory.kept as item (`${item.scope}/${item.path}`)}<p class="py-1"><span class="font-mono break-all">{item.path}</span><span class="block text-textMuted">{item.reason}</span></p>{/each}</div>
+          </div>
+        {/if}
+        {#if inventory.leaked_temp?.length}
+          <div class="space-y-1" data-testid="leaked-temp">
+            <strong>Temp directories nobody can account for (listed only, never removed)</strong>
+            {#each inventory.leaked_temp as leak (leak.path)}<p class="py-1"><span class="font-mono break-all">{leak.path}</span><span class="block text-textMuted">{leak.bytes === null ? "size not fully measured" : humanBytes(leak.bytes)} · {leak.age_days} days old · {leak.reason}</span></p>{/each}
+          </div>
+        {/if}
         <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
         <button class="gp-btn" data-variant="danger" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
       </div>

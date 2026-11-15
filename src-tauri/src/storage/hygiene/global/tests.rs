@@ -886,6 +886,7 @@ fn an_incomplete_repository_does_not_veto_the_complete_ones() {
         scope: super::SCOPE_REPOSITORY.into(),
         private_bytes: None,
         branch: None,
+        evidence: Vec::new(),
     };
     let candidates = vec![
         candidate("/w/trusted", "target"),
@@ -922,6 +923,7 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
         scope: super::SCOPE_REPOSITORY.into(),
         private_bytes: None,
         branch: None,
+        evidence: Vec::new(),
     }];
     let incomplete = ["/w/untrusted".to_string()].into_iter().collect();
     let (eligible, skipped) = eligible_candidates(candidates, &incomplete);
@@ -2345,6 +2347,7 @@ fn dry_run_reclaim_table() {
         per_tree_vetoes: false,
         prune_worktrees: true,
         worktree_idle_days: 7,
+        ..Default::default()
     };
     let inventory = cleaner.inspect(&config, config.scopes, true).unwrap();
     println!("DRY\tscope\trepo\tpath\tlogical\tprivate\tage_gate");
@@ -2462,4 +2465,128 @@ fn an_inspection_cut_short_does_not_count_as_a_preview() {
         None,
         "nothing enabled is nothing previewed"
     );
+}
+
+/// The worktree veto asks who uses the worktree, not only who stands in it: a
+/// build whose working directory is elsewhere and whose arguments name the
+/// worktree refuses its removal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_process_naming_a_worktree_refuses_the_worktree_veto() {
+    let (_temp, _cleaner, code) = fixture();
+    let worktree = repo(&code, "lane");
+    let elsewhere = code.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let mut child =
+        crate::sysload::procscan::tests::directory_use_child(&worktree, &elsewhere, true);
+    let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+        crate::sysload::procscan::processes_using(&worktree).is_ok_and(|pids| !pids.is_empty())
+    });
+    let verdict = super::quiet_worktree(worktree.to_str().unwrap(), None);
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(seen, "the fixture process was never visible to the scan");
+    let refused = verdict.expect_err("a process names the worktree");
+    assert!(
+        refused.message().contains("process(es) use this worktree"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// A full or filling disk makes an enabled schedule due, once per gap. Any
+/// other reason the host sheds work, a disabled schedule and a run in
+/// progress change nothing. It moves the schedule and nothing else: scopes
+/// and checks are those the saved policy already names.
+#[test]
+fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
+    use crate::sysload::Binding;
+    let (_temp, cleaner, root) = fixture();
+    let later = super::current_time() + 86_400;
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = true;
+            saved.config.roots = vec![root.to_string_lossy().into_owned()];
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    let now = super::current_time();
+    let next = |c: &Cleaner| c.state().unwrap().config.next_run_at;
+    for cause in [None, Some(Binding::Swap), Some(Binding::Thermal)] {
+        assert_eq!(cleaner.bring_forward_for_disk(cause, now).unwrap(), None);
+        assert_eq!(next(&cleaner), later, "{cause:?} is not the disk");
+    }
+    let before = cleaner.state().unwrap().config.revision;
+    assert_eq!(
+        cleaner
+            .bring_forward_for_disk(Some(Binding::DiskFilling), now)
+            .unwrap(),
+        Some(now)
+    );
+    assert_eq!(next(&cleaner), now);
+    assert_eq!(cleaner.state().unwrap().config.revision, before + 1);
+    // Due now, and not asked again within the gap, whatever the cause.
+    cleaner
+        .update(|saved| {
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        cleaner
+            .bring_forward_for_disk(Some(Binding::LowDisk), now + 60)
+            .unwrap(),
+        None,
+        "bounded: once per gap"
+    );
+    assert_eq!(
+        cleaner
+            .bring_forward_for_disk(
+                Some(Binding::LowDisk),
+                now + super::DISK_FORWARD_MIN_GAP_SECS
+            )
+            .unwrap(),
+        Some(now + super::DISK_FORWARD_MIN_GAP_SECS)
+    );
+    // Disabled: nothing moves.
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = false;
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        cleaner
+            .bring_forward_for_disk(Some(Binding::LowDisk), later)
+            .unwrap(),
+        None
+    );
+    assert_eq!(next(&cleaner), later);
+}
+
+/// Every scope ships off, and a saved policy written before the agent scratch
+/// scope existed reads with it off.
+#[test]
+fn the_agent_scratch_scope_ships_off_and_an_older_policy_reads_it_off() {
+    let defaults = super::ReclaimScopes::default();
+    assert!(!defaults.agent_scratch_builds);
+    assert!(!defaults.any());
+    assert!(defaults.is_default());
+    let older = r#"{"worktree_caches":true,"per_tree_vetoes":false,"prune_worktrees":false,"worktree_idle_days":7}"#;
+    let read: super::ReclaimScopes = serde_json::from_str(older).unwrap();
+    assert!(!read.agent_scratch_builds);
+    assert_eq!(read.agent_scratch_days, 7);
+    // Turning it on is a change a preview must acknowledge before any run
+    // uses it.
+    let on = super::ReclaimScopes {
+        agent_scratch_builds: true,
+        ..defaults
+    };
+    assert!(on.any());
+    assert!(!on.effective(None).agent_scratch_builds);
+    assert!(!on.effective(Some(defaults)).agent_scratch_builds);
+    assert!(on.effective(Some(on)).agent_scratch_builds);
 }

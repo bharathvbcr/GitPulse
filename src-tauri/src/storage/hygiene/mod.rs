@@ -1,4 +1,5 @@
 //! Reviewable repository hygiene and tool-owned shared-cache maintenance.
+pub(crate) mod agent;
 pub(crate) mod background;
 mod discovery;
 pub mod global;
