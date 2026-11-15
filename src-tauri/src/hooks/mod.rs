@@ -889,22 +889,28 @@ impl HookOutput {
                     .to_string();
                 }
             }
-            if let Some(note) = &self.system_message {
-                // A notice beside no context is a check that did not run or ran
-                // half way: it is asked about, never rendered as a clean pass.
-                // One beside `additional_context` is informational unless it
-                // says the check was degraded.
-                let informational = self
-                    .hook_specific_output
+            // No permission decision: on Claude this is an allow that carries a
+            // message, so it is one here too. `"ask"` is not that — Antigravity
+            // prompts for it, and an agent run with nobody to answer reads it as
+            // "denied by pre-tool hook", which blocked every write that drew a
+            // holder, owner-unknown or incomplete-scan notice. An empty
+            // `decision` keeps the user's own permission mode (verified against
+            // agy 1.5.5 for `{}`), and agy's hook contract documents `reason` as
+            // the text shown to the user and agent, so the notice is sent rather
+            // than rendered as a clean pass. Whether agy displays a `reason`
+            // beside an empty decision has not been observed.
+            let said = [
+                self.system_message.as_deref(),
+                self.hook_specific_output
                     .as_ref()
-                    .is_some_and(|s| s.additional_context.is_some());
-                if !informational || is_degraded_or_unchecked_gate_notice(note) {
-                    return json!({
-                        "decision": "ask",
-                        "reason": note,
-                    })
-                    .to_string();
-                }
+                    .and_then(|s| s.additional_context.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+            if !said.is_empty() {
+                return json!({ "reason": said.join("\n") }).to_string();
             }
             return "{}".to_string();
         }
@@ -988,16 +994,6 @@ impl HookOutput {
         }
         self.render()
     }
-}
-
-fn is_degraded_or_unchecked_gate_notice(note: &str) -> bool {
-    note.contains("did NOT run")
-        || note.contains("was INCOMPLETE")
-        || note.contains("The check was INCOMPLETE")
-        || note.contains("ran UNGATED")
-        || note.contains("could not judge this")
-        || note.contains("checks it could not run")
-        || note.contains("MANVI harness warning")
 }
 
 fn decision(event: &str, decision: PermissionDecision, reason: String) -> HookSpecificOutput {
@@ -11003,6 +10999,8 @@ done
             assert_eq!(deny_json["decision"], "deny");
             assert_eq!(deny_json["reason"], "blocked destructive command");
 
+            // An unchecked notice is said, but it is not a decision: Antigravity
+            // treats `ask` as a prompt, which an agent run reads as a denial.
             let unchecked_out = HookOutput::notice("collision check did NOT run");
             let unchecked_json: Value = serde_json::from_str(
                 &unchecked_out
@@ -11010,7 +11008,7 @@ done
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(unchecked_json["decision"], "ask");
+            assert!(unchecked_json.get("decision").is_none(), "{unchecked_json}");
             assert_eq!(unchecked_json["reason"], "collision check did NOT run");
         }
 
@@ -11213,7 +11211,8 @@ done
             .unwrap();
             assert_eq!(v["decision"], "force_ask");
 
-            // Unchecked/degraded gate notice renders "ask" (never silent "{}").
+            // Unchecked/degraded gate notice carries its text in `reason` (never
+            // silent "{}") and no decision, so it does not block the call.
             let unchecked_out = HookOutput::notice(
                 "GitPulse collision check did NOT run for this edit: missing cwd.",
             );
@@ -11223,7 +11222,84 @@ done
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(v["decision"], "ask");
+            assert!(v.get("decision").is_none(), "{v}");
+            assert_eq!(
+                v["reason"],
+                "GitPulse collision check did NOT run for this edit: missing cwd."
+            );
+        }
+
+        /// Every PreToolUse output Claude lets through — a notice, context, or
+        /// both — must reach Antigravity without a `decision`, because `ask`
+        /// there is a prompt an agent run reads as "denied by pre-tool hook".
+        /// The holder notice is the one that blocked every edit in a repository
+        /// another session had touched; the disjoint-symbol output used to lose
+        /// its text entirely.
+        #[test]
+        fn antigravity_never_blocks_on_what_claude_lets_through() {
+            let edit_call = HookInput::from_value(&json!({
+                "hookEventName": "PreToolUse",
+                "conversationId": AGY_SESSION,
+                "workspacePaths": ["/tmp/ws"],
+                "toolCall": {
+                    "id": "tc-7",
+                    "name": "edit_file",
+                    "args": {
+                        "Path": "/tmp/ws/docs/TRACKS.md",
+                        "Target": "a",
+                        "Replacement": "b"
+                    }
+                }
+            }));
+            assert_eq!(edit_call.host, HostKind::Antigravity);
+
+            let holder = HookOutput::notice(
+                "GitPulse: docs/TRACKS.md — holder: session other-session, 0 s ago.",
+            );
+            let incomplete = HookOutput::notice(
+                "GitPulse collision check was INCOMPLETE for docs/TRACKS.md: 13 worktree(s) \
+                 were not scanned. Nothing was found, but not everything was looked at.",
+            );
+            let disjoint = HookOutput {
+                hook_specific_output: Some(HookSpecificOutput {
+                    hook_event_name: PRE_TOOL_USE.to_string(),
+                    permission_decision: None,
+                    permission_decision_reason: None,
+                    additional_context: Some("changed symbols do not overlap".into()),
+                }),
+                system_message: Some(
+                    "GitPulse: docs/TRACKS.md is also changed in another worktree, \
+                     but this edit is not known to conflict."
+                        .into(),
+                ),
+            };
+            for (output, must_say) in [
+                (holder, vec!["holder: session other-session"]),
+                (incomplete, vec!["was INCOMPLETE"]),
+                (
+                    disjoint,
+                    vec!["not known to conflict", "changed symbols do not overlap"],
+                ),
+            ] {
+                // Claude: no decision, so the call goes through.
+                assert!(
+                    output
+                        .hook_specific_output
+                        .as_ref()
+                        .and_then(|s| s.permission_decision)
+                        .is_none(),
+                    "fixture must be a let-through on Claude"
+                );
+                let rendered = output
+                    .render_for_invocation("collision-guard", &edit_call)
+                    .expect("Antigravity never gets empty stdout");
+                let v: Value = serde_json::from_str(&rendered).unwrap();
+                assert!(v.get("decision").is_none(), "blocked: {rendered}");
+                let reason = v["reason"].as_str().unwrap_or_default();
+                for text in must_say {
+                    assert!(reason.contains(text), "{text:?} dropped from {rendered}");
+                }
+            }
         }
 
         #[test]
