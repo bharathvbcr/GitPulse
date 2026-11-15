@@ -20,6 +20,7 @@ pub mod sidecar;
 mod concurrent_tests;
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub use policy::{
     check_command, check_command_allowing, check_file, render_command, HostScope, PolicyStatus,
@@ -205,7 +206,7 @@ fn judge_command_allowing(
 pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str) -> ScopedVerdict {
     let ask =
         |scope: Option<&HostScope>| policy::check_command_on(lane, repo_path, command, scope, &[]);
-    match hook_scope(repo_path) {
+    let caller = match hook_scope(repo_path) {
         HookScope::Declared(scope) => ScopedVerdict {
             bound: true,
             unscoped: None,
@@ -226,7 +227,565 @@ pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str)
             unscoped: None,
             verdict: failure.verdict(command),
         },
+    };
+    if caller.verdict.gate_failed()
+        || (caller.verdict.blocks() && !caller.verdict.is_unreadable_construct())
+    {
+        return caller;
     }
+    for (sibling_root, rewritten_cmd) in sibling_git_clauses(Path::new(repo_path), command) {
+        let Some(sib_str) = sibling_root.to_str() else {
+            continue;
+        };
+        match hook_scope(sib_str) {
+            HookScope::Declared(sib_scope) => {
+                let sib_verdict =
+                    policy::check_command_on(lane, sib_str, &rewritten_cmd, Some(&sib_scope), &[]);
+                let real_sibling_block = sib_verdict.blocks()
+                    && (!caller.verdict.blocks() || !sib_verdict.is_unreadable_construct());
+                if real_sibling_block || sib_verdict.status == PolicyStatus::Unchecked {
+                    return ScopedVerdict {
+                        bound: true,
+                        unscoped: None,
+                        verdict: sib_verdict,
+                    };
+                }
+            }
+            HookScope::Unresolved(failure) => {
+                return ScopedVerdict {
+                    bound: true,
+                    unscoped: None,
+                    verdict: failure.verdict(command),
+                };
+            }
+            HookScope::Unbound | HookScope::Untrusted => {}
+        }
+    }
+    caller
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+    AnsiC,
+}
+
+struct ShellToken<'a> {
+    raw: &'a str,
+    text: String,
+    quoted: bool,
+    expands: bool,
+    is_redirect: bool,
+}
+
+struct GitInvocation<'a> {
+    tokens: Vec<ShellToken<'a>>,
+    c_args: Vec<(usize, Option<usize>, String, bool)>,
+}
+
+fn split_shell_clauses(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote = QuoteState::None;
+    let mut iter = command.char_indices().peekable();
+
+    while let Some((i, ch)) = iter.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::AnsiC => {
+                if ch == '\\' {
+                    let _ = iter.next();
+                } else if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if ch == '\\' {
+                    let _ = iter.next();
+                } else if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => match ch {
+                '\\' => {
+                    let _ = iter.next();
+                }
+                '$' if bytes.get(i + 1) == Some(&b'\'') => {
+                    let _ = iter.next();
+                    quote = QuoteState::AnsiC;
+                }
+                '\'' => quote = QuoteState::Single,
+                '"' => quote = QuoteState::Double,
+                ';' | '\n' => {
+                    let slice = command[start..i].trim();
+                    if !slice.is_empty() {
+                        parts.push(slice);
+                    }
+                    start = i + ch.len_utf8();
+                }
+                '|' => {
+                    if bytes.get(i + 1) == Some(&b'|') {
+                        let _ = iter.next();
+                        let slice = command[start..i].trim();
+                        if !slice.is_empty() {
+                            parts.push(slice);
+                        }
+                        start = i + 2;
+                    } else if i > 0 && bytes[i - 1] == b'>' {
+                        // `>|` clobber redirection, not a pipe boundary.
+                    } else {
+                        let slice = command[start..i].trim();
+                        if !slice.is_empty() {
+                            parts.push(slice);
+                        }
+                        start = i + 1;
+                    }
+                }
+                '&' => {
+                    if bytes.get(i + 1) == Some(&b'&') {
+                        let _ = iter.next();
+                        let slice = command[start..i].trim();
+                        if !slice.is_empty() {
+                            parts.push(slice);
+                        }
+                        start = i + 2;
+                    } else if i > 0 && (bytes[i - 1] == b'>' || bytes[i - 1] == b'<') {
+                        // `>&` / `<&` descriptor duplication.
+                    } else if bytes.get(i + 1) == Some(&b'>') {
+                        let _ = iter.next();
+                        if bytes.get(i + 2) == Some(&b'>') {
+                            let _ = iter.next();
+                        }
+                    } else {
+                        let slice = command[start..i].trim();
+                        if !slice.is_empty() {
+                            parts.push(slice);
+                        }
+                        start = i + 1;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn scan_shell_tokens(clause: &str) -> Vec<ShellToken<'_>> {
+    let bytes = clause.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    while i < n {
+        while i < n && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        // Check standalone redirection operators starting at an unquoted boundary.
+        if bytes[i] == b'&' && i + 1 < n && bytes[i + 1] == b'>' {
+            let start = i;
+            i += if i + 2 < n && bytes[i + 2] == b'>' {
+                3
+            } else {
+                2
+            };
+            let raw = &clause[start..i];
+            tokens.push(ShellToken {
+                raw,
+                text: raw.to_string(),
+                quoted: false,
+                expands: false,
+                is_redirect: true,
+            });
+            continue;
+        }
+        if bytes[i] == b'<' || bytes[i] == b'>' {
+            let start = i;
+            i = advance_redirection_op(bytes, i);
+            let raw = &clause[start..i];
+            tokens.push(ShellToken {
+                raw,
+                text: raw.to_string(),
+                quoted: false,
+                expands: false,
+                is_redirect: true,
+            });
+            continue;
+        }
+
+        let start = i;
+        let mut text = String::new();
+        let mut quote = QuoteState::None;
+        let mut quoted = false;
+        let mut expands = false;
+        let mut all_unquoted_digits = true;
+
+        while i < n {
+            let b = bytes[i];
+            match quote {
+                QuoteState::Single => {
+                    all_unquoted_digits = false;
+                    if b == b'\'' {
+                        quote = QuoteState::None;
+                    } else {
+                        let ch = clause[i..].chars().next().unwrap();
+                        text.push(ch);
+                        i += ch.len_utf8();
+                        continue;
+                    }
+                    i += 1;
+                }
+                QuoteState::AnsiC => {
+                    all_unquoted_digits = false;
+                    if b == b'\\' && i + 1 < n {
+                        let next_ch = clause[i + 1..].chars().next().unwrap();
+                        text.push(next_ch);
+                        i += 1 + next_ch.len_utf8();
+                        continue;
+                    } else if b == b'\'' {
+                        quote = QuoteState::None;
+                    } else {
+                        let ch = clause[i..].chars().next().unwrap();
+                        text.push(ch);
+                        i += ch.len_utf8();
+                        continue;
+                    }
+                    i += 1;
+                }
+                QuoteState::Double => {
+                    all_unquoted_digits = false;
+                    if b == b'\\' && i + 1 < n {
+                        let next_b = bytes[i + 1];
+                        if matches!(next_b, b'"' | b'\\' | b'$' | b'`') {
+                            text.push(next_b as char);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    if b == b'"' {
+                        quote = QuoteState::None;
+                        i += 1;
+                    } else {
+                        if b == b'$' || b == b'`' {
+                            expands = true;
+                        }
+                        let ch = clause[i..].chars().next().unwrap();
+                        text.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+                QuoteState::None => {
+                    if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                        break;
+                    }
+                    if b == b'<' || b == b'>' {
+                        if all_unquoted_digits {
+                            i = advance_redirection_op(bytes, i);
+                            let raw = &clause[start..i];
+                            tokens.push(ShellToken {
+                                raw,
+                                text: raw.to_string(),
+                                quoted: false,
+                                expands: false,
+                                is_redirect: true,
+                            });
+                            break;
+                        }
+                        break;
+                    }
+                    if b == b'\\' && i + 1 < n {
+                        all_unquoted_digits = false;
+                        quoted = true;
+                        let next_ch = clause[i + 1..].chars().next().unwrap();
+                        text.push(next_ch);
+                        i += 1 + next_ch.len_utf8();
+                    } else if b == b'$' && i + 1 < n && bytes[i + 1] == b'\'' {
+                        all_unquoted_digits = false;
+                        quoted = true;
+                        quote = QuoteState::AnsiC;
+                        i += 2;
+                    } else if b == b'\'' {
+                        all_unquoted_digits = false;
+                        quoted = true;
+                        quote = QuoteState::Single;
+                        i += 1;
+                    } else if b == b'"' {
+                        all_unquoted_digits = false;
+                        quoted = true;
+                        quote = QuoteState::Double;
+                        i += 1;
+                    } else {
+                        if !b.is_ascii_digit() {
+                            all_unquoted_digits = false;
+                        }
+                        if matches!(b, b'$' | b'`' | b'*' | b'?' | b'[')
+                            || (i == start && b == b'~')
+                        {
+                            expands = true;
+                        }
+                        let ch = clause[i..].chars().next().unwrap();
+                        text.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+        }
+        // Only push if loop ended on a normal word (fd-prefixed redirect already pushed above).
+        if i > start
+            && !tokens.last().is_some_and(|t| {
+                t.is_redirect && std::ptr::eq(t.raw.as_ptr(), bytes[start..].as_ptr())
+            })
+        {
+            tokens.push(ShellToken {
+                raw: &clause[start..i],
+                text,
+                quoted,
+                expands,
+                is_redirect: false,
+            });
+        }
+    }
+    tokens
+}
+
+fn advance_redirection_op(bytes: &[u8], i: usize) -> usize {
+    let n = bytes.len();
+    match bytes[i] {
+        b'<' => {
+            if i + 2 < n && bytes[i + 1] == b'<' && (bytes[i + 2] == b'<' || bytes[i + 2] == b'-') {
+                i + 3
+            } else if i + 1 < n && matches!(bytes[i + 1], b'<' | b'&' | b'>') {
+                i + 2
+            } else {
+                i + 1
+            }
+        }
+        b'>' => {
+            if i + 1 < n && matches!(bytes[i + 1], b'>' | b'|' | b'&') {
+                i + 2
+            } else {
+                i + 1
+            }
+        }
+        _ => i + 1,
+    }
+}
+
+fn is_assignment_word(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    if eq == 0 {
+        return false;
+    }
+    word[..eq]
+        .chars()
+        .enumerate()
+        .all(|(i, c)| c == '_' || c.is_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+fn is_git_command_word(tok: &ShellToken<'_>) -> bool {
+    !tok.expands && (tok.text == "git" || tok.text.ends_with("/git"))
+}
+
+fn parse_git_invocation(clause: &str) -> Option<GitInvocation<'_>> {
+    let tokens = scan_shell_tokens(clause);
+    let mut at = 0usize;
+    while at < tokens.len() {
+        let tok = &tokens[at];
+        if tok.is_redirect {
+            at += 2;
+            continue;
+        }
+        if !tok.quoted
+            && (is_assignment_word(&tok.text)
+                || matches!(
+                    tok.text.as_str(),
+                    "if" | "elif"
+                        | "while"
+                        | "until"
+                        | "do"
+                        | "then"
+                        | "else"
+                        | "!"
+                        | "time"
+                        | "{"
+                        | "("
+                        | "command"
+                        | "builtin"
+                        | "noglob"
+                ))
+        {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    if at >= tokens.len() || !is_git_command_word(&tokens[at]) {
+        return None;
+    }
+
+    let mut c_args = Vec::new();
+    let mut i = at + 1;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok.is_redirect {
+            i += 2;
+            continue;
+        }
+        if tok.text == "--" || tok.text == "-" || !tok.text.starts_with('-') {
+            break;
+        }
+        let next = match tok.text.as_str() {
+            "-C" => {
+                if i + 1 < tokens.len() {
+                    c_args.push((
+                        i,
+                        Some(i + 1),
+                        tokens[i + 1].text.clone(),
+                        tokens[i + 1].expands,
+                    ));
+                    i + 2
+                } else {
+                    i + 1
+                }
+            }
+            opt if opt.starts_with("-C") && opt.len() > 2 => {
+                c_args.push((i, None, opt[2..].to_string(), tok.expands));
+                i + 1
+            }
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+            | "--config-env" | "--attr-source" => {
+                if i + 1 < tokens.len() {
+                    i + 2
+                } else {
+                    i + 1
+                }
+            }
+            _ => i + 1,
+        };
+        i = next;
+    }
+    if c_args.is_empty() {
+        return None;
+    }
+    Some(GitInvocation { tokens, c_args })
+}
+
+pub(crate) fn has_divergent_relative_git_c(cwd: &Path, repo_root: &Path, command: &str) -> bool {
+    let (Ok(canon_cwd), Ok(canon_root)) = (cwd.canonicalize(), repo_root.canonicalize()) else {
+        return false;
+    };
+    if canon_cwd == canon_root {
+        return false;
+    }
+    for clause in split_shell_clauses(command) {
+        let Some(inv) = parse_git_invocation(clause) else {
+            continue;
+        };
+        let mut cur_root = canon_root.clone();
+        let mut cur_cwd = canon_cwd.clone();
+        for (_, _, val, expands) in inv.c_args {
+            if expands {
+                break;
+            }
+            if Path::new(&val).is_absolute() {
+                if let Some(next) =
+                    crate::repository_trust::resolve_registered_worktree(&cur_root, &val)
+                {
+                    cur_root = next.clone();
+                    cur_cwd = next;
+                    continue;
+                }
+                break;
+            }
+            let via_root = crate::repository_trust::resolve_registered_worktree(&cur_root, &val);
+            let via_cwd = cur_cwd
+                .join(&val)
+                .to_str()
+                .and_then(|p| crate::repository_trust::resolve_registered_worktree(&cur_root, p));
+            if via_root != via_cwd {
+                return true;
+            }
+            match via_root {
+                Some(next) => {
+                    cur_root = next.clone();
+                    cur_cwd = next;
+                }
+                None => break,
+            }
+        }
+    }
+    false
+}
+
+fn sibling_git_clauses(caller_root: &Path, command: &str) -> Vec<(PathBuf, String)> {
+    let Ok(canon_caller) = caller_root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for clause in split_shell_clauses(command) {
+        let Some(inv) = parse_git_invocation(clause) else {
+            continue;
+        };
+        let mut cur = canon_caller.clone();
+        let mut omit = vec![false; inv.tokens.len()];
+        let mut resolved_all = true;
+        for (flag_idx, val_idx, val, expands) in &inv.c_args {
+            if *expands {
+                resolved_all = false;
+                break;
+            }
+            let Some(next) = crate::repository_trust::resolve_registered_worktree(&cur, val) else {
+                resolved_all = false;
+                break;
+            };
+            omit[*flag_idx] = true;
+            if let Some(vi) = val_idx {
+                omit[*vi] = true;
+            }
+            cur = next;
+        }
+        if !resolved_all || cur == canon_caller {
+            continue;
+        }
+        let mut idx = 0usize;
+        while idx < inv.tokens.len() {
+            if inv.tokens[idx].is_redirect {
+                omit[idx] = true;
+                if idx + 1 < inv.tokens.len() {
+                    omit[idx + 1] = true;
+                }
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+        }
+        let rewritten: Vec<&str> = inv
+            .tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tok)| if omit[i] { None } else { Some(tok.raw) })
+            .collect();
+        if !rewritten.is_empty() {
+            out.push((cur, rewritten.join(" ")));
+        }
+    }
+    out
 }
 
 /// Judges one write by an agent's file tool against this checkout's bound task
@@ -1582,6 +2141,118 @@ done
             check_command_in_scope(Lane::Shared, &worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_git_c_command_checks_sibling_worktree_scope_and_forwards_rewritten_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let main = git_repo();
+        let sibling_parent = main.path().parent().unwrap();
+        let wt_b = tempfile::Builder::new()
+            .prefix("wt-b-")
+            .tempdir_in(sibling_parent)
+            .expect("sibling dir");
+        std::fs::remove_dir(wt_b.path()).expect("vacate target for git worktree add");
+        git_in(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat-b",
+                wt_b.path().to_str().expect("utf8 wt_b"),
+            ],
+        );
+        crate::test_support::trust_repo(main.path());
+        crate::test_support::trust_repo(wt_b.path());
+        let main_path = main
+            .path()
+            .canonicalize()
+            .expect("canonical main")
+            .to_string_lossy()
+            .into_owned();
+        let wt_b_path = wt_b
+            .path()
+            .canonicalize()
+            .expect("canonical wt_b")
+            .to_string_lossy()
+            .into_owned();
+        let rel_wt_b = wt_b.path().file_name().unwrap().to_str().unwrap();
+
+        let db = crate::tasks::store_path(&main_path);
+        std::fs::create_dir_all(db.parent().expect("store parent")).expect("store dir");
+        {
+            let store = dc_store::Store::open(&db).expect("task store");
+            crate::tasks::plant_task::plant(
+                &store,
+                "TASK-MAIN",
+                "in_progress",
+                r#"{"planned_files":[{"path":"src/main.rs","allowed_change":"modify"}]}"#,
+            );
+            crate::tasks::plant_task::plant(
+                &store,
+                "TASK-WTB",
+                "in_progress",
+                r#"{"planned_files":[{"path":"src/sibling.rs","allowed_change":"modify"}]}"#,
+            );
+        }
+        crate::ledger::bindings::bind(&main_path, &main_path, "TASK-MAIN").expect("bind main");
+        crate::ledger::bindings::bind(&main_path, &wt_b_path, "TASK-WTB").expect("bind wt_b");
+
+        let requests = main.path().join("requests.ndjson");
+        let script = main.path().join("scope-aware-manvi");
+        let body = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "@REQUESTS@"
+  case "$line" in
+    *unplanned.txt*'"TASK-WTB"'*) reply "$line" '{"action":"deny","rule":"scope.unplanned","severity":"soft","reason":"Task TASK-WTB does not authorize changes to unplanned.txt","target":"unplanned.txt","task_id":"TASK-WTB","demoted":"","degraded":[]}' ;;
+    *) reply "$line" '{"action":"allow","rule":"","severity":"","reason":"allowed","target":"","task_id":"","demoted":"","degraded":[]}' ;;
+  esac
+done
+"#
+        .replace("@REQUESTS@", &requests.display().to_string());
+        std::fs::write(&script, body).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+
+        let cmd = format!("git -C ../{rel_wt_b} checkout -- unplanned.txt");
+        let judged = check_command_in_scope(Lane::Shared, &main_path, &cmd);
+        assert!(
+            judged.verdict.blocks() && judged.verdict.rule == "scope.unplanned",
+            "expected sibling scope denial for {cmd:?}, got {judged:?}"
+        );
+        let logged = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(
+            logged.contains("TASK-WTB") && logged.contains("git checkout -- unplanned.txt"),
+            "expected rewritten sibling command evaluated against TASK-WTB, got: {logged}"
+        );
+
+        let allowed_cmd = format!("git -C ../{rel_wt_b} checkout -- src/sibling.rs > out.txt");
+        let allowed_judged = check_command_in_scope(Lane::Shared, &main_path, &allowed_cmd);
+        assert!(
+            !allowed_judged.verdict.blocks(),
+            "expected sibling planned file + caller redirect stripped for sibling check, got {allowed_judged:?}"
+        );
+        let logged_after = std::fs::read_to_string(&requests).unwrap_or_default();
+        let sibling_lines: Vec<&str> = logged_after
+            .lines()
+            .filter(|l| l.contains("TASK-WTB") && l.contains("src/sibling.rs"))
+            .collect();
+        assert!(
+            sibling_lines
+                .iter()
+                .any(|l| l.contains("git checkout -- src/sibling.rs") && !l.contains("out.txt")),
+            "expected rewritten sibling command without -C or caller redirect, got: {sibling_lines:?}"
+        );
     }
 }
 
