@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
-mod agent_worktree;
+#[doc(hidden)]
+pub mod agent_worktree;
 pub(crate) mod agy_plugin;
 #[doc(hidden)]
 pub(crate) mod ci_watch;
 pub(crate) mod claude_hook;
-pub(crate) mod conversation;
+pub mod conversation;
 #[doc(hidden)]
 pub mod external_changes;
 mod in_flight;
@@ -36,7 +37,7 @@ pub(crate) mod retention;
 pub mod review;
 mod send_to_agent;
 mod suggest;
-pub(crate) mod terminal_command;
+pub mod terminal_command;
 mod terminal_launch;
 pub(crate) mod terminal_run;
 pub(crate) mod verification_driver;
