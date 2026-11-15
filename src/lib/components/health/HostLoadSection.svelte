@@ -27,7 +27,7 @@
   } from "../../stores/hostLoadStore";
   import {
     admissionLine,
-    diskFillLine,
+    fillRateLine,
     governorLine,
     bytes,
     bytesPerSecond,
@@ -96,6 +96,7 @@
   const status = $derived($hostLoadStatus);
   const snap = $derived(status?.snapshot ?? null);
   const host = $derived(snap?.host ?? null);
+  const fillLine = $derived(status ? fillRateLine(snap, status.governor.disk_fill) : null);
   const procs = $derived(status?.procs ?? null);
 
   async function refresh() {
@@ -209,8 +210,8 @@
     <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
       <p class="text-textPrimary font-medium" data-testid="host-load-governor-shedding">{governorLine(status.governor)}</p>
       <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-warn'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
-      {#if status.governor.disk_fill}
-        <p class="{status.governor.disk_fill.tier === 'severe' ? 'text-warn' : 'text-textMuted'}" data-testid="host-load-disk-fill">{diskFillLine(status.governor.disk_fill)}</p>
+      {#if fillLine}
+        <p class="{status.governor.disk_fill?.tier === 'severe' ? 'text-warn' : 'text-textMuted'}" data-testid="host-load-disk-fill">{fillLine}</p>
       {/if}
       {#if status.governor.verdict.reason === "sensor_unavailable"}
         <p class="text-warn">New runs are admitted and nothing extra is shed while the sensor cannot be read.</p>

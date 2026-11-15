@@ -21,6 +21,7 @@ import type {
   Reading,
   TraceRecord,
   SensorState,
+  Snapshot,
   Why,
 } from "../stores/hostLoadStore";
 
@@ -263,6 +264,35 @@ export function diskFillLine(fill: DiskFill): string {
   const minutes = fill.eta_min < 1 ? "under 1" : `about ${Math.round(fill.eta_min)}`;
   return `Disk filling: ${rate}, ${minutes} min until the ${floor} floor.`;
 }
+
+/**
+ * What the fill-rate rule is doing, for Health and the settings row: the
+ * projection when the disk is heading for the floor, otherwise the state of
+ * the measurement. A rule that has nothing to say because it has not measured
+ * yet must not read like one that measured a calm disk, so the reasons are
+ * said: warming up, the writing app is an older build, or the disk can't be
+ * read. Null only when there is no snapshot at all.
+ */
+export function fillRateLine(snapshot: Snapshot | null, fill: DiskFill | null | undefined): string | null {
+  if (fill) return diskFillLine(fill);
+  if (!snapshot) return null;
+  const reading = snapshot.disk_fill_rate;
+  // A snapshot with no such field is one an older build wrote.
+  if (!reading) return FILL_OLDER_BUILD;
+  if (reading.status === "value") {
+    return reading.value > 0 ? `Fill rate: ${fillRateLabel(reading.value)}` : "Fill rate: not falling";
+  }
+  switch (reading.value) {
+    case "not_yet":
+      return "Fill rate: warming up";
+    case "unsupported":
+      return FILL_OLDER_BUILD;
+    default:
+      return "Fill rate: not available (free disk space can't be read)";
+  }
+}
+
+const FILL_OLDER_BUILD = "Fill rate: not available (the app writing the snapshot is an older build)";
 
 /** The binding resource as a phrase after "under", for the refusal notice. */
 function bindingCause(binding: Binding | null): string {

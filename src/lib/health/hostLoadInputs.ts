@@ -81,7 +81,7 @@ export const INPUT_SPECS: readonly InputSpec[] = [
     settingId: "host-load-disk",
     label: "Free disk space",
     description:
-      "Free space on the volume GitPulse keeps its state on. Lower is worse: below the first number background work is slowed, below the second launches may be refused. Swap files share this space, so by default both numbers follow this computer's memory: half of it and a quarter of it, never under 20 and 10 GiB. A number you set is kept as you set it.",
+      "Free space on the volume GitPulse keeps its state on, which is what slows background work and refuses launches; the command gate checks the volume an agent's command runs in. Lower is worse: below the first number background work is slowed, below the second launches may be refused. Swap files share this space, so by default both numbers follow this computer's memory: half of it and a quarter of it, never under 20 and 10 GiB. A number you set is kept as you set it.",
     rule: { unit: "GiB free", step: 1, max: 1_048_576, lowerIsWorse: true, elevatedLabel: "Slow background work below", severeLabel: "Refuse launches below" },
     canRefuse: true,
   },
@@ -175,7 +175,7 @@ export const GUARD_SPECS: Record<GuardId, { settingId: string; label: string; de
     settingId: "host-load-disk-fill",
     label: "Disk filling fast",
     description:
-      "Watches how fast free space is falling and how long that leaves before the refuse level above. A coverage build once took 145 GiB in about twenty minutes; the level alone says nothing until little is left. Slow background work when the projection is under the first number of minutes, refuse launches under the second.",
+      "Watches how fast free space is falling and how long that leaves before the refuse level above. The level alone says nothing until little is left; a fall that will not stop shows long before. Slow background work when the projection is under the first number of minutes, refuse launches under the second.",
   },
   coverage: {
     settingId: "host-load-disk-coverage",

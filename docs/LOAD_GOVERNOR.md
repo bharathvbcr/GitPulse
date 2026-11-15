@@ -477,13 +477,16 @@ logical CPUs) hung and reset with swap used at 0.9 times physical memory, a
 kernel level read only `warn` and the governor said "launches admitted". The
 sensor already published every one of those readings and nothing decided on
 them. Each has a mode and two thresholds, changeable in Settings. **The
-defaults are provisional: they were set from that one incident.**
+defaults are provisional: they were set from that one incident.** The disk
+floors are not fixed numbers: swap files share the volume, so unless a person
+sets them they follow this computer's memory (see Disk guards).
 
 | Input (`Binding`) | Measures | Default mode | Elevated | Severe |
 |---|---|---|---|---|
 | `compressor_segments` | `vm.compressor.segment.total / vm.compressor.segment.limit` | refuse | 0.60 | 0.80 |
 | `swap` | swap USED / PHYSICAL memory (never swap total: macOS grows swap on demand, so the total reads 0 after boot) | refuse | 0.50x | 0.75x |
-| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below 20 GiB | below 10 GiB |
+| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
+| `disk_filling` | how fast that free space is falling, as minutes until the severe floor (see Disk guards) | refuse | under 30 minutes | under 10 minutes |
 | `thermal` | `NSProcessInfo.thermalState` | shed | serious | critical (refuse mode only) |
 | `cpu_load` | 1-minute load average / logical CPUs | shed | 3.0 | 6.0 |
 | `battery` | running on battery | off | on battery | never |
@@ -496,7 +499,7 @@ off nothing ever refuses.
 
 The verdict takes the highest tier any input reaches. On equal tiers the
 binding is the first of: memory pressure, compressor thrash, compressor
-segments, swap, low disk, thermal, CPU load, battery. The sentence names the
+segments, swap, low disk, disk filling, thermal, CPU load, battery. The sentence names the
 resource, its value and the threshold, for example "swap used is 0.83x
 physical memory (53.4 GiB of 64.0 GiB), at or above 0.75x". While the
 hysteresis still holds a tier the reading has already left, it says "now back
@@ -724,6 +727,65 @@ build does with a newer `tools.json`: ignores `host_load_thresholds`, loses no
 other setting, keeps the key across its own saves, and governs on the old two
 inputs only.
 
+## Disk guards
+
+Free space is read two ways, because the 2026-11-15 coverage build took the
+disk from about 150 GiB to nothing in about fifteen minutes (about 10 GiB a
+minute), and an earlier one took it from 99 to 45 GiB in twenty (about 2.7 GiB a
+minute); the level rule alone says nothing until the floor is near.
+
+**Floors follow memory.** The `low_disk` thresholds are automatic: severe is the
+larger of 10 GiB and a quarter of physical memory, elevated the larger of 20
+GiB and half of it (32 and 16 GiB on a 64 GiB Mac). Whether they are automatic
+is a stored fact (`Thresholds::disk_auto`), never inferred from the numbers: a
+pair a person sets is kept as set, even when it equals the old 20 and 10, and
+wins over any memory size. Settings shows the numbers the governor is deciding
+on. A `disk` entry written before this existed has no `auto` marker and stays
+the person's own.
+
+**The fill rule** (`disk_filling`, `sysload/diskrate.rs`, `thresholds.rs`). The
+writer keeps a bounded history of free space and publishes the fall in bytes
+per minute as a reading in the snapshot; the pure assessment turns it into
+minutes until the severe floor and compares that with two horizons (30 and 10
+minutes by default, each editable, with a mode of its own: off, slow, or also
+refuse). The rate is the smallest of four least-squares falls: the last minute,
+and each third of the last three minutes. The long window is read in thirds so
+that a one-off event (a copy, a compile burst) shorter than a minute leaves a
+flat third and reads as no fall, however large it was; fitting the whole window
+read a step of h GiB as about 1.5 h over the window length and refused launches
+for a burst that was already over. A fill that goes on, and a staircase of
+steps each minute, fall in every third. Unknown is never a rate: too few
+samples, a gap in the timestamps, a new boot, a step no disk can make (a
+remount) and a reading that cannot be taken all leave it unknown. While it is
+unknown the rule is silent and no warning is added, so Health says why: "Fill
+rate: warming up", or "not available" when the app that wrote the snapshot is an
+older build or free space can't be read. The rate and the exact binding are in
+the trace record.
+
+**What an older reader does.** The snapshot's verdict byte carries `low_disk`
+for a disk-filling binding, which every build reads; the exact binding rides in
+spare bytes of the extension block. A byte an older build does not know would
+make it treat the verdict as unavailable (fail open: "did NOT load-check"), so
+the byte it does know is what it reads.
+
+**The command gate's disk checks** (`hooks/load_gate.rs`) read free space live,
+on the volume the command writes to: the `cwd` the hook is given, which for an
+orchestrated child terminal is not the hook process's own directory. They
+refuse a coverage build (any `cargo llvm-cov` in the line that builds; `clean`,
+`report` and `show-env` build nothing and are never refused) below its headroom
+(60 GiB by default) and any heavy build below the severe floor. They follow the
+same two switches as everything else here: with `host_load.enabled` off nothing
+is measured and they say nothing, and with `host_load.govern_launches` off they
+advise and never refuse. A reading that could not be taken is said once per
+session; it is never a pass.
+
+**Storage.** The guards (`fill`, `coverage`) are a top-level
+`host_load_disk_guard` key of their own, not inside `host_load_thresholds`: a
+build from before them rewrites that key from the inputs it knows and would drop
+them. That older build also drops the `auto` marker when it saves
+`host_load_thresholds`, which pins the floors at 20 and 10 GiB until the row is
+set back to automatic.
+
 ## Disk: two owner decisions
 
 2026-10-21: low disk is advice, never a refusal. It can skip the optional
@@ -732,7 +794,8 @@ unchanged.
 
 2026-11-14: the governor's guards become configurable with protective defaults.
 Free disk is one of them (`low_disk`): with mode `refuse` (the default) and free
-space below the severe threshold (10 GiB) a launch is refused with that binding;
+space below the severe threshold (10 GiB then; now the larger of that and a
+quarter of physical memory) a launch is refused with that binding;
 with `off` or `shed` no launch is ever refused on disk, which is the 2026-10-21
 behaviour. The test that pinned the old rule is rewritten to pin both
 (`governor::tests::low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode`).

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { GovernorReport, HostLoadPulse, MemguardHealth } from "../stores/hostLoadStore";
+import type { GovernorReport, HostLoadPulse, MemguardHealth, Reading, Snapshot } from "../stores/hostLoadStore";
 import {
   admissionLine,
   bytes,
@@ -7,6 +7,7 @@ import {
   describeReading,
   diskFillLine,
   fillRateLabel,
+  fillRateLine,
   formatAge,
   governorLine,
   memguardLine,
@@ -309,5 +310,41 @@ describe("the disk fill line", () => {
   it("names the binding in the status words", () => {
     expect(bindingLabel("disk_filling")).toBe("disk filling");
     expect(bindingLabel("low_disk")).toBe("low disk");
+  });
+});
+
+describe("the fill rate line tells not measured from not falling", () => {
+  const GIB = 2 ** 30;
+  // Only the one field the line reads: the rest of a snapshot is not its business.
+  const snapshot = (rate?: Reading<number>) => ({ disk_fill_rate: rate }) as unknown as Snapshot;
+  const projection = {
+    rate_bytes_per_min: 2.7 * GIB,
+    eta_min: 10.7,
+    free_bytes: 45 * GIB,
+    floor_bytes: 16 * GIB,
+    tier: "elevated" as const,
+  };
+
+  it("says warming up while the writer has too little history", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "not_yet" }), null)).toBe("Fill rate: warming up");
+  });
+
+  it("says the writing app is an older build, for an unsupported or an absent reading", () => {
+    const older = "Fill rate: not available (the app writing the snapshot is an older build)";
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "unsupported" }), null)).toBe(older);
+    expect(fillRateLine(snapshot(undefined), null)).toBe(older);
+  });
+
+  it("says the disk can't be read when it can't, and not falling only when it measured that", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "failed" }), null)).toBe(
+      "Fill rate: not available (free disk space can't be read)",
+    );
+    expect(fillRateLine(snapshot({ status: "value", value: 0 }), null)).toBe("Fill rate: not falling");
+    expect(fillRateLine(snapshot({ status: "value", value: 0.5 * GIB }), null)).toBe("Fill rate: 512 MB/min");
+  });
+
+  it("gives the projection when the disk is heading for the floor, and nothing without a snapshot", () => {
+    expect(fillRateLine(snapshot({ status: "value", value: 2.7 * GIB }), projection)).toBe(diskFillLine(projection));
+    expect(fillRateLine(null, null)).toBeNull();
   });
 });

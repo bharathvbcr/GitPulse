@@ -12,11 +12,14 @@
     DEFAULT_THRESHOLDS,
     ensureHostLoadSettings,
     hostLoadSettings,
+    hostLoadStatus,
     updateHostLoadSettings,
     type DiskGuard,
     type InputMode,
   } from "../stores/hostLoadStore";
   import { GUARD_SPECS, MODE_LABELS, coverageProblem, fillProblem, type GuardId } from "../health/hostLoadInputs";
+  import { fillRateLine } from "../health/hostLoad";
+  import { pollHostLoad } from "../health/hostLoadPoll";
   import { loadOnce } from "../settings/loadOnce";
 
   let { guard, active = true }: { guard: GuardId; active?: boolean } = $props();
@@ -41,6 +44,16 @@
   const loader = loadOnce(load);
   $effect(() => {
     if (active) loader.request();
+  });
+
+  // The fill rule's own measurement state, from the sampler's status: warming
+  // up and an older writing build read differently from a calm disk.
+  const state = (
+    guard === "fill" &&  ? fillRateLine(.snapshot, .governor.disk_fill) : null,
+  );
+  $effect(() => {
+    if (!active || guard !== "fill") return;
+    return pollHostLoad();
   });
 
   async function save(next: DiskGuard[GuardId], rejected?: () => void) {
@@ -108,6 +121,9 @@
     </select>
   </div>
   <p class="text-textMuted text-micro leading-snug">{spec.description}</p>
+  {#if state}
+    <p class="text-textMuted text-micro" data-testid="host-load-guard-fill-state">{state}</p>
+  {/if}
   {#if stored && stored.mode !== "off"}
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
       {#each fields as { field, label, unit, step } (field)}
