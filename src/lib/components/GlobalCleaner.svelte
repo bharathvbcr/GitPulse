@@ -5,7 +5,7 @@
   import { closedAppSchedulingReason } from "../ui/platformCopy";
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
-  import { cleanupAllowed, coverageNotice } from "../storage/hygiene/globalEligibility";
+  import { cleanupAllowed, coverageNotice, itemStatusLabel, runRowsSummary } from "../storage/hygiene/globalEligibility";
   import { humanBytes } from "../storage/format";
   import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -145,7 +145,7 @@
     {/if}
     {#if cleaner.history.length}
       <details open><summary class="font-semibold cursor-pointer">Recent cleanup runs ({cleaner.history.length})</summary>
-        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {run.items.length} targets reported</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {item.status}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
+        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {runRowsSummary(run)}</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {itemStatusLabel(item.status)}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
       </details>
     {/if}
     <details><summary class="cursor-pointer">DevCouncil agent hygiene rules</summary><p class="mt-2 whitespace-pre-wrap text-textMuted">{cleaner.agent_rules}</p></details>

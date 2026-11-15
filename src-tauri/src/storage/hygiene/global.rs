@@ -135,6 +135,30 @@ pub struct CleanerRun {
     pub partial: bool,
     pub issues: Vec<String>,
     pub items: Vec<CleanerItem>,
+    /// Candidates that were refused or could not be examined but have no row
+    /// in `items`, because the history keeps at most [`MAX_RUN_ITEMS`] rows.
+    /// Omitted from the saved state while zero, so a file written by this
+    /// build stays readable by a build that predates the field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unlisted: u32,
+    /// Candidates that were never judged because the host shed the checks
+    /// under load (status `unexamined`), counted whether or not they are
+    /// listed. Not a refusal: GitPulse retries them sooner than the schedule.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unexamined: u32,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+/// The most rows one run keeps: [`Cleaner::read`] refuses a history holding
+/// more, and an unreadable history stops every later run.
+const MAX_RUN_ITEMS: usize = 100;
+/// The most issues one run keeps, for the same reason.
+const MAX_RUN_ISSUES: usize = 128;
+fn push_issue(issues: &mut Vec<String>, issue: String) {
+    if issues.len() < MAX_RUN_ISSUES {
+        issues.push(issue);
+    }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +182,8 @@ pub struct CleanerState {
 
 #[cfg(test)]
 type ActivityCheck = fn(&Path) -> Result<(), String>;
+#[cfg(test)]
+type QuietCheck = fn(&str) -> Result<(), CommandError>;
 
 pub struct Cleaner {
     dir: PathBuf,
@@ -167,6 +193,10 @@ pub struct Cleaner {
     current: Mutex<Option<(String, String)>>,
     #[cfg(test)]
     activity_override: Option<ActivityCheck>,
+    /// Replaces the repository-state check, so a test can make the host shed
+    /// it without putting the machine under memory pressure.
+    #[cfg(test)]
+    quiet_override: Option<QuietCheck>,
     #[cfg(test)]
     state_after_read: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -210,8 +240,17 @@ impl Cleaner {
             #[cfg(test)]
             activity_override: None,
             #[cfg(test)]
+            quiet_override: None,
+            #[cfg(test)]
             state_after_read: None,
         }
+    }
+    fn quiet(&self, repo: &str) -> Result<(), CommandError> {
+        #[cfg(test)]
+        if let Some(check) = self.quiet_override {
+            return check(repo);
+        }
+        quiet_repo(repo)
     }
     fn activity(&self, path: &Path) -> Result<(), CommandError> {
         #[cfg(test)]
@@ -283,7 +322,7 @@ impl Cleaner {
             || saved
                 .history
                 .iter()
-                .any(|r| r.items.len() > 100 || r.issues.len() > 128)
+                .any(|r| r.items.len() > MAX_RUN_ITEMS || r.issues.len() > MAX_RUN_ISSUES)
         {
             return Err("Cleaner history exceeds its bounds".into());
         }
@@ -647,7 +686,7 @@ impl Cleaner {
                 config.next_run_at=now.checked_add(u64::from(config.interval_hours)*3600).ok_or("Schedule time overflow")?;
                 config.revision=config.revision.checked_add(1).ok_or("Policy revision exhausted")?;
             }
-            let run=CleanerRun {id:format!("{}-{}-{}",std::process::id(),now,super::SEQUENCE.fetch_add(1,Ordering::Relaxed)),trigger:if scheduled {"scheduled"} else {"manual"}.into(),started_at:now,finished_at:0,status:"running".into(),repositories:0,partial:false,issues:vec![],items:vec![]};
+            let run=CleanerRun {id:format!("{}-{}-{}",std::process::id(),now,super::SEQUENCE.fetch_add(1,Ordering::Relaxed)),trigger:if scheduled {"scheduled"} else {"manual"}.into(),started_at:now,finished_at:0,status:"running".into(),repositories:0,partial:false,issues:vec![],items:vec![],unlisted:0,unexamined:0};
             saved.cancel_run=None;saved.history.insert(0,run.clone());saved.history.truncate(20);
             Ok((config.clone(),run))
         })?;
@@ -701,9 +740,7 @@ impl Cleaner {
                     "incomplete"
                 }
                 .into();
-                if run.issues.len() < 128 {
-                    run.issues.push(error.into_message());
-                }
+                push_issue(&mut run.issues, error.into_message());
             }
             run.finished_at = super::now();
             if let Err(e) = service.record(&run) {
@@ -795,19 +832,32 @@ impl Cleaner {
         }
         if skipped > 0 {
             run.partial = true;
-            run.issues.push(format!(
-                "{skipped} artifact(s) were left alone: their repository was not read in full"
-            ));
+            push_issue(
+                &mut run.issues,
+                format!("{skipped} artifact(s) were left alone: their repository was not read in full"),
+            );
         }
         let started = Instant::now();
         let mut attempted = 0u64;
+        // `max_targets` limits removals attempted, not rows written. Counting
+        // every refused row against it let 14 refused candidates and 6 dirty
+        // repositories fill a 20-target run that then removed nothing, run
+        // after run, while the trees past the 20th were never looked at.
+        let max_targets = config.max_targets as usize;
+        let mut attempted_targets = 0usize;
+        // A repository refused for its own state (uncommitted work, leases,
+        // unreadable task state) refuses every candidate in it, so it is asked
+        // once per run, not once per candidate. The removal gate still asks
+        // again before anything is deleted.
+        let mut refused_repos: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for candidate in candidates {
-            if run.items.len() >= config.max_targets as usize
-                || started.elapsed() > Duration::from_secs(300)
-            {
+            if attempted_targets >= max_targets || started.elapsed() > Duration::from_secs(300) {
                 run.partial = true;
-                run.issues
-                    .push("Run limit reached; remaining candidates were not attempted".into());
+                push_issue(
+                    &mut run.issues,
+                    "Run limit reached; remaining candidates were not attempted".into(),
+                );
                 break;
             }
             self.still_authorized(config, &run.id)?;
@@ -821,7 +871,13 @@ impl Cleaner {
             };
             let mut journal_failed = false;
             let action = (|| {
-                quiet_repo(&candidate.repo_path)?;
+                if let Some(reason) = refused_repos.get(&candidate.repo_path) {
+                    return Err(CommandError::from(reason.clone()));
+                }
+                if let Err(error) = self.quiet(&candidate.repo_path) {
+                    refused_repos.insert(candidate.repo_path.clone(), error.message().to_string());
+                    return Err(error);
+                }
                 let plan = super::prepare_with_activity(
                     &candidate.repo_path,
                     &format!("local:{}", candidate.path),
@@ -833,6 +889,7 @@ impl Cleaner {
                     return Err("Candidate exceeds the remaining byte budget".into());
                 }
                 attempted = attempted.saturating_add(plan.bytes);
+                attempted_targets += 1;
                 row.status = "running".into();
                 row.bytes_before = plan.bytes;
                 run.items.push(row.clone());
@@ -849,7 +906,7 @@ impl Cleaner {
                     &plan.id,
                     |argv, path| {
                         self.still_authorized(config, &run.id)?;
-                        quiet_repo(&candidate.repo_path)?;
+                        self.quiet(&candidate.repo_path)?;
                         let exclusions = discovery::roots(&config.exclusions, true)?;
                         if exclusions.iter().any(|p| Path::new(path).starts_with(p)) {
                             return Err("Target is excluded".into());
@@ -878,8 +935,14 @@ impl Cleaner {
                 .filter(|r| r.repo_path == row.repo_path && r.path == row.path)
             {
                 *last = row;
-            } else {
+            } else if run.items.len() + (max_targets - attempted_targets) < MAX_RUN_ITEMS {
+                // A row that was never attempted is listed only while room is
+                // left for every removal the run may still attempt: the saved
+                // history refuses a run of more than `MAX_RUN_ITEMS` rows, and
+                // an unreadable history stops every later run.
                 run.items.push(row);
+            } else {
+                run.unlisted = run.unlisted.saturating_add(1);
             }
             // A failed journal write stops the next mutation. It never silently
             // proceeds with an operation whose history cannot be persisted.
@@ -887,6 +950,15 @@ impl Cleaner {
             if journal_failed {
                 return Err("Cleanup stopped because its journal could not be saved".into());
             }
+        }
+        if run.unlisted > 0 {
+            push_issue(
+                &mut run.issues,
+                format!(
+                    "{} more refused or unexamined candidate(s) are not listed: a run keeps at most {MAX_RUN_ITEMS} rows",
+                    run.unlisted
+                ),
+            );
         }
         run.status = if self.cancel.load(Ordering::SeqCst) {
             "cancelled"

@@ -204,6 +204,8 @@ fn restart_reports_unfinished_history_as_interrupted_without_replaying_it() {
                 partial: false,
                 issues: vec![],
                 items: vec![],
+                unlisted: 0,
+                unexamined: 0,
             });
             Ok(())
         })
@@ -339,6 +341,8 @@ fn a_worker_finishing_during_a_status_read_is_never_reported_interrupted() {
                 partial: false,
                 issues: vec![],
                 items: vec![],
+                unlisted: 0,
+                unexamined: 0,
             });
             Ok(())
         })
@@ -509,6 +513,8 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -696,6 +702,8 @@ fn policy_edits_inside_the_execution_gate_preserve_real_artifacts() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -742,6 +750,8 @@ fn incomplete_discovery_blocks_every_mutation() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     assert!(cleaner
         .perform_with_gate(&saved.config, &mut run, |_, _, _| panic!(
@@ -1023,6 +1033,8 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1208,6 +1220,8 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1396,6 +1410,8 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1483,6 +1499,8 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1509,4 +1527,171 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
         r.join("__pycache__/module.pyc").is_file(),
         "and the tree survives on disk"
     );
+}
+
+/// A committed repository holding one aged, ignored `__pycache__` per entry of
+/// `dirs` ("" for the repository root), each `bytes` long.
+#[cfg(unix)]
+fn aged_bytecode_repo(
+    root: &std::path::Path,
+    name: &str,
+    dirs: &[&str],
+    bytes: usize,
+) -> std::path::PathBuf {
+    let r = repo(root, name);
+    fs::write(r.join(".gitignore"), "__pycache__/\n").unwrap();
+    fs::write(r.join("source.py"), "print('preserve')").unwrap();
+    crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+    crate::engine::git_cli::git_text(
+        &r,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )
+    .unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+    for dir in dirs {
+        let cache = r.join(dir).join("__pycache__");
+        fs::create_dir_all(&cache).unwrap();
+        let file = cache.join("module.pyc");
+        fs::write(&file, vec![b'x'; bytes]).unwrap();
+        for p in [file, cache] {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+    }
+    r
+}
+
+/// A journaled, running history entry for `perform_with_gate` to fill.
+fn journaled_run(cleaner: &Cleaner, id: &str) -> CleanerRun {
+    let run = CleanerRun {
+        id: id.into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+        unlisted: 0,
+        unexamined: 0,
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    run
+}
+
+/// Measured 2026-11-14: twenty consecutive scheduled runs reclaimed nothing,
+/// each one filled to `max_targets` with refused rows. A refused candidate is
+/// not an attempted removal, so it must not use up the run's target count.
+#[cfg(unix)]
+#[test]
+fn refused_candidates_do_not_use_up_the_target_count() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("refusals-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    // Larger trees sort first, so the two dirty repositories are reached
+    // before the clean one.
+    for name in ["dirty-a", "dirty-b"] {
+        let r = aged_bytecode_repo(&root, name, &[""], 4096);
+        fs::write(r.join("source.py"), "print('edited')").unwrap();
+    }
+    let clean = aged_bytecode_repo(&root, "clean", &[""], 100);
+    let mut c = config(&cleaner, &root);
+    c.max_targets = 1;
+    let saved = cleaner.save(c).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "refusals-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+
+    assert!(
+        !clean.join("__pycache__").exists(),
+        "the clean repository's output is removed: {run:?}"
+    );
+    for name in ["dirty-a", "dirty-b"] {
+        assert!(root.join(name).join("__pycache__/module.pyc").is_file());
+    }
+    assert_eq!(
+        run.items.iter().filter(|r| r.status == "completed").count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.items
+            .iter()
+            .filter(|r| r.message.contains("uncommitted work"))
+            .count(),
+        2,
+        "{run:?}"
+    );
+}
+
+/// Once refused rows stop counting against `max_targets`, one run can refuse
+/// hundreds of candidates. `read` refuses a history holding a run of more than
+/// `MAX_RUN_ITEMS` rows, so an unbounded list would make every later run fail.
+#[cfg(unix)]
+#[test]
+fn a_run_of_many_refusals_keeps_its_history_readable_and_counts_what_it_did_not_list() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("many-refusals-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.quiet_override = Some(|_| Err("Repository has active task leases".into()));
+    let cleaner = Arc::new(service);
+    let dirs: Vec<String> = (0..50).map(|i| format!("pkg{i:02}")).collect();
+    let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    for name in ["r1", "r2", "r3"] {
+        aged_bytecode_repo(&root, name, &dirs, 100);
+    }
+    let mut c = config(&cleaner, &root);
+    c.max_targets = 20;
+    let saved = cleaner.save(c).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "many-refusals-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| {
+            panic!("a refused repository is never gated")
+        })
+        .unwrap();
+
+    assert_eq!(run.items.len(), 80, "room is kept for 20 attempts");
+    assert_eq!(run.unlisted, 70, "150 refusals, 80 listed");
+    assert!(run.items.iter().all(|r| r.status == "skipped"));
+    assert!(run.issues.iter().any(|i| i.contains("70 more")), "{:?}", run.issues);
+    cleaner.record(&run).unwrap();
+    cleaner
+        .read()
+        .expect("the saved history stays readable after the run");
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { cleanupAllowed, coverageNotice } from "./globalEligibility";
-import type { CleanerCandidate, CleanerInventory } from "./globalTypes";
+import { cleanupAllowed, coverageNotice, itemStatusLabel, runRowsSummary } from "./globalEligibility";
+import type { CleanerCandidate, CleanerInventory, CleanerRun } from "./globalTypes";
 
 const candidate: CleanerCandidate = {
   repo_path: "/w/repo",
@@ -63,5 +63,22 @@ describe("coverageNotice", () => {
   it("explains the one case where incomplete coverage does leave nothing to do", () => {
     const notice = coverageNotice(inventory({ candidates: [], partial: true }));
     expect(notice).toContain("nothing eligible was found");
+  });
+});
+
+describe("run rows", () => {
+  const run = (over: Partial<CleanerRun> = {}): CleanerRun => ({
+    id: "r", trigger: "scheduled", started_at: 0, finished_at: 1, status: "completed_with_skips",
+    repositories: 3, partial: false, issues: [], items: [], ...over,
+  });
+  it("never shows a check the host shed as a refusal", () => {
+    expect(itemStatusLabel("unexamined")).toBe("could not examine");
+    expect(itemStatusLabel("completed_with_skips")).toBe("completed with skips");
+  });
+  it("counts rows a run kept and the ones it could not list", () => {
+    expect(runRowsSummary(run())).toBe("0 targets reported");
+    expect(runRowsSummary(run({ unlisted: 70, unexamined: 14 }))).toBe(
+      "0 targets reported · 70 more not listed · 14 could not be examined under load",
+    );
   });
 });
