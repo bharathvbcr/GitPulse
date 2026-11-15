@@ -266,10 +266,8 @@ fn a_scan_that_outlasts_its_bound_admits_nothing() {
     std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
     let mut rig = rig(1_000_000);
     rig.cfg.scan_budget = Duration::ZERO;
-    rig.cfg.scanner = |_| {
-        std::thread::sleep(Duration::from_millis(5));
-        Ok(false)
-    };
+    // A zero bound is passed by the time the second file is reached.
+    rig.cfg.scanner = |_| Ok(false);
     let result = take(&dir, &rig.cfg);
     assert_eq!(
         result.omissions.wholesale.as_deref(),
@@ -1101,7 +1099,7 @@ mod mailbox {
             .record_turn_checkpoint(&request(dir.path(), "turn_start"), Duration::from_secs(10))
             .unwrap_err();
         assert!(err.contains("not attached"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
     }
 
     /// The other mixed-version direction: an owner that does not know the

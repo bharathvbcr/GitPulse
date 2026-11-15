@@ -342,7 +342,7 @@ mod tests {
                 Ok(serde_json::json!({"outcome": "captured"}))
             },
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
         assert!(matches!(outcome, Outcome::NotCaptured(_)), "{outcome:?}");
     }
 
