@@ -1408,8 +1408,7 @@ fn blocking_ancestors(repo: &Path, path: &str) -> Vec<String> {
         }
         prefix.push_str(part);
         let candidate = repo.join(&prefix);
-        let is_non_dir =
-            std::fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir());
+        let is_non_dir = std::fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir());
         if is_non_dir || candidate.join(".git").exists() {
             found.push(prefix.clone());
         }
@@ -6861,14 +6860,19 @@ pub fn render_branch_template(
 /// gitdirs without a `.git` checkout parent return the canonicalized input.
 pub fn resolve_main_checkout(worktree_or_repo: &Path) -> Result<PathBuf, CommandError> {
     let canon = worktree_or_repo.canonicalize().map_err(|e| {
-        CommandError::plain(format!("cannot resolve {}: {e}", worktree_or_repo.display()))
+        CommandError::plain(format!(
+            "cannot resolve {}: {e}",
+            worktree_or_repo.display()
+        ))
     })?;
     let canon = PathBuf::from(plain_path_text(&canon.to_string_lossy()));
     if let Ok((_, common)) = crate::repository_trust::git_directories(&canon) {
         let common = common.canonicalize().unwrap_or(common);
         if common.file_name().and_then(|n| n.to_str()) == Some(".git") {
             if let Some(parent) = common.parent() {
-                let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                let parent = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
                 return Ok(PathBuf::from(plain_path_text(&parent.to_string_lossy())));
             }
         }
@@ -6902,7 +6906,10 @@ pub fn resolve_worktree_path(
     match layout {
         WorktreeLayout::Lane => {
             let mut container = anchor;
-            for segment in [format!(".{GITPULSE_LANE_KIND}"), WORKTREES_SEGMENT.to_string()] {
+            for segment in [
+                format!(".{GITPULSE_LANE_KIND}"),
+                WORKTREES_SEGMENT.to_string(),
+            ] {
                 container.push(segment);
                 match container.symlink_metadata() {
                     Ok(meta) if meta.file_type().is_dir() => {}
@@ -9324,19 +9331,18 @@ some-future-field whatever
         let sibling_path =
             resolve_worktree_path(&canon, "feat-a", WorktreeLayout::Sibling).unwrap();
         let name = canon.file_name().unwrap().to_str().unwrap();
-        assert_eq!(sibling_path, canon.parent().unwrap().join(format!("{name}.feat-a")));
+        assert_eq!(
+            sibling_path,
+            canon.parent().unwrap().join(format!("{name}.feat-a"))
+        );
 
         assert_eq!(
             resolve_worktree_path_for_branch(canon_str, "feat/a", None).unwrap(),
             sibling_path
         );
         assert_eq!(
-            resolve_worktree_path_for_branch_with_layout(
-                canon_str,
-                "feat/a",
-                WorktreeLayout::Lane
-            )
-            .unwrap(),
+            resolve_worktree_path_for_branch_with_layout(canon_str, "feat/a", WorktreeLayout::Lane)
+                .unwrap(),
             lane_path
         );
     }

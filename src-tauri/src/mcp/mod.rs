@@ -12553,8 +12553,8 @@ mod tests {
         )
         .expect("check-ignore");
         assert_eq!(lane_ignored.status_code, 0, "lane dir must be git-ignored");
-        let status = crate::engine::git_cli::git_text(&canon_repo, &["status", "--porcelain"])
-            .unwrap();
+        let status =
+            crate::engine::git_cli::git_text(&canon_repo, &["status", "--porcelain"]).unwrap();
         assert!(
             !status.lines().any(|line| line.contains(".gitpulse")),
             "lane must not dirty git status: {status}"
@@ -12684,9 +12684,8 @@ mod tests {
             }),
         );
         assert!(!err, "sibling create failed: {created_sibling}");
-        let sibling_file =
-            std::path::Path::new(created_sibling["worktree_path"].as_str().unwrap())
-                .join("gate_probe.txt");
+        let sibling_file = std::path::Path::new(created_sibling["worktree_path"].as_str().unwrap())
+            .join("gate_probe.txt");
 
         let lane_verdict =
             crate::harness::policy::check_file(&repo, lane_file.to_str().unwrap(), "write", None);
@@ -12715,7 +12714,10 @@ mod tests {
             sibling_verdict.status.blocks(),
             "sibling layout must be blocked by default gate: {sibling_verdict:?}"
         );
-        assert_eq!(sibling_verdict.rule, "path.outside_root", "{sibling_verdict:?}");
+        assert_eq!(
+            sibling_verdict.rule, "path.outside_root",
+            "{sibling_verdict:?}"
+        );
     }
 
     #[test]

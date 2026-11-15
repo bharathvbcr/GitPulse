@@ -7267,8 +7267,9 @@ done
     /// into `foo` escalates to `Ask` naming `foo`.
     #[cfg(unix)]
     #[test]
-    fn an_incoming_edit_into_another_partys_dirty_symbol_asks_even_when_our_dirty_edits_are_elsewhere()
-    {
+    fn an_incoming_edit_into_another_partys_dirty_symbol_asks_even_when_our_dirty_edits_are_elsewhere(
+    ) {
+        use crate::procguard::LockedSpawn;
         use crate::test_support::git_in;
         let farm = farm_bound(false, false, 1);
         let main_dir = Path::new(&farm.repo);
@@ -7294,7 +7295,7 @@ done
         let head_out = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(main_dir)
-            .output()
+            .output_locked()
             .unwrap();
         assert!(head_out.status.success());
         let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
@@ -7310,8 +7311,11 @@ done
         crate::codeintel::tests::seed_file_symbols(sib_dir, &head, "src/lib.rs", base, syms);
 
         // Party B dirties `foo`; this party dirties `bar`.
-        std::fs::write(sib_dir.join("src/lib.rs"), base.replace("let a = 1;", "let a = 9;"))
-            .unwrap();
+        std::fs::write(
+            sib_dir.join("src/lib.rs"),
+            base.replace("let a = 1;", "let a = 9;"),
+        )
+        .unwrap();
         std::fs::write(
             main_dir.join("src/lib.rs"),
             base.replace("let b = 2;", "let b = 9;"),
@@ -7321,7 +7325,7 @@ done
         let target_file = format!("{}/src/lib.rs", farm.repo);
         let mut disjoint_call = edit_call(&farm.repo, &target_file);
         disjoint_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
-            "    let c = 3;".to_string(),
+            "    let c = 3;".to_string()
         ]));
         let disjoint = guard_here(&disjoint_call);
         assert!(
@@ -7332,10 +7336,14 @@ done
 
         let mut shared_call = edit_call(&farm.repo, &target_file);
         shared_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
-            "    let a = 1;".to_string(),
+            "    let a = 1;".to_string()
         ]));
         let shared = guard_here(&shared_call);
-        assert!(asks(&shared), "shared incoming edit must ask: {:?}", shared.render());
+        assert!(
+            asks(&shared),
+            "shared incoming edit must ask: {:?}",
+            shared.render()
+        );
         assert!(
             reason_of(&shared).contains("foo"),
             "expected shared symbol `foo` in reason: {}",
