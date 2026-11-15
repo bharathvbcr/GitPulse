@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 121 contracts over
- * 311 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 122 contracts over
+ * 315 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -109,7 +109,8 @@ const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
 const ts = (...parts) => path.join(REPO_ROOT, "src", "lib", ...parts);
 
 export const CONTRACTS = Object.freeze([
-  { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
+  { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["ReclaimScopes", "CloneBudget", "CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
+  { label: "stale-worktrees", rustPath: rust("storage", "stale_worktrees.rs"), tsPath: ts("storage", "staleWorktreeTypes.ts"), structs: ["StaleWorktree", "StaleWorktreeReport"] },
   { label: "hygiene", rustPath: rust("storage", "hygiene", "mod.rs"), tsPath: ts("storage", "hygiene", "types.ts"), structs: ["CacheEntry", "CacheInventory", "HygienePlan", "HygieneOutcome"] },
   { label: "workbench", rustPath: rust("workbench.rs"), tsPath: ts("workbench", "client.ts"), structs: ["WorkbenchError"] },
   { label: "attempt-review", rustPath: rust("workbench", "review.rs"), tsPath: ts("workbench", "attemptReview.ts"), structs: ["AttemptReview"] },

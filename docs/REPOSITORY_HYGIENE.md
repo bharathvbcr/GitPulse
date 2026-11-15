@@ -143,6 +143,56 @@ four times, after which the saved interval applies; a run that examined
 everything resets this. The check keeps its own admission class: it is never
 promoted to a user action to get past the governor.
 
+### Reclaim scopes (off by default)
+
+Three settings widen what the scheduled cleaner deletes. Each is off by
+default, and no run — scheduled, in-app or manual — uses any of them until a
+person has previewed the current set with **Inspect saved roots**. The preview
+is recorded in `hygiene/state.json` only by that command, never from the saved
+policy, and any change to the set clears it, so turning a scope off and on
+again needs a fresh preview. A run with scopes enabled but not previewed uses
+none of them and says so.
+
+| Setting | What it adds | Vetoes kept |
+| --- | --- | --- |
+| **Reclaim build caches in idle linked worktrees** (`scopes.worktree_caches`) | Linked worktrees under the roots (including `.claude/worktrees/*` and `.gitpulse/worktrees/*`, which discovery never enters) are inventoried, and the caches worktree creation clones into them (`target`, `.turbo`) become candidates | No process working anywhere in the worktree; its tree clean; no task lease naming its branch (or naming none); producer evidence, ignored and untracked; nothing open; nothing modified for the idle days. Budgeted by clone-private bytes, not logical size |
+| **Judge uncommitted work per project** (`scopes.per_tree_vetoes`) | Uncommitted work refuses a repository's output only when it is in the project directory that produced it | Task leases stay repository-wide; every other check unchanged |
+| **Remove stale linked worktrees** (`scopes.prune_worktrees`) | Linked worktrees the stale-worktree report calls stale are removed with `git worktree remove`, never forced; the branch is kept | No process inside, clean, unlocked, and integrated into the main worktree's branch or idle past the idle days |
+
+The idle threshold (`scopes.worktree_idle_days`) defaults to 7 days and cannot
+go below DevCouncil's scheduled-retention minimum of 7. `node_modules` is never
+offered: DevCouncil's `protected_artifact` preserves it.
+
+### Stale worktrees
+
+**Insights → Storage → Stale worktrees** lists the linked worktrees nobody is
+using: no process works in them (the process table, which covers agent
+sessions, shells and builds alike), unlocked, clean, and integrated or idle past
+the threshold, with what removing each frees in clone-private bytes. A check
+that could not run makes the worktree not stale and names the check. Nothing is
+removed except by a click, which goes through the guarded worktree removal.
+
+### Build-cache clones
+
+A new worktree gets an APFS clone of the main checkout's Cargo `target`.
+**Settings → Repo hygiene → Build-cache clones** limits how many linked
+worktrees of one repository may hold one (`clone_budget.max_target_clones`, 0
+for no limit); at the limit the new worktree is made without one and its
+creation result says so. The default is no limit, from a measurement on
+2026-11-14: a cloned `target` held 1.8 MB of private bytes against 66 GB
+logical, while a worktree that built cold held 26.7 GB. Refusing the clone
+makes the next build cold, so a count limit costs disk rather than saving it. The limit is read from `hygiene/state.json` by
+the app, the MCP server and the `WorktreeCreate` hook alike. A total of the
+linked worktrees' private bytes (`clone_budget.max_private_bytes`, default
+50 GiB, about two cold builds of this size, 0 for no limit) is advisory: the Storage panel warns when the sized
+worktrees exceed it. It is never enforced at creation, where measuring it would
+walk every worktree.
+
+New policy fields are written to `state.json` only once they differ from their
+defaults, so a file this build writes with defaults stays readable by an older
+build. Once a scope or the clone budget is changed, an older build refuses the
+file as invalid and stops cleaning until this build is installed again.
+
 The newest 20 runs retain exact target paths, before/after logical bytes, skips,
 errors and partial outcomes. An item is journaled before mutation; failed journal
 writes stop further work. Interrupted operations are reported, never replayed.

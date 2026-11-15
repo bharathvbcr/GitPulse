@@ -339,7 +339,7 @@ describe("annotated but unregistered commands", () => {
     // terminal session for a peer message), which the A2A branch added, plus
     // cmd_list_op_snapshots and cmd_undo_op_snapshot (op log undo) and the
     // terminal session-ledger handlers on this tree.
-    expect(found.size).toBe(328);
+    expect(found.size).toBe(329);
     expect(found.has("cmd_list_op_snapshots")).toBe(true);
     expect(found.has("cmd_undo_op_snapshot")).toBe(true);
     expect(found.has("cmd_terminal_deliver_peer")).toBe(true);

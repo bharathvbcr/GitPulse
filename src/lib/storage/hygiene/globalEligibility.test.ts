@@ -6,6 +6,7 @@ const candidate: CleanerCandidate = {
   repo_path: "/w/repo",
   path: "target",
   provider: "Rust / Cargo",
+  scope: "repository",
   bytes: 1,
 };
 

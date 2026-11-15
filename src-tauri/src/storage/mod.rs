@@ -36,6 +36,7 @@ pub(crate) mod clone_size;
 pub mod commit_graph;
 pub mod hygiene;
 pub mod repo_tuning;
+pub mod stale_worktrees;
 #[cfg(test)]
 mod walk_adversarial;
 #[cfg(test)]
@@ -1083,8 +1084,7 @@ fn size_tree_scoped(
                 if let Some(tally) = private.as_deref_mut() {
                     if let Some(facts) = budget.file_facts(&entry.path()) {
                         #[cfg(unix)]
-                        let is_dup =
-                            facts.nlink > 1 && !seen_inodes.insert((facts.dev, facts.ino));
+                        let is_dup = facts.nlink > 1 && !seen_inodes.insert((facts.dev, facts.ino));
                         #[cfg(not(unix))]
                         let is_dup = false;
                         if !is_dup {
@@ -2562,7 +2562,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
     if count_objects_unread {
         git_budget.note_unread();
     }
-    let (raw_git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut git_budget, true, None);
+    let (raw_git_dir_bytes, git_truncated) =
+        size_tree_scoped(&git_dir, &mut git_budget, true, None);
     let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut git_budget);
     let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut git_budget);
     let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut git_budget);

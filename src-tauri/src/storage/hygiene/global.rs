@@ -57,6 +57,121 @@ pub struct CleanerConfig {
     pub retention_days: u32,
     pub max_run_bytes: u64,
     pub max_targets: u32,
+    /// Behaviour that makes the cleaner delete more. Every scope is off by
+    /// default, and no run uses a scope until a person has previewed the
+    /// current set in the app (`Saved::previewed_scopes`). Omitted from the
+    /// saved state while all off, so an older build can still read the file.
+    #[serde(default, skip_serializing_if = "ReclaimScopes::is_default")]
+    pub scopes: ReclaimScopes,
+    /// How many linked worktrees may hold a cloned build cache. Read by
+    /// worktree creation, in the app and in the `WorktreeCreate` hook, which
+    /// is why it lives in this file rather than in app storage. Omitted from
+    /// the saved state while at its default.
+    #[serde(default, skip_serializing_if = "CloneBudget::is_default")]
+    pub clone_budget: CloneBudget,
+}
+
+/// Opt-in reclaim scopes. Each one widens what the cleaner may delete.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReclaimScopes {
+    /// Inventory linked worktrees under the roots, and offer the regenerable
+    /// build caches worktree creation clones into them (`target`, `.turbo`)
+    /// when no process works in the worktree, its tree is clean, no task lease
+    /// names its branch, nothing in the cache is open, and nothing in it was
+    /// modified for `worktree_idle_days`. Budgeted by clone-private bytes.
+    #[serde(default)]
+    pub worktree_caches: bool,
+    /// Judge the uncommitted-work veto per tree: a repository's output is
+    /// refused only for uncommitted work in the project directory that
+    /// produced it, not anywhere in the repository.
+    #[serde(default)]
+    pub per_tree_vetoes: bool,
+    /// Remove linked worktrees the stale-worktree report calls stale (no
+    /// process inside, clean, unlocked, integrated or idle past
+    /// `worktree_idle_days`) with `git worktree remove`, never forced.
+    #[serde(default)]
+    pub prune_worktrees: bool,
+    /// Idle days for the two worktree scopes. 7 to 3650: the scheduled
+    /// minimum DevCouncil's retention policy sets.
+    #[serde(default = "default_worktree_idle_days")]
+    pub worktree_idle_days: u32,
+}
+fn default_worktree_idle_days() -> u32 {
+    7
+}
+impl Default for ReclaimScopes {
+    fn default() -> Self {
+        Self {
+            worktree_caches: false,
+            per_tree_vetoes: false,
+            prune_worktrees: false,
+            worktree_idle_days: default_worktree_idle_days(),
+        }
+    }
+}
+impl ReclaimScopes {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    pub fn any(&self) -> bool {
+        self.worktree_caches || self.per_tree_vetoes || self.prune_worktrees
+    }
+    /// What a run may use: the saved scopes when a person previewed exactly
+    /// this set, otherwise none of them.
+    fn effective(self, previewed: Option<ReclaimScopes>) -> ReclaimScopes {
+        if previewed == Some(self) {
+            self
+        } else {
+            ReclaimScopes {
+                worktree_idle_days: self.worktree_idle_days,
+                ..ReclaimScopes::default()
+            }
+        }
+    }
+}
+
+/// The build-cache clone budget worktree creation enforces.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloneBudget {
+    /// Linked worktrees of one repository that may hold a cloned Cargo
+    /// `target` at once; 0 is no limit. Past it, a new worktree is created
+    /// without one and its report says why.
+    #[serde(default = "default_max_target_clones")]
+    pub max_target_clones: u32,
+    /// Advisory total of clone-private bytes the Storage panel compares the
+    /// linked worktrees' sizes against; 0 is no limit. Never enforced at
+    /// creation: measuring it there would walk every worktree.
+    #[serde(default = "default_max_private_bytes")]
+    pub max_private_bytes: u64,
+}
+/// No limit by default. Measured 2026-11-14: a worktree's cloned `target` held
+/// 1.8 MB of private bytes against 66 GB logical, while a worktree that built
+/// cold held 26.7 GB. Refusing the clone makes the next build cold, so a count
+/// limit costs disk rather than saving it; it stays available as a setting.
+pub(crate) const DEFAULT_MAX_TARGET_CLONES: u32 = 0;
+/// The advisory total for linked worktrees' private bytes: 50 GiB, about two
+/// cold Cargo builds of this size. A warning in Storage, never enforced.
+pub(crate) const DEFAULT_MAX_WORKTREE_PRIVATE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+fn default_max_target_clones() -> u32 {
+    DEFAULT_MAX_TARGET_CLONES
+}
+fn default_max_private_bytes() -> u64 {
+    DEFAULT_MAX_WORKTREE_PRIVATE_BYTES
+}
+impl Default for CloneBudget {
+    fn default() -> Self {
+        Self {
+            max_target_clones: DEFAULT_MAX_TARGET_CLONES,
+            max_private_bytes: DEFAULT_MAX_WORKTREE_PRIVATE_BYTES,
+        }
+    }
+}
+impl CloneBudget {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 impl Default for CleanerConfig {
     fn default() -> Self {
@@ -72,6 +187,8 @@ impl Default for CleanerConfig {
             retention_days: 30,
             max_run_bytes: 10 * 1024 * 1024 * 1024,
             max_targets: 20,
+            scopes: ReclaimScopes::default(),
+            clone_budget: CloneBudget::default(),
         }
     }
 }
@@ -97,6 +214,13 @@ impl CleanerConfig {
         {
             return Err("Invalid cleaner path inventory".into());
         }
+        devmap_query::hygiene::validate_retention(self.scopes.worktree_idle_days, true)
+            .map_err(|e| format!("Worktree idle days: {e}"))?;
+        if self.clone_budget.max_target_clones > 1000
+            || self.clone_budget.max_private_bytes > 1024u64.pow(5)
+        {
+            return Err("Clone budget is outside its supported bounds".into());
+        }
         if self.enabled && (self.roots.is_empty() || self.next_run_at == 0) {
             return Err("A schedule needs selected roots and a next run time".into());
         }
@@ -107,9 +231,29 @@ impl CleanerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerCandidate {
     pub repo_path: String,
+    /// Relative to `repo_path`, except for a `prune-worktree` candidate,
+    /// where it is the worktree's absolute path and `repo_path` its
+    /// repository.
     pub path: String,
     pub provider: String,
     pub bytes: u64,
+    /// `repository` (the default), `worktree-cache` or `prune-worktree`: the
+    /// reclaim scope that offered it.
+    #[serde(default = "repository_scope")]
+    pub scope: String,
+    /// What removing it frees now (clone-private bytes), when known. The
+    /// worktree scopes budget with this; `bytes` is logical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+    /// The worktree's branch, for the per-tree lease check. Not on the wire.
+    #[serde(skip)]
+    pub branch: Option<String>,
+}
+const SCOPE_REPOSITORY: &str = "repository";
+const SCOPE_WORKTREE_CACHE: &str = "worktree-cache";
+const SCOPE_PRUNE_WORKTREE: &str = "prune-worktree";
+fn repository_scope() -> String {
+    SCOPE_REPOSITORY.into()
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanerInventory {
@@ -204,6 +348,12 @@ struct Saved {
     /// still read the file.
     #[serde(default, skip_serializing_if = "is_zero")]
     deferral_retries: u32,
+    /// The reclaim scopes as they stood when a person last previewed them in
+    /// the app (`inventory`). Written only there, never from the policy the
+    /// frontend saves, so an edit cannot carry its own acknowledgement. Any
+    /// change to the scopes clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previewed_scopes: Option<ReclaimScopes>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerState {
@@ -214,6 +364,9 @@ pub struct CleanerState {
     pub background_supported: bool,
     pub background_error: Option<String>,
     pub agent_rules: String,
+    /// The saved reclaim scopes include at least one, and a person has
+    /// previewed exactly this set since it last changed: runs use them.
+    pub scopes_previewed: bool,
 }
 
 #[cfg(test)]
@@ -281,12 +434,27 @@ impl Cleaner {
             state_after_read: None,
         }
     }
-    fn quiet(&self, repo: &str) -> Result<(), CommandError> {
+    /// The state veto for one candidate, judged at the scope that offered
+    /// it: the whole repository by default, the producing project directory
+    /// under `per_tree_vetoes`, the linked worktree itself for the worktree
+    /// scopes.
+    fn quiet_tree(
+        &self,
+        candidate: &CleanerCandidate,
+        scopes: ReclaimScopes,
+    ) -> Result<(), CommandError> {
         #[cfg(test)]
         if let Some(check) = self.quiet_override {
-            return check(repo);
+            return check(&candidate.repo_path);
         }
-        quiet_repo(repo)
+        match candidate.scope.as_str() {
+            SCOPE_WORKTREE_CACHE => {
+                quiet_worktree(&candidate.repo_path, candidate.branch.as_deref())
+            }
+            SCOPE_PRUNE_WORKTREE => quiet_worktree(&candidate.path, candidate.branch.as_deref()),
+            _ if scopes.per_tree_vetoes => quiet_project(&candidate.repo_path, &candidate.path),
+            _ => quiet_repo(&candidate.repo_path),
+        }
     }
     /// [`Self::quiet`], asked again after a short pause when the host shed it,
     /// while this run's wait budget lasts. Waits are cancellable and recheck
@@ -297,12 +465,13 @@ impl Cleaner {
         &self,
         config: &CleanerConfig,
         run_id: &str,
-        repo: &str,
+        candidate: &CleanerCandidate,
+        scopes: ReclaimScopes,
         waited: &mut Duration,
     ) -> Result<(), CommandError> {
         let mut pauses = DEFERRAL_BACKOFF.iter();
         loop {
-            match self.quiet(repo) {
+            match self.quiet_tree(candidate, scopes) {
                 Err(error) if shed_under_load(&error) => {
                     let Some(pause) = pauses
                         .next()
@@ -317,7 +486,12 @@ impl Cleaner {
             }
         }
     }
-    fn pause(&self, total: Duration, config: &CleanerConfig, run_id: &str) -> Result<(), CommandError> {
+    fn pause(
+        &self,
+        total: Duration,
+        config: &CleanerConfig,
+        run_id: &str,
+    ) -> Result<(), CommandError> {
         let until = Instant::now() + total;
         loop {
             self.still_authorized(config, run_id)?;
@@ -490,6 +664,8 @@ impl Cleaner {
                 }
             }
         }
+        let scopes_previewed =
+            saved.config.scopes.any() && saved.previewed_scopes == Some(saved.config.scopes);
         Ok(CleanerState {
             config: saved.config,
             history: saved.history,
@@ -498,6 +674,7 @@ impl Cleaner {
             background_supported: super::background::supported(),
             background_error: saved.background_error,
             agent_rules: devmap_query::hygiene::AGENT_RULES.into(),
+            scopes_previewed,
         })
     }
     pub fn save(&self, config: CleanerConfig) -> Result<CleanerState, CommandError> {
@@ -537,6 +714,10 @@ impl Cleaner {
                 .revision
                 .checked_add(1)
                 .ok_or("Policy revision exhausted")?;
+            if config.scopes != saved.config.scopes {
+                // A changed scope set has not been seen by anyone yet.
+                saved.previewed_scopes = None;
+            }
             let previous = saved.config.enabled && saved.config.run_when_closed;
             let next = config.enabled && config.run_when_closed;
             let reconcile = previous || next || saved.background_error.is_some();
@@ -626,9 +807,25 @@ impl Cleaner {
         }
         self.cancel.store(false, Ordering::SeqCst);
         let config = self.state()?.config;
-        self.inspect(&config)
+        // The preview shows every enabled scope, previewed or not: seeing
+        // what a scope would take is the point of it.
+        let inventory = self.inspect(&config, config.scopes, true)?;
+        if config.scopes.any() {
+            self.update(|saved| {
+                if saved.config.scopes == config.scopes {
+                    saved.previewed_scopes = Some(config.scopes);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(inventory)
     }
-    fn inspect(&self, config: &CleanerConfig) -> Result<CleanerInventory, CommandError> {
+    fn inspect(
+        &self,
+        config: &CleanerConfig,
+        scopes: ReclaimScopes,
+        measure: bool,
+    ) -> Result<CleanerInventory, CommandError> {
         let roots = discovery::roots(&config.roots, false)?;
         let excludes = discovery::roots(&config.exclusions, true)?;
         let found = discovery::discover(&roots, &excludes, &self.cancel);
@@ -642,6 +839,7 @@ impl Cleaner {
             shed_repos: 0,
         };
         let start = Instant::now();
+        let discovered: BTreeSet<PathBuf> = found.repos.clone();
         for repo in found.repos {
             if start.elapsed() > Duration::from_secs(120)
                 || self.cancel.load(Ordering::SeqCst)
@@ -748,6 +946,9 @@ impl Cleaner {
                                 path: artifact.path,
                                 provider: provider.into(),
                                 bytes: artifact.bytes,
+                                scope: SCOPE_REPOSITORY.into(),
+                                private_bytes: artifact.private_bytes,
+                                branch: None,
                             });
                         }
                     }
@@ -768,6 +969,21 @@ impl Cleaner {
                     }
                 }
             }
+            // After the repository's own scan, so a scope that walks many
+            // worktrees cannot spend the inventory budget before the
+            // repository itself is read.
+            if scopes.worktree_caches || scopes.prune_worktrees {
+                self.worktree_candidates(
+                    &repo,
+                    &roots,
+                    &excludes,
+                    &discovered,
+                    scopes,
+                    measure,
+                    start,
+                    &mut result,
+                );
+            }
         }
         result.candidates.sort_by(|a, b| {
             b.bytes
@@ -777,6 +993,173 @@ impl Cleaner {
         });
         result.issues.truncate(128);
         Ok(result)
+    }
+    /// Candidates the worktree scopes offer in one repository's linked
+    /// worktrees: their regenerable build caches (`worktree_caches`) and the
+    /// stale worktrees themselves (`prune_worktrees`). Only worktrees under a
+    /// configured root and outside every exclusion, and never one discovery
+    /// already found as a repository of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn worktree_candidates(
+        &self,
+        repo: &Path,
+        roots: &[PathBuf],
+        excludes: &[PathBuf],
+        discovered: &BTreeSet<PathBuf>,
+        scopes: ReclaimScopes,
+        measure: bool,
+        start: Instant,
+        result: &mut CleanerInventory,
+    ) {
+        let Some(repo_path) = repo.to_str() else {
+            return;
+        };
+        let inside = |p: &Path| {
+            roots.iter().any(|r| p.starts_with(r)) && !excludes.iter().any(|e| p.starts_with(e))
+        };
+        let over_budget = |result: &CleanerInventory| {
+            start.elapsed() > Duration::from_secs(120)
+                || self.cancel.load(Ordering::SeqCst)
+                || result.candidates.len() >= 512
+        };
+        let note = |result: &mut CleanerInventory, error: &CommandError, what: String| {
+            result.partial = true;
+            if shed_under_load(error) {
+                result.shed_repos = result.shed_repos.saturating_add(1);
+            }
+            push_issue(&mut result.issues, format!("{what}: {}", error.message()));
+        };
+        if scopes.worktree_caches {
+            let infos = match crate::engine::worktree::list_worktrees_lite(repo_path) {
+                Ok(infos) => infos,
+                Err(e) => {
+                    note(
+                        result,
+                        &e,
+                        format!("{repo_path}: linked worktrees could not be listed"),
+                    );
+                    return;
+                }
+            };
+            for info in infos
+                .iter()
+                .filter(|i| !i.is_main && !i.is_bare && !i.is_locked && !i.is_prunable)
+            {
+                if over_budget(result) {
+                    result.partial = true;
+                    push_issue(
+                        &mut result.issues,
+                        "Inventory budget reached or cancelled".into(),
+                    );
+                    return;
+                }
+                let Ok(path) = crate::engine::git_cli::canonicalize_plain(Path::new(&info.path))
+                else {
+                    continue;
+                };
+                if !inside(&path) || discovered.contains(&path) {
+                    continue;
+                }
+                // A worktree something is working in is in use, not a
+                // finding: it is passed over without an issue.
+                match crate::sysload::procscan::working_in(&path) {
+                    Ok(pids) if pids.is_empty() => {}
+                    Ok(_) => continue,
+                    Err(e) => {
+                        result.partial = true;
+                        push_issue(
+                            &mut result.issues,
+                            format!(
+                                "{}: processes could not be read, so its caches were left alone: {e}",
+                                info.path
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                let worktree = path.to_string_lossy().into_owned();
+                match crate::storage::scan_storage(&worktree) {
+                    Ok(report) => {
+                        for artifact in report.artifacts {
+                            let name = Path::new(&artifact.path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default();
+                            if !crate::engine::cow_clone::STANDARD_CACHE_DIRS.contains(&name)
+                                || !artifact.scan_complete
+                                || artifact.tracked_files > 0
+                                || artifact.unignored
+                                || artifact.checks_unexamined
+                                || !inside(&path.join(&artifact.path))
+                            {
+                                continue;
+                            }
+                            if result.candidates.len() >= 512 {
+                                result.partial = true;
+                                result.incomplete_repos.insert(worktree.clone());
+                                break;
+                            }
+                            if let Ok(provider) =
+                                super::providers::local_provider(&path, &artifact.path)
+                            {
+                                result.candidates.push(CleanerCandidate {
+                                    repo_path: worktree.clone(),
+                                    path: artifact.path,
+                                    provider: provider.into(),
+                                    bytes: artifact.bytes,
+                                    scope: SCOPE_WORKTREE_CACHE.into(),
+                                    private_bytes: artifact.private_bytes,
+                                    branch: info.branch.clone(),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        result.incomplete_repos.insert(worktree.clone());
+                        note(result, &e, worktree.clone());
+                    }
+                }
+            }
+        }
+        if scopes.prune_worktrees && !over_budget(result) {
+            match crate::storage::stale_worktrees::stale_worktrees_with(
+                repo_path,
+                scopes.worktree_idle_days,
+                &crate::sysload::procscan::working_in,
+                measure,
+                current_time(),
+            ) {
+                Ok(report) => {
+                    for issue in report.issues {
+                        push_issue(&mut result.issues, format!("{repo_path}: {issue}"));
+                    }
+                    for row in report.worktrees.into_iter().filter(|w| w.stale) {
+                        let Ok(path) =
+                            crate::engine::git_cli::canonicalize_plain(Path::new(&row.path))
+                        else {
+                            continue;
+                        };
+                        if !inside(&path) || discovered.contains(&path) {
+                            continue;
+                        }
+                        result.candidates.push(CleanerCandidate {
+                            repo_path: repo_path.into(),
+                            path: path.to_string_lossy().into_owned(),
+                            provider: "Stale linked worktree".into(),
+                            bytes: row.size.as_ref().map_or(0, |s| s.bytes),
+                            scope: SCOPE_PRUNE_WORKTREE.into(),
+                            private_bytes: row.size.as_ref().and_then(|s| s.private_bytes),
+                            branch: row.branch,
+                        });
+                    }
+                }
+                Err(e) => note(
+                    result,
+                    &e,
+                    format!("{repo_path}: stale worktrees could not be listed"),
+                ),
+            }
+        }
     }
     pub fn start(
         self: &Arc<Self>,
@@ -930,10 +1313,20 @@ impl Cleaner {
         mut gate: impl FnMut(&str, Option<&[String]>, &str) -> Result<(), CommandError>,
     ) -> Result<(), CommandError> {
         self.still_authorized(config, &run.id)?;
-        let inventory = self.inspect(config)?;
+        // Only scopes a person previewed as they now stand are used, by a
+        // scheduled run and a manual one alike: the in-app scheduler runs with
+        // nobody watching too.
+        let scopes = config.scopes.effective(self.read()?.previewed_scopes);
+        let inventory = self.inspect(config, scopes, false)?;
         run.repositories = inventory.repositories;
         run.partial = inventory.partial;
         run.issues = inventory.issues;
+        if config.scopes.any() && !scopes.any() {
+            push_issue(
+                &mut run.issues,
+                "Reclaim scopes are enabled but have not been previewed since they last changed, so this run used none of them. Inspect saved roots in GitPulse to preview them.".into(),
+            );
+        }
         // An incomplete workspace inventory is a reason not to claim complete
         // coverage; it is not a reason to leave every tree alone. Each
         // candidate is already gated on its own repository being read in full
@@ -978,7 +1371,9 @@ impl Cleaner {
             run.partial = true;
             push_issue(
                 &mut run.issues,
-                format!("{skipped} artifact(s) were left alone: their repository was not read in full"),
+                format!(
+                    "{skipped} artifact(s) were left alone: their repository was not read in full"
+                ),
             );
         }
         let started = Instant::now();
@@ -1015,32 +1410,81 @@ impl Cleaner {
                 bytes_after: None,
             };
             let mut journal_failed = false;
+            let veto_key = veto_key(&candidate, scopes);
             let action = (|| {
-                if let Some(reason) = refused_repos.get(&candidate.repo_path) {
+                if let Some(reason) = refused_repos.get(&veto_key) {
                     return Err(CommandError::from(reason.clone()));
                 }
-                if let Err(error) =
-                    self.quiet_with_backoff(config, &run.id, &candidate.repo_path, &mut waited_on_host)
-                {
+                if let Err(error) = self.quiet_with_backoff(
+                    config,
+                    &run.id,
+                    &candidate,
+                    scopes,
+                    &mut waited_on_host,
+                ) {
                     // A shed check is not an answer about the repository, so
                     // the next candidate in it asks again.
                     if !shed_under_load(&error) {
-                        refused_repos
-                            .insert(candidate.repo_path.clone(), error.message().to_string());
+                        refused_repos.insert(veto_key.clone(), error.message().to_string());
                     }
                     return Err(error);
                 }
+                if candidate.scope == SCOPE_PRUNE_WORKTREE {
+                    // `git worktree remove`, never forced: git itself refuses a
+                    // worktree with uncommitted or untracked work.
+                    let argv =
+                        crate::engine::worktree::remove_worktree_argv(&candidate.path, false);
+                    attempted_targets += 1;
+                    row.status = "running".into();
+                    run.items.push(row.clone());
+                    if let Err(error) = self.record(run) {
+                        journal_failed = true;
+                        return Err(error);
+                    }
+                    let _mutation_lock = self.lock("mutation.lock")?;
+                    self.still_authorized(config, &run.id)?;
+                    self.quiet_tree(&candidate, scopes)?;
+                    if discovery::roots(&config.exclusions, true)?
+                        .iter()
+                        .any(|p| Path::new(&candidate.path).starts_with(p))
+                    {
+                        return Err("Target is excluded".into());
+                    }
+                    gate(&candidate.repo_path, Some(argv.as_slice()), &candidate.path)?;
+                    self.still_authorized(config, &run.id)?;
+                    crate::engine::worktree::remove_worktree(
+                        &candidate.repo_path,
+                        &candidate.path,
+                        false,
+                    )?;
+                    row.status = "completed".into();
+                    row.message = "Removed the stale linked worktree with git worktree remove. Its branch is kept.".into();
+                    row.bytes_after = Some(0);
+                    return Ok(());
+                }
+                let retention = if candidate.scope == SCOPE_WORKTREE_CACHE {
+                    scopes.worktree_idle_days
+                } else {
+                    config.retention_days
+                };
                 let plan = super::prepare_with_activity(
                     &candidate.repo_path,
                     &format!("local:{}", candidate.path),
-                    config.retention_days,
+                    retention,
                     |path| self.activity(path),
                 )?;
-                if plan.bytes > config.max_run_bytes.saturating_sub(attempted) {
+                // A worktree's cloned cache is logically whole and privately a
+                // fraction of that: it is budgeted by what removing it frees.
+                let charge = if candidate.scope == SCOPE_WORKTREE_CACHE {
+                    candidate.private_bytes.unwrap_or(plan.bytes)
+                } else {
+                    plan.bytes
+                };
+                if charge > config.max_run_bytes.saturating_sub(attempted) {
                     super::cancel(&candidate.repo_path, &plan.id)?;
                     return Err("Candidate exceeds the remaining byte budget".into());
                 }
-                attempted = attempted.saturating_add(plan.bytes);
+                attempted = attempted.saturating_add(charge);
                 attempted_targets += 1;
                 row.status = "running".into();
                 row.bytes_before = plan.bytes;
@@ -1058,7 +1502,7 @@ impl Cleaner {
                     &plan.id,
                     |argv, path| {
                         self.still_authorized(config, &run.id)?;
-                        self.quiet(&candidate.repo_path)?;
+                        self.quiet_tree(&candidate, scopes)?;
                         let exclusions = discovery::roots(&config.exclusions, true)?;
                         if exclusions.iter().any(|p| Path::new(path).starts_with(p)) {
                             return Err("Target is excluded".into());
@@ -1156,33 +1600,128 @@ fn eligible_candidates(
 
 fn quiet_repo(repo: &str) -> Result<(), CommandError> {
     let root = crate::engine::git_cli::validate_repo(repo)?;
-    let status = crate::engine::git_cli::git_with_stdin(
-        &root,
-        &[
-            "-c",
-            "core.fsmonitor=false",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-        ],
-        &[],
-    )?;
-    if !status.is_empty() {
+    if !status_in(&root, None)?.is_empty() {
         return Err("Repository has uncommitted work; global cleanup preserves it".into());
     }
+    leases_clear(repo, None)
+}
+
+/// `git status` output for `root`, limited to `under` (repo-relative) when
+/// given.
+fn status_in(root: &Path, under: Option<&str>) -> Result<Vec<u8>, CommandError> {
+    let spec = under.map(|dir| format!(":(literal){dir}"));
+    let mut args = vec![
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+    ];
+    if let Some(spec) = &spec {
+        args.extend(["--", spec.as_str()]);
+    }
+    crate::engine::git_cli::git_with_stdin(root, &args, &[])
+}
+
+/// No active task lease applies. With `branch`, a lease applies when it names
+/// that branch or names none (then it could be anywhere); without, every lease
+/// applies.
+fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandError> {
     let tasks = crate::tasks::view(repo);
     if !tasks.error.is_empty() {
         return Err(format!("Task activity could not be checked: {}", tasks.error).into());
     }
-    if !tasks.leases.is_empty() {
+    let applies = |lease: &crate::tasks::TaskLease| match branch {
+        None => true,
+        Some(branch) => lease.branch.is_none() || lease.branch.as_deref() == branch,
+    };
+    if tasks.leases.iter().any(applies) {
         return Err("Repository has active task leases".into());
     }
     Ok(())
 }
 
+/// The per-tree veto: uncommitted work in the directory that produced the
+/// artifact (its parent) refuses it; work elsewhere in the repository does
+/// not. An artifact at the repository root falls back to the whole
+/// repository. Leases stay repository-wide.
+fn quiet_project(repo: &str, artifact: &str) -> Result<(), CommandError> {
+    let root = crate::engine::git_cli::validate_repo(repo)?;
+    let project = Path::new(artifact)
+        .parent()
+        .and_then(Path::to_str)
+        .filter(|p| !p.is_empty());
+    if !status_in(&root, project)?.is_empty() {
+        return Err(match project {
+            Some(project) => {
+                format!("{project} has uncommitted work; global cleanup preserves its output")
+                    .into()
+            }
+            None => "Repository has uncommitted work; global cleanup preserves it".into(),
+        });
+    }
+    leases_clear(repo, None)
+}
+
+/// The worktree-scope veto: no process works anywhere in the worktree, its
+/// tree is clean, and no task lease names its branch. A process table that
+/// could not be read refuses.
+fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandError> {
+    let root = crate::engine::git_cli::validate_repo(worktree)?;
+    match crate::sysload::procscan::working_in(&root) {
+        Ok(pids) if pids.is_empty() => {}
+        Ok(pids) => {
+            return Err(format!("{} process(es) are working in this worktree", pids.len()).into())
+        }
+        Err(e) => {
+            return Err(format!(
+            "Whether a process works in this worktree could not be read, so it was left alone: {e}"
+        )
+            .into())
+        }
+    }
+    if !status_in(&root, None)?.is_empty() {
+        return Err("Worktree has uncommitted work; global cleanup preserves it".into());
+    }
+    leases_clear(worktree, Some(branch))
+}
+
+/// What one state refusal covers, so a refusal is asked once per run per
+/// tree it judges: the repository, the producing project, or the worktree.
+fn veto_key(candidate: &CleanerCandidate, scopes: ReclaimScopes) -> String {
+    match candidate.scope.as_str() {
+        SCOPE_PRUNE_WORKTREE => candidate.path.clone(),
+        SCOPE_REPOSITORY if scopes.per_tree_vetoes => format!(
+            "{}\0{}",
+            candidate.repo_path,
+            Path::new(&candidate.path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        _ => candidate.repo_path.clone(),
+    }
+}
+
 pub(super) fn mutation_lock() -> Result<CleanerLock, CommandError> {
     service()?.lock("mutation.lock")
+}
+
+/// The build-cache clone budget worktree creation enforces, read without a
+/// lock from the saved policy. A policy that cannot be read yields the
+/// default budget, never "no limit".
+pub fn clone_budget() -> CloneBudget {
+    match service().and_then(|cleaner| cleaner.read()) {
+        Ok(saved) => saved.config.clone_budget,
+        Err(error) => {
+            log::warn!(
+                "Clone budget unreadable, using the default: {}",
+                error.message()
+            );
+            CloneBudget::default()
+        }
+    }
 }
 
 pub fn current_time() -> u64 {

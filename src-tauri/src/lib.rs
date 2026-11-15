@@ -484,6 +484,7 @@ pub fn run() {
             cmd_scan_deps_health,
             cmd_scan_secrets,
             cmd_storage_scan,
+            cmd_storage_stale_worktrees,
             cmd_commit_graph_write_plan,
             cmd_commit_graph_write,
             cmd_commit_graph_write_cancel,

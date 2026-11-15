@@ -30,6 +30,7 @@
   import { describeFailure, unknownState } from "../ui/copy/describeFailure";
   import HygienePanel from "./HygienePanel.svelte";
   import CommitGraphWrite from "./CommitGraphWrite.svelte";
+  import StaleWorktrees from "./StaleWorktrees.svelte";
   import TuningApply from "./TuningApply.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
@@ -770,6 +771,8 @@
           <ListPreviewToggle total={report.worktrees.length} noun="worktrees" bind:expanded={expandedLists.worktrees} />
         </section>
       {/if}
+
+      <StaleWorktrees repoPath={report.repo_path} storage={report} />
 
       <!-- Branch weight -->
       <section class="gp-page-section">
