@@ -1912,7 +1912,7 @@ pub(crate) fn parse_procargs2(data: &[u8]) -> Option<(String, Vec<String>, Vec<S
 }
 
 /// Whether `pid` is still a process. `EPERM` means it is, and is not ours.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn process_exists(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists and may be signalled.
     let rc = unsafe { libc::kill(pid, 0) };

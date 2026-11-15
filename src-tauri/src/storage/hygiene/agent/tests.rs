@@ -604,3 +604,28 @@ fn a_recent_or_unproven_claude_build_folder_says_which() {
         .reason
         .starts_with("owner unproven:"));
 }
+
+/// A real Cargo target has a `tmp` directory (Cargo's own scratch), and the
+/// preserved-name list refuses an entry of that name anywhere inside a
+/// candidate. Until that list tells a build directory's own `tmp` from a
+/// person's, such a target is kept, not offered: this scope reclaims nothing
+/// from a target that has built a test or a build script.
+#[test]
+fn a_target_holding_cargos_own_tmp_directory_is_kept_by_the_preserved_name_list() {
+    let (_temp, root) = temp_root();
+    let target = scratchpad(&root, OLD).join("cargo-target");
+    cargo_target(&target, 30);
+    fs::create_dir_all(target.join("tmp")).unwrap();
+    fs::write(target.join("tmp/x"), "x").unwrap();
+    age(&target, 30);
+    let refused = devmap_query::hygiene::protected_entry(Path::new("tmp"));
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.is_empty(), refused, "{:?}", scan.kept);
+    if refused {
+        assert!(kept_reason(&scan, "cargo-target")
+            .reason
+            .contains("Protected content inside candidate"));
+    }
+}

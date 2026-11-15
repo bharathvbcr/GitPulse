@@ -1117,18 +1117,33 @@ impl Cleaner {
                 // under the roots: sessions build there, and a new session
                 // worktree is seeded with a copy of it.
                 let mut checkouts = vec![repo.clone()];
-                if let Ok(infos) = crate::engine::worktree::list_worktrees_lite(repo_path) {
-                    for info in infos
-                        .iter()
-                        .filter(|i| !i.is_main && !i.is_bare && !i.is_prunable)
-                    {
-                        if let Ok(path) =
-                            crate::engine::process::canonicalize_plain(Path::new(&info.path))
+                match crate::engine::worktree::list_worktrees_lite(repo_path) {
+                    Err(e) => {
+                        // Worktrees not listed are worktrees not examined: this
+                        // inspection is no preview of the scope.
+                        result.partial = true;
+                        result.scopes_complete = false;
+                        push_issue(
+                            &mut result.issues,
+                            format!(
+                                "{repo_path}: linked worktrees could not be listed, so their .claude build folders were not examined: {}",
+                                e.message()
+                            ),
+                        );
+                    }
+                    Ok(infos) => {
+                        for info in infos
+                            .iter()
+                            .filter(|i| !i.is_main && !i.is_bare && !i.is_prunable)
                         {
-                            if roots.iter().any(|r| path.starts_with(r))
-                                && !excludes.iter().any(|e| path.starts_with(e))
+                            if let Ok(path) =
+                                crate::engine::process::canonicalize_plain(Path::new(&info.path))
                             {
-                                checkouts.push(path);
+                                if roots.iter().any(|r| path.starts_with(r))
+                                    && !excludes.iter().any(|e| path.starts_with(e))
+                                {
+                                    checkouts.push(path);
+                                }
                             }
                         }
                     }

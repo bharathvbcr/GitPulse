@@ -384,6 +384,22 @@ fn prune_one(
             return skipped(reason);
         }
     }
+    if reap && !dry_run {
+        // Reaping signals only processes standing in the worktree. One that
+        // merely names it (a build run from elsewhere) is not signalled, and
+        // one that was is given a moment to exit: removal waits for neither.
+        let mut reason = worktree_in_use(std::path::Path::new(&wt.path));
+        for _ in 0..20 {
+            if reason.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            reason = worktree_in_use(std::path::Path::new(&wt.path));
+        }
+        if let Some(reason) = reason {
+            return skipped(format!("after terminating processes: {reason}"));
+        }
+    }
     if dry_run {
         let mut out = PruneOutcome::new("would_remove", None);
         out.reaped = reaped;

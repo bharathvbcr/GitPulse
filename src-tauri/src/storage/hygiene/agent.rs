@@ -351,7 +351,7 @@ fn judge(
         });
     }
     evidence.push(format!(
-        "no process uses {} (cwd, executable, arguments and environment read{})",
+        "no process uses {} (working directory, executable and arguments read; environment too where the OS shows it, which macOS does not for Apple platform programs{})",
         guarded.display(),
         if reading.other_users > 0 {
             format!(
