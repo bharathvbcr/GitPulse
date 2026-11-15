@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 124 contracts over
- * 323 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 126 contracts over
+ * 332 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -278,8 +278,13 @@ export const CONTRACTS = Object.freeze([
   { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
   { label: "host-load-trace", rustPath: rust("sysload", "trace.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["TraceRecord", "TracePeaks", "PreviousBoot"] },
   { label: "host-load-thresholds", rustPath: rust("sysload", "thresholds.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Rule", "ModeRule", "Thresholds"] },
-  { label: "host-load-settings",rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
+  { label: "host-load-settings",rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings", "HostLoadLeases", "HostLoadIdle"] },
   { label: "host-load-governor", rustPath: rust("sysload", "governor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["GovernorVerdict", "GovernorReport", "GovernorPulse", "Shed"] },
+  // Build leases and idle sessions: `cmd_host_load_leases` and
+  // `cmd_host_load_idle`. A renamed field would blank the Build slots block or
+  // read an unknown count as zero, and nothing would fail.
+  { label: "host-load-leases", rustPath: rust("sysload", "lease.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["LeaseRecord", "LeaseHolder", "LeaseWaiter", "LeaseCapacity", "LeaseStatus"] },
+  { label: "host-load-idle", rustPath: rust("sysload", "activity.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["IdleSession", "IdleReport"] },
   // What an agent CLI starts with in a terminal tab, and which modes this
   // build can expand. `modes` and `launchers` are what the chooser renders, so
   // a renamed field would empty the chooser rather than fail — leaving a panel

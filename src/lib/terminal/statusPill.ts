@@ -9,6 +9,8 @@
  */
 
 import { displayName, isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
+import { waitingLabel } from "../health/leases";
+import type { LeaseWaiter } from "../stores/hostLoadStore";
 import { isProvablyIdle, type TerminalContext } from "./sessionContext";
 
 export interface PillSession {
@@ -103,6 +105,8 @@ export function terminalPillView(
     open: boolean;
     repoPath: string | null;
     activity?: Readonly<Record<string, TerminalContext | null | undefined>>;
+    /** Builds waiting for a lease slot; a session at its head of one says so. Absent says nothing. */
+    buildQueue?: readonly LeaseWaiter[];
     identity?: PathIdentityOptions;
   },
 ): TerminalPillView {
@@ -115,7 +119,8 @@ export function terminalPillView(
   });
   const views = ranked.map((session): PillSessionView => {
     const context = input.activity?.[session.key] ?? null;
-    const phrase = activityPhrase(session.status, context);
+    const waiting = session.sessionId && input.buildQueue ? waitingLabel(input.buildQueue, session.sessionId) : null;
+    const phrase = waiting ?? activityPhrase(session.status, context);
     const place = placeOf(context?.cwd ?? session.checkout);
     return { ...session, name: sessionName(session), phrase, ...place };
   });
