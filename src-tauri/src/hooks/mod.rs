@@ -8909,13 +8909,6 @@ done
         assert_eq!(brief.lines().nth(2), Some(line), "{brief}");
     }
 
-    #[test]
-    fn the_brief_is_capped_and_says_so_when_it_cuts() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.worktrees.items = (0..400)
-            .map(|i| WorktreeSummary {
-                path: format!("/repo/wt/{i}"),
-                name: format!("worktree-with-a-long-name-{i}"),
     /// Agents put scratch builds wherever they like unless the brief names a
     /// place; the one place GitPulse accounts for is named once, short, and
     /// survives the cap that cuts the long lists below it.
@@ -8944,6 +8937,13 @@ done
         assert!(cut.contains(".gitpulse/scratch/target-"), "{cut}");
     }
 
+    #[test]
+    fn the_brief_is_capped_and_says_so_when_it_cuts() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
                 branch: Some(format!("branch/{i}")),
                 is_main: false,
                 is_bare: false,
