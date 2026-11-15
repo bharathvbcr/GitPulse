@@ -92,7 +92,7 @@
   <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
     <p class="text-text">Command gate: heavy commands in agent sessions</p>
     <p class="text-textMuted text-micro leading-snug">
-      Refuse (the default): when the machine is overloaded, GitPulse's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session GitPulse did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it could not check (GitPulse not running, or too old) is never refused; the agent is told it was not checked.
+      Refuse (the default): when the machine is overloaded, GitPulse's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session GitPulse did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it couldn't check (GitPulse not running, or too old) is never refused; the agent is told it was not checked.
     </p>
     <SettingSegment
       ariaLabel="What the command gate does with a heavy command under load"
