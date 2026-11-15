@@ -298,27 +298,29 @@ pub async fn cmd_terminal_backend(
 
 /// Releases rendered output bytes so the PTY reader can continue.
 ///
-/// In-process it runs inline, unlike the commands above: it is a map lookup
-/// and one counter update under short locks, no I/O and no wait, and it is
-/// sent for every rendered chunk, so a hop to another thread would cost more
-/// than the work. With the terminal host it is a round trip to that process
-/// (answered inline there, so a refused acknowledgement is refused here), and a
-/// wait does not belong on an async-runtime worker: it goes to the control
-/// pool. Never the session's input lane, which would hold the release of output
-/// behind a write that is waiting on a stuck child.
+/// With the terminal host (all Unix platforms) this is a round trip to that
+/// process (answered inline there, so a refused acknowledgement is refused
+/// here), and a wait does not belong on an async-runtime worker: it goes to the
+/// control pool, never the session's input lane, which would hold the release
+/// of output behind a write waiting on a stuck child. On non-Unix in-process
+/// targets it runs inline under short locks with no I/O.
 #[tauri::command(async)]
 pub async fn cmd_terminal_ack(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     bytes: usize,
 ) -> Result<(), String> {
-    if state.backend() == "host" {
-        return crate::terminal::control_async(&state, "terminal_ack", move |state| {
+    #[cfg(unix)]
+    {
+        crate::terminal::control_async(&state, "terminal_ack", move |state| {
             crate::terminal::acknowledge_output(state, &session_id, bytes)
         })
-        .await;
+        .await
     }
-    crate::terminal::acknowledge_output(&state, &session_id, bytes)
+    #[cfg(not(unix))]
+    {
+        crate::terminal::acknowledge_output(&state, &session_id, bytes)
+    }
 }
 
 /// Runs one argv to completion with a hard timeout and capped tails.

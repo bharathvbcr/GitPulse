@@ -1,47 +1,55 @@
 <script lang="ts">
   /**
-   * Whether terminals live in GitPulse or in the terminal host
-   * (`gitpulse-ptyd`), where they survive a quit or a crash. Stored with the
-   * agent defaults as `keep_terminals_running`; the app reads it when it
-   * starts, so the row says which backend holds the terminals now and that a
-   * change waits for the next launch.
+   * Whether managed agent runs (Codex and Claude driven by Manvi) are kept
+   * running in a hosted Manvi server when GitPulse quits or crashes, plus
+   * read-only status of the terminal host (`gitpulse-ptyd`).
    *
-   * The same choice keeps managed agent runs (Codex and Claude driven by
-   * Manvi) running, when the installed Manvi can serve on a socket. Whether it
-   * does — and, when it cannot, why managed runs still end with the app — is
-   * its own line below the note, as the backend reports it.
-   *
-   * What is wrong with the host — another version's host still running
-   * sessions, a host that would not start — is shown here as the backend
-   * reports it, never summarised into "fine".
+   * On Unix, PTY terminal sessions always live in `gitpulse-ptyd`, so
+   * quitting or crashing does not end them; Cmd-Q asks whether to stop them
+   * or leave them running. The stored `keep_terminals_running` toggle (default
+   * on when absent) governs hosted Manvi for managed runs; whether Manvi can
+   * host them is shown below the note, as reported by `cmd_terminal_backend`,
+   * along with any `trouble` reported by the terminal host.
    */
   import { onMount } from "svelte";
   import { AlertTriangle } from "@lucide/svelte";
   import { agentDefaultsStore, loadAgentDefaults, saveAgentDefaults } from "../stores/agentDefaultsStore";
-  import type { AgentDefaults } from "../terminal/agentDefaults";
+  import { keepsTerminalsRunning, withKeepTerminalsRunning } from "../terminal/agentDefaults";
   import { readTerminalBackend, type TerminalBackendStatus } from "../terminal/quitChoice";
   import { formatError } from "../ui/formatError";
   import SettingToggle from "./SettingToggle.svelte";
 
-  let { active = true }: { active?: boolean } = $props();
+  let {
+    active = true,
+    initialBackend = null,
+    initialBackendError = "",
+  }: {
+    active?: boolean;
+    initialBackend?: TerminalBackendStatus | null;
+    initialBackendError?: string;
+  } = $props();
 
   let busy = $state(false);
   let error = $state("");
-  let backend = $state<TerminalBackendStatus | null>(null);
-  let backendError = $state("");
+  let loadedBackend = $state<TerminalBackendStatus | null>(null);
+  let loadedBackendError = $state("");
+  let hasLoadedBackend = $state(false);
   let loaded = false;
 
   const view = $derived($agentDefaultsStore);
-  const chosen = $derived(view.defaults.keep_terminals_running === true);
+  const chosen = $derived(keepsTerminalsRunning(view.defaults));
+  const backend = $derived(hasLoadedBackend ? loadedBackend : initialBackend);
+  const backendError = $derived(hasLoadedBackend ? loadedBackendError : initialBackendError);
 
   function readBackend() {
-    backendError = "";
+    hasLoadedBackend = true;
+    loadedBackendError = "";
     readTerminalBackend()
       .then((status) => {
-        backend = status;
+        loadedBackend = status;
       })
       .catch((err: unknown) => {
-        backendError = formatError(err);
+        loadedBackendError = formatError(err);
       });
   }
 
@@ -60,17 +68,15 @@
     if (active) load();
   });
 
-  /** Off is stored as absence, like every other default. */
+  /** On (`true`) is the default and stored as absence; off stores `false`. */
   async function choose(next: boolean) {
     if (next === chosen) return;
-    const rest: AgentDefaults = { ...view.defaults };
-    delete rest.keep_terminals_running;
     busy = true;
     error = "";
     try {
-      await saveAgentDefaults(next ? { ...rest, keep_terminals_running: true } : rest);
-      // What the installed Manvi can do about managed runs follows the saved
-      // choice at once; the terminals' answer still waits for the next launch.
+      await saveAgentDefaults(withKeepTerminalsRunning(view.defaults, next));
+      // Refresh backend status right after saving so managed hosting reflects
+      // the new choice.
       readBackend();
     } catch (err) {
       error = formatError(err);
@@ -79,24 +85,22 @@
     }
   }
 
-  const running = $derived(backend?.backend === "host");
-  const pending = $derived(backend !== null && running !== chosen);
+  const runningInHost = $derived(backend?.backend === "host");
 </script>
 
 <div>
   <SettingToggle
-    label="Keep terminals running when GitPulse quits"
+    label="Keep managed agent runs running when GitPulse quits"
     disabled={busy}
     checked={chosen}
     onchange={(next) => void choose(next)}
   />
   <p class="text-textMuted text-micro leading-snug mt-1" data-testid="keep-terminals-note">
-    Terminals and the agents in them run in a process of their own, so quitting GitPulse — or GitPulse crashing — does not end
-    them. The next launch lists them, shows what they printed meanwhile, and records any that finished. Quitting asks whether to
-    stop them or leave them running. Managed agent runs (Codex and Claude driven by Manvi) are kept the same way when the
-    installed Manvi can host them.
+    Terminal sessions run in a separate host process (<code>gitpulse-ptyd</code>), so quitting GitPulse — or GitPulse crashing — does
+    not end them. The next launch lists them, replays buffered output, and reconciles any that finished; quitting asks whether
+    to stop them or leave them running.
     {#if backend}
-      Now: {running ? "kept running when GitPulse quits" : "ended when GitPulse quits"}{pending ? "; your choice applies when GitPulse next starts" : ""}.
+      Terminals now: {runningInHost ? "held by the terminal host (survive quit and crash)" : "held in-process (end when GitPulse quits)"}.
     {/if}
   </p>
   {#if backend?.managed}

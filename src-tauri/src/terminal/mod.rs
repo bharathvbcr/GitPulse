@@ -490,50 +490,232 @@ pub struct TerminalBackendStatus {
     pub managed: crate::harness::hosted::ManagedHosting,
 }
 
-/// Thread-safe registry of live PTY sessions.
+/// In-process PTY engine owning file descriptors, reader threads, flow control,
+/// and replay rings. On Unix this runs inside `gitpulse-ptyd` (and in `#[cfg(test)]`
+/// behind an in-process test host thread); off Unix it backs [`TerminalSessions`]
+/// directly.
 #[derive(Clone)]
-pub struct TerminalSessions {
-    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
-    active_sessions: Arc<AtomicUsize>,
-    /// How many sessions may be open at once, in `1..=MAX_PTY_SESSIONS`.
-    /// Live rather than read per spawn, so a saved setting applies to the
-    /// next session and a test registry never depends on the machine's file.
+pub(in crate::terminal) struct Engine {
+    pub(in crate::terminal) sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    pub(in crate::terminal) active_sessions: Arc<AtomicUsize>,
     limit: Arc<AtomicUsize>,
     /// Milliseconds a reader waits on an unacknowledged window before it
     /// sheds (`DEFAULT_OUTPUT_STALL`). Live, so a test can shorten it.
     output_stall_ms: Arc<AtomicU64>,
-    /// Mass external-signal deaths, recorded once each (see [`incident`]).
-    pub(crate) incidents: Arc<incident::Recorder>,
-    /// The slower commands that are not per keystroke, off the pool every git
-    /// command shares (see `executor`). As wide as the session cap, so closing
-    /// every tab at once still closes them side by side, as it did.
-    control: Executor,
-    /// The terminal host that holds the PTYs, when this registry is the app's
-    /// side of one (`docs/TERMINAL_HOST.md`). `None` is the engine in this
-    /// process. Every `terminal::` function routes on this and nothing else.
-    #[cfg(unix)]
-    host: Option<host::client::HostClient>,
-    /// What an exit of this app does to the sessions a host holds: leave
-    /// them running (a crash, a signal, or a quit that chose to), or stop them.
-    /// Meaningless in-process, where a session cannot outlive the app.
-    leave_running: Arc<AtomicBool>,
+    /// Where slow terminal commands run, outside Tauri's runtime so a held
+    /// session lock never stalls other IPC commands.
+    pub(in crate::terminal) control: Executor,
     /// Copies of a starting session's output that the terminal host armed
-    /// (`host::transcripts`). Always empty in the app's own engine.
-    ring_taps: Arc<ring::Taps>,
-    /// Authoritative host conversation ids and artifact directories reported by
-    /// agent `SessionStart` hooks inside live PTYs.
+    /// (`host::transcripts`).
+    pub(in crate::terminal) ring_taps: Arc<ring::Taps>,
+    /// Authoritative `SessionStart` metadata reported for sessions inside this engine.
     agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>>,
-    /// Option A capability tokens, parent->child lineage edges, and headless
-    /// `vt100` screens for orchestrated child sessions.
-    pub(crate) orchestration: Arc<orchestrate::OrchestrationRegistry>,
+    /// Orchestration registry observing output and child lifecycle inside this engine.
+    pub(in crate::terminal) orchestration: Arc<orchestrate::OrchestrationRegistry>,
 }
 
-impl Default for TerminalSessions {
-    /// The engine in this process.
+impl Default for Engine {
     fn default() -> Self {
         Self {
             sessions: Arc::default(),
             active_sessions: Arc::default(),
+            limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
+            output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
+            control: Executor::new(
+                "control",
+                MAX_PTY_SESSIONS,
+                CONTROL_QUEUE_CAPACITY,
+                CONTROL_IDLE,
+            ),
+            ring_taps: Arc::default(),
+            agent_meta: Arc::default(),
+            orchestration: Arc::default(),
+        }
+    }
+}
+
+impl Engine {
+    pub(in crate::terminal) fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.input.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
+    pub(in crate::terminal) fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.geometry.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
+    #[cfg(not(unix))]
+    pub(in crate::terminal) fn lane_threads(&self) -> usize {
+        self.lock_sessions()
+            .values()
+            .map(|session| session.input.workers() + session.geometry.workers())
+            .sum()
+    }
+
+    /// The session map, recovering from a poisoned lock. The map holds only
+    /// handles, and every writer inserts or removes one whole entry, so a
+    /// panic under the lock cannot leave it half-updated; refusing to read it
+    /// would leave every terminal untypeable and unclosable until restart.
+    pub(in crate::terminal) fn lock_sessions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(in crate::terminal) fn session_limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
+    pub(in crate::terminal) fn set_session_limit(&self, limit: usize) {
+        self.limit
+            .store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release);
+    }
+
+    pub(in crate::terminal) fn set_output_stall_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().clamp(10, 300_000) as u64;
+        self.output_stall_ms.store(ms, Ordering::Release);
+    }
+
+    fn output_stall(&self) -> Duration {
+        Duration::from_millis(self.output_stall_ms.load(Ordering::Acquire))
+    }
+
+    /// Records `meta` in this engine's `agent_meta` map without IPC forwarding.
+    pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
+        let mut map = self
+            .agent_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= MAX_PTY_SESSIONS * 2 && !map.contains_key(session_id) {
+            if let Some(stale) = map.keys().next().cloned() {
+                map.remove(&stale);
+            }
+        }
+        map.insert(session_id.to_owned(), meta);
+    }
+
+    pub(in crate::terminal) fn agent_meta_for(&self, session_id: &str) -> Option<AgentSessionMeta> {
+        self.agent_meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+}
+
+/// Thread-safe registry of live PTY sessions.
+///
+/// On Unix, PTYs always live in `gitpulse-ptyd` behind `host` (with an embedded
+/// unit-test server in `#[cfg(test)]`); non-Unix platforms run `Engine` inline.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct TerminalSessions {
+    limit: Arc<AtomicUsize>,
+    output_stall_ms: Arc<AtomicU64>,
+    pub(crate) incidents: Arc<incident::Recorder>,
+    /// Where slow terminal commands run, outside Tauri's runtime so a blocking
+    /// host call never stalls other IPC commands.
+    control: Executor,
+    host: host::client::HostClient,
+    /// Whether this app's quit leaves the host's sessions running. Starts
+    /// `true` for a live host (updated from the quit choice); `false` when the
+    /// host directory itself is unavailable.
+    leave_running: Arc<AtomicBool>,
+    /// Latest agent `SessionStart` hook metadata per `session_id`, kept live across
+    /// app restarts by syncing through `gitpulse-ptyd`.
+    agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>>,
+    /// Option A child orchestration registry shared with `HostClient::output`.
+    pub(crate) orchestration: Arc<orchestrate::OrchestrationRegistry>,
+    /// Direct handle to the backing unit-test engine when constructed with `Default`
+    /// in unit tests, so white-box tests can inspect/poison internal engine state.
+    #[cfg(test)]
+    pub(in crate::terminal) test_engine: Engine,
+    #[cfg(test)]
+    _unit_host_dir: Option<Arc<tempfile::TempDir>>,
+}
+
+/// Thread-safe registry of live PTY sessions for non-Unix platforms without
+/// `gitpulse-ptyd`.
+#[cfg(not(unix))]
+#[derive(Clone)]
+pub struct TerminalSessions {
+    engine: Engine,
+    pub(crate) incidents: Arc<incident::Recorder>,
+    control: Executor,
+    pub(crate) orchestration: Arc<orchestrate::OrchestrationRegistry>,
+}
+
+#[cfg(not(unix))]
+impl Default for TerminalSessions {
+    fn default() -> Self {
+        let engine = Engine::default();
+        Self {
+            control: engine.control.clone(),
+            orchestration: engine.orchestration.clone(),
+            engine,
+            incidents: Arc::default(),
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+impl Default for TerminalSessions {
+    /// Unit-test host-backed registry running an in-process `gitpulse-ptyd` server
+    /// over a real private Unix socket inside a short-lived temp directory.
+    fn default() -> Self {
+        let test_engine = Engine::default();
+        let tmp_base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let unit_dir = Arc::new(
+            tempfile::Builder::new()
+                .prefix("ut")
+                .tempdir_in(tmp_base)
+                .expect("unit test terminal host tempdir"),
+        );
+        let config = host::client::HostConfig {
+            dir: unit_dir.path().to_path_buf(),
+            binary: None,
+            idle_exit: Some(Duration::from_millis(500)),
+            log_dir: None,
+        };
+        let orchestration: Arc<orchestrate::OrchestrationRegistry> = Arc::default();
+        let agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>> = Arc::default();
+        let server_engine = test_engine.clone();
+        let server_dir = unit_dir.clone();
+        let starter_seq = Arc::new(AtomicU64::new(0));
+        let host = host::client::HostClient::for_unit_test_with_shared_state(
+            config,
+            orchestration.clone(),
+            agent_meta.clone(),
+            move |cfg| {
+                let seq = starter_seq.fetch_add(1, Ordering::Relaxed);
+                let dir_guard = server_dir.clone();
+                let engine = server_engine.clone();
+                let serve_cfg = host::server::ServeConfig {
+                    dir: cfg.dir.clone(),
+                    idle_exit: cfg.idle_exit.unwrap_or(Duration::from_millis(500)),
+                };
+                crate::supervisor::spawn_one_of_many(
+                    format!("unit-ptyd-{seq}"),
+                    "unit test terminal host",
+                    move || {
+                        let _dir_guard = dir_guard;
+                        let _ = host::server::serve_for_unit_test(serve_cfg, engine);
+                    },
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            },
+        );
+        Self {
             limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
             output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
             incidents: Arc::default(),
@@ -543,125 +725,136 @@ impl Default for TerminalSessions {
                 CONTROL_QUEUE_CAPACITY,
                 CONTROL_IDLE,
             ),
-            #[cfg(unix)]
-            host: None,
-            leave_running: Arc::new(AtomicBool::new(false)),
-            ring_taps: Arc::default(),
-            agent_meta: Arc::default(),
-            orchestration: Arc::default(),
+            host,
+            leave_running: Arc::new(AtomicBool::new(true)),
+            agent_meta,
+            orchestration,
+            test_engine,
+            _unit_host_dir: Some(unit_dir),
         }
     }
 }
 
+#[cfg(unix)]
 impl TerminalSessions {
     /// A registry whose sessions live in the terminal host described by
     /// `config`. Nothing connects until the first call (or [`Self::connect_host`]).
-    #[cfg(unix)]
     pub fn with_host(config: host::client::HostConfig) -> Self {
         let orchestration: Arc<orchestrate::OrchestrationRegistry> = Arc::default();
         let agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>> = Arc::default();
         Self {
-            host: Some(host::client::HostClient::with_shared_state(
+            limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
+            output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
+            incidents: Arc::default(),
+            control: Executor::new(
+                "control",
+                MAX_PTY_SESSIONS,
+                CONTROL_QUEUE_CAPACITY,
+                CONTROL_IDLE,
+            ),
+            host: host::client::HostClient::with_shared_state(
                 config,
                 orchestration.clone(),
                 agent_meta.clone(),
-            )),
+            ),
             leave_running: Arc::new(AtomicBool::new(true)),
             agent_meta,
             orchestration,
-            ..Self::default()
+            #[cfg(test)]
+            test_engine: Engine::default(),
+            #[cfg(test)]
+            _unit_host_dir: None,
         }
     }
 
-    /// Option A orchestration registry shared across in-process and hosted PTYs.
+    fn with_unavailable_host(reason: String) -> Self {
+        let orchestration: Arc<orchestrate::OrchestrationRegistry> = Arc::default();
+        let agent_meta: Arc<Mutex<HashMap<String, AgentSessionMeta>>> = Arc::default();
+        Self {
+            limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
+            output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
+            incidents: Arc::default(),
+            control: Executor::new(
+                "control",
+                MAX_PTY_SESSIONS,
+                CONTROL_QUEUE_CAPACITY,
+                CONTROL_IDLE,
+            ),
+            host: host::client::HostClient::unavailable(
+                reason,
+                orchestration.clone(),
+                agent_meta.clone(),
+            ),
+            leave_running: Arc::new(AtomicBool::new(false)),
+            agent_meta,
+            orchestration,
+            #[cfg(test)]
+            test_engine: Engine::default(),
+            #[cfg(test)]
+            _unit_host_dir: None,
+        }
+    }
+
+    /// Option A orchestration registry shared across hosted PTYs.
     pub fn orchestration(&self) -> &Arc<orchestrate::OrchestrationRegistry> {
         &self.orchestration
     }
 
-    /// The app's registry: the host when the user has chosen to keep
-    /// terminals running across quits (Settings → Agents), else in-process.
+    /// The app's registry: unconditionally backed by the terminal host on Unix
+    /// (failing closed if the host directory is unavailable).
     pub fn from_settings() -> Self {
-        #[cfg(unix)]
-        if crate::tool_config::agent_defaults().keeps_terminals_running() {
-            match host::client::HostConfig::for_app() {
-                Ok(config) => return Self::with_host(config),
-                Err(error) => {
-                    log::error!(target: "terminal", "terminals stay in the app: the terminal host has no directory: {error}")
-                }
+        match host::client::HostConfig::for_app() {
+            Ok(config) => Self::with_host(config),
+            Err(error) => {
+                log::error!(target: "terminal", "the terminal host has no directory; terminal launches are unavailable: {error}");
+                Self::with_unavailable_host(format!("The terminal host has no directory: {error}"))
             }
         }
-        Self::default()
     }
 
-    /// The terminal host's pid while connected; `None` in-process. For tests
-    /// that measure what the process holding the PTYs gives back.
+    /// The terminal host's pid while connected. For tests that measure what
+    /// the process holding the PTYs gives back.
     #[doc(hidden)]
     pub fn host_pid(&self) -> Option<u32> {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            return host.host_pid();
-        }
-        None
+        self.host.host_pid()
     }
 
-    /// Which backend holds the PTYs: `"host"` or `"in-process"`.
+    /// Which backend holds the PTYs: `"host"` on Unix.
     pub fn backend(&self) -> &'static str {
-        #[cfg(unix)]
-        if self.host.is_some() {
-            return "host";
-        }
-        "in-process"
+        "host"
     }
 
     /// Where session events go in the app (Tauri events, incidents), for the
     /// sessions it did not start itself: those a host kept from an earlier
     /// app. Called once at startup.
     pub fn bind_app<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.set_events(Arc::new(AppEvents::new(app, self.incidents.clone())));
-        }
-        #[cfg(not(unix))]
-        let _ = app;
+        self.host
+            .set_events(Arc::new(AppEvents::new(app, self.incidents.clone())));
     }
 
     /// How a task run whose terminal outlived the app that launched it is
     /// observed when it ends. Only a host has such runs.
-    #[cfg(unix)]
     pub(crate) fn set_adopter(&self, adopter: host::client::Adopter) {
-        if let Some(host) = &self.host {
-            host.set_adopter(adopter);
-        }
+        self.host.set_adopter(adopter);
     }
 
     /// Connects to the host, adopting what it holds and recording what ended
-    /// while no app was there. Nothing to do in-process.
+    /// while no app was there.
     pub fn connect_host(&self) -> Result<(), String> {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.connect()?;
-            host.set_limit(self.session_limit());
-        }
+        self.host.connect()?;
+        self.host.set_limit(self.session_limit());
         Ok(())
     }
 
     /// What is wrong with the terminal host, if anything (version skew, a host
-    /// that would not start). Always empty in-process.
+    /// that would not start).
     pub fn host_trouble(&self) -> Vec<String> {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            return host.trouble();
-        }
-        Vec::new()
+        self.host.trouble()
     }
 
     /// Whether this app's exit leaves the host's sessions running.
     pub fn leaves_sessions_running(&self) -> bool {
-        #[cfg(unix)]
-        if self.host.is_some() {
-            return self.leave_running.load(Ordering::Acquire);
-        }
-        false
+        self.leave_running.load(Ordering::Acquire)
     }
 
     /// The quit's choice: leave the host's sessions running, or stop them.
@@ -670,20 +863,9 @@ impl TerminalSessions {
     }
 
     /// Lets the host go without stopping anything: every view detaches and
-    /// every session keeps running for the next app. Nothing in-process.
+    /// every session keeps running for the next app.
     pub fn disconnect_host(&self) {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.disconnect();
-        }
-    }
-
-    /// The lane that delivers `session_id`'s keystrokes.
-    fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
-        self.lock_sessions()
-            .get(session_id)
-            .map(|session| session.input.clone())
-            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+        self.host.disconnect();
     }
 
     /// Threads alive on the open sessions' input and geometry lanes. A
@@ -692,32 +874,7 @@ impl TerminalSessions {
     /// retire ask this.
     #[doc(hidden)]
     pub fn lane_threads(&self) -> usize {
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            return host.lane_threads();
-        }
-        self.lock_sessions()
-            .values()
-            .map(|session| session.input.workers() + session.geometry.workers())
-            .sum()
-    }
-
-    /// The lane that applies `session_id`'s resizes.
-    fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
-        self.lock_sessions()
-            .get(session_id)
-            .map(|session| session.geometry.clone())
-            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
-    }
-
-    /// The session map, recovering from a poisoned lock. The map holds only
-    /// handles, and every writer inserts or removes one whole entry, so a
-    /// panic under the lock cannot leave it half-updated; refusing to read it
-    /// would leave every terminal untypeable and unclosable until restart.
-    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionEntry>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.host.lane_threads()
     }
 
     /// Recorded mass-death incidents, newest first and bounded.
@@ -745,10 +902,7 @@ impl TerminalSessions {
     pub fn set_session_limit(&self, limit: usize) {
         self.limit
             .store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release);
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.set_limit(self.session_limit());
-        }
+        self.host.set_limit(self.session_limit());
     }
 
     /// Sets how long a reader waits for a view before shedding, clamped to
@@ -757,20 +911,18 @@ impl TerminalSessions {
     pub fn set_output_stall_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().clamp(10, 300_000) as u64;
         self.output_stall_ms.store(ms, Ordering::Release);
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.set_stall(Duration::from_millis(ms));
-        }
+        self.host.set_stall(Duration::from_millis(ms));
     }
 
-    /// How long a reader waits on an unacknowledged window before it sheds.
-    fn output_stall(&self) -> Duration {
-        Duration::from_millis(self.output_stall_ms.load(Ordering::Acquire))
+    /// Records the authoritative conversation id and optional artifact directory
+    /// reported by an agent `SessionStart` hook running inside `session_id`, and
+    /// mirrors it to `gitpulse-ptyd` so restarts adopt it intact.
+    pub fn record_agent_meta(&self, session_id: &str, meta: AgentSessionMeta) {
+        self.record_agent_meta_local(session_id, meta.clone());
+        self.host.set_agent_meta(session_id, meta);
     }
 
-    /// Records `meta` in this process's `agent_meta` map without forwarding to
-    /// `gitpulse-ptyd` (used both locally and inside `gitpulse-ptyd` itself).
-    pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
+    fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
         let mut map = self
             .agent_meta
             .lock()
@@ -783,17 +935,6 @@ impl TerminalSessions {
         map.insert(session_id.to_owned(), meta);
     }
 
-    /// Records the authoritative conversation id and optional artifact directory
-    /// reported by an agent `SessionStart` hook running inside `session_id`, and
-    /// mirrors it to `gitpulse-ptyd` when hosted so restarts adopt it intact.
-    pub fn record_agent_meta(&self, session_id: &str, meta: AgentSessionMeta) {
-        self.record_agent_meta_local(session_id, meta.clone());
-        #[cfg(unix)]
-        if let Some(host) = &self.host {
-            host.set_agent_meta(session_id, meta);
-        }
-    }
-
     /// Reads the recorded agent metadata for `session_id`, if any.
     pub fn agent_meta_for(&self, session_id: &str) -> Option<AgentSessionMeta> {
         self.agent_meta
@@ -804,15 +945,95 @@ impl TerminalSessions {
     }
 }
 
-pub(crate) fn session_telemetry(
-    state: &TerminalSessions,
+#[cfg(not(unix))]
+impl TerminalSessions {
+    /// Option A orchestration registry.
+    pub fn orchestration(&self) -> &Arc<orchestrate::OrchestrationRegistry> {
+        &self.orchestration
+    }
+
+    pub fn from_settings() -> Self {
+        Self::default()
+    }
+
+    #[doc(hidden)]
+    pub fn host_pid(&self) -> Option<u32> {
+        None
+    }
+
+    pub fn backend(&self) -> &'static str {
+        "in-process"
+    }
+
+    pub fn bind_app<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
+        let _ = app;
+    }
+
+    pub fn connect_host(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn host_trouble(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    pub fn leaves_sessions_running(&self) -> bool {
+        false
+    }
+
+    pub fn set_leave_running(&self, _leave: bool) {}
+
+    pub fn disconnect_host(&self) {}
+
+    pub(in crate::terminal) fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.engine.input_lane(session_id)
+    }
+
+    pub(in crate::terminal) fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.engine.geometry_lane(session_id)
+    }
+
+    #[doc(hidden)]
+    pub fn lane_threads(&self) -> usize {
+        self.engine.lane_threads()
+    }
+
+    pub fn incidents(&self) -> Vec<incident::TerminalIncidentPayload> {
+        self.incidents.recent()
+    }
+
+    pub fn session_limit(&self) -> usize {
+        self.engine.session_limit()
+    }
+
+    pub fn apply_stored_limit(&self) -> usize {
+        self.set_session_limit(crate::tool_config::agent_defaults().terminal_sessions() as usize);
+        self.session_limit()
+    }
+
+    pub fn set_session_limit(&self, limit: usize) {
+        self.engine.set_session_limit(limit);
+    }
+
+    #[doc(hidden)]
+    pub fn set_output_stall_timeout(&self, timeout: Duration) {
+        self.engine.set_output_stall_timeout(timeout);
+    }
+
+    pub fn record_agent_meta(&self, session_id: &str, meta: AgentSessionMeta) {
+        self.engine.record_agent_meta_local(session_id, meta);
+    }
+
+    pub fn agent_meta_for(&self, session_id: &str) -> Option<AgentSessionMeta> {
+        self.engine.agent_meta_for(session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_session_telemetry(
+    engine: &Engine,
     session_id: &str,
 ) -> Option<SessionTelemetry> {
-    #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.telemetry(session_id).ok().flatten();
-    }
-    state.lock_sessions().get(session_id).map(|entry| {
+    engine.lock_sessions().get(session_id).map(|entry| {
         entry
             .telemetry
             .0
@@ -822,9 +1043,12 @@ pub(crate) fn session_telemetry(
     })
 }
 
-pub(crate) fn hosted_session_snapshot(state: &TerminalSessions) -> Vec<HostedSessionMeta> {
+#[cfg(unix)]
+pub(in crate::terminal) fn engine_hosted_session_snapshot(
+    engine: &Engine,
+) -> Vec<HostedSessionMeta> {
     let entries: Vec<HostedSessionMeta> = {
-        let guard = state.lock_sessions();
+        let guard = engine.lock_sessions();
         guard
             .values()
             .filter(|entry| !entry.dead.load(Ordering::Acquire))
@@ -850,7 +1074,7 @@ pub(crate) fn hosted_session_snapshot(state: &TerminalSessions) -> Vec<HostedSes
                     parent_session_id: entry.parent_session_id.clone(),
                     child_launcher: entry.child_launcher.clone(),
                     child_title: entry.child_title.clone(),
-                    agent_meta: state.agent_meta_for(&id),
+                    agent_meta: engine.agent_meta_for(&id),
                     telemetry,
                 }
             })
@@ -1076,7 +1300,7 @@ impl Drop for SessionReservation {
     }
 }
 
-fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, String> {
+pub(in crate::terminal) fn reserve_session(state: &Engine) -> Result<SessionReservation, String> {
     state
         .active_sessions
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2074,10 +2298,20 @@ pub fn session_context(
     session_id: &str,
 ) -> Result<TerminalContext, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.context(session_id);
+    {
+        state.host.context(session_id)
     }
-    let (child, master, repo, closing, telemetry) = state
+    #[cfg(not(unix))]
+    {
+        engine_session_context(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_session_context(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<TerminalContext, String> {
+    let (child, master, repo, closing, telemetry) = engine
         .lock_sessions()
         .get(session_id)
         .map(|s| {
@@ -2177,10 +2411,20 @@ pub fn session_listening_ports(
     session_id: &str,
 ) -> Result<Vec<u16>, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.listening_ports(session_id);
+    {
+        state.host.listening_ports(session_id)
     }
-    let Some((child, closing)) = state
+    #[cfg(not(unix))]
+    {
+        engine_session_listening_ports(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_session_listening_ports(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<Vec<u16>, String> {
+    let Some((child, closing)) = engine
         .lock_sessions()
         .get(session_id)
         .map(|s| (s.child.clone(), s.closing.clone()))
@@ -2202,13 +2446,12 @@ pub fn session_listening_ports(
     Ok(port_probe::listening_loopback_ports_for_root_pid(root))
 }
 
-/// The newest `max_bytes` of a session's saved output, live or finished. Only
-/// the terminal host keeps a transcript (`host::transcripts`); the app's own
-/// engine says so rather than answering as if it had looked. `redact` masks
-/// secrets in the host, before the bytes leave it. `run_id`, when the caller
-/// has the run, restricts the answer to that run's output: terminal ids repeat
-/// across reboots, and a later session under the same id is `Reused`, not read
-/// as the run's.
+/// The newest `max_bytes` of a session's saved output, live or finished. Kept by
+/// the Unix terminal host (`host::transcripts`); `redact` masks secrets in the
+/// host before the bytes leave it. `run_id`, when the caller has the run,
+/// restricts the answer to that run's output: terminal ids repeat across
+/// reboots, and a later session under the same id is `Reused`, not read as the
+/// run's.
 pub fn session_transcript(
     state: &TerminalSessions,
     session_id: &str,
@@ -2217,16 +2460,21 @@ pub fn session_transcript(
     run_id: Option<&str>,
 ) -> Result<TranscriptRead, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.transcript(session_id, max_bytes, redact, run_id);
+    {
+        state.host.transcript(session_id, max_bytes, redact, run_id)
     }
-    let _ = (state, session_id, max_bytes, redact, run_id);
-    Ok(TranscriptRead::Unavailable {
-        reason: "Terminal output is saved only when terminals are kept running by the terminal host (Settings > Agents); this app is running them itself.".into(),
-    })
+    #[cfg(not(unix))]
+    {
+        let _ = (state, session_id, max_bytes, redact, run_id);
+        Ok(TranscriptRead::Unavailable {
+            reason:
+                "Terminal transcripts are only recorded on Unix where gitpulse-ptyd hosts sessions."
+                    .into(),
+        })
+    }
 }
 
-/// Whether this process still holds the PTY session of `run_id`, dead or not.
+/// Whether the terminal host still holds the PTY session of `run_id`, dead or not.
 ///
 /// Unlike `attach_tracked_session`, a session whose child has already exited still
 /// counts: its entry leaves the map only after the run observer has written
@@ -2234,13 +2482,17 @@ pub fn session_transcript(
 /// and nothing else may record one in its place.
 pub(crate) fn tracks_run(state: &TerminalSessions, run_id: &str) -> bool {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.tracks_run(run_id);
+    {
+        state.host.tracks_run(run_id)
     }
-    state
-        .lock_sessions()
-        .values()
-        .any(|s| s.tracked_run.as_deref() == Some(run_id))
+    #[cfg(not(unix))]
+    {
+        state
+            .engine
+            .lock_sessions()
+            .values()
+            .any(|s| s.tracked_run.as_deref() == Some(run_id))
+    }
 }
 
 /// A live PTY as a reloaded renderer needs to see it: enough to count it
@@ -2270,15 +2522,24 @@ pub struct TerminalListing {
     pub parent_session_id: Option<String>,
 }
 
-/// Every session this process (or its terminal host) still owns, live or
+/// Every session the terminal host (or non-Unix engine) still owns, live or
 /// ending. Bounded by `MAX_PTY_SESSIONS`. `Err` when the host could not be
 /// asked, which is not the same as holding nothing.
 pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.list();
+    {
+        state.host.list()
     }
-    let guard = state.lock_sessions();
+    #[cfg(not(unix))]
+    {
+        engine_list_sessions(&state.engine)
+    }
+}
+
+pub(in crate::terminal) fn engine_list_sessions(
+    engine: &Engine,
+) -> Result<Vec<TerminalListing>, String> {
+    let guard = engine.lock_sessions();
     let mut listed: Vec<TerminalListing> = guard
         .values()
         .map(|s| TerminalListing {
@@ -2304,15 +2565,22 @@ pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, S
 /// stopped. Returns how many were detached.
 pub fn detach_all(state: &TerminalSessions) -> usize {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
+    {
         // A count is all the caller logs; a host that could not be told has
         // already detached every view of an app whose page it cannot reach.
-        return host.detach_all().unwrap_or_else(|error| {
+        state.host.detach_all().unwrap_or_else(|error| {
             log::warn!(target: "terminal", "the terminal host could not be told the page reloaded: {error}");
             0
-        });
+        })
     }
-    let live: Vec<(Arc<OutputFlow>, Arc<Mutex<ring::Ring>>)> = state
+    #[cfg(not(unix))]
+    {
+        engine_detach_all(&state.engine)
+    }
+}
+
+pub(in crate::terminal) fn engine_detach_all(engine: &Engine) -> usize {
+    let live: Vec<(Arc<OutputFlow>, Arc<Mutex<ring::Ring>>)> = engine
         .lock_sessions()
         .values()
         .filter(|session| !session.dead.load(Ordering::Acquire))
@@ -2427,10 +2695,20 @@ impl Takeover {
 /// already ended is not an error, there is simply nothing left to keep.
 pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.detach(session_id);
+    {
+        state.host.detach(session_id)
     }
-    let Some((flow, ring)) = state
+    #[cfg(not(unix))]
+    {
+        engine_detach_session(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_detach_session(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<bool, String> {
+    let Some((flow, ring)) = engine
         .lock_sessions()
         .get(session_id)
         .filter(|s| !s.dead.load(Ordering::Acquire))
@@ -2461,25 +2739,38 @@ pub fn attach_session(
     output: OutputSink,
 ) -> Result<TerminalSpawned, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        let out = host.attach(session_id, rows, cols, output);
+    {
+        let out = state.host.attach(session_id, rows, cols, output);
         if out.is_ok() {
             state.orchestration.resize(session_id, rows, cols);
         }
-        return out;
+        out
     }
-    let (takeover, entry_rows, entry_cols) = state
+    #[cfg(not(unix))]
+    {
+        engine_attach_session(&state.engine, session_id, rows, cols, output)
+    }
+}
+
+pub(in crate::terminal) fn engine_attach_session(
+    engine: &Engine,
+    session_id: &str,
+    rows: u16,
+    cols: u16,
+    output: OutputSink,
+) -> Result<TerminalSpawned, String> {
+    let (takeover, entry_rows, entry_cols) = engine
         .lock_sessions()
         .get(session_id)
         .filter(|s| !s.dead.load(Ordering::Acquire))
         .map(|s| (Takeover::of(s), s.rows.clone(), s.cols.clone()))
         .ok_or_else(|| format!("Terminal session '{session_id}' has ended"))?;
-    let out = takeover.hand_to(output, rows, cols, false, state.output_stall());
+    let out = takeover.hand_to(output, rows, cols, false, engine.output_stall());
     if out.is_ok() {
         let size = bounded_pty_size(rows, cols);
         entry_rows.store(size.rows, Ordering::Release);
         entry_cols.store(size.cols, Ordering::Release);
-        state.orchestration.resize(session_id, rows, cols);
+        engine.orchestration.resize(session_id, rows, cols);
     }
     out
 }
@@ -2498,10 +2789,23 @@ pub(crate) fn attach_tracked_session(
     output: OutputSink,
 ) -> Option<TerminalSpawned> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.attach_tracked(run_id, rows, cols, output);
+    {
+        state.host.attach_tracked(run_id, rows, cols, output)
     }
-    let takeover = state
+    #[cfg(not(unix))]
+    {
+        engine_attach_tracked_session(&state.engine, run_id, rows, cols, output)
+    }
+}
+
+pub(in crate::terminal) fn engine_attach_tracked_session(
+    engine: &Engine,
+    run_id: &str,
+    rows: u16,
+    cols: u16,
+    output: OutputSink,
+) -> Option<TerminalSpawned> {
+    let takeover = engine
         .lock_sessions()
         .values()
         .find(|s| s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire))
@@ -2512,7 +2816,7 @@ pub(crate) fn attach_tracked_session(
     // never be shown or repaid. A fresh window, the ring and a repaint are what
     // a view that starts here needs.
     takeover
-        .hand_to(output, rows, cols, true, state.output_stall())
+        .hand_to(output, rows, cols, true, engine.output_stall())
         .inspect_err(|error| log::warn!(target: "terminal", "a task terminal could not be taken over: {error}"))
         .ok()
 }
@@ -2794,14 +3098,12 @@ pub(crate) fn spawn_at(
         request.args.clone(),
     );
     #[cfg(unix)]
-    let started_res = match &state.host {
-        Some(host) => host
-            .spawn(events, request, output, observer)
-            .map_err(CommandError::from),
-        None => start_session(state, request, output, events, observer),
-    };
+    let started_res = state
+        .host
+        .spawn(events, request, output, observer)
+        .map_err(CommandError::from);
     #[cfg(not(unix))]
-    let started_res = start_session(state, request, output, events, observer);
+    let started_res = engine_start_session(&state.engine, request, output, events, observer);
 
     let started = match started_res {
         Ok(started) => started,
@@ -2826,33 +3128,35 @@ pub(crate) fn spawn_at(
     Ok(spawned)
 }
 
-/// Starts one session in this process: the engine. Everything here runs where
-/// the PTY will live — the repository and trust checks, the fork, the reader —
-/// so the checks hold for the process that forks.
-pub(crate) fn start_session(
-    state: &TerminalSessions,
+/// Starts one session in `engine`. Everything here runs where the PTY will live
+/// — the repository and trust checks, the fork, the reader — so the checks hold
+/// for the process that forks.
+#[cfg_attr(unix, allow(dead_code))]
+pub(in crate::terminal) fn engine_start_session(
+    engine: &Engine,
     request: SpawnRequest,
     output: OutputSink,
     events: Arc<dyn SessionEvents>,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<Started, CommandError> {
-    start_session_with(state, request, output, events, observer)
+    start_session_with(engine, request, output, events, observer)
 }
 
-/// [`start_session`] for a session nobody observes: the terminal host's. Its
-/// own instantiation, so no observer call is compiled into it (see
+/// [`engine_start_session`] for a session nobody observes: the terminal host's.
+/// Its own instantiation, so no observer call is compiled into it (see
 /// [`NoObserver`]).
-pub(crate) fn start_unobserved(
-    state: &TerminalSessions,
+#[cfg(unix)]
+pub(in crate::terminal) fn engine_start_unobserved(
+    engine: &Engine,
     request: SpawnRequest,
     output: OutputSink,
     events: Arc<dyn SessionEvents>,
 ) -> Result<Started, CommandError> {
-    start_session_with::<NoObserver>(state, request, output, events, None)
+    start_session_with::<NoObserver>(engine, request, output, events, None)
 }
 
 fn start_session_with<O: SessionObserver + ?Sized + 'static>(
-    state: &TerminalSessions,
+    engine: &Engine,
     request: SpawnRequest,
     output: OutputSink,
     events: Arc<dyn SessionEvents>,
@@ -2896,10 +3200,10 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     }
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let (repo, start) = place.resolve()?;
-    if state.lock_sessions().contains_key(&session_id) {
+    if engine.lock_sessions().contains_key(&session_id) {
         return Err(format!("Terminal session '{session_id}' already exists").into());
     }
-    let reservation = reserve_session(state)?;
+    let reservation = reserve_session(engine)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
     // `openpty` sets `FD_CLOEXEC` on the master and slave in two `fcntl` calls
@@ -3044,10 +3348,10 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     let master = Arc::new(Mutex::new(pair.master));
     let closing = Arc::new(AtomicUsize::new(0));
     let ring = Arc::new(Mutex::new(ring::Ring::for_session(
-        &state.ring_taps,
+        &engine.ring_taps,
         &session_id,
     )));
-    let telemetry = state
+    let telemetry = engine
         .orchestration
         .telemetry_for(&session_id)
         .unwrap_or_else(new_shared_telemetry);
@@ -3087,7 +3391,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     };
 
     {
-        let mut guard = state.lock_sessions();
+        let mut guard = engine.lock_sessions();
         // Checked again where it counts: two requests naming one id raced past
         // the check above, and the second child is stopped, not filed.
         if guard.contains_key(&session_id) {
@@ -3104,12 +3408,12 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     // Reader thread: streams output to the session's view through its output sink.
     let thread_events = events.clone();
     let thread_ring = ring.clone();
-    let thread_orchestration = state.orchestration.clone();
+    let thread_orchestration = engine.orchestration.clone();
     let sid_for_thread = session_id.clone();
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
-    let sessions_map = state.sessions.clone();
-    let output_stall_ms = state.output_stall_ms.clone();
+    let sessions_map = engine.sessions.clone();
+    let output_stall_ms = engine.output_stall_ms.clone();
     // The program's name, not its path or the session's id (see
     // `log_sites_do_not_interpolate_session_identifiers`).
     let program_for_log = std::path::Path::new(&resolved).file_name().map_or_else(
@@ -3157,7 +3461,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
         });
 
     let slot = SessionSlot {
-        sessions: state.sessions.clone(),
+        sessions: engine.sessions.clone(),
         id: session_id.clone(),
     };
     let reader_thread = crate::supervisor::spawn_once(
@@ -3541,7 +3845,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
         },
     );
     if let Err(e) = reader_thread {
-        let mut guard = state.lock_sessions();
+        let mut guard = engine.lock_sessions();
         guard.remove(&session_id);
         drop(guard);
         dead.store(true, Ordering::SeqCst);
@@ -3689,67 +3993,22 @@ pub(crate) fn deliver_peer_wake_with_mailbox(
         return Ok(false);
     }
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        let context = host.context(session_id)?;
+    {
+        let context = state.host.context(session_id)?;
         if !is_agy_foreground_process(context.process.as_deref()) {
             return Err(format!(
                 "Antigravity (`agy`) is not the foreground process in this terminal (found {}).",
                 context.process.as_deref().unwrap_or("unknown")
             ));
         }
-        host.write_blocking(session_id, PEER_WAKE_PROMPT.as_bytes())?;
-        return Ok(true);
-    }
-    let (child, master, writer, dead, closing) = state
-        .lock_sessions()
-        .get(session_id)
-        .map(|s| {
-            (
-                s.child.clone(),
-                s.master.clone(),
-                s.writer.clone(),
-                s.dead.clone(),
-                s.closing.clone(),
-            )
-        })
-        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
-    #[cfg(unix)]
-    {
-        let mut child = child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if closing.load(Ordering::SeqCst) > 0 || dead.load(Ordering::Acquire) {
-            return Err("Terminal session is closed".into());
-        }
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Err(
-                "Antigravity (`agy`) is not the foreground process in this terminal.".into(),
-            );
-        }
-        let Some(root) = child.process_id().and_then(|p| i32::try_from(p).ok()) else {
-            return Err(
-                "Antigravity (`agy`) is not the foreground process in this terminal.".into(),
-            );
-        };
-        let group = lock_within(&master, MASTER_LOCK_BUDGET)?.process_group_leader();
-        // SAFETY: getsid takes a numeric id and reads nothing else.
-        let leader = group.filter(|g| *g > 1 && unsafe { libc::getsid(*g) } == root);
-        let fg = foreground::describe(leader.unwrap_or(root));
-        if !is_agy_foreground_process(fg.name.as_deref()) {
-            return Err(format!(
-                "Antigravity (`agy`) is not the foreground process in this terminal (found {}).",
-                fg.name.as_deref().unwrap_or("unknown")
-            ));
-        }
-        // Hold `child` across the write so the session leader cannot be reaped
-        // or recycled into a parent shell between verification and delivery.
-        input::write(&writer, &dead, PEER_WAKE_PROMPT.as_bytes())?;
-        drop(child);
+        state
+            .host
+            .write_blocking(session_id, PEER_WAKE_PROMPT.as_bytes())?;
         Ok(true)
     }
     #[cfg(not(unix))]
     {
-        let _ = (child, master, writer, dead, closing);
+        let _ = state;
         Err("Peer terminal wakeup requires Unix foreground process verification.".into())
     }
 }
@@ -3798,16 +4057,19 @@ pub(crate) fn write_input(
     data: &[u8],
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
+    {
         if data.len() > MAX_PTY_INPUT_BYTES {
             return Err(format!(
                 "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}",
                 data.len()
             ));
         }
-        return host.write_blocking(session_id, data);
+        state.host.write_blocking(session_id, data)
     }
-    write_pty_bytes(state, session_id, data)
+    #[cfg(not(unix))]
+    {
+        engine_write_pty_bytes(&state.engine, session_id, data)
+    }
 }
 
 struct EraseInputCounts {
@@ -3870,7 +4132,11 @@ fn note_erase_input(data: &[u8]) {
     }
 }
 
-fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> Result<(), String> {
+pub(in crate::terminal) fn engine_write_pty_bytes(
+    engine: &Engine,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(), String> {
     if data.len() > MAX_PTY_INPUT_BYTES {
         return Err(format!(
             "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}",
@@ -3878,7 +4144,7 @@ fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> R
         ));
     }
     let (writer, dead) = {
-        let guard = state.lock_sessions();
+        let guard = engine.lock_sessions();
         guard
             .get(session_id)
             .map(|session| (session.writer.clone(), session.dead.clone()))
@@ -3915,16 +4181,28 @@ pub fn resize_session(
     cols: u16,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        let out = host.resize_blocking(session_id, rows, cols);
+    {
+        let out = state.host.resize_blocking(session_id, rows, cols);
         if out.is_ok() {
             state.orchestration.resize(session_id, rows, cols);
         }
-        return out;
+        out
     }
+    #[cfg(not(unix))]
+    {
+        engine_resize_session(&state.engine, session_id, rows, cols)
+    }
+}
+
+pub(in crate::terminal) fn engine_resize_session(
+    engine: &Engine,
+    session_id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
     // The map is let go before the master is waited for: one session's busy
     // master must not stall list, write, kill and attach for all the others.
-    let (master, entry_rows, entry_cols) = state
+    let (master, entry_rows, entry_cols) = engine
         .lock_sessions()
         .get(session_id)
         .map(|session| {
@@ -3943,7 +4221,7 @@ pub fn resize_session(
     resized.map_err(|e| format!("Failed to resize terminal: {e}"))?;
     entry_rows.store(size.rows, Ordering::Release);
     entry_cols.store(size.cols, Ordering::Release);
-    state.orchestration.resize(session_id, rows, cols);
+    engine.orchestration.resize(session_id, rows, cols);
     Ok(())
 }
 
@@ -4021,10 +4299,20 @@ impl Drop for MasterHold {
 #[doc(hidden)]
 pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.size(session_id);
+    {
+        state.host.size(session_id)
     }
-    let master = state
+    #[cfg(not(unix))]
+    {
+        engine_pty_size(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_pty_size(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<(u16, u16), String> {
+    let master = engine
         .lock_sessions()
         .get(session_id)
         .map(|session| session.master.clone())
@@ -4040,10 +4328,20 @@ pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16)
 #[doc(hidden)]
 pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterHold, String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.hold(session_id);
+    {
+        state.host.hold(session_id)
     }
-    let master = state
+    #[cfg(not(unix))]
+    {
+        engine_hold_master(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_hold_master(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<MasterHold, String> {
+    let master = engine
         .lock_sessions()
         .get(session_id)
         .map(|session| session.master.clone())
@@ -4079,12 +4377,22 @@ pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterH
 /// a timeout retains ownership so a retry cannot signal an unrelated process.
 pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
+    {
         log::info!(target: "terminal", "terminal close requested");
-        return host.kill(session_id);
+        state.host.kill(session_id)
     }
+    #[cfg(not(unix))]
+    {
+        engine_kill_session(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_kill_session(
+    engine: &Engine,
+    session_id: &str,
+) -> Result<(), String> {
     let handles = {
-        let guard = state.lock_sessions();
+        let guard = engine.lock_sessions();
         guard.get(session_id).map(|s| {
             (
                 s.child.clone(),
@@ -4106,7 +4414,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
         flow.stop();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let present = state.lock_sessions().contains_key(session_id);
+            let present = engine.lock_sessions().contains_key(session_id);
             if !present {
                 break;
             }
@@ -4122,17 +4430,24 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
 /// Application exit closes every owned PTY before the runtime disappears.
 pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.stop_all();
+    {
+        state.host.stop_all()
     }
-    let ids: Vec<String> = state.lock_sessions().keys().cloned().collect();
+    #[cfg(not(unix))]
+    {
+        engine_shutdown_sessions(&state.engine)
+    }
+}
+
+pub(in crate::terminal) fn engine_shutdown_sessions(engine: &Engine) -> Result<(), String> {
+    let ids: Vec<String> = engine.lock_sessions().keys().cloned().collect();
     // Every session at once: each close waits for its own reader (a hangup
     // grace plus a reap), and quitting with a full dock one session after
     // another cost that wait once per session. At most MAX_PTY_SESSIONS threads.
     let failures = thread::scope(|scope| {
         let closes: Vec<_> = ids
             .iter()
-            .map(|id| scope.spawn(move || kill_session(state, id).is_err()))
+            .map(|id| scope.spawn(move || engine_kill_session(engine, id).is_err()))
             .collect();
         closes
             .into_iter()
@@ -4143,10 +4458,10 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
     // Drain even after a failure: a session that did close still has to give
     // its slot back before the runtime goes.
     let deadline = Instant::now() + Duration::from_secs(2);
-    while state.active_sessions.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+    while engine.active_sessions.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    let remaining = state.active_sessions.load(Ordering::Acquire);
+    let remaining = engine.active_sessions.load(Ordering::Acquire);
     match (failures, remaining) {
         (0, 0) => Ok(()),
         (0, remaining) => Err(format!(
@@ -4161,12 +4476,19 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
 /// sleeps until output, an exit or its safety net, so this does not move.
 pub fn reader_wakeups(state: &TerminalSessions, session_id: &str) -> Option<u64> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.wakeups(session_id).unwrap_or_else(|error| {
+    {
+        state.host.wakeups(session_id).unwrap_or_else(|error| {
             panic!("the terminal host's reader could not be asked: {error}")
-        });
+        })
     }
-    state
+    #[cfg(not(unix))]
+    {
+        engine_reader_wakeups(&state.engine, session_id)
+    }
+}
+
+pub(in crate::terminal) fn engine_reader_wakeups(engine: &Engine, session_id: &str) -> Option<u64> {
+    engine
         .lock_sessions()
         .get(session_id)
         .map(|s| s.wakeups.load(Ordering::Relaxed))
@@ -4182,16 +4504,23 @@ const MAX_BACKGROUND_REPORT: usize = 256;
 /// is the whole truth each time, so a session that left it is visible again.
 pub fn set_background_sessions(state: &TerminalSessions, session_ids: &[String]) {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
+    {
         let bounded = &session_ids[..session_ids.len().min(MAX_BACKGROUND_REPORT)];
-        return host.set_background(bounded);
+        state.host.set_background(bounded);
     }
+    #[cfg(not(unix))]
+    {
+        engine_set_background_sessions(&state.engine, session_ids);
+    }
+}
+
+pub(in crate::terminal) fn engine_set_background_sessions(engine: &Engine, session_ids: &[String]) {
     let hidden: std::collections::HashSet<&str> = session_ids
         .iter()
         .take(MAX_BACKGROUND_REPORT)
         .map(String::as_str)
         .collect();
-    for (id, session) in state.lock_sessions().iter() {
+    for (id, session) in engine.lock_sessions().iter() {
         session
             .hidden
             .store(hidden.contains(id.as_str()), Ordering::Relaxed);
@@ -4205,10 +4534,21 @@ pub fn acknowledge_output(
     bytes: usize,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Some(host) = &state.host {
-        return host.ack(session_id, bytes);
+    {
+        state.host.ack(session_id, bytes)
     }
-    let flow = state
+    #[cfg(not(unix))]
+    {
+        engine_acknowledge_output(&state.engine, session_id, bytes)
+    }
+}
+
+pub(in crate::terminal) fn engine_acknowledge_output(
+    engine: &Engine,
+    session_id: &str,
+    bytes: usize,
+) -> Result<(), String> {
+    let flow = engine
         .lock_sessions()
         .get(session_id)
         .map(|s| s.flow.clone());
@@ -4217,6 +4557,33 @@ pub fn acknowledge_output(
         flow.acknowledge(bytes)?;
     }
     Ok(())
+}
+
+/// Internal PTY engine entry points used directly by `host::server` (Unix)
+/// and by [`TerminalSessions`] on non-Unix platforms.
+#[cfg_attr(not(unix), allow(unused_imports))]
+pub(in crate::terminal) mod engine {
+    #[cfg(any(not(unix), test))]
+    pub(in crate::terminal) use super::engine_start_session as start_session;
+    pub(in crate::terminal) use super::{
+        default_shell, engine_acknowledge_output as acknowledge_output,
+        engine_attach_session as attach_session,
+        engine_attach_tracked_session as attach_tracked_session, engine_detach_all as detach_all,
+        engine_detach_session as detach_session, engine_hold_master as hold_master,
+        engine_kill_session as kill_session, engine_list_sessions as list_sessions,
+        engine_pty_size as pty_size, engine_reader_wakeups as reader_wakeups,
+        engine_resize_session as resize_session, engine_session_context as session_context,
+        engine_session_listening_ports as session_listening_ports,
+        engine_session_telemetry as session_telemetry,
+        engine_set_background_sessions as set_background_sessions,
+        engine_shutdown_sessions as shutdown_sessions, engine_write_pty_bytes as write_pty_bytes,
+        MasterHold,
+    };
+    #[cfg(unix)]
+    pub(in crate::terminal) use super::{
+        engine_hosted_session_snapshot as hosted_session_snapshot,
+        engine_start_unobserved as start_unobserved,
+    };
 }
 
 /// Whether the session's own process has exited. Reaping here is safe: the
@@ -5758,7 +6125,7 @@ mod tests {
             refusal = refusal.message()
         );
         assert_eq!(
-            state.active_sessions.load(Ordering::SeqCst),
+            state.test_engine.active_sessions.load(Ordering::SeqCst),
             0,
             "a refused launch holds no session slot"
         );
@@ -6098,17 +6465,75 @@ mod tests {
             wait_until(Duration::from_secs(5), || exited.load(Ordering::SeqCst)),
             "the view is told the session ended"
         );
-        assert_eq!(state.active_sessions.load(Ordering::SeqCst), 0);
+        assert_eq!(state.test_engine.active_sessions.load(Ordering::SeqCst), 0);
     }
 
-    /// The defect: a panic while reading output (the scanner, an event
-    /// listener) ended the reader thread with the child still alive and
-    /// nothing reading its tty. The session stayed "running" forever and its
-    /// output backed up until the program blocked. The reader now contains the
-    /// panic, stops the child, and takes the normal exit path.
+    /// The defect: a panic in an engine reader thread ended the thread with the
+    /// child still alive and nothing reading its tty. The session stayed "running"
+    /// forever and its output backed up until the program blocked. The engine
+    /// reader now contains the panic, stops the child, and takes the normal exit path.
     #[cfg(unix)]
     #[test]
     fn a_panic_while_reading_output_ends_the_session_instead_of_orphaning_it() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let engine = super::Engine::default();
+        let pid_file = dir.path().join("reader-panic.pid");
+        let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app.handle(), Arc::default()));
+        let sink = OutputSink::from_fn(|_, data| {
+            if data.is_some() {
+                panic!("injected panic while delivering output");
+            }
+            Ok(())
+        });
+        engine::start_session(
+            &engine,
+            SpawnRequest {
+                session_id: next_session_id(),
+                place: Place::Repo {
+                    repo_path: dir.path().to_str().unwrap().into(),
+                    start_dir: None,
+                },
+                rows: 24,
+                cols: 80,
+                program: Some("/bin/sh".into()),
+                args: Some(vec![
+                    "-c".into(),
+                    format!("echo $$ > '{}'; echo hello; sleep 300", pid_file.display()),
+                ]),
+                env: None,
+                run_id: None,
+                parent_session_id: None,
+                child_launcher: None,
+                child_title: None,
+                token_hash_hex: None,
+            },
+            sink,
+            events,
+            None,
+        )
+        .unwrap();
+        let pid = read_pid(&pid_file);
+        assert!(
+            wait_until(Duration::from_secs(15), || engine::list_sessions(&engine)
+                .unwrap()
+                .is_empty()),
+            "the reader panicked and the session was left running"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || unsafe { libc::kill(pid, 0) }
+                != 0),
+            "the child of a reader that panicked was left running"
+        );
+    }
+
+    /// When PTYs live in the separate host process, a panic in an app-side
+    /// output listener is contained by the host delivery thread (acknowledging
+    /// the frame so the host does not stall) and leaves the hosted PTY running.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_in_an_app_output_listener_sheds_and_leaves_the_hosted_session_running() {
         use tauri::Listener;
         let dir = tempfile::tempdir().unwrap();
         init_test_repo(dir.path());
@@ -6117,8 +6542,8 @@ mod tests {
         app.listen("terminal-output", |_| {
             panic!("injected panic while delivering output");
         });
-        let pid_file = dir.path().join("reader-panic.pid");
-        spawn_session_inner(
+        let pid_file = dir.path().join("listener-panic.pid");
+        let spawned = spawn_session_inner(
             app.handle(),
             &state,
             dir.path().to_str().unwrap(),
@@ -6136,19 +6561,21 @@ mod tests {
         )
         .unwrap();
         let pid = read_pid(&pid_file);
-        // The listener's panic poisons the event bus, so the exit event
-        // itself cannot be announced here; what must hold is that the process
-        // does not outlive its reader.
-        assert!(
-            wait_until(Duration::from_secs(15), || list_sessions(&state)
-                .unwrap()
-                .is_empty()),
-            "the reader panicked and the session was left running"
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "an app listener panic must not kill the hosted PTY"
         );
+        assert!(
+            !list_sessions(&state).unwrap().is_empty(),
+            "the hosted session remains listed after app listener panic"
+        );
+        kill_session(&state, &spawned.id).unwrap();
         assert!(
             wait_until(Duration::from_secs(5), || unsafe { libc::kill(pid, 0) }
                 != 0),
-            "the child of a reader that panicked was left running"
+            "the hosted child stopped when explicitly killed"
         );
     }
 
@@ -6162,6 +6589,7 @@ mod tests {
         let state = TerminalSessions::default();
         let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
         let master = state
+            .test_engine
             .lock_sessions()
             .get(&spawned.id)
             .unwrap()
@@ -6196,6 +6624,7 @@ mod tests {
         let state = TerminalSessions::default();
         let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
         let master = state
+            .test_engine
             .lock_sessions()
             .get(&spawned.id)
             .unwrap()
@@ -6377,6 +6806,7 @@ mod tests {
         let b = spawn_script(&state, dir.path(), "exec cat".into());
         let hidden = |id: &str| {
             state
+                .test_engine
                 .lock_sessions()
                 .get(id)
                 .unwrap()
@@ -6385,11 +6815,11 @@ mod tests {
         };
         assert!(!hidden(&a.id) && !hidden(&b.id), "unreported is seen");
         set_background_sessions(&state, &[a.id.clone(), "term-unknown".into()]);
-        assert!(hidden(&a.id) && !hidden(&b.id));
+        assert!(wait_until(Duration::from_secs(2), || hidden(&a.id) && !hidden(&b.id)));
         set_background_sessions(&state, std::slice::from_ref(&b.id));
-        assert!(!hidden(&a.id) && hidden(&b.id));
+        assert!(wait_until(Duration::from_secs(2), || !hidden(&a.id) && hidden(&b.id)));
         set_background_sessions(&state, &[]);
-        assert!(!hidden(&a.id) && !hidden(&b.id));
+        assert!(wait_until(Duration::from_secs(2), || !hidden(&a.id) && !hidden(&b.id)));
         kill_session(&state, &a.id).unwrap();
         kill_session(&state, &b.id).unwrap();
     }
@@ -6525,6 +6955,7 @@ mod tests {
     #[cfg(unix)]
     fn leader_pid(state: &TerminalSessions, id: &str) -> i32 {
         let child = state
+            .test_engine
             .lock_sessions()
             .get(id)
             .map(|s| s.child.clone())
@@ -6545,6 +6976,7 @@ mod tests {
         Arc<AtomicUsize>,
     ) {
         state
+            .test_engine
             .lock_sessions()
             .get(id)
             .map(|s| (s.child.clone(), s.master.clone(), s.closing.clone()))
@@ -6890,13 +7322,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = TerminalSessions::default();
         let spawned = spawn_script(&state, dir.path(), "read finish".into());
-        let map = state.sessions.clone();
+        let map = state.test_engine.sessions.clone();
         let _ = thread::spawn(move || {
             let _guard = map.lock().unwrap();
             panic!("injected panic under the session map");
         })
         .join();
-        assert!(state.sessions.is_poisoned());
+        assert!(state.test_engine.sessions.is_poisoned());
         assert!(write_to_session(&state, &spawned.id, "x").is_ok());
         assert!(resize_session(&state, &spawned.id, 30, 90).is_ok());
         assert!(session_context(&state, &spawned.id).is_ok());
@@ -6923,7 +7355,7 @@ mod tests {
             ),
         );
         let shell = read_pid(&dir.path().join("shell"));
-        let map = state.sessions.clone();
+        let map = state.test_engine.sessions.clone();
         let _ = thread::spawn(move || {
             let _guard = map.lock().unwrap();
             panic!("injected panic under the session map");
@@ -6937,7 +7369,8 @@ mod tests {
     /// The defect: Cmd-Q reached `RunEvent::Exit`, which stopped the terminals
     /// and never swept procguard's children, and a signal swept the children
     /// and never stopped the terminals. Both now run `teardown`; this pins its
-    /// order: terminals first (a job gets its hangup grace), the sweep after.
+    /// order when quit chooses to stop sessions: terminals first (a job gets
+    /// its hangup grace), the sweep after.
     #[cfg(unix)]
     #[test]
     fn teardown_stops_terminal_jobs_before_the_sweep_runs() {
@@ -6952,6 +7385,7 @@ mod tests {
             ),
         );
         let job = read_pid(&dir.path().join("job"));
+        state.set_leave_running(false);
         let swept_with_job_alive = std::cell::Cell::new(None);
         crate::teardown::steps(&state, Duration::from_secs(10), || {
             swept_with_job_alive.set(Some(alive(job)));
@@ -6961,7 +7395,44 @@ mod tests {
             Some(false),
             "the sweep ran before the terminals stopped"
         );
-        assert!(list_sessions(&state).unwrap().is_empty());
+        let next = TerminalSessions::with_host(state.host.config().clone());
+        assert!(list_sessions(&next).unwrap().is_empty());
+    }
+
+    /// Without a stop choice (a signal exit or "Quit and Leave Running"),
+    /// teardown disconnects from the host and leaves every session and job alive
+    /// for the next launch to adopt.
+    #[cfg(unix)]
+    #[test]
+    fn teardown_leaves_terminal_jobs_running_when_leaving() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; sleep 300 & echo $! > '{}'; wait",
+                dir.path().join("job").display()
+            ),
+        );
+        let job = read_pid(&dir.path().join("job"));
+        let swept_with_job_alive = std::cell::Cell::new(None);
+        crate::teardown::steps(&state, Duration::from_secs(10), || {
+            swept_with_job_alive.set(Some(alive(job)));
+        });
+        assert_eq!(
+            swept_with_job_alive.get(),
+            Some(true),
+            "default teardown must leave hosted terminal jobs alive"
+        );
+        let next = TerminalSessions::with_host(state.host.config().clone());
+        let listed = list_sessions(&next).unwrap();
+        assert!(
+            listed.iter().any(|s| s.id == spawned.id && s.detached),
+            "relaunch must find the kept session detached: {listed:?}"
+        );
+        shutdown_sessions(&next).unwrap();
+        assert!(wait_until(Duration::from_secs(3), || !alive(job)));
     }
 
     /// The defect: spawn waited on the repository address (git), the task
@@ -7007,6 +7478,7 @@ mod tests {
         let spawned = spawn_script(&state, dir.path(), "read finish".into());
         assert!(!list_sessions(&state).unwrap()[0].ending);
         state
+            .test_engine
             .lock_sessions()
             .get(&spawned.id)
             .unwrap()
@@ -9124,16 +9596,16 @@ mod tests {
 
     #[test]
     fn pty_session_reservations_are_globally_bounded() {
-        let state = TerminalSessions::default();
-        assert_eq!(state.session_limit(), DEFAULT_PTY_SESSIONS);
+        let engine = super::Engine::default();
+        assert_eq!(engine.session_limit(), DEFAULT_PTY_SESSIONS);
         let reservations: Vec<_> = (0..DEFAULT_PTY_SESSIONS)
-            .map(|_| reserve_session(&state).expect("within cap"))
+            .map(|_| reserve_session(&engine).expect("within cap"))
             .collect();
-        let err = reserve_session(&state).err().expect("cap must refuse");
+        let err = reserve_session(&engine).err().expect("cap must refuse");
         assert!(err.contains("limit"), "{err}");
         drop(reservations);
         assert!(
-            reserve_session(&state).is_ok(),
+            reserve_session(&engine).is_ok(),
             "released slots must be reusable"
         );
     }
@@ -9145,9 +9617,9 @@ mod tests {
     /// `1..=MAX_PTY_SESSIONS`, whatever it is asked for.
     #[test]
     fn the_session_limit_is_the_users_and_applies_to_the_next_session() {
-        let state = TerminalSessions::default();
-        let lane = state.clone();
-        state.set_session_limit(DEFAULT_PTY_SESSIONS + 8);
+        let engine = super::Engine::default();
+        let lane = engine.clone();
+        engine.set_session_limit(DEFAULT_PTY_SESSIONS + 8);
         assert_eq!(lane.session_limit(), DEFAULT_PTY_SESSIONS + 8);
         let mut held: Vec<_> = (0..DEFAULT_PTY_SESSIONS + 8)
             .map(|_| reserve_session(&lane).expect("a raised limit refused"))
@@ -9159,7 +9631,7 @@ mod tests {
         );
         assert!(refused.contains("Settings"), "{refused}");
 
-        state.set_session_limit(4);
+        engine.set_session_limit(4);
         assert!(
             reserve_session(&lane).is_err(),
             "opened past a lowered limit"
@@ -9170,19 +9642,23 @@ mod tests {
         held.push(reserve_session(&lane).expect("a closed session freed its place"));
         drop(held);
 
+        let sessions = TerminalSessions::default();
+        let sessions_lane = sessions.clone();
         for (asked, kept) in [
             (0, 1),
             (1, 1),
             (MAX_PTY_SESSIONS, MAX_PTY_SESSIONS),
             (usize::MAX, MAX_PTY_SESSIONS),
         ] {
-            state.set_session_limit(asked);
-            assert_eq!(state.session_limit(), kept, "{asked}");
+            engine.set_session_limit(asked);
+            assert_eq!(engine.session_limit(), kept, "{asked}");
+            sessions.set_session_limit(asked);
+            assert_eq!(sessions_lane.session_limit(), kept, "{asked}");
         }
         let all: Vec<_> = (0..MAX_PTY_SESSIONS)
-            .map(|_| reserve_session(&state).expect("within the ceiling"))
+            .map(|_| reserve_session(&engine).expect("within the ceiling"))
             .collect();
-        assert!(reserve_session(&state).is_err());
+        assert!(reserve_session(&engine).is_err());
         drop(all);
     }
 
@@ -9662,17 +10138,17 @@ mod tests {
     /// card 1b's change; this pins the starting point it changes.
     #[test]
     fn characterization_a_launch_is_admitted_on_the_session_count_alone() {
-        let state = TerminalSessions::default();
-        let limit = state.session_limit();
+        let engine = super::Engine::default();
+        let limit = engine.session_limit();
         let held: Vec<_> = (0..limit)
-            .map(|_| reserve_session(&state).expect("admitted under the limit"))
+            .map(|_| reserve_session(&engine).expect("admitted under the limit"))
             .collect();
         assert!(
-            reserve_session(&state).is_err(),
+            reserve_session(&engine).is_err(),
             "the count is the only gate"
         );
         drop(held);
-        assert!(reserve_session(&state).is_ok());
+        assert!(reserve_session(&engine).is_ok());
     }
 
     /// Characterization (host-load governor, Part 0): a `claude` started in a

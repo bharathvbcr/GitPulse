@@ -53,7 +53,7 @@ mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session, TerminalSessions,
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session,
     };
     use std::time::{Duration, Instant};
     use tauri::Listener;
@@ -118,7 +118,7 @@ mod imp {
         let app = tauri::test::mock_builder()
             .build(gitpulse_lib::context())
             .expect("mock app");
-        let state = TerminalSessions::default();
+        let state = super::common::terminals();
         {
             let state = state.clone();
             app.listen("terminal-output", move |event| {

@@ -83,19 +83,19 @@ pub fn trust_repo(repo: &Path) {
         .expect("approve fixture");
 }
 
-/// Which backend the terminal suites run against:
-/// `GITPULSE_TEST_TERMINAL_BACKEND=host` runs each of them against a real
-/// `gitpulse-ptyd`; anything else, in-process.
+/// Which backend the terminal suites run against: on Unix the real
+/// `gitpulse-ptyd` host is unconditional; non-Unix still uses the in-process
+/// engine until its own host exists.
 pub fn terminal_host_selected() -> bool {
-    std::env::var("GITPULSE_TEST_TERMINAL_BACKEND").as_deref() == Ok("host")
+    cfg!(unix)
 }
 
-/// A session registry on the selected backend. A host registry gets a host of
-/// its own, in a directory of its own, so suites running side by side never
-/// share sessions.
+/// A session registry on the selected backend. On Unix every registry gets a
+/// host of its own, in a directory of its own, so suites running side by side
+/// never share sessions.
 pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
     #[cfg(unix)]
-    if terminal_host_selected() {
+    {
         let base = std::env::temp_dir().canonicalize().expect("temp dir");
         // Kept for the life of the test process: the host exits on its own
         // once its registry is gone and it holds no session.
@@ -104,7 +104,7 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
             .tempdir_in(base)
             .expect("host dir")
             .keep();
-        return gitpulse_lib::terminal::TerminalSessions::with_host(
+        gitpulse_lib::terminal::TerminalSessions::with_host(
             gitpulse_lib::terminal::host::client::HostConfig {
                 binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
                 idle_exit: Some(std::time::Duration::from_secs(3)),
@@ -112,9 +112,12 @@ pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
                 log_dir: Some(dir.join("logs")),
                 dir,
             },
-        );
+        )
     }
-    gitpulse_lib::terminal::TerminalSessions::default()
+    #[cfg(not(unix))]
+    {
+        gitpulse_lib::terminal::TerminalSessions::default()
+    }
 }
 
 /// Every shipped binary's entry file, relative to the crate, derived two

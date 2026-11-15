@@ -403,6 +403,9 @@ impl Drop for Retrying<'_> {
     }
 }
 
+#[cfg(test)]
+type HostStarter = Arc<dyn Fn(&HostConfig) -> Result<(), String> + Send + Sync>;
+
 struct Inner {
     config: HostConfig,
     vouched: Mutex<Vouched>,
@@ -428,6 +431,13 @@ struct Inner {
     leaving: AtomicBool,
     /// What is wrong with the host, said plainly, when something is.
     trouble: Mutex<Vec<String>>,
+    /// Permanent host-directory initialization failure; every connect refuses
+    /// immediately without attempting socket setup or falling back in-process.
+    unavailable: Option<String>,
+    /// Test-only in-process server launcher substituted for spawning the external
+    /// `gitpulse-ptyd` binary.
+    #[cfg(test)]
+    starter: Option<HostStarter>,
     /// Shared orchestration registry so child terminals hosted in `gitpulse-ptyd`
     /// stream output into their `vt100` parser and revoke capability tokens on exit.
     orchestration: Arc<crate::terminal::orchestrate::OrchestrationRegistry>,
@@ -473,9 +483,87 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                unavailable: None,
+                #[cfg(test)]
+                starter: None,
                 orchestration,
                 agent_meta,
                 #[cfg(test)]
+                adopt_seam: Mutex::default(),
+            }),
+        }
+    }
+
+    /// A client whose host directory could not be resolved: fails every host
+    /// operation closed with `reason` and reports `reason` in `trouble()`.
+    pub(crate) fn unavailable(
+        reason: String,
+        orchestration: Arc<crate::terminal::orchestrate::OrchestrationRegistry>,
+        agent_meta: Arc<Mutex<HashMap<String, crate::terminal::AgentSessionMeta>>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                config: HostConfig {
+                    dir: PathBuf::new(),
+                    binary: None,
+                    idle_exit: None,
+                    log_dir: None,
+                },
+                vouched: Mutex::default(),
+                retrying: AtomicBool::new(false),
+                conn: Mutex::default(),
+                connecting: Mutex::default(),
+                proxies: Mutex::default(),
+                events: Mutex::default(),
+                adopter: Mutex::default(),
+                ended: Mutex::default(),
+                recording: Mutex::default(),
+                adopted: AtomicBool::new(false),
+                limit: AtomicUsize::new(0),
+                stall_ms: AtomicU64::new(0),
+                leaving: AtomicBool::new(false),
+                trouble: Mutex::new(vec![reason.clone()]),
+                unavailable: Some(reason),
+                #[cfg(test)]
+                starter: None,
+                orchestration,
+                agent_meta,
+                #[cfg(test)]
+                adopt_seam: Mutex::default(),
+            }),
+        }
+    }
+
+    /// HostClient backed by a caller-provided in-process server starter for
+    /// unit tests inside `crate::terminal`.
+    #[cfg(test)]
+    pub(in crate::terminal) fn for_unit_test_with_shared_state(
+        config: HostConfig,
+        orchestration: Arc<crate::terminal::orchestrate::OrchestrationRegistry>,
+        agent_meta: Arc<Mutex<HashMap<String, crate::terminal::AgentSessionMeta>>>,
+        starter: impl Fn(&HostConfig) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                config,
+                vouched: Mutex::default(),
+                retrying: AtomicBool::new(false),
+                conn: Mutex::default(),
+                connecting: Mutex::default(),
+                proxies: Mutex::default(),
+                events: Mutex::default(),
+                adopter: Mutex::default(),
+                ended: Mutex::default(),
+                recording: Mutex::default(),
+                adopted: AtomicBool::new(false),
+                limit: AtomicUsize::new(0),
+                stall_ms: AtomicU64::new(0),
+                leaving: AtomicBool::new(false),
+                trouble: Mutex::default(),
+                unavailable: None,
+                starter: Some(Arc::new(starter)),
+                orchestration,
+                agent_meta,
                 adopt_seam: Mutex::default(),
             }),
         }
@@ -803,6 +891,9 @@ impl HostClient {
         for proxy in lock(&self.inner.proxies).values_mut() {
             proxy.viewed = false;
         }
+        if !self.inner.is_live_or_socket_present() {
+            return Ok(0);
+        }
         self.call(Request::DetachAll, CALL_DEADLINE)
     }
 
@@ -919,6 +1010,9 @@ impl HostClient {
 
     /// Stops every session the host holds and waits for their exits.
     pub fn stop_all(&self) -> Result<(), String> {
+        if !self.inner.is_live_or_socket_present() {
+            return Ok(());
+        }
         self.call::<serde_json::Value>(Request::StopAll, STOP_ALL_DEADLINE)?;
         if self
             .inner
@@ -1112,7 +1206,17 @@ impl Inner {
     /// `retry`: a listing that fails is tried again in the background (see
     /// `retry_adoption`). The attempts that are themselves such a retry, or a
     /// reconnect, pass false and are their own loop.
+    fn is_live_or_socket_present(&self) -> bool {
+        self.unavailable.is_none()
+            && !self.leaving.load(Ordering::Acquire)
+            && (self.current().is_some()
+                || self.config.dir.join(super::socket_name(PROTOCOL)).exists())
+    }
+
     fn connect(self: &Arc<Self>, retry: bool) -> Result<Arc<Connection>, String> {
+        if let Some(reason) = &self.unavailable {
+            return Err(reason.clone());
+        }
         if let Some(conn) = self.current() {
             return Ok(conn);
         }
@@ -1132,7 +1236,8 @@ impl Inner {
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                self.start_host()?;
+                self.start_host()
+                    .inspect_err(|trouble| self.note_trouble(trouble.clone()))?;
                 self.wait_for_socket(&socket)?
             }
             Err(error) => {
@@ -1635,24 +1740,47 @@ impl Inner {
             .get(session)
             .map(|p| (p.output.clone(), p.failing.clone()));
         let delivered = match &target {
-            Some((slot, failing)) => match slot.current().bytes(session, bytes) {
-                Ok(()) => {
-                    failing.store(false, Ordering::Release);
-                    true
-                }
-                Err(error) => {
-                    if !failing.swap(true, Ordering::AcqRel) {
-                        log::warn!(target: "terminal", "terminal output could not be sent to its view, skipping output: {error}");
-                        if let Some(events) = self.events() {
-                            events.loss(TerminalLossPayload {
-                                id: session.to_owned(),
-                                message: SHED_NOTICE.into(),
-                            });
-                        }
+            Some((slot, failing)) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    slot.current().bytes(session, bytes)
+                })) {
+                    Ok(Ok(())) => {
+                        failing.store(false, Ordering::Release);
+                        true
                     }
-                    false
+                    Ok(Err(error)) => {
+                        if !failing.swap(true, Ordering::AcqRel) {
+                            log::warn!(target: "terminal", "terminal output could not be sent to its view, skipping output: {error}");
+                            if let Some(events) = self.events() {
+                                events.loss(TerminalLossPayload {
+                                    id: session.to_owned(),
+                                    message: SHED_NOTICE.into(),
+                                });
+                            }
+                        }
+                        false
+                    }
+                    Err(panic) => {
+                        crate::supervisor::note_stopped(
+                            "terminal output delivery panic",
+                            panic.as_ref(),
+                        );
+                        if !failing.swap(true, Ordering::AcqRel) {
+                            log::warn!(target: "terminal", "terminal output delivery panicked, skipping output");
+                            if let Some(events) = self.events() {
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        events.loss(TerminalLossPayload {
+                                            id: session.to_owned(),
+                                            message: SHED_NOTICE.into(),
+                                        });
+                                    }));
+                            }
+                        }
+                        false
+                    }
                 }
-            },
+            }
             None => false,
         };
         // Output no view here will acknowledge is repaid at once, so the
@@ -1791,15 +1919,14 @@ impl Inner {
     /// this app's process group or session reaches it, and nothing this app's
     /// quit sweeps (`procguard::reap_all`) tracks it.
     fn start_host(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(starter) = &self.starter {
+            return starter(&self.config);
+        }
         let binary = match &self.config.binary {
             Some(binary) => binary.clone(),
-            None => crate::insights::bundled_binary(super::BINARY_ENV, super::BINARY).map_err(
-                |error| {
-                    let trouble = format!("The terminal host could not start: {error}");
-                    self.note_trouble(trouble.clone());
-                    trouble
-                },
-            )?,
+            None => crate::insights::bundled_binary(super::BINARY_ENV, super::BINARY)
+                .map_err(|error| format!("The terminal host could not start: {error}"))?,
         };
         crate::local_socket::private_dir(&self.config.dir)?;
         let log_path = self.config.dir.join("ptyd.log");
@@ -1999,7 +2126,16 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
                     let Some(inner) = inner.upgrade() else {
                         break;
                     };
-                    inner.deliver(&conn, frame, &payload);
+                    if let Err(panic) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            inner.deliver(&conn, frame, &payload);
+                        }))
+                    {
+                        crate::supervisor::note_stopped(
+                            "terminal host delivery frame panic",
+                            panic.as_ref(),
+                        );
+                    }
                     conn.mark_delivered();
                 }
             },
@@ -2056,21 +2192,13 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
 }
 
 /// Whether the registry holds the session `key`, asked without waiting on
-/// anything: a host is answered from this app's own snapshot
-/// ([`HostClient::holds_session`]), and an in-process registry from its own
-/// map, a local lock with no connection behind it. `None` when the registry
-/// cannot tell (a host with no open, listed connection, or an unreadable
-/// in-process list): the caller decides what that means.
+/// anything (`HostClient::holds_session`). `None` when the host connection has
+/// not listed yet, is down, or was disconnected.
 ///
 /// Its natural home is beside `tracks_run` in `terminal/mod.rs`; it lives here
 /// because a descendant module can read that file's private `host` field.
 pub(crate) fn registry_holds(state: &crate::terminal::TerminalSessions, key: &str) -> Option<bool> {
-    match &state.host {
-        Some(host) => host.holds_session(key),
-        None => crate::terminal::list_sessions(state)
-            .ok()
-            .map(|listed| listed.iter().any(|session| session.id == key)),
-    }
+    state.host.holds_session(key)
 }
 
 #[cfg(test)]

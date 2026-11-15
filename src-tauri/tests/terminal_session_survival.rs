@@ -13,8 +13,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
-    acknowledge_output, attach_session, detach_session, kill_session, list_sessions, spawn_session,
-    TerminalSessions,
+    acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
+    session_transcript, spawn_session, OutputSink, TerminalSessions, TranscriptRead, RING_BYTES,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -57,6 +57,8 @@ struct View {
     received: Arc<AtomicUsize>,
     /// Acknowledgements refused as stale (only ever after a detach).
     stale: Arc<AtomicUsize>,
+    record: Arc<AtomicBool>,
+    recorded: Arc<Mutex<Vec<u8>>>,
     losses: Arc<Mutex<Vec<serde_json::Value>>>,
     exits: mpsc::Receiver<serde_json::Value>,
 }
@@ -72,22 +74,27 @@ impl View {
         let owed = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::new(AtomicUsize::new(0));
         let stale = Arc::new(AtomicUsize::new(0));
-        let (ack_state, ack_on, ack_owed, ack_received, ack_stale) = (
+        let record = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let (ack_state, ack_on, ack_owed, ack_received, ack_stale, ack_record, ack_recorded) = (
             state.clone(),
             acking.clone(),
             owed.clone(),
             received.clone(),
             stale.clone(),
+            record.clone(),
+            recorded.clone(),
         );
         app.listen("terminal-output", move |event| {
             let data: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
             let id = data["id"].as_str().unwrap().to_string();
-            let bytes = STANDARD
-                .decode(data["data_b64"].as_str().unwrap())
-                .unwrap()
-                .len();
+            let decoded = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+            let bytes = decoded.len();
             assert_eq!(data["bytes"].as_u64(), Some(bytes as u64));
             ack_received.fetch_add(bytes, Ordering::SeqCst);
+            if ack_record.load(Ordering::SeqCst) {
+                ack_recorded.lock().unwrap().extend_from_slice(&decoded);
+            }
             if ack_on.load(Ordering::SeqCst) {
                 // A chunk in flight when its session was detached is acked
                 // after the detach forgave the window, and refused — as the
@@ -121,6 +128,8 @@ impl View {
             owed,
             received,
             stale,
+            record,
+            recorded,
             losses,
             exits,
         }
@@ -364,4 +373,195 @@ fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
         assert!(wait_until(Duration::from_secs(2), || !alive(*pid)));
     }
     assert!(list_sessions(&view.state).unwrap().is_empty());
+}
+
+fn transcript_ends_with(state: &TerminalSessions, id: &str, suffix: &[u8]) -> bool {
+    match session_transcript(state, id, 65_536, false, None) {
+        Ok(TranscriptRead::Found(tail)) => STANDARD
+            .decode(&tail.data_b64)
+            .map(|bytes| bytes.ends_with(suffix))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// S2-11 (under RING_BYTES): a non-repainting process that prints while no view
+/// holds the session replays the exact bytes on reattach and emits no loss
+/// notice.
+#[test]
+fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() {
+    const PAYLOAD_FILL: usize = 16 * 1024;
+    let view = View::new(Duration::from_secs(2));
+    let _cleanup = TerminalCleanup(view.state.clone());
+    let dir = repo();
+    let ready = dir.path().join("ready");
+    let go = dir.path().join("go");
+    let done = dir.path().join("done");
+    let script = format!(
+        "trap '' WINCH; : > '{ready}'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
+         printf 'DETACHED-START:'; dd if=/dev/zero bs={fill} count=1 2>/dev/null | tr '\\000' m; \
+         printf ':DETACHED-END'; : > '{done}'; sleep 300",
+        ready = ready.display(),
+        go = go.display(),
+        fill = PAYLOAD_FILL,
+        done = done.display(),
+    );
+    let spawned = spawn_session(
+        view.app.handle(),
+        &view.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), script]),
+        None,
+        OutputSink::events(view.app.handle()),
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    assert!(detach_session(&view.state, &spawned.id).unwrap());
+
+    view.recorded.lock().unwrap().clear();
+    view.losses.lock().unwrap().clear();
+    view.record.store(true, Ordering::SeqCst);
+
+    std::fs::write(&go, b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || done.exists()
+            && transcript_ends_with(&view.state, &spawned.id, b":DETACHED-END")),
+        "detached child never flushed its payload to the host"
+    );
+    assert!(
+        view.recorded.lock().unwrap().is_empty(),
+        "detached session must not deliver output before reattach"
+    );
+
+    attach_session(
+        &view.state,
+        &spawned.id,
+        30,
+        100,
+        OutputSink::events(view.app.handle()),
+    )
+    .unwrap();
+
+    let mut expected =
+        Vec::with_capacity(b"DETACHED-START:".len() + PAYLOAD_FILL + b":DETACHED-END".len());
+    expected.extend_from_slice(b"DETACHED-START:");
+    expected.resize(expected.len() + PAYLOAD_FILL, b'm');
+    expected.extend_from_slice(b":DETACHED-END");
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            view.recorded.lock().unwrap().len() >= expected.len()
+        }),
+        "reattach never replayed all {} detached bytes (got {})",
+        expected.len(),
+        view.recorded.lock().unwrap().len()
+    );
+    let replayed = view.recorded.lock().unwrap().clone();
+    assert_eq!(replayed, expected);
+
+    let losses = view.losses.lock().unwrap();
+    assert!(
+        !losses.iter().any(|event| {
+            event["id"] == spawned.id.as_str()
+                && event["message"]
+                    .as_str()
+                    .is_some_and(|msg| msg.starts_with("Output while detached was not kept"))
+        }),
+        "unexpected detached-loss notice: {losses:?}"
+    );
+    drop(losses);
+
+    kill_session(&view.state, &spawned.id).unwrap();
+}
+
+/// S2-11 (past RING_BYTES): when detached output overflows the ring, reattach
+/// replays the newest `RING_BYTES` tail ending cleanly and emits the
+/// `"Output while detached was not kept"` `terminal-loss` event.
+#[test]
+fn detached_non_repainting_output_past_ring_replays_tail_and_emits_loss() {
+    let blocks = (RING_BYTES / 65_536) + 2;
+    let view = View::new(Duration::from_secs(2));
+    let _cleanup = TerminalCleanup(view.state.clone());
+    let dir = repo();
+    let ready = dir.path().join("ready");
+    let go = dir.path().join("go");
+    let done = dir.path().join("done");
+    let script = format!(
+        "trap '' WINCH; : > '{ready}'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
+         dd if=/dev/zero bs=65536 count={blocks} 2>/dev/null | tr '\\000' x; \
+         printf 'DETACHED-TAIL-END'; : > '{done}'; sleep 300",
+        ready = ready.display(),
+        go = go.display(),
+        blocks = blocks,
+        done = done.display(),
+    );
+    let spawned = spawn_session(
+        view.app.handle(),
+        &view.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), script]),
+        None,
+        OutputSink::events(view.app.handle()),
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+    assert!(detach_session(&view.state, &spawned.id).unwrap());
+
+    view.recorded.lock().unwrap().clear();
+    view.losses.lock().unwrap().clear();
+    view.record.store(true, Ordering::SeqCst);
+
+    std::fs::write(&go, b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || done.exists()
+            && transcript_ends_with(
+                &view.state,
+                &spawned.id,
+                b"DETACHED-TAIL-END"
+            )),
+        "detached child never flushed overflow payload to the host"
+    );
+    assert!(
+        view.recorded.lock().unwrap().is_empty(),
+        "detached session must not deliver output before reattach"
+    );
+
+    attach_session(
+        &view.state,
+        &spawned.id,
+        30,
+        100,
+        OutputSink::events(view.app.handle()),
+    )
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            view.recorded.lock().unwrap().len() >= RING_BYTES
+                && view.losses.lock().unwrap().iter().any(|event| {
+                    event["id"] == spawned.id.as_str()
+                        && event["message"]
+                            .as_str()
+                            .is_some_and(|msg| msg.starts_with("Output while detached was not kept"))
+                })
+        }),
+        "reattach did not deliver RING_BYTES replay + detached loss notice (got {} bytes, losses={:?})",
+        view.recorded.lock().unwrap().len(),
+        view.losses.lock().unwrap()
+    );
+
+    let replayed = view.recorded.lock().unwrap().clone();
+    assert_eq!(replayed.len(), RING_BYTES);
+    let marker = b"DETACHED-TAIL-END";
+    let (prefix, tail) = replayed.split_at(RING_BYTES - marker.len());
+    assert_eq!(tail, marker);
+    assert!(prefix.iter().all(|b| *b == b'x'));
+
+    kill_session(&view.state, &spawned.id).unwrap();
 }
