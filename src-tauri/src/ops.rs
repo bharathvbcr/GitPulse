@@ -1046,6 +1046,7 @@ mod tests {
             stderr: stderr.as_bytes().to_vec(),
             success: status_code == 0,
             status_code,
+            signal: None,
             incomplete: None,
             stderr_incomplete: None,
             cancelled: false,
