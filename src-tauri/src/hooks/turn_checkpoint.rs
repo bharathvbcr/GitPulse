@@ -195,8 +195,9 @@ fn not_captured_reason(why: &str) -> String {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    #![cfg(target_os = "macos")]
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
