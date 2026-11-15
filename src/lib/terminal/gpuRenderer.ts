@@ -89,6 +89,38 @@ export const GPU_LOSS_BUDGET = 3;
 /** The span a session's losses are counted over. */
 export const GPU_LOSS_WINDOW_MS = 10 * 60_000;
 
+/**
+ * The span the pool counts the contexts the page creates over. An engine that
+ * caps live WebGL contexts per page (WebKit: 16, and a lost one counts until
+ * it is collected) force-loses the one drawn least recently when a burst of
+ * creations passes the cap, which on the small tiers, where every dock switch
+ * creates one context and releases another, is a pane nobody is touching.
+ */
+export const GPU_CHURN_WINDOW_MS = 60_000;
+/**
+ * Creations in the window at which the pool stops releasing hidden holders
+ * that are over the tier's budget. Chosen from the WebKit dock-cycling check
+ * in `harness/terminal.html`: with the dock session, one idle pane and the
+ * pane being shown live, the engine's 16 is reached after about thirteen
+ * creations in a burst and the idle pane was force-lost within the first
+ * twenty; six creations is one turn of a five-dock rotation, early enough that
+ * the docks are held (up to the window maximum of eight) before the cap is
+ * near, and rare enough that a person switching a few times a minute never
+ * reaches it.
+ */
+export const GPU_CHURN_DAMPING_AT = 6;
+/**
+ * Creations in the window at which a loss is the page's own churn, not the
+ * session's fault, and does not count against its budget.
+ */
+export const GPU_CHURN_FORGIVE_AT = 12;
+/**
+ * Losses one session may have forgiven in the loss window. Forgiveness is for
+ * a burst; a session that keeps losing while the page keeps creating is
+ * counted again past this, so it cannot recover in a loop for ever.
+ */
+export const GPU_LOSS_FORGIVEN_MAX = 3 * GPU_LOSS_BUDGET;
+
 /** The numbers above, as one object the browser harness can shorten. */
 export interface GpuPolicy {
   hideGraceMs: number;
@@ -164,11 +196,25 @@ export interface GpuSlots {
   /** Slots held now, including those a hidden session is holding. */
   held(): number;
   /**
-   * The budget for contexts held beyond what is on screen. The pool holds
-   * at most `max(cap, terminals on screen)` contexts, never more than its
-   * window maximum; a terminal on screen always gets one up to that maximum.
+   * The budget for hidden contexts. Every terminal on screen always keeps its
+   * own context (up to the window maximum of eight, roughly 49 MB of graphics
+   * memory each), so the budget limits only what is kept for terminals out of
+   * sight: the pool holds `max(cap, terminals on screen)` contexts in all, and
+   * the hidden ones allowed are `max(0, cap - terminals on screen)`. A cap of
+   * two with one terminal on screen keeps one hidden context; with two or more
+   * on screen it keeps none. One exception: while the page is creating contexts
+   * in a burst (`GPU_CHURN_DAMPING_AT` in the last minute) hidden terminals keep
+   * theirs beyond the budget, up to the window maximum, so that showing them
+   * again does not create more; the budget applies again when the burst ends.
    */
   cap(): number;
+  /**
+   * Records that the page has just created a context. The pool counts them
+   * over the last minute (`GPU_CHURN_WINDOW_MS`).
+   */
+  noteCreated(): void;
+  /** Contexts the page created in the last minute. */
+  recentCreations(): number;
   /**
    * Changes the cap (floored, at least one; a value that is not a finite
    * number is ignored). A smaller cap gives up hidden holders beyond it,
@@ -194,8 +240,18 @@ export function createGpuSlots(
   initialCap: number = MAX_VISIBLE_SESSIONS,
   /** The most contexts that may be live at once, whatever the budget. */
   hardCap: number = initialCap,
+  /** The clock the creation count reads; a test's, or the page's. */
+  now: () => number = () => Date.now(),
 ): GpuSlots {
   let cap = initialCap;
+  /** When the page created its contexts, oldest first, over the last minute. */
+  const created: number[] = [];
+  const MAX_RECORDED = 1_024;
+  const recent = () => {
+    const cutoff = now() - GPU_CHURN_WINDOW_MS;
+    while (created.length > 0 && created[0] <= cutoff) created.shift();
+    return created.length;
+  };
   let held = 0;
   /** Hidden holders, longest-hidden first (a Set keeps insertion order). */
   const idles = new Set<() => void>();
@@ -212,7 +268,14 @@ export function createGpuSlots(
    * window's maximum. The budget is for the hidden; it never takes a context
    * from a terminal that can be seen.
    */
-  const allowed = (onScreen: number) => Math.min(hardCap, Math.max(cap, onScreen));
+  const allowed = (onScreen: number) => {
+    // While the page is creating contexts fast, releasing the over-budget hidden
+    // ones only feeds the churn that makes the engine force-lose a pane on
+    // screen: they stay, up to the window maximum, and the tier's budget applies
+    // again once the rate drops (the next decision, or the hold's own timer).
+    const budget = recent() >= GPU_CHURN_DAMPING_AT ? hardCap : cap;
+    return Math.min(hardCap, Math.max(budget, onScreen));
+  };
 
   const reclaimOldest = () => {
     const [oldest] = idles;
@@ -264,6 +327,11 @@ export function createGpuSlots(
     },
     held: () => held,
     cap: () => cap,
+    noteCreated() {
+      created.push(now());
+      if (created.length > MAX_RECORDED) created.shift();
+    },
+    recentCreations: recent,
     setCap(next) {
       if (!Number.isFinite(next)) return;
       cap = Math.max(1, Math.floor(next));
@@ -350,6 +418,9 @@ export function createGpuRenderer(deps: {
   let stopWaiting: (() => void) | null = null;
   let recoverTimer: ReturnType<typeof setTimeout> | null = null;
   let losses: number[] = [];
+  /** Losses the page's own churn caused, which did not count against the budget. */
+  let forgiven: number[] = [];
+  let lastLossAt = 0;
 
   const set = (next: GpuState) => {
     if (next === state) return;
@@ -435,6 +506,7 @@ export function createGpuRenderer(deps: {
       return;
     }
     addon = created;
+    slots.noteCreated();
     lossListener = created.onContextLoss(() => lose());
     set("webgl");
     repaint();
@@ -452,7 +524,7 @@ export function createGpuRenderer(deps: {
   const scheduleRecover = () => {
     clearRecover();
     if (closed || final || !wanted) return;
-    const wait = Math.max(0, (losses.at(-1) ?? 0) + policy().recoverDelayMs - Date.now());
+    const wait = Math.max(0, lastLossAt + policy().recoverDelayMs - Date.now());
     recoverTimer = setTimeout(() => {
       recoverTimer = null;
       attempt();
@@ -474,11 +546,20 @@ export function createGpuRenderer(deps: {
       return;
     }
     const now = Date.now();
+    lastLossAt = now;
     losses = losses.filter((at) => now - at < policy().lossWindowMs);
-    losses.push(now);
-    if (losses.length > policy().lossBudget) {
-      finalize();
-      return;
+    forgiven = forgiven.filter((at) => now - at < policy().lossWindowMs);
+    // A page creating contexts fast makes its engine force-lose the one drawn
+    // least recently, whichever pane that is: the loss is the pool's doing, not
+    // this session's, so it is not counted, and the session attaches again.
+    if (slots.recentCreations() >= GPU_CHURN_FORGIVE_AT && forgiven.length < GPU_LOSS_FORGIVEN_MAX) {
+      forgiven.push(now);
+    } else {
+      losses.push(now);
+      if (losses.length > policy().lossBudget) {
+        finalize();
+        return;
+      }
     }
     set("reset");
     scheduleRecover();

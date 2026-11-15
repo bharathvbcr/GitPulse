@@ -424,16 +424,40 @@ export function startHostLoad(): void {
   const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
     announceRefusal(event.payload);
-    // The pulse does not carry the resource profile, so a startup read that
-    // failed would leave every consumer on the compact budgets for the whole
-    // run. Until one read has landed, each pulse retries it (single-flight).
-    if (get(statusStore) === null) void refreshHostLoad().catch(() => undefined);
+    rereadProfileIfUnsettled();
   }).catch((error) => {
     if (listening === attempt) listening = null;
     diagnostics.warn("hostLoad", `couldn't listen for the host-load pulse; will retry: ${String(error)}`);
     return null;
   });
   listening = attempt;
+  profileRetryNotBefore = Date.now() + PROFILE_RETRY_BASE_MS;
+  void refreshHostLoad().catch(() => undefined);
+}
+
+/** First wait before the profile is reread; each further wait doubles, up to the cap. */
+export const PROFILE_RETRY_BASE_MS = 2_000;
+export const PROFILE_RETRY_CAP_MS = 60_000;
+
+let profileRetries = 0;
+let profileRetryNotBefore = 0;
+
+/**
+ * The pulse does not carry the resource profile, so a start-up read that failed,
+ * or that said the computer's memory could not be read, would leave every
+ * consumer on a guessed tier until a restart. While the profile is unsettled
+ * (no status yet, or `memory_unreadable`) a pulse rereads it, but on a doubling
+ * wait that levels off at `PROFILE_RETRY_CAP_MS`: at most one read a minute for
+ * a read that never succeeds, never one per two-second tick, and never a stop
+ * that would strand the tier. A change of setting starts the waits over.
+ */
+function rereadProfileIfUnsettled(): void {
+  const held = get(statusStore);
+  if (held !== null && held.profile.basis !== "memory_unreadable") return;
+  const now = Date.now();
+  if (now < profileRetryNotBefore) return;
+  profileRetryNotBefore = now + Math.min(PROFILE_RETRY_CAP_MS, PROFILE_RETRY_BASE_MS * 2 ** profileRetries);
+  profileRetries += 1;
   void refreshHostLoad().catch(() => undefined);
 }
 
@@ -466,6 +490,8 @@ export function refreshHostLoad(): Promise<HostLoadStatus | null> {
  * reads again instead of joining it.
  */
 function refreshAfterChange(): void {
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   void (refreshing ?? Promise.resolve())
     .catch(() => undefined)
     .then(() => refreshHostLoad())
@@ -543,6 +569,8 @@ export function resetHostLoadForTests(): void {
   listening = null;
   refreshing = null;
   noticeShown = false;
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   pulseStore.set(null);
   statusStore.set(null);
 }

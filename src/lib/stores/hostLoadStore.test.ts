@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -7,6 +7,8 @@ import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
   HOST_LOAD_PULSE_EVENT,
+  PROFILE_RETRY_BASE_MS,
+  PROFILE_RETRY_CAP_MS,
   hostLoadPulse,
   hostPressure,
   pulseOf,
@@ -115,16 +117,23 @@ describe("hostLoadStore", () => {
     // Let the rejected startup read settle, as the two seconds before the first pulse do.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(get(resourceProfile), "nothing has been read yet").toBeNull();
+    // The sampler's first pulse comes a tick (two seconds) after start-up.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + PROFILE_RETRY_BASE_MS);
 
-    const handler = vi.mocked(listen).mock.calls[0][1] as (e: { payload: HostLoadPulse }) => void;
-    handler({ payload: pulseOf(status()) } as never);
-    await vi.waitFor(() => expect(get(resourceProfile)?.tier).toBe("roomy"));
-    expect(invoke).toHaveBeenCalledTimes(2);
+      const handler = vi.mocked(listen).mock.calls[0][1] as (e: { payload: HostLoadPulse }) => void;
+      handler({ payload: pulseOf(status()) } as never);
+      await vi.waitFor(() => expect(get(resourceProfile)?.tier).toBe("roomy"));
+      expect(invoke).toHaveBeenCalledTimes(2);
 
-    // Once a status is held, pulses do not each cost a read.
-    handler({ payload: pulseOf(status()) } as never);
-    handler({ payload: pulseOf(status()) } as never);
-    expect(invoke).toHaveBeenCalledTimes(2);
+      // Once a status is held, pulses do not each cost a read.
+      handler({ payload: pulseOf(status()) } as never);
+      handler({ payload: pulseOf(status()) } as never);
+      expect(invoke).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("derives the pulse from a status exactly as the backend does", () => {
@@ -347,5 +356,117 @@ describe("hostLoadStore", () => {
     vi.mocked(invoke).mockRejectedValue(new Error("backend down"));
     await expect(refreshHostLoad()).rejects.toThrow("backend down");
     expect(get(hostPressure)).toBe("unavailable");
+  });
+
+  describe("rereading an unknown or unreadable profile", () => {
+    type Handler = (e: { payload: HostLoadPulse }) => void;
+    const unreadable = () =>
+      status({
+        profile: {
+          tier: "standard",
+          basis: "memory_unreadable",
+          memory_bytes: null,
+          logical_cores: 10,
+          budgets: { gpu_contexts: 4, gpu_hide_grace_ms: 60_000, graph_cache_repositories: 4 },
+        },
+      });
+
+    /** Fires one pulse per sampler tick (two seconds) for the given span of seconds. */
+    async function pulseFor(handler: Handler, seconds: number): Promise<void> {
+      for (let at = 0; at < seconds; at += 2) {
+        vi.setSystemTime(Date.now() + 2_000);
+        handler({ payload: pulseOf(status()) } as never);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    async function started(): Promise<Handler> {
+      startHostLoad();
+      await vi.waitFor(() => expect(listen).toHaveBeenCalledTimes(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return vi.mocked(listen).mock.calls[0][1] as Handler;
+    }
+
+    beforeEach(() => vi.useFakeTimers({ toFake: ["Date"] }));
+    afterEach(() => vi.useRealTimers());
+
+    it("keeps rereading while the first status says the memory was unreadable, then stops once it can be read", async () => {
+      vi.mocked(invoke).mockResolvedValue(unreadable());
+      const handler = await started();
+      expect(get(resourceProfile)?.basis).toBe("memory_unreadable");
+      expect(invoke).toHaveBeenCalledTimes(1);
+
+      await pulseFor(handler, PROFILE_RETRY_BASE_MS / 1000 + 2);
+      expect(vi.mocked(invoke).mock.calls.length, "a reread was made once the backoff had passed").toBeGreaterThan(1);
+
+      vi.mocked(invoke).mockResolvedValue(status());
+      await pulseFor(handler, 120);
+      expect(get(resourceProfile)?.tier).toBe("roomy");
+      const settled = vi.mocked(invoke).mock.calls.length;
+      await pulseFor(handler, 600);
+      expect(invoke, "a readable profile is not reread by pulses").toHaveBeenCalledTimes(settled);
+    });
+
+    /** When each status read was made. */
+    let reads: number[] = [];
+    function recordReads(answer: () => Promise<HostLoadStatus>): void {
+      reads = [];
+      vi.mocked(invoke).mockImplementation(async () => {
+        reads.push(Date.now());
+        return (await answer()) as never;
+      });
+    }
+    function gaps(times: number[]): number[] {
+      return times.slice(1).map((at, index) => at - times[index]);
+    }
+
+    /** The waits double, level off at the cap, and the rereads never stop: at most one a minute, for good. */
+    function expectBackoffThatLevelsOff(): void {
+      const times = reads.slice();
+      const waits = gaps(times);
+      // Never denser than the first wait, however many pulses come.
+      expect(Math.min(...waits)).toBeGreaterThanOrEqual(PROFILE_RETRY_BASE_MS);
+      // Far fewer reads than the one-per-tick of 1,800 pulses, and a bounded rate at the end.
+      expect(times.length).toBeLessThan(80);
+      expect(waits.slice(-5).every((wait) => wait >= PROFILE_RETRY_CAP_MS)).toBe(true);
+      // Still reading in the last ten minutes: the tier is never left stranded.
+      expect(times.filter((at) => at > times[0] + 3_000_000).length).toBeGreaterThanOrEqual(5);
+    }
+
+    it("backs off to one reread a minute for an unreadable profile, and does not stop", async () => {
+      recordReads(async () => unreadable());
+      const handler = await started();
+      await pulseFor(handler, 3_600);
+      expectBackoffThatLevelsOff();
+    });
+
+    it("backs off to one reread a minute for a status read that always fails, and does not stop", async () => {
+      recordReads(async () => {
+        throw new Error("backend down");
+      });
+      const handler = await started();
+      expect(get(resourceProfile)).toBeNull();
+      await pulseFor(handler, 3_600);
+      expectBackoffThatLevelsOff();
+    });
+
+    it("lets a person's change of setting start the retries over", async () => {
+      const saved = { enabled: true, govern_launches: true, profile: "auto" } as const;
+      reads = [];
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === "cmd_host_load_settings_save") return saved as never;
+        reads.push(Date.now());
+        return unreadable() as never;
+      });
+      const handler = await started();
+      await pulseFor(handler, 3_600);
+      const leveled = reads.length;
+
+      await saveHostLoadSettings(saved);
+      await pulseFor(handler, 12);
+      // The waits start again from the first one: several reads in twelve seconds,
+      // where the leveled-off cadence would allow at most one in a minute.
+      expect(reads.length - leveled, "retries resumed after the change").toBeGreaterThanOrEqual(3);
+    });
   });
 });

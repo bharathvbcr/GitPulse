@@ -93,10 +93,14 @@
       {/each}
     </select>
     <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
-      Sizes how much GitPulse keeps ready in memory: how many terminals that are out of sight keep their GPU
-      drawing, for how long, and how many repositories keep their commit graph. Every terminal you can see is
-      still drawn with the GPU. It never changes your session limits or scrollback. Automatic picks from this
-      computer's memory.
+      Sizes how much GitPulse keeps ready in memory. Every terminal you can see always keeps its GPU drawing
+      (up to 8, about 49 MB each), whatever you pick here. Only terminals that are out of sight are limited:
+      the number allowed to keep theirs is
+      {#if $resourceProfile}{$resourceProfile.budgets.gpu_contexts}{:else}this setting's limit{/if}
+      minus the terminals on screen, never below zero, and each is let go after a while. While you switch
+      terminals very quickly, hidden ones may keep theirs a little longer. It also sets how many repositories
+      keep their commit graph.
+      It never changes your session limits or scrollback. Automatic picks from this computer's memory.
       {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
     </p>
   </div>
