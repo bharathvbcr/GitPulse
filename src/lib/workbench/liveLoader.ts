@@ -1,5 +1,5 @@
 import { createListenerTracker } from "../dom/listenerTracker";
-import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+import { bindForegroundChanges, readBackgroundDocument, readHiddenDocument } from "../runtime/foreground";
 import { subscribeWorkbenchChanges } from "./client";
 
 export interface LiveLoaderOptions<Mode> {
@@ -20,6 +20,34 @@ export interface LiveLoaderOptions<Mode> {
    * each one was a full re-read. `load()` itself is never held back.
    */
   minGapMs?: number;
+}
+
+/**
+ * Whether a live surface should keep itself current: true while the window is
+ * on screen, focused or not. Lost focus is not "in the background" here. The
+ * board beside another app's terminal, where an agent is filing tasks, is the
+ * commonest moment a change arrives, and the host announces external changes
+ * exactly while the window is on screen (`external_changes.rs`), so pausing on
+ * blur dropped those changes until the next click into the window. Work that
+ * spawns git keeps the stricter focus gate (`readBackgroundDocument`).
+ */
+export function liveOnScreen(): boolean {
+  return !readHiddenDocument();
+}
+
+/**
+ * Tells, for each foreground event, whether a live surface should re-read: the
+ * window came back on screen, or took focus. A blur while it stays on screen
+ * is not one. Changes keep arriving as change events then, and re-reading on
+ * the blur too doubled the reads of every switch to another app.
+ */
+export function createLiveReturn(): (onScreen: boolean) => boolean {
+  let was = liveOnScreen();
+  return (onScreen) => {
+    const back = onScreen && (!was || !readBackgroundDocument());
+    was = onScreen;
+    return back;
+  };
 }
 
 /** Changes reach a surface within this long, however often they come. */
@@ -111,15 +139,17 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
       cancelScheduled();
     },
     /**
-     * Subscribes to workbench changes and to the window returning to the
-     * front. `onVisibility` receives the new state before a refresh is
-     * scheduled for a return. The disposer releases both.
+     * Subscribes to workbench changes and to the window's hide, show, focus
+     * and blur. `onVisibility` receives whether the window is on screen
+     * (`liveOnScreen`); a refresh follows only a return (`createLiveReturn`).
+     * The disposer releases both.
      */
     connect(handlers: {
       onVisibility(visible: boolean): void;
       onUnavailable(message: string): void;
     }): () => void {
       const listeners = createListenerTracker();
+      const returned = createLiveReturn();
       listeners.track(subscribeWorkbenchChanges({
         changed: schedule,
         unavailable: (message) => {
@@ -127,9 +157,9 @@ export function createLiveLoader<Mode = never>(options: LiveLoaderOptions<Mode>)
         },
       }));
       listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, () => {
-        const visible = !readBackgroundDocument();
+        const visible = liveOnScreen();
         handlers.onVisibility(visible);
-        if (visible) schedule();
+        if (returned(visible)) schedule();
       }));
       return () => listeners.dispose();
     },
