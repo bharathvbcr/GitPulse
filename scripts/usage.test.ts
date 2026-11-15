@@ -27,6 +27,25 @@ describe("shared usage printer", () => {
     expect(new Set(columns).size).toBe(1);
   });
 
+  it("lists environment variables, aligned, only when there are any", () => {
+    const base = { name: "demo", summary: "Demo.", flags: [{ flag: "--x", description: "x" }] };
+    expect(formatUsage(base)).not.toContain("Environment:");
+    const text = formatUsage({
+      ...base,
+      environment: [
+        { flag: "DEMO_KEEP", description: "keep" },
+        { flag: "DEMO_A_MUCH_LONGER_NAME", description: "long" },
+      ],
+    });
+    expect(text).toContain("Environment:");
+    const columns = text
+      .split("\n")
+      .filter((line) => line.startsWith("  DEMO_"))
+      .map((line) => line.search(/\S+$/));
+    expect(columns).toHaveLength(2);
+    expect(new Set(columns).size).toBe(1);
+  });
+
   it("includes the exit-code contract when given", () => {
     const text = formatUsage({
       name: "demo",

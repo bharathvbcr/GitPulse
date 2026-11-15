@@ -7,7 +7,7 @@
  * "helped" and "failed" is the point.
  *
  * @typedef {{ flag: string, description: string }} UsageFlag
- * @typedef {{ name: string, summary: string, usage?: string, flags: UsageFlag[], exits?: string }} UsageSpec
+ * @typedef {{ name: string, summary: string, usage?: string, flags: UsageFlag[], environment?: UsageFlag[], exits?: string }} UsageSpec
  */
 
 import { alignFlags } from "./columns.mjs";
@@ -27,9 +27,10 @@ export function wantsHelp(argv) {
  * @param {UsageSpec} spec
  * @returns {string}
  */
-export function formatUsage({ name, summary, usage, flags, exits }) {
+export function formatUsage({ name, summary, usage, flags, environment, exits }) {
   const lines = [summary, "", `Usage: ${usage ?? `node scripts/${name}.mjs [options]`}`, ""];
   lines.push(...alignFlags(flags));
+  if (environment?.length) lines.push("", "Environment:", ...alignFlags(environment));
   if (exits) lines.push("", `Exit codes: ${exits}`);
   return lines.join("\n");
 }
