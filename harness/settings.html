@@ -201,6 +201,16 @@
       // or "throw" for a backend that could not answer.
       window.__gpClaudeStatus = { key_saved: false, account: null, account_error: null };
       localStorage.removeItem("gitpulse_ai_model");
+      const { hostLoadSettingsFixture } = await import("./hostLoadFixture");
+      window.__gpHost = { stored: hostLoadSettingsFixture(), reads: 0, attempts: [], failNext: null };
+      // `?wide=1` (the narrow-width probe's frame) stores the longest values the
+      // fields accept, so the 375 px measurement is of the worst row.
+      if (new URL(location.href).searchParams.get("wide")) {
+        window.__gpHost.stored.thresholds.disk = { mode: "refuse", elevated_at: 1048576, severe_at: 1048575 };
+        window.__gpHost.stored.thresholds.load = { mode: "refuse", elevated_at: 255.5, severe_at: 256 };
+        // The page pins #app to a 1280 px stage; a 375 px frame must lay out in its own width.
+        document.getElementById("app").style.width = "100%";
+      }
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "cmd_agent_defaults") return agentView();
@@ -267,7 +277,23 @@
           }
           // Lappi reloads each time the Agents panel becomes active, so a null
           // answer here crashes the modal on the second visit.
-          if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true };
+          // The host-load settings, in the wire shape, with a save that keeps
+          // what it was sent and can be told to fail. `reads` and `attempts`
+          // let a check say what reached the backend and what did not.
+          if (cmd === "cmd_host_load_settings") {
+            window.__gpHost.reads += 1;
+            return structuredClone(window.__gpHost.stored);
+          }
+          if (cmd === "cmd_host_load_settings_save") {
+            window.__gpHost.attempts.push(structuredClone(args));
+            if (window.__gpHost.failNext !== null) {
+              const failure = window.__gpHost.failNext;
+              window.__gpHost.failNext = null;
+              throw failure;
+            }
+            window.__gpHost.stored = structuredClone(args.settings);
+            return structuredClone(window.__gpHost.stored);
+          }
           if (cmd === "cmd_host_load_status") return hostLoadStatus;
           if (cmd === "cmd_lappi_settings") {
             return {
@@ -433,6 +459,173 @@
           check("a failed read shows the failure", await until(() => modelText().includes("Keychain could not be read")));
           check("a failed read claims neither a missing key nor a missing registry", !modelText().includes("No Claude API key saved") && !keyInput());
           await remountWith({ key_saved: false, account: null, account_error: null });
+
+          // ---- Host load: the inputs and the command gate ---------------------
+          // Driven through the DOM against a backend that keeps what it is sent.
+          // `attempts` is every save that reached the seam, so "no save call" is
+          // a count that did not move, not an absence of evidence.
+          const H = window.__gpHost;
+          const hostCard = () => document.querySelector('[data-testid="host-load-settings"]');
+          const input = (id) => document.querySelector(`[data-testid="host-load-input-${id}"]`);
+          const flatText = (el) => (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+          const modeSelect = (id) => document.querySelector(`[data-testid="host-load-input-${id}-mode"]`);
+          const thresholdField = (id, which) => document.querySelector(`[data-testid="host-load-input-${id}-${which}"]`);
+          const inputError = (id) => flatText(document.querySelector(`[data-testid="host-load-input-${id}-error"]`));
+          const resetButton = (id) => document.querySelector(`[data-testid="host-load-input-${id}-reset"]`);
+          const gateButtons = () => [...document.querySelectorAll('[data-testid="host-load-hook-mode"] button')];
+          const gateShown = () => gateButtons().filter((b) => b.getAttribute("aria-pressed") === "true").map((b) => b.textContent.trim()).join("|");
+          const pickMode = async (id, value) => {
+            const select = modeSelect(id);
+            select.value = value;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+            await wait(100);
+          };
+          const typeThreshold = async (id, which, text) => {
+            const field = thresholdField(id, which);
+            field.value = text;
+            field.dispatchEvent(new Event("change", { bubbles: true }));
+            await wait(100);
+          };
+          const lastSave = () => H.attempts.at(-1)?.settings;
+          const pickGate = async (label) => {
+            gateButtons().find((b) => b.textContent.trim() === label).click();
+            await wait(100);
+          };
+
+          check("Host load is a card on the Agents panel", await until(() => hostCard() && input("swap") && input("disk")));
+          // Every input, at its starting value, with the unit and wording a reader sees.
+          const EXPECT = [
+            ["swap", "Swap used", "refuse", "0.5", "0.75", "x memory", "Slow background work at", "Refuse launches at"],
+            ["compressor_segments", "Memory compressor", "refuse", "0.6", "0.8", "of limit", "Slow background work at", "Refuse launches at"],
+            ["load", "CPU load", "shed", "3", "6", "per CPU", "Slow background work at", "Refuse launches at"],
+            ["disk", "Free disk space", "refuse", "20", "10", "GiB free", "Slow background work below", "Refuse launches below"],
+          ];
+          for (const [id, label, mode, elevated, severe, unit, elevatedLabel, severeLabel] of EXPECT) {
+            const text = flatText(input(id));
+            check(`${label} renders with its name, unit and threshold labels`, text.includes(label) && text.includes(unit) && text.includes(elevatedLabel) && text.includes(severeLabel));
+            check(`${label} starts at ${mode}, ${elevated} and ${severe}`, modeSelect(id).value === mode && thresholdField(id, "elevated_at").value === elevated && thresholdField(id, "severe_at").value === severe);
+            check(`${label} offers Off, slow-down and refuse`, [...modeSelect(id).options].map((o) => o.value).join(",") === "off,shed,refuse");
+            check(`${label} shows a live reading, not a blank or a NaN`, /^now /.test(flatText(document.querySelector(`[data-testid="host-load-input-${id}-now"]`))) && !/NaN|undefined/.test(text));
+          }
+          check("a slow-down-only input keeps its refuse threshold disabled", thresholdField("load", "severe_at").disabled && !thresholdField("load", "elevated_at").disabled);
+          for (const [id, label, mode] of [["thermal", "Heat", "shed"], ["battery", "Battery power", "off"]]) {
+            check(`${label} renders its name at ${mode} with no thresholds`, flatText(input(id)).includes(label) && modeSelect(id).value === mode && !thresholdField(id, "elevated_at") && !thresholdField(id, "severe_at"));
+          }
+          check("Battery never offers to refuse a launch", [...modeSelect("battery").options].map((o) => o.value).join(",") === "off,shed");
+          check("Heat offers to refuse a launch", [...modeSelect("thermal").options].map((o) => o.value).join(",") === "off,shed,refuse");
+          check("no reset button shows while every input is at its default", ["swap", "compressor_segments", "load", "thermal", "battery", "disk"].every((id) => !resetButton(id)));
+          check("the command gate reads Refuse, Advise, Off with Refuse selected", gateButtons().map((b) => b.textContent.trim()).join("|") === "Refuse|Advise|Off" && gateShown() === "Refuse");
+          check("opening the card saved nothing", H.attempts.length === 0);
+
+          // A mode change saves the whole settings, one input changed.
+          await pickMode("swap", "shed");
+          check("changing Swap to slow-down saves exactly that input", H.attempts.length === 1 && Object.keys(H.attempts[0]).join() === "settings"
+            && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.5, severe_at: 0.75 })
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 10 })
+            && lastSave().enabled === true && lastSave().govern_launches === true && lastSave().hook_mode === "enforce");
+          check("a slow-down input disables its refuse threshold and offers a reset", thresholdField("swap", "severe_at").disabled && Boolean(resetButton("swap")));
+          // A threshold change carries the other threshold and the mode through.
+          await typeThreshold("swap", "elevated_at", "0.4");
+          check("editing Swap's slow-down level saves 0.4 and keeps 0.75 and the mode", H.attempts.length === 2
+            && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
+          await typeThreshold("disk", "severe_at", "5");
+          check("editing Free disk's refuse level saves 5 and keeps 20", H.attempts.length === 3
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 })
+            && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
+          await pickMode("load", "off");
+          check("turning CPU load off saves it and hides its thresholds", H.attempts.length === 4 && lastSave().thresholds.load.mode === "off"
+            && !thresholdField("load", "elevated_at") && Boolean(resetButton("load")));
+          resetButton("load").click();
+          await wait(100);
+          check("Reset on CPU load saves its starting values and removes the button", H.attempts.length === 5
+            && JSON.stringify(lastSave().thresholds.load) === JSON.stringify({ mode: "shed", elevated_at: 3, severe_at: 6 }) && !resetButton("load"));
+          await pickMode("battery", "shed");
+          check("Battery saves a mode and no thresholds", H.attempts.length === 6 && JSON.stringify(lastSave().thresholds.battery) === JSON.stringify({ mode: "shed" }));
+
+          // Values the rules refuse are said so on screen, and nothing is saved.
+          const before = H.attempts.length;
+          await typeThreshold("compressor_segments", "elevated_at", "0.9");
+          check("a slow-down level above the refuse level is refused with a sentence", inputError("compressor_segments").includes("the refuse level must not be below the slow-down level"));
+          check("the refused value is put back in the field", thresholdField("compressor_segments", "elevated_at").value === "0.6");
+          await typeThreshold("compressor_segments", "elevated_at", "-1");
+          check("a negative threshold is refused with a sentence", inputError("compressor_segments").includes("thresholds must be above 0 and at most 1 of limit"));
+          await typeThreshold("compressor_segments", "elevated_at", "abc");
+          check("a non-numeric threshold is refused with a sentence", inputError("compressor_segments").includes("both thresholds must be numbers"));
+          await typeThreshold("compressor_segments", "severe_at", "1.5");
+          check("a threshold above the input's maximum is refused with a sentence", inputError("compressor_segments").includes("at most 1 of limit"));
+          await typeThreshold("disk", "severe_at", "30");
+          check("a disk refuse level above its slow-down level is refused", inputError("disk").includes("must not be above the slow-down level"));
+          check("none of the refused values reached the backend", H.attempts.length === before && thresholdField("disk", "severe_at").value === "5");
+
+          // A save the backend rejects: said on screen, and the control goes back.
+          H.failNext = "the settings file is read-only";
+          await pickMode("disk", "shed");
+          check("a rejected save shows its reason", inputError("disk").includes("the settings file is read-only") && H.attempts.length === before + 1);
+          check("a rejected mode change returns the control to the stored mode", modeSelect("disk").value === "refuse" && H.stored.thresholds.disk.mode === "refuse");
+          H.failNext = "the settings file is read-only";
+          await typeThreshold("swap", "elevated_at", "0.3");
+          check("a rejected threshold change returns the field to the stored value", thresholdField("swap", "elevated_at").value === "0.4" && inputError("swap").includes("read-only"));
+
+          // The command gate.
+          const attempts = H.attempts.length;
+          await pickGate("Advise");
+          check("choosing Advise saves hook_mode advise and nothing else changed", H.attempts.length === attempts + 1 && lastSave().hook_mode === "advise"
+            && lastSave().enabled === true && lastSave().govern_launches === true
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 }));
+          check("Advise reads as the selected choice", gateShown() === "Advise");
+          H.failNext = "the settings file is read-only";
+          await pickGate("Off");
+          check("a rejected gate change says why", flatText(hostCard()).includes("the settings file is read-only") && H.attempts.length === attempts + 2);
+          check("a rejected gate change leaves the stored choice selected", gateShown() === "Advise" && H.stored.hook_mode === "advise");
+          await pickGate("Off");
+          check("choosing Off saves hook_mode off", lastSave().hook_mode === "off" && gateShown() === "Off");
+          const readsBefore = H.reads;
+          await remountWith({ key_saved: false, account: null, account_error: null });
+          check("after a remount the card was read again", await until(() => H.reads > readsBefore));
+          check("after a remount the command gate shows the saved Off", await until(() => gateShown() === "Off"));
+          check("after a remount the inputs show their saved values", await until(() => modeSelect("swap")?.value === "shed" && thresholdField("swap", "elevated_at")?.value === "0.4" && thresholdField("disk", "severe_at")?.value === "5" && modeSelect("battery")?.value === "shed"));
+          await pickGate("Refuse");
+          check("choosing Refuse again saves the default", lastSave().hook_mode === "enforce" && gateShown() === "Refuse");
+
+          // Narrow width. The window cannot be narrower than 900 px
+          // (tauri.conf.json minWidth), so the dialog is measured in a frame of
+          // that width, laid out by its own viewport. Below it the dialog's rail
+          // and gutters leave the content pane about 60 px at 375 px, for every
+          // card alike; that is the dialog, not these rows, so the 375 px claim
+          // is made of the card itself: it is forced to 375 px and its rows must
+          // wrap inside it. `?wide=1` stores the longest values the fields take.
+          const frame = document.createElement("iframe");
+          frame.style.cssText = "position:fixed;left:-2000px;top:0;width:900px;height:900px;border:0";
+          frame.src = `${location.pathname}?wide=1`;
+          document.body.appendChild(frame);
+          check("the narrow frame boots the settings page", await until(() => frame.contentDocument?.title === "gp-settings ready", 15000));
+          const inner = frame.contentDocument;
+          inner.getElementById("settings-tab-agents").click();
+          await until(() => inner.querySelector('[data-testid="host-load-input-disk"]'), 8000);
+          await wait(300);
+          const hostSection = inner.querySelector('[data-testid="host-load-settings"]').closest("section");
+          const pokesOut = () => {
+            const box = hostSection.getBoundingClientRect();
+            return [...hostSection.querySelectorAll("*")].filter((el) => {
+              const r = el.getBoundingClientRect();
+              return r.width > 0 && (r.right > box.right + 1 || r.left < box.left - 1);
+            });
+          };
+          check("the frame is 900 px wide", frame.contentWindow.innerWidth === 900);
+          check("at 900 px the host-load card holds every input row", ["swap", "compressor_segments", "load", "thermal", "battery", "disk"].every((id) => inner.querySelector(`[data-testid="host-load-input-${id}"]`)) && hostSection.getBoundingClientRect().width > 400);
+          check("at 900 px nothing in the host-load card pokes past its edge", pokesOut().length === 0);
+          check("at 900 px the card and the page do not scroll sideways", hostSection.scrollWidth <= hostSection.clientWidth + 1 && inner.documentElement.scrollWidth <= 901);
+          hostSection.style.width = "375px";
+          hostSection.style.maxWidth = "375px";
+          await wait(150);
+          const wrapped = hostSection.getBoundingClientRect();
+          check("forced to 375 px the card is 375 px wide", Math.round(wrapped.width) === 375);
+          check("at a 375 px card every input row wraps inside it", pokesOut().length === 0
+            || (console.error("overflow", pokesOut().slice(0, 5).map((el) => `${el.tagName}.${el.className}`.slice(0, 80))), false));
+          check("at a 375 px card the card does not scroll sideways", hostSection.scrollWidth <= hostSection.clientWidth + 1);
+          const longest = inner.querySelector('[data-testid="host-load-input-disk-elevated_at"]');
+          check("at a 375 px card the longest threshold, 1048576, is shown whole", longest.value === "1048576" && longest.scrollWidth <= longest.clientWidth + 1);
+          frame.remove();
 
           // Search finds the new rows by the words a reader would use.
           await typeSearch("model servers");

@@ -589,3 +589,27 @@ node harness/runPage.mjs chrome /harness/appearance.html   # or: webkit
 
 `frame-rate.html` takes `?blur=<0..40>` to measure the float at a chosen blur radius
 the way Settings sets it (`--gp-float-blur`, or `data-float-blur="off"` at 0).
+
+## Host load: Settings and Health
+
+`harness/settings.html` and `harness/health.html` render the governor's UI
+through `harness/hostLoadFixture.ts`, whose settings, status and previous-boot
+fixtures are typed against `hostLoadStore.ts`.
+
+Settings > Agents > Host load: every input row (swap, compressor segments, CPU
+load, heat, battery, free disk) at its starting mode, thresholds, unit and live
+reading; a mode change and a threshold change each save the whole settings with
+one input changed (the mock keeps a log of every save attempt); a slow-down
+level above the refuse level, a negative, a non-numeric and an out-of-range
+value are refused on screen with no save; a save the backend rejects shows its
+reason and puts the control back; the command gate's Refuse / Advise / Off saves
+`hook_mode`, and after a remount shows the saved choice. The width check is
+made at 900 px (the window's `minWidth`) and with the card forced to 375 px: the
+dialog's own rail leaves its content pane about 60 px at a 375 px window, which
+the app cannot be.
+
+Health > Host load: "Before the last restart" with a previous boot (peaks, last
+readings, the dropped count only when non-zero), with none, with an unreadable
+trace, and the sampler's drop problem line. The runner reports a verdict only; it
+has no screenshot step, so look at a page by serving the harness config on a
+free port (`vite --config vite.harness.config.ts --port <n>`).

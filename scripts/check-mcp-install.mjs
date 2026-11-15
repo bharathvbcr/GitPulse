@@ -681,13 +681,17 @@ export function claudeConfigDir(env = process.env) {
     : path.join(homedir(), ".claude");
 }
 
-/** JSON with every object's keys in order, so two spellings of one file compare equal. */
+/**
+ * JSON with every object's keys in order, so two spellings of one file compare equal.
+ * @param {unknown} value
+ * @returns {string}
+ */
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object") {
     return `{${Object.keys(value)
       .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+      .map((key) => `${JSON.stringify(key)}:${canonical(/** @type {Record<string, unknown>} */ (value)[key])}`)
       .join(",")}}`;
   }
   return JSON.stringify(value);

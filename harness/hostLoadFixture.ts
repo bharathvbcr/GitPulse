@@ -1,4 +1,4 @@
-import type { HostLoadStatus, Reading } from "../src/lib/stores/hostLoadStore";
+import type { HostLoadSettings, HostLoadStatus, PreviousBoot, Reading, TracePeaks, TraceRecord } from "../src/lib/stores/hostLoadStore";
 
 /**
  * What `cmd_host_load_status` returns on a calm Mac where another GitPulse
@@ -86,4 +86,79 @@ export function hostLoadStatusFixture(): HostLoadStatus {
     problems: [],
     previous_boot: null,
   };
+}
+
+/**
+ * `cmd_host_load_settings` as the backend answers it: every field of
+ * `HostLoadSettings`, thresholds included, with the starting values written
+ * out here rather than imported from the store, so a changed default is a
+ * fixture edit a reviewer sees. A reply short of `thresholds` is not a smaller
+ * fixture: the input rows read `thresholds[input]` and throw on mount.
+ */
+export function hostLoadSettingsFixture(): HostLoadSettings {
+  return {
+    enabled: true,
+    govern_launches: true,
+    hook_mode: "enforce",
+    thresholds: {
+      swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
+      compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },
+      load: { mode: "shed", elevated_at: 3, severe_at: 6 },
+      thermal: { mode: "shed" },
+      battery: { mode: "off" },
+      disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+    },
+  };
+}
+
+const GIB = 2 ** 30;
+
+/** The trace record of the previous boot's `i`th reading, one second apart, swap climbing. */
+function traceRecordFixture(i: number): TraceRecord {
+  return {
+    wall_s: 1_760_000_000 + i,
+    mono_ms: 5_000_000 + i * 1_000,
+    boot_id: 7,
+    pressure: i === 2 ? "critical" : "warn",
+    tier: i === 2 ? "severe" : "elevated",
+    binding: i === 2 ? "swap" : null,
+    admit: i !== 2,
+    swap_used: (10 + i * 3) * GIB,
+    compressed_bytes: 8 * GIB,
+    load_1m: 14.5 + i,
+    free_disk: 42 * GIB,
+    launched_sessions: 3,
+    observed_sessions: 4,
+    largest_foreign: 6 * GIB,
+    launched_footprint: 12 * GIB,
+    thermal: "fair",
+    power: "ac",
+    segment_fraction: 0.91,
+    dropped_before: 0,
+    dropped_total: 0,
+  };
+}
+
+/**
+ * What the last boot's trace ended with: three readings, the governor
+ * refusing on the third, with `dropped` readings the trace write lost. The
+ * peaks are written out, not derived, so the page shows a number a person can
+ * look up in this file.
+ */
+export function previousBootFixture(dropped: number): PreviousBoot {
+  const peaks: TracePeaks = {
+    records: 3,
+    max_tier: "severe",
+    refused: true,
+    max_swap_used: 16 * GIB,
+    max_compressed_bytes: 8 * GIB,
+    max_load_1m: 16.5,
+    min_free_disk: 42 * GIB,
+    max_launched_footprint: 12 * GIB,
+    max_largest_foreign: 6 * GIB,
+    max_segment_fraction: 0.91,
+    worst_thermal: "fair",
+    max_pressure: "critical",
+  };
+  return { ended_wall_s: 1_760_000_002, records: [0, 1, 2].map(traceRecordFixture), peaks, dropped, error: null };
 }
