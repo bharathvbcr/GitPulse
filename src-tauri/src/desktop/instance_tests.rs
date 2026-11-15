@@ -2506,6 +2506,50 @@ fn an_op_record_exchange_says_how_far_it_got() {
     drop(owner);
 }
 
+/// The instant the sink is handed is no later than the asker's send, however
+/// long the asker took between reading the greeting and sending. An instant
+/// taken after the request was read and parsed would fall after the asker's
+/// send, and a budget counted from it could outlast the asker's own wait.
+#[test]
+fn the_op_record_budget_starts_before_the_greeting_not_after_the_request_is_read() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let handed = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&handed);
+    owner.attach_op_recorder(Arc::new(move |_, at| {
+        *seen.lock().unwrap() = Some(at);
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+
+    let asker = Secondary::connect(&socket).ok().expect("reach the owner");
+    let greeting_read = Instant::now();
+    // A long gap between the greeting and the send, made by spinning until it
+    // has really passed, so the order below does not depend on a fast host.
+    while greeting_read.elapsed() < Duration::from_millis(20) {
+        std::thread::yield_now();
+    }
+    let sent = AtomicBool::new(false);
+    asker
+        .record_git_op(&op_request("op-gap"), Duration::from_secs(5), &sent)
+        .expect("answered");
+    let send_completed = Instant::now();
+
+    let at = handed
+        .lock()
+        .unwrap()
+        .expect("the sink was handed an instant");
+    assert!(
+        at <= greeting_read,
+        "the budget must start before the asker could have sent, not when the request was parsed"
+    );
+    assert!(
+        send_completed.duration_since(at) >= Duration::from_millis(20),
+        "the asker's gap is inside the app's budget: the app's deadline is the earlier one"
+    );
+    drop(owner);
+}
+
 #[test]
 fn an_op_record_that_goes_unanswered_after_the_send_is_sent_unanswered() {
     let dir = profile();

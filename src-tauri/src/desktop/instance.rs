@@ -1156,8 +1156,11 @@ pub type OrchestrateSink = Arc<
 /// Delivers an A2A peer message or kickoff spawn for an MCP process.
 pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 /// Snapshots pre-op refs and `git stash create` under `refs/gitpulse/ops/<n>`.
-/// The instant is when the mailbox received the request: the asker's
-/// [`OP_RECORD_DEADLINE`] runs from it.
+/// The instant is no later than the moment the asker sent the request (the
+/// owner takes it just before it greets the asker, who cannot send before it
+/// has read the greeting): the asker waits a full [`OP_RECORD_DEADLINE`] from
+/// its send, so a deadline counted from this instant never falls after the
+/// asker gave up.
 pub type OpRecordSink =
     Arc<dyn Fn(&Request, Instant) -> Result<serde_json::Value, String> + Send + Sync>;
 
@@ -1695,6 +1698,13 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if shared.closing.load(Ordering::Acquire) {
         return Ok(());
     }
+    // The asker cannot send its request before it has read this `Hello`, so
+    // this instant is no later than the moment it sent. The op-record budget
+    // runs from here and not from when the request was read and parsed: the
+    // asker's own wait runs a full `OP_RECORD_DEADLINE` from its send, so an
+    // app deadline measured from any instant at or before the send can never
+    // fall after the asker has given up, however slow this accept was.
+    let before_hello = Instant::now();
     write_frame(
         stream,
         &Hello {
@@ -1761,7 +1771,8 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
         });
     }
     if let Request::RecordGitOp { id, .. } = &request {
-        return answer_op_record(stream, shared, id, &request, started).map_err(Ended::Refused);
+        return answer_op_record(stream, shared, id, &request, before_hello)
+            .map_err(Ended::Refused);
     }
     if let Request::RecordTurnCheckpoint { id, .. } = &request {
         return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {
@@ -1855,10 +1866,10 @@ fn answer_op_record(
     shared: &Shared,
     id: &str,
     request: &Request,
-    received: Instant,
+    not_after_send: Instant,
 ) -> Result<(), String> {
     answer_asked(stream, shared, id, "the op log", || {
-        attached(&shared.op_record, "the op log")?(request, received)
+        attached(&shared.op_record, "the op log")?(request, not_after_send)
     })
 }
 

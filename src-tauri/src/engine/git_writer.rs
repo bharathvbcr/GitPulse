@@ -4448,10 +4448,10 @@ pub(crate) struct AskerDeadline {
 }
 
 impl AskerDeadline {
-    /// `budget` from `received`, on the real clock.
-    pub(crate) fn new(received: Instant, budget: Duration) -> Self {
+    /// `budget` from `start`, on the real clock.
+    pub(crate) fn new(start: Instant, budget: Duration) -> Self {
         Self {
-            expires_at: received + budget,
+            expires_at: start + budget,
             now: Instant::now,
         }
     }
@@ -4979,14 +4979,17 @@ impl GitWriter {
     /// primary desktop process. Snapshot failures append `"unsnapshotted"` to
     /// the ledger and return `snapshotted: false` so the hook never stays silent.
     ///
-    /// `received` is when the mailbox got the request: the asker waits
-    /// [`crate::desktop::instance::OP_RECORD_DEADLINE`] from about then, so the
-    /// same budget is the app's deadline. A refusal for a passed deadline is
+    /// `not_after_send` is an instant no later than the asker's send (the
+    /// mailbox takes it before greeting the asker). The asker waits a full
+    /// [`crate::desktop::instance::OP_RECORD_DEADLINE`] after its send, so the
+    /// same budget counted from this instant ends no later than the asker's
+    /// wait does: app start <= asker's send, asker waits >= budget after send,
+    /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
     /// logged like any other failure (under the request's id), which is also
     /// what settles the hook's "unknown" row for the same write.
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
-        received: Instant,
+        not_after_send: Instant,
     ) -> Result<serde_json::Value, String> {
         let crate::desktop::instance::Request::RecordGitOp {
             id,
@@ -5004,7 +5007,7 @@ impl GitWriter {
         let ask = OpAsk {
             request_id: Some(id.as_str()),
             deadline: Some(AskerDeadline::new(
-                received,
+                not_after_send,
                 crate::desktop::instance::OP_RECORD_DEADLINE,
             )),
         };

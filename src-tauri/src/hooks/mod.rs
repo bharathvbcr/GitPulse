@@ -2925,18 +2925,65 @@ fn maybe_record_git_op(input: &HookInput, output: HookOutput) -> HookOutput {
     }
 }
 
-/// Whether the hook's own total budget still holds a whole op-record wait.
-///
-/// The app judges the asker's deadline by the nominal budget, and no request
-/// field can say otherwise. A hook whose wait [`clamp_to_total`] would cut below
-/// that budget would give up while the app still believed it had time, so the
-/// app could capture state after the write began. Such a hook does not ask.
-/// `elapsed` is how much of [`TOTAL_BUDGET`] is already spent; the 100 ms is the
-/// margin [`within_budget`] adds to every wait on the app.
+/// How long the hook waits for the app to greet it before it asks for an op
+/// snapshot. The same number the command gate gives the same mailbox
+/// ([`GATE_APP_DEADLINE`]): a loaded but live app has answered the gate inside
+/// it in production, and a wedged one costs the write under a second before the
+/// existing "unsnapshotted" fallback. The wait for the answer is separate and a
+/// full [`crate::desktop::instance::OP_RECORD_DEADLINE`]; a slow greeting never
+/// shortens it.
 #[cfg(target_os = "macos")]
-fn op_record_wait_fits(elapsed: Duration) -> bool {
-    crate::desktop::instance::OP_RECORD_DEADLINE + Duration::from_millis(100)
-        <= TOTAL_BUDGET.saturating_sub(elapsed)
+const OP_RECORD_REACH: Duration = GATE_APP_DEADLINE;
+
+/// The waits of one op-record ask.
+///
+/// The invariant they keep, with the app's half stated at
+/// `desktop::instance::answer`: the app counts its budget from an instant no
+/// later than the asker's send; the asker waits at least `answer_wait` after its
+/// send (the socket's read timeout, which starts when the write completes); so
+/// the app's deadline never falls after the asker has stopped waiting. `outer`
+/// is the one timer around reach and ask together, and is long enough that it
+/// cannot end the answer wait early: a send is only allowed within `reach` of
+/// the start ([`send_window_open`]), so `outer` ends no sooner than
+/// `answer_wait` plus the margin after any send.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpRecordBudgets {
+    reach: Duration,
+    answer_wait: Duration,
+    outer: Duration,
+}
+
+#[cfg(target_os = "macos")]
+fn op_record_budgets(reach: Duration, answer_wait: Duration) -> OpRecordBudgets {
+    OpRecordBudgets {
+        reach,
+        answer_wait,
+        // The margin `within_budget` adds to every wait on the app.
+        outer: reach + answer_wait + Duration::from_millis(100),
+    }
+}
+
+/// Whether a request may still be sent: only within `reach` of the start of
+/// the ask. A connect that blocks past it must not send afterwards, because the
+/// outer timer would then end the wait before a full answer budget after the
+/// send, and the app's deadline could fall after the hook gave up.
+#[cfg(target_os = "macos")]
+fn send_window_open(cutoff: std::time::Instant, now: std::time::Instant) -> bool {
+    now < cutoff
+}
+
+/// Whether the hook's own total budget still holds the whole ask: reach, the
+/// answer wait and the margin.
+///
+/// `within_budget` clamps its wait to what is left of [`TOTAL_BUDGET`]
+/// ([`clamp_to_total`]), and no request field can tell the app. A clamped wait
+/// would end before a full budget after the send, so the app could capture state
+/// after the write began. A hook without the room does not ask. `elapsed` is how
+/// much of [`TOTAL_BUDGET`] is already spent.
+#[cfg(target_os = "macos")]
+fn op_record_wait_fits(elapsed: Duration, budgets: &OpRecordBudgets) -> bool {
+    budgets.outer <= TOTAL_BUDGET.saturating_sub(elapsed)
 }
 
 #[cfg(target_os = "macos")]
@@ -2953,7 +3000,10 @@ fn record_op_by_app(root: &str, input: &HookInput) -> OpRecordAttempt {
         dir,
         root,
         input,
-        crate::desktop::instance::OP_RECORD_DEADLINE,
+        op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        ),
         STARTED.get().copied(),
     )
 }
@@ -2969,14 +3019,14 @@ fn record_op_by_app(_root: &str, _input: &HookInput) -> OpRecordAttempt {
 }
 
 /// [`record_op_by_app`] against the app that owns profile directory `dir`,
-/// waiting `deadline` for it. `started` is when this process began (`None` where
-/// nothing called [`start_deadline`]).
+/// within `budgets`. `started` is when this process began (`None` where nothing
+/// called [`start_deadline`]).
 #[cfg(target_os = "macos")]
 fn record_op_by_app_in(
     dir: PathBuf,
     root: &str,
     input: &HookInput,
-    deadline: Duration,
+    budgets: OpRecordBudgets,
     started: Option<std::time::Instant>,
 ) -> OpRecordAttempt {
     use crate::desktop::instance::{reach_owner, AskFailure, Request};
@@ -2987,7 +3037,7 @@ fn record_op_by_app_in(
         request_id: Some(request_id.clone()),
         outcome,
     };
-    if !started.is_none_or(|started| op_record_wait_fits(started.elapsed())) {
+    if !started.is_none_or(|started| op_record_wait_fits(started.elapsed(), &budgets)) {
         return attempt(OpRecordOutcome::TransportFailed(
             "there was no time left to wait for a snapshot, so none was asked for".into(),
         ));
@@ -3001,10 +3051,20 @@ fn record_op_by_app_in(
     };
     let sent = std::sync::Arc::new(AtomicBool::new(false));
     let worker_sent = std::sync::Arc::clone(&sent);
-    let answer = within_budget(deadline + Duration::from_millis(100), move || {
-        reach_owner(&dir, deadline)
-            .ok_or_else(|| AskFailure::not_sent("no GitPulse app is answering"))?
-            .record_git_op(&request, deadline, &worker_sent)
+    // The one place the hook's wait is set. App start <= asker's send; the
+    // asker waits `answer_wait` after its send (the read timeout runs from the
+    // completed write, whatever the reach took); so the app's deadline cannot
+    // fall after the hook has stopped waiting. A send after `cutoff` is not made.
+    let cutoff = std::time::Instant::now() + budgets.reach;
+    let answer = within_budget(budgets.outer, move || {
+        let owner = reach_owner(&dir, budgets.reach)
+            .ok_or_else(|| AskFailure::not_sent("no GitPulse app is answering"))?;
+        if !send_window_open(cutoff, std::time::Instant::now()) {
+            return Err(AskFailure::not_sent(
+                "the app greeted too late to leave a full wait for its answer",
+            ));
+        }
+        owner.record_git_op(&request, budgets.answer_wait, &worker_sent)
     });
     attempt(classify_op_answer(answer, sent.load(Ordering::Acquire)))
 }
@@ -7392,8 +7452,8 @@ done
     /// into `foo` escalates to `Ask` naming `foo`.
     #[cfg(unix)]
     #[test]
-    fn an_incoming_edit_into_another_partys_dirty_symbol_asks_even_when_our_dirty_edits_are_elsewhere(
-    ) {
+    fn an_incoming_edit_into_another_partys_dirty_symbol_asks_even_when_our_dirty_edits_are_elsewhere()
+    {
         use crate::test_support::git_in;
         let farm = farm_bound(false, false, 1);
         let main_dir = Path::new(&farm.repo);
@@ -7435,11 +7495,8 @@ done
         crate::codeintel::tests::seed_file_symbols(sib_dir, &head, "src/lib.rs", base, syms);
 
         // Party B dirties `foo`; this party dirties `bar`.
-        std::fs::write(
-            sib_dir.join("src/lib.rs"),
-            base.replace("let a = 1;", "let a = 9;"),
-        )
-        .unwrap();
+        std::fs::write(sib_dir.join("src/lib.rs"), base.replace("let a = 1;", "let a = 9;"))
+            .unwrap();
         std::fs::write(
             main_dir.join("src/lib.rs"),
             base.replace("let b = 2;", "let b = 9;"),
@@ -7449,7 +7506,7 @@ done
         let target_file = format!("{}/src/lib.rs", farm.repo);
         let mut disjoint_call = edit_call(&farm.repo, &target_file);
         disjoint_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
-            "    let c = 3;".to_string()
+            "    let c = 3;".to_string(),
         ]));
         let disjoint = guard_here(&disjoint_call);
         assert!(
@@ -7460,14 +7517,10 @@ done
 
         let mut shared_call = edit_call(&farm.repo, &target_file);
         shared_call.incoming = Some(insights::IncomingEdit::Replacing(vec![
-            "    let a = 1;".to_string()
+            "    let a = 1;".to_string(),
         ]));
         let shared = guard_here(&shared_call);
-        assert!(
-            asks(&shared),
-            "shared incoming edit must ask: {:?}",
-            shared.render()
-        );
+        assert!(asks(&shared), "shared incoming edit must ask: {:?}", shared.render());
         assert!(
             reason_of(&shared).contains("foo"),
             "expected shared symbol `foo` in reason: {}",
@@ -12194,25 +12247,86 @@ done
     #[cfg(target_os = "macos")]
     #[test]
     fn the_hook_asks_only_while_its_total_budget_holds_a_whole_op_record_wait() {
-        let wait = crate::desktop::instance::OP_RECORD_DEADLINE + Duration::from_millis(100);
-        let last_good = TOTAL_BUDGET - wait;
-        assert!(op_record_wait_fits(Duration::ZERO));
-        assert!(op_record_wait_fits(last_good), "exactly enough still asks");
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
+        // Reach, the whole answer wait and the margin: the lot, not the wait alone.
+        let whole = OP_RECORD_REACH
+            + crate::desktop::instance::OP_RECORD_DEADLINE
+            + Duration::from_millis(100);
+        assert_eq!(budgets.outer, whole);
+        let last_good = TOTAL_BUDGET - whole;
+        assert!(op_record_wait_fits(Duration::ZERO, &budgets));
         assert!(
-            !op_record_wait_fits(last_good + Duration::from_nanos(1)),
+            op_record_wait_fits(last_good, &budgets),
+            "exactly enough still asks"
+        );
+        assert!(
+            !op_record_wait_fits(last_good + Duration::from_nanos(1), &budgets),
             "a nanosecond short does not"
         );
-        assert!(!op_record_wait_fits(TOTAL_BUDGET));
-        assert!(!op_record_wait_fits(TOTAL_BUDGET * 2), "no underflow");
-        // The wait it guards is the one `within_budget` would otherwise cut.
+        // The old requirement (the answer wait and margin alone) would have let
+        // this ask through, and `within_budget` would then have clamped the
+        // whole thing below what the answer wait needs after a slow reach.
+        let old_last_good = TOTAL_BUDGET
+            - (crate::desktop::instance::OP_RECORD_DEADLINE + Duration::from_millis(100));
+        assert!(last_good < old_last_good);
+        assert!(!op_record_wait_fits(old_last_good, &budgets));
+        assert!(!op_record_wait_fits(TOTAL_BUDGET, &budgets));
+        assert!(
+            !op_record_wait_fits(TOTAL_BUDGET * 2, &budgets),
+            "no underflow"
+        );
+        // What it guards: past the boundary `within_budget` would cut the outer
+        // timer below the whole ask.
         let cut = clamp_to_total(
-            wait,
+            budgets.outer,
             Some(std::time::Instant::now() - last_good - Duration::from_secs(1)),
         );
         assert!(
-            cut < wait,
+            cut < budgets.outer,
             "past the boundary the wait would be clamped: {cut:?}"
         );
+    }
+
+    /// The answer wait after a slow reach is still a whole budget. Asserted on
+    /// the values the ask is built from, not on elapsed time: the exchange is
+    /// handed `answer_wait` (the socket's read timeout, which runs from the
+    /// completed write), and the one outer timer is the reach, that wait and the
+    /// margin together, so no reach, however slow, leaves the wait shorter.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_answer_wait_after_a_slow_reach_is_still_a_whole_budget() {
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
+        assert_eq!(
+            budgets.answer_wait,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+            "the exchange waits the shared budget in full"
+        );
+        assert_eq!(budgets.reach, OP_RECORD_REACH);
+        assert_eq!(OP_RECORD_REACH, GATE_APP_DEADLINE);
+        assert!(budgets.outer >= budgets.reach + budgets.answer_wait + Duration::from_millis(100));
+
+        // A send is only made within `reach` of the start, so the latest send
+        // still has the whole answer wait before the outer timer ends.
+        let start = std::time::Instant::now();
+        let cutoff = start + budgets.reach;
+        let slowest_send = cutoff - Duration::from_nanos(1);
+        assert!(send_window_open(cutoff, start));
+        assert!(send_window_open(cutoff, slowest_send));
+        assert!(
+            (start + budgets.outer) - slowest_send >= budgets.answer_wait,
+            "the outer timer never ends the wait short of a whole budget after a send"
+        );
+        assert!(
+            !send_window_open(cutoff, cutoff),
+            "a greeting that lands exactly at the cutoff sends nothing"
+        );
+        assert!(!send_window_open(cutoff, cutoff + Duration::from_secs(5)));
     }
 
     #[cfg(target_os = "macos")]
@@ -12237,17 +12351,21 @@ done
             cwd: root.clone(),
             ..HookInput::default()
         };
-        let deadline = crate::desktop::instance::OP_RECORD_DEADLINE;
+        let budgets = op_record_budgets(
+            OP_RECORD_REACH,
+            crate::desktop::instance::OP_RECORD_DEADLINE,
+        );
 
-        // Seven of the eight seconds are spent: there is no whole wait left.
+        // Five and a half of the eight seconds are spent: a bare answer wait
+        // would still fit, the reach and the wait together do not.
         let spent = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(7))
+            .checked_sub(Duration::from_millis(5500))
             .expect("the host has been up for seven seconds");
         let refused = record_op_by_app_in(
             profile.path().to_path_buf(),
             &root,
             &input,
-            deadline,
+            budgets,
             Some(spent),
         );
         match &refused.outcome {
@@ -12268,7 +12386,7 @@ done
             profile.path().to_path_buf(),
             &root,
             &input,
-            deadline,
+            budgets,
             Some(std::time::Instant::now()),
         );
         assert_eq!(asked_now.outcome, OpRecordOutcome::Snapshotted);
