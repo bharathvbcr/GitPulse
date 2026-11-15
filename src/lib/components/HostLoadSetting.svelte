@@ -10,12 +10,14 @@
    */
   import { explainError } from "../workbench/client";
   import SettingToggle from "./SettingToggle.svelte";
+  import SettingSegment from "./SettingSegment.svelte";
   import {
     DEFAULT_HOST_LOAD_SETTINGS,
     DEFAULT_THRESHOLDS,
     hostLoadSettings,
     loadHostLoadSettings,
     updateHostLoadSettings,
+    type HookMode,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
   import { loadOnce } from "../settings/loadOnce";
@@ -26,6 +28,11 @@
   // here never saves their thresholds back stale.
   const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
   const thresholdsAreDefault = $derived(JSON.stringify(settings.thresholds) === JSON.stringify(DEFAULT_THRESHOLDS));
+  const HOOK_MODES: readonly { value: HookMode; label: string; title: string }[] = [
+    { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
+    { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },
+    { value: "off", label: "Off", title: "Say nothing about load" },
+  ];
   let busy = $state(false);
   let error = $state("");
   // False until a read succeeds: before that `settings` is the defaults, and a
@@ -82,6 +89,22 @@
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
+  <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
+    <p class="text-text">Command gate: heavy commands in agent sessions</p>
+    <p class="text-textMuted text-micro leading-snug">
+      Refuse (the default): when the machine is overloaded, GitPulse's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session GitPulse did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it could not check (GitPulse not running, or too old) is never refused; the agent is told it was not checked.
+    </p>
+    <SettingSegment
+      ariaLabel="What the command gate does with a heavy command under load"
+      options={HOOK_MODES}
+      value={settings.hook_mode}
+      onselect={(next) => {
+        // Before a read has succeeded `settings` is the defaults; saving one
+        // would write them over the real configuration.
+        if (readOk && !busy) void save({ hook_mode: next });
+      }}
+    />
+  </div>
   <div class="flex items-center gap-2 pt-1">
     <p class="text-textMuted text-micro leading-snug flex-1">
       Each input below can slow GitPulse's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.

@@ -9,6 +9,7 @@ import {
   DEFAULT_THRESHOLDS,
   ensureHostLoadSettings,
   hostLoadSettings,
+  DEFAULT_HOST_LOAD_SETTINGS,
   updateHostLoadSettings,
   HOST_LOAD_PULSE_EVENT,
   hostLoadPulse,
@@ -134,14 +135,14 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    const stored = { enabled: false, govern_launches: true, thresholds: DEFAULT_THRESHOLDS };
+    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
     vi.mocked(invoke).mockResolvedValue(stored);
     await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
     expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
   });
 
   it("saves one row's change on top of the latest settings, not a stale copy", async () => {
-    const first = { enabled: true, govern_launches: true, thresholds: DEFAULT_THRESHOLDS };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
     vi.mocked(invoke).mockResolvedValueOnce(first);
     await ensureHostLoadSettings();
     // A row saves a new swap rule; the store takes what the backend returns.
@@ -152,14 +153,27 @@ describe("hostLoadStore", () => {
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
     await updateHostLoadSettings({ govern_launches: false });
     expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: true, govern_launches: false, thresholds: { ...DEFAULT_THRESHOLDS, swap } },
+      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", thresholds: { ...DEFAULT_THRESHOLDS, swap } },
     });
     expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
   });
 
+  it("saves the command gate's mode on top of the latest settings, and defaults to enforcing", async () => {
+    expect(DEFAULT_HOST_LOAD_SETTINGS.hook_mode).toBe("enforce");
+    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ hook_mode: "advise" });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { ...first, hook_mode: "advise" },
+    });
+    expect(get(hostLoadSettings)?.hook_mode).toBe("advise");
+  });
+
   it("reads the settings once however many rows ask at the same time", async () => {
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, thresholds: DEFAULT_THRESHOLDS });
+    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, hook_mode: "enforce", thresholds: DEFAULT_THRESHOLDS });
     await Promise.all([ensureHostLoadSettings(), ensureHostLoadSettings(), ensureHostLoadSettings()]);
     expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings")).toHaveLength(1);
   });

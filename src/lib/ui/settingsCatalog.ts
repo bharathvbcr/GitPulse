@@ -406,7 +406,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "host-load",
     section: "agents",
     label: "Host load",
-    keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability reset defaults thresholds",
+    keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability reset defaults thresholds command gate hook heavy build test cargo refuse advise enforce",
   },
   {
     id: "host-load-swap",

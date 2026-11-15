@@ -432,10 +432,15 @@ export interface Thresholds {
   disk: Rule;
 }
 
+/** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
+export type HookMode = "enforce" | "advise" | "off";
+
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
   govern_launches: boolean;
+  /** Stored as the top-level `host_load_hook_mode`, never inside `host_load`. */
+  hook_mode: HookMode;
   thresholds: Thresholds;
 }
 
@@ -594,6 +599,7 @@ export async function admitAnyway(): Promise<string> {
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
+  hook_mode: "enforce",
   thresholds: DEFAULT_THRESHOLDS,
 };
 

@@ -511,6 +511,41 @@ where
     }))
 }
 
+/// What the `command-gate` hook does with a heavy command while the host is
+/// overloaded (`hooks::load_gate`). Stored as its own top-level key,
+/// `host_load_hook_mode`: a build older than this one keeps an unknown
+/// top-level key as it was read, but would throw away the whole `host_load`
+/// block over a key it does not know (that struct refuses unknown fields), and
+/// would drop an unknown key inside `host_load_thresholds`, which it rewrites
+/// from the keys it knows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostLoadHookMode {
+    /// Refuse a heavy command the governor's verdict refuses, with a reason.
+    #[default]
+    Enforce,
+    /// Say the same thing as context for the model and refuse nothing.
+    Advise,
+    /// The hook adds nothing about load.
+    Off,
+}
+
+/// Reads `host_load_hook_mode`; a value this build does not know keeps the
+/// default (enforce) and says so rather than costing any other setting.
+fn lenient_hook_mode<'de, D>(deserializer: D) -> Result<HostLoadHookMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load_hook_mode, the hook enforces: {error}"
+        );
+        HostLoadHookMode::default()
+    }))
+}
+
 /// The host-load sensor's kill switch (`host_load.enabled`).
 ///
 /// On unless the user turns it off. The sampler publishes the value in every
@@ -537,6 +572,15 @@ pub struct HostLoadSettings {
     /// what the "refusing launches for 30 minutes" notice flips.
     #[serde(default = "host_load_enabled_default")]
     pub govern_launches: bool,
+    /// What the `command-gate` hook does about a heavy command under load.
+    /// Carried over IPC with the switches but stored at the top level of the
+    /// file as `host_load_hook_mode`, for the same reason as `thresholds`.
+    #[serde(default)]
+    pub hook_mode: HostLoadHookMode,
+}
+
+fn is_default_hook_mode(mode: &HostLoadHookMode) -> bool {
+    *mode == HostLoadHookMode::default()
 }
 
 fn host_load_enabled_default() -> bool {
@@ -549,6 +593,7 @@ impl Default for HostLoadSettings {
             thresholds: crate::sysload::Thresholds::default(),
             enabled: true,
             govern_launches: true,
+            hook_mode: HostLoadHookMode::default(),
         }
     }
 }
@@ -775,6 +820,14 @@ pub struct ToolConfig {
         skip_serializing_if = "crate::sysload::Thresholds::is_default"
     )]
     pub host_load_thresholds: crate::sysload::Thresholds,
+    /// What the `command-gate` hook does with a heavy command under load: a
+    /// sibling of `host_load`, so an older build keeps it in `unknown`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_hook_mode",
+        skip_serializing_if = "is_default_hook_mode"
+    )]
+    pub host_load_hook_mode: HostLoadHookMode,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -797,6 +850,7 @@ impl Default for ToolConfig {
             verify_status: VerifyStatusSettings::default(),
             host_load: HostLoadSettings::default(),
             host_load_thresholds: crate::sysload::Thresholds::default(),
+            host_load_hook_mode: HostLoadHookMode::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1479,8 +1533,21 @@ pub fn host_load_settings() -> HostLoadSettings {
     load()
         .map(|cfg| HostLoadSettings {
             thresholds: cfg.host_load_thresholds,
+            hook_mode: cfg.host_load_hook_mode,
             ..cfg.host_load
         })
+        .unwrap_or_default()
+}
+
+/// What the `command-gate` hook does about load, or the default (enforce).
+///
+/// An unreadable file is "enforce": the hook only refuses what the app's own
+/// verdict refuses, and a broken config must not be what quietly turns the
+/// protection off. Read by the hook process itself, after it has found a heavy
+/// command, so a call that is not one never opens the file.
+pub fn host_load_hook_mode() -> HostLoadHookMode {
+    load()
+        .map(|cfg| cfg.host_load_hook_mode)
         .unwrap_or_default()
 }
 
@@ -1493,6 +1560,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     }
     let mut cfg = load()?;
     cfg.host_load_thresholds = next.thresholds.clone();
+    cfg.host_load_hook_mode = next.hook_mode;
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -1761,6 +1829,81 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert!(stored.get("host_load").is_none());
             assert!(stored.get("host_load_thresholds").is_some());
+        });
+    }
+
+    /// What the `command-gate` hook does under load is stored as its own
+    /// top-level `host_load_hook_mode` key. A build from before it existed
+    /// reads `host_load` with a strict struct, which would discard the whole
+    /// block (and the sensor switch with it) over one key it does not know,
+    /// and rewrites `host_load_thresholds` from the keys it knows; only a
+    /// top-level key it does not know is written back as it was read. The
+    /// stand-in below is that build's parsing of the file.
+    #[test]
+    fn the_hook_mode_is_stored_where_an_older_build_keeps_it_and_leaves_host_load_intact() {
+        #[derive(Deserialize, Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct OlderHostLoad {
+            enabled: bool,
+            govern_launches: bool,
+        }
+        #[derive(Deserialize, Serialize)]
+        struct OlderConfig {
+            host_load: Option<OlderHostLoad>,
+            #[serde(flatten)]
+            unknown: serde_json::Map<String, serde_json::Value>,
+        }
+        with_temp_config(|path| {
+            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Enforce, "enforce by default");
+            set_host_load_settings(HostLoadSettings {
+                enabled: false,
+                hook_mode: HostLoadHookMode::Advise,
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Advise);
+            assert_eq!(host_load_settings().hook_mode, HostLoadHookMode::Advise);
+            let text = fs::read_to_string(path).unwrap();
+            let stored: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(stored["host_load_hook_mode"], "advise");
+            assert_eq!(
+                stored["host_load"],
+                serde_json::json!({"enabled": false, "govern_launches": true}),
+                "nothing new goes inside the strict block"
+            );
+            // The older build parses the block, keeps the key, and writes both back.
+            let older: OlderConfig = serde_json::from_str(&text).unwrap();
+            assert!(older.host_load.as_ref().is_some_and(|b| !b.enabled), "the block survives");
+            assert_eq!(older.unknown["host_load_hook_mode"], "advise");
+            let rewritten: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&older).unwrap()).unwrap();
+            assert_eq!(rewritten["host_load_hook_mode"], "advise");
+            assert_eq!(rewritten["host_load"]["enabled"], false);
+
+            // The default is not written, and `off` round-trips.
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load_hook_mode").is_none());
+            set_host_load_settings(HostLoadSettings {
+                hook_mode: HostLoadHookMode::Off,
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Off);
+
+            // A value this build does not know keeps the default and costs nothing else.
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load":{"enabled":false},"host_load_hook_mode":"sometimes"}"#,
+            );
+            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Enforce);
+            assert!(!host_load_settings().enabled);
+            // An unreadable file enforces: a broken config does not turn the guard off.
+            write_raw(path, "{ not json");
+            assert_eq!(host_load_hook_mode(), HostLoadHookMode::Enforce);
         });
     }
 

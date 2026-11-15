@@ -63,7 +63,7 @@ in Health. That signal is re-checked on the live process before it is sent
 | 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
 | 1c | Shedding GitPulse's own background and reactive work | Implemented (see Admission and shedding) |
 | 1d | Leases and the priority queue ("time slots") | Not started |
-| 3 | The `gitpulse-hook` check, the skill, `doctor` | Not started |
+| 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases, `gitpulse_system_load`, launch-environment caps and `CLAUDE_ENV_FILE` caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
 | 4 | Tree-sum supervisor and launched-orphan stop, advise by default | Not started |
@@ -137,8 +137,8 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   without reading settings. **It is one tick behind the readings beside it**:
   the sampler publishes, then counts the sample, so a record carries the
   verdict the previous count produced (pending on a writer's first tick, and
-  unsupported while the sensor is switched off). No reader consumes it yet; the
-  hook is not wired to it. The extension opens with the magic `GPX2` and ends
+  unsupported while the sensor is switched off). The hook reads it (see The command
+  gate). The extension opens with the magic `GPX2` and ends
   with a checksum of its own, which also covers the sequence.
 
 **Sequence lock.** The writer makes the head sequence odd, writes the body and
@@ -542,6 +542,90 @@ message, in the launch's repository. It is written off the launch path.
 and the hook have no governor, so an agent's MCP calls are never refused on
 pressure. Shedding acts on spawns through the gate; background work that
 spawns no git child (a pure IPC read) is not shed by this card.
+
+## The command gate
+
+On 2026-11-14 this Mac hung with swap at 0.9x RAM and a load of 120 on 18
+cores, under sessions GitPulse only observes, so launch admission never touched
+them. The only GitPulse code that runs inside those sessions is the plugin's
+`PreToolUse` `command-gate` hook, so the hook reads the app's published verdict
+(`PublishedVerdict`, above) and acts on it. It never samples the host and never
+re-derives a threshold: it refuses what the governor refuses to admit.
+
+The load stage (`hooks/load_gate.rs`, the table in `hooks/heavy_commands.rs`)
+runs **before** the harness is asked, and is folded in after the guard and the
+gate are combined, so the harness's 5 s budget expiring cannot drop it.
+
+| The command | The verdict | The hook |
+|---|---|---|
+| not in the table | any | nothing, zero added output, no snapshot or settings read |
+| heavy | not admitted; sensor fresh or stale-recent | `enforce`: **deny** with a reason; `advise`: the same text as context |
+| heavy | elevated, admitted | one line of advice, with the capped form |
+| heavy | clear | nothing |
+| heavy | no verdict: sensor stale-old or dead, no snapshot, a record with no verdict (an older GitPulse), measurement switched off | one line: **not** load-checked, and why. Never a refusal |
+| heavy, but the line could not be read | | the same "not load-checked" line |
+| `grep -r` with `-z`/`-a`/`--null-data` or no `--exclude-dir`; `rg -uu`/`--no-ignore` with no `-g '!…'`; `go test ./...` or `-fuzz` with no `-timeout`; `python` with `train` or `bench` in its argv | elevated or severe | one line of advice. Never a refusal; silent on a quiet host |
+
+Heavy is a table (`ROWS`), not branching: `cargo` build/b/check/c/clippy/test/t/
+bench/nextest/llvm-cov/doc, `go` build/test, `npm`/`bun`/`pnpm` `test` and `run`
+of `test*` or `ci:local`, `vitest`, `jest` (also through `npx`, `pnpm exec`,
+`node …/vitest/…`). It reads the command with the signal guard's own lexer
+(`signal_guard::command_words`), so `VAR=val`, `env`, `time`, `nice`, `cd x &&`,
+`;`, `||`, pipes, `$( )`, backticks and `bash -c '…'` are seen through, and a
+word in a quoted string (`echo "cargo test"`, `git commit -m "run cargo test"`)
+is not a program. A script's name is all it reads: `package.json` is not
+resolved, so a script called `check` that runs the whole suite is not heavy
+here (recorded follow-up). The heavy-lane holder is exempt: `MAC_HEAVY_LABEL` in
+the hook's environment, or a command run through `mac_heavy.sh`.
+
+It never emits `allow`, `ask` or `updatedInput`: an unearned allow would
+override the person's permission rules.
+
+**Bypass mode does not waive it.** `under_bypass` turns the guard's and the
+gate's refusals into notices because they are permission questions and bypass is
+the host's "stop asking me". This one protects the machine from every session at
+once, and the sessions that hung it run in bypass, so it is enforced there. A
+person turns it down in Settings. That the host honours a hook `deny` while in
+`bypassPermissions` is **not** stated by the hooks documentation fetched below;
+it is inferred from `under_bypass` existing and was not run against a live
+session.
+
+**The loop breaker.** The fifth refusal of the same command (compared trimmed)
+in one session inside ten minutes says "STOP: you are looping", tells the person
+through the user-facing message, and grants nothing. State is one marker file per
+refused tool call (`loopdeny-<session>-<digest>-<tool_use_id>`), created
+exclusively in the advisory-dedupe directory (private to the user, symlink and
+foreign-owner refusal, bounded scan, 15-minute prune), so two copies of the hook
+answering one call count once and nothing in a marker can be corrupt. A call with
+no session id or no tool-use id (an orchestrated child terminal) is refused
+plainly and never counted. A directory that cannot be used is a plain refusal,
+never an allow.
+
+**The setting** (Settings → Agents → Host load → "Command gate"): `enforce`
+(the default; "Refuse" in the UI), `advise`, `off`. Stored as its own top-level
+`host_load_hook_mode` key, written only when it is not `enforce`. Not inside
+`host_load`, whose strict reader would make an older build discard the whole
+block (the sensor switch with it), and not inside `host_load_thresholds`, which
+an older build rewrites from the keys it knows. An older build keeps a top-level
+key it does not know. The hook reads it from `tools.json` itself
+(`tool_config::host_load_hook_mode`), only once a command is in the table; an
+unreadable file or an unknown value enforces.
+
+**Docs the fields come from** (fetched 2026-11-14): `https://code.claude.com/docs/en/hooks`
+(`PreToolUse` `hookSpecificOutput`: `hookEventName` required, `permissionDecision`
+of `allow`/`deny`/`ask`/`defer`, `permissionDecisionReason` shown to Claude,
+`updatedInput`, `additionalContext`; common output `systemMessage`; text capped
+at 10,000 characters; input `session_id`, `permission_mode`). Not confirmed from
+those pages, though the code reads it already: `tool_use_id` on the input.
+
+**Cost**, in process (a debug build, so an upper bound), host load average
+about 11 on 18 cores, 9 rounds of 200 calls, interleaved and rotated, the median
+of round medians, `cargo test --lib -- --ignored --nocapture load_stage_cost`:
+a command that is not heavy 1.7 µs; one of 10 KB 175 µs; a heavy command with a
+clear host, settings cold and the snapshot read from disk, 42.6 µs; a refused one,
+which also writes the loop marker, 464 µs. The hook process's own start (about
+25 ms, `tests/hook_gate_bench.rs`) is the cost to look at; this stage is not
+measurable against it, and no end-to-end speed claim is made.
 
 ## Health and the status bar
 

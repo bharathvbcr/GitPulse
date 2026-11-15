@@ -1172,6 +1172,37 @@ pub(crate) fn plan(command: &str) -> Plan {
     plan_with(command, process_env, Dialect::host())
 }
 
+/// Every simple command `command` runs, as its words after quoting: the
+/// commands of each list and pipeline, and of every `$( … )`, backtick and
+/// `<( … )` body inside a word. `None` when the line cannot be read (longer
+/// than [`MAX_COMMAND_BYTES`], an unterminated quote, nested past
+/// [`MAX_DEPTH`]): the caller must say it did not look, not that it found
+/// nothing.
+///
+/// The one reading of a command line the hook owns, so the load gate
+/// (`load_gate`) agrees with this guard about what a quoted word is.
+pub(super) fn command_words(command: &str) -> Option<Vec<Vec<String>>> {
+    if command.len() > MAX_COMMAND_BYTES {
+        return None;
+    }
+    let mut budget = Budget { commands: 0 };
+    let script = parse_script(command, 0, &mut budget, process_env).ok()?;
+    let mut out = Vec::new();
+    collect_words(&script, &mut out);
+    Some(out)
+}
+
+fn collect_words(script: &[Pipeline], out: &mut Vec<Vec<String>>) {
+    for command in script.iter().flatten() {
+        out.push(command.words.iter().map(|w| w.text.clone()).collect());
+        for word in command.words.iter().chain(&command.redirects) {
+            for body in &word.subst {
+                collect_words(body, out);
+            }
+        }
+    }
+}
+
 fn plan_with(command: &str, env: EnvFn, dialect: Dialect) -> Plan {
     let mut plan = Plan::default();
     if command.len() > MAX_COMMAND_BYTES {

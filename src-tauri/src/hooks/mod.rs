@@ -48,6 +48,8 @@ use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
 pub mod deliver;
+mod heavy_commands;
+mod load_gate;
 pub(crate) mod notify_drops;
 mod notify_input;
 mod notify_outcome;
@@ -2167,12 +2169,30 @@ fn command_gate_call(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
+    command_gate_call_with(input, run, load_gate::gather_live)
+}
+
+/// [`command_gate_call`] with what the load stage reads from the world
+/// injected, so a test can put a verdict in front of it.
+///
+/// The load stage is answered before the harness is asked, and folded in after
+/// the guard and the gate are combined: the harness has a budget that can
+/// expire, which must not take the host-load refusal with it, and
+/// [`signal_guard::combine`] keeps its first argument's decision, which an
+/// advice-only answer must not displace. Bypass mode does not waive it (see
+/// `load_gate`).
+fn command_gate_call_with(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+    gather: impl FnOnce() -> load_gate::Gathered,
+) -> HookOutput {
     let guard = under_bypass(input, signal_guard::run(input));
     if signal_guard::refuses(&guard) {
         return guard;
     }
+    let load = load_gate::judge(input, gather);
     let gate = command_gate_with(input, run);
-    signal_guard::combine(guard, gate)
+    load_gate::fold(signal_guard::combine(guard, gate), load)
 }
 
 /// Judges one command line the way the hook does, on `lane`'s sidecar.
