@@ -18,7 +18,7 @@ use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
 use super::snapshot::{self, PublishedVerdict, Snapshot, TickStats, Writer, WriterIdentity};
-use super::trace::{self, PreviousBoot, TraceRecord, TraceWriter};
+use super::trace::{self, PreviousBoot, TraceFeed, TraceRecord};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,9 @@ pub struct SamplerOptions {
     /// Begins the App Nap opt-out; dropping what it returns ends it. A seam so
     /// the begin/end transitions can be observed without a real activity.
     pub begin_activity: Box<dyn Fn() -> Result<Box<dyn Send>, String> + Send>,
+    /// Opens where the pre-crash trace is written, on the trace thread. A seam
+    /// so a test can make the write block.
+    pub trace_opener: trace::TraceOpener,
 }
 
 impl SamplerOptions {
@@ -153,6 +156,7 @@ impl SamplerOptions {
                 super::probe::Activity::begin("GitPulse host-load sampler")
                     .map(|activity| Box::new(activity) as Box<dyn Send>)
             }),
+            trace_opener: trace::file_opener(),
         }
     }
 }
@@ -447,8 +451,12 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut held_verdict: Reading<PublishedVerdict> = Reading::Unavailable(Why::NotYet);
     // The pre-crash trace: opened only once this process holds the writer
     // election, so a reader process never appends.
-    let mut trace_ring: Option<TraceWriter> = None;
+    // The ring is written on its own thread; the tick only hands a record to a
+    // one-slot feed, which drops and counts rather than wait.
+    let mut trace_feed: Option<TraceFeed> = None;
     let mut trace_problem: Option<String> = None;
+    let mut drops_seen: u64 = 0;
+    let mut last_drop: Option<Instant> = None;
     *shared
         .previous_boot
         .lock()
@@ -469,23 +477,42 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 Err(why) => tick_problems.push(format!("election: {why}")),
             }
         }
-        if writer.is_some() && trace_ring.is_none() {
-            // Opening moves a ring written under another boot to
-            // `host-load-trace.prev.v1`, so the previous boot is read after.
-            match TraceWriter::open(&shared.dir, Clock::now().boot_id) {
-                Ok(opened) => {
-                    trace_ring = Some(opened);
-                    trace_problem = None;
-                    *shared
-                        .previous_boot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        trace::previous_boot(&shared.dir);
-                }
+        if writer.is_some() && trace_feed.is_none() {
+            // The feed's thread opens the ring (which moves one written under
+            // another boot to `host-load-trace.prev.v1`), so the open never
+            // runs on this tick.
+            match TraceFeed::start(
+                options.trace_opener.clone(),
+                shared.dir.clone(),
+                Clock::now().boot_id,
+            ) {
+                Ok(started) => trace_feed = Some(started),
                 Err(why) => trace_problem = Some(format!("trace: {why}")),
             }
         }
+        if let Some(feed) = &trace_feed {
+            // The previous boot is read once the thread has rotated the ring.
+            if feed.take_opened() {
+                *shared
+                    .previous_boot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    trace::previous_boot(&shared.dir);
+            }
+            trace_problem = feed.problem();
+            let dropped = feed.dropped();
+            if dropped > drops_seen {
+                drops_seen = dropped;
+                last_drop = Some(Instant::now());
+            }
+        }
         tick_problems.extend(trace_problem.clone());
+        if let Some(at) = last_drop.filter(|at| at.elapsed() < DROP_NOTICE) {
+            tick_problems.push(format!(
+                "trace: {drops_seen} reading(s) dropped while the trace write was blocked (last {} s ago); the ring has a gap",
+                at.elapsed().as_secs()
+            ));
+        }
         let status = match writer.as_mut() {
             Some(w) => {
                 let mut snap = Snapshot::empty(Clock::now(), identity.clone(), enabled);
@@ -550,17 +577,16 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         // One record every fifth tick (10 s), from the elected writer only.
         // A write that fails is a problem in Health, not a silent gap.
         if trace::due(writer.is_some(), enabled, tick.ticks + 1) {
-            if let (Some(ring), Some(snapshot)) = (trace_ring.as_mut(), status.snapshot.as_ref()) {
+            if let (Some(feed), Some(snapshot)) = (trace_feed.as_ref(), status.snapshot.as_ref()) {
                 let verdict = &status.governor.verdict;
-                trace_problem = ring
-                    .append(&TraceRecord::of(
-                        snapshot,
-                        verdict.tier,
-                        verdict.binding,
-                        verdict.admit,
-                    ))
-                    .err()
-                    .map(|why| format!("trace: {why}"));
+                // Dropped when the thread is still writing the last one; the
+                // feed counts it and the next record that lands says so.
+                feed.offer(TraceRecord::of(
+                    snapshot,
+                    verdict.tier,
+                    verdict.binding,
+                    verdict.admit,
+                ));
             }
         }
 
@@ -607,7 +633,16 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             std::thread::park_timeout(next - now);
         }
     }
+    // Stopped: close the feed. The thread writes a record still in its slot;
+    // a write blocked in the kernel is detached after `STOP_WAIT` rather than
+    // held up, so stopping the sampler stays bounded.
+    if let Some(mut feed) = trace_feed.take() {
+        feed.stop(trace::STOP_WAIT);
+    }
 }
+
+/// How long a dropped reading stays a line in the status after the last one.
+const DROP_NOTICE: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 mod tests {
@@ -783,7 +818,7 @@ mod tests {
         let foreign_boot = Clock::now().boot_id ^ 0x5eed;
         {
             // A ring a previous boot left behind.
-            let mut old = TraceWriter::open(dir.path(), foreign_boot).unwrap();
+            let mut old = super::trace::TraceWriter::open(dir.path(), foreign_boot).unwrap();
             let snap = Snapshot::empty(Clock::now(), own_identity(), true);
             old.append(&TraceRecord::of(&snap, super::governor::Tier::Severe, None, false))
                 .unwrap();
@@ -836,6 +871,96 @@ mod tests {
         assert_eq!(previous.len(), 1, "the old boot's ring was kept");
         assert_eq!(previous[0].tier, Some(super::governor::Tier::Severe));
         assert_eq!(previous[0].admit, Some(false));
+    }
+
+    /// Real: while the trace write is blocked the sampler keeps publishing at
+    /// cadence and its governor keeps counting; readings it cannot hand over
+    /// are dropped, said in the status, and the count is in the ring once the
+    /// write resumes. A write on the tick would have stopped all of it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_blocked_trace_write_does_not_stop_the_sampler_and_the_drops_are_counted() {
+        use super::trace::blocked_sink_tests::{blocked_writes, Gate};
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gate::new();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.trace_opener = blocked_writes(gate.clone());
+        let sampler = start(options).unwrap();
+        let snapshot_path = dir.path().join(snapshot::SNAPSHOT_FILE_NAME);
+        let wait = crate::test_support::coverage_relaxed(Duration::from_secs(30));
+        assert!(gate.wait_entered(wait), "no record ever reached the trace write");
+        let seq_when_blocked = snapshot::read(&snapshot_path).unwrap().seq;
+        let ticks_when_blocked = sampler.status().expect("a status").tick.ticks;
+
+        // Thirty cadences later, with the write still blocked.
+        let deadline = Instant::now() + wait;
+        let mut dropping = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            let status = sampler.status().expect("a status");
+            dropping = status.problems.iter().any(|p| p.contains("dropped while the trace write was blocked"));
+            if dropping && status.tick.ticks >= ticks_when_blocked + 30 {
+                break;
+            }
+        }
+        let status = sampler.status().expect("a status");
+        let record = snapshot::read(&snapshot_path).unwrap();
+        assert!(
+            record.seq >= seq_when_blocked + 20,
+            "snapshots stopped while the write was blocked: seq {} then {}",
+            seq_when_blocked,
+            record.seq
+        );
+        assert!(status.tick.ticks >= ticks_when_blocked + 20, "{:?}", status.tick);
+        assert!(
+            matches!(record.verdict, Reading::Value(_)),
+            "the governor stopped counting: {:?}",
+            record.verdict
+        );
+        assert!(dropping, "the drops were not said: {:?}", status.problems);
+
+        gate.release();
+        sampler.stop();
+        let held = trace::read_ring(&dir.path().join(trace::TRACE_FILE_NAME)).unwrap();
+        let carried: u64 = held.iter().map(|r| r.dropped_before).sum();
+        assert!(carried >= 3, "the ring says {carried} dropped: {held:?}");
+        assert_eq!(held.last().map(|r| r.dropped_total), Some(carried));
+    }
+
+    /// Real: opening the ring (which can rename the previous boot's) is on
+    /// the trace thread too, so a stuck open leaves the sampler publishing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_blocked_trace_open_does_not_stop_the_sampler() {
+        use super::trace::blocked_sink_tests::{blocked_open, Gate};
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gate::new();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.trace_opener = blocked_open(gate.clone());
+        let sampler = start(options).unwrap();
+        let wait = crate::test_support::coverage_relaxed(Duration::from_secs(30));
+        assert!(gate.wait_entered(wait), "the open was never attempted");
+        let snapshot_path = dir.path().join(snapshot::SNAPSHOT_FILE_NAME);
+        // The open is attempted in the tick that wins the election, before
+        // that tick's first publish: wait for the first snapshot to exist.
+        let deadline = Instant::now() + wait;
+        let seq = || snapshot::read(&snapshot_path).map_or(0, |s| s.seq);
+        while seq() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first = seq();
+        assert!(first > 0, "no snapshot was ever published");
+        while seq() < first + 15 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            seq() >= first + 15,
+            "snapshots stopped while the open was blocked"
+        );
+        gate.release();
+        sampler.stop();
     }
 
     /// Real: a tick that panics does not end the sampler. A raw thread died

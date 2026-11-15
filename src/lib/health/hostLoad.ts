@@ -330,7 +330,14 @@ export function previousBootLines(previous: PreviousBoot): string[] {
   const first = previous.records[0].mono_ms;
   const last = previous.records[previous.records.length - 1].mono_ms;
   const spanMs = Math.max(0, last - first);
+  const gap =
+    previous.dropped > 0
+      ? [
+          `${previous.dropped} reading${previous.dropped === 1 ? " was" : "s were"} dropped while the trace write was blocked, so this history has gaps. Anything dropped after the last row below is not counted.`,
+        ]
+      : [];
   return [
+    ...gap,
     `Ended ${wallTime(previous.ended_wall_s)}; its last ${previous.records.length} readings span ${formatAge(spanMs)}.`,
     `Highest memory pressure: ${p.max_pressure === null ? "unreadable" : levelLabel(p.max_pressure)}. Governor: ${p.max_tier ?? "unknown"}${p.refused ? ", launches were refused" : ", launches were admitted"}.`,
     `Swap used, at most ${readOrUnknown(p.max_swap_used, bytes)}. Compressor segments, at most ${readOrUnknown(p.max_segment_fraction, (f) => f.toFixed(2))} of the limit.`,

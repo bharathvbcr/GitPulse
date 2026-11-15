@@ -347,6 +347,10 @@ export interface TraceRecord {
   thermal: Thermal | null;
   power: Power | null;
   segment_fraction: number | null;
+  /** Readings dropped while the trace write was blocked, since the previous record that landed. */
+  dropped_before: number;
+  /** The same count since the trace feed started. */
+  dropped_total: number;
 }
 
 /** `sysload::TracePeaks`: the worst of each reading over a window; null when none could be read. */
@@ -370,6 +374,8 @@ export interface PreviousBoot {
   ended_wall_s: number | null;
   records: TraceRecord[];
   peaks: TracePeaks;
+  /** Readings dropped while a trace write was blocked, summed over every record the ring still holds. */
+  dropped: number;
   error: string | null;
 }
 

@@ -26,12 +26,39 @@
 //! # Who writes
 //!
 //! Only the sampler that holds the `host-load.v1` writer election, in the app
-//! process, appends (`sampler.rs`; `tests/host_load_sampler_scope.rs` pins
-//! that nothing else names [`TraceWriter`]). One record every
-//! [`EVERY_NTH_TICK`] ticks, which at the 2 s cadence is every 10 s. The file
-//! opens through `fs_entry::open_private_record`: no symlink, a regular file,
-//! owned by this user, mode 0600. One that fails those checks is not touched:
-//! tracing stays off and the sampler reports why.
+//! process, feeds the ring (`sampler.rs` starts a [`TraceFeed`] only once it
+//! is the writer; `tests/host_load_sampler_scope.rs` pins that nothing else
+//! names [`TraceFeed`] and that [`TraceWriter`] is named only here). One
+//! record every [`EVERY_NTH_TICK`] ticks, which at the 2 s cadence is every
+//! 10 s. The file opens through `fs_entry::open_private_record`: no symlink, a
+//! regular file, owned by this user, mode 0600. One that fails those checks is
+//! not touched: tracing stays off and the sampler reports why.
+//!
+//! # Off the tick
+//!
+//! The sampler's tick publishes `host-load.v1` and counts the governor, and a
+//! full-device flush on that thread would hold both while the disk is stalled,
+//! which is when the trace matters most. So the tick only calls
+//! [`TraceFeed::offer`], which moves a record into a one-slot hand-off under a
+//! lock that is held for nothing but that move, and never waits on the file.
+//! A thread of its own (`host-load-trace`, started through
+//! `supervisor::spawn_once`) owns the ring: it opens it (so the rename of the
+//! previous boot's ring is off the tick too), then writes and flushes what it
+//! is handed. If the slot is still full when the next record is offered, that
+//! record is dropped and counted, and the count rides in the next record that
+//! lands (`dropped_before`, and `dropped_total` since the feed started, in
+//! bytes 104..120 that were spare: a record from before the feed reads as
+//! nothing dropped, and an older build still validates a newer record, so the
+//! layout version stays 1). Health shows the count under "Before the last
+//! restart" and, while drops are happening, as a line in the status.
+//!
+//! [`TraceFeed::stop`] waits a bounded time ([`STOP_WAIT`]) for the thread. A
+//! flush blocked in the kernel cannot be interrupted, so past the bound the
+//! thread is detached rather than joined. That is safe: it owns the file and
+//! its own state through an `Arc`, nothing the sampler holds depends on it, it
+//! finishes the write it is in and exits when it sees the feed closed, and at
+//! process exit it is simply gone. A drop without a stop (the sampler
+//! restarting after a panic) closes and detaches the same way.
 //!
 //! # Across a reboot
 //!
@@ -44,12 +71,19 @@
 //!
 //! # What a hard reset can lose, and what it costs
 //!
-//! `File::sync_all` follows every record. On Apple targets std implements it
-//! as `fcntl(F_FULLFSYNC)` (a whole-device cache flush), so a hard reset loses
-//! at most the record being appended (up to 10 s). A power cut mid-write loses
-//! only that one record, which fails its checksum. The cost is one 128-byte
-//! write and one full flush per 10 s: about 5 ms median and 23 ms worst of 300
-//! on the owner's Mac, against 0.07 ms for plain `fsync(2)`.
+//! `File::sync_all` follows every record, on the trace thread. On Apple
+//! targets std implements it as `fcntl(F_FULLFSYNC)` (a whole-device cache
+//! flush), so a hard reset loses the record being appended (up to 10 s) and
+//! any record the sampler dropped while a flush was stuck. A power cut
+//! mid-write loses only that one record, which fails its checksum. The cost is
+//! one 128-byte write and one full flush per 10 s, about 5 ms median and 23 ms
+//! worst of 300 on the owner's Mac, against 0.07 ms for plain `fsync(2)`; none
+//! of it is on the sampler's tick.
+//!
+//! Drops that happen after the last record that reached the ring leave no
+//! record to carry their count: a stall that runs into the reset shows as a
+//! trace that simply ends early, with the drops it caused unrecorded. The
+//! "ended" time Health shows is the last record's, not the reset's.
 
 use super::governor::{Binding, Tier};
 use super::sensor::{Level, Power, Reading, Thermal};
@@ -57,6 +91,9 @@ use super::snapshot::Snapshot;
 use serde::Serialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub const TRACE_FILE_NAME: &str = "host-load-trace.v1";
 pub const PREV_TRACE_FILE_NAME: &str = "host-load-trace.prev.v1";
@@ -100,6 +137,12 @@ const R_OBSERVED_N: usize = 76;
 const R_FOREIGN: usize = 80;
 const R_LAUNCHED_FP: usize = 88;
 const R_SEGMENTS: usize = 96;
+// Bytes 100..104 stay spare. A record written before the feed existed has
+// zeros here and in the next 16 bytes, which read as "nothing dropped", so
+// the layout needs no version bump and an older build still validates a record
+// that carries them (its checksum covers 0..120).
+const R_DROPPED_BEFORE: usize = 104;
+const R_DROPPED_TOTAL: usize = 112;
 const R_CHECKSUM: usize = 120;
 
 /// The stored value of a reading that could not be taken.
@@ -134,6 +177,13 @@ pub struct TraceRecord {
     pub power: Option<Power>,
     /// Compressor segments in use over its segment limit.
     pub segment_fraction: Option<f64>,
+    /// Records the sampler offered while the trace write was still busy, and
+    /// so never reached the ring, since the previous record that did. Set by
+    /// the feed when it takes the record; zero from [`TraceRecord::of`].
+    pub dropped_before: u64,
+    /// The same count since the feed started (the sampler's start, or its
+    /// restart after a panic). Zero from [`TraceRecord::of`].
+    pub dropped_total: u64,
 }
 
 fn value<T: Copy>(reading: Reading<T>) -> Option<T> {
@@ -184,6 +234,8 @@ impl TraceRecord {
             power: value(host.power),
             segment_fraction: value(host.compressor_segments)
                 .and_then(|s| (s.limit > 0).then(|| s.total as f64 / s.limit as f64)),
+            dropped_before: 0,
+            dropped_total: 0,
         }
     }
 }
@@ -287,6 +339,8 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
             .filter(|f| f.is_finite() && *f >= 0.0)
             .map_or(NONE32, |f| ((f * 1_000_000.0).round() as u64).min(u64::from(NONE32 - 1)) as u32),
     );
+    put_u64(&mut b, R_DROPPED_BEFORE, r.dropped_before);
+    put_u64(&mut b, R_DROPPED_TOTAL, r.dropped_total);
     let sum = checksum(&b[..R_CHECKSUM]);
     put_u64(&mut b, R_CHECKSUM, sum);
     b
@@ -333,6 +387,8 @@ fn decode_record(b: &[u8]) -> Option<(u64, TraceRecord)> {
                 _ => None,
             },
             segment_fraction: opt32(R_SEGMENTS).map(|ppm| f64::from(ppm) / 1_000_000.0),
+            dropped_before: get_u64(b, R_DROPPED_BEFORE),
+            dropped_total: get_u64(b, R_DROPPED_TOTAL),
         },
     ))
 }
@@ -578,6 +634,236 @@ impl TraceWriter {
     }
 }
 
+/// Where a record goes once the feed's thread has it: the ring file, or in a
+/// test something that blocks.
+pub trait TraceSink: Send {
+    fn append(&mut self, record: &TraceRecord) -> Result<(), String>;
+}
+
+impl TraceSink for TraceWriter {
+    fn append(&mut self, record: &TraceRecord) -> Result<(), String> {
+        TraceWriter::append(self, record)
+    }
+}
+
+/// Opens the sink for a boot in a directory. Run on the feed's thread, never
+/// on the sampler's: opening can rename the previous boot's ring and syncs.
+pub type TraceOpener =
+    Arc<dyn Fn(&Path, u64) -> Result<Box<dyn TraceSink>, String> + Send + Sync>;
+
+/// The opener the app uses: the ring file in the directory.
+pub fn file_opener() -> TraceOpener {
+    Arc::new(|dir, boot_id| {
+        TraceWriter::open(dir, boot_id).map(|w| Box::new(w) as Box<dyn TraceSink>)
+    })
+}
+
+/// How long [`TraceFeed::stop`] waits for the thread before detaching it.
+pub const STOP_WAIT: Duration = Duration::from_secs(2);
+/// How often a failed open is tried again.
+const REOPEN_EVERY: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct FeedState {
+    /// The one record waiting for the thread. Never more than one.
+    slot: Option<TraceRecord>,
+    closed: bool,
+    finished: bool,
+    opened: bool,
+    dropped_total: u64,
+    /// Dropped since the last record that reached the sink.
+    dropped_unwritten: u64,
+    problem: Option<String>,
+}
+
+struct FeedShared {
+    state: Mutex<FeedState>,
+    wake: Condvar,
+}
+
+impl FeedShared {
+    /// The state is only ever changed in short, panic-free sections, so a
+    /// poisoned lock still holds a consistent value.
+    fn lock(&self) -> MutexGuard<'_, FeedState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Marks the feed finished however its thread ends, a panic included, so
+/// [`TraceFeed::stop`] never waits for a thread that is gone.
+struct Finish(Arc<FeedShared>);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.finished = true;
+        if state.problem.is_none() && !state.closed {
+            state.problem = Some("trace: the trace thread ended".into());
+        }
+        self.0.wake.notify_all();
+    }
+}
+
+/// The sampler's end of the trace: a one-slot hand-off to a thread that owns
+/// the ring file. [`offer`](Self::offer) never waits on the file. A record
+/// offered while the thread still has the previous one is dropped and counted,
+/// and the count is written into the next record that does get through, so a
+/// ring with a gap says it has one.
+pub struct TraceFeed {
+    shared: Arc<FeedShared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TraceFeed {
+    /// Starts the feed's thread, which opens the sink (and so rotates the
+    /// previous boot's ring) and then writes what it is handed.
+    pub fn start(opener: TraceOpener, dir: PathBuf, boot_id: u64) -> Result<Self, String> {
+        let shared = Arc::new(FeedShared {
+            state: Mutex::new(FeedState::default()),
+            wake: Condvar::new(),
+        });
+        let worker = shared.clone();
+        let thread = crate::supervisor::spawn_once("host-load-trace", "host-load-trace", move || {
+            feed_loop(&worker, &opener, &dir, boot_id);
+        })
+        .map_err(|e| format!("could not start the trace thread: {e}"))?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// Hands `record` to the thread. Never blocks on I/O: the lock is held
+    /// only to move a record in or out of the slot. `false` when it was
+    /// dropped because the slot was still full or the thread is gone.
+    pub fn offer(&self, record: TraceRecord) -> bool {
+        let mut state = self.shared.lock();
+        if state.slot.is_some() || state.closed || state.finished {
+            state.dropped_total = state.dropped_total.saturating_add(1);
+            state.dropped_unwritten = state.dropped_unwritten.saturating_add(1);
+            return false;
+        }
+        state.slot = Some(record);
+        self.shared.wake.notify_one();
+        true
+    }
+
+    /// Records dropped since this feed started.
+    pub fn dropped(&self) -> u64 {
+        self.shared.lock().dropped_total
+    }
+
+    /// What is wrong with the trace now: the open that failed, or the last
+    /// write that did. `None` once a write succeeds.
+    pub fn problem(&self) -> Option<String> {
+        self.shared.lock().problem.clone()
+    }
+
+    /// True once, after the sink has opened (the previous boot's ring has been
+    /// rotated by then, so it can be read).
+    pub fn take_opened(&self) -> bool {
+        std::mem::take(&mut self.shared.lock().opened)
+    }
+
+    /// Closes the feed and waits up to `wait` for the thread, which first
+    /// writes a record still in the slot. Returns whether it finished. A write
+    /// blocked in the kernel cannot be interrupted, so past `wait` the thread
+    /// is detached: it owns the file and its own state, finishes that write
+    /// and exits, and nothing the caller holds depends on it.
+    pub fn stop(&mut self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut state = self.shared.lock();
+        state.closed = true;
+        self.shared.wake.notify_all();
+        while !state.finished {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .shared
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        let finished = state.finished;
+        drop(state);
+        if let Some(thread) = self.thread.take() {
+            if finished {
+                let _ = thread.join();
+            }
+        }
+        finished
+    }
+}
+
+impl Drop for TraceFeed {
+    /// A feed dropped without a stop (the sampler restarting after a panic)
+    /// is closed and detached, not left waiting for a record forever.
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.stop(Duration::ZERO);
+        }
+    }
+}
+
+fn feed_loop(shared: &Arc<FeedShared>, opener: &TraceOpener, dir: &Path, boot_id: u64) {
+    let _finish = Finish(shared.clone());
+    let mut sink = loop {
+        match opener(dir, boot_id) {
+            Ok(sink) => {
+                let mut state = shared.lock();
+                state.opened = true;
+                state.problem = None;
+                break sink;
+            }
+            Err(why) => {
+                let mut state = shared.lock();
+                state.problem = Some(format!("trace: {why}"));
+                if state.closed {
+                    return;
+                }
+                let (state, _) = shared
+                    .wake
+                    .wait_timeout(state, REOPEN_EVERY)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.closed {
+                    return;
+                }
+            }
+        }
+    };
+    loop {
+        let mut state = shared.lock();
+        while state.slot.is_none() && !state.closed {
+            state = shared
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let Some(mut record) = state.slot.take() else {
+            return;
+        };
+        let carried = std::mem::take(&mut state.dropped_unwritten);
+        record.dropped_before = carried;
+        record.dropped_total = state.dropped_total;
+        drop(state);
+        // The only place that waits on the file, with no lock held.
+        let outcome = sink.append(&record);
+        let mut state = shared.lock();
+        match outcome {
+            Ok(()) => state.problem = None,
+            Err(why) => {
+                state.dropped_unwritten = state.dropped_unwritten.saturating_add(carried);
+                state.problem = Some(format!("trace: {why}"));
+            }
+        }
+    }
+}
+
 /// The highest, lowest or worst of each reading over a window of records.
 /// `None` where every record in the window was unreadable: not a zero.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -637,6 +923,11 @@ pub struct PreviousBoot {
     pub records: Vec<TraceRecord>,
     /// Peaks over exactly those records.
     pub peaks: TracePeaks,
+    /// Records the sampler dropped while the trace write was blocked, summed
+    /// over every record the ring still holds (not only the tail shown). Drops
+    /// after the last record that reached the ring are not in it: nothing was
+    /// left to carry the count.
+    pub dropped: u64,
     /// Why the previous trace could not be read, when it could not. A trace
     /// that is missing is `None` here and a `None` previous boot altogether.
     pub error: Option<String>,
@@ -652,15 +943,20 @@ pub fn previous_boot(dir: &Path) -> Option<PreviousBoot> {
             ended_wall_s: None,
             records: Vec::new(),
             peaks: TracePeaks::of(&[]),
+            dropped: 0,
             error: Some(error.to_string()),
         }),
         Ok(mut records) => {
+            let dropped = records
+                .iter()
+                .fold(0u64, |sum, r| sum.saturating_add(r.dropped_before));
             let keep = records.len().saturating_sub(PREVIOUS_TAIL);
             let tail = records.split_off(keep);
             Some(PreviousBoot {
                 ended_wall_s: tail.last().map(|r| r.wall_s),
                 peaks: TracePeaks::of(&tail),
                 records: tail,
+                dropped,
                 error: None,
             })
         }
@@ -675,3 +971,5 @@ pub fn due(is_writer: bool, enabled: bool, tick: u64) -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) mod blocked_sink_tests;

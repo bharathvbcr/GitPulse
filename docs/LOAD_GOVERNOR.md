@@ -200,11 +200,29 @@ beside it, in the same directory, that keeps them.
   oldest record is overwritten first.
 - **Cadence.** One record every 5th sampler tick (10 s at the 2 s cadence), so
   the ring holds three hours.
-- **Who writes.** Only the elected writer sampler appends; a reader process
-  never opens the file for writing. `tests/host_load_sampler_scope.rs` pins
-  that `TraceWriter` is named only by the sampler and `trace.rs`. The file is
-  opened through `fs_entry::open_private_record`, so a symlink, a file owned by
-  someone else or one readable by others is refused and never touched.
+- **Who writes.** Only the elected writer sampler feeds the ring; a reader
+  process never opens the file for writing. `tests/host_load_sampler_scope.rs`
+  pins that `TraceFeed` is named only by the sampler and `trace.rs`, and
+  `TraceWriter` only by `trace.rs`. The file is opened through
+  `fs_entry::open_private_record`, so a symlink, a file owned by someone else
+  or one readable by others is refused and never touched.
+- **Off the tick.** The sampler tick only offers a record to a one-slot
+  hand-off (a lock held for nothing but moving the record) and never waits on
+  the file. A thread of its own, `host-load-trace`, started through
+  `supervisor::spawn_once` and only by the elected writer, opens the ring (so
+  the rotation of the previous boot's ring is off the tick as well), then
+  writes and flushes each record. If the slot is still full at the next offer
+  the new record is dropped and counted, and the count rides in the next record
+  that lands (`dropped_before`, and `dropped_total` since the feed started,
+  stored in bytes 104..120 that were spare, so a record from before this
+  existed reads as nothing dropped, an older build still validates a newer
+  record, and the layout version stays 1). While drops are happening the
+  status carries a problem line (for 60 s after the last), and the previous
+  boot's Health block says how many readings its ring lost. `stop` waits at
+  most 2 s for the thread; a flush blocked in the kernel cannot be
+  interrupted, so past that the thread is detached. It owns the file and its
+  own state, finishes that write and exits, and nothing the sampler holds
+  depends on it.
 - **Fields.** Wall seconds, monotonic ms, boot id, memory pressure, the
   governor's held tier, binding and admit verdict, swap used, compressed bytes,
   1-minute load, free disk, launched and observed session counts, the largest
@@ -216,17 +234,19 @@ beside it, in the same directory, that keeps them.
   10 s. On Apple targets the standard library implements `sync_all` (and
   `sync_data`) as `fcntl(F_FULLFSYNC)`, a whole-device cache flush (verified in
   `library/std/src/sys/fs/unix.rs` at the installed rustc's commit
-  0ef1bc386). So a hard reset loses at most the record being appended (up to
-  10 s of readings), not what the drive had in its cache. The price, measured
-  on the owner's Mac at load average about 20 (300 appends, interleaved with
-  plain `fsync(2)`): `sync_all` min 2.9 ms, median 4.9 ms, p95 11.2 ms, max
-  23 ms; plain `fsync(2)` median 0.07 ms, max 3.7 ms. A torn record fails its
-  checksum and is dropped on read. The append runs on the sampler thread after
-  the tick's snapshot is published and inside the tick's timing, so a slow
-  flush shows in `tick.last_us`, `tick.max_us` and, past the 2 s cadence,
-  `tick.overruns` in Health; a stall delays the next publish (the snapshot then
-  ages through the sensor states above).
-- **Boot change.** When the sampler starts and the header's boot id differs
+  0ef1bc386). So a hard reset loses the record being appended (up to 10 s of
+  readings) and any record the sampler dropped while a flush was stuck, not
+  what the drive had in its cache. The price, measured on the owner's Mac at
+  load average about 20 (300 appends, interleaved with plain `fsync(2)`):
+  `sync_all` min 2.9 ms, median 4.9 ms, p95 11.2 ms, max 23 ms; plain
+  `fsync(2)` median 0.07 ms, max 3.7 ms. None of it is on the tick any more, so
+  a stalled flush no longer delays the `host-load.v1` publish or the governor's
+  count (tests: the sampler keeps publishing with the write blocked, and with
+  the open blocked). A torn record fails its checksum and is dropped on read.
+  Drops after the last record that reached the ring leave nothing to carry
+  their count: a stall that runs into the reset shows as a trace that ends
+  early, and the "ended" time is the last record's, not the reset's.
+- **Boot change.** When the trace thread opens the ring and the header's boot id differs
   from this boot's, the file is renamed to `host-load-trace.prev.v1` (replacing
   any older one) and a fresh ring starts. A restart inside the same boot resumes
   the sequence. A short, torn or foreign file is a typed error, is never

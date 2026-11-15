@@ -23,6 +23,8 @@ fn rec(n: u64) -> TraceRecord {
         thermal: Some(Thermal::Fair),
         power: Some(Power::Ac),
         segment_fraction: Some(0.25),
+        dropped_before: 0,
+        dropped_total: 0,
     }
 }
 
@@ -46,6 +48,8 @@ fn blank(n: u64) -> TraceRecord {
         thermal: None,
         power: None,
         segment_fraction: None,
+        dropped_before: 0,
+        dropped_total: 0,
     }
 }
 
@@ -334,4 +338,137 @@ fn a_record_is_made_from_the_snapshot_and_the_held_verdict() {
     snap.codex = Reading::Unavailable(Why::Unreadable);
     let r = TraceRecord::of(&snap, Tier::Clear, None, true);
     assert_eq!((r.launched_sessions, r.observed_sessions), (None, None));
+}
+
+const SECONDS: Duration = Duration::from_secs(1);
+
+fn feed_over(gate: &std::sync::Arc<blocked_sink_tests::Gate>, dir: &tempfile::TempDir) -> TraceFeed {
+    TraceFeed::start(blocked_sink_tests::blocked_writes(gate.clone()), dir.path().to_path_buf(), 7).unwrap()
+}
+
+/// Records offered while the write is stuck are dropped, counted, and the
+/// count reaches the ring in the next record that lands: a ring with a gap
+/// says it has one.
+#[test]
+fn records_offered_while_the_write_is_blocked_are_dropped_and_the_ring_says_how_many() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    let mut feed = feed_over(&gate, &dir);
+    assert!(feed.offer(rec(1)));
+    assert!(gate.wait_entered(30 * SECONDS), "the thread never reached the sink");
+    assert!(feed.offer(rec(2)), "the slot is free once the thread took the first");
+    assert!(!feed.offer(rec(3)));
+    assert!(!feed.offer(rec(4)));
+    assert_eq!(feed.dropped(), 2);
+    gate.release();
+    assert!(feed.stop(30 * SECONDS), "stopped once the write resumed");
+    let held = read_ring(&path(&dir)).unwrap();
+    assert_eq!(held.len(), 2, "records 3 and 4 are not in the ring");
+    assert_eq!((held[0].wall_s, held[0].dropped_before, held[0].dropped_total), (rec(1).wall_s, 0, 0));
+    assert_eq!(
+        (held[1].wall_s, held[1].dropped_before, held[1].dropped_total),
+        (rec(2).wall_s, 2, 2),
+        "the record after the gap carries the count"
+    );
+}
+
+/// The tick's call never waits on the file: a thousand offers against a stuck
+/// write return at once.
+#[test]
+fn offering_never_waits_on_a_blocked_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    let mut feed = feed_over(&gate, &dir);
+    assert!(feed.offer(rec(1)));
+    assert!(gate.wait_entered(30 * SECONDS));
+    let began = Instant::now();
+    for n in 2..1_002 {
+        feed.offer(rec(n));
+    }
+    assert!(
+        began.elapsed() < 5 * SECONDS,
+        "1000 offers took {:?} behind a blocked write",
+        began.elapsed()
+    );
+    assert_eq!(feed.dropped(), 999);
+    gate.release();
+    feed.stop(30 * SECONDS);
+}
+
+/// `stop` is bounded by the wait it is given: a write blocked in the kernel
+/// cannot be interrupted, so the thread is detached, still owns the file, and
+/// finishes its writes once the disk answers.
+#[test]
+fn stop_returns_after_its_wait_with_a_blocked_write_and_the_detached_thread_finishes_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    let mut feed = feed_over(&gate, &dir);
+    assert!(feed.offer(rec(1)));
+    assert!(gate.wait_entered(30 * SECONDS));
+    assert!(feed.offer(rec(2)));
+    let began = Instant::now();
+    let finished = feed.stop(Duration::from_millis(150));
+    let took = began.elapsed();
+    assert!(!finished, "the write is still blocked");
+    assert!(took >= Duration::from_millis(100), "waited its bound: {took:?}");
+    assert!(took < 10 * SECONDS, "returned in {took:?}, not when the write did");
+    gate.release();
+    let deadline = Instant::now() + 30 * SECONDS;
+    loop {
+        let held = read_ring(&path(&dir)).map(|r| r.len()).unwrap_or(0);
+        if held == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the detached thread never wrote its records ({held})");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stopping_a_feed_that_is_not_blocked_joins_and_writes_the_waiting_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = blocked_sink_tests::Gate::new();
+    gate.release();
+    let mut feed = feed_over(&gate, &dir);
+    assert!(feed.offer(rec(1)));
+    assert!(feed.stop(30 * SECONDS));
+    assert_eq!(read_ring(&path(&dir)).unwrap().len(), 1);
+    assert!(!feed.offer(rec(2)), "a stopped feed takes nothing");
+}
+
+/// An open that fails is a problem the sampler can say, retried later, and
+/// does not keep `stop` waiting.
+#[test]
+fn a_failing_open_is_a_problem_and_does_not_hold_up_stop() {
+    let opener: TraceOpener = Arc::new(|_, _| Err("disk said no".into()));
+    let dir = tempfile::tempdir().unwrap();
+    let mut feed = TraceFeed::start(opener, dir.path().to_path_buf(), 7).unwrap();
+    let deadline = Instant::now() + 30 * SECONDS;
+    while feed.problem().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(feed.problem().as_deref(), Some("trace: disk said no"));
+    assert!(!feed.take_opened());
+    let began = Instant::now();
+    assert!(feed.stop(30 * SECONDS));
+    assert!(began.elapsed() < 5 * SECONDS, "stop waited for the reopen timer");
+}
+
+/// The count the ring carries is summed over everything it holds when the
+/// previous boot is read, and a record an older build wrote (zeros there)
+/// reads as nothing dropped.
+#[test]
+fn the_previous_boot_reports_the_drops_its_ring_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut old = TraceWriter::open(dir.path(), 7).unwrap();
+        old.append(&rec(1)).unwrap();
+        old.append(&TraceRecord { dropped_before: 3, dropped_total: 3, ..rec(2) }).unwrap();
+        old.append(&TraceRecord { dropped_before: 4, dropped_total: 7, ..rec(3) }).unwrap();
+    }
+    TraceWriter::open(dir.path(), 8).unwrap();
+    let previous = previous_boot(dir.path()).expect("the old ring is kept");
+    assert_eq!(previous.dropped, 7);
+    assert_eq!(previous.records[0].dropped_before, 0, "no drops reads as zero");
+    assert_eq!(previous.records[2].dropped_total, 7);
 }

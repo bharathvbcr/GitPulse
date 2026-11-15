@@ -21,6 +21,8 @@ const record = (over: Partial<TraceRecord> = {}): TraceRecord => ({
   thermal: "fair",
   power: "ac",
   segment_fraction: 0.4,
+  dropped_before: 0,
+  dropped_total: 0,
   ...over,
 });
 
@@ -44,6 +46,7 @@ const previous = (over: Partial<PreviousBoot> = {}): PreviousBoot => ({
   ended_wall_s: 1_760_000_020,
   records: [record({ mono_ms: 0 }), record({ mono_ms: 10_000 })],
   peaks: peaks(),
+  dropped: 0,
   error: null,
   ...over,
 });
@@ -54,6 +57,14 @@ describe("previousBootLines", () => {
     expect(text).toContain("launches were refused");
     expect(text).toContain("at most 120.0");
     expect(text).toContain("0.80 of the limit");
+  });
+
+  it("says how many readings were dropped, and says nothing when none were", () => {
+    expect(previousBootLines(previous()).join("\n")).not.toContain("dropped");
+    const lines = previousBootLines(previous({ dropped: 3 }));
+    expect(lines[0]).toContain("3 readings were dropped");
+    expect(lines[0]).toContain("gaps");
+    expect(previousBootLines(previous({ dropped: 1 }))[0]).toContain("1 reading was dropped");
   });
 
   it("says unreadable for a reading that could not be taken, never zero", () => {
