@@ -21,6 +21,12 @@
 //!   lockfile integrity hashes, UUIDs, base64, prose) with one planted key per
 //!   1,000 lines. Bytes per second through `dc_redact::find_secret`.
 //! * `parse_patch 4 MiB`: the strict `-U0` patch parser alone.
+//! * `push range 20 commits` / `push range 20 commits (null pair)`: the
+//!   push gate's scan (`resolve_push` + `scan_range`) of 20 unpushed commits
+//!   of 50 added lines each, interleaved with an identical second row for the
+//!   noise floor. This is what `cmd_push` adds before git's own push.
+//! * `push range 500 commits`: 500 unpushed commits (eight `git log` batches),
+//!   to size the per-push commit and time limits.
 //!
 //! The production spawn rate is lifted, as the other git-spawning benches do:
 //! these rows time the work, not the gate's token refill.
@@ -29,8 +35,10 @@ mod common;
 
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
+use gitpulse_lib::leak_scan::range::{resolve_push, scan_range, PushRefs, RangeLimits};
 use gitpulse_lib::leak_scan::staged::scan_staged;
 use gitpulse_lib::leak_scan::{parse_patch, Tally};
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 
 /// Deterministic text: a rotating set of line shapes a real repository has,
@@ -102,6 +110,111 @@ fn staged_repo(root: &Path, files: usize, lines: usize) -> String {
     root.to_str().expect("UTF-8 fixture path").to_string()
 }
 
+/// A repository whose `main` is a base commit followed by `commits` commits
+/// of `lines` added lines each (spread over 24 files), and a remote `origin`
+/// whose tracking ref is at the base: the commits are what a push sends.
+/// Built with `git fast-import`. Clean of credentials.
+fn push_repo(root: &Path, commits: usize, lines: usize) -> String {
+    use std::io::Write;
+    std::fs::create_dir_all(root).unwrap();
+    git(root, &["init", "-q", "-b", "main"]);
+    let body = corpus(lines * commits * 90 + 1024, usize::MAX);
+    let mut source = body.lines();
+    let mut files: Vec<String> = vec![String::new(); 24];
+    let mut stream = String::new();
+    for n in 0..=commits {
+        stream.push_str(&format!(
+            "commit refs/heads/main
+mark :{}
+committer Bench <bench@example.com> {} +0000
+",
+            n + 1,
+            1_700_000_000 + n
+        ));
+        let message = format!(
+            "change {n}
+"
+        );
+        stream.push_str(&format!(
+            "data {}
+{message}",
+            message.len()
+        ));
+        if n > 0 {
+            stream.push_str(&format!(
+                "from :{n}
+"
+            ));
+            let file = &mut files[n % 24];
+            for _ in 0..lines {
+                file.push_str(source.next().unwrap_or("filler line"));
+                file.push_str(&format!(" // {n}\n"));
+            }
+            stream.push_str(&format!(
+                "M 644 inline src/m{}.rs\ndata {}\n{file}\n",
+                n % 24,
+                file.len()
+            ));
+        } else {
+            stream.push_str("M 644 inline README.md\ndata 6\nbench\n\n");
+        }
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["fast-import", "--quiet"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git fast-import");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stream.as_bytes())
+        .expect("feed fast-import");
+    let out = child.wait_with_output().expect("wait for fast-import");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/bench.git",
+        ],
+    );
+    let base = format!("main~{commits}");
+    git(root, &["update-ref", "refs/remotes/origin/main", &base]);
+    trust_repo(root);
+    root.to_str().expect("UTF-8 fixture path").to_string()
+}
+
+fn push_case<'a>(name: &str, repo: &'a str, commits: u64) -> Case<'a> {
+    Case::new(name, move || {
+        let repo = Path::new(repo);
+        let range = resolve_push(repo, Some("origin"), PushRefs::Branch(Some("main")))
+            .expect("the push resolves");
+        let scan =
+            scan_range(repo, &range, RangeLimits::DEFAULT).expect("the scan reaches a verdict");
+        assert!(
+            scan.tally.is_clean(),
+            "the fixture is clean: {:?}",
+            scan.tally
+        );
+        assert_eq!(scan.commits_scanned, commits, "every commit was read");
+        Sample::default()
+            .counter("commits", scan.commits_scanned)
+            .counter("lines", scan.tally.lines_scanned)
+            .counter("bytes", scan.tally.bytes_scanned)
+    })
+}
+
 fn staged_case<'a>(name: &str, repo: &'a str) -> Case<'a> {
     Case::new(name, move || {
         let scan = scan_staged(Path::new(repo), &[]).expect("the scan reaches a verdict");
@@ -151,6 +264,19 @@ fn main() {
         opts.warmup(3),
     );
 
+    // ---- push ranges, with a same-code null pair
+    let push_small = push_repo(&temp.path().join("push20"), 20, 50);
+    let push_large = push_repo(&temp.path().join("push500"), 500, 50);
+    let push_rows = interleave(
+        vec![
+            push_case("push range 20 commits", &push_small, 20),
+            push_case("push range 20 commits (null pair)", &push_small, 20),
+            push_case("push range 500 commits", &push_large, 500),
+        ],
+        opts.samples(21),
+        opts.warmup(2),
+    );
+
     // ---- engine and parser alone
     let text = corpus(4 << 20, 1000);
     let diff = patch(64, 700);
@@ -186,10 +312,12 @@ fn main() {
          streamed; scan_staged spawns git (raw listing, patch, cat-file for binaries); production \
          spawn rate lifted. Engine rows: \
          generated 4 MiB mixed text with a planted key every 1,000 lines, and a 64-file, \
-         700-line-per-file -U0 patch"
+         700-line-per-file -U0 patch. Push rows: fast-import repositories of 20 and 500 commits \
+         of 50 added lines each past a tracking ref, scanned with the default range limits"
             .to_string(),
     );
     report.extend(staged_rows);
+    report.extend(push_rows);
     report.extend(pure_rows);
     report.finish();
 }

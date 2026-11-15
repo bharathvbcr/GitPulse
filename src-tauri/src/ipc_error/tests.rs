@@ -73,7 +73,11 @@ fn produced(kind: IpcErrorKind) -> IpcError {
                 hits_total: 1,
                 ..Default::default()
             };
-            let refused = crate::leak_scan::staged::refusal(Some(&tally), None);
+            let refused = crate::leak_scan::staged::refusal(
+                crate::leak_scan::staged::Gate::Commit,
+                Some(&tally),
+                None,
+            );
             assert_eq!(refused.message(), message, "the committed message");
             run_command(|| Err::<(), _>(refused)).expect_err("the body failed")
         }

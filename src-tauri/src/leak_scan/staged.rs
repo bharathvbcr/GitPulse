@@ -125,7 +125,11 @@ pub fn scan_staged(repo: &Path, pathspec: &[String]) -> Result<StagedScan, ScanF
 
 /// Read and scan staged binary blobs by object id, within the per-blob cap
 /// and the scan's budget. Every blob left unread is a typed skip.
-fn scan_blobs(repo: &Path, blobs: &[&RawEntry], tally: &mut Tally) -> Result<(), ScanFailure> {
+pub(super) fn scan_blobs(
+    repo: &Path,
+    blobs: &[&RawEntry],
+    tally: &mut Tally,
+) -> Result<(), ScanFailure> {
     let mut request = Vec::new();
     for entry in blobs {
         request.extend_from_slice(entry.dst_oid.as_bytes());
@@ -296,8 +300,8 @@ pub fn guard_commit(repo: &Path, pathspec: &[String], policy: Policy) -> Result<
             );
             Ok(())
         }
-        Ok(scan) => Err(refusal(Some(&scan.tally), None)),
-        Err(failure) => Err(refusal(None, Some(&failure))),
+        Ok(scan) => Err(refusal(Gate::Commit, Some(&scan.tally), None)),
+        Err(failure) => Err(refusal(Gate::Commit, None, Some(&failure))),
     }
 }
 
@@ -307,15 +311,53 @@ fn shown(path: &str) -> String {
     dc_redact::redact_secrets(path)
 }
 
+/// Which git write a refusal stops. The scan and its report are the same for
+/// both; what was stopped, and what fixing it takes, are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// A commit of the staged changes ([`guard_commit`]).
+    Commit,
+    /// A push of the commits the remote does not have
+    /// ([`super::range::guard_push`]).
+    Push,
+}
+
+impl Gate {
+    fn wording(self) -> GateWording {
+        match self {
+            Self::Commit => GateWording {
+                name: "commit",
+                stopped: "Commit blocked by the secret scan. Nothing was committed.",
+                unread: "The staged changes could not be scanned",
+                remedy: "A credential committed to history stays there after the file is fixed: remove it from the staged changes.",
+                inputs: "staged file",
+            },
+            Self::Push => GateWording {
+                name: "push",
+                stopped: "Push blocked by the secret scan. Nothing was pushed.",
+                unread: "The commits this push would send could not be scanned",
+                remedy: "Each of these is in a commit the push would send, and a later commit that deletes it does not take it out of history: rewrite the commits that added it (an interactive rebase, for example) before pushing.",
+                inputs: "input the push would send",
+            },
+        }
+    }
+}
+
+struct GateWording {
+    name: &'static str,
+    stopped: &'static str,
+    unread: &'static str,
+    remedy: &'static str,
+    inputs: &'static str,
+}
+
 /// The typed refusal. Names shapes, paths and line numbers — never a value
 /// or the line it sits on.
-pub fn refusal(tally: Option<&Tally>, failure: Option<&ScanFailure>) -> CommandError {
-    let mut message = String::from("Commit blocked by the secret scan. Nothing was committed.");
+pub fn refusal(gate: Gate, tally: Option<&Tally>, failure: Option<&ScanFailure>) -> CommandError {
+    let words = gate.wording();
+    let mut message = String::from(words.stopped);
     if let Some(failure) = failure {
-        message.push_str(&format!(
-            "\nThe staged changes could not be scanned: {}.",
-            failure.0
-        ));
+        message.push_str(&format!("\n{}: {}.", words.unread, failure.0));
     }
     let empty = Tally::default();
     let tally = tally.unwrap_or(&empty);
@@ -338,14 +380,14 @@ pub fn refusal(tally: Option<&Tally>, failure: Option<&ScanFailure>) -> CommandE
         if unnamed > 0 {
             message.push_str(&format!("\n  and {unnamed} more"));
         }
-        message.push_str(
-            "\nA credential committed to history stays there after the file is fixed: remove it from the staged changes.",
-        );
+        message.push('\n');
+        message.push_str(words.remedy);
     }
     if tally.skipped_total > 0 {
         message.push_str(&format!(
-            "\n{} staged file{} could not be scanned:",
+            "\n{} {}{} could not be scanned:",
             tally.skipped_total,
+            words.inputs,
             if tally.skipped_total == 1 { "" } else { "s" },
         ));
         for skip in tally.skipped.iter().take(NAMED_IN_MESSAGE) {
@@ -373,6 +415,7 @@ pub fn refusal(tally: Option<&Tally>, failure: Option<&ScanFailure>) -> CommandE
         )
         .collect();
     let detail = serde_json::json!({
+        "gate": words.name,
         "engine": ENGINE,
         "hits": hits,
         "hits_total": tally.hits_total,

@@ -1,10 +1,11 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, readable, writable, type Readable } from "svelte/store";
-import { invoke } from "../ipc/invoke";
+import { invoke, ipcErrorKind } from "../ipc/invoke";
 import { formatErrorRaw } from "../ui/formatError";
 import { describeError, mirrorUserFacingError } from "../ui/copy/describeFailure";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore } from "./harnessStore";
+import { toastStore } from "./toastStore";
 import {
   type BranchInfo,
   type DeadbranchCleanResult,
@@ -653,6 +654,28 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   const { beginMutation, runMutating } = mutationRunner;
 
+  /** The secret scan refused the push: the one failure "Push anyway" answers. */
+  const secretScanRefused = (err: unknown) => ipcErrorKind(err) === "secret_scan_blocked";
+
+  /**
+   * A push the secret scan refused, offered once more past the scan. The
+   * toast carries the refusal (shape, commit, path and line, never a value);
+   * its "Push anyway" button is the only caller of `again`, which pushes the
+   * repository that was refused, not whichever tab is active by then. No
+   * member takes the override from a caller, so no other path can send it.
+   */
+  function offerPushPastSecretScan(
+    outcome: MutationOutcome,
+    again: () => Promise<MutationOutcome>,
+  ): MutationOutcome {
+    if (outcome.ok || !secretScanRefused(outcome.cause)) return outcome;
+    toastStore.error(outcome.error ?? "Push blocked by the secret scan.", {
+      label: "Push anyway",
+      onClick: async () => (await again()).ok,
+    });
+    return { ...outcome, surfaced: true };
+  }
+
   function repoFacts(): RepoFacts[] {
     return collectRepoFacts(internal.workspace.tabs, internal.sessions);
   }
@@ -1268,13 +1291,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       branch?: string,
       force: boolean = false,
       target?: MutationTarget | null,
-    ) =>
-      runMutating(
-        force ? "push-force" : "push",
-        [remote, branch].filter(Boolean).join(" ") || "upstream",
-        (path) => invokeFn("cmd_push", { repoPath: path, remote, branch, force }),
-        { target },
-      ),
+    ): Promise<MutationOutcome> => {
+      const session = target === undefined ? activeSession() : undefined;
+      const refused: MutationTarget | null =
+        target !== undefined ? target : session ? { tabId: session.id, path: session.path } : null;
+      const run = (allowSecrets: boolean, at: MutationTarget | null | undefined) =>
+        runMutating(
+          force ? "push-force" : "push",
+          [remote, branch].filter(Boolean).join(" ") || "upstream",
+          (path) =>
+            invokeFn("cmd_push", {
+              repoPath: path,
+              remote,
+              branch,
+              force,
+              ...(allowSecrets ? { allowSecrets } : {}),
+            }),
+          { target: at, expected: allowSecrets ? undefined : secretScanRefused },
+        );
+      return offerPushPastSecretScan(await run(false, target), () => run(true, refused));
+    },
     reportIssue: async (
       title: string,
       body: string,
@@ -1304,9 +1340,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return { ok: false, error: describeError(err, "repo") };
       }
     },
-    publishRelease: async (tag: string, message: string) =>
+    // `allowSecrets` only from the release pane's "Publish anyway" button,
+    // under a `secret_scan_blocked` refusal of this tag's push.
+    publishRelease: async (tag: string, message: string, allowSecrets: boolean = false) =>
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
-        invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
+        invokeFn("cmd_publish_release", {
+          repoPath: path,
+          tag,
+          message,
+          ...(allowSecrets ? { allowSecrets } : {}),
+        }),
       ),
     stashSave: async (
       message?: string,

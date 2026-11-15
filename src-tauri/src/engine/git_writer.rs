@@ -9,6 +9,7 @@ use crate::engine::process::{
     OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use crate::ipc_error::CommandError;
+use crate::leak_scan::range::{guard_push as guard_pushed_secrets, PushRefs};
 use crate::leak_scan::staged::guard_commit as guard_staged_secrets;
 pub use crate::leak_scan::staged::Policy as SecretPolicy;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
@@ -2633,6 +2634,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// an explicit expected value, or a lease without the includes check past
     /// the contract.
     pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, CommandError> {
+        Self::push_planned_with_policy(repo_path, args, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::push_planned`], with the secret scan of the commits the push
+    /// would send run under the repository lock just before it.
+    /// [`SecretPolicy::HumanOverride`] skips the scan, and only the "Push
+    /// anyway" button reaches it.
+    pub fn push_planned_with_policy(
+        repo_path: &str,
+        args: &[String],
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if args.first().map(String::as_str) != Some("push") {
             return Err("internal: planned push argv must start with push".into());
@@ -2679,13 +2692,16 @@ Unset the local override with `git config --local --unset-all user.name` and \
         // re-checked here, under the lock, so a planned argv that was edited
         // or went stale between plan and run cannot reach an unconfigured
         // repository.
-        if let Some(repository) = args
+        let mut positionals = args
             .iter()
             .skip(1)
-            .find(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
-        {
+            .filter(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
+            .map(String::as_str);
+        let (repository, branch) = (positionals.next(), positionals.next());
+        if let Some(repository) = repository {
             crate::engine::remotes::require_configured(&repo, repository)?;
         }
+        guard_pushed_secrets(&repo, repository, PushRefs::Branch(branch), secrets)?;
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         git_text_network(&repo, &refs)
     }
@@ -2693,6 +2709,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
     /// ambiguous branch/tag name from publishing the wrong object.
     pub fn push_tag(repo_path: &str, remote: &str, tag: &str) -> Result<String, CommandError> {
+        Self::push_tag_with_policy(repo_path, remote, tag, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::push_tag`], with the secret scan of the commits the tag would
+    /// send, as [`Self::push_planned_with_policy`] runs it.
+    pub fn push_tag_with_policy(
+        repo_path: &str,
+        remote: &str,
+        tag: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2700,6 +2727,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::engine::remotes::require_configured(&repo, remote)?;
         let argv = Self::push_tag_argv(remote, tag)?;
+        guard_pushed_secrets(&repo, Some(remote), PushRefs::Tag(tag), secrets)?;
         git_text_network(&repo, &Self::argv_refs(&argv)[1..])
     }
 

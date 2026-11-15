@@ -98,11 +98,12 @@ pub async fn cmd_unstage_selective_patch(
     .await
 }
 
-/// The secret gate's policy for a commit the webview asked for.
-/// `allow_secrets` is sent only by the commit view's "Commit anyway" button,
-/// which a person sees after the scan refused this commit; it is no MCP
-/// tool's argument, so an agent cannot set it.
-fn secret_policy(allow_secrets: Option<bool>) -> SecretPolicy {
+/// The secret gate's policy for a commit or push the webview asked for.
+/// `allow_secrets` is sent only by the commit view's "Commit anyway" button
+/// and the "Push anyway" / "Publish anyway" actions on a push refusal, which
+/// a person sees after the scan refused; it is no MCP tool's argument, so an
+/// agent cannot set it.
+pub(super) fn secret_policy(allow_secrets: Option<bool>) -> SecretPolicy {
     if allow_secrets == Some(true) {
         SecretPolicy::HumanOverride
     } else {

@@ -12,8 +12,10 @@
 //! (`crate::secrets`); this is the everyday path that has to be fast, local
 //! and dependency-free.
 //!
-//! The module is pure over bytes. [`staged`] is the one place that runs git.
+//! The module is pure over bytes. [`staged`] (what a commit adds) and
+//! [`range`] (what a push sends) are the places that run git.
 
+pub mod range;
 pub mod staged;
 
 use serde::Serialize;
@@ -56,6 +58,13 @@ pub enum SkipReason {
     BudgetExhausted,
     /// Git could not produce its bytes.
     Unreadable,
+    /// Commits past the most one push scan reads.
+    CommitLimit,
+    /// Not reached before the scan's time limit.
+    TimeLimit,
+    /// A change git cannot show on its own terms: an octopus merge, whose
+    /// own edits `--remerge-diff` does not isolate.
+    Unsupported,
 }
 
 impl SkipReason {
@@ -64,6 +73,9 @@ impl SkipReason {
             Self::Oversized => "larger than the scan reads",
             Self::BudgetExhausted => "past the scan's byte budget",
             Self::Unreadable => "could not be read",
+            Self::CommitLimit => "past the scan's commit limit",
+            Self::TimeLimit => "past the scan's time limit",
+            Self::Unsupported => "a change the scan cannot isolate",
         }
     }
 }
@@ -137,7 +149,13 @@ impl Tally {
     }
 
     pub fn skip(&mut self, path: &str, reason: SkipReason, bytes: Option<u64>) {
-        self.skipped_total += 1;
+        self.skip_many(path, reason, bytes, 1);
+    }
+
+    /// One row standing for `count` inputs skipped for the same reason (the
+    /// commits past a push scan's limit), each counted in `skipped_total`.
+    pub fn skip_many(&mut self, path: &str, reason: SkipReason, bytes: Option<u64>, count: u64) {
+        self.skipped_total += count;
         if self.skipped.len() < MAX_REPORTED_SKIPS {
             self.skipped.push(Skip {
                 path: path.to_string(),
@@ -263,6 +281,10 @@ pub struct Section {
     /// Git printed `Binary files … differ` instead of hunks, so the added
     /// bytes are not in the patch and have to be read from the blob.
     pub binary: bool,
+    /// The section is only `--remerge-diff`'s note on a merge conflict (`remerge
+    /// CONFLICT …` lines and nothing else): git prints it with no `--raw`
+    /// entry, because the merge recorded no change to that path.
+    pub remerge_only: bool,
 }
 
 /// Why a patch could not be read. Any of these fails the scan: a section the
@@ -325,6 +347,8 @@ pub fn parse_patch(patch: &[u8]) -> Result<Vec<Section>, PatchError> {
     let mut sections: Vec<Section> = Vec::new();
     // Inside a hunk: (next new-side line number, added lines still expected).
     let mut hunk: Option<(u32, u32)> = None;
+    // The current section has a header line or hunk other than a remerge note.
+    let mut content = false;
     let mut offset = 0usize;
     let mut lines = patch.split(|b| *b == b'\n').peekable();
     while let Some(line) = lines.next() {
@@ -341,6 +365,7 @@ pub fn parse_patch(patch: &[u8]) -> Result<Vec<Section>, PatchError> {
                 }
             }
             sections.push(Section::default());
+            content = false;
             continue;
         }
         let Some(section) = sections.last_mut() else {
@@ -354,13 +379,22 @@ pub fn parse_patch(patch: &[u8]) -> Result<Vec<Section>, PatchError> {
             }
             let (new_start, count) = hunk_new_side(line).ok_or(PatchError::BadHunkHeader)?;
             hunk = Some((new_start, count));
+            content = true;
+            section.remerge_only = false;
             continue;
         }
         match hunk.as_mut() {
             None => {
-                // Extended header: index, mode, rename, ---/+++, Binary files.
+                // Extended header: index, mode, rename, ---/+++, Binary files,
+                // and `--remerge-diff`'s conflict notes.
                 if line.starts_with(b"Binary files ") && line.ends_with(b" differ") {
                     section.binary = true;
+                }
+                if line.starts_with(b"remerge ") {
+                    section.remerge_only = !content;
+                } else {
+                    content = true;
+                    section.remerge_only = false;
                 }
             }
             Some((next, remaining)) => match line.first() {
