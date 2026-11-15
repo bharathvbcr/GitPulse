@@ -1370,6 +1370,14 @@ pub const BYPASS_PERMISSIONS: &str = "bypassPermissions";
 /// nothing they found goes unsaid: the person gets a notice and the model gets
 /// the reason as context. A waived refusal therefore never reads as a check
 /// that passed.
+///
+/// One exception, and it is deliberate: the host-load refusal
+/// (`load_gate`) is **not** passed through here. The refusals above are
+/// permission questions, which bypass mode exists to stop asking. A load refusal
+/// protects the machine from every session at once, not a permission the person
+/// waived, and the sessions that hung this Mac on 2026-11-14 ran in bypass mode.
+/// A person turns it down in Settings → Agents → Host load → Command gate
+/// (Advise says the same thing and refuses nothing; Off says nothing).
 fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
     if input.permission_mode != BYPASS_PERMISSIONS {
         return output;

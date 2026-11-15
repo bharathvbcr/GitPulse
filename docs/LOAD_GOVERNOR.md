@@ -581,14 +581,30 @@ the hook's environment, or a command run through `mac_heavy.sh`.
 It never emits `allow`, `ask` or `updatedInput`: an unearned allow would
 override the person's permission rules.
 
-**Bypass mode does not waive it.** `under_bypass` turns the guard's and the
-gate's refusals into notices because they are permission questions and bypass is
-the host's "stop asking me". This one protects the machine from every session at
-once, and the sessions that hung it run in bypass, so it is enforced there. A
-person turns it down in Settings. That the host honours a hook `deny` while in
-`bypassPermissions` is **not** stated by the hooks documentation fetched below;
-it is inferred from `under_bypass` existing and was not run against a live
-session.
+**Bypass mode does not waive it, and that is the one exception to
+`under_bypass`.** `under_bypass` (`hooks/mod.rs`) turns the guard's and the
+gate's refusals into notices because they are permission questions, and bypass
+is the host's "stop asking me". A load refusal is not one: it protects the
+machine from every session at once, not a permission the person waived, and the
+sessions that hung this Mac on 2026-11-14 ran in bypass mode, so waiving it
+there would leave this feature advice-only for the sessions it exists for. The
+comment on `under_bypass` states the same exception. A person turns it down in
+**Settings → Agents → Host load → Command gate**: Advise gives the model the same
+text and refuses nothing, Off says nothing about load.
+
+Whether the host itself blocks a call on a hook `deny` in `bypassPermissions`
+mode is **not confirmed from the docs**. Read on 2026-11-15:
+`https://code.claude.com/docs/en/hooks` says only "`"deny"` prevents the tool
+call" and that "[d]eny and ask rules are still evaluated regardless of what the
+hook returns"; it never mentions `bypassPermissions` in connection with a hook
+decision (about 100,000 of its 293,529 characters were readable through the
+fetch, not all of it). `https://code.claude.com/docs/en/permission-modes` says
+"Deny rules block in every mode, including `bypassPermissions`", which is about
+permission rules, not hooks, and that no `PreToolUse` hook that returns
+`"allow"` approves a critical-path removal. It was not run against a live
+bypass session. If the host does not enforce a hook `deny` there, this
+feature's refusal is advice-only in bypass sessions, and the `additionalContext`
+and `systemMessage` it also carries are all that reach the model.
 
 **The loop breaker.** The fifth refusal of the same command (compared trimmed)
 in one session inside ten minutes says "STOP: you are looping", tells the person
@@ -615,8 +631,9 @@ unreadable file or an unknown value enforces.
 (`PreToolUse` `hookSpecificOutput`: `hookEventName` required, `permissionDecision`
 of `allow`/`deny`/`ask`/`defer`, `permissionDecisionReason` shown to Claude,
 `updatedInput`, `additionalContext`; common output `systemMessage`; text capped
-at 10,000 characters; input `session_id`, `permission_mode`). Not confirmed from
-those pages, though the code reads it already: `tool_use_id` on the input.
+at 10,000 characters; input `session_id`, `permission_mode`). `tool_use_id` on the input is confirmed, fetched 2026-11-15 from the same page
+(PreToolUse input): "In addition to the common input fields, PreToolUse hooks
+receive `tool_name`, `tool_input`, and `tool_use_id`." 
 
 **`mcp:doctor` and the plugin cache.** The doctor (`scripts/check-mcp-install.mjs`)
 also compares the `hooks/hooks.json` the host has installed (found through
