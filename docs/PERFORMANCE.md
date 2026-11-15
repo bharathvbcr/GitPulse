@@ -1103,7 +1103,7 @@ measurement.
 
 | bench | rows | baseline for |
 | --- | --- | --- |
-| `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
+| `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `sessions` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07; S3-04 `ft-9cfa5274` (protocol overhead + zero-git `gitpulse_sessions`; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
 | `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the size of the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
@@ -3033,3 +3033,20 @@ Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30
 A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with GitPulse running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
 
 Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.
+
+## 2026-11-14: `gitpulse_sessions` cold-process scan and zero-git MCP call (`ft-9cfa527403d342da25e756db971761c5`, S3-04; row in `ft-c0d9313f`)
+
+What: cold-process `insights::sessions` (`GITPULSE_HOST_LOAD_ONCE=mcp_sessions`) compared side by side against `ft-7ba9b4b2`'s `observe_sessions` scan (`GITPULSE_HOST_LOAD_ONCE=sessions`), plus `tools/call sessions` in `mcp_protocol -- --smoke` alongside `gitpulse_collision_risk` and `gitpulse_insights`.
+
+Where: Apple Silicon macOS release build (`host_load` 15 fresh cold processes each on the active repository with 27 host agent sessions and 4 repo-attributed sessions; `mcp_protocol -- --smoke` on a generated 400-file, 3-linked-worktree fixture under a hermetic `HOME` with `alerts::start` active).
+
+| path | min | p50 | p95 | max / worst | notes |
+| --- | --- | --- | --- | --- | --- |
+| `host_load` once `sessions` (`observe_sessions`, n=15) | 9.73 ms | 40.39 ms | 89.90 ms | 161.52 ms | 27 host sessions (`ok=true`) |
+| `host_load` once `mcp_sessions` (`insights::sessions`, n=15) | 11.90 ms | 16.03 ms | 32.16 ms | 36.49 ms | +registry, CARD 11, ledger, hub snapshot (`total=4`, `app_ok=false`, 0 git) |
+| `mcp_protocol` `tools/call sessions` (`--smoke`, n=3) | 26.46 ms | 34.20 ms | 47.51 ms | 47.51 ms | `facets_ok=7`, `git_processes=0`, `bytes=1690` (load avg 74.1 on 18 CPUs) |
+| `mcp_protocol` `tools/call collision_risk` (`--smoke`, n=3) | 110.98 ms | 163.04 ms | 289.38 ms | 289.38 ms | `facets_ok=1`, same smoke pass |
+| `mcp_protocol` `tools/call insights` (`--smoke`, n=3) | 180.23 ms | 274.93 ms | 675.48 ms | 675.48 ms | `facets_ok=10`, `git_processes=10`, same smoke pass |
+
+The cold-process `insights::sessions` call tracks `ft-7ba9b4b2`'s ~10 ms `observe_sessions` baseline (`min` 11.90 ms vs 9.73 ms on this host) and spawns 0 `git` processes (verified via git `trace2` in both `mcp_protocol` and `tests/mcp_sessions.rs`), compared to 10 `git` processes for `gitpulse_insights`. On `mcp_protocol -- --smoke`, load average was 74.1 across 18 CPUs, so absolute times reflect shared host load while `min`, relative ratios, `facets_ok`, and `git_processes=0` establish the comparison.
+

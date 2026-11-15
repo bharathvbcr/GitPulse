@@ -1878,6 +1878,27 @@
     ],
     "type": "object"
   },
+  "gitpulse_sessions": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "description": "Maximum live sessions to return (default 64, max 256)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_status": {
     "additionalProperties": false,
     "properties": {

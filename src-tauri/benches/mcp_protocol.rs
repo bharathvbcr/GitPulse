@@ -92,6 +92,22 @@ fn call(method: &str, params: &Value) -> (Value, usize) {
 
 /// A `tools/call` that must be the work, not a refusal: aborts naming the tool
 /// and the failing facet otherwise.
+struct BenchSnapshotHost;
+
+impl gitpulse_lib::alerts::Host for BenchSnapshotHost {
+    fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn attended(&self, _: &str) -> bool {
+        false
+    }
+
+    fn state_snapshot_path(&self) -> Option<std::path::PathBuf> {
+        gitpulse_lib::alerts::default_state_snapshot_path()
+    }
+}
+
 fn checked_tool_call(tool: &str, repo: &str) -> Sample {
     let params = json!({ "name": tool, "arguments": { "repo_path": repo } });
     let (response, bytes) = call("tools/call", &params);
@@ -224,10 +240,24 @@ fn main() {
     let warmup = report.opts.warmup(20);
     let mut rows = interleave(cheap, protocol_rounds, warmup);
 
+    // Start the alerts worker on the hermetic config root so `gitpulse_sessions`
+    // sees a live `app_state` facet (`ok: true`) rather than failing the gate.
+    gitpulse_lib::alerts::start(std::sync::Arc::new(BenchSnapshotHost));
+    assert!(
+        common::env::wait_until(std::time::Duration::from_secs(2), || matches!(
+            gitpulse_lib::alerts::read_state_snapshot(),
+            gitpulse_lib::alerts::HubStateRead::Ok(_)
+        )),
+        "alerts snapshot not created inside bench hermetic HOME",
+    );
+
     // ---- Real work. These dominate; the rows above exist to show by how much.
     let work = vec![
         Case::new("codeintel status", || {
             checked_tool_call("gitpulse_status", &repo)
+        }),
+        Case::new("tools/call sessions", || {
+            checked_tool_call("gitpulse_sessions", &repo)
         }),
         Case::new("tools/call collision_risk", || {
             checked_tool_call("gitpulse_collision_risk", &repo)
@@ -246,6 +276,19 @@ fn main() {
     }
     report.note(format!(
         "one insights call starts {processes} git processes (git trace2, counted in a separate untimed pass)"
+    ));
+
+    let (_, sessions_processes) =
+        count_git_processes(|| checked_tool_call("gitpulse_sessions", &repo));
+    assert_eq!(
+        sessions_processes, 0,
+        "gitpulse_sessions must spawn zero git processes"
+    );
+    if let Some(row) = rows.iter_mut().find(|r| r.name == "tools/call sessions") {
+        row.counters.insert("git_processes", sessions_processes);
+    }
+    report.note(format!(
+        "one sessions call starts {sessions_processes} git processes (git trace2, counted in a separate untimed pass)"
     ));
 
     // A protocol-only call has to be negligible against a call that touches

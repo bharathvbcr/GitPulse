@@ -5462,6 +5462,8 @@ mod tests {
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            start_us: None,
+            is_caller: false,
             ide_hosted: false,
             terminal_session_id: None,
         }
@@ -8128,6 +8130,8 @@ done
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            start_us: None,
+            is_caller: false,
             ide_hosted: false,
             terminal_session_id: None,
         };

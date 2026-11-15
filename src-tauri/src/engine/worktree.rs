@@ -125,8 +125,16 @@ impl AdmittedPair {
     /// [`Self::metadata_checkouts`] without the admitted pair: the primary
     /// working tree first, then each linked worktree the registry names. What
     /// the metadata says is registered, whatever the caller asked about.
-    fn registered_checkouts(&self) -> Option<Vec<PathBuf>> {
+    pub(crate) fn registered_checkouts(&self) -> Option<Vec<PathBuf>> {
         self.scan_checkouts(false)
+    }
+
+    pub(crate) fn repo_path(&self) -> &Path {
+        &self.repo
+    }
+
+    pub(crate) fn common_dir(&self) -> &Path {
+        &self.common
     }
 
     fn scan_checkouts(&self, with_pair: bool) -> Option<Vec<PathBuf>> {

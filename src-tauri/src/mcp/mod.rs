@@ -527,6 +527,17 @@ tool_args! {
 }
 
 tool_args! {
+    struct SessionsArgs {
+        repo_path: String = repo_spec(),
+        limit: Option<u32> = Spec::int(
+            "Maximum live sessions to return (default 64, max 256)",
+            1,
+            256,
+        ),
+    }
+}
+
+tool_args! {
     /// The code-intelligence tools that answer one budgeted question about a
     /// repository.
     struct BudgetArgs {
@@ -1761,6 +1772,68 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
             }),
+        ),
+        tool(
+            "gitpulse_sessions",
+            "Live agent sessions",
+            "List live agent sessions (Claude Code and Codex) running inside this repository's worktrees, without spawning git. Reads the OS process table, Claude Code session registries, CARD 11 file claims / worktree locks, ledger run bindings, and the running GitPulse desktop app's hook-report hub snapshot (`agent-session-state.json`). Marks `is_caller: true` on the nearest agent ancestor of this MCP server (`pid` + `start_us`), carries `run_id`, `tree`, and `task_id` when known, and reports `state` (`working` | `blocked` | `done` | `idle` | `unknown`), `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`. Codex sessions with no hub entry report `state: \"unknown\"` (never `\"idle\"`); sessions with no registry or hub entry report `state_source: \"none\"`. When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process table and registry. Results are sorted caller-first and bounded by `limit` (`cap`, `total`, `returned`, `truncated`).",
+            SessionsArgs::properties(),
+            &SessionsArgs::required(),
+            ok_error_output(
+                json!({
+                    "repo_path": { "type": "string" },
+                    "app_state": ok_error_output(
+                        json!({
+                            "updated_ms": { "type": "integer", "minimum": 0 }
+                        }),
+                        &[],
+                    ),
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "ok": { "type": "boolean" },
+                                "error": { "type": "string" },
+                                "sessions": { "type": "integer", "minimum": 0 },
+                                "unverified": { "type": "integer", "minimum": 0 },
+                                "truncated": { "type": "boolean" }
+                            },
+                            "required": ["kind", "ok", "error", "sessions", "unverified", "truncated"]
+                        }
+                    },
+                    "cap": { "type": "integer", "minimum": 1 },
+                    "total": { "type": "integer", "minimum": 0 },
+                    "returned": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "sessions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "pid": { "type": "integer", "minimum": 0 },
+                                "start_us": { "type": "integer", "minimum": 0 },
+                                "is_caller": { "type": "boolean" },
+                                "worktree": { "type": "string" },
+                                "cwd": { "type": "string" },
+                                "tree": { "type": "string" },
+                                "run_id": { "type": "string" },
+                                "task_id": { "type": "string" },
+                                "parent_pid": { "type": "integer", "minimum": 0 },
+                                "session_id": { "type": "string" },
+                                "entrypoint": { "type": "string" },
+                                "state": { "type": "string", "enum": ["working", "blocked", "done", "idle", "unknown"] },
+                                "state_source": { "type": "string", "enum": ["hub", "registry", "none", "unknown"] },
+                                "state_age_s": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": ["kind", "pid", "is_caller", "worktree", "cwd", "state", "state_source"]
+                        }
+                    }
+                }),
+                &["repo_path", "app_state", "kinds", "cap", "total", "returned", "truncated", "sessions"],
+            ),
         ),
         tool(
             "gitpulse_status",
@@ -3366,6 +3439,39 @@ fn open_shared_profile(
     Ok(Some(store))
 }
 
+/// Fail-soft read-only lookup from `run_id` to board `task_id`.
+///
+/// Opens the shared profile store at most once per `gitpulse_sessions` call
+/// with `SQLITE_OPEN_READ_ONLY` and `refuse_workbench_upgrades`, returning
+/// `None` if the store is absent or requires a schema upgrade rather than
+/// failing a read-only session listing.
+fn with_sessions_run_lookup<T>(f: impl FnOnce(&dyn Fn(&str) -> Option<String>) -> T) -> T {
+    let store_cell: std::cell::OnceCell<Option<dc_store::Store>> = std::cell::OnceCell::new();
+    let lookup = |run_id: &str| -> Option<String> {
+        let store = store_cell
+            .get_or_init(|| {
+                let path = task_profile_path().ok()?;
+                if !path.exists() {
+                    return None;
+                }
+                let mut store = dc_store::Store::open_readonly(&path).ok()?;
+                store.refuse_workbench_upgrades();
+                Some(store)
+            })
+            .as_ref()?;
+        let raw = store
+            .workbench_request("runs.get", &json!({ "id": run_id }).to_string())
+            .ok()?;
+        let res: Value = serde_json::from_str(&raw).ok()?;
+        res.get("item")
+            .and_then(|item| item.get("task_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    f(&lookup)
+}
+
 #[cfg(not(test))]
 fn task_profile_path() -> Result<std::path::PathBuf, String> {
     crate::workbench::intake::default_profile_path().map_err(|e| e.message)
@@ -3649,6 +3755,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             Ok(with_production_retry(|retry| {
                 read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
+        }
+        "gitpulse_sessions" => {
+            let a: SessionsArgs = parse(name, arguments)?;
+            let report = with_sessions_run_lookup(|lookup| {
+                insights::sessions(&a.repo_path, a.limit, lookup)
+            })?;
+            serde_json::to_value(report).map_err(|e| format!("serialize sessions report: {e}"))
         }
         "gitpulse_status" => {
             let a: RepoArgs = parse(name, arguments)?;
@@ -10621,6 +10734,7 @@ mod tests {
         use devmap_parity as dm;
         rows![
             ("gitpulse_insights", RepoArgs),
+            ("gitpulse_sessions", SessionsArgs),
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
             ("gitpulse_collision_risk", CollisionRiskArgs),
@@ -10752,6 +10866,7 @@ mod tests {
             use devmap_parity as dm;
             rows![
                 ("gitpulse_insights", RepoArgs),
+                ("gitpulse_sessions", SessionsArgs),
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
                 ("gitpulse_collision_risk", CollisionRiskArgs),
