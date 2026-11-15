@@ -364,6 +364,75 @@
       "reason": "no injection point exists between the object write and the ref write"
     },
     {
+      "id": "OPSLOG-SNAPSHOT-ASKER-DEADLINE-BEFORE-REF",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "the repository as it stands when the asker's op-snapshot deadline passes, which is when the hook lets the agent's git write run; the hook's own row, written as \"unknown\" when the request was sent and went unanswered",
+        "notYetWritten": "the snapshot ref and its snapshotted ledger row"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "no hook name: record_op_snapshot_with_limits_asked takes an OpAsk whose AskerDeadline reads a clock the test scripts call by call (before the lock, after it, before the ref), so each point is chosen rather than raced; the lock-held tests hold repo_mutation_lock until the asker has passed its first check",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "a_deadline_that_passed_before_the_lock_refuses_with_no_ref_and_no_snapshotted_row"
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "the_lock_held_past_the_deadline_leaves_no_snapshot_when_it_is_released"
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "a_deadline_that_passed_after_the_state_was_read_writes_no_ref_and_no_snapshotted_row"
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "an_answer_exactly_at_the_deadline_has_missed_it"
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "a_second_request_that_waited_out_the_first_is_refused_while_the_first_stands"
+        },
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "serving_a_request_received_too_long_ago_answers_the_deadline_and_logs_it_under_the_id"
+        },
+        {
+          "file": "src-tauri/src/hooks/mod.rs",
+          "name": "a_sent_but_unanswered_snapshot_is_unknown_and_the_apps_late_refusal_settles_it",
+          "cfg": [
+            "target_os=\"macos\""
+          ]
+        }
+      ],
+      "recovery": "the app refuses: no ref and no snapshotted row, an unsnapshotted row naming the passed deadline under the request id, and the reply says so; the hook's \"unknown\" row for the same id and the agent's notice (outcome unknown, not unrecoverable) are settled by it. The state the app had read is a commit object no ref reaches, which git gc collects",
+      "status": "covered"
+    },
+    {
+      "id": "OPSLOG-SNAPSHOT-STATE-IN-TIME-REF-AFTER-DEADLINE",
+      "path": "ops-log",
+      "boundary": {
+        "durableBefore": "the repository state read and checked against the asker's deadline immediately before the ref is written",
+        "notYetWritten": "the snapshot ref and its ledger row, which may land after the deadline"
+      },
+      "injection": {
+        "kind": "state",
+        "detail": "the same scripted clock; its readings after the last check are past the deadline, and the test asserts the code read the clock exactly three times so nothing after the ref can change the outcome",
+        "hooks": []
+      },
+      "tests": [
+        {
+          "file": "src-tauri/src/engine/git_writer_op_deadline_tests.rs",
+          "name": "state_captured_in_time_is_a_normal_snapshot_however_late_the_write_finishes"
+        }
+      ],
+      "recovery": "the snapshot is a true pre-op state, kept as a normal one with the request id in its row; there are no late-marked refs, because the undo list reads refs and never the ledger",
+      "status": "covered"
+    },
+    {
       "id": "OPSLOG-SNAPSHOT-REF-BEFORE-PRUNE",
       "path": "ops-log",
       "boundary": {

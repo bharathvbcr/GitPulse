@@ -2392,3 +2392,145 @@ fn turn_checkpoints_have_their_own_small_cap_and_never_starve_a_gate_request() {
         .record_turn_checkpoint(&req("c-after"), Duration::from_secs(10));
     assert!(after.is_ok(), "{after:?}");
 }
+
+fn op_request(id: &str) -> Request {
+    Request::RecordGitOp {
+        id: id.into(),
+        cwd: "/".into(),
+        command: "git reset --hard HEAD".into(),
+        session_id: Some("s-1".into()),
+        task_id: None,
+    }
+}
+
+/// The request an installed app has always understood. The enum refuses
+/// unknown fields, so a newer hook that added one would make every git write
+/// of an older app "unsnapshotted"; this is what keeps the wire the same.
+#[test]
+fn the_record_git_op_request_keeps_the_fields_it_has_always_had() {
+    let envelope = Envelope {
+        v: PROTOCOL,
+        request: op_request("op-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(&envelope).unwrap(),
+        serde_json::json!({
+            "v": 1,
+            "request": {
+                "kind": "record_git_op",
+                "id": "op-1",
+                "cwd": "/",
+                "command": "git reset --hard HEAD",
+                "session_id": "s-1",
+            }
+        })
+    );
+    let with_task = Request::RecordGitOp {
+        id: "op-2".into(),
+        cwd: "/".into(),
+        command: "git reset --hard HEAD".into(),
+        session_id: None,
+        task_id: Some("t-1".into()),
+    };
+    let wire = serde_json::to_value(&with_task).unwrap();
+    let mut keys: Vec<&str> = wire
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["command", "cwd", "id", "kind", "task_id"]);
+    assert_eq!(PROTOCOL, 1, "the protocol version is not bumped for this");
+
+    // The reason the shape is frozen: a field this build does not know is refused.
+    let extra = r#"{"kind":"record_git_op","id":"x","cwd":"/","command":"c","deadline_ms":2000}"#;
+    assert!(serde_json::from_str::<Request>(extra).is_err());
+}
+
+#[test]
+fn the_op_budget_is_one_constant_the_hook_and_the_app_both_read() {
+    assert_eq!(OP_RECORD_DEADLINE, Duration::from_secs(2));
+}
+
+#[test]
+fn an_op_record_exchange_says_how_far_it_got() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let connect = || Secondary::connect(&socket).ok().expect("reach the owner");
+    let within = Duration::from_secs(5);
+
+    // Nothing attached: the owner reads the request and refuses it.
+    let sent = AtomicBool::new(false);
+    let refused = connect()
+        .record_git_op(&op_request("op-a"), within, &sent)
+        .expect_err("refused");
+    assert_eq!(refused.reached, Reached::Refused, "{refused:?}");
+    assert!(sent.load(Ordering::Acquire), "a refusal is after the send");
+
+    // A request that is not an op record never leaves.
+    let sent = AtomicBool::new(false);
+    let never = connect()
+        .record_git_op(&gate_request("g-1"), within, &sent)
+        .expect_err("not an op request");
+    assert_eq!(never.reached, Reached::NotSent);
+    assert!(!sent.load(Ordering::Acquire));
+
+    // An invalid request is refused before anything is written.
+    let sent = AtomicBool::new(false);
+    let invalid = connect()
+        .record_git_op(&op_request(""), within, &sent)
+        .expect_err("empty id");
+    assert_eq!(invalid.reached, Reached::NotSent, "{invalid:?}");
+    assert!(!sent.load(Ordering::Acquire));
+
+    // The sink gets the instant the mailbox received the request.
+    let received = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&received);
+    owner.attach_op_recorder(Arc::new(move |_, at| {
+        *seen.lock().unwrap() = Some(at);
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+    let before = Instant::now();
+    let sent = AtomicBool::new(false);
+    let reply = connect()
+        .record_git_op(&op_request("op-b"), within, &sent)
+        .expect("answered");
+    assert_eq!(reply["snapshotted"], true);
+    let at = received
+        .lock()
+        .unwrap()
+        .expect("the sink was handed the receipt");
+    assert!(at >= before && at <= Instant::now());
+    drop(owner);
+}
+
+#[test]
+fn an_op_record_that_goes_unanswered_after_the_send_is_sent_unanswered() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    // The sink holds the answer until the test lets it go, so the asker's read
+    // deadline is what ends the exchange: no timing decides the outcome.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    owner.attach_op_recorder(Arc::new(move |_, _| {
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+    let sent = AtomicBool::new(false);
+    let unanswered = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_git_op(&op_request("op-c"), Duration::from_millis(1500), &sent)
+        .expect_err("no answer in time");
+    assert_eq!(
+        unanswered.reached,
+        Reached::SentUnanswered,
+        "{unanswered:?}"
+    );
+    assert!(sent.load(Ordering::Acquire));
+    release_tx.send(()).unwrap();
+    drop(owner);
+}

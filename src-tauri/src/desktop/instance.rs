@@ -49,6 +49,12 @@ pub const SOCKET_FILE: &str = "instance.sock";
 /// Bumped on any incompatible change to the frames below. A launch that meets
 /// an owner speaking another version still never starts a second instance.
 const PROTOCOL: u32 = 1;
+/// How long a hook waits for the app's answer to [`Request::RecordGitOp`], and
+/// so how long the app has, from the moment it receives that request, before
+/// its asker has stopped waiting. The one budget both sides read: the hook
+/// waits on it, and the app refuses to capture state once it has passed. Not a
+/// request field, so the wire shape is unchanged.
+pub const OP_RECORD_DEADLINE: Duration = Duration::from_secs(2);
 /// Every frame is one JSON line no longer than this: room for [`MAX_PATHS`]
 /// paths of [`MAX_PATH_BYTES`] even when every byte is a control character
 /// JSON spells as six (`\u0001`). `forward` checks the encoded size anyway,
@@ -217,6 +223,13 @@ pub enum Request {
     /// Asks the app owner to snapshot `refs/heads`, `refs/tags`, and
     /// `git stash create` under `refs/gitpulse/ops/<n>` before a gated agent
     /// git write proceeds; answered synchronously on the connection.
+    ///
+    /// The asker waits [`OP_RECORD_DEADLINE`] and then lets the write run; the
+    /// app measures that budget from receipt and captures nothing after it.
+    /// The fields below are the wire contract with every installed app: the
+    /// enum refuses unknown fields, so a field added here would make a newer
+    /// hook's request fail against an older app. See
+    /// `the_record_git_op_request_keeps_the_fields_it_has_always_had`.
     RecordGitOp {
         id: String,
         cwd: String,
@@ -973,15 +986,30 @@ impl Secondary {
 
     /// Asks the owner to snapshot refs and working-tree changes before a gated
     /// agent git write proceeds: the owner's reply to [`Request::RecordGitOp`].
+    ///
+    /// The failure says how far the exchange got ([`Reached`]), because only a
+    /// request that was sent and then went unanswered leaves the app's
+    /// snapshot outcome unknown. `sent` is set the moment the whole request is
+    /// written, so a caller that abandons this call from outside (its own
+    /// budget) still knows whether the request left.
     pub fn record_git_op(
         self,
         request: &Request,
         within: Duration,
-    ) -> Result<serde_json::Value, String> {
+        sent: &AtomicBool,
+    ) -> Result<serde_json::Value, AskFailure> {
         if !matches!(request, Request::RecordGitOp { .. }) {
-            return Err("not an op-record request".into());
+            return Err(AskFailure::not_sent("not an op-record request"));
         }
-        self.answered(request, within)
+        let id = request.answered_id().ok_or_else(|| {
+            AskFailure::not_sent("this request is not answered on its connection")
+        })?;
+        let ack = self.exchange_reaching(request, within, Some(sent))?;
+        if ack.id.as_deref() != Some(id) {
+            return Err(AskFailure::unanswered("the answer names another request"));
+        }
+        ack.reply
+            .ok_or_else(|| AskFailure::unanswered("the answer carries no verdict"))
     }
 
     /// Asks the owner to take a turn checkpoint: the owner's reply to
@@ -1009,30 +1037,92 @@ impl Secondary {
             .ok_or_else(|| "the answer carries no verdict".into())
     }
 
-    fn exchange(mut self, request: &Request, within: Duration) -> Result<Ack, String> {
-        request.validate()?;
+    fn exchange(self, request: &Request, within: Duration) -> Result<Ack, String> {
+        self.exchange_reaching(request, within, None)
+            .map_err(|failure| failure.why)
+    }
+
+    /// [`Self::exchange`] saying how far it got when it failed. `sent` is set
+    /// right after the request is completely written.
+    fn exchange_reaching(
+        mut self,
+        request: &Request,
+        within: Duration,
+        sent: Option<&AtomicBool>,
+    ) -> Result<Ack, AskFailure> {
+        request.validate().map_err(AskFailure::not_sent)?;
         self.stream
             .set_read_timeout(Some(within))
             .and_then(|()| self.stream.set_write_timeout(Some(within)))
-            .map_err(|error| format!("timeouts: {error}"))?;
+            .map_err(|error| AskFailure::not_sent(format!("timeouts: {error}")))?;
         let envelope = Envelope {
             v: PROTOCOL,
             request: request.clone(),
         };
-        let encoded = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_vec(&envelope)
+            .map_err(|error| AskFailure::not_sent(error.to_string()))?;
         if encoded.len() > MAX_FRAME {
-            return Err(format!(
+            return Err(AskFailure::not_sent(format!(
                 "request is {} bytes; frames carry {MAX_FRAME}",
                 encoded.len()
-            ));
+            )));
         }
-        write_frame(&mut self.stream, &envelope)?;
-        let line = read_frame(&mut self.reader)?.ok_or("the owner closed without an answer")?;
-        let ack: Ack = serde_json::from_str(&line).map_err(|error| format!("answer: {error}"))?;
+        // A frame cut short by a failed write has no newline, so the owner
+        // reads it as no request at all: a failed write is "never sent".
+        write_frame(&mut self.stream, &envelope).map_err(AskFailure::not_sent)?;
+        if let Some(sent) = sent {
+            sent.store(true, Ordering::Release);
+        }
+        let line = read_frame(&mut self.reader)
+            .map_err(AskFailure::unanswered)?
+            .ok_or_else(|| AskFailure::unanswered("the owner closed without an answer"))?;
+        let ack: Ack = serde_json::from_str(&line)
+            .map_err(|error| AskFailure::unanswered(format!("answer: {error}")))?;
         if ack.accepted {
             Ok(ack)
         } else {
-            Err(ack.reason.unwrap_or_else(|| "refused".into()))
+            Err(AskFailure {
+                reached: Reached::Refused,
+                why: ack.reason.unwrap_or_else(|| "refused".into()),
+            })
+        }
+    }
+}
+
+/// How far an exchange with the owner got before it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    /// The request was never completely written: the owner cannot have acted
+    /// on it.
+    NotSent,
+    /// The owner read the request and answered that it refused it. A refusal
+    /// is written before the request's work is attempted.
+    Refused,
+    /// The request was completely written and no usable answer came back: a
+    /// timeout, a read error or an owner that closed. The owner may or may not
+    /// have acted.
+    SentUnanswered,
+}
+
+/// Why an exchange failed, and how far it got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskFailure {
+    pub reached: Reached,
+    pub why: String,
+}
+
+impl AskFailure {
+    pub fn not_sent(why: impl Into<String>) -> Self {
+        Self {
+            reached: Reached::NotSent,
+            why: why.into(),
+        }
+    }
+
+    fn unanswered(why: impl Into<String>) -> Self {
+        Self {
+            reached: Reached::SentUnanswered,
+            why: why.into(),
         }
     }
 }
@@ -1066,7 +1156,10 @@ pub type OrchestrateSink = Arc<
 /// Delivers an A2A peer message or kickoff spawn for an MCP process.
 pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 /// Snapshots pre-op refs and `git stash create` under `refs/gitpulse/ops/<n>`.
-pub type OpRecordSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
+/// The instant is when the mailbox received the request: the asker's
+/// [`OP_RECORD_DEADLINE`] runs from it.
+pub type OpRecordSink =
+    Arc<dyn Fn(&Request, Instant) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// Takes a turn checkpoint (`refs/gitpulse/turns/<key>/<stamp>`).
 pub type TurnCheckpointSink =
@@ -1668,7 +1761,7 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
         });
     }
     if let Request::RecordGitOp { id, .. } = &request {
-        return answer_op_record(stream, shared, id, &request).map_err(Ended::Refused);
+        return answer_op_record(stream, shared, id, &request, started).map_err(Ended::Refused);
     }
     if let Request::RecordTurnCheckpoint { id, .. } = &request {
         return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {
@@ -1762,9 +1855,10 @@ fn answer_op_record(
     shared: &Shared,
     id: &str,
     request: &Request,
+    received: Instant,
 ) -> Result<(), String> {
     answer_asked(stream, shared, id, "the op log", || {
-        attached(&shared.op_record, "the op log")?(request)
+        attached(&shared.op_record, "the op log")?(request, received)
     })
 }
 

@@ -111,8 +111,8 @@ pub fn establish() -> Launch {
                 }));
                 // App-side git operation log snapshots (`refs/gitpulse/ops/*`)
                 // requested over the mailbox by the decide-only command-gate hook.
-                primary.attach_op_recorder(std::sync::Arc::new(|request| {
-                    crate::engine::GitWriter::serve_op_record(request)
+                primary.attach_op_recorder(std::sync::Arc::new(|request, received| {
+                    crate::engine::GitWriter::serve_op_record(request, received)
                 }));
                 // Turn checkpoints (`refs/gitpulse/turns/*`) requested by the
                 // decide-only hook at turn boundaries, when the user enabled them.

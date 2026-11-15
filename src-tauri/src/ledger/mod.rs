@@ -5510,6 +5510,11 @@ fn read_fleet_languages(
 pub const OP_UNDO_ACTION: &str = "git.op.undo";
 pub const OP_SNAPSHOT_OK: &str = "snapshotted";
 pub const OP_UNSNAPSHOTTED: &str = "unsnapshotted";
+/// The hook sent its snapshot request and no usable answer came back: the app
+/// may or may not have recorded a snapshot. Distinct from [`OP_UNSNAPSHOTTED`],
+/// which says none was taken. Carried in the row's detail and object; it is not
+/// an [`Outcome`] variant, so nothing that crosses the IPC boundary changes.
+pub const OP_SNAPSHOT_UNKNOWN: &str = "unknown";
 
 fn split_shell_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
@@ -5968,6 +5973,7 @@ pub fn record_op_snapshot_event(
     stash_oid: Option<&str>,
     ref_count: usize,
     prune_error: Option<&str>,
+    request_id: Option<&str>,
     now_ms: u64,
 ) -> Option<i64> {
     let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
@@ -5982,6 +5988,10 @@ pub fn record_op_snapshot_event(
     // The snapshot is real; only retention failed. Present only when it did.
     if let (Some(error), Some(fields)) = (prune_error, detail.as_object_mut()) {
         fields.insert("prune_error".to_string(), error.into());
+    }
+    // Ties this row to the hook's own row for the same write.
+    if let (Some(id), Some(fields)) = (request_id, detail.as_object_mut()) {
+        fields.insert("request_id".to_string(), id.into());
     }
     let detail_json = serde_json::to_string(&detail).ok();
     record(Draft {
@@ -6008,7 +6018,9 @@ pub fn record_op_snapshot_event(
 
 /// Appends the command's ledger row when taking the pre-op snapshot failed or
 /// could not reach the app recorder, recording `"unsnapshotted"` so the loss
-/// is never silent.
+/// is never silent. `request_id` is the mailbox request's id, shared by the
+/// app's and the hook's rows for the same write.
+#[allow(clippy::too_many_arguments)]
 pub fn record_unsnapshotted_git_op(
     repo_path: &str,
     command: &str,
@@ -6016,15 +6028,76 @@ pub fn record_unsnapshotted_git_op(
     task_id: Option<&str>,
     before_ref: Option<&str>,
     error: &str,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    record_op_failure_row(
+        OP_UNSNAPSHOTTED,
+        repo_path,
+        command,
+        session_id,
+        task_id,
+        before_ref,
+        error,
+        request_id,
+        now_ms,
+    )
+}
+
+/// Appends the hook's row when its snapshot request was sent and no usable
+/// answer came back: `"unknown"`, never `"unsnapshotted"`, because the app may
+/// have recorded a snapshot (one captured before the asker's deadline). The
+/// app's own row for the same `request_id` settles it either way.
+#[allow(clippy::too_many_arguments)]
+pub fn record_unknown_snapshot_git_op(
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    reason: &str,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    record_op_failure_row(
+        OP_SNAPSHOT_UNKNOWN,
+        repo_path,
+        command,
+        session_id,
+        task_id,
+        before_ref,
+        reason,
+        request_id,
+        now_ms,
+    )
+}
+
+/// The one body of the op log's rows that confirm no snapshot. `state` is both
+/// the row's `object` and its detail's `snapshot`. The outcome stays `failed`
+/// for both: `Outcome` crosses the IPC boundary, so "unknown" lives in the
+/// detail, and a row that confirms nothing must not read as a success.
+#[allow(clippy::too_many_arguments)]
+fn record_op_failure_row(
+    state: &str,
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    error: &str,
+    request_id: Option<&str>,
     now_ms: u64,
 ) -> Option<i64> {
     let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
-    let detail_json = serde_json::to_string(&serde_json::json!({
+    let mut detail = serde_json::json!({
         "source": "op_log",
-        "snapshot": OP_UNSNAPSHOTTED,
+        "snapshot": state,
         "snapshot_error": error,
-    }))
-    .ok();
+    });
+    if let (Some(id), Some(fields)) = (request_id, detail.as_object_mut()) {
+        fields.insert("request_id".to_string(), id.into());
+    }
+    let detail_json = serde_json::to_string(&detail).ok();
     record(Draft {
         repo_path: anchor,
         worktree_path: worktree,
@@ -6036,7 +6109,7 @@ pub fn record_unsnapshotted_git_op(
             .map(str::to_string),
         task_id: resolved_task,
         action: action_for_git_command(command),
-        object: Some(OP_UNSNAPSHOTTED.to_string()),
+        object: Some(state.to_string()),
         argv_json: serde_json::to_string(&[command]).ok(),
         outcome: Some(Outcome::Failed),
         before_ref: before_ref.map(str::to_string),
