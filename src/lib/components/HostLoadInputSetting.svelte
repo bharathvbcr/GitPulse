@@ -127,7 +127,7 @@
             min="0"
             max={spec.rule.max}
             step={spec.rule.step}
-            class="gp-field text-meta w-20 text-right" data-size="sm"
+            class="gp-field text-meta w-24 text-right" data-size="sm"
             data-testid={`host-load-input-${input}-${which}`}
             disabled={busy || !settings?.enabled || (which === "severe_at" && stored.mode !== "refuse")}
             value={stored[which]}
