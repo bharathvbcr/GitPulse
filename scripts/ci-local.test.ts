@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -12,7 +13,18 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GATES, cargoMetadata, commandLine, main, productionScratchContext, runGates, skipReason, summarize } from "./ci-local.mjs";
+import {
+  GATES,
+  cargoMetadata,
+  cleanupProblem,
+  commandLine,
+  main,
+  productionScratchContext,
+  runGates,
+  skipReason,
+  summarize,
+  wantsKeep,
+} from "./ci-local.mjs";
 
 /**
  * The local gate has to be told what actually runs remotely, or it drifts into
@@ -331,7 +343,9 @@ const READER = gate("reader", { reads: ["lcov.info"] });
 const OTHER = gate("other");
 
 const ok = { ok: true, detail: "exit 0", ms: 1 };
-const bad = { ok: false, detail: "exit 101", ms: 1 };
+const bad = { ok: false, detail: "exit 101", ms: 1, exitCode: 101 };
+// The machine's cargo slot gate giving up: cargo never ran.
+const noSlot = { ok: false, detail: "exit 75", ms: 1, exitCode: 75 };
 
 let root: string;
 let outside: string;
@@ -362,6 +376,7 @@ const scratchOptions = (env: Record<string, string> = {}, cargoMetadata = metada
   env,
   cargoMetadata,
   home: join(outside, "home"),
+  listProcesses: () => "",
 });
 
 const run = (
@@ -491,10 +506,11 @@ describe("the coverage build is removed once nothing needs it", () => {
     expect(report).toContain("2 passed");
   });
 
-  it("says plainly when there was nothing to remove", () => {
-    const { outcomes, report } = run([OWNER]);
+  it("says plainly when a gate that did not pass left nothing to remove", () => {
+    const { outcomes, report } = run([OWNER], { results: { owner: bad } });
     expect(firstCleanup(outcomes).status).toBe("absent");
     expect(report).toMatch(/nothing to remove/i);
+    expect(report).not.toMatch(/NOT REMOVED/);
   });
 });
 
@@ -509,9 +525,22 @@ describe("keeping the build for an incremental rebuild", () => {
     expect(report).toContain(KEEP);
   });
 
-  it.each(["0", "false", ""])("treats %j as not asking to keep it", (value) => {
+  it.each(["0", "false", "", "no", "2", "off"])("treats %j as not asking to keep it", (value) => {
     run([OWNER], { env: { [KEEP]: value }, onRun: (id) => id === "owner" && plant(defaultDir()) });
     expect(existsSync(defaultDir())).toBe(false);
+  });
+});
+
+describe("what counts as asking to keep it", () => {
+  it.each(["1", "true", "TRUE", "yes", "Yes"])("keeps on %j", (value) => {
+    expect(wantsKeep(value)).toBe(true);
+  });
+  it.each([undefined, "", "0", "false", "no", "2", "keep"])("does not keep on %j", (value) => {
+    expect(wantsKeep(value)).toBe(false);
+  });
+  it("keeps the directory on yes, as --help says", () => {
+    run([OWNER], { env: { [KEEP]: "yes" }, onRun: (id) => id === "owner" && plant(defaultDir()) });
+    expect(existsSync(defaultDir())).toBe(true);
   });
 });
 
@@ -535,7 +564,7 @@ describe("the directory deleted is the one the coverage build used", () => {
     run([OWNER], {
       env: { CARGO_TARGET_DIR: moved },
       cargoMetadata: metadata(moved),
-      onRun: () => plant(join(moved, "llvm-cov-target")),
+      onRun: () => plant(join(moved, "llvm-cov-target"), { "CACHEDIR.TAG": "x", "debug/x": "x" }),
     });
     expect(existsSync(join(moved, "llvm-cov-target"))).toBe(false);
   });
@@ -573,7 +602,23 @@ describe("the directory deleted is the one the coverage build used", () => {
     expect(existsSync(join(root, "tgt", "llvm-cov-target"))).toBe(false);
   });
 
-  it("leaves CARGO_LLVM_COV_BUILD_DIR alone when cargo's build-dir is not configured, as the build never used it", () => {
+  // `cargo metadata` cannot tell "build-dir not configured" from "configured to the target's own path",
+  // so with both variables set and no difference in metadata, the build directory is optional: it goes
+  // only if this run wrote it, and a stale one is left alone without a warning.
+  it("leaves a stale CARGO_LLVM_COV_BUILD_DIR alone when cargo shows no separate build-dir, without a warning", () => {
+    const build = join(root, "build-scratch", "llvm-cov-target");
+    plant(build, { "stale.bin": "old" });
+    const { outcomes, report } = run([OWNER], {
+      env: BUILD_ENV,
+      onRun: () => plant(join(root, "tgt", "llvm-cov-target")),
+    });
+    expect(existsSync(join(root, "tgt", "llvm-cov-target"))).toBe(false);
+    expect(existsSync(build)).toBe(true);
+    expect(outcomes[0].cleanups?.some(cleanupProblem)).toBe(false);
+    expect(report).not.toMatch(/NOT REMOVED/);
+  });
+
+  it("removes CARGO_LLVM_COV_BUILD_DIR when this run wrote it even though cargo shows no separate build-dir", () => {
     const build = join(root, "build-scratch", "llvm-cov-target");
     run([OWNER], {
       env: BUILD_ENV,
@@ -582,8 +627,7 @@ describe("the directory deleted is the one the coverage build used", () => {
         plant(build);
       },
     });
-    expect(existsSync(join(root, "tgt", "llvm-cov-target"))).toBe(false);
-    expect(existsSync(build)).toBe(true);
+    expect(existsSync(build)).toBe(false);
   });
 
   it("leaves CARGO_LLVM_COV_BUILD_DIR alone when CARGO_LLVM_COV_TARGET_DIR is not set, as the build never read it", () => {
@@ -681,20 +725,28 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
     expect(first(outcomes).status).toBe("refused");
   });
 
-  it("does not delete the real home directory when none is injected", () => {
-    const { outcomes } = (() => {
-      const lines: string[] = [];
-      const outcomes = runGates([OWNER], {
-        platform: "darwin",
-        root,
-        log: (l) => lines.push(l),
-        scratch: { env: { CARGO_LLVM_COV_TARGET_DIR: homedir() }, cargoMetadata: metadata() },
-        run: () => ok,
-      });
-      return { outcomes };
-    })();
-    expect(existsSync(homedir())).toBe(true);
+  it("refuses the real home directory before any delete is attempted", () => {
+    // The production delete path with the real $HOME, so `remove` is a stub that fails the test: a
+    // regression here must never be able to delete the home directory.
+    const removed: string[] = [];
+    const outcomes = runGates([OWNER], {
+      platform: "darwin",
+      root,
+      log: () => {},
+      scratch: {
+        env: { CARGO_LLVM_COV_TARGET_DIR: homedir() },
+        cargoMetadata: metadata(),
+        listProcesses: () => "",
+        remove: (dir) => {
+          removed.push(dir);
+          throw new Error(`refusing to let a test delete ${dir}`);
+        },
+      },
+      run: () => ok,
+    });
+    expect(removed).toEqual([]);
     expect(first(outcomes).status).toBe("refused");
+    expect(existsSync(homedir())).toBe(true);
   });
 
   it("does not delete outside the repository when only a config file moved the target", () => {
@@ -722,11 +774,20 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
     expect(first(outcomes).status).toBe("refused");
   });
 
-  it("refuses a variable that is set but empty", () => {
-    plant(defaultDir());
-    const { outcomes } = run([OWNER], { env: { CARGO_LLVM_COV_TARGET_DIR: "" } });
-    expect(existsSync(defaultDir())).toBe(true);
-    expect(first(outcomes).status).toBe("refused");
+  // cargo-llvm-cov v0.9.1 src/env.rs `var()` returns None for an empty value: empty is unset.
+  it("reads an empty CARGO_LLVM_COV_TARGET_DIR as unset, as cargo-llvm-cov does, and cleans the default", () => {
+    run([OWNER], { env: { CARGO_LLVM_COV_TARGET_DIR: "" }, onRun: (id) => id === "owner" && plant(defaultDir()) });
+    expect(existsSync(defaultDir())).toBe(false);
+  });
+
+  it("reads an empty CARGO_LLVM_COV_BUILD_DIR as unset beside a named target directory", () => {
+    const named = join(root, "tgt", "llvm-cov-target");
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: "tgt/llvm-cov-target", CARGO_LLVM_COV_BUILD_DIR: "" },
+      onRun: (id) => id === "owner" && plant(named),
+    });
+    expect(existsSync(named)).toBe(false);
+    expect(first(outcomes).status).toBe("removed");
   });
 
   it("deletes nothing and fails loudly when the location cannot be resolved", () => {
@@ -743,7 +804,6 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
   });
 
   it("reports a failed removal as failed, never as removed", () => {
-    plant(defaultDir());
     const lines: string[] = [];
     const outcomes = runGates([OWNER], {
       platform: "darwin",
@@ -755,7 +815,10 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
           throw new Error("EBUSY");
         },
       },
-      run: () => ok,
+      run: () => {
+        plant(defaultDir());
+        return ok;
+      },
     });
     expect(first(outcomes).status).toBe("failed");
     expect(summarize(outcomes)).toMatch(/NOT REMOVED/);
@@ -765,6 +828,295 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
   it("does not let a refused cleanup turn a passing gate into a failing one", () => {
     const { outcomes } = run([OWNER], { cargoMetadata: metadata(join(outside, "t")) });
     expect(outcomes[0].status).toBe("passed");
+  });
+});
+
+describe("a path with .. in it is not guessed at", () => {
+  // cargo-llvm-cov joins the raw string and the OS resolves `..` through symlinks; path.resolve would
+  // collapse it as text and name a different directory.
+  const setup = () => {
+    const deep = join(outside, "elsewhere", "deep");
+    mkdirSync(deep, { recursive: true });
+    symlinkSync(deep, join(root, "link"));
+    const lexical = join(root, "llvm-cov-target");
+    const physical = join(outside, "elsewhere", "llvm-cov-target");
+    plant(lexical, { "unrelated.txt": "not this build" });
+    plant(physical, { "CACHEDIR.TAG": "x", "real-build.bin": "x" });
+    return { lexical, physical };
+  };
+
+  it("refuses CARGO_LLVM_COV_TARGET_DIR=link/../llvm-cov-target and deletes neither directory", () => {
+    const { lexical, physical } = setup();
+    const { outcomes, report } = run([OWNER], { env: { CARGO_LLVM_COV_TARGET_DIR: "link/../llvm-cov-target" } });
+    expect(readFileSync(join(lexical, "unrelated.txt"), "utf8")).toBe("not this build");
+    expect(existsSync(join(physical, "real-build.bin"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(report).toMatch(/NOT REMOVED/);
+    expect(report).toContain('".." component');
+  });
+
+  it("refuses a CARGO_LLVM_COV_BUILD_DIR with .. in it as well", () => {
+    const { lexical } = setup();
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: "tgt/llvm-cov-target", CARGO_LLVM_COV_BUILD_DIR: "link/../llvm-cov-target" },
+      cargoMetadata: metadata(join(root, "src-tauri", "target"), join(root, "cargo-build")),
+      onRun: () => plant(join(root, "tgt", "llvm-cov-target")),
+    });
+    expect(readFileSync(join(lexical, "unrelated.txt"), "utf8")).toBe("not this build");
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+
+  it("refuses a CARGO_TARGET_DIR with .. in it rather than trust where it leads", () => {
+    const { physical } = setup();
+    const moved = join(outside, "shared");
+    plant(join(moved, "llvm-cov-target"), { "CACHEDIR.TAG": "x" });
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_TARGET_DIR: `${outside}/shared/../shared` },
+      cargoMetadata: metadata(moved),
+      onRun: () => writeFileSync(join(moved, "llvm-cov-target", "new.bin"), "n"),
+    });
+    expect(existsSync(join(moved, "llvm-cov-target", "new.bin"))).toBe(true);
+    expect(existsSync(join(physical, "real-build.bin"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+});
+
+describe("outside the repository a regular cargo target is never deleted, whatever names it", () => {
+  it("refuses a sibling worktree's target that merely holds CACHEDIR.TAG", () => {
+    const sibling = join(outside, "sibling", "src-tauri", "target");
+    plant(sibling, { "CACHEDIR.TAG": "x", "debug/.fingerprint/a": "a", "debug/gitpulse": "regular build" });
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: sibling },
+      onRun: () => writeFileSync(join(sibling, "touched-by-this-run"), "t"),
+    });
+    expect(existsSync(join(sibling, "debug", "gitpulse"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+
+  it("refuses an outside directory not named llvm-cov-target even with markers and no profile directories", () => {
+    const named = join(outside, "cov");
+    plant(named, { "CACHEDIR.TAG": "x", "x.bin": "x" });
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: named },
+      onRun: () => writeFileSync(join(named, "y.bin"), "y"),
+    });
+    expect(existsSync(join(named, "x.bin"))).toBe(true);
+    expect(firstCleanup(outcomes).detail).toMatch(/named llvm-cov-target/);
+  });
+
+  it("refuses an outside llvm-cov-target that holds no cargo marker", () => {
+    const named = join(outside, "llvm-cov-target");
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: named },
+      onRun: () => plant(named, { "x.bin": "x" }),
+    });
+    expect(existsSync(join(named, "x.bin"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+
+  it("refuses an in-repository directory that looks like a regular cargo target", () => {
+    const named = join(root, "build", "cov");
+    const { outcomes } = run([OWNER], {
+      env: { CARGO_LLVM_COV_TARGET_DIR: "build/cov" },
+      onRun: () => plant(named, { "CACHEDIR.TAG": "x", "debug/.fingerprint/a": "a" }),
+    });
+    expect(existsSync(join(named, "debug", ".fingerprint", "a"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+});
+
+describe("only a build this run wrote is deleted", () => {
+  const shared = () => join(outside, "shared-target");
+  const sharedBuild = () => join(shared(), "llvm-cov-target");
+  const sharedOptions = (extra: { results?: Record<string, typeof ok>; onRun?: (id: string) => void } = {}) => ({
+    env: { CARGO_TARGET_DIR: shared() },
+    cargoMetadata: metadata(shared()),
+    ...extra,
+  });
+  const marked = { "CACHEDIR.TAG": "x", "debug/x.rlib": "x" };
+
+  it("leaves a directory that predates the run and did not change, and says why", () => {
+    plant(defaultDir());
+    const { outcomes, report } = run([OWNER]);
+    expect(existsSync(defaultDir())).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(report).toMatch(/predates this run/);
+    expect(report).toMatch(/NOT REMOVED/);
+  });
+
+  it("deletes a directory that predates the run when the run changed it", () => {
+    plant(defaultDir());
+    run([OWNER], { onRun: (id) => id === "owner" && writeFileSync(join(defaultDir(), "debug", "new.profraw"), "n") });
+    expect(existsSync(defaultDir())).toBe(false);
+  });
+
+  it("leaves another run's live shared directory when this gate never ran cargo (slot gate exit 75)", () => {
+    plant(sharedBuild(), marked);
+    const { outcomes, report } = run(
+      [OWNER],
+      sharedOptions({
+        results: { owner: noSlot },
+        // Another run is writing it while this one waits for a slot.
+        onRun: () => writeFileSync(join(sharedBuild(), "other-run.profraw"), "o"),
+      }),
+    );
+    expect(existsSync(join(sharedBuild(), "other-run.profraw"))).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(report).toMatch(/did not run cargo to completion/);
+  });
+
+  it("still cleans up after a gate that ran cargo and failed its tests", () => {
+    run([OWNER], { results: { owner: bad }, onRun: (id) => id === "owner" && plant(defaultDir()) });
+    expect(existsSync(defaultDir())).toBe(false);
+  });
+
+  it("does not clean up after a gate that threw before it could say whether cargo ran", () => {
+    expect(() =>
+      run([OWNER], {
+        onRun: (id) => {
+          plant(defaultDir());
+          if (id === "owner") throw new Error("runner blew up");
+        },
+      }),
+    ).toThrow("runner blew up");
+    expect(existsSync(defaultDir())).toBe(true);
+  });
+
+  it("deletes a shared directory this run created, when nothing live names it", () => {
+    const { outcomes } = run([OWNER], sharedOptions({ onRun: (id) => id === "owner" && plant(sharedBuild(), marked) }));
+    expect(existsSync(sharedBuild())).toBe(false);
+    expect(firstCleanup(outcomes).status).toBe("removed");
+  });
+});
+
+describe("a shared directory is not deleted while anything may be using it", () => {
+  const shared = () => join(outside, "shared-target");
+  const build = () => join(shared(), "llvm-cov-target");
+  const runShared = (listProcesses: () => string, remove?: (dir: string) => void) =>
+    runGates([OWNER], {
+      platform: "darwin",
+      root,
+      log: () => {},
+      scratch: {
+        env: { CARGO_TARGET_DIR: shared() },
+        cargoMetadata: metadata(shared()),
+        home: join(outside, "home"),
+        listProcesses,
+        ...(remove === undefined ? {} : { remove }),
+      },
+      run: () => {
+        plant(build(), { "CACHEDIR.TAG": "x", "debug/x.rlib": "x" });
+        return ok;
+      },
+    });
+
+  it("refuses when a process names the directory in its arguments", () => {
+    const outcomes = runShared(() => ` 123 /usr/bin/llvm-cov report --object ${build()}/debug/x\n 456 node other\n`);
+    expect(existsSync(build())).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(firstCleanup(outcomes).detail).toMatch(/live process/);
+  });
+
+  it("refuses when a process runs an executable from inside it", () => {
+    const outcomes = runShared(() => ` 99 ${build()}/debug/deps/gitpulse_lib-abc --nocapture\n`);
+    expect(existsSync(build())).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+  });
+
+  it("is not fooled into refusing by a longer sibling name, and ignores itself", () => {
+    const outcomes = runShared(() => ` 7 tail ${build()}2/log\n ${process.pid} node ${build()}\n`);
+    expect(firstCleanup(outcomes).status).toBe("removed");
+  });
+
+  it("refuses when ps cannot be read, since that is not proof it is unused", () => {
+    const outcomes = runShared(() => {
+      throw new Error("ps exited 1");
+    });
+    expect(existsSync(build())).toBe(true);
+    expect(firstCleanup(outcomes).status).toBe("refused");
+    expect(firstCleanup(outcomes).detail).toMatch(/could not be shown to be unused/);
+  });
+
+  it("refuses if the directory is swapped for another between the checks and the delete", () => {
+    const removed: string[] = [];
+    const outcomes = runShared(
+      () => {
+        // The last thing before the delete: another run replaces the directory.
+        renameSync(build(), `${build()}.old`);
+        plant(build(), { "CACHEDIR.TAG": "x", "other-runs.bin": "live" });
+        return "";
+      },
+      (dir) => removed.push(dir),
+    );
+    expect(removed).toEqual([]);
+    expect(existsSync(join(build(), "other-runs.bin"))).toBe(true);
+    expect(firstCleanup(outcomes).detail).toMatch(/changed identity/);
+  });
+});
+
+describe("a passing gate whose build cannot be found is a warning, not a quiet success", () => {
+  it("reports not-found with the prominence of a refusal, and in the NOT REMOVED line", () => {
+    const { outcomes, report } = run([OWNER]);
+    const done = firstCleanup(outcomes);
+    expect(done.status).toBe("not-found");
+    expect(cleanupProblem(done)).toBe(true);
+    expect(report).toMatch(/COVERAGE BUILD NOT REMOVED \(not-found\)/);
+    expect(report).toMatch(/1 scratch directory NOT REMOVED/);
+  });
+
+  it("logs it with the warning marker while the run is going", () => {
+    const { lines } = run([OWNER]);
+    expect(lines.join("\n")).toMatch(/! COVERAGE BUILD NOT REMOVED \(not-found\)/);
+  });
+
+  it("is quiet when the gate did not pass and so may have built nothing", () => {
+    const { outcomes } = run([OWNER], { results: { owner: noSlot } });
+    expect(firstCleanup(outcomes).status).toBe("absent");
+    expect(cleanupProblem(firstCleanup(outcomes))).toBe(false);
+  });
+});
+
+describe("the exit code when the gates passed but the disk was not cleaned", () => {
+  const mainWith = (env: Record<string, string>, results: Record<string, typeof ok> = {}, onRun?: (id: string) => void) =>
+    main([], {
+      gates: [OWNER, READER],
+      root,
+      log: () => {},
+      scratch: scratchOptions(env),
+      run: (g) => {
+        onRun?.(g.id);
+        return results[g.id] ?? ok;
+      },
+    });
+
+  it("is 3 when a coverage build was refused, failed or not found", () => {
+    expect(mainWith({})).toBe(3); // owner passed, nothing found
+    expect(mainWith({ CARGO_LLVM_COV_TARGET_DIR: homedir() })).toBe(3); // refused
+  });
+
+  it("is 0 when the build was removed", () => {
+    expect(mainWith({}, {}, (id) => id === "owner" && plant(defaultDir()))).toBe(0);
+  });
+
+  it("is 0 when the build was kept on request", () => {
+    expect(mainWith({ [KEEP]: "1" }, {}, (id) => id === "owner" && plant(defaultDir()))).toBe(0);
+  });
+
+  it("stays 1 when a gate failed, whatever happened to the build", () => {
+    expect(mainWith({}, { reader: bad })).toBe(1);
+  });
+
+  it("is documented in --help", () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line: string) => lines.push(line);
+    try {
+      main(["--help"]);
+    } finally {
+      console.log = original;
+    }
+    expect(lines.join("\n")).toMatch(/3 every gate passed but the coverage build was not removed/);
+    expect(lines.join("\n")).toContain("1 (or true, yes)");
   });
 });
 

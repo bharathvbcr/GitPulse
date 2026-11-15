@@ -118,13 +118,42 @@ must still pass on their respective operating systems.
 The Rust test gate builds an instrumented copy of the crate (about 50 GiB in
 `<cargo target>/llvm-cov-target`). The runner deletes it itself once the coverage floor has
 read `lcov.info`, and also when a gate fails or the run is abandoned where the runner still
-has control; it prints what it removed and how much it freed, and says plainly if it could
-not remove it. A Ctrl-C or `kill` that stops the runner itself is not covered, so check
-for the directory after one. Set `CI_LOCAL_KEEP_COVERAGE_BUILD=1` to keep it: an
-incremental coverage rebuild is about 15 minutes faster, at the cost of the disk space. The
-runner deletes the directory cargo-llvm-cov actually used (`CARGO_LLVM_COV_TARGET_DIR`,
-`CARGO_TARGET_DIR` and cargo's own configuration are honoured) and refuses, loudly, to delete
-a path it cannot identify as that build.
+has control; it prints what it removed and how much it freed. A Ctrl-C or `kill` that stops
+the runner itself is not covered, so check for the directory after one. Set
+`CI_LOCAL_KEEP_COVERAGE_BUILD=1` (or `true`, `yes`; any other value, `0` and `no` included,
+deletes) to keep it: an incremental coverage rebuild is about 15 minutes faster, at the cost of
+the disk space.
+
+What it will delete, and when it will not:
+
+- It deletes the directory cargo-llvm-cov used: `CARGO_LLVM_COV_TARGET_DIR` (and
+  `CARGO_LLVM_COV_BUILD_DIR` beside it) if set, else `llvm-cov-target` under the target
+  directory `cargo metadata` reports. An empty variable counts as unset, as it does for
+  cargo-llvm-cov. A value with a `..` component is refused, because cargo-llvm-cov lets the OS
+  resolve it through symlinks and the runner will not guess where that leads.
+- Only a build this run wrote: the directory must not have existed before the Rust test gate,
+  or must have changed while it ran, and the gate must have got as far as running cargo (a
+  slot-gate give-up, exit 75, did not). A directory that predates the run unchanged is left
+  alone.
+- Inside the repository, `llvm-cov-target` is deleted. A symlink is never followed, and neither
+  the repository, your home directory, cargo's regular target directory nor anything that
+  looks like one is.
+- Outside the repository (a shared target directory), only `<CARGO_TARGET_DIR>/llvm-cov-target`
+  or the exact path `CARGO_LLVM_COV_TARGET_DIR` names, and only if it is named
+  `llvm-cov-target` and holds a cargo marker (`CACHEDIR.TAG` or `.rustc_info.json`). A target
+  moved outside the repository by `.cargo/config.toml` or `CARGO_BUILD_TARGET_DIR` rather than
+  `CARGO_TARGET_DIR` is refused, not followed. Because another worktree's coverage run may be
+  using a shared directory, it is also refused if any live process names it in its arguments or
+  runs an executable from inside it (a process's working directory is not checked), or if `ps`
+  cannot be read. The coverage run is serialised machine-wide but this delete happens after it,
+  so with a shared target directory prefer `CI_LOCAL_KEEP_COVERAGE_BUILD=1` while others are
+  building.
+
+A build that could not be removed is reported as `COVERAGE BUILD NOT REMOVED` with the reason,
+in the run's log and its summary. That includes the case where the Rust test gate passed but
+nothing was found where the build should be. If every gate passed but the build was not
+removed, `ci:local` exits 3 rather than 0 (1 still means a gate failed); a build kept on request
+exits 0.
 
 > [!IMPORTANT]
 > **macOS is the platform this project is developed and hand-tested on.** CI
@@ -231,7 +260,7 @@ flowchart TD
 | `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
 | `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
 | `bun run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
-| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command, then deletes the ~50 GiB coverage build unless `CI_LOCAL_KEEP_COVERAGE_BUILD=1` |
+| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command, then deletes the ~50 GiB coverage build unless `CI_LOCAL_KEEP_COVERAGE_BUILD=1`; exits 3 if every gate passed but it could not be removed |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 

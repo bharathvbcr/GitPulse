@@ -22,7 +22,9 @@
  * platform is reported as SKIPPED with the reason and counted separately,
  * because a check that could not run must never read like one that passed.
  *
- * Exit codes: 0 every gate that ran passed · 1 at least one gate failed.
+ * Exit codes: 0 every gate that ran passed · 1 at least one gate failed ·
+ * 3 every gate passed but a coverage build was not removed (never for a build
+ * kept on request).
  */
 
 import { spawnSync } from "node:child_process";
@@ -310,15 +312,37 @@ function runGate(gate) {
     ok: !result.error && result.status === 0,
     detail: result.error ? result.error.message : `exit ${result.status}`,
     ms: Date.now() - started,
+    exitCode: result.error ? null : result.status,
   };
 }
 
-/** Set (to anything but "", "0" or "false") to keep the coverage build for an incremental rebuild. */
+/**
+ * Whether the keep opt-out is on: only "1", "true" or "yes" (any case). Anything
+ * else, including "0", "false", "no" and the empty string, leaves it off, so a
+ * stray value cannot silently keep 50 GiB.
+ *
+ * @param {string | undefined} value
+ */
+export function wantsKeep(value) {
+  return value !== undefined && ["1", "true", "yes"].includes(value.toLowerCase());
+}
+
+/** Set to 1 (or true/yes) to keep the coverage build for an incremental rebuild. */
 export const KEEP_COVERAGE_BUILD_ENV = "CI_LOCAL_KEEP_COVERAGE_BUILD";
 
 /** Cargo drops one of these at the root of every target directory it creates. */
 const CARGO_TARGET_MARKERS = ["CACHEDIR.TAG", ".rustc_info.json"];
 const COVERAGE_BUILD_NAME = "llvm-cov-target";
+
+/**
+ * Exit codes that mean the owning gate never got as far as running cargo:
+ * 75 is the machine's cargo slot gate giving up (~/.claude-bin/cargo), 126 and
+ * 127 are "found but not executable" and "not found".
+ */
+const NOT_BUILT_EXIT_CODES = [75, 126, 127];
+
+/** `ci:local` exit code for "every gate passed but a coverage build was not removed". */
+export const EXIT_SCRATCH_NOT_REMOVED = 3;
 
 /**
  * What the runner needs to delete scratch output safely. Cleanup is opt-in:
@@ -331,11 +355,20 @@ const COVERAGE_BUILD_NAME = "llvm-cov-target";
  *   cargoMetadata: (manifest: string) => CargoDirectories,
  *   home?: string,
  *   remove?: (dir: string) => void,
+ *   listProcesses?: () => string,
  * }} ScratchContext
+ * @typedef {"removed" | "absent" | "not-found" | "kept" | "refused" | "failed"} CleanupStatus
  * @typedef {{
- *   kind: string, status: "removed" | "absent" | "kept" | "refused" | "failed",
+ *   kind: string, status: CleanupStatus,
  *   dir: string | null, bytes: number | null, detail: string,
  * }} CleanupResult
+ * @typedef {{ id: string, state: string }} Fingerprint
+ * @typedef {{ dir: string, named: boolean, optional: boolean, before: Fingerprint | null }} SnapshotCandidate
+ * @typedef {{
+ *   scratch: Scratch, cargo: CargoDirectories | null, candidates: SnapshotCandidate[],
+ *   failure: CleanupResult | null,
+ * }} ScratchSnapshot
+ * @typedef {{ ran: boolean, passed: boolean, detail: string }} OwnerEvidence
  */
 
 /**
@@ -348,7 +381,6 @@ const COVERAGE_BUILD_NAME = "llvm-cov-target";
  * execs the real cargo for every subcommand but the build ones), took 0.1 s on
  * 2026-11-15, and is bounded at 60 s regardless.
  *
- * @param {string} manifest repository-relative Cargo.toml
  * @typedef {(args: string[]) => { error?: Error, status: number | null, stdout: string }} CargoRunner
  *
  * @param {string} manifest repository-relative Cargo.toml
@@ -374,7 +406,7 @@ export function cargoMetadata(manifest, runCargo = spawnCargo) {
 /** The real context `main` hands to `runGates`: the process environment, cargo itself, this user's home. */
 export function productionScratchContext() {
   /** @type {ScratchContext} */
-  const context = { env: process.env, cargoMetadata, home: homedir() };
+  const context = { env: process.env, cargoMetadata, home: homedir(), listProcesses: psSnapshot };
   return context;
 }
 
@@ -448,63 +480,186 @@ function formatBytes(bytes) {
   return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
 }
 
+class RefusedError extends Error {}
+
+/**
+ * An environment variable the way cargo-llvm-cov reads it: v0.9.1 `src/env.rs`
+ * `var()` returns `None` for an empty value, exactly as for an unset one.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {string} name
+ * @returns {string | undefined}
+ */
+function envValue(env, name) {
+  const value = env[name];
+  return value === undefined || value === "" ? undefined : value;
+}
+
+/** @param {string} value */
+function hasParentComponent(value) {
+  return value.split(/[\\/]/).includes("..");
+}
+
+/**
+ * cargo-llvm-cov joins the raw string onto the current directory and the OS
+ * resolves `..` through whatever symlinks are on the way, so `link/../x` is
+ * `<link target's parent>/x`. `path.resolve` collapses `..` as text and would
+ * name a different directory. Rather than emulate the OS and risk deleting the
+ * wrong one, a value with a `..` component is refused.
+ *
+ * @param {string} variable
+ * @param {string} value
+ */
+function refuseParentComponent(variable, value) {
+  if (hasParentComponent(value)) {
+    throw new RefusedError(
+      `${variable}=${JSON.stringify(value)} has a ".." component: cargo-llvm-cov lets the OS resolve it through symlinks, ` +
+        "which this runner will not guess at, so the directory it names cannot be identified",
+    );
+  }
+}
+
 /**
  * The directories one `cargo llvm-cov nextest --manifest-path <manifest>` run
- * writes its instrumented build to, and why each may be deleted.
+ * writes its instrumented build to.
  *
- * Read from cargo-llvm-cov v0.9.1, src/cargo.rs, `Workspace::new` (the version
- * installed on this machine): when `CARGO_LLVM_COV_TARGET_DIR` is set the target
- * directory is the current directory joined with it, and the build directory is
- * the current directory joined with `CARGO_LLVM_COV_BUILD_DIR` if that is set
- * (else the target directory itself); `CARGO_LLVM_COV_BUILD_DIR` is not read
- * otherwise. When neither is set they are `<metadata target_directory>/llvm-cov-target`
- * and `<metadata build_directory>/llvm-cov-target`. Either way the build
- * directory only takes effect when cargo's `build.build-dir` is configured, which
- * is exactly when `build_directory` differs from `target_directory` in
- * `cargo metadata`. The gate passes no `--target-dir`, and runs with the
- * repository root as its current directory, so relative values resolve there.
+ * Read from cargo-llvm-cov v0.9.1, src/cargo.rs `Workspace::new` and src/env.rs
+ * `var` (the version installed on this machine): an empty variable counts as
+ * unset. When `CARGO_LLVM_COV_TARGET_DIR` is set the target directory is the
+ * current directory joined with it, and the build directory is the current
+ * directory joined with `CARGO_LLVM_COV_BUILD_DIR` if that is set (else the
+ * target directory itself); `CARGO_LLVM_COV_BUILD_DIR` is not read otherwise.
+ * When neither is set they are `<metadata target_directory>/llvm-cov-target` and
+ * `<metadata build_directory>/llvm-cov-target`. The build directory takes effect
+ * only when cargo's `build.build-dir` is configured. `cargo metadata` shows that
+ * as `build_directory` differing from `target_directory`, but a configuration
+ * that points at the same path is invisible there, so with the target named and
+ * the build directory named too and no difference in metadata, the build
+ * directory is an `optional` candidate: removed only if this run wrote it, and
+ * otherwise left alone without a word. The gate passes no `--target-dir`, and
+ * runs with the repository root as its current directory.
  *
  * @param {string} root
  * @param {ScratchContext} context
  * @param {CargoDirectories} cargo
- * @returns {{ dir: string, named: boolean, why: string }[]} named: spelled out by an environment variable
+ * @returns {{ dir: string, named: boolean, optional: boolean }[]} named: spelled out by an environment variable
  */
 function coverageBuildCandidates(root, context, cargo) {
   const { env } = context;
-  /** @type {{ dir: string, named: boolean, why: string }[]} */
+  /** @type {{ dir: string, named: boolean, optional: boolean }[]} */
   const found = [];
-  /** @param {string} dir @param {boolean} named @param {string} why */
-  const add = (dir, named, why) => {
-    if (!found.some((f) => f.dir === dir)) found.push({ dir, named, why });
+  /** @param {string} dir @param {boolean} named @param {boolean} optional */
+  const add = (dir, named, optional) => {
+    if (!found.some((f) => f.dir === dir)) found.push({ dir, named, optional });
   };
-  const target = env.CARGO_LLVM_COV_TARGET_DIR;
-  const build = env.CARGO_LLVM_COV_BUILD_DIR;
-  // An empty value is not one this file can interpret; deleting by a guess at it is not an option.
-  if (target === "") throw new RefusedError("CARGO_LLVM_COV_TARGET_DIR is set but empty, so the directory it names cannot be identified");
-  if (target !== undefined && build === "") throw new RefusedError("CARGO_LLVM_COV_BUILD_DIR is set but empty, so the directory it names cannot be identified");
+  const target = envValue(env, "CARGO_LLVM_COV_TARGET_DIR");
+  const build = envValue(env, "CARGO_LLVM_COV_BUILD_DIR");
   const buildConfigured = cargo.buildDirectory !== cargo.targetDirectory;
   if (target !== undefined) {
-    add(path.resolve(root, target), true, "CARGO_LLVM_COV_TARGET_DIR");
-    if (build !== undefined && buildConfigured) add(path.resolve(root, build), true, "CARGO_LLVM_COV_BUILD_DIR");
+    refuseParentComponent("CARGO_LLVM_COV_TARGET_DIR", target);
+    add(path.resolve(root, target), true, false);
+    if (build !== undefined) {
+      refuseParentComponent("CARGO_LLVM_COV_BUILD_DIR", build);
+      add(path.resolve(root, build), true, !buildConfigured);
+    }
   } else {
-    add(path.join(cargo.targetDirectory, COVERAGE_BUILD_NAME), false, "<cargo target>/llvm-cov-target");
-    if (buildConfigured) add(path.join(cargo.buildDirectory, COVERAGE_BUILD_NAME), false, "<cargo build>/llvm-cov-target");
+    add(path.join(cargo.targetDirectory, COVERAGE_BUILD_NAME), false, false);
+    if (buildConfigured) add(path.join(cargo.buildDirectory, COVERAGE_BUILD_NAME), false, false);
   }
   return found;
 }
 
-class RefusedError extends Error {}
+/** @param {string} target */
+function lstatOrNull(target) {
+  try {
+    return lstatSync(target);
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Whether `dir` may be deleted as a coverage build, or the reason it may not.
- * Checked on the real path of its parent and the lstat of the leaf, so a
- * symlink at either place cannot redirect the delete.
+ * What a directory looks like right now: its device and inode, its own mtime and
+ * its top-level entries with theirs. Two equal fingerprints mean nothing was
+ * added, removed or rewritten at the top level between them, which is how a
+ * build directory that predates a run, and that the run never touched, is told
+ * from one the run wrote.
  *
- * @param {{ dir: string, named: boolean, why: string }} candidate
+ * @param {string} dir
+ * @returns {Fingerprint | null} null when nothing is there
+ */
+function fingerprintOf(dir) {
+  const stat = lstatOrNull(dir);
+  if (stat === null) return null;
+  const id = `${stat.dev}:${stat.ino}`;
+  if (!stat.isDirectory()) return { id, state: `${id}:not-a-directory:${stat.mtimeMs}` };
+  let entries;
+  try {
+    entries = readdirSync(dir)
+      .sort()
+      .map((name) => {
+        const entry = lstatOrNull(path.join(dir, name));
+        return `${name}:${entry === null ? "gone" : `${entry.ino}:${entry.mtimeMs}`}`;
+      });
+  } catch {
+    entries = ["unreadable"];
+  }
+  return { id, state: `${id}:${stat.mtimeMs}:${entries.join("|")}` };
+}
+
+/**
+ * `ps` as the live-use check reads it. Throws when it cannot be taken: a
+ * snapshot that could not be read is not evidence that nothing is using a directory.
+ *
+ * @returns {string}
+ */
+function psSnapshot() {
+  const result = spawnSync("ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.error) throw new Error(`ps could not run: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`ps exited ${result.status}`);
+  return result.stdout ?? "";
+}
+
+/**
+ * The first process line that names one of `dirs` (as a whole path, so
+ * `.../llvm-cov-target` does not match `.../llvm-cov-target2`), other than this
+ * runner. Arguments and the executable path are both in `command`; a process's
+ * working directory is not, and is not checked.
+ *
+ * @param {string} listing
+ * @param {string[]} dirs
+ * @returns {string | null}
+ */
+function processNaming(listing, dirs) {
+  for (const line of listing.split("\n")) {
+    const pid = /^\s*(\d+)\s/.exec(line)?.[1];
+    if (pid === String(process.pid)) continue;
+    for (const dir of dirs) {
+      let from = line.indexOf(dir);
+      while (from !== -1) {
+        const next = line[from + dir.length];
+        if (next === undefined || !/[\w.-]/.test(next)) return line.trim();
+        from = line.indexOf(dir, from + 1);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether `dir` may be deleted as a coverage build, by where it is and what it
+ * is called, or the reason it may not. Checked on the real path of its parent,
+ * so a symlink on the way cannot redirect the delete.
+ *
+ * @param {{ dir: string, named: boolean }} candidate
  * @param {string} root
  * @param {ScratchContext} context
  * @param {CargoDirectories} cargo
- * @returns {{ ok: true, real: string } | { ok: false, reason: string }}
+ * @returns {{ ok: true, real: string, outside: boolean } | { ok: false, reason: string }}
  */
 function vet(candidate, root, context, cargo) {
   const { dir, named } = candidate;
@@ -524,85 +679,145 @@ function vet(candidate, root, context, cargo) {
       return { ok: false, reason: "it is, or contains, cargo's regular target directory" };
     }
   }
-  if (!isInside(real, realRoot)) {
+  const outside = !isInside(real, realRoot);
+  const leafIsCoverage = path.basename(real) === COVERAGE_BUILD_NAME;
+  const marked = CARGO_TARGET_MARKERS.some((marker) => lstatOrNull(path.join(real, marker)) !== null);
+  if (outside) {
     // Outside the repository only a path the environment names for this build is ours to delete.
-    const targetEnv = context.env.CARGO_TARGET_DIR;
-    const viaCargoTargetDir =
-      !named &&
-      targetEnv !== undefined &&
-      targetEnv !== "" &&
-      path.basename(real) === COVERAGE_BUILD_NAME &&
-      realpathOrNull(path.resolve(root, targetEnv)) === realParent;
+    const targetEnv = envValue(context.env, "CARGO_TARGET_DIR");
+    let viaCargoTargetDir = false;
+    if (!named && targetEnv !== undefined) {
+      if (hasParentComponent(targetEnv)) {
+        return { ok: false, reason: `CARGO_TARGET_DIR=${JSON.stringify(targetEnv)} has a ".." component, so where it points cannot be identified` };
+      }
+      viaCargoTargetDir = realpathOrNull(path.resolve(root, targetEnv)) === realParent;
+    }
     if (!named && !viaCargoTargetDir) {
       return {
         ok: false,
         reason: "it is outside the repository and is not named by CARGO_TARGET_DIR or CARGO_LLVM_COV_TARGET_DIR",
       };
     }
-  }
-  if (path.basename(real) !== COVERAGE_BUILD_NAME) {
-    const marked = CARGO_TARGET_MARKERS.some((marker) => lstatOrNull(path.join(real, marker)) !== null);
+    if (!leafIsCoverage) {
+      return { ok: false, reason: `outside the repository only a directory named ${COVERAGE_BUILD_NAME} is deleted, whatever names it` };
+    }
+    if (!marked) {
+      return { ok: false, reason: `it holds none of ${CARGO_TARGET_MARKERS.join(", ")}, so it is not recognisable as a cargo build directory` };
+    }
+  } else if (!leafIsCoverage) {
     if (!marked) {
       return {
         ok: false,
         reason: `it is not named ${COVERAGE_BUILD_NAME} and holds none of ${CARGO_TARGET_MARKERS.join(", ")}, so it is not recognisable as a cargo build directory`,
       };
     }
+    // A regular cargo target holds profile directories with a .fingerprint inside; whatever names it, it is not the coverage build.
+    if (["debug", "release"].some((profile) => lstatOrNull(path.join(real, profile, ".fingerprint")) !== null)) {
+      return { ok: false, reason: `it is not named ${COVERAGE_BUILD_NAME} and looks like a regular cargo target directory (debug or release with a .fingerprint)` };
+    }
   }
-  return { ok: true, real };
-}
-
-/** @param {string} target */
-function lstatOrNull(target) {
-  try {
-    return lstatSync(target);
-  } catch {
-    return null;
-  }
+  return { ok: true, real, outside };
 }
 
 /**
- * Delete what one `scratch` entry names, or say precisely why it was not.
- * Never throws, and never reports a removal it did not confirm: after the
- * delete the path is looked at again.
+ * Resolve where a scratch entry's output will go and record what is there now,
+ * before its gate runs. Never throws.
  *
  * @param {Scratch} scratch
  * @param {string} root repository root
  * @param {ScratchContext} context
- * @returns {CleanupResult[]}
+ * @returns {ScratchSnapshot}
  */
-export function cleanScratch(scratch, root, context) {
-  const kind = scratch.kind;
-  /** @param {CleanupResult["status"]} status @param {string | null} dir @param {string} detail @param {number | null} [bytes] @returns {CleanupResult} */
-  const result = (status, dir, detail, bytes = null) => ({ kind, status, dir, bytes, detail });
-  const keep = context.env[KEEP_COVERAGE_BUILD_ENV];
-  if (keep !== undefined && keep !== "" && keep !== "0" && keep.toLowerCase() !== "false") {
-    return [result("kept", null, `${KEEP_COVERAGE_BUILD_ENV} is set; the coverage build is left in place`)];
-  }
-  if (scratch.kind !== "cargo-llvm-cov") {
-    return [result("refused", null, `unknown scratch kind ${JSON.stringify(scratch.kind)}`)];
-  }
-  /** @type {CargoDirectories} */
-  let cargo;
-  /** @type {{ dir: string, named: boolean, why: string }[]} */
-  let candidates;
+export function snapshotScratch(scratch, root, context) {
+  /** @param {CleanupStatus} status @param {string} detail @returns {ScratchSnapshot} */
+  const failed = (status, detail) => ({
+    scratch,
+    cargo: null,
+    candidates: [],
+    failure: { kind: scratch.kind, status, dir: null, bytes: null, detail },
+  });
+  if (scratch.kind !== "cargo-llvm-cov") return failed("refused", `unknown scratch kind ${JSON.stringify(scratch.kind)}`);
   try {
-    cargo = context.cargoMetadata(scratch.manifest);
-    candidates = coverageBuildCandidates(root, context, cargo);
+    const cargo = context.cargoMetadata(scratch.manifest);
+    const candidates = coverageBuildCandidates(root, context, cargo).map((candidate) => ({
+      ...candidate,
+      before: fingerprintOf(candidate.dir),
+    }));
+    return { scratch, cargo, candidates, failure: null };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const status = error instanceof RefusedError ? "refused" : "failed";
-    return [result(status, null, `could not identify the coverage build directory: ${message}`)];
+    return failed(error instanceof RefusedError ? "refused" : "failed", `could not identify the coverage build directory: ${message}`);
   }
-  return candidates.map((candidate) => {
+}
+
+/**
+ * Delete what one snapshotted scratch entry names, or say precisely why it was
+ * not. Never throws, and never reports a removal it did not confirm: after the
+ * delete the path is looked at again.
+ *
+ * A directory is deleted only if this run wrote it: it did not exist before the
+ * owning gate, or it differs from how it was, and the gate got as far as running
+ * cargo. A directory that predates the run unchanged is somebody else's.
+ *
+ * @param {ScratchSnapshot} snapshot
+ * @param {string} root repository root
+ * @param {ScratchContext} context
+ * @param {OwnerEvidence} evidence
+ * @returns {CleanupResult[]}
+ */
+export function cleanScratch(snapshot, root, context, evidence) {
+  const kind = snapshot.scratch.kind;
+  /** @param {CleanupStatus} status @param {string | null} dir @param {string} detail @param {number | null} [bytes] @returns {CleanupResult} */
+  const result = (status, dir, detail, bytes = null) => ({ kind, status, dir, bytes, detail });
+  if (wantsKeep(context.env[KEEP_COVERAGE_BUILD_ENV])) {
+    return [result("kept", null, `${KEEP_COVERAGE_BUILD_ENV} is set; the coverage build is left in place`)];
+  }
+  const { cargo } = snapshot;
+  if (snapshot.failure !== null || cargo === null) {
+    return [snapshot.failure ?? result("failed", null, "could not identify the coverage build directory")];
+  }
+  return snapshot.candidates.map((candidate) => {
     const { dir } = candidate;
     const leaf = lstatOrNull(dir);
-    if (leaf === null) return result("absent", dir, "nothing to remove: the directory does not exist");
+    if (leaf === null) {
+      if (candidate.optional) return result("absent", dir, "not used by this run: nothing is there");
+      if (evidence.passed) {
+        return result(
+          "not-found",
+          dir,
+          "the owning gate passed, so its coverage build exists somewhere, but nothing is here: the runner looked in the wrong place and the build is still on disk",
+        );
+      }
+      return result("absent", dir, "nothing to remove: the directory does not exist");
+    }
     if (leaf.isSymbolicLink()) return result("refused", dir, "it is a symlink, which is never followed");
     if (!leaf.isDirectory()) return result("refused", dir, "it is not a directory");
     const verdict = vet(candidate, root, context, cargo);
     if (!verdict.ok) return result("refused", dir, verdict.reason);
+    if (!evidence.ran) {
+      return result("refused", dir, `this run's gate did not run cargo to completion (${evidence.detail}), so a directory here is not this run's build`);
+    }
+    const now = fingerprintOf(dir);
+    if (now === null) return result("absent", dir, "nothing to remove: the directory does not exist");
+    if (candidate.before !== null && candidate.before.state === now.state) {
+      if (candidate.optional) return result("absent", dir, "not used by this run: it did not change while the gate ran");
+      return result("refused", dir, "it predates this run and did not change while the gate ran, so it is not this run's build");
+    }
+    // Sized before the last checks, so the checks and the delete sit close together.
     const bytes = measureBytes(verdict.real);
+    if (verdict.outside) {
+      try {
+        const using = processNaming((context.listProcesses ?? psSnapshot)(), [...new Set([dir, verdict.real])]);
+        if (using !== null) return result("refused", dir, `a live process names it, so another run may be using it: ${using.slice(0, 200)}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return result("refused", dir, `outside the repository, and it could not be shown to be unused: ${message}`);
+      }
+    }
+    const last = lstatOrNull(verdict.real);
+    if (last === null || last.isSymbolicLink() || !last.isDirectory() || `${last.dev}:${last.ino}` !== now.id) {
+      return result("refused", dir, "it changed identity between the checks and the delete");
+    }
     try {
       (context.remove ?? ((target) => rmSync(target, { recursive: true, force: false, maxRetries: 3 })))(verdict.real);
     } catch (error) {
@@ -612,6 +827,11 @@ export function cleanScratch(scratch, root, context) {
     if (lstatOrNull(verdict.real) !== null) return result("failed", dir, "removal reported success but the directory is still there", bytes);
     return result("removed", dir, "removed", bytes);
   });
+}
+
+/** Whether a cleanup left a coverage build on disk that should have gone, or could not be shown to be. */
+export function cleanupProblem(/** @type {CleanupResult} */ cleanup) {
+  return cleanup.status === "refused" || cleanup.status === "failed" || cleanup.status === "not-found";
 }
 
 /** @param {CleanupResult} cleanup */
@@ -657,13 +877,16 @@ export function cleanupPoints(gates) {
  * `produces` reports under it are removed before the gate runs; `main` passes
  * the repository root, and a caller without one leaves files alone.
  *
- * With `root` and `scratch`, a gate's `scratch` output is deleted once the last
- * gate that reads its reports has run (see `cleanupPoints`), or on the way out
- * if the run is abandoned first. The results ride on the owning gate's outcome
- * as `cleanups`; they are not outcomes of their own, so gate counts are unchanged.
+ * With `root` and `scratch`, a gate's `scratch` output is resolved and looked at
+ * before the gate runs, and deleted once the last gate that reads its reports
+ * has run (see `cleanupPoints`), or on the way out if the run is abandoned
+ * first, but only if the gate got as far as running cargo and the directory is
+ * this run's. The results ride on the owning gate's outcome as `cleanups`; they
+ * are not outcomes of their own, so gate counts are unchanged.
  *
+ * @typedef {{ ok: boolean, detail: string, ms: number, exitCode?: number | null }} GateResult
  * @param {Gate[]} gates
- * @param {{ run?: (gate: Gate) => { ok: boolean, detail: string, ms: number },
+ * @param {{ run?: (gate: Gate) => GateResult,
  *           platform?: NodeJS.Platform, log?: (line: string) => void,
  *           root?: string, scratch?: ScratchContext }} [options]
  */
@@ -673,18 +896,21 @@ export function runGates(gates, options = {}) {
   const outcomes = [];
   /** @type {Map<number, number>} */
   const points = root !== undefined && scratch !== undefined ? cleanupPoints(gates) : new Map();
-  /** owner index -> its outcome, for owners that ran and are not yet cleaned */
-  /** @type {Map<number, (typeof outcomes)[number]>} */
+  /**
+   * Owners that started and are not yet cleaned: what they were looking at before
+   * they ran, and what is known afterwards about whether they ran cargo.
+   * @type {Map<number, { outcome: (typeof outcomes)[number], snapshots: ScratchSnapshot[], evidence: OwnerEvidence }>}
+   */
   const pending = new Map();
 
   /** @param {number} owner */
   const clean = (owner) => {
-    const outcome = pending.get(owner);
-    if (outcome === undefined || root === undefined || scratch === undefined) return;
+    const entry = pending.get(owner);
+    if (entry === undefined || root === undefined || scratch === undefined) return;
     pending.delete(owner);
-    const results = (outcome.gate.scratch ?? []).flatMap((entry) => cleanScratch(entry, root, scratch));
-    outcome.cleanups = results;
-    for (const cleanup of results) log(`  ${cleanup.status === "removed" || cleanup.status === "absent" || cleanup.status === "kept" ? "·" : "!"} ${describeCleanup(cleanup)}`);
+    const results = entry.snapshots.flatMap((snapshot) => cleanScratch(snapshot, root, scratch, entry.evidence));
+    entry.outcome.cleanups = results;
+    for (const cleanup of results) log(`  ${cleanupProblem(cleanup) ? "!" : "·"} ${describeCleanup(cleanup)}`);
   };
 
   try {
@@ -699,11 +925,18 @@ export function runGates(gates, options = {}) {
           for (const report of gate.produces ?? []) rmSync(path.join(root, report), { force: true });
         }
         const outcome = { gate, status: "running", detail: "", ms: 0 };
-        // Registered before it runs: a gate that throws midway may already have written.
-        if (points.has(index)) pending.set(index, outcome);
         outcomes.push(outcome);
-        const { ok, detail, ms } = run(gate);
+        /** @type {OwnerEvidence} */
+        const evidence = { ran: false, passed: false, detail: "it did not return" };
+        if (points.has(index) && root !== undefined && scratch !== undefined) {
+          // Registered, and looked at, before it runs: a gate that throws midway may already have written.
+          const snapshots = (gate.scratch ?? []).map((entry) => snapshotScratch(entry, root, scratch));
+          pending.set(index, { outcome, snapshots, evidence });
+        }
+        const { ok, detail, ms, exitCode } = run(gate);
         Object.assign(outcome, { status: ok ? "passed" : "failed", detail, ms });
+        const started = ok || (typeof exitCode === "number" && !NOT_BUILT_EXIT_CODES.includes(exitCode));
+        Object.assign(evidence, { ran: started, passed: ok, detail });
         if (!ok) log(`✗ ${gate.name} failed (${detail}) — continuing so the rest still report`);
       }
       for (const [owner, due] of points) if (due === index) clean(owner);
@@ -748,6 +981,10 @@ export function summarize(outcomes) {
   if (cleanups.length) {
     lines.push("", "  scratch output");
     for (const { gate, cleanup } of cleanups) lines.push(`    ${gate.name}: ${describeCleanup(cleanup)}`);
+    const stuck = cleanups.filter(({ cleanup }) => cleanupProblem(cleanup));
+    if (stuck.length) {
+      lines.push(`  ${stuck.length} scratch director${stuck.length === 1 ? "y" : "ies"} NOT REMOVED: the disk is not as this run found it`);
+    }
   }
   lines.push("");
   return lines.join("\n");
@@ -765,11 +1002,13 @@ function usage() {
       {
         flag: KEEP_COVERAGE_BUILD_ENV,
         description:
-          "Set to 1 to keep the instrumented coverage build (about 50 GiB in <cargo target>/llvm-cov-target) after the run; " +
+          "Set to 1 (or true, yes) to keep the instrumented coverage build (about 50 GiB in <cargo target>/llvm-cov-target) after the run; any other value, including 0 and no, deletes it; " +
           "an incremental coverage rebuild is about 15 minutes faster. Unset, the runner deletes it once the coverage floor has read lcov.info",
       },
     ],
-    exits: "0 every gate that ran passed · 1 at least one gate failed",
+    exits:
+      "0 every gate that ran passed · 1 at least one gate failed · " +
+      `${EXIT_SCRATCH_NOT_REMOVED} every gate passed but the coverage build was not removed (not for one kept on request)`,
   });
 }
 
@@ -778,7 +1017,7 @@ function usage() {
  * scratch context and where output goes. Left out, they are the real ones.
  *
  * @param {string[]} argv
- * @param {{ gates?: Gate[], run?: (gate: Gate) => { ok: boolean, detail: string, ms: number },
+ * @param {{ gates?: Gate[], run?: (gate: Gate) => GateResult,
  *           root?: string, scratch?: ScratchContext, log?: (line: string) => void }} [deps]
  */
 export function main(argv = process.argv.slice(2), deps = {}) {
@@ -802,7 +1041,10 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   }
   const outcomes = runGates(gates, { root, scratch, run, log });
   log(summarize(outcomes));
-  return outcomes.some((o) => o.status === "failed") ? 1 : 0;
+  if (outcomes.some((o) => o.status === "failed")) return 1;
+  // The gates were green but the disk is not as it was: not a pass either.
+  const stuck = outcomes.some((o) => (o.cleanups ?? []).some(cleanupProblem));
+  return stuck ? EXIT_SCRATCH_NOT_REMOVED : 0;
 }
 
 if (process.argv[1]?.endsWith("ci-local.mjs")) {
