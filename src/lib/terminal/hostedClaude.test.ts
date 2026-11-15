@@ -7,6 +7,8 @@ import {
   createResumers,
   endedFromOutside,
   readHostedClaude,
+  resolveClaudeForkSource,
+  resolveTranscriptAnswer,
   settleConversation,
   withSessionId,
   type HostedStorage,
@@ -35,14 +37,14 @@ const launch = (sessionId: string, startedAt = 1) => ({
 });
 
 describe("withSessionId", () => {
-  it("gives a fresh launch a session id in front of its arguments", () => {
+  it("gives a fresh launch a sessionId without prepending --session-id into args", () => {
     const { args, sessionId } = withSessionId(["--", "fix it"], () => ID.toUpperCase());
     expect(sessionId).toBe(ID);
-    expect(args).toEqual(["--session-id", ID, "--", "fix it"]);
+    expect(args).toEqual(["--", "fix it"]);
   });
 
-  it("gives a launch with no arguments one too", () => {
-    expect(withSessionId(undefined, () => ID)).toEqual({ args: ["--session-id", ID], sessionId: ID });
+  it("gives a launch with no arguments a sessionId too", () => {
+    expect(withSessionId(undefined, () => ID)).toEqual({ args: [], sessionId: ID });
   });
 
   it("leaves a launch that already names a conversation exactly as it is", () => {
@@ -66,7 +68,7 @@ describe("withSessionId", () => {
   it("does not read a flag out of the prompt", () => {
     expect(carriesSession(["--", "--resume", OTHER])).toBe(false);
     const out = withSessionId(["--", "--resume", OTHER], () => ID);
-    expect(out.args).toEqual(["--session-id", ID, "--", "--resume", OTHER]);
+    expect(out.args).toEqual(["--", "--resume", OTHER]);
     expect(out.sessionId).toBe(ID);
   });
 
@@ -220,7 +222,7 @@ describe("the conversation a start records", () => {
     store.bind(ID, "term-1");
     const before = store.list();
     const decided = conversationForStart(store, { attach: "term-1", resumeId: null, args: ["--model", "opus"], record, newId: () => OTHER });
-    expect(decided).toEqual({ args: ["--model", "opus"], sessionId: ID });
+    expect(decided).toEqual({ args: ["--model", "opus"], sessionId: ID, resume: null });
     expect(store.list()).toEqual(before);
     expect(store.byTerminal("term-1")?.sessionId).toBe(ID);
   });
@@ -229,16 +231,99 @@ describe("the conversation a start records", () => {
     const store = createHostedClaudeStore(null);
     const decided = conversationForStart(store, { attach: "term-9", resumeId: null, args: undefined, record, newId: () => OTHER });
     expect(decided.sessionId).toBeNull();
+    expect(decided.resume).toBeNull();
     expect(store.list()).toEqual([]);
   });
 
-  it("a fresh launch and a --resume launch each record exactly one", () => {
+  it("a fresh launch and a typed resume launch each record exactly one", () => {
     const store = createHostedClaudeStore(null);
     const fresh = conversationForStart(store, { attach: null, resumeId: null, args: ["--model", "opus"], record, newId: () => OTHER });
-    expect(fresh).toEqual({ args: ["--session-id", OTHER, "--model", "opus"], sessionId: OTHER });
+    expect(fresh).toEqual({ args: ["--model", "opus"], sessionId: OTHER, resume: null });
     expect(store.list().map((r) => r.sessionId)).toEqual([OTHER]);
     const resumed = conversationForStart(store, { attach: null, resumeId: ID, args: undefined, record, newId: () => "unused" });
-    expect(resumed).toEqual({ args: ["--resume", ID], sessionId: ID });
+    expect(resumed).toEqual({ args: undefined, sessionId: ID, resume: { session_id: ID, fork: false } });
     expect(store.list().map((r) => r.sessionId).sort()).toEqual([ID, OTHER].sort());
+  });
+
+  it("records a forked session as a distinct hosted record while keeping the source intact and verifies transcript gating", () => {
+    const store = createHostedClaudeStore(null);
+    store.begin(launch(ID));
+
+    const forked = conversationForStart(store, {
+      attach: null,
+      resumeId: ID,
+      fork: true,
+      args: undefined,
+      record,
+      newId: () => OTHER,
+    });
+    expect(forked).toEqual({
+      args: undefined,
+      sessionId: OTHER,
+      resume: { session_id: ID, fork: true },
+    });
+    expect(store.get(ID)?.forkedFrom).toBeNull();
+    expect(store.get(OTHER)?.forkedFrom).toBe(ID);
+
+    expect(resolveTranscriptAnswer(store, ID, "claude", { state: "found" })).toEqual({ offer: ID, note: null });
+    expect(resolveTranscriptAnswer(store, ID, "claude", { state: "unknown", reason: "unreadable" }).offer).toBeNull();
+    expect(resolveTranscriptAnswer(store, ID, "claude", { state: "absent" }).offer).toBeNull();
+    expect(store.get(ID)).toBeUndefined();
+    expect(store.get(OTHER)?.sessionId).toBe(OTHER);
+  });
+});
+
+describe("resolveClaudeForkSource", () => {
+  it("matches a hosted Claude session launched with repoPath + startDir pointing at the forked worktree", () => {
+    const store = createHostedClaudeStore(null);
+    store.begin({
+      sessionId: ID,
+      provider: "claude",
+      repoPath: "/work/repo",
+      startDir: ".gitpulse/worktrees/lane-a",
+      mode: "edit",
+      startedAt: 100,
+    });
+    const resolved = resolveClaudeForkSource(store, "/work/repo/.gitpulse/worktrees/lane-a", null, {
+      caseInsensitive: false,
+    });
+    expect(resolved).toEqual({ sessionId: ID, mode: "edit" });
+  });
+
+  it("prefers the backend session id and never inherits bypass mode from an unrelated hosted session", () => {
+    const store = createHostedClaudeStore(null);
+    const bypassOther = "11111111-1111-4111-8111-111111111111";
+    const agyId = "22222222-2222-4222-8222-222222222222";
+    store.begin({
+      sessionId: bypassOther,
+      provider: "claude",
+      repoPath: "/work/wt-src",
+      startDir: null,
+      mode: "bypass",
+      startedAt: 200,
+    });
+    store.begin({
+      sessionId: agyId,
+      provider: "agy",
+      repoPath: "/work/wt-src",
+      startDir: null,
+      mode: "bypass",
+      startedAt: 300,
+    });
+
+    // Unhosted transcript discovered on disk by backend: must NOT borrow bypass mode from bypassOther.
+    expect(
+      resolveClaudeForkSource(store, "/work/wt-src", OTHER.toUpperCase(), { caseInsensitive: false }),
+    ).toEqual({ sessionId: OTHER, mode: null });
+
+    // Non-claude record matching backend id must NOT inherit its mode as a claude mode.
+    expect(
+      resolveClaudeForkSource(store, "/work/wt-src", agyId, { caseInsensitive: false }),
+    ).toEqual({ sessionId: agyId, mode: null });
+
+    // Direct match on hosted claude record keeps its recorded mode.
+    expect(
+      resolveClaudeForkSource(store, "/work/wt-src", bypassOther, { caseInsensitive: false }),
+    ).toEqual({ sessionId: bypassOther, mode: "bypass" });
   });
 });

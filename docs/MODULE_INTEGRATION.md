@@ -20,6 +20,7 @@ the configured executable and restarting it.
 | Read and query a persisted index | DevCouncil `devmap-store`, `devmap-query`, `devmap-resolve` | Vendored Rust path dependencies with `default-features = false` |
 | HTML map and graph projection | DevCouncil `devmap-query` | Same upstream projection; HTML assets live inside the crate |
 | Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-redact` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in GitPulse |
+| Test-path classification (`role_of`) | DevCouncil `dc-glob` (`is_test_path`, `protocols/test-paths/v1.json`) | Vendored Rust library; commit drafting delegates test-path classification instead of keeping a private copy |
 | Profile workspaces, tasks, briefs and run records | Manvi wrap of DevCouncil `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns the wrap's schemas, revisions and receipts |
 | Task suggestions and managed agent hosting | Profile Manvi host | GitPulse presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
 | Policy, local-model discovery and chat preparation | Manvi `serve` | Protocol v1 in `src-tauri/src/harness/`; advertised `hello.ops` capabilities |
@@ -27,13 +28,20 @@ the configured executable and restarting it.
 
 The module owner implements behavior once. Host adapters translate their UI or
 transport types; they do not copy policy decisions, schema migrations, parsers
-or HTML assets into independent implementations.
+or HTML assets into independent implementations. Where a GitPulse safety check
+intentionally diverges from a shared helper, that boundary exception is
+documented explicitly:
+[`parse_git_version`](../src-tauri/src/engine/git_cli/preflight.rs) remains
+local instead of delegating to `dc_proc::GitVersion::parse` because GitPulse
+requires overflowing patch components to fail closed (not saturate to `0`),
+requires pre-release builds such as `2.45.1-rc1` to compare cleanly against
+`MIN_CLONE_GIT_VERSION`, and accepts major-only `git version 3` output.
 
 ```mermaid
 flowchart TD
     subgraph DevCouncil["DevCouncil (Components & Modules)"]
         direction TB
-        DCLibs["Rust Libraries:<br/><code>devmap-store</code> · <code>devmap-query</code><br/><code>devmap-resolve</code> · <code>dc-store</code> · <code>dc-redact</code>"]
+        DCLibs["Rust Libraries:<br/><code>devmap-store</code> · <code>devmap-query</code><br/><code>devmap-resolve</code> · <code>dc-store</code> · <code>dc-redact</code> · <code>dc-glob</code>"]
         DCCLI["Process Tools:<br/><code>devmap</code> CLI (build, search, impact, explore)<br/><code>devmap serve</code> (background watcher daemon)"]
     end
 
@@ -53,11 +61,11 @@ flowchart TD
     subgraph GitPulseHost["GitPulse Desktop Host"]
         direction TB
         UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
-        RustIPC["Rust Core (292 Handlers, Tauri 2 IPC)"]
+        RustIPC["Rust Core (328 Handlers, Tauri 2 IPC)"]
         InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
         CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
         HarnessClient["Harness Client & Grants<br/>(<code>src-tauri/src/harness/</code>)"]
-        WorkbenchCmd["Workbench Bridge<br/>(<code>src-tauri/src/commands/workbench.rs</code>)"]
+        WorkbenchCmd["Workbench Bridge<br/>(<code>src-tauri/src/workbench.rs</code>)"]
 
         UIHost --> RustIPC
         RustIPC --> InProcessReaders
@@ -70,7 +78,7 @@ flowchart TD
     DCCLI <-->|CLI build/search & socket probe| CLIGate
     DCLibs -.->|Wrapped by Manvi| ManviWorkbench
     ManviSidecar <-->|NDJSON Stdio v1 protocol| HarnessClient
-    ManviSidecar <-->|cmd_workbench_request| WorkbenchCmd
+    DCLibs -.->|In-process dc-store CRUD| WorkbenchCmd
 ```
 
 ### Integration Sequence: Policy & Workbench

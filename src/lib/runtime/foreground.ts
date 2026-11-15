@@ -148,3 +148,28 @@ export function bindForegroundChanges(
     removeForegroundListener("blur", onChange);
   };
 }
+
+export interface ForegroundBinding {
+  bind(): void;
+  unbind(): void;
+}
+
+/**
+ * Idempotent document/window foreground subscription owner so modules do not
+ * duplicate `let unbind = null; bind(); unbind();` listener pairs.
+ */
+export function createForegroundBinding(onChange: () => void): ForegroundBinding {
+  let release: (() => void) | null = null;
+  return {
+    bind() {
+      if (release !== null || typeof document === "undefined") return;
+      release = bindForegroundChanges(document, typeof window === "undefined" ? null : window, onChange);
+    },
+    unbind() {
+      if (release === null) return;
+      const fn = release;
+      release = null;
+      fn();
+    },
+  };
+}

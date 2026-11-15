@@ -197,9 +197,11 @@ and 4 that no other card owns.
 The store work for each part is done in DevCouncil
 (`rust/dc-store/src/workbench/`), re-vendored, and then wired into GitPulse.
 Schema 11 is merged into DevCouncil `main` (`8d09fa2b`, with follow-up fixes)
-and vendored into GitPulse: the vendored dc-store is `9de7d7cd` at schema 11
-(`src-tauri/vendored/VENDOR.json`). Schema 11 adds `work_item_links` (see
-part 3) but no queue or outbox table. The schema version is a resource two
+and vendored into GitPulse; later DevCouncil migrations through workbench
+schema 17 (`src-tauri/vendored/dc-store` at `b5215026`, `src-tauri/vendored/VENDOR.json`)
+added queue and GitHub issue-sync outbox tables (`queue_outbox.sql`, `queue.rs`,
+`outbox.rs`), wired in GitPulse via `workbench/queue_driver.rs`, `workbench/github_sync.rs`,
+and `workbench/terminal_launch.rs`. The schema version is a resource two
 branches can both claim, so the queue and outbox take the rung after schema 11.
 
 **Sequencing agreed with the user, 2026-10-07:**

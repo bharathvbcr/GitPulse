@@ -155,6 +155,23 @@
           if (args.method !== "runs.list") throw new Error(`unexpected workbench method ${args.method}`);
           return runPage(JSON.parse(args.input).state);
         },
+        // One settled thread shaped like a real cross-session note: the sender is
+        // a bare session uuid and the title is longer than the thread list.
+        cmd_inbox_read: () => {
+          const sender = "08ed0464-1cc2-4f66-a87e-107731d5f268";
+          const note = (seq) => ({
+            seq, from_agent: sender, to_agent: "claude:52d6abcd-6965-454b-a465-56a4a88526e7", kind: "note",
+            body: `Cards I hold: ft-a8a6e589 — internal/search/{europe_pmc_fulltext,oa_locate,openalex,abstract_lookup,openalex_work_lookup_with_a_long_name}.go ${seq}`,
+            created_at_ms: Date.now() - 30_000, thread_key: "s08-w4-coordination-with-a-long-key",
+          });
+          const thread = {
+            thread_key: "s08-w4-coordination-with-a-long-key",
+            title: "From session 08ed0464 (desktop, \"s08\"), working the same backlog in parallel",
+            status: "settled", ask_type: null, latest_msg: note(2), messages: [note(1), note(2)],
+            from_agent: sender, to_agent: "claude:52d6abcd-6965-454b-a465-56a4a88526e7", updated_at_ms: Date.now() - 30_000,
+          };
+          return { ok: true, repo_path: MAIN, threads: [thread], lanes: [], total: 1 };
+        },
         cmd_terminal_context: (args) => (
           args.sessionId === "pty-alpha"
             ? { process: "claude", busy: false, cwd: ALPHA, repo_dir: ".claude/worktrees/alpha" }
@@ -437,6 +454,65 @@
         await until(() => text().includes("Sessions couldn't be read"), "a failed read looked like an empty workspace");
         check("a failed read names itself and is not an empty workspace", () =>
           text().includes("insights down") && text().includes("Sessions couldn't be read") && !text().includes("No agent sessions"));
+
+        // The Inbox thread list is a fixed-width column with a selection toggle
+        // beside each card. A long sender or title must truncate inside the card,
+        // never push the card past the column where the column's clip cuts off
+        // its status chip and time.
+        root().querySelector("[data-testid=agents-view-mode-inbox]").click();
+        const card = () => root().querySelector("[data-testid^=thread-card-]");
+        await until(() => card(), "the inbox thread did not arrive");
+        const pane = root().querySelector(".threads-pane");
+        const inside = (node) => node.getBoundingClientRect().right <= pane.getBoundingClientRect().right - 1;
+        check("an inbox thread card fits its column beside the selection toggle", () =>
+          pane.scrollWidth <= pane.clientWidth + 1 && inside(card()));
+        check("the card's status chip and time stay inside the column", () =>
+          inside(card().querySelector(".thread-card-header > .gp-chip")) && inside(card().querySelector(".thread-time")));
+        check("a long sender and key truncate on one line rather than wrap", () => {
+          const sender = card().querySelector(".agent-name-text");
+          const key = card().querySelector(".thread-slug");
+          return sender && sender.scrollWidth > sender.clientWidth && sender.getClientRects().length === 1
+            && key.scrollWidth > key.clientWidth;
+        });
+        // Narrow enough that the note's unbroken path is wider than the pane.
+        stage.style.width = "760px";
+        await settle();
+        check("a long timeline line wraps inside the detail pane", () => {
+          // The timeline is its own scroller, so an overflow lands there.
+          const timeline = root().querySelector(".messages-timeline");
+          const detail = root().querySelector(".thread-detail-pane");
+          return timeline.scrollWidth <= timeline.clientWidth + 1 && detail.scrollWidth <= detail.clientWidth + 1;
+        });
+        stage.style.width = "1280px";
+        await settle();
+        root().querySelector("[data-testid=agents-view-mode-plane]").click();
+        await settle();
+
+        // The task sheet lists the same threads under a task, in a column as
+        // narrow as the sheet's side. A bare-uuid sender must give way to the
+        // summary rather than push the row past the column.
+        const TaskRelations = (await import("../src/lib/components/TaskRelations.svelte")).default;
+        const { threads: [linked] } = fixtures.cmd_inbox_read();
+        const sheet = document.createElement("div");
+        sheet.style.width = "300px";
+        document.body.append(sheet);
+        mount(TaskRelations, {
+          target: sheet,
+          // A saved task: only one with an id lists its linked threads.
+          props: { checklist: [], links: [], taskId: "ft-a8a6e589", initialSubtasks: [], initialInboxThreads: [linked], onchange: () => {} },
+        });
+        await until(() => sheet.querySelector(".linked-thread-item"), "the linked thread did not render");
+        const head = sheet.querySelector(".linked-thread-item .subtask-row-top");
+        const edge = sheet.querySelector(".linked-thread-item").getBoundingClientRect().right;
+        check("a linked thread's sender and summary fit the task sheet's column", () =>
+          head.scrollWidth <= head.clientWidth + 1
+          && [...head.children].every((node) => node.getBoundingClientRect().right <= edge));
+        check("a long sender truncates and leaves the summary room to read", () => {
+          const sender = head.querySelector(".kind");
+          const summary = head.querySelector(".title");
+          return sender.scrollWidth > sender.clientWidth && summary.getBoundingClientRect().width >= 100;
+        });
+        sheet.remove();
         check("the run made no unexpected native calls", () => unexpected.length === 0 && errors.length === 0);
         await finish();
       } catch (error) {

@@ -109,6 +109,11 @@ pub fn establish() -> Launch {
                 primary.attach_insights(std::sync::Arc::new(|repo| {
                     crate::hooks::serve_insights(repo)
                 }));
+                // App-side git operation log snapshots (`refs/gitpulse/ops/*`)
+                // requested over the mailbox by the decide-only command-gate hook.
+                primary.attach_op_recorder(std::sync::Arc::new(|request| {
+                    crate::engine::GitWriter::serve_op_record(request)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch

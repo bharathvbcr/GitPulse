@@ -82,7 +82,7 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
       expect(res.status).toBe(0);
       expect(res.stdout).toContain("store schema 29");
       expect(res.stdout).toContain("code graph schema 2");
-      expect(res.stdout).toContain("extract schema 98");
+      expect(res.stdout).toContain("extract schema 99");
     });
 
     it("1.3: DevCouncil schema constants declare CURRENT_SCHEMA_VERSION = 29", () => {
@@ -100,8 +100,8 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
       expect(output.ok).toBe(true);
       expect(output.owner.store).toBe(29);
       expect(output.owner.dcStore).toBe(11);
-      expect(output.owner.workbench).toBe(14);
-      expect(output.owner.extract).toBe(98);
+      expect(output.owner.workbench).toBe(16);
+      expect(output.owner.extract).toBe(99);
       expect(Array.isArray(output.rows)).toBe(true);
       expect(output.rows.length).toBe(8);
       expect(output.rows.every((r: { verdict: string }) => r.verdict === "match")).toBe(true);

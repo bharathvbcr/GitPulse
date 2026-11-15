@@ -336,8 +336,12 @@ describe("annotated but unregistered commands", () => {
     // switch), which main added on top of cmd_cancel_read while the terminal
     // overhaul added its seven; the two counts met when the branch merged. And
     // 322 with cmd_terminal_deliver_peer (wakes a quiescent Antigravity CLI
-    // terminal session for a peer message), which the A2A branch added.
-    expect(found.size).toBe(322);
+    // terminal session for a peer message), which the A2A branch added, plus
+    // cmd_list_op_snapshots and cmd_undo_op_snapshot (op log undo) and the
+    // terminal session-ledger handlers on this tree.
+    expect(found.size).toBe(328);
+    expect(found.has("cmd_list_op_snapshots")).toBe(true);
+    expect(found.has("cmd_undo_op_snapshot")).toBe(true);
     expect(found.has("cmd_terminal_deliver_peer")).toBe(true);
     expect(found.has("cmd_native_rendering_apply")).toBe(true);
     expect(found.has("cmd_browser_snapshot")).toBe(true);

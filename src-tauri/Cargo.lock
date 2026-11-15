@@ -1542,6 +1542,7 @@ dependencies = [
  "async-channel",
  "base64 0.23.1",
  "block2",
+ "dc-glob",
  "dc-redact",
  "dc-regress",
  "dc-regress-store",

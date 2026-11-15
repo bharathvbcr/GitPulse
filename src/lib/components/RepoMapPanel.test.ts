@@ -383,12 +383,15 @@ describe("RepoMapPanel map view tablist", () => {
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
 } {
   let resolve: (value: T) => void = () => {};
-  const promise = new Promise<T>((res) => {
+  let reject: (reason?: unknown) => void = () => {};
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 describe("RepoMapPanel map reload does not wait on devmap status", () => {
@@ -452,19 +455,91 @@ describe("RepoMapPanel map reload does not wait on devmap status", () => {
     expect(first.applied).toEqual([]);
   }, 1000);
 
-  it("clears loading from the map settlement, not from the status probe", () => {
-    const reload = source.slice(
-      source.indexOf("async function reload("),
-      source.indexOf("async function reloadGraph("),
-    );
-    expect(reload).toContain("settleMapBeforeStatus(");
-    expect(reload).not.toContain("Promise.all");
-    const onMap = reload.indexOf("onMap(mapResult)");
-    const onStatus = reload.indexOf("onStatus(statusResult)");
-    expect(onMap).toBeGreaterThan(-1);
-    expect(onStatus).toBeGreaterThan(onMap);
-    expect(reload.slice(onMap, onStatus)).toContain("loading = false");
-    expect(reload.slice(onStatus)).not.toContain("loading");
+  it("clears loading from the map settlement, not from the status probe", async () => {
+    let loading = true;
+    let statusLoading = true;
+    const map = deferred<string>();
+    const status = deferred<string>();
+
+    const done = settleMapBeforeStatus({
+      map: map.promise,
+      status: status.promise,
+      isCurrent: () => true,
+      onMap: () => {
+        loading = false;
+      },
+      onStatus: () => {
+        statusLoading = false;
+      },
+    });
+
+    expect(loading).toBe(true);
+    expect(statusLoading).toBe(true);
+
+    map.resolve("map-payload");
+    await done;
+
+    // Loading is cleared immediately by map resolution, while status remains pending
+    expect(loading).toBe(false);
+    expect(statusLoading).toBe(true);
+
+    status.resolve("status-payload");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statusLoading).toBe(false);
+  });
+
+  it("catches errors thrown inside onStatus without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const status = deferred<string>();
+      const done = settleMapBeforeStatus({
+        map: Promise.resolve("map-payload"),
+        status: status.promise,
+        isCurrent: () => true,
+        onMap: () => {},
+        onStatus: () => {
+          throw new Error("simulated status handler failure");
+        },
+      });
+
+      await done;
+      status.resolve("status-payload");
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("catches errors thrown inside onStatus when status probe rejects", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const status = deferred<string>();
+      const done = settleMapBeforeStatus({
+        map: Promise.resolve("map-payload"),
+        status: status.promise,
+        isCurrent: () => true,
+        onMap: () => {},
+        onStatus: () => {
+          throw new Error("simulated status handler failure on rejection");
+        },
+      });
+
+      await done;
+      status.reject(new Error("status probe rejected"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });
 
@@ -782,5 +857,36 @@ describe("RepoMapPanel layout follows the pane", () => {
 
   it("puts no tinted band on a full-width row", () => {
     expect(template).not.toMatch(/bg-surface\/\d+/);
+  });
+});
+
+describe("RepoMapPanel graph view descriptions", () => {
+  // The graph tabs were titled "File import graph (ranked cap)" and
+  // "Subsystem handoff map": accurate, but nothing a first-time user could act
+  // on. Each now says what a dot and a line are and what clicking does.
+  it("gives the Files, Symbols and Subsystems tabs a plain-language tooltip", () => {
+    const { body } = render(RepoMapPanel);
+    const at = body.indexOf('aria-label="Map views"');
+    const region = body.slice(at, body.indexOf('role="tabpanel"', at));
+    const tabs = new Map(
+      [...region.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map((match) => [
+        (match[2] ?? "").replace(/<[^>]+>/g, "").trim(),
+        match[1] ?? "",
+      ]),
+    );
+    for (const [label, says] of [
+      ["Files", "Each dot is a file"],
+      ["Symbols", "Each dot is a symbol"],
+      ["Subsystems", "Each dot is a subsystem"],
+    ] as const) {
+      const title = tabs.get(label)?.match(/\btitle="([^"]*)"/)?.[1] ?? "";
+      expect(title, `${label} tab tooltip`).toContain(says);
+      expect(title, `${label} tab tooltip`).toContain("Click a");
+      expect(title).not.toMatch(/ranked cap|handoff/);
+    }
+  });
+
+  it("hands the active view's description to the canvas as its About hint", () => {
+    expect(source).toContain("about={MAP_VIEWS.find((v) => v.id === mapView)?.title}");
   });
 });

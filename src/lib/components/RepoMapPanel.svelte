@@ -1,5 +1,7 @@
 <script module lang="ts">
+  import { reportPanelError } from "../diagnostics/report";
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { formatError } from "../ui/formatError";
 
   /**
    * What Map → Docs search shows for a repository, kept past the panel's
@@ -33,10 +35,18 @@
       (value) => ({ status: "fulfilled", value }),
       (reason) => ({ status: "rejected", reason }),
     );
-    void statusSettled.then((result) => {
-      if (!input.isCurrent()) return;
-      input.onStatus(result);
-    });
+    void statusSettled
+      .then((result) => {
+        if (!input.isCurrent()) return;
+        try {
+          input.onStatus(result);
+        } catch (error) {
+          reportPanelError("code-map", `Status update failed:\n${formatError(error)}`);
+        }
+      })
+      .catch((error) => {
+        reportPanelError("code-map", `Status settlement failed:\n${formatError(error)}`);
+      });
     return input.map.then(
       (value) => {
         if (!input.isCurrent()) return;
@@ -54,7 +64,6 @@
   import { onDestroy, untrack } from "svelte";
   import { crossfade } from "svelte/transition";
   import { beginGeneration } from "../async/guard";
-  import { reportPanelError } from "../diagnostics/report";
   import { paneDetails } from "../diagnostics/paneCrash";
   import { dedupePreserveOrder, keyedList } from "../ui/eachKeys";
   import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
@@ -132,7 +141,6 @@
     docsSearchPrompt,
     docsStatusHonesty,
   } from "../docs/docsHonesty";
-  import { formatError } from "../ui/formatError";
   import CodeGraphCanvas from "./CodeGraphCanvas.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import ListPreviewToggle from "./ListPreviewToggle.svelte";
@@ -171,10 +179,30 @@
 
   const MAP_VIEWS: ReadonlyArray<{ id: MapView; label: string; title?: string }> = [
     { id: "navigator", label: "Navigator" },
-    { id: "files", label: "Files", title: "File import graph (ranked cap)" },
-    { id: "symbols", label: "Symbols", title: "Symbol call graph (ranked cap)" },
-    { id: "subsystems", label: "Subsystems", title: "Subsystem handoff map" },
-    { id: "docgraph", label: "Doc graph", title: "Markdown doc link graph (same free-2D canvas)" },
+    // These titles are written for someone new to the map: the tab tooltip and
+    // the canvas's "About this view" hint both show them (one copy).
+    { id: "files", label: "Files", title: [
+      "How your files depend on each other.",
+      "Each dot is a file, coloured by language; a line means one file imports another. " +
+        "Large repositories show only the most connected files — the count line says how many.",
+      "Click a file to see its connections; double-click to open it.",
+    ].join("\n") },
+    { id: "symbols", label: "Symbols", title: [
+      "How functions, types and other symbols use each other.",
+      "Each dot is a symbol, coloured by language; a line means one calls or references another. " +
+        "Large repositories show only the most connected symbols — the count line says how many.",
+      "Click a symbol to see its connections; double-click to open its file.",
+    ].join("\n") },
+    { id: "subsystems", label: "Subsystems", title: [
+      "The big picture: the main areas of the code and how they connect.",
+      "Each dot is a subsystem (a folder-level area); " +
+        "a line joins areas whose code depends on each other. Not every folder is a subsystem.",
+      "Click a subsystem to see what it connects to.",
+    ].join("\n") },
+    { id: "docgraph", label: "Doc graph", title: [
+      "How your Markdown documents link to each other.",
+      "Each dot is a document; a line means one links to another.",
+    ].join("\n") },
     { id: "docs", label: "Docs", title: "Repository markdown search and broken links" },
     { id: "links", label: "Links", title: "Cross-repository import link candidates from the workspace registry" },
   ];
@@ -1120,7 +1148,7 @@
   >
   {#if CODE_GRAPH_VIEWS.has(mapView)}
     <div class="flex-1 min-h-0 flex flex-col">
-      <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} focusNodeId={mapView === "subsystems" ? focusNodeId : null} />
+      <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} focusNodeId={mapView === "subsystems" ? focusNodeId : null} about={MAP_VIEWS.find((v) => v.id === mapView)?.title} />
     </div>
   {:else if mapView === "docs"}
     <PageBody testId="docs-panel">

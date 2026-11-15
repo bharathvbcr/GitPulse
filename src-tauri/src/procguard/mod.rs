@@ -318,10 +318,40 @@ impl Registration {
     /// on Windows the tree kill is all there is.
     pub fn kill_tree(&self, child: &mut Child) {
         let pid = lock(&self.slot.pid);
-        if let Some(pid) = *pid {
-            let _ = sys::force_kill(pid, &self.slot.label);
+        match *pid {
+            Some(pid) => {
+                match sys::force_kill(pid, &self.slot.label) {
+                    Ok(signalled) => {
+                        // If the group had no living members remaining (Ok(false)),
+                        // backstop with direct child kill only if child still belongs to us.
+                        if !signalled {
+                            let _ = child.kill();
+                        }
+                    }
+                    Err(error) => {
+                        if is_refusal(&error) {
+                            log::error!(
+                                target: "procguard",
+                                "kill_tree for {} (pid {pid}) REFUSED by signal guard: {error}; suppressing direct child.kill() backstop",
+                                self.slot.label
+                            );
+                        } else {
+                            // System call failed unexpectedly; attempt direct kill as emergency fallback
+                            let _ = child.kill();
+                        }
+                    }
+                }
+            }
+            None => {
+                // Pid already cleared/reaped! Absolutely DO NOT call child.kill(),
+                // as the kernel may have recycled the PID.
+                log::debug!(
+                    target: "procguard",
+                    "kill_tree skipped for {}: pid already reaped",
+                    self.slot.label
+                );
+            }
         }
-        let _ = child.kill();
     }
 
     /// Gives a child that has already been asked to stop `grace` to do it on
@@ -1378,10 +1408,7 @@ mod sys {
     /// under the entry lock is what rules that out.
     fn signal_group(pid: u32, signo: libc::c_int, who: &str) -> io::Result<bool> {
         let pgid = i32::try_from(pid).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pid {pid} does not fit a pid_t"),
-            )
+            super::signal::refusal(format!("pid {pid} does not fit a pid_t"))
         })?;
         // The guarded primitive refuses 0, 1, negative ids, our own group and a
         // leader that is no longer one of ours; see `super::signal`.
@@ -2733,7 +2760,10 @@ mod tests {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         if std::env::var_os("PROCGUARD_SELF_AIM").is_some() {
             let me = unsafe { libc::getpgrp() } as u32;
-            for target in [me, 0, 1, u32::MAX] {
+            let pid = unsafe { libc::getpid() } as u32;
+            let ppid = unsafe { libc::getppid() } as u32;
+            let sid = unsafe { libc::getsid(0) } as u32;
+            for target in [me, pid, ppid, sid, 0, 1, u32::MAX] {
                 assert!(sys::force_kill(target, "self-aim").is_err(), "{target}");
                 assert!(sys::request_stop(target, "self-aim").is_err(), "{target}");
             }
@@ -2821,7 +2851,8 @@ mod adv_keep_pid_tests {
         );
     }
 
-    /// ATTACK 1b: `kill_tree` ignores the error but must not forget the pid.
+    /// ATTACK 1b: `kill_tree` ignores the error but must not forget the pid, and
+    /// suppresses direct child.kill() backstop when force_kill is refused.
     #[test]
     fn adv_kill_tree_after_a_failed_kill_keeps_the_pid() {
         let b = bystander();
@@ -2835,7 +2866,8 @@ mod adv_keep_pid_tests {
         registration.kill_tree(&mut backstop);
         let pid_after = *lock(&slot.pid);
         let alive = b_alive(&b);
-        let _ = backstop.wait();
+        let backstop_alive = b_alive(&backstop);
+        reap(backstop);
         // Not registered in the global registry: forget the Registration's drop.
         std::mem::forget(registration);
         reap(b);
@@ -2847,6 +2879,30 @@ mod adv_keep_pid_tests {
             alive,
             "kill_tree killed a process outside procguard's groups"
         );
+        assert!(
+            backstop_alive,
+            "kill_tree direct child.kill() backstop must be suppressed when force_kill is refused"
+        );
+    }
+
+    #[test]
+    fn kill_tree_does_not_call_child_kill_when_pid_is_none() {
+        let mut c = bystander();
+        let slot = Arc::new(Entry {
+            label: "test-none".to_string(),
+            pid: Mutex::new(None),
+            kill_failures: AtomicU32::new(0),
+            born: (0, 0),
+        });
+        let registration = Registration {
+            key: next_key(),
+            slot,
+        };
+        registration.kill_tree(&mut c);
+        let alive = b_alive(&c);
+        reap(c);
+        std::mem::forget(registration);
+        assert!(alive, "kill_tree called child.kill() when pid was None");
     }
 
     fn b_alive(c: &Child) -> bool {

@@ -39,6 +39,8 @@ export interface GraphFrameRequest {
    */
   showAvatars?: boolean;
   avatarX?: number | null;
+  /** Forwarded to the renderer; see RenderOptions.avatarImageFor. */
+  avatarImageFor?: (row: VisualCommitRow) => CanvasImageSource | null;
 }
 
 /**
@@ -121,6 +123,7 @@ export function paintGraphFrame(
       emphasisOnly: staticBlitted,
       showAvatars: req.showAvatars === true,
       avatarX: req.showAvatars ? (req.avatarX ?? null) : null,
+      avatarImageFor: req.avatarImageFor,
     },
   );
 

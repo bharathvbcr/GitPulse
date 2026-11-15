@@ -3,6 +3,18 @@ import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { INCIDENT_EVENT, parseIncident, type TerminalIncident } from "../terminal/incident";
 
+export {
+  describeEndState,
+  dismissSessionLedgerRow,
+  reopenAllSessionLedgerOffers,
+  reopenBannerHeading,
+  reopenSessionLedgerOffer,
+  reopenableOffers,
+  sessionLedgerStore,
+  subscribeSessionLedger,
+  type SessionLedgerOffer,
+} from "../terminal/sessionLedger";
+
 /** The backend keeps this many; the view never holds more. */
 export const MAX_INCIDENTS_SHOWN = 32;
 

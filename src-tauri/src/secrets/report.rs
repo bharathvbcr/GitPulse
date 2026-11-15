@@ -153,12 +153,79 @@ fn confidence_rank(confidence: &str) -> u8 {
     }
 }
 
+/// Directory names whose wholly ignored copies are build output, installed
+/// dependencies or scratch space: not what a person wrote, and on a large
+/// checkout most of its bytes. Kingfisher honours no `.gitignore`, so on the
+/// GitPulse checkout a 50 GB `target/` and `tmp/` made scans miss their 300 s
+/// deadline. Kingfisher skips `node_modules` on its own; it is named here so
+/// the report says so.
+pub(crate) const BULK_IGNORED_DIRS: [&str; 3] = ["node_modules", "target", "tmp"];
+
+/// At most this many trees are left out. Past it the rest are scanned, which
+/// costs time but never coverage.
+pub(crate) const MAX_EXCLUSIONS: usize = 256;
+
+/// What a glob reads as a pattern. `--exclude` takes a glob, so a tree whose
+/// absolute path holds one of these could leave out something else; it is
+/// scanned instead.
+const GLOB_METACHARACTERS: [char; 8] = ['*', '?', '[', ']', '{', '}', '\\', '!'];
+
+/// The trees a scan of `root` leaves out, repo-relative and ending in `/`:
+/// wholly ignored directories named in [`BULK_IGNORED_DIRS`] (a directory of
+/// that name holding anything Git tracks is not wholly ignored, so it is
+/// scanned), and the linked `worktrees` of this repository that sit inside
+/// `root` — other checkouts of the same code, each scanned when it is the
+/// repository open. A tree inside another excluded tree is not listed again.
+///
+/// `root` and `worktrees` are canonical. Without `view` no directory can be
+/// shown to be ignored, so only worktrees are left out.
+pub(crate) fn scan_exclusions(
+    root: &Path,
+    view: Option<&GitView>,
+    worktrees: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut trees: Vec<String> = Vec::new();
+    if let Some(view) = view {
+        trees.extend(view.ignored.iter().filter_map(|entry| {
+            let dir = entry.strip_suffix('/')?;
+            let name = dir.rsplit('/').next()?;
+            BULK_IGNORED_DIRS
+                .contains(&name)
+                .then(|| entry.clone())
+        }));
+    }
+    trees.extend(worktrees.iter().filter_map(|tree| {
+        let rel = relativize(root, &tree.to_string_lossy())?;
+        Some(format!("{rel}/"))
+    }));
+    trees.retain(|rel| {
+        !root
+            .join(rel.trim_end_matches('/'))
+            .to_string_lossy()
+            .contains(GLOB_METACHARACTERS)
+    });
+    trees.sort();
+    trees.dedup();
+    // Sorted, so an ancestor comes before everything under it; both end in
+    // `/`, so a prefix is a whole path segment.
+    let mut kept: Vec<String> = Vec::new();
+    for rel in trees {
+        if !kept.iter().any(|ancestor| rel.starts_with(ancestor.as_str())) {
+            kept.push(rel);
+        }
+    }
+    kept.truncate(MAX_EXCLUSIONS);
+    kept
+}
+
 /// Facts about the run that the envelope does not carry.
 pub(crate) struct RunFacts {
     pub scanned_at_ms: u64,
     pub duration_ms: u64,
     pub nested_repos_scanned: bool,
     pub max_file_size_mb: u32,
+    /// What [`scan_exclusions`] left out of this run.
+    pub excluded_paths: Vec<String>,
 }
 
 /// Assemble the IPC report. `view` is `Err` when the Git listings could not
@@ -237,6 +304,7 @@ pub(crate) fn assemble(
         kingfisher_version: envelope.version,
         kingfisher_version_rejected: envelope.version_rejected,
         nested_repos_scanned: facts.nested_repos_scanned,
+        excluded_paths: facts.excluded_paths,
         completeness: if envelope.failed {
             ScanCompleteness::Partial
         } else {

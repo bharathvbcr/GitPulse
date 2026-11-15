@@ -102,6 +102,7 @@ const parentOf = new Map(), lineageReads = [];
 let failLineage = false;
 let verifyOptIn = false;
 const verifyPosts = [];
+const verifySaveCalls = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
@@ -113,6 +114,7 @@ let uncheckableProbes = 0;
 const fixtureRepoCommands = {
   cmd_note_tab_activated: () => null,
   cmd_verify_status_enabled: () => verifyOptIn,
+  cmd_verify_status_save: a => { verifySaveCalls.push(a); verifyOptIn = Boolean(a.enabled); return null; },
   cmd_verify_status_post: a => { verifyPosts.push(a); return { sha: "0123456789abcdef0123456789abcdef01234567", state: "success", description: "", dry_run: false, status_posted: true, commented: [], comment_note: null, would_run: [] }; },
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
   // A task terminal opens the checkout holding the attempt's directory; the
@@ -733,10 +735,15 @@ if (params.has("check")) {
     check("Post verify result is disabled while the repository has not opted in", Boolean(postButton()) && postButton().disabled === true && verifyPosts.length === 0);
     // The sheet posts for the repository tab the person has open.
     await click("Close task details"); await settle();
-    await repoStore.openRepo("/fixture/GitPulse", { activate: true }); verifyOptIn = true;
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true });
     card("task-1").click(); await wait(editor);
+    const optInSwitch = () => editor().querySelector("#task-verify-opt-in");
+    const commentSwitch = () => editor().querySelector("#task-verify-comment");
+    await wait(() => optInSwitch() && optInSwitch().disabled === false);
+    check("Post verify result stays disabled until opted in while the opt-in switch is offered", postButton().disabled === true && !commentSwitch());
+    optInSwitch().click();
     await wait(() => postButton() && postButton().disabled === false);
-    check("Post verify result is enabled once the repository opted in", postButton().disabled === false);
+    check("Post verify result is enabled once the repository opted in via the switch", verifySaveCalls.length === 1 && verifySaveCalls[0].repoPath === "/fixture/GitPulse" && verifySaveCalls[0].enabled === true && postButton().disabled === false);
     postButton().click(); await settle();
     const postPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
     check("posting asks for confirmation and sends nothing before the answer", Boolean(postPrompt) && verifyPosts.length === 0);
@@ -744,8 +751,21 @@ if (params.has("check")) {
     check("cancelling the confirmation posts nothing", verifyPosts.length === 0);
     postButton().click(); await settle();
     button("Post to GitHub", [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?"))?.click(); await settle(100);
-    check("confirming posts that task once, not as a dry run", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false);
-    verifyOptIn = false;
+    check("confirming posts that task once, not as a dry run and without commenting by default", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false && verifyPosts[0].comment === false);
+    commentSwitch().click(); await settle();
+    postButton().click(); await settle();
+    const commentPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
+    check("confirming with PR comments enabled names open pull requests before sending", Boolean(commentPrompt) && /open pull requests/.test(commentPrompt.textContent));
+    button("Post to GitHub", commentPrompt)?.click(); await settle(100);
+    check("confirming with PR comments enabled sends comment: true", verifyPosts.length === 2 && verifyPosts[1].taskId === "task-1" && verifyPosts[1].dryRun === false && verifyPosts[1].comment === true);
+    await repoStore.removeRepo("/fixture/GitPulse"); await settle();
+    check("closing the repository tab clears the posted notice from the task sheet", !editor().querySelector('[data-testid="task-verify-posted"]'));
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true });
+    await wait(() => optInSwitch() && optInSwitch().disabled === false);
+    check("switching repositories resets the pull-request comment toggle to off", Boolean(commentSwitch()) && commentSwitch().getAttribute("aria-checked") === "false");
+    optInSwitch().click();
+    await wait(() => postButton() && postButton().disabled === true);
+    check("toggling opt-in back off disables Post verify result and hides comment toggle", postButton().disabled === true && !commentSwitch() && verifyOptIn === false);
     await repoStore.removeRepo("/fixture/GitPulse");
     verdicts.delete("task-1");
     parentOf.clear();

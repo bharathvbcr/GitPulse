@@ -32,6 +32,8 @@
     axis = "y",
     hint,
     diffuse = false,
+    endLabel,
+    onEnd,
   }: {
     target: HTMLElement | undefined;
     axis?: OverflowAxis;
@@ -42,6 +44,14 @@
      * while the pointer is over the scroller's parent. Off for everyone else.
      */
     diffuse?: boolean;
+    /**
+     * Vertical only: names what lies past the end edge ("Worktrees"). The end
+     * chevron becomes a labelled pill, so a reader learns there is a section
+     * below rather than only that the list overflows.
+     */
+    endLabel?: string;
+    /** Replaces the page nudge on the end cue (e.g. scroll that section into view). */
+    onEnd?: () => void;
   } = $props();
 
   let measured: OverflowHint = $state(EMPTY_OVERFLOW_HINT);
@@ -79,6 +89,20 @@
       last = next;
       yielded = next;
     });
+  });
+
+  // An edge whose chevron gave way has nothing drawn in its band, so it need
+  // not be cleared: the sidebar's fade reads these and only ramps there,
+  // instead of hiding a band of rows under a chevron that is not drawn.
+  $effect(() => {
+    const el = target;
+    if (!el) return;
+    el.style.setProperty("--gp-cue-clear-start", yielded.start ? "0px" : "");
+    el.style.setProperty("--gp-cue-clear-end", yielded.end ? "0px" : "");
+    return () => {
+      el.style.removeProperty("--gp-cue-clear-start");
+      el.style.removeProperty("--gp-cue-clear-end");
+    };
   });
 
   // The token follows the hint; clearing is tied to the element alone, so a
@@ -158,9 +182,10 @@
   {@const StartIcon = horizontal ? ChevronLeft : ChevronUp}
   {@const EndIcon = horizontal ? ChevronRight : ChevronDown}
   {@const Icon = toward === "start" ? StartIcon : EndIcon}
+  {@const named = !horizontal && toward === "end" && !!endLabel}
   {@const label = toward === "start"
     ? (horizontal ? "Scroll left" : "Scroll up")
-    : (horizontal ? "Scroll right" : "Scroll down")}
+    : (horizontal ? "Scroll right" : named ? `Scroll down to ${endLabel}` : "Scroll down")}
   <div
     class={horizontal
       ? `gp-scroll-cue ${toward === "start" ? "gp-scroll-cue-start" : "gp-scroll-cue-end"}`
@@ -169,7 +194,7 @@
     <button
       type="button"
       tabindex="-1"
-      class="gp-scroll-cue-btn"
+      class={named ? "gp-scroll-cue-pill" : "gp-scroll-cue-btn"}
       data-hover-only={diffuse ? "" : undefined}
       aria-label={label}
       title={label}
@@ -180,10 +205,12 @@
       onclick={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        nudge(toward);
+        if (toward === "end" && onEnd) onEnd();
+        else nudge(toward);
       }}
     >
-      <Icon size={12} strokeWidth={2.5} />
+      {#if named}<span class="truncate">{endLabel}</span>{/if}
+      <Icon size={12} strokeWidth={2.5} class="shrink-0" />
     </button>
   </div>
 {/snippet}

@@ -65,4 +65,16 @@ describe("ReflogViewer interaction contract", () => {
     expect(source).toContain("Showing the 200 most recent reflog entries");
     expect(source).toContain("Older reflog history may exist");
   });
+
+  it("offers Agent ops snapshot listing and CAS undo review without auto-overwriting dirty worktrees", () => {
+    expect(source).toContain('label: "Agent ops"');
+    expect(source).toContain('invoke<OpSnapshotList>("cmd_list_op_snapshots"');
+    expect(source).toContain('invoke<Guarded<OpUndoOutcome>>("cmd_undo_op_snapshot"');
+    expect(source).toContain("expected_refs: snap.refs.map((r) => ({");
+    expect(source).toContain("expected_oid: r.current_oid");
+    expect(source).toContain("confirm_dirty: confirmDirty");
+    expect(source).toContain("<Checkbox");
+    expect(source).toContain("checked={confirmDirty}");
+    expect(source).toContain('onclick={confirmUndo}');
+  });
 });

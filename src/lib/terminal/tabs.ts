@@ -126,7 +126,11 @@ export interface TerminalTab {
  */
 export interface ResumeLaunch {
   sessionId: string;
-  mode: PermissionMode;
+  mode: PermissionMode | null;
+  /** Durable backend session ledger row id when reopened after quit/crash. */
+  ledgerRowId?: string;
+  /** True when resuming as a distinct forked Claude session (`--fork-session`). */
+  fork?: boolean;
   /**
    * The ended attempt this conversation continues. Linkage only, so the
    * task's Agents pane can list the session under its attempt; a resumed tab
@@ -134,9 +138,9 @@ export interface ResumeLaunch {
    */
   runId?: string;
   /**
-   * A first message for the resumed conversation, sent as the prompt of
-   * `claude --resume <id> -- <prompt>` (`resumeArgs`). The first start only: a
-   * restart of the tab resumes without it, or it would be said twice.
+   * A first message for the resumed conversation, sent via `resumeArgs`.
+   * The first start only: a restart of the tab resumes without it, or it
+   * would be said twice.
    */
   prompt?: string;
 }
@@ -176,12 +180,32 @@ const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 /** The only session id shape Claude Code's `--resume` and `--session-id` take. */
 export function isSessionId(value: string): boolean { return CANONICAL_UUID.test(value); }
 
+/**
+ * True for canonical UUIDs or the Antigravity `--continue` sentinel produced
+ * when an `agy` session ends before reporting a UUID.
+ */
+export function isResumableSessionRef(value: string, provider?: string): boolean {
+  return isSessionId(value) || (provider === "agy" && value === "__agy_continue__");
+}
+
 /** The tab already showing this launch, if one is. */
 export function tabFor(state: TabState, launch: TaskLaunch): TerminalTab | undefined {
   const { resume, attach } = launch;
   if (attach) return state.tabs.find((tab) => tab.attachSessionId === attach.sessionId);
+  if (resume?.ledgerRowId) {
+    return state.tabs.find((tab) => tab.resume?.ledgerRowId === resume.ledgerRowId);
+  }
+  if (resume?.fork) {
+    const checkout = launch.checkout ?? null;
+    return state.tabs.find(
+      (tab) =>
+        tab.resume?.fork === true
+        && tab.resume.sessionId === resume.sessionId
+        && (tab.checkout ?? null) === checkout,
+    );
+  }
   return resume
-    ? state.tabs.find((tab) => tab.resume?.sessionId === resume.sessionId)
+    ? state.tabs.find((tab) => !tab.resume?.fork && tab.resume?.sessionId === resume.sessionId)
     : state.tabs.find((tab) => tab.taskRunId === launch.runId);
 }
 
@@ -304,9 +328,15 @@ export function openTab(state: TabState, launcher: TabKind, launch?: string | Ta
   } else if (task?.resume) {
     // A plain agent tab, not the attempt's: the attempt ended and its
     // record is final, so this session is the reader's own continuation.
-    if ((launcher !== "claude" && launcher !== "agy") || !isSessionId(task.resume.sessionId)) return state;
-    tab.resume = { ...task.resume, runId: task.runId };
-    tab.name = `${task.title} (resumed)`;
+    if (task.resume.fork) {
+      if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;
+      tab.resume = { ...task.resume, ...(task.runId ? { runId: task.runId } : {}) };
+      tab.name = `${task.title} (forked)`;
+    } else {
+      if ((launcher !== "claude" && launcher !== "agy") || !isResumableSessionRef(task.resume.sessionId, launcher)) return state;
+      tab.resume = { ...task.resume, ...(task.runId ? { runId: task.runId } : {}) };
+      tab.name = task.resume.ledgerRowId ? `${task.title} (reopened)` : `${task.title} (resumed)`;
+    }
   } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
   // A taken-over session is already running wherever it runs.
   const startDir = task && !task.attach ? relativeStartDir(task.startDir) : null;
@@ -520,6 +550,20 @@ export function setTabStartDir(state: TabState, id: string, startDir: string | n
 export function setTabAutoWake(state: TabState, id: string, autoWake: boolean): TabState {
   if (!state.tabs.some((tab) => tab.id === id)) return state;
   return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, autoWake } : tab)) };
+}
+
+/** Sets typed resume metadata (and optional display name) on a newly opened tab. */
+export function setTabResume(state: TabState, id: string, resume: ResumeLaunch, name?: string): TabState {
+  if (!state.tabs.some((tab) => tab.id === id)) return state;
+  const trimmedName = name?.trim();
+  return {
+    ...state,
+    tabs: state.tabs.map((tab) =>
+      tab.id === id
+        ? { ...tab, resume: { ...resume }, ...(trimmedName ? { name: trimmedName } : {}) }
+        : tab,
+    ),
+  };
 }
 
 export function activateTab(state: TabState, id: string): TabState {

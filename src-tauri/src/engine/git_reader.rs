@@ -1364,7 +1364,7 @@ impl GitReader {
             let mut warnings: Vec<String> = Vec::new();
             // Unstaged churn: untracked files count file lines directly; modified working-tree files read numstat_work
             let (work_add, work_del) = if is_untracked {
-                let lines = match sandbox_join_canonical(&repo, &path) {
+                let lines = match sandbox_join_entry(&repo, &path) {
                     Ok(safe_path) => untracked_scan.lines(&safe_path),
                     Err(_) => UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
                 };
@@ -5839,6 +5839,12 @@ const UNTRACKED_BUDGET_SPENT: &str =
 const UNTRACKED_TOO_LARGE: &str =
     "untracked file not line-counted: larger than the 64 MiB scan limit";
 const UNTRACKED_UNREADABLE: &str = "untracked file not line-counted: it could not be read";
+const UNTRACKED_SYMLINK: &str = "untracked file not line-counted: symbolic link";
+const UNTRACKED_FIFO: &str = "untracked file not line-counted: FIFO / named pipe";
+const UNTRACKED_SOCKET: &str = "untracked file not line-counted: socket";
+const UNTRACKED_DEVICE: &str = "untracked file not line-counted: device node";
+const UNTRACKED_DIRECTORY: &str = "untracked file not line-counted: directory";
+const UNTRACKED_NOT_REGULAR: &str = "untracked file not line-counted: not a regular file";
 
 enum UntrackedLines {
     Counted(usize),
@@ -5978,20 +5984,52 @@ impl UntrackedScan {
     }
 
     fn lines(&mut self, full_path: &Path) -> UntrackedLines {
-        let Ok(meta) = std::fs::symlink_metadata(full_path) else {
-            return UntrackedLines::Counted(0);
+        let meta = match std::fs::symlink_metadata(full_path) {
+            Ok(m) => m,
+            Err(_) => return UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
         };
-        if !meta.is_file() || meta.len() == 0 {
-            return UntrackedLines::Counted(0);
+
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return UntrackedLines::NotCounted(UNTRACKED_SYMLINK);
         }
-        let identity = ScanIdentity::of(&meta);
-        if let Some(known) = self.previous.get(full_path) {
-            if known.identity == identity {
-                let lines = known.lines;
-                self.remember(full_path, identity, lines);
-                return UntrackedLines::Counted(lines);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if file_type.is_fifo() {
+                return UntrackedLines::NotCounted(UNTRACKED_FIFO);
+            }
+            if file_type.is_socket() {
+                return UntrackedLines::NotCounted(UNTRACKED_SOCKET);
+            }
+            if file_type.is_char_device() || file_type.is_block_device() {
+                return UntrackedLines::NotCounted(UNTRACKED_DEVICE);
             }
         }
+        if file_type.is_dir() {
+            return UntrackedLines::NotCounted(UNTRACKED_DIRECTORY);
+        }
+        if !file_type.is_file() {
+            return UntrackedLines::NotCounted(UNTRACKED_NOT_REGULAR);
+        }
+
+        // Legitimate empty regular file: exactly 0 lines, no warning.
+        if meta.len() == 0 {
+            return UntrackedLines::Counted(0);
+        }
+
+        let identity = ScanIdentity::of(&meta);
+        // Only trust cache if identity has a valid, non-zero file identifier.
+        if identity.inode != 0 {
+            if let Some(known) = self.previous.get(full_path) {
+                if known.identity == identity {
+                    let lines = known.lines;
+                    self.remember(full_path, identity, lines);
+                    return UntrackedLines::Counted(lines);
+                }
+            }
+        }
+
         if meta.len() > UNTRACKED_FILE_MAX_BYTES {
             return UntrackedLines::NotCounted(UNTRACKED_TOO_LARGE);
         }
@@ -6011,14 +6049,24 @@ impl UntrackedScan {
             return UntrackedLines::NotCounted(UNTRACKED_UNREADABLE);
         };
         match file.metadata() {
-            Ok(opened) if opened.is_file() => {}
-            // Replaced by something that is not a file after the `lstat`.
-            Ok(_) => return UntrackedLines::Counted(0),
+            Ok(opened) => {
+                #[cfg(windows)]
+                let is_link = {
+                    use std::os::windows::fs::MetadataExt;
+                    opened.file_attributes() & 0x400 != 0
+                };
+                #[cfg(not(windows))]
+                let is_link = false;
+
+                if is_link || !opened.is_file() {
+                    return UntrackedLines::NotCounted(UNTRACKED_NOT_REGULAR);
+                }
+            }
             Err(_) => return UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
         }
         match self.count_lines(file, meta.len()) {
             Some(lines) => {
-                if lang_cache::settled(&identity) {
+                if identity.inode != 0 && lang_cache::settled(&identity) {
                     self.remember(full_path, identity, lines);
                 }
                 UntrackedLines::Counted(lines)
@@ -6102,6 +6150,13 @@ fn open_working_tree_file(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // OPEN_REPARSE_POINT (0x0020_0000): Opens the reparse point without traversing it.
+        // BACKUP_SEMANTICS (0x0200_0000): Allows inspecting directories and reparse points without access denial.
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
     options.open(path)
 }
 
@@ -6116,11 +6171,17 @@ pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<
     }
     check_working_tree_size(path, max_bytes)?;
     let file = open_working_tree_file(path).map_err(|e| format!("Cannot open file: {e}"))?;
-    if !file
+    let file_meta = file
         .metadata()
-        .map_err(|e| format!("Cannot inspect open file: {e}"))?
-        .is_file()
-    {
+        .map_err(|e| format!("Cannot inspect open file: {e}"))?;
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        file_meta.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = false;
+    if is_link || !file_meta.is_file() {
         return Err("Expected a regular working-tree file".into());
     }
     let mut bytes = Vec::new();
@@ -7359,9 +7420,14 @@ impl ScanIdentity {
                 .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
             (meta.ino(), changed)
         };
-        // Windows exposes no inode or change time through `std`; size and
-        // mtime still move on every ordinary write.
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let (inode, changed) = {
+            use std::os::windows::fs::MetadataExt;
+            let creation_ns = meta.creation_time();
+            let changed = meta.created().ok();
+            (creation_ns, changed)
+        };
+        #[cfg(all(not(unix), not(windows)))]
         let (inode, changed) = (0, None);
         Self {
             len: meta.len(),
@@ -7682,11 +7748,12 @@ mod lang_cache {
 
     /// Whether `identity` is old enough that a later write must change it.
     pub(super) fn settled(identity: &ScanIdentity) -> bool {
-        identity.newest().is_some_and(|newest| {
-            SystemTime::now()
-                .duration_since(newest)
-                .is_ok_and(|age| age >= RACY_WINDOW)
-        })
+        identity.inode != 0
+            && identity.newest().is_some_and(|newest| {
+                SystemTime::now()
+                    .duration_since(newest)
+                    .is_ok_and(|age| age >= RACY_WINDOW)
+            })
     }
 
     /// Takes `repo`'s map out of the store so the scan holds no lock while it
@@ -15330,6 +15397,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .unwrap();
         let swapped = rows.iter().find(|r| r.path == "u001.txt").unwrap();
         assert_eq!(swapped.additions, 0);
+        assert_eq!(swapped.warnings, vec![UNTRACKED_NOT_REGULAR.to_string()]);
         assert_eq!(
             rows.iter()
                 .find(|r| r.path == "u000.txt")
@@ -15344,6 +15412,131 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 .additions,
             2
         );
+    }
+
+    #[test]
+    fn untracked_empty_regular_file_is_counted_zero_without_warnings() {
+        let (_dir, root) = untracked_fixture(0, 0);
+        std::fs::write(root.join("empty.txt"), b"").unwrap();
+        let rows = GitReader::get_status(root.to_str().unwrap()).unwrap();
+        let empty = rows.iter().find(|r| r.path == "empty.txt").unwrap();
+        assert_eq!(empty.additions, 0);
+        assert_eq!(empty.deletions, 0);
+        assert!(
+            empty.warnings.is_empty(),
+            "true empty file must not have warnings: {:?}",
+            empty.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_special_files_emit_diagnostic_warnings_and_zero_additions() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_dir, root) = untracked_fixture(0, 0);
+
+        // 1. Symbolic link (dangling / broken)
+        let link_path = root.join("broken.link");
+        std::os::unix::fs::symlink("nonexistent_target.txt", &link_path).unwrap();
+
+        // 2. FIFO (named pipe)
+        let fifo_path = root.join("pipe.fifo");
+        let c_fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+        // 3. Unix domain socket
+        let sock_path = root.join("test.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+        // 4. Regular file to ensure standard files are still counted
+        std::fs::write(root.join("normal.txt"), "line1\nline2\n").unwrap();
+
+        let mut scan = UntrackedScan::new(&root, UntrackedBudget::SHIPPED);
+        match scan.lines(&fifo_path) {
+            UntrackedLines::NotCounted(why) => {
+                assert_eq!(why, UNTRACKED_FIFO);
+            }
+            UntrackedLines::Counted(n) => panic!("FIFO counted as {n}"),
+        }
+        match scan.lines(&sock_path) {
+            UntrackedLines::NotCounted(why) => {
+                assert_eq!(why, UNTRACKED_SOCKET);
+            }
+            UntrackedLines::Counted(n) => panic!("Socket counted as {n}"),
+        }
+        match scan.lines(&link_path) {
+            UntrackedLines::NotCounted(why) => {
+                assert_eq!(why, UNTRACKED_SYMLINK);
+            }
+            UntrackedLines::Counted(n) => panic!("Symlink counted as {n}"),
+        }
+
+        let rows = GitReader::get_status(root.to_str().unwrap()).unwrap();
+
+        let symlink_row = rows.iter().find(|r| r.path == "broken.link").unwrap();
+        assert_eq!(symlink_row.additions, 0);
+        assert_eq!(symlink_row.warnings, vec![UNTRACKED_SYMLINK.to_string()]);
+
+        let normal_row = rows.iter().find(|r| r.path == "normal.txt").unwrap();
+        assert_eq!(normal_row.additions, 2);
+        assert!(normal_row.warnings.is_empty());
+
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_unreadable_file_emits_diagnostic_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = untracked_fixture(0, 0);
+        let unreadable = root.join("secret.txt");
+        std::fs::write(&unreadable, "top secret\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rows = GitReader::get_status(root.to_str().unwrap()).unwrap();
+        let row = rows.iter().find(|r| r.path == "secret.txt").unwrap();
+        assert_eq!(row.additions, 0);
+        assert_eq!(row.warnings, vec![UNTRACKED_UNREADABLE.to_string()]);
+
+        // Restore permissions for clean tempdir drop
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600));
+    }
+
+    #[test]
+    fn scan_identity_with_zero_inode_is_never_settled_or_cached() {
+        let zero_identity = ScanIdentity {
+            len: 100,
+            inode: 0,
+            modified: Some(SystemTime::now() - Duration::from_secs(60)),
+            changed: Some(SystemTime::now() - Duration::from_secs(60)),
+        };
+        // Zero inode identity must fail settled() check closed
+        assert!(
+            !lang_cache::settled(&zero_identity),
+            "zero inode identity must never be settled"
+        );
+
+        let (_dir, root) = untracked_fixture(1, 5);
+        let file_path = root.join("u000.txt");
+        let mut scan = UntrackedScan::new(&root, UntrackedBudget::SHIPPED);
+
+        // Fabricate a previous cache entry with inode 0
+        scan.previous.insert(
+            file_path.clone(),
+            untracked_cache::Entry {
+                identity: zero_identity,
+                lines: 999,
+            },
+        );
+
+        // Scanning lines() must bypass cache with inode 0 and count real lines (5, not 999)
+        let lines = scan.lines(&file_path);
+        match lines {
+            UntrackedLines::Counted(n) => {
+                assert_eq!(n, 5, "must count real lines, not dummy 0-inode cache")
+            }
+            UntrackedLines::NotCounted(why) => panic!("unexpected uncounted file: {why}"),
+        }
     }
 
     /// The two numstats run only when a row reads them, and skipping them

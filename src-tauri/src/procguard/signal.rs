@@ -46,17 +46,19 @@ pub enum Basis {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Me {
     pub pid: i32,
+    pub ppid: i32,
     pub pgrp: i32,
     pub sid: i32,
 }
 
 impl Me {
     pub fn current() -> Me {
-        // SAFETY: getpid, getpgrp and getsid(0) take no pointers and read only
+        // SAFETY: getpid, getppid, getpgrp and getsid(0) take no pointers and read only
         // this process's own ids.
         unsafe {
             Me {
                 pid: libc::getpid(),
+                ppid: libc::getppid(),
                 pgrp: libc::getpgrp(),
                 sid: libc::getsid(0),
             }
@@ -77,7 +79,7 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-fn refusal(why: impl Into<String>) -> io::Error {
+pub(crate) fn refusal(why: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, Refused(why.into()))
 }
 
@@ -110,9 +112,10 @@ pub fn vet_group(
     sid_of: &dyn Fn(i32) -> Option<i32>,
 ) -> io::Result<()> {
     plain_id(pgid, "process group")?;
-    if pgid == me.pgrp || pgid == me.pid {
+    if pgid == me.pgrp || pgid == me.pid || pgid == me.ppid || pgid == me.sid {
         return Err(refusal(format!(
-            "refusing to signal this process's own group {pgid}"
+            "refusing to signal host process tree group {pgid} (pid={}, ppid={}, pgrp={}, sid={})",
+            me.pid, me.ppid, me.pgrp, me.sid
         )));
     }
     match basis {
@@ -136,9 +139,10 @@ pub fn vet_group(
         }
         Basis::Session(sid) => {
             plain_id(sid, "session")?;
-            if sid == me.sid {
+            if sid == me.sid || sid == me.pgrp || sid == me.ppid || sid == me.pid {
                 return Err(refusal(format!(
-                    "refusing to signal inside this process's own session {sid}"
+                    "refusing to signal inside host process tree session {sid} (pid={}, ppid={}, pgrp={}, sid={})",
+                    me.pid, me.ppid, me.pgrp, me.sid
                 )));
             }
             if let Some(session) = sid_of(pgid) {
@@ -161,8 +165,11 @@ pub fn vet_process(
     start_of: &dyn Fn(i32) -> Option<u64>,
 ) -> io::Result<()> {
     plain_id(pid, "process")?;
-    if pid == me.pid {
-        return Err(refusal("refusing to signal this process"));
+    if pid == me.pid || pid == me.ppid || pid == me.pgrp || pid == me.sid {
+        return Err(refusal(format!(
+            "refusing to signal host process {pid} (pid={}, ppid={}, pgrp={}, sid={})",
+            me.pid, me.ppid, me.pgrp, me.sid
+        )));
     }
     if started_us == 0 {
         return Err(refusal(
@@ -191,8 +198,11 @@ pub fn vet_spawn_window(
     start_of: &dyn Fn(i32) -> Option<u64>,
 ) -> io::Result<()> {
     plain_id(pid, "process")?;
-    if pid == me.pid {
-        return Err(refusal("refusing to signal this process"));
+    if pid == me.pid || pid == me.ppid || pid == me.pgrp || pid == me.sid {
+        return Err(refusal(format!(
+            "refusing to signal host process {pid} (pid={}, ppid={}, pgrp={}, sid={})",
+            me.pid, me.ppid, me.pgrp, me.sid
+        )));
     }
     let (before, after) = born;
     if before == 0 || after < before {
@@ -293,6 +303,7 @@ mod tests {
 
     const ME: Me = Me {
         pid: 500,
+        ppid: 150,
         pgrp: 400,
         sid: 300,
     };
@@ -318,6 +329,9 @@ mod tests {
         assert!(vet_spawn_window(600, (0, 0), slack, ME, &at(1)).is_err());
         assert!(vet_spawn_window(600, (5, 4), slack, ME, &at(5)).is_err());
         assert!(vet_spawn_window(ME.pid, window, slack, ME, &at(1_000_200)).is_err());
+        assert!(vet_spawn_window(ME.ppid, window, slack, ME, &at(1_000_200)).is_err());
+        assert!(vet_spawn_window(ME.pgrp, window, slack, ME, &at(1_000_200)).is_err());
+        assert!(vet_spawn_window(ME.sid, window, slack, ME, &at(1_000_200)).is_err());
         assert!(vet_spawn_window(1, window, slack, ME, &at(1_000_200)).is_err());
     }
 
@@ -340,12 +354,62 @@ mod tests {
     #[test]
     fn this_process_and_its_group_and_its_session_are_refused() {
         assert!(vet(ME.pid, Basis::Spawned).is_err());
+        assert!(vet(ME.ppid, Basis::Spawned).is_err());
         assert!(vet(ME.pgrp, Basis::Spawned).is_err());
+        assert!(vet(ME.sid, Basis::Spawned).is_err());
+        assert!(vet(ME.pid, Basis::Session(77)).is_err());
+        assert!(vet(ME.ppid, Basis::Session(77)).is_err());
         assert!(vet(ME.pgrp, Basis::Session(77)).is_err());
+        assert!(vet(ME.sid, Basis::Session(77)).is_err());
         assert!(vet(600, Basis::Session(ME.sid)).is_err(), "own session");
+        assert!(vet(600, Basis::Session(ME.pgrp)).is_err(), "own group session");
+        assert!(vet(600, Basis::Session(ME.ppid)).is_err(), "parent session");
+        assert!(vet(600, Basis::Session(ME.pid)).is_err(), "own pid session");
         assert!(vet(600, Basis::Session(1)).is_err(), "session 1");
         assert!(vet(600, Basis::Session(0)).is_err(), "session 0");
         assert!(vet_process(ME.pid, 9, ME, &|_| Some(9)).is_err());
+        assert!(vet_process(ME.ppid, 9, ME, &|_| Some(9)).is_err());
+        assert!(vet_process(ME.pgrp, 9, ME, &|_| Some(9)).is_err());
+        assert!(vet_process(ME.sid, 9, ME, &|_| Some(9)).is_err());
+    }
+
+    #[test]
+    fn vet_group_refuses_host_session_under_spawned_basis() {
+        // Even if OS claims pgid ME.sid is in group ME.sid and session ME.sid,
+        // it must be refused because ME.sid is the host session leader.
+        let group_fn = |pid: i32| (pid == ME.sid).then_some(ME.sid);
+        let session_fn = |pid: i32| (pid == ME.sid).then_some(ME.sid);
+        let res = vet_group(ME.sid, Basis::Spawned, ME, &group_fn, &session_fn);
+        assert!(res.is_err(), "must refuse host session under spawned basis");
+        assert!(is_refusal(&res.unwrap_err()));
+    }
+
+    #[test]
+    fn vet_group_refuses_parent_pid() {
+        let group_fn = |pid: i32| (pid == ME.ppid).then_some(ME.ppid);
+        let session_fn = |pid: i32| (pid == ME.ppid).then_some(ME.sid);
+        let res = vet_group(ME.ppid, Basis::Spawned, ME, &group_fn, &session_fn);
+        assert!(res.is_err(), "must refuse parent PID under spawned basis");
+        assert!(is_refusal(&res.unwrap_err()));
+    }
+
+    #[test]
+    fn vet_process_refuses_host_tree() {
+        for target in [ME.pid, ME.ppid, ME.pgrp, ME.sid] {
+            let res = vet_process(target, 10, ME, &|_| Some(10));
+            assert!(res.is_err(), "must refuse host target {target}");
+            assert!(is_refusal(&res.unwrap_err()));
+        }
+    }
+
+    #[test]
+    fn vet_spawn_window_refuses_host_tree() {
+        let window = (1_000_000, 1_000_500);
+        for target in [ME.pid, ME.ppid, ME.pgrp, ME.sid] {
+            let res = vet_spawn_window(target, window, 100, ME, &|_| Some(1_000_200));
+            assert!(res.is_err(), "must refuse host target {target}");
+            assert!(is_refusal(&res.unwrap_err()));
+        }
     }
 
     /// A group the caller did not create is not signalled: a pid that is now a
@@ -396,9 +460,10 @@ mod tests {
             assert!(signal_process(id, 1, &|_| Some(1), libc::SIGKILL, "test").is_err());
         }
         let me = Me::current();
-        for target in [me.pid, me.pgrp] {
+        for target in [me.pid, me.ppid, me.pgrp, me.sid] {
             assert!(signal_group(target, libc::SIGKILL, Basis::Spawned, "test").is_err());
+            assert!(signal_group(target, libc::SIGKILL, Basis::Session(me.sid), "test").is_err());
+            assert!(signal_process(target, 1, &|_| Some(1), libc::SIGKILL, "test").is_err());
         }
-        assert!(signal_process(me.pid, 1, &|_| Some(1), libc::SIGKILL, "test").is_err());
     }
 }

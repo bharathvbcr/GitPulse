@@ -520,6 +520,43 @@
           button("Hide the terminal dock").click(); await wait();
           button("Show terminal").click(); await wait();
           check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
+          // A double-click on the page hides the dock (the shell keeps running);
+          // one inside the dock, such as selecting a word of output, does not.
+          {
+            const terminalOpenNow = () => { let open = false; repoStore.subscribe((state) => { open = state.terminalOpen; })(); return open; };
+            const dblclick = (el) => el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
+            const shown = () => getComputedStyle(document.querySelector("[data-terminal-dock]")).display !== "none" && terminalOpenNow();
+            dblclick(document.querySelector("[data-terminal-dock] .xterm-rows") ?? document.querySelector("[data-terminal-dock]")); await wait();
+            check("double-click inside the dock leaves it open", () => shown());
+            const page = document.querySelector("[data-view-host] .p-4") ?? document.querySelector("[data-view-host]");
+            page.addEventListener("dblclick", (event) => event.stopPropagation(), { once: true });
+            dblclick(page); await wait(500);
+            check("double-click on the page hides the dock, even when the page stops the event", () => !terminalOpenNow() && !shown());
+            check("hiding by double-click keeps the sessions", () => report.spawned === beforeHide && report.killed === 0);
+            button("Show terminal").click(); await wait();
+            // The page tab bar counts as the page; the terminal pill in it, and
+            // anything outside the page (the sidebar), do not. The host has no
+            // view bar, so a stand-in wears the attributes the real ones render.
+            const bar = document.createElement("nav");
+            bar.setAttribute("data-viewbar", "");
+            bar.setAttribute("data-tauri-drag-region", "");
+            bar.innerHTML = '<button type="button" role="tab">Graph</button><div data-tauri-drag-region style="width:48px;height:12px"></div><span data-terminal-pill><button type="button">Terminal</button></span>';
+            const aside = document.createElement("aside");
+            document.body.prepend(bar, aside);
+            dblclick(bar.querySelector("[data-terminal-pill] button")); await wait();
+            check("double-click on the terminal pill leaves the dock open", () => shown());
+            // Empty tab-bar space is a window drag region: the window zooms, the dock stays.
+            dblclick(bar.querySelector("div[data-tauri-drag-region]")); await wait();
+            dblclick(bar); await wait();
+            check("double-click on the tab bar's empty space (a window drag region) leaves the dock open", () => shown());
+            dblclick(aside); await wait();
+            check("double-click outside the page and its tab bar leaves the dock open", () => shown());
+            dblclick(bar.querySelector('[role="tab"]')); await wait(500);
+            check("double-click on the page tab bar hides the dock", () => !terminalOpenNow() && !shown());
+            bar.remove();
+            aside.remove();
+            button("Show terminal").click(); await wait();
+          }
           // THE DECOUPLING, in a real browser. Visiting another repository
           // while a shell runs here must not open a dock there, and must not
           // spawn anything: a panel mounts a session, and this check used to

@@ -133,7 +133,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]
-        Bridge["invoke('cmd_*') — 322 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+        Bridge["invoke('cmd_*') — 328 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -174,7 +174,7 @@ workbench; this does not imply complete feature parity.
 
 ## Build and contribute
 
-Use Bun 1.4.2, Node.js 22.x (22.12 or newer), stable Rust, Git, and your platform's native
+Use Bun 1.4.2, Node.js 22.x (22.12 or newer), Rust 1.100+ (stable), Go 1.27.4 (for `gusset:check`), Git, and your platform's native
 build tools. The [contributor guide](CONTRIBUTING.md) covers setup and platform prerequisites.
 
 ```sh
@@ -189,6 +189,7 @@ bun run tauri dev
 | --- | --- |
 | `bun run check` | Svelte and TypeScript checks |
 | `bun run test` | Frontend and contract tests |
+| `bun run test:tz` | Local-time frontend tests across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata` |
 | `bun run check:ipc` | Match frontend calls to the native command registry |
 | `bun run check:types` | Compare Rust and TypeScript wire contracts |
 | `bun run check:release` | Check version manifest consistency |

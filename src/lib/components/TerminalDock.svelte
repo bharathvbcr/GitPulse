@@ -29,7 +29,7 @@
   import { nudgedPaneHeight, startPaneDrag } from "../ui/paneHeight";
   import { panelModes } from "../ui/panelMode";
   import { LAYERS } from "../ui/layers";
-  import { floatingPanelDismiss } from "../ui/panelDismiss";
+  import { floatingPanelDismiss, isWindowDragDoubleClick, pageDoubleClickHidesPanel } from "../ui/panelDismiss";
   import { popover, type PopoverOptions } from "../ui/popover";
 
   /**
@@ -166,9 +166,12 @@
    * the status bar's terminal pill is the dock's own trigger, so both count as
    * inside (ui/panelDismiss.ts); the popover owner does the judging.
    */
+  /** The dock's own toggle: the terminal pill in the view bar and its menu. */
+  const DOCK_TRIGGER = "[data-terminal-pill], [data-terminal-pill-menu]";
+
   const dockDismissOptions = $derived<PopoverOptions>({
     dismiss: {
-      ...floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]"),
+      ...floatingPanelDismiss("[data-terminal-dock]", DOCK_TRIGGER),
       pointer: overlay && open && !leaving ? "pointerdown" : "none",
     },
     onDismiss: () => onClose(),
@@ -241,6 +244,29 @@
         ? fitTerminalDockHeight(dragHeight, containerHeight)
         : fitTerminalDockHeight($interfaceStore.terminalDockHeight, containerHeight),
   );
+
+  /*
+   * A double-click on the page above the dock, or on the page tab bar, hides
+   * the dock, so the page is one gesture away in either mode; the shell keeps
+   * running, as with the hide button. Heard on the document in the capture
+   * phase, so a page that stops its own double-click cannot keep the dock up,
+   * and scoped to the column the dock shares with the view plus the view bar
+   * (`data-viewbar`). The dock, its pill, menus, text fields and the sidebar
+   * do not count, and neither does the empty space of the tab bar: that is a
+   * window drag region, where the double-click zooms the window instead
+   * (ui/panelDismiss.ts).
+   */
+  $effect(() => {
+    const column = host?.parentElement;
+    if (!column || !open) return;
+    const scope = { panel: "[data-terminal-dock]", trigger: DOCK_TRIGGER, column, page: "[data-viewbar]" };
+    const onDoubleClick = (event: MouseEvent) => {
+      if (isWindowDragDoubleClick(event.composedPath())) return;
+      if (pageDoubleClickHidesPanel(event.target, scope)) onClose();
+    };
+    document.addEventListener("dblclick", onDoubleClick, true);
+    return () => document.removeEventListener("dblclick", onDoubleClick, true);
+  });
 
   $effect(() => {
     const parent = host?.parentElement;

@@ -524,6 +524,17 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   }
 }
 
+/* The end cue when it names the section below ("Worktrees ⌄"): the same
+   chip as the chevron, widened to carry the word, and kept inside the 2rem
+   band (h-6) so it never sits on a row. */
+@utility gp-scroll-cue-pill {
+  @apply pointer-events-auto inline-flex h-6 max-w-[calc(100%-1.5rem)] cursor-pointer items-center gap-1 rounded-full border border-edge bg-surface/90 pr-2 pl-2.5 text-micro font-medium text-textMuted;
+  box-shadow: var(--shadow-bubble-lift);
+  &:hover {
+    @apply bg-surfaceHover text-textPrimary;
+  }
+}
+
 @utility gp-menu {
   /* Floating menu / popover. */
   @apply overflow-hidden rounded-xl border border-edgeStrong bg-surface p-1;
@@ -1973,16 +1984,38 @@ html.light .gp-sidebar[data-sidebar-panel] {
   --gp-sidebar-cue-ramp: 0.5rem;
 }
 
+/* Per edge, the cleared band is the cue band only where that scroller draws
+   its own chevron. ScrollCue sets `--gp-cue-clear-start`/`-end` to 0px on an
+   edge whose chevron gave way to an enclosing one (the branch list's bottom,
+   right above the body's cue): nothing is drawn there, so that edge only
+   ramps and no band of rows is hidden for nothing. */
+.gp-sidebar [data-gp-fade] {
+  --gp-clear-start: var(--gp-cue-clear-start, var(--gp-sidebar-cue-band));
+  --gp-clear-end: var(--gp-cue-clear-end, var(--gp-sidebar-cue-band));
+}
+
 .gp-sidebar [data-gp-fade="y-start"] {
-  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-clear-start), #000 calc(var(--gp-clear-start) + var(--gp-sidebar-cue-ramp)));
 }
 
 .gp-sidebar [data-gp-fade="y-end"] {
-  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-clear-end), #000 calc(var(--gp-clear-end) + var(--gp-sidebar-cue-ramp)));
 }
 
 .gp-sidebar [data-gp-fade="y-both"] {
-  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-sidebar-cue-band) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-sidebar-cue-band)));
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-clear-start), #000 calc(var(--gp-clear-start) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-clear-end) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-clear-end)));
+}
+
+/* The branch list fills the sidebar body except for a strip at the bottom:
+   the body's cue band and ramp, less the body's 0.75rem (p-3) padding. While
+   worktrees and changes wait below, the body fades that strip out and draws
+   its "Worktrees" cue there. A list that ran into it had its last row (the
+   Tags header) erased by the body's fade even when scrolled to its end. The
+   floor keeps a short window from squeezing the list to nothing; the body
+   scrolls instead. */
+.gp-sidebar-branches {
+  height: calc(100% - (var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp) - 0.75rem));
+  min-height: 18rem;
 }
 
 html.macos :is(.gp-menu, .gp-card.shadow-float) {

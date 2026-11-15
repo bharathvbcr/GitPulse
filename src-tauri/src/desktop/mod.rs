@@ -451,7 +451,8 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         | instance::Request::CollisionScan { .. }
         | instance::Request::InsightsRead { .. }
         | instance::Request::TerminalOrchestrate { .. }
-        | instance::Request::AgentDeliver { .. } => {}
+        | instance::Request::AgentDeliver { .. }
+        | instance::Request::RecordGitOp { .. } => {}
         // An agent's `gitpulse_browser_open`. The window opens the repository
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.
@@ -487,6 +488,7 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
                     artifact_dir: artifact_dir.clone(),
                 },
             );
+            sessions.session_ledger().emit_view(&handle);
             let payload = crate::terminal::TerminalAgentMetaPayload {
                 id: terminal_id,
                 agent,

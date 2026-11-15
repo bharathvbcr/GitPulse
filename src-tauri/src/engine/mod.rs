@@ -59,7 +59,10 @@ pub use git_reader::{
     KnowledgeReport, OrphanedFile, PulseCommitSummary, PulseExtensionChurn, PulseFileChurn,
     PulseReport, ReflogEntry, RepoLanguageStat, TagInfo, TagList,
 };
-pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep, ResetMode};
+pub use git_writer::{
+    GitWriter, OpRefEntry, OpSnapshotList, OpSnapshotSummary, OpUndoExpectation, OpUndoOutcome,
+    OpUndoPlan, RebaseActionKind, RebaseStep, ResetMode,
+};
 pub use provenance::{ProvenanceFreshness, SessionEpisodeNote, VerificationNote};
 pub use remotes::{RemoteChange, RemoteInfo, RemoteList};
 pub use repo_op::{OperationAction, OperationKind, RepoOperation};
@@ -67,7 +70,7 @@ pub use stash::{StashAction, StashEntry};
 pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
 pub use worktree::{
     add_sparse_worktree_zero_copy, add_worktree_extended, agent_kind, agent_session_slug,
-    expand_sparse_cone_with_devmap, merge_and_teardown_worktree, merge_teardown_argv,
-    MergeTeardownError, MergeTeardownResult, SparseWorktreeCreated, WorktreeDiffStat,
-    WorktreeDivergence, WorktreeInfo,
+    expand_sparse_cone_with_devmap, fork_worktree_extended, merge_and_teardown_worktree,
+    merge_teardown_argv, MergeTeardownError, MergeTeardownResult, SparseWorktreeCreated,
+    WorktreeDiffStat, WorktreeDivergence, WorktreeInfo,
 };

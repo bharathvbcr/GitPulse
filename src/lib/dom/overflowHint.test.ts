@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CUE_BAND_PX,
+  CUE_YIELD_PX,
   cueYield,
   EMPTY_OVERFLOW_HINT,
   NO_CUE_YIELD,
@@ -594,10 +595,11 @@ describe("observeOverflow", () => {
 });
 
 describe("cueYield", () => {
-  // The sidebar case: the branch list is h-full inside the sidebar body, so at
-  // rest its bottom edge sits the body's 12px padding above the body's own.
+  // A list whose bottom edge sits a 12px padding above its parent scroller's,
+  // and whose top is well clear of the parent's top cue (more than
+  // CUE_YIELD_PX below it; the start-edge boundary is tested on its own).
   const body = { start: 100, end: 800 };
-  const list = { start: 140, end: 788 };
+  const list = { start: 180, end: 788 };
 
   it("gives way at an edge where the enclosing scroller draws its own chevron", () => {
     expect(cueYield(list, body, "y-end", "y")).toEqual({ start: false, end: true });
@@ -610,18 +612,29 @@ describe("cueYield", () => {
     expect(cueYield(list, body, "y-start", "y")).toEqual({ start: false, end: false });
   });
 
-  it("keeps its chevron once its edge is clear of the enclosing chevron's band", () => {
+  it("keeps its chevron once its edge is clear of the enclosing chevron's band and ramp", () => {
     // Scrolled so the list ends well above the body's bottom: two edges, two cues.
-    const clear = { start: 20, end: body.end - CUE_BAND_PX - 1 };
+    const clear = { start: 20, end: body.end - CUE_YIELD_PX - 1 };
     expect(cueYield(clear, body, "y-end", "y").end).toBe(false);
     const touching = { start: 20, end: body.end - CUE_BAND_PX + 1 };
     expect(cueYield(touching, body, "y-end", "y").end).toBe(true);
   });
 
+  it("gives way when its edge sits in the ramp above the enclosing band", () => {
+    // The sidebar's branch list is sized to end exactly at the ramp's top, so
+    // its chevron would stack 8px above the body's. Subpixel layout either side
+    // of that line must not flip the answer.
+    expect(CUE_YIELD_PX).toBeGreaterThan(CUE_BAND_PX);
+    for (const nudge of [-0.4, 0, 0.4, 4]) {
+      const atRamp = { start: 20, end: body.end - CUE_YIELD_PX + nudge };
+      expect(cueYield(atRamp, body, "y-end", "y").end).toBe(true);
+    }
+  });
+
   it("applies the same rule to the start edge", () => {
     const top = { start: body.start + 4, end: 600 };
     expect(cueYield(top, body, "y-start", "y")).toEqual({ start: true, end: false });
-    expect(cueYield({ start: body.start + CUE_BAND_PX + 1, end: 600 }, body, "y-both", "y").start).toBe(false);
+    expect(cueYield({ start: body.start + CUE_YIELD_PX + 1, end: 600 }, body, "y-both", "y").start).toBe(false);
   });
 
   it("never reads another axis's token as its own", () => {

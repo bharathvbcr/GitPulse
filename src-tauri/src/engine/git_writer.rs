@@ -1,8 +1,8 @@
 use crate::engine::git_cli::{
-    git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
-    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
-    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+    git_captured, git_captured_with_stdin, git_global_observed, git_text, git_text_network,
+    git_with_stdin, git_with_timeout, is_deferred_under_load, is_slot_wait_timeout,
+    is_transient_git_lock_error, resolve_git_common_dir, sandbox_join, validate_repo,
+    with_background_processes, BoundedRun, OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
 use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
 use crate::ipc_error::CommandError;
@@ -4041,6 +4041,861 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
         return Err("Invalid revision".into());
     }
     Ok(())
+}
+
+// ── Agent git operation log (`refs/gitpulse/ops/*`) & CAS undo ─────────────────
+//
+// Security-Impact Statement (`refs/gitpulse/ops/*`):
+// - Namespace & authority: snapshots are stored solely under `refs/gitpulse/ops/<n>`
+//   by the desktop app process inside `GitWriter` (under `repo_mutation_lock`),
+//   never by external hook scripts; `hooks/` stays strictly decide-only and only
+//   sends `Request::RecordGitOp` over the UID-authenticated single-instance unix
+//   socket mailbox. Failed or unreachable snapshot attempts write an
+//   `"unsnapshotted"` ledger row and emit a visible notice rather than failing open
+//   in silence.
+// - Command & secret handling: command text recorded in snapshot commit metadata is
+//   passed through `crate::ledger::redact::text` before writing commit objects so
+//   tokens/credentials embedded in shell commands do not persist in git history.
+// - Working-tree & ref integrity on Undo: every ref restore runs under
+//   `harness::guard` (`cmd_undo_op_snapshot`), checks `repo_op::detect` to refuse
+//   parked multi-step states, refuses dirty working trees unless `confirm_dirty` is
+//   explicitly set after UI review, and executes atomic `git update-ref --stdin -z`
+//   with explicit expected old OIDs (CAS), refusing and naming any moved ref.
+// - Config hygiene: snapshot creation uses inline `-c` flags only (`user.name`,
+//   `user.email`, `commit.gpgsign=false`) and cap/expiry eviction deletes refs via
+//   `git update-ref -d` without ever modifying `.git/config`.
+
+/// Ref prefix under which pre-op agent snapshots are stored.
+pub const OP_REF_PREFIX: &str = "refs/gitpulse/ops/";
+/// Maximum number of retained snapshots per repository before oldest are evicted.
+pub const MAX_OPS: usize = 50;
+/// Snapshot retention window in seconds before automatic expiry pruning (7 days).
+pub const OP_EXPIRY_SECS: u64 = 7 * 24 * 3600;
+const OP_SNAPSHOT_VERSION: u32 = 1;
+const OP_SNAPSHOT_PARENT_CAP: usize = 64;
+const OP_MAX_LIST_LIMIT: usize = 200;
+
+/// One recorded ref in an agent operation snapshot alongside its current live target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpRefEntry {
+    pub refname: String,
+    pub oid: String,
+    pub current_oid: Option<String>,
+}
+
+/// Summary of one pre-op snapshot commit stored under `refs/gitpulse/ops/<seq>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpSnapshotSummary {
+    pub seq: u64,
+    pub op_ref: String,
+    pub snapshot_oid: String,
+    pub created_at: i64,
+    pub command: String,
+    pub head_ref: Option<String>,
+    pub head_oid: Option<String>,
+    pub stash_oid: Option<String>,
+    pub refs: Vec<OpRefEntry>,
+}
+
+/// Bounded list of agent operation snapshots, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpSnapshotList {
+    pub entries: Vec<OpSnapshotSummary>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+/// Caller's reviewed expectation for a single ref during CAS undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoExpectation {
+    pub refname: String,
+    pub expected_oid: Option<String>,
+}
+
+/// Reviewed plan to restore every ref recorded in snapshot `seq` via CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoPlan {
+    pub seq: u64,
+    pub expected_refs: Vec<OpUndoExpectation>,
+    pub confirm_dirty: bool,
+}
+
+/// Result of restoring snapshot `seq` via atomic CAS `update-ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoOutcome {
+    pub seq: u64,
+    pub op_ref: String,
+    pub restored_refs: usize,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpSnapshotRefRecord {
+    refname: String,
+    oid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpSnapshotPayload {
+    v: u32,
+    seq: u64,
+    created_at: i64,
+    command: String,
+    head_ref: Option<String>,
+    head_oid: Option<String>,
+    stash_oid: Option<String>,
+    refs: Vec<OpSnapshotRefRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRefRow {
+    refname: String,
+    oid: String,
+    commit_oid: Option<String>,
+}
+
+fn absent_oid_for_len(oid_len: usize) -> &'static str {
+    if oid_len == 64 {
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    } else {
+        "0000000000000000000000000000000000000000"
+    }
+}
+
+fn repo_absent_oid(
+    repo: &Path,
+    head_oid: Option<&str>,
+    refs: &[LiveRefRow],
+) -> Result<&'static str, CommandError> {
+    if let Some(oid) = head_oid.or_else(|| refs.first().map(|r| r.oid.as_str())) {
+        return Ok(absent_oid_for_len(oid.len()));
+    }
+    let fmt = git_text(repo, &["rev-parse", "--show-object-format"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    Ok(absent_oid_for_len(if fmt == "sha256" { 64 } else { 40 }))
+}
+
+fn read_head_oid(repo: &Path) -> Result<Option<String>, CommandError> {
+    let run = git_captured(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    if !run.success {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    validate_oid(&oid)?;
+    Ok(Some(oid))
+}
+
+fn read_head_symbolic_ref(repo: &Path) -> Result<Option<String>, CommandError> {
+    let run = git_captured(repo, &["symbolic-ref", "-q", "HEAD"])?;
+    if !run.success {
+        return Ok(None);
+    }
+    let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if name.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
+}
+
+fn read_heads_and_tags(repo: &Path) -> Result<Vec<LiveRefRow>, CommandError> {
+    let raw = git_text(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\0').collect();
+        if parts.len() < 3 {
+            return Err("Unexpected for-each-ref record while reading refs".into());
+        }
+        let refname = parts[0];
+        let oid = parts[1];
+        let obj_type = parts[2];
+        let peeled_oid = parts.get(3).copied().unwrap_or("");
+        let peeled_type = parts.get(4).copied().unwrap_or("");
+        validate_ref_name(refname)?;
+        validate_oid(oid)?;
+        let commit_oid = if obj_type == "commit" {
+            Some(oid.to_string())
+        } else if obj_type == "tag" && peeled_type == "commit" && is_full_oid(peeled_oid) {
+            Some(peeled_oid.to_string())
+        } else {
+            None
+        };
+        rows.push(LiveRefRow {
+            refname: refname.to_string(),
+            oid: oid.to_string(),
+            commit_oid,
+        });
+    }
+    Ok(rows)
+}
+
+/// Returns `true` when the working tree or index holds user changes that an
+/// op-log undo could overwrite. Ignores only untracked `.devcouncil/` entries
+/// created by GitPulse's own SQLite ledger/workbench state in repositories
+/// whose `.gitignore` does not yet cover `.devcouncil/`.
+fn working_tree_has_user_changes(repo: &Path) -> Result<bool, CommandError> {
+    let raw = git_text(repo, &["status", "--porcelain=v1", "-z"])?;
+    for entry in raw.split('\0') {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = &entry[3..];
+        if status == "??" && (path == ".devcouncil" || path.starts_with(".devcouncil/")) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn list_op_ref_tips(repo: &Path) -> Result<Vec<(u64, String, String)>, CommandError> {
+    let raw = git_text(
+        repo,
+        &["for-each-ref", "--format=%(refname)%00%(objectname)", OP_REF_PREFIX],
+    )?;
+    let mut tips = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((refname, oid)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some(suffix) = refname.strip_prefix(OP_REF_PREFIX) else {
+            continue;
+        };
+        let Ok(seq) = suffix.parse::<u64>() else {
+            continue;
+        };
+        if validate_oid(oid).is_err() {
+            continue;
+        }
+        tips.push((seq, refname.to_string(), oid.to_string()));
+    }
+    tips.sort_by_key(|(seq, _, _)| *seq);
+    Ok(tips)
+}
+
+fn read_op_payload(
+    repo: &Path,
+    seq: u64,
+    op_ref: &str,
+    snapshot_oid: &str,
+) -> Result<OpSnapshotPayload, CommandError> {
+    let raw = git_text(repo, &["cat-file", "commit", snapshot_oid])?;
+    let (_, body) = raw
+        .split_once("\n\n")
+        .ok_or_else(|| format!("Snapshot {op_ref} ({snapshot_oid}) has no commit message body"))?;
+    let trimmed = body.trim();
+    let payload: OpSnapshotPayload = serde_json::from_str(trimmed).map_err(|e| {
+        format!("Snapshot {op_ref} ({snapshot_oid}) payload is invalid JSON: {e}")
+    })?;
+    if payload.seq != seq {
+        return Err(format!(
+            "Snapshot {op_ref} sequence mismatch: payload carries {}, ref carries {seq}",
+            payload.seq
+        )
+        .into());
+    }
+    Ok(payload)
+}
+
+fn resolve_snapshot_tree_oid(repo: &Path, head_oid: Option<&str>) -> Result<String, CommandError> {
+    if head_oid.is_some() {
+        let tree = git_text(repo, &["rev-parse", "--verify", "HEAD^{tree}"])?;
+        let trimmed = tree.trim();
+        validate_oid(trimmed)?;
+        return Ok(trimmed.to_string());
+    }
+    let out = git_with_stdin(repo, &["mktree"], b"")?;
+    let tree = String::from_utf8_lossy(&out).trim().to_string();
+    validate_oid(&tree)?;
+    Ok(tree)
+}
+
+fn prune_op_snapshots_locked(
+    repo: &Path,
+    now_secs: i64,
+    max_ops: usize,
+    expiry_secs: u64,
+    keep_seq: Option<u64>,
+) -> Result<usize, CommandError> {
+    let tips = list_op_ref_tips(repo)?;
+    let mut survivors: Vec<(u64, String, String)> = Vec::new();
+    let mut removed = 0usize;
+
+    for (seq, op_ref, snapshot_oid) in tips {
+        let is_kept = keep_seq == Some(seq) && max_ops > 0;
+        let expired = if is_kept {
+            false
+        } else {
+            match read_op_payload(repo, seq, &op_ref, &snapshot_oid) {
+                Ok(payload) => {
+                    now_secs > payload.created_at
+                        && (now_secs - payload.created_at) as u64 > expiry_secs
+                }
+                // Corrupt/unparseable op ref is cleaned up on prune only when expired isn't known? Keep readable-only expiry, avoid silent data loss unless unreadable? Wait: don't delete valid newer refs on transient read errors; only delete verified expired ones.
+                Err(_) => false,
+            }
+        };
+        if expired {
+            let run = git_captured(repo, &["update-ref", "-d", &op_ref, &snapshot_oid])?;
+            if !run.success {
+                return Err(format!(
+                    "Failed to prune expired snapshot {op_ref}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+            removed += 1;
+        } else {
+            survivors.push((seq, op_ref, snapshot_oid));
+        }
+    }
+
+    if survivors.len() > max_ops {
+        let mut excess = survivors.len() - max_ops;
+        for (seq, op_ref, snapshot_oid) in survivors {
+            if excess == 0 {
+                break;
+            }
+            if keep_seq == Some(seq) && max_ops > 0 {
+                continue;
+            }
+            let run = git_captured(repo, &["update-ref", "-d", &op_ref, &snapshot_oid])?;
+            if !run.success {
+                return Err(format!(
+                    "Failed to evict oldest snapshot {op_ref}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+            removed += 1;
+            excess -= 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+#[cfg(test)]
+fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
+    static FAILURES: OnceLock<Mutex<Vec<(PathBuf, String)>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
+    let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
+    op_snapshot_test_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((canon, reason.to_string()));
+}
+
+#[cfg(test)]
+fn take_injected_op_snapshot_failure(repo: &Path) -> Option<String> {
+    let mut guard = op_snapshot_test_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pos = guard.iter().position(|(p, _)| p == repo)?;
+    Some(guard.remove(pos).1)
+}
+
+impl GitWriter {
+    /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
+    pub fn record_op_snapshot(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        Self::record_op_snapshot_with_limits(
+            repo_path,
+            command,
+            session_id,
+            task_id,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+    }
+
+    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits.
+    pub fn record_op_snapshot_with_limits(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        now_ms: u64,
+        max_ops: usize,
+        expiry_secs: u64,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        if command.trim().is_empty() {
+            return Err("Operation command must not be empty".into());
+        }
+        let repo = validate_repo(repo_path)?;
+        #[cfg(test)]
+        if let Some(reason) = take_injected_op_snapshot_failure(&repo) {
+            return Err(reason.into());
+        }
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let head_ref = read_head_symbolic_ref(&repo)?;
+        let head_oid = read_head_oid(&repo)?;
+        let live_refs = read_heads_and_tags(&repo)?;
+        let stash_oid = crate::engine::stash::stash_create_in(&repo)?;
+        let tree_oid = resolve_snapshot_tree_oid(&repo, head_oid.as_deref())?;
+        let absent_oid = repo_absent_oid(&repo, head_oid.as_deref(), &live_refs)?;
+
+        let existing_tips = list_op_ref_tips(&repo)?;
+        let next_seq = existing_tips
+            .last()
+            .map(|(seq, _, _)| seq.saturating_add(1))
+            .unwrap_or(1);
+        let op_ref = format!("{OP_REF_PREFIX}{next_seq}");
+        let created_at = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+        let redacted_command = crate::ledger::redact::text(command);
+
+        let payload = OpSnapshotPayload {
+            v: OP_SNAPSHOT_VERSION,
+            seq: next_seq,
+            created_at,
+            command: redacted_command.clone(),
+            head_ref: head_ref.clone(),
+            head_oid: head_oid.clone(),
+            stash_oid: stash_oid.clone(),
+            refs: live_refs
+                .iter()
+                .map(|r| OpSnapshotRefRecord {
+                    refname: r.refname.clone(),
+                    oid: r.oid.clone(),
+                })
+                .collect(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("Failed to serialize op snapshot payload: {e}"))?;
+
+        let mut parents: Vec<String> = Vec::new();
+        let mut seen_parents: HashSet<String> = HashSet::new();
+        for oid in head_oid
+            .iter()
+            .chain(stash_oid.iter())
+            .chain(live_refs.iter().filter_map(|r| r.commit_oid.as_ref()))
+        {
+            if parents.len() >= OP_SNAPSHOT_PARENT_CAP {
+                break;
+            }
+            if seen_parents.insert(oid.clone()) {
+                parents.push(oid.clone());
+            }
+        }
+
+        let mut args: Vec<String> = vec![
+            "-c".into(),
+            "user.name=GitPulse".into(),
+            "-c".into(),
+            "user.email=gitpulse@local".into(),
+            "-c".into(),
+            "commit.gpgsign=false".into(),
+            "commit-tree".into(),
+            tree_oid,
+        ];
+        for p in &parents {
+            args.push("-p".into());
+            args.push(p.clone());
+        }
+        args.push("-F".into());
+        args.push("-".into());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let commit_run = git_captured_with_stdin(&repo, &arg_refs, &payload_bytes)?;
+        if !commit_run.success {
+            return Err(format!(
+                "Failed to write op snapshot commit object: {}",
+                String::from_utf8_lossy(&commit_run.stderr).trim()
+            )
+            .into());
+        }
+        let snapshot_oid = String::from_utf8_lossy(&commit_run.stdout)
+            .trim()
+            .to_string();
+        validate_oid(&snapshot_oid)?;
+
+        let ref_run = git_captured(&repo, &["update-ref", &op_ref, &snapshot_oid, absent_oid])?;
+        if !ref_run.success {
+            return Err(format!(
+                "Failed to record snapshot ref {op_ref}: {}",
+                String::from_utf8_lossy(&ref_run.stderr).trim()
+            )
+            .into());
+        }
+
+        let keep = if max_ops > 0 { Some(next_seq) } else { None };
+        prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep)?;
+
+        crate::ledger::record_op_snapshot_event(
+            repo_path,
+            &redacted_command,
+            session_id,
+            task_id,
+            head_oid.as_deref(),
+            &op_ref,
+            next_seq,
+            stash_oid.as_deref(),
+            live_refs.len(),
+            now_ms,
+        );
+
+        let refs = live_refs
+            .into_iter()
+            .map(|r| OpRefEntry {
+                refname: r.refname,
+                oid: r.oid.clone(),
+                current_oid: Some(r.oid),
+            })
+            .collect();
+
+        Ok(OpSnapshotSummary {
+            seq: next_seq,
+            op_ref,
+            snapshot_oid,
+            created_at,
+            command: redacted_command,
+            head_ref,
+            head_oid,
+            stash_oid,
+            refs,
+        })
+    }
+
+    /// Evicts expired or over-cap snapshots under `refs/gitpulse/ops/*` without
+    /// modifying `.git/config`.
+    pub fn prune_op_snapshots(
+        repo_path: &str,
+        now_secs: i64,
+        max_ops: usize,
+        expiry_secs: u64,
+    ) -> Result<usize, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_op_snapshots_locked(&repo, now_secs, max_ops, expiry_secs, None)
+    }
+
+    /// Lists recorded snapshots under `refs/gitpulse/ops/*` newest first,
+    /// populating each recorded ref's live `current_oid`.
+    pub fn list_op_snapshots(
+        repo_path: &str,
+        limit: usize,
+    ) -> Result<OpSnapshotList, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let live_refs = read_heads_and_tags(&repo)?;
+        let live_map: HashMap<String, String> = live_refs
+            .into_iter()
+            .map(|r| (r.refname, r.oid))
+            .collect();
+        let mut tips = list_op_ref_tips(&repo)?;
+        tips.reverse();
+
+        let cap = limit.clamp(1, OP_MAX_LIST_LIMIT);
+        let mut parsed = Vec::new();
+        for (seq, op_ref, snapshot_oid) in tips {
+            let Ok(payload) = read_op_payload(&repo, seq, &op_ref, &snapshot_oid) else {
+                continue;
+            };
+            let refs = payload
+                .refs
+                .into_iter()
+                .map(|r| {
+                    let current_oid = live_map.get(&r.refname).cloned();
+                    OpRefEntry {
+                        refname: r.refname,
+                        oid: r.oid,
+                        current_oid,
+                    }
+                })
+                .collect();
+            parsed.push(OpSnapshotSummary {
+                seq,
+                op_ref,
+                snapshot_oid,
+                created_at: payload.created_at,
+                command: payload.command,
+                head_ref: payload.head_ref,
+                head_oid: payload.head_oid,
+                stash_oid: payload.stash_oid,
+                refs,
+            });
+        }
+        let total = parsed.len();
+        let truncated = total > cap;
+        parsed.truncate(cap);
+        Ok(OpSnapshotList {
+            entries: parsed,
+            total,
+            truncated,
+        })
+    }
+
+    /// Builds an [`OpUndoPlan`] for snapshot `seq` from the current live refs.
+    pub fn prepare_op_undo(repo_path: &str, seq: u64) -> Result<OpUndoPlan, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let op_ref = format!("{OP_REF_PREFIX}{seq}");
+        let tips = list_op_ref_tips(&repo)?;
+        let (_, _, snapshot_oid) = tips
+            .into_iter()
+            .find(|(s, _, _)| *s == seq)
+            .ok_or_else(|| format!("Op snapshot {op_ref} does not exist"))?;
+        let payload = read_op_payload(&repo, seq, &op_ref, &snapshot_oid)?;
+        let live_refs: HashMap<String, String> = read_heads_and_tags(&repo)?
+            .into_iter()
+            .map(|r| (r.refname, r.oid))
+            .collect();
+        let expected_refs = payload
+            .refs
+            .into_iter()
+            .map(|r| OpUndoExpectation {
+                expected_oid: live_refs.get(&r.refname).cloned(),
+                refname: r.refname,
+            })
+            .collect();
+        Ok(OpUndoPlan {
+            seq,
+            expected_refs,
+            confirm_dirty: false,
+        })
+    }
+
+    /// Restores every ref recorded by snapshot `plan.seq` through atomic CAS
+    /// `git update-ref --stdin -z`. Refuses before touching any ref if a
+    /// multi-step operation is parked, the working tree is dirty without
+    /// `confirm_dirty`, or any expected ref moved since review (naming every
+    /// moved ref). Appends a `git.op.undo` ledger row with `before_ref`/`after_ref`.
+    pub(crate) fn undo_op_snapshot_with_gate(
+        repo_path: &str,
+        plan: &OpUndoPlan,
+        gate: crate::engine::worktree::GitWriteGate<'_>,
+    ) -> Result<OpUndoOutcome, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(parked) = crate::engine::repo_op::detect(&repo)? {
+            return Err(format!(
+                "Cannot undo op snapshot while a {} is in progress. Finish or abort it first.",
+                parked.kind.label()
+            )
+            .into());
+        }
+
+        let op_ref = format!("{OP_REF_PREFIX}{}", plan.seq);
+        let tips = list_op_ref_tips(&repo)?;
+        let (_, _, snapshot_oid) = tips
+            .into_iter()
+            .find(|(s, _, _)| *s == plan.seq)
+            .ok_or_else(|| format!("Op snapshot {op_ref} does not exist"))?;
+        let payload = read_op_payload(&repo, plan.seq, &op_ref, &snapshot_oid)?;
+
+        let head_before = read_head_oid(&repo)?;
+        let head_sym_before = read_head_symbolic_ref(&repo)?;
+        let live_rows = read_heads_and_tags(&repo)?;
+        let absent_oid = repo_absent_oid(&repo, head_before.as_deref(), &live_rows)?;
+        let live_map: HashMap<String, String> = live_rows
+            .into_iter()
+            .map(|r| (r.refname, r.oid))
+            .collect();
+
+        let mut expected_map: HashMap<&str, Option<&str>> =
+            HashMap::with_capacity(plan.expected_refs.len());
+        for exp in &plan.expected_refs {
+            validate_ref_name(&exp.refname)?;
+            if let Some(oid) = &exp.expected_oid {
+                validate_oid(oid)?;
+            }
+            if expected_map
+                .insert(exp.refname.as_str(), exp.expected_oid.as_deref())
+                .is_some()
+            {
+                return Err(
+                    format!("Undo plan contains duplicate expectation for {}", exp.refname).into(),
+                );
+            }
+        }
+
+        for recorded in &payload.refs {
+            validate_ref_name(&recorded.refname)?;
+            validate_oid(&recorded.oid)?;
+            if !expected_map.contains_key(recorded.refname.as_str()) {
+                return Err(format!(
+                    "Undo plan omits recorded ref {} from snapshot {}",
+                    recorded.refname, plan.seq
+                )
+                .into());
+            }
+        }
+
+        let mut moved_refs = Vec::new();
+        for exp in &plan.expected_refs {
+            let live_oid = live_map.get(&exp.refname).map(String::as_str);
+            if live_oid != exp.expected_oid.as_deref() {
+                moved_refs.push(exp.refname.clone());
+            }
+        }
+        if !moved_refs.is_empty() {
+            return Err(format!(
+                "Cannot undo op snapshot {}: ref moved since review ({}). Refresh snapshots and review again.",
+                plan.seq,
+                moved_refs.join(", ")
+            )
+            .into());
+        }
+
+        if !plan.confirm_dirty && working_tree_has_user_changes(&repo)? {
+            return Err(
+                "Working tree has uncommitted changes; confirm dirty-worktree overwrite before undoing this op."
+                    .into(),
+            );
+        }
+
+        if !payload.refs.is_empty() {
+            gate(&["git", "update-ref", "--stdin"])?;
+            let mut batch = Vec::new();
+            batch.extend_from_slice(b"start\0");
+            for recorded in &payload.refs {
+                let old_oid = live_map
+                    .get(&recorded.refname)
+                    .map(String::as_str)
+                    .unwrap_or(absent_oid);
+                batch.extend_from_slice(b"update ");
+                batch.extend_from_slice(recorded.refname.as_bytes());
+                batch.push(0);
+                batch.extend_from_slice(recorded.oid.as_bytes());
+                batch.push(0);
+                batch.extend_from_slice(old_oid.as_bytes());
+                batch.push(0);
+            }
+            batch.extend_from_slice(b"prepare\0commit\0");
+
+            let run = git_captured_with_stdin(&repo, &["update-ref", "--stdin", "-z"], &batch)?;
+            if !run.success {
+                return Err(format!(
+                    "Atomic CAS update-ref failed for snapshot {}: {}",
+                    plan.seq,
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+        }
+
+        let mut head_target_changed = false;
+        if let Some(sym) = &payload.head_ref {
+            validate_ref_name(sym)?;
+            if head_sym_before.as_deref() != Some(sym.as_str()) {
+                git_text(&repo, &["symbolic-ref", "HEAD", sym])?;
+                head_target_changed = true;
+            }
+        } else if let Some(detached_oid) = &payload.head_oid {
+            validate_oid(detached_oid)?;
+            if head_sym_before.is_some() || head_before.as_deref() != Some(detached_oid.as_str()) {
+                git_text(&repo, &["update-ref", "--no-deref", "HEAD", detached_oid])?;
+                head_target_changed = true;
+            }
+        }
+
+        let head_after = read_head_oid(&repo)?;
+        if (head_before != head_after || head_target_changed) && head_after.is_some() {
+            git_text(&repo, &["read-tree", "--reset", "-u", "HEAD"])?;
+        }
+
+        crate::ledger::record_op_undo_event(
+            repo_path,
+            plan.seq,
+            &op_ref,
+            head_before.as_deref(),
+            head_after.as_deref(),
+            payload.refs.len(),
+            crate::ledger::ids::now_millis(),
+        );
+
+        Ok(OpUndoOutcome {
+            seq: plan.seq,
+            op_ref,
+            restored_refs: payload.refs.len(),
+            head_before,
+            head_after,
+        })
+    }
+
+    /// Handles [`crate::desktop::instance::Request::RecordGitOp`] inside the
+    /// primary desktop process. Snapshot failures append `"unsnapshotted"` to
+    /// the ledger and return `snapshotted: false` so the hook never stays silent.
+    pub fn serve_op_record(
+        request: &crate::desktop::instance::Request,
+    ) -> Result<serde_json::Value, String> {
+        let crate::desktop::instance::Request::RecordGitOp {
+            cwd,
+            command,
+            session_id,
+            task_id,
+            ..
+        } = request
+        else {
+            return Err("not an op-record request".into());
+        };
+        let root = crate::engine::git_cli::find_git_root(Path::new(cwd))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.clone());
+        match Self::record_op_snapshot(&root, command, session_id.as_deref(), task_id.as_deref()) {
+            Ok(summary) => Ok(serde_json::json!({
+                "snapshotted": true,
+                "seq": summary.seq,
+                "op_ref": summary.op_ref,
+            })),
+            Err(err) => {
+                let head_before = validate_repo(&root)
+                    .ok()
+                    .and_then(|canon| read_head_oid(&canon).ok().flatten());
+                crate::ledger::record_unsnapshotted_git_op(
+                    &root,
+                    command,
+                    session_id.as_deref(),
+                    task_id.as_deref(),
+                    head_before.as_deref(),
+                    err.message(),
+                    crate::ledger::ids::now_millis(),
+                );
+                Ok(serde_json::json!({
+                    "snapshotted": false,
+                    "error": err.message(),
+                }))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8315,6 +9170,185 @@ mod bound_to_checked_state {
         );
         assert_eq!(ours.name.as_deref(), Some("Env Name"));
         assert_eq!(ours.email.as_deref(), Some("env@example.test"));
+    }
+
+    #[test]
+    fn op_log_undo_restores_refs_atomically_via_cas_refuses_moved_ref_and_logs_before_after_refs() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+
+        std::fs::write(p.join("f.txt"), "base\n").unwrap();
+        git_in(p, &["add", "--", "f.txt"]);
+        git_in(p, &["commit", "-q", "-m", "base"]);
+        let main_before = rev(p, "refs/heads/main");
+
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(p.join("feature.txt"), "feat-1\n").unwrap();
+        git_in(p, &["add", "--", "feature.txt"]);
+        git_in(p, &["commit", "-q", "-m", "feat-1"]);
+        let feature_before = rev(p, "refs/heads/feature");
+        git_in(p, &["tag", "v0.1.0", "refs/heads/main"]);
+
+        let repo_canon = p.canonicalize().unwrap();
+        let repo_str = repo_canon.to_str().unwrap();
+
+        let snap = GitWriter::record_op_snapshot_with_limits(
+            repo_str,
+            "git rebase main",
+            Some("sess-1"),
+            None,
+            1_700_000_010_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("snapshot must succeed");
+        assert_eq!(snap.seq, 1);
+        assert_eq!(snap.op_ref, "refs/gitpulse/ops/1");
+        assert_eq!(snap.refs.len(), 3);
+
+        // Simulate an agent git write moving both feature and tag after snapshot.
+        std::fs::write(p.join("feature.txt"), "feat-rewritten\n").unwrap();
+        git_in(p, &["add", "--", "feature.txt"]);
+        git_in(p, &["commit", "-q", "--amend", "-m", "feat-rewritten"]);
+        let feature_after_agent = rev(p, "refs/heads/feature");
+        assert_ne!(feature_after_agent, feature_before);
+        git_in(p, &["tag", "-f", "v0.1.0", "refs/heads/feature"]);
+
+        // Review undo while clean -> move a ref externally before confirming -> must refuse & name moved ref!
+        let stale_plan = GitWriter::prepare_op_undo(repo_str, 1).expect("prepare_op_undo");
+        std::fs::write(p.join("extra.txt"), "extra\n").unwrap();
+        git_in(p, &["add", "--", "extra.txt"]);
+        git_in(p, &["commit", "-q", "-m", "extra move after review"]);
+        let feature_externally_moved = rev(p, "refs/heads/feature");
+        let moved_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &stale_plan, &mut |_| Ok(()))
+            .expect_err("moved ref after review must be refused by CAS");
+        assert!(
+            moved_err.message().contains("refs/heads/feature"),
+            "refusal must name moved ref: {}",
+            moved_err.message()
+        );
+        // Atomic refusal: tag v0.1.0 must NOT have moved back either.
+        assert_eq!(rev(p, "refs/tags/v0.1.0"), feature_after_agent);
+        assert_eq!(rev(p, "refs/heads/feature"), feature_externally_moved);
+
+        // Dirty working tree (both untracked user files and tracked edits) must refuse unless confirm_dirty is true.
+        let mut plan = GitWriter::prepare_op_undo(repo_str, 1).expect("re-prepare");
+        std::fs::write(p.join("untracked.txt"), "untracked-user-file\n").unwrap();
+        let untracked_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect_err("untracked user file must require confirm_dirty");
+        assert!(
+            untracked_err.message().to_lowercase().contains("uncommitted")
+                || untracked_err.message().to_lowercase().contains("dirty"),
+            "expected dirty confirmation error for untracked user file, got: {}",
+            untracked_err.message()
+        );
+        std::fs::remove_file(p.join("untracked.txt")).unwrap();
+
+        std::fs::write(p.join("feature.txt"), "dirty-edit\n").unwrap();
+        let dirty_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect_err("dirty tree must require confirm_dirty");
+        assert!(
+            dirty_err.message().to_lowercase().contains("uncommitted")
+                || dirty_err.message().to_lowercase().contains("dirty"),
+            "expected dirty confirmation error, got: {}",
+            dirty_err.message()
+        );
+
+        // With confirm_dirty = true, CAS restores every recorded ref and logs before_ref/after_ref.
+        plan.confirm_dirty = true;
+        let outcome = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect("confirmed undo must succeed");
+        assert_eq!(outcome.seq, 1);
+        assert_eq!(outcome.op_ref, "refs/gitpulse/ops/1");
+        assert_eq!(outcome.restored_refs, 3);
+        assert_eq!(outcome.head_before.as_deref(), Some(feature_externally_moved.as_str()));
+        assert_eq!(outcome.head_after.as_deref(), Some(feature_before.as_str()));
+        assert_eq!(rev(p, "refs/heads/main"), main_before);
+        assert_eq!(rev(p, "refs/heads/feature"), feature_before);
+        assert_eq!(rev(p, "refs/tags/v0.1.0"), main_before);
+        assert_eq!(std::fs::read_to_string(p.join("feature.txt")).unwrap(), "feat-1\n");
+
+        let page = crate::ledger::query_readonly_page(
+            repo_str,
+            &crate::ledger::EventQuery {
+                action: Some(crate::ledger::OP_UNDO_ACTION.to_string()),
+                descending: true,
+                limit: 5,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query undo row")
+        .expect("ledger exists");
+        assert_eq!(page.events.len(), 1);
+        let row = &page.events[0];
+        assert_eq!(row.before_ref.as_deref(), Some(feature_externally_moved.as_str()));
+        assert_eq!(row.after_ref.as_deref(), Some(feature_before.as_str()));
+        let detail = row.detail_json.as_deref().unwrap_or("");
+        assert!(detail.contains("\"occurred_at\""), "detail missing occurred_at: {detail}");
+        assert!(detail.contains("\"kind\":\"undo\""), "detail missing kind: {detail}");
+    }
+
+    #[test]
+    fn op_log_evicts_oldest_over_cap_expires_old_and_never_writes_git_config() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+
+        let config_path = p.join(".git").join("config");
+        let config_before = std::fs::read(&config_path).expect("read .git/config");
+        let repo_canon = p.canonicalize().unwrap();
+        let repo_str = repo_canon.to_str().unwrap();
+
+        // Write 5 snapshots with cap = 3 -> only ops 3, 4, 5 survive (oldest 1, 2 evicted).
+        for idx in 1..=5_u64 {
+            GitWriter::record_op_snapshot_with_limits(
+                repo_str,
+                &format!("git commit --allow-empty -m op-{idx}"),
+                None,
+                None,
+                (1_700_000_000 + idx * 10) * 1000,
+                3,
+                3600,
+            )
+            .expect("record bounded snapshot");
+        }
+        let listed = GitWriter::list_op_snapshots(repo_str, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![5, 4, 3], "oldest ops over cap must be evicted");
+
+        // Advance time beyond expiry and add op 6 -> ops 3..5 expire and are pruned cleanly.
+        let future_ms = (1_700_000_050 + 3600 + 60) * 1000;
+        let fresh = GitWriter::record_op_snapshot_with_limits(
+            repo_str,
+            "git rebase main",
+            None,
+            None,
+            future_ms,
+            MAX_OPS,
+            3600,
+        )
+        .expect("record fresh snapshot");
+        assert_eq!(fresh.seq, 6);
+
+        let after_expiry = GitWriter::list_op_snapshots(repo_str, 50).expect("list after expiry");
+        let after_seqs: Vec<u64> = after_expiry.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(after_seqs, vec![6], "expired snapshots must be pruned");
+
+        // Verify .git/config bytes were never touched by snapshot creation, eviction, or expiry.
+        let config_after = std::fs::read(&config_path).expect("read .git/config after prune");
+        assert_eq!(config_after, config_before, "pruning must write no .git/config");
     }
 }
 

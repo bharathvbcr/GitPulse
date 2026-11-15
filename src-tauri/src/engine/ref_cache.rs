@@ -131,9 +131,13 @@ fn file_inode(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::ino(meta)
 }
 
-/// Windows has no stable inode through `std`; size and mtime still move on
-/// every lockfile rename git performs.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn file_inode(_meta: &std::fs::Metadata) -> u64 {
     0
 }

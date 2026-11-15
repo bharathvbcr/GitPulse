@@ -178,3 +178,120 @@ describe("DUE_SHORTCUTS", () => {
     expect(new Set(DUE_SHORTCUTS.map((item) => item.id)).size).toBe(DUE_SHORTCUTS.length);
   });
 });
+
+describe("DST and non-UTC timezone behaviour", () => {
+  const activeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  it("never silently shifts an hour when composeDue succeeds across DST transition dates", () => {
+    for (const [year, month, day] of [
+      [2026, 2, 8],   // US spring-forward (23h day in America/New_York)
+      [2026, 3, 5],   // NZ fall-back (25h day in Pacific/Auckland)
+      [2026, 8, 27],  // NZ spring-forward (23h day in Pacific/Auckland)
+      [2026, 10, 1],  // US fall-back (25h day in America/New_York)
+    ]) {
+      for (let hour = 0; hour < 24; hour += 1) {
+        const time = `${String(hour).padStart(2, "0")}:30`;
+        const sec = composeDue({ year, month, day }, time);
+        if (sec === null) continue;
+        expect(duePartsOf(sec)).toEqual({ day: { year, month, day }, time });
+      }
+    }
+  });
+
+  it("keeps consecutive local days in monthGrid and relativeDue across 23h and 25h days", () => {
+    for (const view of [
+      { year: 2026, month: 2 },
+      { year: 2026, month: 3 },
+      { year: 2026, month: 8 },
+      { year: 2026, month: 10 },
+    ]) {
+      const cells = monthGrid(view, null, NOW_MS);
+      expect(cells).toHaveLength(42);
+      expect(new Set(cells.map((c) => c.key)).size).toBe(42);
+      for (let i = 1; i < cells.length; i += 1) {
+        const prev = new Date(cells[i - 1].year, cells[i - 1].month, cells[i - 1].day);
+        prev.setDate(prev.getDate() + 1);
+        expect({ year: cells[i].year, month: cells[i].month, day: cells[i].day }).toEqual({
+          year: prev.getFullYear(),
+          month: prev.getMonth(),
+          day: prev.getDate(),
+        });
+      }
+    }
+
+    const marNow = at(2026, 2, 8, 9, 0);
+    expect(relativeDue(at(2026, 2, 7, 17, 0), marNow).text).toBe("yesterday");
+    expect(relativeDue(at(2026, 2, 8, 17, 0), marNow).text).toBe("today");
+    expect(relativeDue(at(2026, 2, 9, 17, 0), marNow).text).toBe("tomorrow");
+
+    const novNow = at(2026, 10, 1, 9, 0);
+    expect(relativeDue(at(2026, 9, 31, 17, 0), novNow).text).toBe("yesterday");
+    expect(relativeDue(at(2026, 10, 1, 17, 0), novNow).text).toBe("today");
+    expect(relativeDue(at(2026, 10, 2, 17, 0), novNow).text).toBe("tomorrow");
+  });
+
+  it.skipIf(activeZone !== "America/New_York")(
+    "rejects the 2026-03-08 02:30 spring-forward gap with null and round-trips fall-back 01:30 in America/New_York",
+    () => {
+      // 2026-03-08 02:00 EST jumps directly to 03:00 EDT in America/New_York.
+      expect(composeDue({ year: 2026, month: 2, day: 8 }, "02:30")).toBeNull();
+      expect(readDuePhrase("2026-03-08 02:30", null, NOW_MS)).toBeNull();
+      const validOnGapDay = composeDue({ year: 2026, month: 2, day: 8 }, "17:00");
+      expect(validOnGapDay).not.toBeNull();
+      expect(readDuePhrase("02:30", validOnGapDay, NOW_MS)).toBeNull();
+
+      // Boundary minutes flanking the spring-forward gap remain valid and 60s apart.
+      const beforeGap = composeDue({ year: 2026, month: 2, day: 8 }, "01:59");
+      const afterGap = composeDue({ year: 2026, month: 2, day: 8 }, "03:00");
+      expect(beforeGap).not.toBeNull();
+      expect(afterGap).not.toBeNull();
+      expect(afterGap! - beforeGap!).toBe(60);
+      expect(duePartsOf(beforeGap)?.time).toBe("01:59");
+      expect(duePartsOf(afterGap)?.time).toBe("03:00");
+
+      // 2026-11-01 01:30 occurs twice (EDT then EST); composeDue accepts and round-trips it.
+      const overlap = composeDue({ year: 2026, month: 10, day: 1 }, "01:30");
+      expect(overlap).not.toBeNull();
+      expect(duePartsOf(overlap)).toEqual({
+        day: { year: 2026, month: 10, day: 1 },
+        time: "01:30",
+      });
+    },
+  );
+
+  it.skipIf(activeZone !== "Pacific/Auckland")(
+    "rejects the 2026-09-27 02:30 spring-forward gap with null and round-trips fall-back 02:30 in Pacific/Auckland",
+    () => {
+      // 2026-09-27 02:00 NZST jumps directly to 03:00 NZDT in Pacific/Auckland.
+      expect(composeDue({ year: 2026, month: 8, day: 27 }, "02:30")).toBeNull();
+      const beforeGap = composeDue({ year: 2026, month: 8, day: 27 }, "01:59");
+      const afterGap = composeDue({ year: 2026, month: 8, day: 27 }, "03:00");
+      expect(beforeGap).not.toBeNull();
+      expect(afterGap).not.toBeNull();
+      expect(afterGap! - beforeGap!).toBe(60);
+
+      // 2026-04-05 02:30 occurs twice during NZDT->NZST fall-back and round-trips cleanly.
+      const overlap = composeDue({ year: 2026, month: 3, day: 5 }, "02:30");
+      expect(overlap).not.toBeNull();
+      expect(duePartsOf(overlap)).toEqual({
+        day: { year: 2026, month: 3, day: 5 },
+        time: "02:30",
+      });
+    },
+  );
+
+  it.skipIf(activeZone !== "Asia/Kolkata" && activeZone !== "Asia/Calcutta")(
+    "round-trips 02:30 and half-hour midnight boundaries without drift in Asia/Kolkata",
+    () => {
+      expect(new Date(2026, 2, 8, 2, 30).getTimezoneOffset()).toBe(-330);
+      for (const time of ["00:15", "02:30", "23:45"]) {
+        const sec = composeDue({ year: 2026, month: 2, day: 8 }, time);
+        expect(sec).not.toBeNull();
+        expect(duePartsOf(sec)).toEqual({
+          day: { year: 2026, month: 2, day: 8 },
+          time,
+        });
+      }
+    },
+  );
+});

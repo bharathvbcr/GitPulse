@@ -380,6 +380,14 @@ export type DevmapOutcome =
  */
 export interface WorktreeCreated {
   path: string;
+  /** Branch checked out by the new worktree, if one was created or specified. */
+  branch?: string | null;
+  /** HEAD commit OID of the new worktree, when resolved by the backend. */
+  head_oid?: string | null;
+  /** Whether uncommitted source edits were carried via `stash create` + `stash apply` (fork flow). */
+  carried_uncommitted?: boolean;
+  /** Source lane Claude session UUID discovered at fork time, when present. */
+  source_session_id?: string | null;
   /** Some build cache could not be copied (or checked); each is named, and none is left half-copied. */
   cache_error: string | null;
   /** Caches skipped for want of disk; advice, not a failure (the worktree was made). */

@@ -1223,7 +1223,7 @@ fn finish(current: &mut Option<Acc>, files: &mut Vec<FileChange>, tally: &mut Ta
 }
 
 fn role_of(path: &str) -> Role {
-    if is_test_path(path) {
+    if dc_glob::is_test_path(path) {
         Role::Test
     } else if is_ci_path(path) {
         Role::Ci
@@ -1244,37 +1244,6 @@ fn file_name(path: &str) -> &str {
 
 fn components(path: &str) -> impl Iterator<Item = &str> {
     path.split(['/', '\\']).filter(|part| !part.is_empty())
-}
-
-fn is_test_path(path: &str) -> bool {
-    let name = file_name(path).to_ascii_lowercase();
-    if name == "test.rs"
-        || name == "tests.rs"
-        || name == "test.go"
-        || name.starts_with("test_")
-        || name.ends_with("_test.py")
-        || name.ends_with("_test.rs")
-        || name.ends_with("_tests.rs")
-        || name.ends_with("_test.go")
-        || name.ends_with("_spec.rb")
-        || name.ends_with(".test.ts")
-        || name.ends_with(".test.tsx")
-        || name.ends_with(".test.js")
-        || name.ends_with(".test.jsx")
-        || name.ends_with(".spec.ts")
-        || name.ends_with(".spec.tsx")
-        || name.ends_with(".spec.js")
-        || name.ends_with(".spec.jsx")
-        || name.ends_with("test.java")
-    {
-        return true;
-    }
-    components(path).any(|part| {
-        matches!(
-            part.to_ascii_lowercase().as_str(),
-            "test" | "tests" | "__tests__" | "testdata" | "testing"
-        )
-    })
 }
 
 fn is_docs_path(path: &str) -> bool {
@@ -2276,5 +2245,51 @@ diff --git a/src/auth/login.rs b/src/auth/login.rs
                 draft.brief
             );
         }
+    }
+
+    #[test]
+    fn role_of_conforms_to_shared_test_paths_protocol() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../protocols/test-paths/v1.json"))
+                .expect("shared test-paths fixture must parse");
+        for (path, expected_is_test) in rows {
+            let role = role_of(&path);
+            if expected_is_test {
+                assert_eq!(role, Role::Test, "expected Role::Test for {path}");
+            } else {
+                assert_ne!(role, Role::Test, "did not expect Role::Test for {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn draft_does_not_yield_test_subject_for_latest_or_contest_java() {
+        for path in ["src/Latest.java", "src/Contest.java"] {
+            let diff = format!(
+                "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+class Entry {{}}\n"
+            );
+            let d = draft(&diff);
+            assert_contract(&d);
+            assert!(
+                !d.subject.starts_with("test:") && !d.subject.starts_with("test("),
+                "unexpected test commit subject for {path}: {}",
+                d.subject
+            );
+        }
+    }
+
+    #[test]
+    fn draft_classifies_e2e_spec_infix_and_tests_stem_as_test() {
+        for path in ["e2e/login.ts", "src/login-spec.ts", "src/LoginTests.cs"] {
+            assert_eq!(role_of(path), Role::Test, "expected Role::Test for {path}");
+        }
+        let diff = "diff --git a/e2e/login.ts b/e2e/login.ts\nnew file mode 100644\n--- /dev/null\n+++ b/e2e/login.ts\n@@ -0,0 +1 @@\n+test('login', () => {});\n";
+        let d = draft(diff);
+        assert_contract(&d);
+        assert!(
+            d.subject.starts_with("test:") || d.subject.starts_with("test("),
+            "expected test commit subject for e2e/login.ts, got: {}",
+            d.subject
+        );
     }
 }

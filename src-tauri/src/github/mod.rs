@@ -5,6 +5,7 @@ use crate::engine::git_cli::{
 };
 use crate::ipc_error::CommandError;
 pub mod actions;
+pub mod avatars;
 pub mod outcome;
 pub mod pr_worktree;
 use outcome::RunOutcome;
@@ -1703,6 +1704,35 @@ fn capture_gh_api(
 ) -> Result<CapturedOutput, CommandError> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
     args.extend(api_host_flags(remote));
+    capture_gh_args(&args, timeout)
+}
+
+/// Argv of a read-only `gh api graphql` call for this remote. Variables go in
+/// as `-f` (raw strings), never `-F`, which reads `@file` and guesses types.
+pub(crate) fn gh_graphql_args(remote: &GitHubRepoRef, query: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["api".to_string(), "graphql".to_string()];
+    for (key, value) in [
+        ("owner", remote.owner.as_str()),
+        ("name", remote.name.as_str()),
+        ("query", query),
+    ] {
+        args.push("-f".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.extend(api_host_flags(remote));
+    args
+}
+
+/// Runs one read-only `gh api graphql` call pinned to this remote's host.
+fn capture_gh_graphql(
+    remote: &GitHubRepoRef,
+    query: &str,
+    timeout: Duration,
+) -> Result<CapturedOutput, CommandError> {
+    capture_gh_args(&gh_graphql_args(remote, query), timeout)
+}
+
+fn capture_gh_args(args: &[String], timeout: Duration) -> Result<CapturedOutput, CommandError> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     capture_command("gh", &refs, None, timeout, &[])
 }

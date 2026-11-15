@@ -181,6 +181,11 @@ export interface RenderOptions {
   /** Canvas X of the avatar column centre; see {@link RenderOptions.showAvatars}. */
   avatarX?: number | null;
   /**
+   * Profile picture for a row's author, when one has loaded. Returning null
+   * keeps the initials disc, so the canvas never waits on the network.
+   */
+  avatarImageFor?: (row: VisualCommitRow) => CanvasImageSource | null;
+  /**
    * Skip connectors whose span exceeds {@link LOOKBACK_ROWS} (they are owned
    * by the live overlay; see graphEdges.ts). The strip painter must set this:
    * a long connector baked into a tile is clipped mid-edge at the seam, which
@@ -896,7 +901,7 @@ export class GraphRenderer {
           const row = rows[i];
           const y = calcY(i);
           if (y < -rowHeight || y > viewportHeight + rowHeight) continue;
-          this.drawAuthorAvatar(ctx, avatarX, y, this.avatarStyle.radius, this.avatarStyle.fontPx, theme, row);
+          this.drawAuthorAvatar(ctx, avatarX, y, this.avatarStyle.radius, this.avatarStyle.fontPx, theme, row, options.avatarImageFor?.(row) ?? null);
         }
       }
     }
@@ -1011,6 +1016,7 @@ export class GraphRenderer {
     fontPx: number,
     theme: GraphTheme,
     row: VisualCommitRow,
+    image: CanvasImageSource | null = null,
   ): void {
     const identity = authorIdentity(row.author_name, row.author_email);
     ctx.save();
@@ -1021,6 +1027,17 @@ export class GraphRenderer {
       ctx.beginPath();
       ctx.arc(x, y, radius + 1.25, 0, Math.PI * 2);
       ctx.stroke();
+
+      if (image !== null) {
+        // Profile picture clipped to the disc; it replaces the initials fill.
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.drawImage(image, x - radius, y - radius, radius * 2, radius * 2);
+        ctx.restore();
+        return;
+      }
 
       ctx.fillStyle = authorColor(identity.hue);
       ctx.beginPath();

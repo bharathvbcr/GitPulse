@@ -1246,7 +1246,19 @@ fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
 /// and what is refused is refused at once.
 #[test]
 fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() {
-    use gitpulse_lib::commands::{cmd_terminal_context, cmd_terminal_kill};
+    use gitpulse_lib::commands::cmd_terminal_context;
+
+    async fn cmd_terminal_kill(
+        _handle: tauri::AppHandle<tauri::test::MockRuntime>,
+        state: tauri::State<'_, TerminalSessions>,
+        session_id: String,
+    ) -> Result<(), String> {
+        let kill_id = session_id.clone();
+        gitpulse_lib::terminal::control_async(&state, "terminal_kill", move |state| {
+            kill_session(state, &kill_id)
+        })
+        .await
+    }
     let _serial = serial();
     let state = common::terminals();
     let app = mock_app(&state);
@@ -1320,7 +1332,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
                         tauri::async_runtime::block_on(cmd_terminal_context(state, id.clone()))
                             .map(|_| ())
                     } else {
-                        tauri::async_runtime::block_on(cmd_terminal_kill(state, id.clone()))
+                        tauri::async_runtime::block_on(cmd_terminal_kill(handle.clone(), state, id.clone()))
                     }
                 })
             })

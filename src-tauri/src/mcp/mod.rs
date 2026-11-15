@@ -3354,6 +3354,17 @@ fn open_task_profile(create: bool) -> Result<Option<dc_store::Store>, String> {
     open_shared_profile(dc_store::Store::open_existing(&path))
 }
 
+/// Opens the task board's profile read-only. A machine with no board yet answers
+/// `None` rather than creating one. Does not run DDL, WAL switch, schema migrations,
+/// or lease sweeps.
+fn open_task_profile_readonly() -> Result<Option<dc_store::Store>, String> {
+    let path = task_profile_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    open_shared_profile(dc_store::Store::open_readonly(&path))
+}
+
 /// The task profile is shared with the desktop app, which owns its schema.
 /// This server may be older or newer than the app, so its handle never
 /// upgrades: a request that needs the upgrade fails with
@@ -3801,7 +3812,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_list_tasks" => {
             let a: ListTasksArgs = parse(name, arguments)?;
-            let Some(store) = open_task_profile(false)? else {
+            let Some(store) = open_task_profile_readonly()? else {
                 return Ok(json!({
                     "ok": true, "repository": null, "returned": 0, "total": 0, "has_more": false,
                     "next_cursor": null, "tasks": [],
@@ -3820,7 +3831,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_get_task" => {
             let a: GetTaskArgs = parse(name, arguments)?;
-            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            let store = open_task_profile_readonly()?.ok_or(NO_BOARD)?;
             intake::get_task(&store, &a.repo_path, &a.task_id).map_err(workbench_message)
         }
         "gitpulse_complete_task" => {
@@ -8237,6 +8248,127 @@ mod tests {
                 .exists(),
             "an upgrade that did not run took no backup"
         );
+    }
+
+    /// A reader tool (`gitpulse_list_tasks` or `gitpulse_get_task`) opens the task
+    /// profile strictly read-only: it does not create missing databases, does not
+    /// run DDL or schema migrations, does not switch to WAL, and succeeds even if
+    /// the database file is marked read-only on disk. Mutating tools, in contrast,
+    /// require writable access and fail when the file is read-only.
+    #[test]
+    fn task_list_and_get_open_read_only_and_do_not_run_writable_prepare() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let database = profile.path().join("workbench.sqlite");
+
+        // 1. Reading when no board exists answers empty/none and does NOT create the database file.
+        assert!(!database.exists(), "database must not exist initially");
+        let (error, listed_empty) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        assert!(!error, "{listed_empty}");
+        assert_eq!(listed_empty["returned"], 0, "{listed_empty}");
+        assert_eq!(listed_empty["tasks"], json!([]), "{listed_empty}");
+        assert!(
+            !database.exists(),
+            "gitpulse_list_tasks must not create workbench.sqlite on a machine with no board"
+        );
+
+        let (error, get_empty) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "nonexistent"}),
+        );
+        assert!(error, "getting a task when no board exists must return error");
+        assert_eq!(get_empty, json!(NO_BOARD));
+        assert!(
+            !database.exists(),
+            "gitpulse_get_task must not create workbench.sqlite on a machine with no board"
+        );
+
+        // 2. Create tasks via add_task to populate the database.
+        let (error, added1) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "gp-ro-test-task",
+                "title": "Task for read-only store test"
+            }),
+        );
+        assert!(!error, "{added1}");
+        let (error, added2) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "gp-ro-source-task",
+                "title": "Source task for merge"
+            }),
+        );
+        assert!(!error, "{added2}");
+        assert!(database.exists(), "workbench.sqlite must exist after add_task");
+
+        // 3. Mark the database file as read-only.
+        struct ReadonlyGuard(std::path::PathBuf);
+        impl Drop for ReadonlyGuard {
+            fn drop(&mut self) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+                }
+                #[cfg(windows)]
+                if let Ok(meta) = std::fs::metadata(&self.0) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(&self.0, perms);
+                }
+            }
+        }
+        let _guard = ReadonlyGuard(database.clone());
+        let mut perms = std::fs::metadata(&database).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&database, perms).unwrap();
+
+        // 4. Verify reader tools succeed on the read-only database.
+        let (error, listed) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        assert!(!error, "gitpulse_list_tasks must succeed on read-only store: {listed}");
+        assert_eq!(listed["returned"], 2, "{listed}");
+        let titles: Vec<&str> = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"Task for read-only store test"));
+        assert!(titles.contains(&"Source task for merge"));
+
+        let (error, fetched) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task"}),
+        );
+        assert!(!error, "gitpulse_get_task must succeed on read-only store: {fetched}");
+        assert_eq!(fetched["task"]["title"], "Task for read-only store test");
+
+        // 5. Verify mutating tools fail when the store cannot be opened writeable.
+        let (error, complete_res) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task", "status": "review"}),
+        );
+        assert!(error, "gitpulse_complete_task must fail when database is read-only: {complete_res}");
+
+        let (error, delete_res) = tool_json(
+            "gitpulse_delete_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task", "reason": "test"}),
+        );
+        assert!(error, "gitpulse_delete_task must fail when database is read-only: {delete_res}");
+
+        let (error, merge_res) = tool_json(
+            "gitpulse_merge_tasks",
+            json!({
+                "repo_path": repo,
+                "into_task_id": "gp-ro-test-task",
+                "sources": [{"task_id": "gp-ro-source-task"}],
+                "reason": "test"
+            }),
+        );
+        assert!(error, "gitpulse_merge_tasks must fail when database is read-only: {merge_res}");
     }
 
     /// `inbox` was merged into `backlog`. An agent written before that still

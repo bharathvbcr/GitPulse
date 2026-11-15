@@ -1,0 +1,121 @@
+{
+ "description": "Which paths are test files. Every implementation that classifies a path as a test is held to these rows; Go's verifier (devcouncil/verify isTestPath) and the dc-verify/devmap crates read this file.",
+ "rows": [
+  {
+   "path": "src/foo_test.go",
+   "test": true
+  },
+  {
+   "path": "src/foo.go",
+   "test": false
+  },
+  {
+   "path": "tests/a.py",
+   "test": true
+  },
+  {
+   "path": "test/x.go",
+   "test": true
+  },
+  {
+   "path": "a/b/__tests__/c.js",
+   "test": true
+  },
+  {
+   "path": "src/foo.test.ts",
+   "test": true
+  },
+  {
+   "path": "src/foo.spec.ts",
+   "test": true
+  },
+  {
+   "path": "web/e2e/login.ts",
+   "test": true
+  },
+  {
+   "path": "spec/models/user_spec.rb",
+   "test": true
+  },
+  {
+   "path": "src/FooTest.java",
+   "test": true
+  },
+  {
+   "path": "src/FooTests.cs",
+   "test": true
+  },
+  {
+   "path": "src/FooSpec.scala",
+   "test": true
+  },
+  {
+   "path": "test_foo.py",
+   "test": true
+  },
+  {
+   "path": "conftest_x.py",
+   "test": false
+  },
+  {
+   "path": "src/testing_utils.py",
+   "test": false
+  },
+  {
+   "path": "src/contest.go",
+   "test": false
+  },
+  {
+   "path": "lib/latest/mod.rs",
+   "test": false
+  },
+  {
+   "path": "src/attestation.go",
+   "test": false
+  },
+  {
+   "path": "pkg/testdata/x.json",
+   "test": true
+  },
+  {
+   "path": "src/main.go",
+   "test": false
+  },
+  {
+   "path": "README.md",
+   "test": false
+  },
+  {
+   "path": "a\\tests\\b.py",
+   "test": true
+  },
+  {
+   "path": "src/foo-test.js",
+   "test": true
+  },
+  {
+   "path": "src/foo_spec.rb",
+   "test": true
+  },
+  {
+   "path": "test.py",
+   "test": true
+  },
+  {
+   "path": "src/Latest.java",
+   "test": false
+  },
+  {
+   "path": "docs/specs/design.md",
+   "test": true
+  },
+  {
+   "path": "src/mytest/x.go",
+   "test": false
+  },
+  {
+   "path": "UPPER/TESTS/a.py",
+   "test": true
+  }
+ ]
+}

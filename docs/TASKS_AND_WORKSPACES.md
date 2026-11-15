@@ -161,7 +161,7 @@ is not. [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md) records the store
 change (dc-store schema 11) behind this, including the upgrade that archives
 every task that was Done before it.
 
-**Archive**, the panel beside the Inbox, holds the scope's archived tasks. It
+**Archive**, opened from the Tasks bar beside the Backlog and board controls (Inbox merged into Backlog in workbench schema 16; schema 17 adds cross-repo queue, GitHub issue sync outbox, and DAG readiness tables), holds the scope's archived tasks. It
 states that rule above the list whether or not the list is empty. It has its
 own search and **Load more**, and its header badge is the store's total for the
 scope rather than the page on screen. Tasks are listed most recently completed

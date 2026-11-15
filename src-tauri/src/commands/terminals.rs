@@ -30,58 +30,121 @@ pub async fn cmd_terminal_spawn(
     permission_mode: Option<String>,
     acknowledged: Option<bool>,
     start_dir: Option<String>,
+    resume: Option<crate::terminal::TerminalResume>,
+    session_id: Option<String>,
+    reopen_row_id: Option<String>,
     on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, IpcError> {
     let state = state.inner().clone();
     off_thread(move || {
         // Expanded here, at the boundary, rather than in the caller: the flags
-        // for a mode are the workbench's table and the frontend never carries
-        // them. The refusals inside are what make a bypassed session
-        // impossible without an acknowledgement, whatever the frontend did or
-        // forgot to do. The notification and setting-source flags go in first
-        // so the policy flags land in front of them: policy, launch flags,
-        // then the caller's prompt.
+        // for a mode and for resuming/starting a conversation are the
+        // workbench's single table (`terminal_command::interactive_args`) and
+        // the frontend never carries raw session/resume flags (`S2-07`).
         //
         // On the blocking pool with the spawn, not before it: the settings
         // file is read and the hook binary is looked for on disk, and an
         // `async fn` doing either parks a Tauri async-runtime worker.
         let defaults = crate::tool_config::agent_defaults();
         let sources = defaults.claude_setting_sources_arg();
-        // Before the flags: the hook goes on every claude launch, plugin or not
-        // (`workbench::claude_hook`).
         let hook = match program.as_deref() {
             Some(provider) => crate::workbench::claude_hook::for_launch(provider.trim()),
             None => crate::workbench::claude_hook::HookInjection::NotApplicable,
         };
-        let args = crate::workbench::terminal_command::apply_permission_mode(
+        let checkout_for_resume = {
+            let base = std::path::PathBuf::from(&repo_path);
+            match start_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != ".")
+            {
+                Some(sub) => base.join(sub),
+                None => base,
+            }
+        };
+        let is_fork = resume.as_ref().is_some_and(|r| r.fork);
+        let args = match crate::workbench::terminal_command::interactive_args(
             program.as_deref(),
             permission_mode.as_deref(),
             acknowledged.unwrap_or(false),
-            crate::workbench::terminal_command::with_launch_flags(
-                program.as_deref(),
-                &crate::workbench::terminal_command::LaunchOptions {
-                    notify: crate::tool_config::session_alerts().configure_agents,
-                    setting_sources: sources.as_deref(),
-                    model: program
-                        .as_deref()
-                        .and_then(|launcher| defaults.model_for(launcher)),
-                    hook: hook.binary(),
-                },
-                args,
-            )?,
-        )?;
-        crate::terminal::spawn_session_in(
+            &crate::workbench::terminal_command::LaunchOptions {
+                notify: crate::tool_config::session_alerts().configure_agents,
+                setting_sources: sources.as_deref(),
+                model: program
+                    .as_deref()
+                    .and_then(|launcher| defaults.model_for(launcher)),
+                hook: hook.binary(),
+            },
+            &checkout_for_resume,
+            resume.as_ref().map(|r| r.session_id.as_str()),
+            session_id.as_deref(),
+            is_fork,
+            args,
+        ) {
+            Ok(built) => built,
+            Err(message) => {
+                if let Some(ref row_id) = reopen_row_id {
+                    if state
+                        .session_ledger()
+                        .record_reopen_failure(row_id, message.clone())
+                        .is_some()
+                    {
+                        state.session_ledger().emit_view(&app);
+                    }
+                }
+                return Err(CommandError::plain(message));
+            }
+        };
+        let spawned = match crate::terminal::spawn_session_in(
             &app,
             &state,
             &repo_path,
             start_dir.as_deref(),
             rows,
             cols,
-            program,
+            program.clone(),
             args,
             env,
             crate::terminal::OutputSink::channel(on_output),
-        )
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                if let Some(ref row_id) = reopen_row_id {
+                    if state
+                        .session_ledger()
+                        .record_reopen_failure(row_id, error.message().to_owned())
+                        .is_some()
+                    {
+                        state.session_ledger().emit_view(&app);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let launcher = program
+            .as_deref()
+            .and_then(crate::terminal::launcher_kind)
+            .unwrap_or("shell")
+            .to_owned();
+        let native_id = if is_fork {
+            session_id
+        } else {
+            resume.map(|r| r.session_id).or(session_id)
+        };
+        state
+            .session_ledger()
+            .record_spawn(crate::terminal::session_ledger::NewSessionRow {
+                terminal_id: spawned.id.clone(),
+                launcher,
+                native_id,
+                repo_path,
+                start_dir,
+                cwd: spawned.cwd.clone(),
+                mode: permission_mode,
+                reopen_row_id,
+            });
+        state.session_ledger().emit_view(&app);
+        Ok(spawned)
     })
     .await
 }
@@ -237,13 +300,20 @@ pub async fn cmd_terminal_detach(
 /// why it is on the control pool and never on a session's input lane.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(
+    app: AppHandle,
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
 ) -> Result<(), String> {
-    crate::terminal::control_async(&state, "terminal_kill", move |state| {
-        crate::terminal::kill_session(state, &session_id)
+    let ledger = state.session_ledger().clone();
+    let kill_id = session_id.clone();
+    let result = crate::terminal::control_async(&state, "terminal_kill", move |state| {
+        crate::terminal::kill_session(state, &kill_id)
     })
-    .await
+    .await;
+    if result.is_ok() && ledger.mark_user_closed(&session_id) {
+        ledger.emit_view(&app);
+    }
+    result
 }
 
 /// Mass external-signal deaths recorded this run, newest first and bounded.
@@ -410,6 +480,59 @@ pub async fn cmd_terminal_read_agent_artifact(
 ) -> Result<crate::terminal::AgentArtifactRead, String> {
     crate::terminal::control_async(&state, "terminal_read_agent_artifact", move |state| {
         crate::terminal::read_agent_artifact(state, &session_id, hint_artifact_dir.as_deref())
+    })
+    .await
+}
+
+/// Returns the durable backend ledger of interrupted hosted tabs and whether
+/// each row can currently be resumed (`S2-03`, `S2-05`).
+#[tauri::command(async)]
+pub async fn cmd_terminal_session_ledger(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<crate::terminal::SessionLedgerView, IpcError> {
+    let state = state.inner().clone();
+    off_thread(move || Ok(state.session_ledger().view())).await
+}
+
+/// Dismisses one recovery row (or corrupt ledger row) from the durable
+/// ledger (`S2-05`) and pushes the updated view.
+#[tauri::command(async)]
+pub async fn cmd_terminal_session_ledger_dismiss(
+    app: AppHandle,
+    state: State<'_, crate::terminal::TerminalSessions>,
+    row_id: String,
+) -> Result<crate::terminal::SessionLedgerView, IpcError> {
+    let state = state.inner().clone();
+    off_thread(move || {
+        let changed = state.session_ledger().dismiss(&row_id);
+        let view = state.session_ledger().view();
+        if changed {
+            state.session_ledger().emit_view(&app);
+        }
+        Ok(view)
+    })
+    .await
+}
+
+/// Verifies whether one ledger row can currently be reopened (transcript
+/// present and working directory intact), recording any per-row failure while
+/// keeping the row listed (`S2-03`, `S2-07`).
+#[tauri::command(async)]
+pub async fn cmd_terminal_session_ledger_reopen_check(
+    app: AppHandle,
+    state: State<'_, crate::terminal::TerminalSessions>,
+    row_id: String,
+) -> Result<crate::terminal::SessionReopenCheck, IpcError> {
+    let state = state.inner().clone();
+    off_thread(move || {
+        let checked = state
+            .session_ledger()
+            .check_reopen(&row_id)
+            .map_err(CommandError::plain)?;
+        if !checked.offer.resumable {
+            state.session_ledger().emit_view(&app);
+        }
+        Ok(checked)
     })
     .await
 }

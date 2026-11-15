@@ -138,7 +138,8 @@ describe("TerminalDock modes", () => {
   it("dismisses on an outside pointerdown only while floating and open, with its status-bar trigger inside", () => {
     expect(source).toContain("use:popover={dockDismissOptions}");
     expect(source).toContain('pointer: overlay && open && !leaving ? "pointerdown" : "none"');
-    expect(source).toContain('floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]")');
+    expect(source).toContain('const DOCK_TRIGGER = "[data-terminal-pill], [data-terminal-pill-menu]";');
+    expect(source).toContain('floatingPanelDismiss("[data-terminal-dock]", DOCK_TRIGGER)');
   });
 
   it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
@@ -181,6 +182,23 @@ describe("App hosts the terminal as a dock, not a view", () => {
     // Control, not Command, on macOS too: ⌘` is the OS window cycler.
     expect(app).toContain('e.key === "`"');
     expect(app).toContain("repoStore.toggleTerminal()");
+  });
+
+  it("hides on a double-click on the page or its tab bar, heard before the page can stop it", () => {
+    // vitest never runs $effect, so this pins the wiring; the judgement of
+    // which targets count is panelDismiss.test.ts's, and the real double-click
+    // is harness/terminal.html's "double-click on the page hides the dock".
+    expect(source).toContain(
+      'const scope = { panel: "[data-terminal-dock]", trigger: DOCK_TRIGGER, column, page: "[data-viewbar]" };',
+    );
+    expect(source).toMatch(
+      /if \(isWindowDragDoubleClick\(event\.composedPath\(\)\)\) return;\s*if \(pageDoubleClickHidesPanel\(event\.target, scope\)\) onClose\(\);/,
+    );
+    expect(source).toContain('document.addEventListener("dblclick", onDoubleClick, true);');
+    expect(source).toContain('document.removeEventListener("dblclick", onDoubleClick, true);');
+    expect(source).toMatch(/if \(!column \|\| !open\) return;\s*const scope/);
+    // The tab bar the scope names is the view bar's root.
+    expect(readFileSync(join(here, "ViewBar.svelte"), "utf8")).toMatch(/<nav[^>]*\n(?:[^>]*\n)*?\s*data-viewbar\n/);
   });
 
   it("reads the dock's open state from the repository tab, not a workspace preference", () => {

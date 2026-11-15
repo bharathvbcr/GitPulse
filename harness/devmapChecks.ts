@@ -1,4 +1,5 @@
 import { tick } from "svelte";
+import { codeGraphHitTestCount, codeGraphLayoutCount } from "../src/lib/codeintel/codeMap";
 import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
 
 /** Records one named assertion. The page passes `createChecks().check` so a
@@ -67,15 +68,26 @@ export async function runDevmapChecks(
   }});
   await settle();
   check("a same-count payload repaints", () => before !== canvas.toDataURL());
-  // A lost context comes back blank; the restore event must repaint it.
+  // A lost context comes back blank; the restore event must re-acquire, re-tune
+  // and repaint it — and nothing may repaint while the context is still lost.
   const painted = canvas.toDataURL();
   const lost = new Event("contextlost", { cancelable: true });
   canvas.dispatchEvent(lost);
   check("contextlost is claimed, so the browser can restore the context", () => lost.defaultPrevented);
-  canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
-  check("the harness can blank the canvas", () => canvas.toDataURL() !== painted);
+  await settle();
+  const raw2d = canvas.getContext("2d");
+  if (raw2d) {
+    raw2d.save();
+    raw2d.setTransform(1, 0, 0, 1, 0, 0);
+    raw2d.clearRect(0, 0, canvas.width, canvas.height);
+    raw2d.restore();
+    raw2d.imageSmoothingEnabled = false;
+  }
+  await settle();
+  check("the blanked canvas stays blank until contextrestored", () => canvas.toDataURL() !== painted);
   canvas.dispatchEvent(new Event("contextrestored"));
   await settle();
+  check("contextrestored re-acquires and tunes the 2D context", () => canvas.getContext("2d")?.imageSmoothingEnabled === true);
   check("contextrestored repaints the graph", () => canvas.toDataURL() === painted);
   setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload});
   await settle();
@@ -236,7 +248,83 @@ export async function runDevmapChecks(
   setFocus("pkg-4/file-4.ts"); await settle();
   check("focusNodeId selects the node in the flat view", () => selection().includes("file-4.ts"));
   setFocus(null); await settle();
-  return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, repeated-name labels, globe toggle and rotation, focus requests, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
+  const mapEl = document.querySelector<HTMLElement>(".code-map");
+  check("the map container is mounted for resize checks", () => !!mapEl);
+  if (!mapEl) return "";
+  const savedMapWidth = mapEl.style.width;
+  try {
+    const layoutsBeforeLoad = codeGraphLayoutCount();
+    setLoad({
+      available: true,
+      kind: "code_graph",
+      path: "/fixture/resize-no-relayout",
+      payload: {
+        level: "file",
+        nodes: [
+          { id: "r1", name: "ResizeOne", kind: "file", path: "src/r1.ts" },
+          { id: "r2", name: "ResizeTwo", kind: "file", path: "src/r2.ts" },
+        ],
+        links: [{ source: "r1", target: "r2", kind: "imports" }],
+      },
+    });
+    await settle();
+    const layoutsAfterLoad = codeGraphLayoutCount();
+    check("loading a new graph payload runs layout once", () => layoutsAfterLoad === layoutsBeforeLoad + 1);
+    mapEl.style.width = "480px";
+    await settle();
+    check("resizing the fitted stage updates the canvas width", () => liveCanvas().style.width === "480px");
+    mapEl.style.width = "720px";
+    await settle();
+    check("resizing the fitted stage again updates the canvas width", () => liveCanvas().style.width === "720px");
+    check("resizing while fitted does not call layoutNodes", () => codeGraphLayoutCount() === layoutsAfterLoad);
+    liveCanvas().dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    await settle();
+    mapEl.style.width = "560px";
+    await settle();
+    check("resizing after panning updates the canvas width without calling layoutNodes", () =>
+      liveCanvas().style.width === "560px" && codeGraphLayoutCount() === layoutsAfterLoad);
+  } finally {
+    mapEl.style.width = savedMapWidth;
+    await settle();
+  }
+  setLoad({
+    available: true,
+    kind: "code_graph",
+    path: "/fixture/hover-coalesce",
+    payload: {
+      level: "file",
+      nodes: [{ id: "hover-node", name: "Hover target", kind: "file", path: "src/hover.ts", x: 400, y: 280 }],
+      links: [],
+    },
+  });
+  await settle();
+  const hoverCanvas = liveCanvas();
+  const hoverBounds = hoverCanvas.getBoundingClientRect();
+  const centreX = hoverBounds.left + hoverBounds.width / 2;
+  const centreY = hoverBounds.top + hoverBounds.height / 2;
+  const cornerX = hoverBounds.left + 6;
+  const cornerY = hoverBounds.top + 6;
+  const hitsBeforeBurst = codeGraphHitTestCount();
+  for (let i = 0; i < 9; i++) {
+    hoverCanvas.dispatchEvent(new PointerEvent("pointermove", { clientX: cornerX + i, clientY: cornerY, bubbles: true }));
+  }
+  hoverCanvas.dispatchEvent(new PointerEvent("pointermove", { clientX: centreX, clientY: centreY, bubbles: true }));
+  const syncHitDelta = codeGraphHitTestCount() - hitsBeforeBurst;
+  check("pointermove does not run hitTestCodeGraph synchronously", () => syncHitDelta === 0);
+  await settle();
+  const burstHitDelta = codeGraphHitTestCount() - hitsBeforeBurst;
+  check(`a 10-event pointermove burst runs at most one hitTestCodeGraph per frame (ran ${burstHitDelta})`, () => burstHitDelta === 1);
+  check("coalesced hover hit-test uses the newest pointer position", () => selection().includes("Hover target"));
+  hoverCanvas.dispatchEvent(new PointerEvent("pointermove", { clientX: cornerX, clientY: cornerY, bubbles: true }));
+  await settle();
+  check("moving off the node clears the hover inspector", () => !selection().includes("Hover target"));
+  const hitsBeforeLeave = codeGraphHitTestCount();
+  hoverCanvas.dispatchEvent(new PointerEvent("pointermove", { clientX: centreX, clientY: centreY, bubbles: true }));
+  hoverCanvas.dispatchEvent(new PointerEvent("pointerleave", { bubbles: false }));
+  await settle();
+  check("pointerleave cancels a queued hover hit-test in the same frame", () =>
+    codeGraphHitTestCount() === hitsBeforeLeave && !selection().includes("Hover target"));
+  return "PASS: repaint, resize without re-layout, coalesced hover hit-test, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, repeated-name labels, globe toggle and rotation, focus requests, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
 }
 
 /** Measure mounted Svelte + canvas work, including actual frame completion. */

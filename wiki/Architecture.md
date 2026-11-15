@@ -19,7 +19,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 292 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 327 handlers, check:ipc"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -55,7 +55,7 @@ flowchart TB
     Backend --> LocalBox
 ```
 
-The 292-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
+The 327-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
 
 ## Layout
 

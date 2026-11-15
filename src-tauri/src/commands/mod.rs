@@ -35,6 +35,7 @@ use crate::github::{
     load_workflow_runs_report, pr_checkout_argv, validate_issue_payload, CodeScanningReport,
     DependabotReport, GitHubContext,
 };
+use crate::github::avatars::{load_author_avatars, AuthorAvatarQuery, AuthorAvatarReport};
 use crate::graph::{
     mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
     LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,

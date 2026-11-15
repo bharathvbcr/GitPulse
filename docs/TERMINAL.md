@@ -122,8 +122,8 @@ terminal's own automatic replies (focus, cursor reports, mouse) answer
 nothing. A bell rung for the same moment as a hook report is folded into it
 rather than becoming a second, reasonless banner, and the rate limit delays a
 banner rather than discarding it, most urgent first. The setting **Count a terminal
-bell as waiting for you** in **Settings → Agents** (default on, `asksForReader`)
-controls whether bells count as waiting prompts; when disabled, terminal bells ring
+bell as waiting for you** in **Settings → Agents** (default off, `asksForReader`)
+controls whether bells count as waiting prompts; when enabled, terminal bells from hook-less agents count as waiting prompts, and while off (default), terminal bells ring
 without updating the attention badge. A window that reloads
 reads what stood while it was not listening, with its real age. The tray shows
 the attention mark while an agent is waiting on you. Which of Claude Code's settings files an

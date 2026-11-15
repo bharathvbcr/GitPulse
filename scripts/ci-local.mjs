@@ -145,6 +145,13 @@ export const GATES = [
     produces: ["coverage/lcov.info"],
   },
   {
+    id: "timezone-tests",
+    name: "Frontend timezone and DST tests",
+    program: "bun",
+    args: ["run", "test:tz"],
+    covers: ["bun run test:tz"],
+  },
+  {
     id: "browser-regressions",
     name: "Browser regressions (headless Chrome)",
     program: "bun",

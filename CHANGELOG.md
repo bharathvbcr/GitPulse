@@ -11,6 +11,18 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Workbench schema 17 (`dc-store` at `b5215026`):** Cross-repo queue (`workbench/queue_driver.rs`), two-way GitHub issue sync outbox (`workbench/github_sync.rs`), and DAG launch readiness (`workbench/terminal_launch.rs`).
+- **Pre-operation Git snapshot log & guarded undo:** Allowed agent Git writes record snapshots under `refs/gitpulse/ops/<n>` via the desktop single-instance mailbox (`src-tauri/src/engine/git_writer.rs`), with CAS-checked restore in `cmd_undo_op_snapshot` and dirty-worktree confirmation in `ReflogViewer.svelte`.
+- **Durable interactive terminal session ledger (`src-tauri/src/terminal/session_ledger.rs`):** Bounded 64-row JSONL recovery log (`terminal-sessions.v1.jsonl`) and `TerminalResume` (`--fork` support) across app restarts and unexpected exits.
+- **Timezone & DST test runner (`bun run test:tz`, `scripts/test-timezones.mjs`):** Executes date-sensitive frontend suites across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata`.
+
+### Changed
+
+- **Vendored `dc-redact` at DevCouncil `d9c7a512` & `dc-glob` commit briefs:** Expanded bare Google OAuth credential redaction (`GOCSPX-`, `ya29.`, `1//`) and delegated test-path classification in `src-tauri/src/ai/commit_brief.rs` to `dc-glob`.
+- **"Count a terminal bell as waiting for you" (`asksForReader`)** in Settings → Agents now defaults to off.
+
 ## [1.99.0] - 2026-11-13
 
 The 2.0 beta. It ships as 1.99.0 because release and macOS bundle versions are

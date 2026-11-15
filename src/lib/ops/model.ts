@@ -177,3 +177,46 @@ export function splitBranchCleanup(
     byTree: picked.filter((candidate) => candidate.merged_by_tree),
   };
 }
+
+export interface OpRefEntry {
+  refname: string;
+  oid: string;
+  current_oid: string | null;
+}
+
+export interface OpSnapshotSummary {
+  seq: number;
+  op_ref: string;
+  snapshot_oid: string;
+  created_at: number;
+  command: string;
+  head_ref: string | null;
+  head_oid: string | null;
+  stash_oid: string | null;
+  refs: OpRefEntry[];
+}
+
+export interface OpSnapshotList {
+  entries: OpSnapshotSummary[];
+  total: number;
+  truncated: boolean;
+}
+
+export interface OpUndoExpectation {
+  refname: string;
+  expected_oid: string | null;
+}
+
+export interface OpUndoPlan {
+  seq: number;
+  expected_refs: OpUndoExpectation[];
+  confirm_dirty: boolean;
+}
+
+export interface OpUndoOutcome {
+  seq: number;
+  op_ref: string;
+  restored_refs: number;
+  head_before: string | null;
+  head_after: string | null;
+}

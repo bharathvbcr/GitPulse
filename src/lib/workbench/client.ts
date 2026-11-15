@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { isTauri } from "../platform";
-import { invoke } from "../ipc/invoke";
+import { invoke, type IpcOptions } from "../ipc/invoke";
 import { createWorkbenchChanges, type WorkbenchSubscriber } from "./changes";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
@@ -571,8 +571,9 @@ export function explainError(error: unknown): string {
   return typeof error === "string" ? error : "Task storage is unavailable. Try again.";
 }
 export function newID(): string { return crypto.randomUUID(); }
-export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>): Promise<unknown> {
-  try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) })); }
+export const WORKBENCH_REQUEST_TIMEOUT_MS = 30_000;
+export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>, options?: IpcOptions): Promise<unknown> {
+  try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) }, options)); }
   catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : "transport_error";
     throw new WorkbenchError(code, explainError(error));
@@ -963,7 +964,9 @@ export async function listTasks(
   cursor?: string,
   limit = TASK_PAGE_SIZE,
   filter: TaskListFilter = {},
+  options?: IpcOptions,
 ): Promise<Page<TaskCard>> {
+  const effectiveOptions: IpcOptions = { deadlineMs: WORKBENCH_REQUEST_TIMEOUT_MS, ...options };
   const result = page(
     await request("items.list", {
       ...scopeParams(scope),
@@ -974,7 +977,7 @@ export async function listTasks(
       query,
       limit,
       ...(cursor ? { cursor } : {}),
-    }),
+    }, effectiveOptions),
     taskCard,
   );
   // A store that ignored the filter would hand the board archived cards as

@@ -153,6 +153,7 @@ impl<R: tauri::Runtime> OrchestrateUiSink for AppOrchestrateUiSink<R> {
         std::sync::Arc::new(crate::terminal::AppEvents::new(
             &self.app,
             state.incidents.clone(),
+            state.session_ledger.clone(),
         ))
     }
 }

@@ -121,6 +121,8 @@ fixtures.cmd_reset_preview=a=>{calls.push({cmd:"cmd_reset_preview",args:a});retu
 fixtures.cmd_reset=a=>{calls.push({cmd:"cmd_reset",args:a});return null;};
 fixtures.cmd_create_branch=a=>{calls.push({cmd:"cmd_create_branch",args:a});return null;};
 fixtures.cmd_get_reflog=a=>{calls.push({cmd:"cmd_get_reflog",args:a});return reflog;};
+fixtures.cmd_list_op_snapshots=a=>{calls.push({cmd:"cmd_list_op_snapshots",args:a});return {entries:[],total:0,truncated:false};};
+fixtures.cmd_undo_op_snapshot=a=>{calls.push({cmd:"cmd_undo_op_snapshot",args:a});return {policy:{decision:"allow",reason:"fixture",policy_mode:"enforced",source:"manvi"},output:{seq:a.plan?.seq??1,op_ref:"refs/gitpulse/ops/1",restored_refs:0,head_before:hex(0),head_after:hex(0)}};};
 fixtures.cmd_get_commit_details=a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:a.commitId===ORPHAN?"Orphan Author":"Ada",author_email:"ada@example.com",author_date:"Tue Nov 14 2023",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:`details of ${a.commitId.slice(0,4)}`,body:"",co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};};
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
 const {mount,tick}=await import("svelte");

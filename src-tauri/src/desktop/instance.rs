@@ -204,6 +204,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
     },
+    /// Asks the app owner to snapshot `refs/heads`, `refs/tags`, and
+    /// `git stash create` under `refs/gitpulse/ops/<n>` before a gated agent
+    /// git write proceeds; answered synchronously on the connection.
+    RecordGitOp {
+        id: String,
+        cwd: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+    },
 }
 
 impl Request {
@@ -215,7 +227,8 @@ impl Request {
             | Request::CollisionScan { id, .. }
             | Request::InsightsRead { id, .. }
             | Request::TerminalOrchestrate { id, .. }
-            | Request::AgentDeliver { id, .. } => Some(id),
+            | Request::AgentDeliver { id, .. }
+            | Request::RecordGitOp { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -438,6 +451,38 @@ impl Request {
                         || tid.chars().any(char::is_control)
                     {
                         return Err("deliver task_id is empty, too long or not printable".into());
+                    }
+                }
+                Ok(())
+            }
+            Request::RecordGitOp {
+                id,
+                cwd,
+                command,
+                session_id,
+                task_id,
+            } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("op-record request id is empty, too long or not printable".into());
+                }
+                if cwd.is_empty()
+                    || cwd.len() > MAX_PATH_BYTES
+                    || cwd.contains('\0')
+                    || !Path::new(cwd).is_absolute()
+                {
+                    return Err("op-record cwd must be an absolute path".into());
+                }
+                if command.is_empty() || command.len() > MAX_GATE_COMMAND_BYTES {
+                    return Err("op-record command is empty or too long".into());
+                }
+                if let Some(sid) = session_id.as_deref() {
+                    if sid.len() > MAX_NATIVE_ID || sid.chars().any(char::is_control) {
+                        return Err("op-record session_id is too long or not printable".into());
+                    }
+                }
+                if let Some(tid) = task_id.as_deref() {
+                    if tid.len() > MAX_NATIVE_ID || tid.chars().any(char::is_control) {
+                        return Err("op-record task_id is too long or not printable".into());
                     }
                 }
                 Ok(())
@@ -865,6 +910,19 @@ impl Secondary {
         self.answered(request, within)
     }
 
+    /// Asks the owner to snapshot refs and working-tree changes before a gated
+    /// agent git write proceeds: the owner's reply to [`Request::RecordGitOp`].
+    pub fn record_git_op(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::RecordGitOp { .. }) {
+            return Err("not an op-record request".into());
+        }
+        self.answered(request, within)
+    }
+
     fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
         let id = request
             .answered_id()
@@ -933,6 +991,8 @@ pub type OrchestrateSink = Arc<
 >;
 /// Delivers an A2A peer message or kickoff spawn for an MCP process.
 pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
+/// Snapshots pre-op refs and `git stash create` under `refs/gitpulse/ops/<n>`.
+pub type OpRecordSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
@@ -951,6 +1011,7 @@ struct Shared {
     collision: Mutex<Option<ScanSink>>,
     insights: Mutex<Option<InsightsSink>>,
     deliver: Mutex<Option<DeliverSink>>,
+    op_record: Mutex<Option<OpRecordSink>>,
     /// Insights reads in flight, a share of `gating` of their own.
     reading: AtomicUsize,
     orchestrate: Mutex<Option<OrchestrateSink>>,
@@ -977,6 +1038,7 @@ impl Shared {
             collision: Mutex::new(None),
             insights: Mutex::new(None),
             deliver: Mutex::new(None),
+            op_record: Mutex::new(None),
             reading: AtomicUsize::new(0),
             orchestrate: Mutex::new(None),
             delivering: AtomicUsize::new(0),
@@ -1125,6 +1187,16 @@ impl Primary {
         *self
             .shared
             .deliver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where pre-op agent git write snapshot requests ([`Request::RecordGitOp`])
+    /// are answered.
+    pub fn attach_op_recorder(&self, sink: OpRecordSink) {
+        *self
+            .shared
+            .op_record
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1350,6 +1422,11 @@ enum Ended {
     /// Everything else, including a peer that sent part of a frame, a
     /// stranger's uid, and a peer that stalled while still connected.
     Refused(String),
+    /// A read-only ask (a gate verdict, a collision scan, an insights read)
+    /// whose asker left on its own deadline before the answer was written. The
+    /// asker has already fallen back to working it out itself, by design, so
+    /// nothing was refused; the line keeps what was late and by how much.
+    Unheard(String),
 }
 
 impl Ended {
@@ -1365,6 +1442,31 @@ impl Ended {
                 log::Level::Warn,
                 format!("instance mailbox refused a launch: {reason}"),
             ),
+            Self::Unheard(reason) => (log::Level::Info, format!("instance mailbox: {reason}")),
+        }
+    }
+
+    /// A failure answering an asked request (`what`, read since `started`).
+    /// [`Unheard`] only for a `read_only` ask whose asker is provably gone:
+    /// one that acts (a delivery, an orchestration, an op record) has already
+    /// done so when its ack cannot be written, and its asker does not know, so
+    /// that stays a refusal. Either way the line says what and how long.
+    ///
+    /// [`Unheard`]: Ended::Unheard
+    fn after_ask(
+        stream: &UnixStream,
+        what: &str,
+        read_only: bool,
+        started: Instant,
+        reason: String,
+    ) -> Self {
+        let ms = started.elapsed().as_millis();
+        if read_only && crate::local_socket::peer_hung_up_silently(stream) {
+            Self::Unheard(format!(
+                "the asker of {what} left before its answer, {ms} ms after asking: {reason}"
+            ))
+        } else {
+            Self::Refused(format!("{what}, {ms} ms after asking: {reason}"))
         }
     }
 
@@ -1445,20 +1547,35 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
             return Err(Ended::Refused(reason));
         }
     };
+    // An asked request's failure is the answer's write, or (vanishingly) its
+    // encoding: `after_ask` names the request and the time it took.
+    let started = Instant::now();
     if let Request::GateCommand { id, cwd, command } = &request {
-        return answer_gate(stream, shared, id, cwd, command).map_err(Ended::Refused);
+        return answer_gate(stream, shared, id, cwd, command)
+            .map_err(|reason| Ended::after_ask(stream, "the gate", true, started, reason));
     }
     if let Request::CollisionScan { id, repo, path } = &request {
-        return answer_scan(stream, shared, id, repo, path).map_err(Ended::Refused);
+        return answer_scan(stream, shared, id, repo, path).map_err(|reason| {
+            Ended::after_ask(stream, "the collision scan", true, started, reason)
+        });
     }
     if let Request::InsightsRead { id, repo } = &request {
-        return answer_insights(stream, shared, id, repo).map_err(Ended::Refused);
+        return answer_insights(stream, shared, id, repo).map_err(|reason| {
+            Ended::after_ask(stream, "the insights read", true, started, reason)
+        });
     }
     if let Request::TerminalOrchestrate { id, call } = request {
-        return answer_orchestrate(stream, shared, &id, call).map_err(Ended::Refused);
+        return answer_orchestrate(stream, shared, &id, call).map_err(|reason| {
+            Ended::after_ask(stream, "the terminal orchestration", false, started, reason)
+        });
     }
     if let Request::AgentDeliver { id, .. } = &request {
-        return answer_agent_deliver(stream, shared, id, &request).map_err(Ended::Refused);
+        return answer_agent_deliver(stream, shared, id, &request).map_err(|reason| {
+            Ended::after_ask(stream, "the agent delivery", false, started, reason)
+        });
+    }
+    if let Request::RecordGitOp { id, .. } = &request {
+        return answer_op_record(stream, shared, id, &request).map_err(Ended::Refused);
     }
     let verdict = admit(shared, request);
     let ack = match &verdict {
@@ -1539,6 +1656,17 @@ fn answer_agent_deliver(
             return Err("the agent delivery is busy".to_string());
         }
         attached(&shared.deliver, "the agent delivery")?(request)
+    })
+}
+
+fn answer_op_record(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    request: &Request,
+) -> Result<(), String> {
+    answer_asked(stream, shared, id, "the op log", || {
+        attached(&shared.op_record, "the op log")?(request)
     })
 }
 

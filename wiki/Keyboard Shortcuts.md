@@ -52,7 +52,7 @@ Sections (Work: Overview/Remote/Tasks; Code: Explorer/Map; History: Graph/Diff; 
 | Zoom In / Out / Reset | `⌘+` / `⌘-` / `⌘0` | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Toggle Dark / Light | `⌘⇧T` | `Ctrl+Shift+T` |
 
-In **Code**, `⌘F` searches the open file (Explorer and Blame). From other views it focuses History's commit filter.
+In **Code**, `⌘F` searches the open file (Explorer, including when the Blame toggle is active). From other views it focuses History's commit filter.
 
 ## Git operations
 

@@ -208,7 +208,26 @@ export function scopeNotes(report: SecretsReport): string[] {
   if (report.nested_repos_scanned) {
     notes.push("Nested repositories and submodules inside this tree are scanned too.");
   }
+  const left = excludedNote(report.excluded_paths);
+  if (left) notes.push(left);
   return notes;
+}
+
+/** Trees named in the note before it says how many more there are. */
+const EXCLUDED_SHOWN = 10;
+
+/**
+ * The trees the scan left out, by name: ignored build output, dependency and
+ * scratch directories, and this repository's own worktrees nested inside it.
+ * A finding there is a copy of one the scan can see, or is scanned when that
+ * worktree is the repository open; the note keeps the narrower scope visible.
+ */
+function excludedNote(paths: readonly string[]): string | null {
+  if (paths.length === 0) return null;
+  const shown = paths.slice(0, EXCLUDED_SHOWN).join(", ");
+  const more = paths.length - EXCLUDED_SHOWN;
+  const tail = more > 0 ? `, and ${more.toLocaleString("en-US")} more` : "";
+  return `Not scanned: ignored build output, dependency and scratch trees, and this repository's other worktrees inside it (${shown}${tail}).`;
 }
 
 /** A cached report older than this is refreshed when the panel reopens. */

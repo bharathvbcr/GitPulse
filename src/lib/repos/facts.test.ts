@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { toWipInput, unknownFacts, type RepoFacts } from "./facts";
+import { collectRepoFacts, pathsTrustedForBackground, toWipInput, unknownFacts, type RepoFacts } from "./facts";
 import { IDLE_OPERATION } from "./operation";
+import { createSession } from "./projection";
 import { WATCH_ACTIVE, WATCH_UNKNOWN } from "./watchState";
 import { repoWip } from "./wipSummary";
 
@@ -82,5 +83,87 @@ describe("toWipInput", () => {
       "stashEntries",
       "unpushedCommits",
     ]);
+  });
+});
+
+describe("pathsTrustedForBackground", () => {
+  it("excludes untrusted and missing tabs from both scopes and activeKey, and omits inactive parked tabs from liveKeys", () => {
+    const result = pathsTrustedForBackground(
+      [
+        { path: "/repo/trusted" },
+        { path: "/repo/untrusted", trustRequired: true },
+        { path: "/repo/missing", missing: true },
+        { path: "/repo/parked-bg", parked: true },
+        { path: "/repo/parked-active", parked: true },
+      ],
+      "/repo/parked-active",
+    );
+    expect(result).toEqual({
+      activeKey: "/repo/parked-active",
+      retainedKeys: ["/repo/trusted", "/repo/parked-bg", "/repo/parked-active"],
+      liveKeys: ["/repo/trusted", "/repo/parked-active"],
+    });
+
+    const blockedActive = pathsTrustedForBackground(
+      [{ path: "/repo/untrusted", trustRequired: true }, { path: "/repo/ok" }],
+      "/repo/untrusted",
+    );
+    expect(blockedActive.activeKey).toBeNull();
+  });
+});
+
+describe("collectRepoFacts", () => {
+  it("extracts churnPartial floors, folds stashTruncated into stashFailed, and defaults unhydrated tabs", () => {
+    const partial = createSession({ id: "a", path: "/work/app/core", pinned: false }, {
+      hasHydrated: true,
+      currentBranch: "feat",
+      statuses: [
+        { path: "a.ts", status_code: "M", is_staged: true, is_conflicted: false, additions: 3, deletions: 1, warnings: ["numstat skipped"] },
+        { path: "b.ts", status_code: "UU", is_staged: false, is_conflicted: true, additions: 2, deletions: 4 },
+      ],
+      branches: [{
+        name: "feat",
+        is_remote: false,
+        remote_name: null,
+        is_current: true,
+        is_default: false,
+        ahead_count: 2,
+        behind_count: 1,
+        last_commit_id: "abc",
+        tip_commit_id: "abc",
+        last_commit_summary: "wip",
+        last_commit_time: 1,
+      } as never],
+      stashTruncated: true,
+    });
+    const list = collectRepoFacts(
+      [
+        { id: "a", path: "/work/app/core" },
+        { id: "b", path: "/work/lib/core" },
+      ],
+      { a: partial },
+    );
+    expect(list[0]).toMatchObject({
+      path: "/work/app/core",
+      label: "app/core",
+      branch: "feat",
+      changedFiles: 2,
+      conflictedFiles: 1,
+      stagedFiles: 1,
+      additions: 5,
+      deletions: 5,
+      churnPartial: true,
+      unpushedCommits: 2,
+      behindCommits: 1,
+      stashFailed: true,
+      hydrated: true,
+    });
+    expect(list[1]).toMatchObject({
+      path: "/work/lib/core",
+      label: "lib/core",
+      branch: null,
+      changedFiles: 0,
+      hydrated: false,
+    });
   });
 });

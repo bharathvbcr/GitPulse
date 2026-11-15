@@ -119,6 +119,9 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 # dc-verify, where the table used to live, links tree-sitter 0.25 and cannot
 # resolve beside markdev-highlight's 0.26.
 dc-redact = { path = "vendored/dc-redact" }
+# Test-path classification shared with DevCouncil (`dc_glob::test_paths::is_test_path`
+# against `protocols/test-paths/v1.json`), used by commit-brief role tallying.
+dc-glob = { path = "vendored/dc-glob" }
 
 # Manvi owns storage schemas and transactions. Repository execution tasks and
 # leases remain read-only in GitPulse; profile workspaces/items use the separate

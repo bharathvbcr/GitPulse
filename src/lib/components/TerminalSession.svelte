@@ -154,6 +154,7 @@
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
   import { AGY_CONTINUE_SENTINEL, conversationForStart, hostedClaude, resolveTranscriptAnswer, resumers, settleConversation, unindexedExitOffer, type ExitFacts, type ResumeOutcome } from "../terminal/hostedAgent";
+  import type { TerminalResume } from "../terminal/sessionLedger";
   import { agentEvents } from "../terminal/agentEvents";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
@@ -994,6 +995,12 @@
     resumePrompt = undefined;
     return prompt;
   }
+  let reopenRowPending: string | null = untrack(() => resume?.ledgerRowId ?? null);
+  function takeReopenRowId(): string | null {
+    const rowId = reopenRowPending;
+    reopenRowPending = null;
+    return rowId;
+  }
 
   /**
    * The mode this tab will start in, decided here rather than in the backend
@@ -1034,6 +1041,8 @@
   let transcriptNote = $state<string | null>(null);
   /** Set to relaunch the conversation a signal ended; consumed by the next spawn. */
   let resumeOverride: string | null = null;
+  /** Newly minted session UUID once a `--fork-session` launch succeeds; subsequent restarts resume it instead of re-forking. */
+  let forkedId: string | null = null;
   /** The conversation a signal ended in this tab, which Resume relaunches. */
   let resumeOffer = $state<string | null>(null);
   /** The dead PTY the offer was registered under for an incident's "Resume N". */
@@ -1138,8 +1147,12 @@
           // ordinary way, because the session it took over has ended.
           const attachTo = attachPending;
           attachPending = null;
-          const resumeId = resumeOverride;
+          const hadResumeOverride = resumeOverride !== null;
+          const resumeId = resumeOverride ?? forkedId ?? resume?.sessionId ?? null;
           resumeOverride = null;
+          const reopenRowId = attachTo || hadResumeOverride ? null : takeReopenRowId();
+          const fork = Boolean(!hadResumeOverride && !forkedId && !attachTo && resume?.fork && resumeId);
+          let spawnResume: TerminalResume | null = null;
           hostedId = null;
           // A conversation GitPulse can name is one it can resume. A fresh
           // Claude launch is given an id and a resumed one keeps its own; a
@@ -1150,11 +1163,13 @@
             const provider = launcher === "agy" ? "agy" : "claude";
             const decided = conversationForStart(hostedClaude, {
               attach: attachTo, resumeId, args: cfg.args,
+              fork,
               record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now(), provider },
               provider,
             });
             cfg.args = decided.args;
             hostedId = decided.sessionId;
+            spawnResume = decided.resume;
           }
           if (attachTo) {
             return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId: attachTo, rows, cols, onOutput }));
@@ -1173,6 +1188,9 @@
             // this unconditionally would fail on the next ordinary launch
             // rather than wait to matter.
             acknowledged: requiresAcknowledgement(permissionMode) ? acknowledgedBypass : false,
+            resume: spawnResume,
+            sessionId: !spawnResume || spawnResume.fork ? hostedId : null,
+            reopenRowId,
             onOutput,
           }));
         },
@@ -1230,6 +1248,7 @@
           if (hostedId) {
             hostedClaude.bind(hostedId, spawned.id);
             hostedLive = true;
+            if (resume?.fork && !forkedId) forkedId = hostedId;
           }
           const rememberedMeta = hostedClaude.byTerminal(spawned.id);
           if (rememberedMeta?.artifactDir) {

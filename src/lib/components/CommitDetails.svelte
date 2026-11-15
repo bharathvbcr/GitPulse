@@ -8,7 +8,6 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     GitCommit,
-    User,
     Calendar,
     Plus,
     Minus,
@@ -33,6 +32,7 @@
     evidenceTitle,
     hopsLabel,
   } from "../codeintel/suspectsQuery";
+  import AuthorAvatar from "../authors/AuthorAvatar.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
@@ -164,6 +164,9 @@
   );
   let headerAuthor = $derived(
     offGraph ? (readDetails?.author_name ?? "") : (selectedCommit?.author_name ?? ""),
+  );
+  let headerAuthorEmail = $derived(
+    offGraph ? (readDetails?.author_email ?? "") : (selectedCommit?.author_email ?? ""),
   );
 
   // The store's read status describes ITS selected commit; it only speaks for
@@ -469,7 +472,7 @@
         </div>
       </div>
       <div class="flex items-center gap-4 text-meta text-textMuted shrink-0">
-        <span class="flex items-center gap-1.5 select-text"><User size={13} /> {headerAuthor || "—"}</span>
+        <span class="flex items-center gap-1.5 select-text"><AuthorAvatar name={headerAuthor} email={headerAuthorEmail} class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-micro font-semibold text-white" ariaHidden /> {headerAuthor || "—"}</span>
         <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || (offGraph ? "—" : formatDate(selectedCommit.timestamp))}</span>
         <span class="flex items-center gap-1 {sig.ok ? 'text-ok' : 'text-textMuted'}">
           {#if sig.ok}

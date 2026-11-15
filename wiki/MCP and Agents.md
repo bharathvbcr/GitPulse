@@ -116,6 +116,10 @@ Pass an **absolute** `repo_path` on every call.
 | `gitpulse_delete_task` / `_merge_tasks` | Destructive board writes (both end in the store's soft delete) and annotated `destructiveHint: true` |
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null (and `verified` false) when the commit has no verification note. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with none, even when `gitpulse_landed` finds its work on the base |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `landed: false` only when absence is provable; otherwise null with a `reason` (`partial_clone_fetch_required`, `search_depth_exceeded`, `content_not_provable`, ...). `reverted` is true only when a revert commit is found by ancestry; `landed_at` comes from the base branch's own reflog (never `HEAD`'s). Never writes to the repository: the content comparison (`git merge-tree --write-tree`) runs in a quarantined object directory deleted afterwards |
+| `gitpulse_browser_open` | Ask the running desktop app over the single-instance mailbox to open a loopback URL in a supervised Browser session (refuses untrusted repos and non-loopback URLs) |
+| `gitpulse_terminal_spawn` / `_open_file` / `_list` / `_wait` / `_read` / `_send` / `_close` | Supervised PTY sessions inside GitPulse's terminal dock: spawn shells or open files (`_open_file`), list, wait on output/exit, read bounded buffers, send input, and close |
+| `gitpulse_kickoff_agent` / `gitpulse_agent_register` / `_peers` / `_send` / `_inbox` / `_wait` | Orchestrate supervised agent sessions (`_kickoff_agent`) and bounded peer-to-peer A2A messaging across worktrees |
+| `gitpulse_campaign_audit` | Inspect cross-worktree campaign readiness, active sessions, and lane state |
 
 Prompts: `gitpulse_preflight`, `gitpulse_collision_triage`, `gitpulse_handoff`, `gitpulse_session_brief`.
 

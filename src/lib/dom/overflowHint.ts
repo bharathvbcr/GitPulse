@@ -388,6 +388,15 @@ export function observeOverflow(
  */
 export const CUE_BAND_PX = 32;
 
+/**
+ * How close an inner scroller's edge may come to an enclosing scroller's
+ * drawn cue before its own chevron gives way: the cue's band plus the 0.5rem
+ * fade ramp above it (`--gp-sidebar-cue-ramp`). The sidebar's branch list
+ * ends exactly at the top of that ramp, so its chevron would otherwise stack
+ * 8px above the body's.
+ */
+export const CUE_YIELD_PX = CUE_BAND_PX + 8;
+
 /** Which of a scroller's own cue chevrons give way to an enclosing one. */
 export interface CueYield {
   start: boolean;
@@ -403,13 +412,13 @@ export interface AxisSpan {
 }
 
 /**
- * Nested scrollers each draw their own chevron, so a list that fills its
- * parent scroller (the sidebar's branch list does: it is `h-full` inside the
- * sidebar body) put two "scroll down" arrows on top of each other. One edge
- * gets one chevron: the inner scroller's gives way while its edge sits inside
- * the band where the enclosing scroller is drawing its own chevron for that
- * same edge. The inner scroller keeps its fade, so its overflow still shows;
- * the chevron that stays is the one that reveals what is below the list.
+ * Nested scrollers each draw their own chevron, so a list that ends at its
+ * parent scroller's edge (the sidebar's branch list ends just above the
+ * sidebar body's cue band) put two "scroll down" arrows on top of each other.
+ * One edge gets one chevron: the inner scroller's gives way while its edge
+ * sits within `CUE_YIELD_PX` of the edge where the enclosing scroller is
+ * drawing its own chevron. The inner scroller keeps a fade, so its overflow
+ * still shows; the cue that stays is the one that reveals what is below.
  */
 export function cueYield(
   inner: AxisSpan,
@@ -420,8 +429,10 @@ export function cueYield(
   const outerStart = outerToken === `${axis}-start` || outerToken === `${axis}-both`;
   const outerEnd = outerToken === `${axis}-end` || outerToken === `${axis}-both`;
   return {
-    start: outerStart && inner.start < outer.start + CUE_BAND_PX,
-    end: outerEnd && inner.end > outer.end - CUE_BAND_PX,
+    // Half a pixel of slack: a list sized to end exactly at the ramp's top
+    // lands there give or take subpixel layout.
+    start: outerStart && inner.start < outer.start + CUE_YIELD_PX + 0.5,
+    end: outerEnd && inner.end > outer.end - CUE_YIELD_PX - 0.5,
   };
 }
 

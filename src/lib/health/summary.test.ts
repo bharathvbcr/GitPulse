@@ -25,6 +25,7 @@ function cleanSecrets(overrides: Partial<SecretsReport> = {}): SecretsReport {
     kingfisher_version: "2.7.0",
     kingfisher_version_rejected: false,
     nested_repos_scanned: true,
+    excluded_paths: [],
     completeness: "complete",
     findings: [],
     findings_total: 0,

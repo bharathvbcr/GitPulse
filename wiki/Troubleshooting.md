@@ -23,7 +23,7 @@ GitPulse never stores GitHub credentials. If `gh` is missing, the rest of the ap
 
 ## Policy shows Unchecked
 
-MANVI is optional. **Unchecked** means the harness was absent or that rung could not run. It is not a pass. Install from **Settings → Agents** (or the MANVI panel's Install button) when a sibling `Manvi` checkout is available, or run `go -C manvi install ./cmd/manvi` yourself, then press Reconnect. Otherwise treat Unchecked as "this check did not run". See [[Policy and AI]].
+MANVI is optional. **Unchecked** means the harness was absent or that rung could not run. It is not a pass. Install from **Settings → Agents** (or the policy card in Work → Overview) when a sibling `Manvi` checkout is available, or run `go -C manvi install ./cmd/manvi` yourself, then press Reconnect. Otherwise treat Unchecked as "this check did not run". See [[Policy and AI]].
 
 ## Local AI will not connect
 
@@ -39,7 +39,7 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 ## Code map / Map panel says unavailable
 
-DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **27**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
+DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
 Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
 lookup, build/background-refresh state, visible errors, and recent DevMap entries

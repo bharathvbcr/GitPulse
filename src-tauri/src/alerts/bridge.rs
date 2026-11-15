@@ -83,8 +83,12 @@
 //!
 //! * **Report, v1.** `v` (must be [`PROTOCOL_VERSION`]) and `event` (a name in
 //!   [`EVENTS`]) are required. Optional: `agent`, `session`, `cwd`, `message`,
-//!   `subject`, `subagent`, `agent_id`, and `seq`. Fields not listed are
-//!   ignored, which is what lets a field be added without a new version.
+//!   `subject`, `subagent`, `agent_id`, `fully_idle`, `provider_session_id`,
+//!   and `seq`. Unrecognized non-argv fields are ignored, which lets benign
+//!   fields be added without a new version; argv-like fields (`argv`,
+//!   `resume_argv`, `resume_args`, `args`, `command`, `cmd`, etc.) are refused
+//!   explicitly as `forbidden_argv_field` (hooks may report validated ids,
+//!   never argv).
 //! * **`agent_id`** names which subagent a report came from. It travels beside
 //!   the `subagent` boolean, which stays for a bridge or hook that predates it,
 //!   and is held to [`valid_key`]'s alphabet and length: one that is present
@@ -1102,6 +1106,36 @@ pub fn order_for(seq: Option<u64>, accepted: u64) -> u64 {
     seq.map_or(accepted, |seq| seq.min(accepted))
 }
 
+fn is_forbidden_argv_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("argv")
+        || matches!(
+            lower.as_str(),
+            "args" | "resume_args" | "resume_command" | "resume_cmd" | "command" | "cmd"
+        )
+}
+
+fn contains_forbidden_argv_field(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let mut stack: Vec<&serde_json::Map<String, serde_json::Value>> = vec![root];
+    while let Some(map) = stack.pop() {
+        for (key, value) in map {
+            if is_forbidden_argv_key(key) {
+                return true;
+            }
+            if let Some(child) = value.as_object() {
+                stack.push(child);
+            } else if let Some(items) = value.as_array() {
+                for item in items {
+                    if let Some(child) = item.as_object() {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// [`parse_report`] with the typed refusal and the report's own `seq`, if any.
 pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reason> {
     if bytes.len() > MAX_REPORT_BYTES {
@@ -1114,6 +1148,9 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
     }
     if object.get("v").and_then(serde_json::Value::as_u64) != Some(PROTOCOL_VERSION) {
         return Err(Reason::UnsupportedVersion);
+    }
+    if contains_forbidden_argv_field(object) {
+        return Err(Reason::ForbiddenArgvField);
     }
     // When the hook began, on the clock `order_stamp_ns` reads. Optional, so an
     // older hook's report is still one; a present one must be a positive

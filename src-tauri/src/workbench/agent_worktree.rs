@@ -383,6 +383,90 @@ fn provision_with(
     Ok(provisioned)
 }
 
+/// Plans a collision-free `(worktree_path, branch_name)` pair inside the main
+/// checkout's `.gitpulse/worktrees/` container for forking `source_worktree_path`,
+/// keeping `.gitpulse/worktrees/` excluded via `$GIT_COMMON_DIR/info/exclude`.
+#[doc(hidden)]
+pub fn plan_fork_target(
+    repo_path: &str,
+    source_worktree_path: &str,
+    requested_branch: Option<&str>,
+) -> Result<(String, String), CommandError> {
+    let selected = Path::new(repo_path);
+    let main = main_checkout(selected).map_err(|e| CommandError::plain(e.message))?;
+    let exclude = crate::devmap::init::ensure_dir_excluded(&main, EXCLUDED, EXCLUDE_MARKER);
+    if !exclude.is_clean() {
+        return Err(CommandError::plain(format!(
+            "GitPulse could not keep {EXCLUDED}/ out of git status, so it will not create a forked worktree there: {exclude:?}"
+        )));
+    }
+    let container = gitpulse_lane_container(&main);
+    std::fs::create_dir_all(&container).map_err(|e| {
+        CommandError::plain(format!(
+            "Could not create {}: {e}",
+            container.display()
+        ))
+    })?;
+
+    let source_name = Path::new(source_worktree_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("lane");
+    let stemmed = {
+        let base = slug(source_name);
+        base.strip_suffix("-fork").unwrap_or(&base).to_string()
+    };
+    let explicit_branch = requested_branch
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(branch) = explicit_branch {
+        crate::engine::git_writer::validate_ref_name(branch)?;
+        let taken = crate::engine::git_cli::git_captured(
+            &main,
+            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        )?;
+        if taken.success {
+            return Err(CommandError::plain(format!(
+                "Branch '{branch}' already exists; choose another branch name for the fork."
+            )));
+        }
+    }
+
+    for n in 1usize..=64 {
+        let lane = if n == 1 {
+            format!("{stemmed}-fork")
+        } else {
+            format!("{stemmed}-fork-{n}")
+        };
+        let path = container.join(&lane);
+        if path.exists() {
+            continue;
+        }
+        let branch = explicit_branch
+            .map(str::to_string)
+            .unwrap_or_else(|| lane_branch(&lane));
+        if existing(&main, &path, &branch).map_err(|e| CommandError::plain(e.message))? {
+            continue;
+        }
+        let branch_taken = crate::engine::git_cli::git_captured(
+            &main,
+            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        )?;
+        if branch_taken.success {
+            continue;
+        }
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| CommandError::plain("The forked worktree path is not valid Unicode."))?
+            .to_owned();
+        return Ok((path_text, branch));
+    }
+
+    Err(CommandError::plain(
+        "All candidate fork worktree names (-fork-1..64) already exist; clean up old forks or specify a target path and branch.",
+    ))
+}
+
 /// What a removal left to say beyond "removed": the files that could not be
 /// deleted and the leftovers of earlier removals the sweep could not clear.
 /// Logged, and returned for a caller that reports it. `None` when nothing.

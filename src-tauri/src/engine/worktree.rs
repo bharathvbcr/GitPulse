@@ -3660,6 +3660,18 @@ pub struct WorktreeCreated {
     /// caller asked for it, and never `provisioned` for a store that is not there.
     #[serde(default)]
     pub devmap: DevmapOutcome,
+    /// Branch checked out in the created worktree, when known (`fork_worktree_extended`).
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Commit OID at `HEAD` in the created worktree when provisioned (`fork_worktree_extended`).
+    #[serde(default)]
+    pub head_oid: Option<String>,
+    /// True when uncommitted edits (tracked or untracked) were carried from a forked source lane.
+    #[serde(default)]
+    pub carried_uncommitted: bool,
+    /// Most recent verified Claude Code session id found for the forked source checkout, if any.
+    #[serde(default)]
+    pub source_session_id: Option<String>,
 }
 
 /// Whether, and how, creating a worktree also seeds its DevMap store. Seeding
@@ -3795,6 +3807,10 @@ pub fn add_worktree_configured(
             hook_error: None,
             hook_notice: None,
             devmap: sparse.devmap,
+            branch: None,
+            head_oid: None,
+            carried_uncommitted: false,
+            source_session_id: None,
         };
         if run_hooks {
             let repo = validate_repo(repo_path)?;
@@ -3876,6 +3892,10 @@ pub fn add_worktree_with_devmap(
         hook_error: None,
         hook_notice: None,
         devmap: DevmapOutcome::NotRequested,
+        branch: None,
+        head_oid: None,
+        carried_uncommitted: false,
+        source_session_id: None,
     };
     let target = Path::new(&created.path);
     let anchor = resolve_worktree_family(repo_path, &created.path)
@@ -3959,6 +3979,346 @@ pub fn add_worktree_with_devmap(
             Err(e) => created.hook_error = Some(e.into_message()),
         }
     }
+    Ok(created)
+}
+
+const MAX_FORK_UNTRACKED_FILES: usize = 2_000;
+const MAX_FORK_UNTRACKED_BYTES: usize = 64 * 1024 * 1024;
+
+struct CapturedUntrackedFile {
+    rel: PathBuf,
+    bytes: Vec<u8>,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn is_machine_owned_untracked_path(rel: &Path) -> bool {
+    let mut comps = rel.components();
+    let Some(std::path::Component::Normal(first)) = comps.next() else {
+        return false;
+    };
+    if first == ".devmap" {
+        return true;
+    }
+    if first == ".gitpulse" {
+        return matches!(
+            comps.next(),
+            Some(std::path::Component::Normal(second)) if second == "worktrees"
+        );
+    }
+    if first == ".devcouncil" {
+        let is_user_config = matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(file)), None)
+                if file == "config.yaml" || file == "config.yml"
+        );
+        return !is_user_config;
+    }
+    false
+}
+
+fn capture_untracked_files(source: &Path) -> Result<Vec<CapturedUntrackedFile>, CommandError> {
+    let raw = git_text(
+        source,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    let mut out = Vec::new();
+    let mut total_bytes: usize = 0;
+
+    for rel_str in raw.split('\0').filter(|s| !s.is_empty()) {
+        let rel = Path::new(rel_str);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(part) if part != ".git"))
+        {
+            return Err(format!("Cannot fork worktree: unsafe untracked path {rel_str:?}.").into());
+        }
+        if is_machine_owned_untracked_path(rel) {
+            continue;
+        }
+        if out.len() >= MAX_FORK_UNTRACKED_FILES {
+            return Err(format!(
+                "Cannot fork worktree: source lane has more than {MAX_FORK_UNTRACKED_FILES} untracked files."
+            )
+            .into());
+        }
+        let abs = source.join(rel);
+        let meta = std::fs::symlink_metadata(&abs).map_err(|e| {
+            CommandError::from(format!(
+                "Cannot fork worktree: failed to inspect untracked file {rel_str:?}: {e}"
+            ))
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        let size = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+        if total_bytes.saturating_add(size) > MAX_FORK_UNTRACKED_BYTES {
+            return Err(format!(
+                "Cannot fork worktree: untracked files exceed {} MiB.",
+                MAX_FORK_UNTRACKED_BYTES / (1024 * 1024)
+            )
+            .into());
+        }
+        let bytes = std::fs::read(&abs).map_err(|e| {
+            CommandError::from(format!(
+                "Cannot fork worktree: failed to read untracked file {rel_str:?}: {e}"
+            ))
+        })?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode()
+        };
+        out.push(CapturedUntrackedFile {
+            rel: rel.to_path_buf(),
+            bytes,
+            #[cfg(unix)]
+            mode,
+        });
+    }
+    Ok(out)
+}
+
+fn restore_untracked_files(
+    target: &Path,
+    files: &[CapturedUntrackedFile],
+) -> Result<(), CommandError> {
+    for file in files {
+        let dest = target.join(&file.rel);
+        if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(format!(
+                    "Untracked path '{}' already exists as a non-regular entry in the fork worktree.",
+                    file.rel.display()
+                )
+                .into());
+            }
+            let existing = std::fs::read(&dest).map_err(|e| {
+                CommandError::from(format!(
+                    "Failed to inspect existing path '{}' in fork worktree: {e}",
+                    file.rel.display()
+                ))
+            })?;
+            if existing == file.bytes {
+                continue;
+            }
+            return Err(format!(
+                "Copying untracked file '{}' conflicted with existing content in the fork worktree.",
+                file.rel.display()
+            )
+            .into());
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CommandError::from(format!(
+                    "Failed to create directory '{}' for forked file '{}': {e}",
+                    parent.display(),
+                    file.rel.display()
+                ))
+            })?;
+        }
+        std::fs::write(&dest, &file.bytes).map_err(|e| {
+            CommandError::from(format!(
+                "Failed to copy untracked file '{}' into fork worktree: {e}",
+                file.rel.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(file.mode);
+            let _ = std::fs::set_permissions(&dest, perms);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_fork_base_record(
+    anchor: &Path,
+    source_wt: &Path,
+    source_head_oid: &str,
+) -> Result<Option<(String, String)>, CommandError> {
+    if let Some(existing) = read_base_record(source_wt)? {
+        return Ok(Some(existing));
+    }
+    if let Ok(default) = crate::engine::git_reader::compute_default_base(anchor).checked() {
+        if let Some((default_branch, default_ref)) = default.base {
+            let head_ref = format!("refs/heads/{default_branch}");
+            if let Ok(raw_oid) = git_text(anchor, &["merge-base", &head_ref, source_head_oid])
+                .or_else(|_| git_text(anchor, &["merge-base", &default_ref, source_head_oid]))
+            {
+                let oid = raw_oid.trim();
+                if is_full_oid(oid) && validate_ref_name(&default_branch).is_ok() {
+                    return Ok(Some((default_branch, oid.to_ascii_lowercase())));
+                }
+            }
+        }
+    }
+    if let Ok(Some(source_branch)) = crate::engine::git_reader::head_branch(source_wt) {
+        if validate_ref_name(&source_branch).is_ok() {
+            return Ok(Some((source_branch, source_head_oid.to_ascii_lowercase())));
+        }
+    }
+    Ok(None)
+}
+
+fn teardown_failed_fork(
+    repo_path: &str,
+    created_path: &str,
+    new_branch: Option<&str>,
+    gate: GitWriteGate<'_>,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    let plain_target = plain_path_text(created_path);
+    let remove_args = ["worktree", "remove", "--force", plain_target.as_str()];
+    let worktree_removed = match gate(&remove_args)
+        .and_then(|()| remove_worktree(repo_path, created_path, true).map(drop))
+    {
+        Ok(()) => true,
+        Err(e) => {
+            problems.push(format!(
+                "worktree {plain_target} was not removed: {}",
+                e.message()
+            ));
+            false
+        }
+    };
+    if worktree_removed {
+        if let Some(branch) = new_branch {
+            let delete_args = ["branch", "-D", branch];
+            if let Err(e) = gate(&delete_args)
+                .and_then(|()| GitWriter::delete_branch(repo_path, branch, true).map(drop))
+            {
+                problems.push(format!("branch {branch} was not deleted: {}", e.message()));
+            }
+        }
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
+}
+
+/// Forks an existing checkout/lane (`source_worktree_path`) into a new linked
+/// worktree at `target_path` at the source lane's exact `HEAD`, carrying
+/// tracked staged+unstaged edits via `git stash create` + `git stash apply --index`
+/// (leaving the source working tree and `refs/stash` untouched) and copying
+/// bounded non-ignored untracked files.
+///
+/// Stated rollback rule: if carrying uncommitted changes conflicts or setup
+/// fails after creation, the fork worktree is reset clean (`stash::apply_oid_with_gate`)
+/// and removed along with its newly created branch, reporting the conflict reason.
+#[allow(clippy::too_many_arguments)]
+pub fn fork_worktree_extended(
+    repo_path: &str,
+    source_worktree_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    cow_caches: bool,
+    run_hooks: bool,
+    devmap: DevmapMode,
+    gate: GitWriteGate<'_>,
+) -> Result<WorktreeCreated, CommandError> {
+    // Do NOT hold `repo_mutation_lock` across this function: `stash_create_with_gate`,
+    // `add_worktree_configured`, `apply_oid_with_gate`, `remove_worktree`, and
+    // `delete_branch` each acquire the shared per-repo mutex internally.
+    let family = resolve_worktree_family(repo_path, source_worktree_path)?;
+    let source_wt = family.worktree;
+    let source_head_oid = git_text(&source_wt, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|e| {
+            e.wrap(|msg| format!("Cannot fork worktree without a valid HEAD commit: {msg}"))
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    if !is_full_oid(&source_head_oid) {
+        return Err(format!("Unexpected HEAD commit id {source_head_oid:?}.").into());
+    }
+
+    let base_record = resolve_fork_base_record(&family.anchor, &source_wt, &source_head_oid)?;
+    let source_wt_str = source_wt.to_string_lossy().into_owned();
+    let stash_oid = crate::engine::stash::stash_create_with_gate(&source_wt_str, gate)?;
+    let untracked = capture_untracked_files(&source_wt)?;
+
+    let detach = new_branch.is_none();
+    let add_argv = add_worktree_argv_configured(
+        target_path,
+        new_branch,
+        Some(&source_head_oid),
+        detach,
+        false,
+    );
+    let add_args: Vec<&str> = add_argv.iter().skip(1).map(String::as_str).collect();
+    gate(&add_args)?;
+
+    let mut created = add_worktree_configured(
+        repo_path,
+        target_path,
+        new_branch,
+        Some(&source_head_oid),
+        detach,
+        cow_caches,
+        run_hooks,
+        devmap,
+        None,
+        gate,
+    )?;
+
+    let fail_with_teardown =
+        |reason: CommandError, created_path: &str, gate: GitWriteGate<'_>| -> CommandError {
+            match teardown_failed_fork(repo_path, created_path, new_branch, gate) {
+                None => reason,
+                Some(rb) => CommandError::plain(format!(
+                    "{} (fork cleanup also failed: {rb})",
+                    reason.message()
+                )),
+            }
+        };
+
+    if let Some(hook_err) = created.hook_error.take() {
+        return Err(fail_with_teardown(
+            CommandError::plain(format!(
+                "Fork post_create hook failed, so the fork worktree was removed: {hook_err}"
+            )),
+            &created.path,
+            gate,
+        ));
+    }
+
+    if let Some((ref base_branch, ref base_oid)) = base_record {
+        if let Err(err) = write_base_record(Path::new(&created.path), base_branch, base_oid) {
+            return Err(fail_with_teardown(err, &created.path, gate));
+        }
+    }
+
+    if let Some(ref oid) = stash_oid {
+        if let Err(err) = crate::engine::stash::apply_oid_with_gate(&created.path, oid, gate) {
+            return Err(fail_with_teardown(
+                CommandError::plain(format!(
+                    "{} Fork worktree was reset cleanly and removed.",
+                    err
+                )),
+                &created.path,
+                gate,
+            ));
+        }
+    }
+
+    if !untracked.is_empty() {
+        if let Err(err) = restore_untracked_files(Path::new(&created.path), &untracked) {
+            return Err(fail_with_teardown(
+                CommandError::plain(format!("{} Fork worktree was removed.", err.message())),
+                &created.path,
+                gate,
+            ));
+        }
+    }
+
+    created.branch = new_branch.map(str::to_string);
+    created.head_oid = Some(source_head_oid);
+    created.carried_uncommitted = stash_oid.is_some() || !untracked.is_empty();
     Ok(created)
 }
 
@@ -4144,7 +4504,8 @@ pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(),
 /// no record (a lane made before it existed, or by the Worktrees panel). A
 /// record that is there and cannot be read is an error, not "no record": a
 /// check that could not run must not pass as one that did.
-fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, CommandError> {
+#[doc(hidden)]
+pub fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, CommandError> {
     let path = resolve_git_dir(worktree)?.join(BASE_RECORD);
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
@@ -8806,7 +9167,7 @@ some-future-field whatever
     /// A trusted repository on `main` with one commit, and a linked worktree
     /// on `feature-x` holding one more commit. Returns (repo dir, worktree
     /// dir); both are trusted.
-    fn teardown_fixture(hooks: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
+    pub(super) fn teardown_fixture(hooks: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
         teardown_fixture_on(hooks, "main")
     }
 
@@ -8868,7 +9229,7 @@ some-future-field whatever
         Ok(())
     }
 
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
+    pub(super) fn branch_exists(repo: &Path, branch: &str) -> bool {
         git_text(
             repo,
             &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
@@ -16030,5 +16391,160 @@ mod scan_once_adversarial_tests {
         });
         assert_eq!(runs, 2, "the named file changed, the stamp did not");
         assert!(!stale, "a stale shortstat was served");
+    }
+
+    #[test]
+    fn fork_worktree_carries_staged_unstaged_and_untracked_leaves_source_and_stash_untouched_and_records_base(
+    ) {
+        let (dir, src_wt) = super::tests::teardown_fixture(None);
+        let repo = dir.path();
+        let src = src_wt.path();
+
+        let base_oid = git_text(repo, &["rev-parse", "refs/heads/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_base_record(src, "main", &base_oid).unwrap();
+
+        // Pre-existing stash on the stack must stay untouched and unshifted.
+        std::fs::write(repo.join("stash-seed.txt"), "keep on stack\n").unwrap();
+        git_in(repo, &["add", "stash-seed.txt"]);
+        git_in(repo, &["stash", "push", "-m", "preexisting"]);
+        let stash_before = git_text(repo, &["stash", "list"]).unwrap();
+        assert!(!stash_before.trim().is_empty());
+
+        // Track an extra file in source worktree, commit it so source HEAD advances past main.
+        std::fs::write(src.join("extra.txt"), "base extra\n").unwrap();
+        git_in(src, &["add", "extra.txt"]);
+        git_in(src, &["commit", "-m", "source commit"]);
+        let src_head = git_text(src, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Uncommitted changes: staged, unstaged, plus untracked (and one ignored file).
+        std::fs::write(src.join(".gitignore"), "*.ignored\n").unwrap();
+        git_in(src, &["add", ".gitignore"]);
+        std::fs::write(src.join("README.md"), "staged readme edit\n").unwrap();
+        git_in(src, &["add", "README.md"]);
+        std::fs::write(src.join("extra.txt"), "unstaged extra edit\n").unwrap();
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested/untracked.txt"), "fresh untracked note\n").unwrap();
+        std::fs::write(src.join("skip.ignored"), "do not copy ignored\n").unwrap();
+        let src_porcelain = git_text(src, &["status", "--porcelain"]).unwrap();
+
+        let fork_dir = tempfile::tempdir().unwrap();
+        let fork_target = fork_dir.path().join("fork-lane");
+        let mut gated: Vec<Vec<String>> = Vec::new();
+        let created = fork_worktree_extended(
+            repo.to_str().unwrap(),
+            src.to_str().unwrap(),
+            fork_target.to_str().unwrap(),
+            Some("feature-x-fork"),
+            false,
+            false,
+            DevmapMode::None,
+            &mut |args| {
+                gated.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(())
+            },
+        )
+        .expect("clean fork succeeds");
+        crate::test_support::trust_repo(Path::new(&created.path));
+
+        assert_eq!(created.branch.as_deref(), Some("feature-x-fork"));
+        assert_eq!(created.head_oid.as_deref(), Some(src_head.as_str()));
+        assert!(created.carried_uncommitted);
+        assert!(
+            gated
+                .iter()
+                .any(|a| a.first().map(String::as_str) == Some("stash")),
+            "stash create/apply must pass gate: {gated:?}"
+        );
+
+        let fork_path = Path::new(&created.path);
+        assert_eq!(
+            git_text(fork_path, &["rev-parse", "HEAD"]).unwrap().trim(),
+            src_head,
+            "fork HEAD must equal source lane HEAD"
+        );
+        assert_eq!(
+            git_text(fork_path, &["status", "--porcelain"]).unwrap(),
+            src_porcelain,
+            "fork porcelain must match source lane porcelain"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_path.join("README.md")).unwrap(),
+            "staged readme edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_path.join("extra.txt")).unwrap(),
+            "unstaged extra edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_path.join("nested/untracked.txt")).unwrap(),
+            "fresh untracked note\n"
+        );
+        assert!(
+            !fork_path.join("skip.ignored").exists(),
+            "gitignored files must not be copied as untracked"
+        );
+        assert_eq!(
+            read_base_record(fork_path).unwrap(),
+            Some(("main".to_string(), base_oid)),
+            "CARD 22 base record inherited so CARD 23 integration into main passes"
+        );
+
+        // Source lane working tree and repo stash stack stay completely untouched.
+        assert_eq!(
+            git_text(src, &["status", "--porcelain"]).unwrap(),
+            src_porcelain
+        );
+        assert_eq!(git_text(repo, &["stash", "list"]).unwrap(), stash_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_worktree_stash_conflict_reports_error_and_removes_fork_worktree_and_branch() {
+        let (dir, src_wt) = super::tests::teardown_fixture(Some(
+            r#"{"worktree":{"post_create":["printf 'hook conflict\\n' > README.md && git add README.md && git commit -m hook"]}}"#,
+        ));
+        let repo = dir.path();
+        let src = src_wt.path();
+
+        std::fs::write(src.join("README.md"), "source conflicting edit\n").unwrap();
+        let src_porcelain = git_text(src, &["status", "--porcelain"]).unwrap();
+
+        let fork_dir = tempfile::tempdir().unwrap();
+        let fork_target = fork_dir.path().join("fork-conflict");
+        let err = fork_worktree_extended(
+            repo.to_str().unwrap(),
+            src.to_str().unwrap(),
+            fork_target.to_str().unwrap(),
+            Some("feature-x-conflict"),
+            false,
+            true,
+            DevmapMode::None,
+            &mut |_| Ok(()),
+        )
+        .expect_err("conflicting fork must fail closed");
+
+        let msg = err.message();
+        assert!(
+            msg.contains("conflicted") || msg.contains("Applying uncommitted changes"),
+            "unexpected conflict error: {msg}"
+        );
+        assert!(
+            !fork_target.exists(),
+            "conflicted fork worktree directory must be removed per stated rule"
+        );
+        assert!(
+            !super::tests::branch_exists(repo, "feature-x-conflict"),
+            "conflicted fork branch must be deleted per stated rule"
+        );
+        assert_eq!(
+            git_text(src, &["status", "--porcelain"]).unwrap(),
+            src_porcelain
+        );
     }
 }

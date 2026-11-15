@@ -19,8 +19,12 @@ describe("terminal dock trigger exemption", () => {
   const pill = read("TerminalPill.svelte");
 
   it("exempts the selectors the pill renders", () => {
-    const match = dock.match(/floatingPanelDismiss\("\[data-terminal-dock\]", "([^"]+)"\)/);
+    // One constant serves both the outside-click dismiss and the double-click
+    // hide, so the pill cannot be exempt from one and not the other.
+    const match = dock.match(/const DOCK_TRIGGER = "([^"]+)";/);
     expect(match).not.toBeNull();
+    expect(dock).toContain('floatingPanelDismiss("[data-terminal-dock]", DOCK_TRIGGER)');
+    expect(dock).toContain("trigger: DOCK_TRIGGER");
     const selectors = (match?.[1] ?? "").split(",").map((s) => s.trim());
     expect(selectors.length).toBeGreaterThan(0);
     for (const selector of selectors) {

@@ -258,8 +258,21 @@ export function parseQuickAddDue(value: unknown, now = Date.now()): number | nul
   const day = parseDueWords(text.slice(0, split), now);
   if (day === null) return null;
   const dated = new Date(day * 1000);
+  const y = dated.getFullYear();
+  const m = dated.getMonth();
+  const d = dated.getDate();
   dated.setHours(clock.hour, clock.minute, 0, 0);
-  return Number.isFinite(dated.getTime()) ? seconds(dated) : null;
+  if (
+    !Number.isFinite(dated.getTime()) ||
+    dated.getFullYear() !== y ||
+    dated.getMonth() !== m ||
+    dated.getDate() !== d ||
+    dated.getHours() !== clock.hour ||
+    dated.getMinutes() !== clock.minute
+  ) {
+    return null;
+  }
+  return seconds(dated);
 }
 
 /** The date-word grammar itself, over text this module has already normalized. */
@@ -300,8 +313,16 @@ function parseDueWords(text: string, now: number): number | null {
     if (m < 1 || m > 12 || d < 1 || d > 31 || h > 23 || min > 59) return null;
     const date = new Date(y, m - 1, d, h, min, 0, 0);
     if (!Number.isFinite(date.getTime())) return null;
-    // Reject 2026-02-31: the Date constructor would roll it into March.
-    if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+    // Reject 2026-02-31 (rolled into March) and DST spring-forward gap clocks (02:30 → 03:30).
+    if (
+      date.getFullYear() !== y ||
+      date.getMonth() !== m - 1 ||
+      date.getDate() !== d ||
+      date.getHours() !== h ||
+      date.getMinutes() !== min
+    ) {
+      return null;
+    }
     return seconds(date);
   }
   return null;

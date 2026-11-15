@@ -1,7 +1,7 @@
 import { get, writable } from "svelte/store";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { MAX_LIVE_RUNS } from "../workbench/vocabulary";
-import { isSessionId, type LauncherKind, type ResumeLaunch } from "./tabs";
+import { isResumableSessionRef, type LauncherKind, type ResumeLaunch } from "./tabs";
 
 /**
  * Prepared task attempts waiting for their repository's terminal dock.
@@ -100,11 +100,16 @@ export const taskTerminalRequests = { subscribe: pending.subscribe };
 
 function requestKey(request: TaskTerminalRequest): string {
   if (request.attach) return `attach:${request.attach.sessionId}`;
-  return request.resume ? `resume:${request.resume.sessionId.toLowerCase()}` : `run:${request.runId}`;
+  if (request.resume) {
+    return request.resume.ledgerRowId
+      ? `resume-row:${request.resume.ledgerRowId}`
+      : `resume:${request.resume.sessionId.toLowerCase()}`;
+  }
+  return `run:${request.runId}`;
 }
 
 export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
-  if (request.resume && ((request.provider !== "claude" && request.provider !== "agy") || !isSessionId(request.resume.sessionId))) {
+  if (request.resume && ((request.provider !== "claude" && request.provider !== "agy") || !isResumableSessionRef(request.resume.sessionId, request.provider))) {
     throw new Error("Only a Claude Code or Antigravity conversation with a valid session id can be resumed.");
   }
   if (request.attach && (request.resume || !/^[\w-]{1,128}$/.test(request.attach.sessionId))) {

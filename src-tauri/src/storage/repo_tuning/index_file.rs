@@ -67,7 +67,13 @@ fn inode_of(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::ino(meta)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn inode_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn inode_of(_meta: &std::fs::Metadata) -> u64 {
     0
 }

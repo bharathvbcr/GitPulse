@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["322 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["328 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (322 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (328 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -52,7 +52,7 @@ flowchart TB
             Ledger["Event Ledger & Provenance<br/><code>src-tauri/src/ledger/</code>"]
             MCP["MCP Read Surface<br/><code>src-tauri/src/mcp/</code>"]
             HarnessBridge["Harness Policy Client<br/><code>src-tauri/src/harness/</code>"]
-            WorkbenchBridge["Workbench Command Bridge<br/><code>src-tauri/src/commands/workbench.rs</code>"]
+            WorkbenchBridge["Workbench Command Bridge<br/><code>src-tauri/src/workbench.rs</code>"]
             DevmapSubsystem["DevMap Gate & Query Subsystem<br/><code>src-tauri/src/devmap/</code>"]
             VendoredDevCouncil["Vendored DevCouncil Readers<br/><code>src-tauri/vendored/devmap-*</code>"]
         end
@@ -205,7 +205,7 @@ On the backend, a DevMap live refresh never holds its IPC command on the `devmap
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +322 Registered Handlers
+        +328 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -352,7 +352,7 @@ for contracts, regression evidence and platform verification limits.
 - **`hooks/`**: Agent hook bridge, signal guard, and notification intake (`gitpulse-hook`). The signal guard models Linux process inspection tools (`procps pkill`/`pgrep`, `psmisc killall`, `sysvinit pidof`) natively on Linux, matching names on `comm` or `argv[0]` basename, reading UIDs from `/proc/<pid>/status` with `kill(2)` permission rules, and escalating unmodelled options to confirmation prompts. The notification client records timed drop records in `<socket>.drops` upon reply deadline expiration, rotated to `.prev` at 32 KiB, tightened to `0600` best-effort, and expired after 7 days using `.prev`'s `ctime`.
 - **`agent_mailbox`**: The per-session filesystem mailbox behind **Send to agent** (`<config dir>/agent-mailbox/<claude session uuid>/`): atomic temp+rename publish, one-use claim by atomic rename, bounded size/count/waiters, TTL cleanup, owner and mode and `O_NOFOLLOW` checks. The `gitpulse-hook deliver` subcommand (a second `Stop` entry with `asyncRewake`) waits on it for a GitPulse-launched session and wakes the idle agent with one claimed message; `workbench/send_to_agent.rs` decides the route (mailbox, resume, managed follow-up through Manvi's `work.runs.managed.continue`, or unavailable) and sends only on a confirm of the route that was previewed. See [SECURITY.md](SECURITY.md).
 - **`procguard/`**: Child process supervision and Darwin QoS scheduling. On macOS, background-class processes enter Darwin's background band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`, `ft-b597add5`), ensuring all subsequent forks and execs permanently inherit background scheduling. Spawns fail explicitly with tagged errnos if the band cannot be entered.
-- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 512 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. Under the `gitpulse-ptyd` host backend, session existence checks (`Host::knows`) evaluate directly from the client-side vouched snapshot, eliminating IPC round-trips to the host daemon. Authority survives spawns, quits, and wrapped exit records mid-adoption, while newly opened connections revoke previous authority. Session exits are recorded strictly once (`record_exit`), and adoption skips already-reported exits while reading `vouched.late` after proxy scans. Input write timeouts measure idle stalls rather than cumulative totals. Expanding the terminal dock hides and inerts the underlying view to prevent focus leaks. The frontend renderer caches up to 2 hidden WebGL contexts for 5 seconds to eliminate tab-switching lag, recovers from WebGL context loss under a 3-strike budget, wraps output chunks to guarantee termination outside open DEC 2026 synchronized blocks, supports Unicode 11 double-cell glyphs, and defers fitting on hidden panes (`fitSchedule.ts`). See [Terminal](TERMINAL.md), [Terminal Host](TERMINAL_HOST.md), and the [archived terminal audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/TERMINAL_AUDIT.md).
+- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 512 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. Under the `gitpulse-ptyd` host backend, session existence checks (`Host::knows`) evaluate directly from the client-side vouched snapshot, eliminating IPC round-trips to the host daemon. Authority survives spawns, quits, and wrapped exit records mid-adoption, while newly opened connections revoke previous authority. Session exits are recorded strictly once (`record_exit`), and adoption skips already-reported exits while reading `vouched.late` after proxy scans. Input write timeouts measure idle stalls rather than cumulative totals. Expanding the terminal dock hides and inerts the underlying view to prevent focus leaks. The frontend renderer holds hidden WebGL contexts for up to 5 minutes (`GPU_HIDE_GRACE_MS`, counting toward the 8-context `MAX_VISIBLE_SESSIONS` cap) to eliminate tab-switching lag, recovers from WebGL context loss under a 3-strike budget within 10 minutes, wraps output chunks to guarantee termination outside open DEC 2026 synchronized blocks, supports Unicode 11 double-cell glyphs, and defers fitting on hidden panes (`fitSchedule.ts`). See [Terminal](TERMINAL.md), [Terminal Host](TERMINAL_HOST.md), and the [archived terminal audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/TERMINAL_AUDIT.md).
 - **`workbench/`**: Task workbench bridge and verification runner. The background verification driver (`workbench-verification`) batches claimed card status queries into a single `latest_many` walk, queries `LIMIT 1` for `work.verify.task` rows, and reuses decision records for parked card notes, reducing background CPU overhead. A second driver, `ci_watch` (`workbench-ci-watch`), carries CI results on an agent's `gitpulse/<task>-<id>` branch to its task: it polls `github::load_workflow_runs_report` only for repositories with a live or just-finished attempt branch, in a bounded budget and only for trusted repositories, and reports each finish to the store with the host-only `signals.record`. What counts as a finish is decided once, in `github/outcome.rs` (`RunOutcome`, the transition detector and one baseline per repository), which the Remote panel's "went red" banner reads too (from its own per-repository cursor over a bounded log of red finishes, so the watcher crossing in-flight to failed first never costs the panel its banner, and the panel's first look announces nothing); a finished run is attributed to an attempt only by the attempt branch GitHub reports it ran on, never by the commit the attempt started from, which is the base branch's own CI; `action_required` is `needs_person`, attention-worthy but never a failure. The notice reaches the OS through the existing notification coordinator; `ci_watch` has no delivery code.
 - **`grants/`**: Policy grant model, scoped overrides, and override lifecycle for elevated paths.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history. Transcripts are read through a `TranscriptSource` per agent: Claude Code (`~/.claude/projects`, `GITPULSE_TRANSCRIPT_ROOT`, rows with `actor_id` `claude-code`) and Codex (`$CODEX_HOME/sessions`, default `~/.codex/sessions`, `GITPULSE_CODEX_TRANSCRIPT_ROOT` overriding, `actor_id` `codex`; structured tool calls, plus the straight-line literal calls of code-mode `exec` programs read with tree-sitter-javascript under size, time and node bounds; every other code-mode call is counted in `skipped_lines`). Each source is walked under its own depth and file caps; `walk_complete` is true only when every walked source was whole, and a transcript's saved offset is forgotten only after such a walk. A Codex line this build cannot read is counted in `skipped_lines`, never guessed at. Other agents' transcripts are not read.
@@ -371,6 +371,40 @@ A worktree's task binding is a ledger event (`worktree.bind` / `worktree.unbind`
 - **Sibling ledgers: the initial pass is grandfathered (B+).** Older builds wrote a binding into the worktree's own ledger. A sibling enumerated before the anchor's initial consolidation pass completed is legacy: the rows it held then keep setting bindings, so an upgrade never turns a bound worktree unbound. That is decided once per sibling and stored in its `ledger_family_imports` row as `legacy@<max id>|<path>`, so a pass that is cut short and resumed keeps legacy authority for the rows up to that bound however many runs it takes; rows past the bound, and every row of a sibling first seen after the pass, are history only. Rows from different legacy siblings are ranked by `(ts_utc, ulid)`, the one cross-database key (row ids mean nothing across databases); a far-future date ranks below every believable one. The pass itself is one `family-initial-pass` row in the same table (no schema change): cursor 0 while unfinished, 1 once it ended. No row means no pass has finished, whatever source rows an older build left, so an upgrade from a build that kept no marker treats every sibling still present as legacy. A fresh family closes its window when a bind or unbind creates the ledger (nothing legacy can exist), and a read-only caller never writes the marker. Everything after the pass is imported as `worktree.bind.imported` / `worktree.unbind.imported`: visible in history, matched by no binding read, however it is dated. File timestamps play no part: the same user can rewrite them. Residuals, not closed: a ledger created by a plain append (hook, ingest) rather than a bind has no marker until the first consolidation, and a sibling ledger that appears in that gap counts as legacy; deleting the marker row, or resetting it to 0, reopens the initial pass, which takes a write to the anchor itself.
 - **Demotions are never silent.** An import that demotes rows logs how many and from which sibling. The running count is its own field, `history_only_bindings`, on `LedgerStatus` (the app status and every MCP surface: the status, insights and ledger tools and resources, and their output schema), so it coexists with any `error_code`. The status also carries it as `error_code` `binding_rows_history_only`, with the count in the message, when the slot is free or holds only the legacy-unconsolidated caveat; a real failure keeps the slot there. Rebind the worktree in GitPulse if one was meant.
 - **What this does not claim.** The ledger is not tamper-evident against a same-user writer of the anchor itself: it is a file inside the checkout and carries no signature or hash chain, so whoever can write the anchor ledger directly can write any row, including a bind. This narrows what a sibling worktree can contribute; it does not authenticate the anchor.
+
+---
+
+### Agent Git operation log security boundary
+
+Every allowed agent Git write triggers a pre-operation snapshot stored under
+`refs/gitpulse/ops/<n>` (`src-tauri/src/engine/git_writer.rs`), exposing a
+new ref-write surface whose authority and hygiene rules are bounded as follows:
+
+- **App-only ref authority (`hooks/` stays decide-only).** Only the GitPulse
+  desktop app process inside `GitWriter::record_op_snapshot` (serialized under
+  `repo_mutation_lock`) writes or prunes `refs/gitpulse/ops/*`.
+  `src-tauri/src/hooks/` never runs `update-ref`, `commit-tree`, or `GitWriter`
+  directly; it only sends `Request::RecordGitOp` over the UID-authenticated
+  single-instance Unix socket mailbox (`src-tauri/src/desktop/instance.rs`).
+- **Fail-visible degradation, never silent gaps.** When the app mailbox is
+  unreachable or snapshot creation fails, `hooks/` appends an `"unsnapshotted"`
+  row via `ledger::record_unsnapshotted_git_op` and attaches a visible
+  `HookOutput` warning rather than failing open silently.
+- **Secret redaction before object creation.** Command text embedded in
+  snapshot commit metadata passes through `crate::ledger::redact::text` prior to
+  `git commit-tree` so tokens or credentials in shell text do not enter the
+  object database.
+- **Guarded CAS restore and dirty-worktree gate.** `cmd_undo_op_snapshot` runs
+  under `harness::guard`, refuses parked multi-step repository states
+  (`repo_op::detect`), refuses dirty working trees unless `confirm_dirty` is
+  explicitly checked after UI review in `ReflogViewer.svelte`, restores recorded
+  refs atomically with `git update-ref --stdin -z` against explicit expected
+  old OIDs (refusing and naming any ref that moved since review), and logs a
+  `git.op.undo` row carrying `before_ref` and `after_ref`.
+- **No repository config writes.** `git commit-tree` uses inline `-c` author,
+  email, and `commit.gpgsign=false` flags only; retention pruning
+  (`MAX_OPS = 50` oldest eviction and seven-day expiry) deletes refs solely via
+  `git update-ref -d` without writing `.git/config`.
 
 ---
 
@@ -448,8 +482,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 322 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 2110 data fields, over 299 structs, in 118 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 328 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 2169 data fields, over 311 structs, in 121 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 

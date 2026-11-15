@@ -63,18 +63,32 @@ export function postAvailability(
   return { allowed: true, reason: "" };
 }
 
+const POST_CONFIRM_MESSAGE =
+  "This posts the task's latest verdict to GitHub as the devcouncil/verify commit status on the verified commit, through your own gh login. Anyone who can see the repository's commit statuses will see it. A verdict that is out of date or couldn't be established is posted as an error, never as a pass.";
+
 /** The confirmation a person answers before anything is sent to GitHub. */
-export const POST_CONFIRM = Object.freeze({
-  title: "Post verify result?",
-  message:
-    "This posts the task's latest verdict to GitHub as the devcouncil/verify commit status on the verified commit, through your own gh login. Anyone who can see the repository's commit statuses will see it. A verdict that is out of date or couldn't be established is posted as an error, never as a pass.",
-  confirmLabel: "Post to GitHub",
-  cancelLabel: "Cancel",
-});
+export function postConfirm(comment = false): {
+  readonly title: string;
+  readonly message: string;
+  readonly confirmLabel: string;
+  readonly cancelLabel: string;
+} {
+  return {
+    title: "Post verify result?",
+    message: comment
+      ? `${POST_CONFIRM_MESSAGE} It also comments on open pull requests containing that commit with the criterion counts.`
+      : POST_CONFIRM_MESSAGE,
+    confirmLabel: "Post to GitHub",
+    cancelLabel: "Cancel",
+  };
+}
+
+export const POST_CONFIRM = Object.freeze(postConfirm(false));
 
 /** One line saying what a post did, for the sheet. */
 export function postedSummary(posted: PostedVerifyStatus): string {
   const sha = posted.sha.slice(0, 7);
   const comments = posted.commented.length > 0 ? ` and commented on #${posted.commented.join(", #")}` : "";
-  return posted.status_posted ? `Posted ${posted.state} for ${sha}${comments}.` : `Nothing was posted for ${sha}.`;
+  const note = posted.comment_note ? ` (${posted.comment_note})` : "";
+  return posted.status_posted ? `Posted ${posted.state} for ${sha}${comments}${note}.` : `Nothing was posted for ${sha}.`;
 }

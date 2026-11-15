@@ -507,3 +507,68 @@ describe("isQuickAddMode", () => {
     for (const value of ["", "ai", null, undefined, 0, {}, "constructor"]) expect(isQuickAddMode(value)).toBe(false);
   });
 });
+
+describe("DST gap and overlap handling in quick add", () => {
+  const activeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  it("never shifts an accepted YYYY-MM-DD HH:MM onto a different clock across DST dates", () => {
+    for (const [year, month, day] of [
+      [2026, 3, 8],
+      [2026, 4, 5],
+      [2026, 9, 27],
+      [2026, 11, 1],
+    ]) {
+      const mm = String(month).padStart(2, "0");
+      const dd = String(day).padStart(2, "0");
+      for (let hour = 0; hour < 24; hour += 1) {
+        const hh = String(hour).padStart(2, "0");
+        const sec = parseQuickAddDue(`${year}-${mm}-${dd}T${hh}:30`, NOW);
+        if (sec === null) continue;
+        const parsed = new Date(sec * 1000);
+        expect({
+          y: parsed.getFullYear(),
+          m: parsed.getMonth() + 1,
+          d: parsed.getDate(),
+          h: parsed.getHours(),
+          min: parsed.getMinutes(),
+        }).toEqual({ y: year, m: month, d: day, h: hour, min: 30 });
+      }
+    }
+  });
+
+  it.skipIf(activeZone !== "America/New_York")(
+    "rejects spring-forward gap times and accepts fall-back overlap times in America/New_York",
+    () => {
+      expect(parseQuickAddDue("2026-03-08T02:30", NOW)).toBeNull();
+      expect(parseQuickAddDue("2026-03-08 02:30", NOW)).toBeNull();
+      expect(parseQuickAddDue("2026-03-07 02:30", NOW)).not.toBeNull();
+
+      // Relative phrase + gap clock must also reject via bad_due rather than shifting to 03:30.
+      const beforeGapMorning = new Date(2026, 2, 7, 10, 0, 0, 0).getTime();
+      expect(parseQuickAddDue("tomorrow 02:30", beforeGapMorning)).toBeNull();
+
+      const quick = parseQuickAdd("Ship fix due:2026-03-08t02:30", { repositories, now: NOW });
+      expect(quick.dueAt).toBeNull();
+      expect(quick.warnings.map((w) => w.code)).toContain("bad_due");
+
+      const overlap = parseQuickAddDue("2026-11-01T01:30", NOW);
+      expect(overlap).not.toBeNull();
+      const overlapDate = new Date(overlap! * 1000);
+      expect(overlapDate.getHours()).toBe(1);
+      expect(overlapDate.getMinutes()).toBe(30);
+    },
+  );
+
+  it.skipIf(activeZone !== "Pacific/Auckland")(
+    "rejects spring-forward gap times and accepts fall-back overlap times in Pacific/Auckland",
+    () => {
+      expect(parseQuickAddDue("2026-09-27T02:30", NOW)).toBeNull();
+      expect(parseQuickAddDue("2026-09-27 02:30", NOW)).toBeNull();
+      const overlap = parseQuickAddDue("2026-04-05T02:30", NOW);
+      expect(overlap).not.toBeNull();
+      const overlapDate = new Date(overlap! * 1000);
+      expect(overlapDate.getHours()).toBe(2);
+      expect(overlapDate.getMinutes()).toBe(30);
+    },
+  );
+});

@@ -931,6 +931,20 @@
                       onchange={(next) => interfaceStore.setShowGraphAvatars(next)}
                     />
                   </div>
+                  <div
+                    data-setting="github-avatars"
+                    hidden={!shown("github-avatars")}
+                    class="pt-1"
+                  >
+                    <div class="gp-separator" aria-hidden="true"></div>
+                    <SettingToggle
+                      label="Show GitHub profile pictures"
+                      description="On by default. When a repository has a GitHub remote, GitPulse asks GitHub through the GitHub CLI which account each commit email belongs to, and loads profile pictures from avatars.githubusercontent.com. Commits made with a GitHub noreply address load their picture directly from there. Off shows initials only and makes no requests."
+                      ariaLabel="Show GitHub profile pictures for commit authors"
+                      checked={$interfaceStore.showGithubAvatars}
+                      onchange={(next) => interfaceStore.setShowGithubAvatars(next)}
+                    />
+                  </div>
                 </div>
               {:else if entry.id === "diff"}
                 <div class="space-y-4">
@@ -1215,7 +1229,7 @@
                 <div class="mt-3 pt-3" data-setting="bell-asks" hidden={!shown("bell-asks")}>
                   <SettingToggle
                     label="Count a terminal bell as waiting for you"
-                    description="On by default: an agent without hooks can only ask for you by ringing the bell, so turning this off stops those asks from counting on the board, the task pane, the Agents view and the menu-bar count. The Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
+                    description="Off by default: turn this on so a terminal bell from an agent without hooks (Codex, Cursor, or a shell program) counts as waiting on the board, the task pane, the Agents view and the menu-bar count. While off, the Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
                     ariaLabel="Count a terminal bell as waiting for you"
                     checked={$interfaceStore.bellAsksForReader}
                     onchange={(next) => interfaceStore.setBellAsksForReader(next)}

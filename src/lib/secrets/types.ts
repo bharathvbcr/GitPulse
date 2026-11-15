@@ -46,6 +46,12 @@ export interface SecretsReport {
   /** The scan output named a version that was refused; see `kingfisher_version`. */
   kingfisher_version_rejected: boolean;
   nested_repos_scanned: boolean;
+  /**
+   * Repo-relative directories, each ending in `/`, left out of the scan:
+   * wholly ignored build output, dependency and scratch trees, and linked
+   * worktrees of this repository nested inside it.
+   */
+  excluded_paths: string[];
   completeness: ScanCompleteness;
   findings: SecretFinding[];
   findings_total: number;
@@ -56,6 +62,9 @@ export interface SecretsReport {
   scanned_at_ms: number;
   duration_ms: number;
 }
+
+/** `report::MAX_EXCLUSIONS` in the backend. */
+const MAX_EXCLUDED_PATHS = 256;
 
 const LOCATIONS: ReadonlySet<string> = new Set<SecretLocation>([
   "git_metadata",
@@ -150,6 +159,12 @@ export function parseSecretsReport(value: unknown): SecretsReport {
       typeof raw.kingfisher_version === "string" ? raw.kingfisher_version : null,
     kingfisher_version_rejected: raw.kingfisher_version_rejected === true,
     nested_repos_scanned: raw.nested_repos_scanned !== false,
+    excluded_paths: Array.isArray(raw.excluded_paths)
+      ? raw.excluded_paths
+          .filter((p): p is string => typeof p === "string" && p.length > 0)
+          .slice(0, MAX_EXCLUDED_PATHS)
+          .map((p) => p.slice(0, 4_096))
+      : [],
     completeness,
     findings,
     findings_total: Math.max(count(raw.findings_total), findings.length),

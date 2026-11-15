@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 118 contracts over
- * 299 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 121 contracts over
+ * 311 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -127,6 +127,9 @@ export const CONTRACTS = Object.freeze([
   // Health list both read it, and `sender` is what keeps "who killed them"
   // from becoming "nobody did" when a field is renamed.
   { label: "terminal-incident", rustPath: rust("terminal", "incident.rs"), tsPath: ts("terminal", "incident.ts"), structs: ["TerminalIncidentPayload", "Sender"] },
+  // Durable per-tab session ledger (`terminal-session-ledger` event and
+  // `cmd_terminal_session_ledger*` / typed `cmd_terminal_spawn` resume arg).
+  { label: "terminal-session-ledger", rustPath: rust("terminal", "session_ledger.rs"), tsPath: ts("terminal", "sessionLedger.ts"), structs: ["TerminalResume", "SessionLedgerOffer", "SessionLedgerView", "SessionReopenCheck"] },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
   // Apple Intelligence crosses IPC as four structs, and the error is one of
   // them on purpose: the frontend branches on `code`, so a rename there would
@@ -143,6 +146,7 @@ export const CONTRACTS = Object.freeze([
   { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskEvidence", "TaskGap", "DevCouncilRun", "TaskView"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupCandidate", "BranchCleanupPlan", "CommitReviewReport", "TagCleanupPlan", "TagCleanupEntry"] },
   { label: "release", rustPath: rust("commands", "refs.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  { label: "op-log", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("ops", "model.ts"), structs: ["OpRefEntry", "OpSnapshotSummary", "OpSnapshotList", "OpUndoExpectation", "OpUndoPlan", "OpUndoOutcome"] },
   // The Diff view's history rail: a comparison's file list (whose `truncated`
   // is what keeps a cut list from passing as whole) and a commit's git note
   // (whose `note: null` is a measured "no note", never a failed read).
@@ -223,6 +227,7 @@ export const CONTRACTS = Object.freeze([
   // `exit_code: null` is "no exit observed", so a rename in either would turn
   // a classified failure into an unlabelled one.
   { label: "firebase-diagnose", rustPath: rust("firebase", "diagnose.rs"), tsPath: ts("firebase", "types.ts"), structs: ["FirebaseFailure", "FirebaseAttempt", "FirebaseAccount"] },
+  { label: "author-avatars", rustPath: rust("github", "avatars.rs"), tsPath: ts("authors", "githubAvatars.ts"), structs: ["AuthorAvatarReport", "AuthorAvatar"] },
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "code-scanning", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["CodeScanningReport", "CodeScanningAlertInfo"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },

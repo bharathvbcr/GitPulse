@@ -122,7 +122,7 @@ export const DEFAULT_LIVE_RUNS = 8;
  * not a product limit. It also sizes the queue of terminals waiting to open:
  * there can never be more live attempts than this.
  *
- * `run-capacity-contract.test.ts` reads both from the vendored
+ * `documented-counts-contract.test.ts` reads both from the vendored
  * `dc-store/src/workbench/runs.rs` to keep them equal. One checkout holds
  * one attempt.
  */

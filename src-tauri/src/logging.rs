@@ -143,6 +143,9 @@ struct SinkState {
     /// What the last failure was, so lines dropped while backing off still
     /// report why.
     cause: String,
+    /// The session's start marker has not been written yet and goes in ahead
+    /// of the first line that is ([`FileSink::open_marked_on_first_line`]).
+    marker_owed: bool,
     /// Next writes that fail as if the disk refused them.
     #[cfg(test)]
     inject_write_errors: u32,
@@ -237,7 +240,22 @@ impl FileSink {
     /// above the marker are the previous session's, which is exactly the
     /// context wanted after a crash and a relaunch.
     fn open_in(dir: &Path, stem: &str) -> Self {
-        let sink = Self {
+        let sink = Self::unopened(dir, stem, false);
+        sink.write_line(&session_marker(stem, "start"));
+        sink
+    }
+
+    /// [`Self::open_in`] for a process that usually has nothing to say: the
+    /// start marker is written ahead of its first line, so a run that logs
+    /// nothing leaves the file as it found it. launchd wakes the headless
+    /// cleanup every minute, and an eager marker made each idle wake a line in
+    /// the app's own log.
+    fn open_marked_on_first_line(dir: &Path, stem: &str) -> Self {
+        Self::unopened(dir, stem, true)
+    }
+
+    fn unopened(dir: &Path, stem: &str, marker_owed: bool) -> Self {
+        Self {
             current: dir.join(format!("{stem}.log")),
             previous: dir.join(format!("{stem}.log.1")),
             state: Mutex::new(SinkState {
@@ -249,13 +267,12 @@ impl FileSink {
                 failures: 0,
                 retry_at: None,
                 cause: String::new(),
+                marker_owed,
                 #[cfg(test)]
                 inject_write_errors: 0,
             }),
             release_error: Mutex::new(None),
-        };
-        sink.write_line(&session_marker(stem, "start"));
-        sink
+        }
     }
 
     fn open_append(dir: &Path, path: &Path) -> Result<(File, u64), String> {
@@ -332,6 +349,9 @@ impl FileSink {
                 state.note_failure(error);
                 return;
             }
+        }
+        if std::mem::take(&mut state.marker_owed) {
+            Self::write_locked(&mut state, &session_marker(&stem_of(&self.current), "start"));
         }
         let projected = state
             .bytes
@@ -777,8 +797,15 @@ fn sink_target(stem: Option<&str>, explicit: Option<&Path>) -> Option<(PathBuf, 
 fn durable_sink() -> Option<FileSink> {
     let explicit = std::env::var_os(LOG_DIR_ENV).filter(|dir| !dir.is_empty());
     let (dir, stem) = sink_target(exe_stem().as_deref(), explicit.as_ref().map(Path::new))?;
-    Some(FileSink::open_in(&dir, &stem))
+    if MARK_ON_FIRST_LINE.load(Ordering::Acquire) {
+        Some(FileSink::open_marked_on_first_line(&dir, &stem))
+    } else {
+        Some(FileSink::open_in(&dir, &stem))
+    }
 }
+
+/// Set by [`init_for_headless_tick`] before the logger is built.
+static MARK_ON_FIRST_LINE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub(crate) struct RingLogger {
@@ -954,6 +981,15 @@ pub fn init() {
     {
         LOGGER.get_or_init(build_logger);
     }
+}
+
+/// [`init`] for a process launchd wakes on a timer that usually finds nothing
+/// to do (`gitpulse --cleaner-due`, every 60 s). It shares the app's durable
+/// log, so a failure lands in the tail a diagnostics export reads, but a wake
+/// that logs nothing writes nothing: not even the session marker.
+pub fn init_for_headless_tick() {
+    MARK_ON_FIRST_LINE.store(true, Ordering::Release);
+    init();
 }
 
 pub fn diagnostic_tail(max_lines: usize) -> Vec<String> {
@@ -1607,6 +1643,48 @@ mod tests {
     }
 
     #[test]
+    fn a_headless_tick_with_nothing_to_say_leaves_the_app_log_untouched() {
+        // launchd wakes `gitpulse --cleaner-due` every 60 s. A tick with no
+        // cleanup due logged nothing of its own, yet each one appended a start
+        // marker to gitpulse.log: 13 of the 200 lines a diagnostics export
+        // carried were these markers, crowding out the app's own record.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("gitpulse.log");
+        std::fs::write(&path, "the app's own line\n").expect("seed");
+        {
+            let mut logger = RingLogger::new(LevelFilter::Trace);
+            logger.sink = Some(Arc::new(FileSink::open_marked_on_first_line(
+                dir.path(),
+                "gitpulse",
+            )));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "the app's own line\n",
+            "a silent tick must not mark a session it never logged in"
+        );
+    }
+
+    #[test]
+    fn a_headless_tick_that_logs_is_still_marked_before_its_first_line() {
+        // A tick that fails must still land in the tail the diagnostics export
+        // reads, delimited like any other process's lines.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logger = RingLogger::new(LevelFilter::Trace);
+        logger.sink = Some(Arc::new(FileSink::open_marked_on_first_line(
+            dir.path(),
+            "gitpulse",
+        )));
+        logger.write_entry(Level::Error, "cleaner", "Background cleanup failed: x");
+        logger.write_entry(Level::Info, "cleaner", "second line");
+        let lines = file_lines(&dir.path().join("gitpulse.log"));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("gitpulse start pid"), "{lines:?}");
+        assert!(lines[1].contains("Background cleanup failed: x"), "{lines:?}");
+        assert!(lines[2].contains("second line"), "{lines:?}");
+    }
+
+    #[test]
     fn durable_log_outlives_the_logger_that_wrote_it() {
         let dir = tempfile::tempdir().expect("temp dir");
         {
@@ -2052,6 +2130,7 @@ mod tests {
             failures: u32::MAX - 1,
             retry_at: None,
             cause: String::new(),
+            marker_owed: false,
             inject_write_errors: 0,
         };
         state.note_failure("EIO".into());
@@ -2070,6 +2149,7 @@ mod tests {
             failures: 0,
             retry_at: None,
             cause: String::new(),
+            marker_owed: false,
             inject_write_errors: 0,
         };
         let mut waits = Vec::new();

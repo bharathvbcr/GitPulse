@@ -596,7 +596,7 @@ fn merge_claude_settings(flags: &mut Vec<String>, entries: ClaudeSettings) -> Re
 /// permission mode. One value so a new setting is one field here, not a new
 /// parameter threaded through every launch path.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct LaunchOptions<'a> {
+pub struct LaunchOptions<'a> {
     /// Whether to add [`notify_flags`].
     pub notify: bool,
     /// The user's `--setting-sources` value, if they narrowed it.
@@ -727,6 +727,341 @@ pub(crate) fn is_canonical_uuid(id: &str) -> bool {
             8 | 13 | 18 | 23 => *byte == b'-',
             _ => byte.is_ascii_hexdigit(),
         })
+}
+
+/// Sentinel session id recorded when an Antigravity session exited on a
+/// signal or app quit before reporting a conversation UUID, resolved by
+/// [`resume`] into `agy --continue --add-dir <checkout>`.
+pub const AGY_CONTINUE_SENTINEL: &str = "__agy_continue__";
+
+/// The provider-specific flag pair that assigns a *fresh* conversation id
+/// ahead of launch (`claude --session-id <uuid>`).
+///
+/// Providers whose CLI assigns conversation ids lazily (`agy`, `codex`, `grok`)
+/// return an empty `Vec`. Malformed ids for `claude` or unknown providers are
+/// refused loudly rather than silently dropped.
+pub fn session_id_args(provider: &str, session_id: &str) -> Result<Vec<String>, String> {
+    let provider = provider.trim();
+    let sid = session_id.trim();
+    match provider {
+        "claude" => {
+            if !is_canonical_uuid(sid) {
+                return Err(format!(
+                    "Claude Code session_id must be a canonical UUID, got {sid:?}."
+                ));
+            }
+            Ok(vec!["--session-id".into(), sid.to_ascii_lowercase()])
+        }
+        "agy" | "codex" | "grok" => Ok(Vec::new()),
+        _ => Err(format!(
+            "Provider {provider:?} does not accept an explicit session id."
+        )),
+    }
+}
+
+/// Documented Claude Code CLI flag to fork a resumed session (`--fork-session`).
+/// Verified against Claude Code CLI `CLAUDE_FORK_VERIFIED_VERSION` (`2.1.325`)
+/// and [`CLAUDE_FORK_DOC_URL`].
+pub const CLAUDE_FORK_SESSION_FLAG: &str = "--fork-session";
+pub const CLAUDE_FORK_DOC_URL: &str = "https://code.claude.com/docs/en/cli-reference";
+pub const CLAUDE_FORK_VERIFIED_VERSION: &str = "2.1.325";
+
+/// The single Rust owner of resume CLI arguments beside [`policy`].
+///
+/// Maps `(provider, session_id, checkout)` into the provider's documented
+/// resume flags (`claude --resume <uuid>`, `agy --conversation <uuid>`, or
+/// `agy --continue --add-dir <checkout>` for [`AGY_CONTINUE_SENTINEL`]).
+/// Refuses unsupported providers and malformed ids instead of letting callers
+/// construct raw resume flags.
+pub fn resume(provider: &str, session_id: &str, checkout: &Path) -> Result<Vec<String>, String> {
+    let provider = provider.trim();
+    let sid = session_id.trim();
+    match provider {
+        "claude" => {
+            if !is_canonical_uuid(sid) {
+                return Err(format!(
+                    "Claude Code resume requires a canonical session UUID, got {sid:?}."
+                ));
+            }
+            Ok(vec!["--resume".into(), sid.to_ascii_lowercase()])
+        }
+        "agy" => {
+            if sid == AGY_CONTINUE_SENTINEL {
+                let mut argv = vec!["--continue".to_owned()];
+                let dir = checkout.to_string_lossy();
+                if !dir.is_empty() {
+                    argv.push("--add-dir".into());
+                    argv.push(dir.into_owned());
+                }
+                return Ok(argv);
+            }
+            if !is_canonical_uuid(sid) {
+                return Err(format!(
+                    "Antigravity resume requires a canonical conversation UUID, got {sid:?}."
+                ));
+            }
+            Ok(vec!["--conversation".into(), sid.to_ascii_lowercase()])
+        }
+        _ => Err(format!(
+            "Provider {provider:?} does not support resuming conversations from GitPulse."
+        )),
+    }
+}
+
+/// Expands a typed fork-resume request against injected `dirs` into
+/// `["--resume", resume_target, "--fork-session", "--session-id", fork_id]`.
+///
+/// When `checkout` is `Some` and the source transcript lives in another
+/// checkout's project directory (the common case when forking into a brand-new
+/// worktree), `resume_target` is the resolved `.jsonl` file path so Claude
+/// Code `2.1.325` finds the source conversation instead of failing with
+/// `"No conversation found with session ID"`. Verifies both that the source
+/// Claude Code transcript exists and that `fork_id` does not already own a
+/// saved transcript (Claude Code `2.1.325` fails with `"Session ID ... is
+/// already in use."` otherwise).
+pub(crate) fn fork_resume_with(
+    dirs: &crate::workbench::conversation::ClaudeConfigDirs,
+    provider: &str,
+    source_session_id: &str,
+    fork_session_id: &str,
+    checkout: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let provider = provider.trim();
+    if provider != "claude" {
+        return Err(format!(
+            "Provider {provider:?} does not support forking conversations from GitPulse."
+        ));
+    }
+    let source = source_session_id.trim();
+    if !is_canonical_uuid(source) {
+        return Err(format!(
+            "Forking requires a canonical source session UUID, got {source:?}."
+        ));
+    }
+    let fork_id = fork_session_id.trim();
+    if !is_canonical_uuid(fork_id) {
+        return Err(format!(
+            "Forking requires a canonical target session UUID, got {fork_id:?}."
+        ));
+    }
+    let source = source.to_ascii_lowercase();
+    let fork_id = fork_id.to_ascii_lowercase();
+    if source == fork_id {
+        return Err("Forked session_id must differ from the resumed source session_id.".into());
+    }
+    let resume_target = match crate::workbench::conversation::locate_claude_transcript_in(
+        dirs, &source, checkout,
+    ) {
+        crate::workbench::conversation::ClaudeTranscriptLocation::Found {
+            in_checkout_project: true,
+            ..
+        } => source.clone(),
+        crate::workbench::conversation::ClaudeTranscriptLocation::Found {
+            path,
+            in_checkout_project: false,
+        } => path
+            .to_str()
+            .ok_or_else(|| {
+                format!("Saved Claude Code transcript path for {source} is not valid UTF-8.")
+            })?
+            .to_owned(),
+        crate::workbench::conversation::ClaudeTranscriptLocation::Absent => {
+            return Err(format!(
+                "Cannot fork conversation: no saved Claude Code transcript found for {source}."
+            ));
+        }
+        crate::workbench::conversation::ClaudeTranscriptLocation::Unknown(why) => {
+            return Err(format!(
+                "Could not verify saved Claude Code transcript for {source}: {why}"
+            ));
+        }
+    };
+    crate::workbench::conversation::verify_unused_claude_session_in(dirs, &fork_id)?;
+    Ok(vec![
+        "--resume".into(),
+        resume_target,
+        CLAUDE_FORK_SESSION_FLAG.into(),
+        "--session-id".into(),
+        fork_id,
+    ])
+}
+
+/// Single Rust owner for CLI fork-session flags (CARD 33 + CARD 8).
+pub fn fork_resume(
+    provider: &str,
+    source_session_id: &str,
+    fork_session_id: &str,
+) -> Result<Vec<String>, String> {
+    let dirs = crate::workbench::conversation::claude_config_dirs();
+    fork_resume_with(&dirs, provider, source_session_id, fork_session_id, None)
+}
+
+/// Checkout-aware companion to [`fork_resume`] that emits the source `.jsonl`
+/// transcript path when forking from another worktree's conversation.
+pub fn fork_resume_for_checkout(
+    provider: &str,
+    source_session_id: &str,
+    fork_session_id: &str,
+    checkout: &Path,
+) -> Result<Vec<String>, String> {
+    let dirs = crate::workbench::conversation::claude_config_dirs();
+    fork_resume_with(
+        &dirs,
+        provider,
+        source_session_id,
+        fork_session_id,
+        Some(checkout),
+    )
+}
+
+fn is_shell_program(program: Option<&str>) -> bool {
+    let trimmed = program.map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let name = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "pwsh" | "cmd"
+    )
+}
+
+/// Refuses raw session/resume flags in caller-supplied `args` (`--resume`,
+/// `-r`, `--session-id`, `--continue`, `-c`, `--conversation`, `--fork`,
+/// `--fork-session`, or `flag=value` variants) before any `--` prompt
+/// separator so resume and session-id construction stays owned solely by
+/// [`resume`], [`fork_resume`], and [`session_id_args`].
+///
+/// Exceptions that match documented non-session CLI meanings:
+/// - POSIX/login shells allow `-c <command>`;
+/// - `codex` uses `-c, --config <key=value>` rather than `--continue`;
+/// - `agy`'s `--prompt-interactive <text>` takes a single prompt value whose
+///   text may contain arbitrary words, so its value slot is skipped.
+pub fn refuse_raw_session_args(
+    program: Option<&str>,
+    args: Option<&[String]>,
+) -> Result<(), String> {
+    let Some(args) = args else {
+        return Ok(());
+    };
+    let provider = program.map(str::trim).unwrap_or_default();
+    let allow_short_c = is_shell_program(program) || provider == "codex";
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if provider == "agy" && arg == "--prompt-interactive" {
+            i += 2;
+            continue;
+        }
+        let flag = arg.split_once('=').map_or(arg, |(name, _)| name);
+        let forbidden = matches!(
+            flag,
+            "--resume"
+                | "-r"
+                | "--session-id"
+                | "--continue"
+                | "--conversation"
+                | "--fork"
+                | "--fork-session"
+        ) || (!allow_short_c && flag == "-c");
+        if forbidden {
+            return Err(format!(
+                "Raw session flag {flag:?} is refused in terminal args; use typed resume or session_id fields."
+            ));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Expands an interactive `cmd_terminal_spawn` launch through the single Rust
+/// owner: refuses raw session flags in `caller_args`, injects [`resume`],
+/// [`fork_resume`], or [`session_id_args`], prepends [`with_launch_flags`], and
+/// prepends [`policy`] flags via [`apply_permission_mode`].
+#[allow(clippy::too_many_arguments)]
+pub fn interactive_args(
+    program: Option<&str>,
+    permission_mode: Option<&str>,
+    acknowledged: bool,
+    options: &LaunchOptions<'_>,
+    checkout: &Path,
+    resume_session_id: Option<&str>,
+    session_id: Option<&str>,
+    fork_session: bool,
+    caller_args: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    interactive_args_with(
+        program,
+        permission_mode,
+        acknowledged,
+        options,
+        checkout,
+        resume_session_id,
+        session_id,
+        fork_session,
+        caller_args,
+        crate::workbench::conversation::claude_config_dirs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interactive_args_with(
+    program: Option<&str>,
+    permission_mode: Option<&str>,
+    acknowledged: bool,
+    options: &LaunchOptions<'_>,
+    checkout: &Path,
+    resume_session_id: Option<&str>,
+    session_id: Option<&str>,
+    fork_session: bool,
+    caller_args: Option<Vec<String>>,
+    claude_dirs: impl FnOnce() -> crate::workbench::conversation::ClaudeConfigDirs,
+) -> Result<Option<Vec<String>>, String> {
+    refuse_raw_session_args(program, caller_args.as_deref())?;
+    let resume_id = resume_session_id.map(str::trim).filter(|s| !s.is_empty());
+    let fresh_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let provider = program.map(str::trim).unwrap_or_default();
+    let session_flags = if fork_session {
+        let (Some(source_id), Some(fork_id)) = (resume_id, fresh_id) else {
+            return Err(
+                "Forking a conversation requires both resume.session_id and a new session_id."
+                    .into(),
+            );
+        };
+        let dirs = claude_dirs();
+        fork_resume_with(&dirs, provider, source_id, fork_id, Some(checkout))?
+    } else {
+        if resume_id.is_some() && fresh_id.is_some() {
+            return Err("Pass either resume or session_id, never both.".into());
+        }
+        if let Some(id) = resume_id {
+            resume(provider, id, checkout)?
+        } else if let Some(id) = fresh_id {
+            if provider.is_empty() {
+                return Err("A login shell does not accept an explicit session_id.".into());
+            }
+            session_id_args(provider, id)?
+        } else {
+            Vec::new()
+        }
+    };
+    let merged_caller = if session_flags.is_empty() {
+        caller_args
+    } else {
+        let mut combined = session_flags;
+        if let Some(rest) = caller_args {
+            combined.extend(rest);
+        }
+        Some(combined)
+    };
+    let with_launch = with_launch_flags(program, options, merged_caller)?;
+    apply_permission_mode(program, permission_mode, acknowledged, with_launch)
 }
 
 /// What a task attempt adds to its provider's argv beyond policy and prompt.
@@ -1185,7 +1520,9 @@ pub(super) fn arguments(
         }
         "claude" => {
             if let Some(id) = extras.run_id.filter(|id| is_canonical_uuid(id)) {
-                args.extend(["--session-id".into(), id.into()]);
+                if let Ok(flags) = session_id_args("claude", id) {
+                    args.extend(flags);
+                }
             }
             if let Some(dir) = extras.brief_dir {
                 let dir = dir
@@ -3322,21 +3659,215 @@ mod hook_launch_tests {
     }
 
     #[test]
-    fn resume_and_session_id_arguments_pass_through_untouched() {
-        for caller in [
-            vec!["--resume", "6f0a6d1e-1111-4222-8333-444455556666"],
-            vec!["--session-id", "6f0a6d1e-1111-4222-8333-444455556666"],
+    fn resume_owner_and_raw_session_flag_refusal_follow_s2_07_contract() {
+        const SID: &str = "6f0a6d1e-1111-4222-8333-444455556666";
+        let repo = Path::new("/tmp/repo");
+
+        // Single Rust owner for resume & session_id argv.
+        assert_eq!(
+            super::resume("claude", SID, repo).unwrap(),
+            vec!["--resume", SID]
+        );
+        assert_eq!(
+            super::resume("agy", SID, repo).unwrap(),
+            vec!["--conversation", SID]
+        );
+        assert_eq!(
+            super::resume("agy", super::AGY_CONTINUE_SENTINEL, repo).unwrap(),
+            vec!["--continue", "--add-dir", "/tmp/repo"]
+        );
+        assert!(super::resume("codex", SID, repo).is_err());
+        assert!(super::resume("grok", SID, repo).is_err());
+        assert!(super::resume("", SID, repo).is_err());
+        assert!(super::resume("claude", "not-a-uuid", repo).is_err());
+
+        assert_eq!(
+            super::session_id_args("claude", SID).unwrap(),
+            vec!["--session-id", SID]
+        );
+        assert!(super::session_id_args("agy", SID).unwrap().is_empty());
+
+        // Typed interactive_args produces policy -> launch -> resume/session_id -> prompt.
+        let argv = super::interactive_args(
+            Some("claude"),
+            Some("edit"),
+            false,
+            &with_hook(true),
+            repo,
+            Some(SID),
+            None,
+            false,
+            Some(vec!["--".into(), "continue task".into()]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(argv.starts_with(&["--permission-mode".to_owned(), "acceptEdits".to_owned()]));
+        assert!(settings_of(&argv).get("hooks").is_some());
+        let resume_at = argv.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(argv[resume_at + 1], SID);
+        assert_eq!(argv[resume_at + 2..], ["--", "continue task"]);
+
+        // Raw session/resume flags in caller args are refused across providers.
+        for bad in [
+            vec!["--resume", "x"],
+            vec!["--resume=x"],
+            vec!["-r", "x"],
+            vec!["--session-id", SID],
+            vec!["--session-id=x"],
             vec!["--continue"],
+            vec!["-c"],
+            vec!["--conversation", SID],
+            vec!["--fork"],
+            vec!["--fork=1"],
+            vec!["--fork-session"],
+            vec!["--fork-session=true"],
         ] {
-            let caller: Vec<String> = caller.into_iter().map(str::to_owned).collect();
-            let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller.clone()))
-                .unwrap()
-                .unwrap();
-            assert!(argv.ends_with(&caller), "{argv:?}");
-            assert!(settings_of(&argv[..argv.len() - caller.len()])
-                .get("hooks")
-                .is_some());
+            let err = super::interactive_args(
+                Some("claude"),
+                None,
+                false,
+                &LaunchOptions::default(),
+                repo,
+                None,
+                None,
+                false,
+                Some(bad.into_iter().map(str::to_owned).collect()),
+            );
+            assert!(err.is_err(), "raw session args must be refused");
         }
+        // Raw flags after `--` (or inside `agy --prompt-interactive <text>`) are prompt text, not flags.
+        assert!(super::refuse_raw_session_args(
+            Some("claude"),
+            Some(&["--".into(), "--resume".into(), "literal".into()])
+        )
+        .is_ok());
+        assert!(super::refuse_raw_session_args(
+            Some("agy"),
+            Some(&[
+                "--prompt-interactive".into(),
+                "--resume mentioned in prompt".into()
+            ])
+        )
+        .is_ok());
+        // Codex uses `-c` as `--config`, not `--continue`; shells use `-c` as script.
+        assert!(super::refuse_raw_session_args(
+            Some("codex"),
+            Some(&["-c".into(), "model=o3".into()])
+        )
+        .is_ok());
+        assert!(
+            super::refuse_raw_session_args(None, Some(&["-c".into(), "echo hi".into()])).is_ok()
+        );
+        // Cannot pass both resume and session_id when not forking.
+        assert!(super::interactive_args(
+            Some("claude"),
+            None,
+            false,
+            &LaunchOptions::default(),
+            repo,
+            Some(SID),
+            Some(SID),
+            false,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fork_resume_owner_emits_documented_fork_session_and_fails_closed_on_missing_or_colliding_transcripts(
+    ) {
+        const ORIG: &str = "6f0a6d1e-1111-4222-8333-444455556666";
+        const FORK: &str = "7a1b2c3d-1111-4222-8333-444455557777";
+        assert_eq!(super::CLAUDE_FORK_SESSION_FLAG, "--fork-session");
+        assert_eq!(
+            super::CLAUDE_FORK_DOC_URL,
+            "https://code.claude.com/docs/en/cli-reference"
+        );
+        assert_eq!(super::CLAUDE_FORK_VERIFIED_VERSION, "2.1.325");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("claude");
+        let proj = cfg.join("projects").join("-tmp-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{ORIG}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
+
+        let make_dirs = || crate::workbench::conversation::ClaudeConfigDirs {
+            dirs: vec![cfg.clone()],
+            error: None,
+        };
+        let repo = Path::new("/tmp/repo");
+
+        let argv = super::interactive_args_with(
+            Some("claude"),
+            Some("edit"),
+            false,
+            &with_hook(true),
+            repo,
+            Some(ORIG),
+            Some(FORK),
+            true,
+            Some(vec!["--".into(), "try alt approach".into()]),
+            make_dirs,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(argv.starts_with(&["--permission-mode".to_owned(), "acceptEdits".to_owned()]));
+        let tail = argv.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(
+            argv[tail..],
+            [
+                "--resume",
+                ORIG,
+                "--fork-session",
+                "--session-id",
+                FORK,
+                "--",
+                "try alt approach",
+            ]
+        );
+
+        let cross_argv = super::interactive_args_with(
+            Some("claude"),
+            Some("edit"),
+            false,
+            &with_hook(true),
+            Path::new("/tmp/repo-fork"),
+            Some(ORIG),
+            Some(FORK),
+            true,
+            None,
+            make_dirs,
+        )
+        .unwrap()
+        .unwrap();
+        let cross_tail = cross_argv.iter().position(|a| a == "--resume").unwrap();
+        let orig_path = proj.join(format!("{ORIG}.jsonl"));
+        assert_eq!(
+            cross_argv[cross_tail..],
+            [
+                "--resume",
+                orig_path.to_str().unwrap(),
+                "--fork-session",
+                "--session-id",
+                FORK,
+            ]
+        );
+
+        // Missing source transcript is refused.
+        assert!(
+            super::fork_resume_with(&make_dirs(), "claude", FORK, ORIG, None).is_err(),
+            "missing source transcript must be refused"
+        );
+        // Same source and target session id is refused.
+        assert!(super::fork_resume_with(&make_dirs(), "claude", ORIG, ORIG, None).is_err());
+        // Non-claude provider is refused.
+        assert!(super::fork_resume_with(&make_dirs(), "agy", ORIG, FORK, None).is_err());
+        // Already-existing target transcript is refused.
+        std::fs::write(proj.join(format!("{FORK}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
+        assert!(
+            super::fork_resume_with(&make_dirs(), "claude", ORIG, FORK, None).is_err(),
+            "pre-existing fork target transcript must be refused"
+        );
     }
 
     #[test]

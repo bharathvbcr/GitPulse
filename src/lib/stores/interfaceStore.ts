@@ -153,6 +153,8 @@ export interface InterfacePrefs extends AppearancePrefs {
   showHarnessBadges: boolean;
   /** Author-avatar column in the commit graph gutter. */
   showGraphAvatars: boolean;
+  /** GitHub profile pictures instead of initials, resolved through the GitHub CLI. */
+  showGithubAvatars: boolean;
   /** Maximum share of the graph view used by the lane viewport. */
   graphWidthMode: GraphWidthMode;
   /**
@@ -400,15 +402,23 @@ export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Whether a terminal bell or OSC notice counts as an agent waiting on the
    * reader, on the board, the task pane, the Agents view and the menu-bar
-   * count. On by default: an agent without hooks can only ask by ringing the
-   * bell, so turning this off stops those asks from counting. The Agents view
-   * also stops listing a bell as a reason (the task pane and the board still
-   * show the bell and only stop counting it). A request an agent reports
-   * through its hooks (`needs-you`, `error`) counts either way. Owned by
+   * count. Off by default (opt-in): turning this on counts terminal bells from
+   * agents without hooks on those surfaces. While off, the Agents view also
+   * stops listing a bell as a reason (the task pane and the board still show
+   * the bell and only stop counting it). A request an agent reports through
+   * its hooks (`needs-you`, `error`) counts either way. Owned by
    * `sessionActivity`, which cannot import this store, so every change is
    * pushed to it from here.
    */
   bellAsksForReader: boolean;
+  /**
+   * Which default `bellAsksForReader` was last reconciled against. Pre-revision-1
+   * `true` was the old default written by every preference save rather than an
+   * opt-in, so a read that finds it under an older revision moves it to `false`
+   * once; `BELL_ASKS_FOR_READER_REV` is written back on every save, so turning
+   * the opt-in on afterwards stays `true`.
+   */
+  bellAsksForReaderRev: number;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -436,6 +446,28 @@ export function migrateBranchRowLayout(stored: unknown, storedRev: unknown): Bra
   return stored;
 }
 
+/**
+ * Revision of the `bellAsksForReader` default. Bumped to 1 when the default
+ * moved from on to opt-in (`false`); see `bellAsksForReaderRev`.
+ */
+export const BELL_ASKS_FOR_READER_REV = 1;
+
+/**
+ * Whether a stored `bellAsksForReader` opts in, reconciled once against the
+ * opt-in default.
+ *
+ * - Not `true` (`false`, missing, corrupt): `false` — an unreadable value
+ *   never opts a reader in.
+ * - `true` saved before revision 1: the old default rather than a choice, so
+ *   it becomes `false` once. Every save writes `BELL_ASKS_FOR_READER_REV`, so
+ *   turning the setting on afterwards is kept.
+ * - `true` at or after revision 1: `true`.
+ */
+export function migrateBellAsksForReader(stored: unknown, storedRev: unknown): boolean {
+  if (stored !== true) return false;
+  return typeof storedRev === "number" && storedRev >= BELL_ASKS_FOR_READER_REV;
+}
+
 const DEFAULTS: InterfacePrefs = {
   ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
@@ -454,6 +486,7 @@ const DEFAULTS: InterfacePrefs = {
   codePercentageMode: "code-only",
   showHarnessBadges: true,
   showGraphAvatars: true,
+  showGithubAvatars: true,
   graphWidthMode: "balanced",
   graphRefScope: "named",
   uiFontScale: 1.0,
@@ -503,7 +536,8 @@ const DEFAULTS: InterfacePrefs = {
   dismissedUpdateVersion: "",
   autoRunCoverage: false,
   autoScanGithubAlerts: true,
-  bellAsksForReader: true,
+  bellAsksForReader: false,
+  bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
 };
 
 /**
@@ -612,6 +646,7 @@ function readPrefs(): InterfacePrefs {
         parsed.codePercentageMode === "all" ? "all" : "code-only",
       showHarnessBadges: bool(parsed.showHarnessBadges, DEFAULTS.showHarnessBadges),
       showGraphAvatars: bool(parsed.showGraphAvatars, DEFAULTS.showGraphAvatars),
+      showGithubAvatars: bool(parsed.showGithubAvatars, DEFAULTS.showGithubAvatars),
       graphWidthMode: isGraphWidthMode(parsed.graphWidthMode)
         ? parsed.graphWidthMode
         : DEFAULTS.graphWidthMode,
@@ -707,7 +742,11 @@ function readPrefs(): InterfacePrefs {
         parsed.autoScanGithubAlerts,
         DEFAULTS.autoScanGithubAlerts,
       ),
-      bellAsksForReader: bool(parsed.bellAsksForReader, DEFAULTS.bellAsksForReader),
+      bellAsksForReader: migrateBellAsksForReader(
+        parsed.bellAsksForReader,
+        parsed.bellAsksForReaderRev,
+      ),
+      bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -858,6 +897,7 @@ function createInterfaceStore() {
     setCodePercentageMode: (mode: CodePercentageMode) => patch({ codePercentageMode: mode }),
     setShowHarnessBadges: (show: boolean) => patch({ showHarnessBadges: show }),
     setShowGraphAvatars: (show: boolean) => patch({ showGraphAvatars: show }),
+    setShowGithubAvatars: (show: boolean) => patch({ showGithubAvatars: show }),
     setGraphWidthMode: (mode: GraphWidthMode) => patch({ graphWidthMode: mode }),
     setGraphRefScope: (scope: RefScope) => patch({ graphRefScope: scope }),
     toggleGraphAvatars: () =>

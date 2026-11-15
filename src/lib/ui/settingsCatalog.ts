@@ -334,6 +334,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "initials badges gutter author who committed",
   },
   {
+    id: "github-avatars",
+    section: "graph",
+    label: "GitHub profile pictures",
+    keywords: "avatar photo picture github gravatar author who committed network gh",
+  },
+  {
     id: "diff-layout",
     section: "diff",
     label: "Default diff layout",

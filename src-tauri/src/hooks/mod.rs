@@ -2785,7 +2785,139 @@ fn command_gate_with(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
-    under_bypass(input, command_gate_decided(input, run))
+    let output = under_bypass(input, command_gate_decided(input, run));
+    maybe_record_git_op(input, output)
+}
+
+#[cfg(target_os = "macos")]
+const OP_RECORD_APP_DEADLINE: Duration = Duration::from_secs(2);
+
+enum OpRecordOutcome {
+    Snapshotted,
+    FailedAlreadyLogged(String),
+    TransportFailed(String),
+}
+
+/// Forwards every allowed gated git write command to the desktop app mailbox
+/// so the app (never this decide-only hook) records the pre-op snapshot and
+/// op-log ledger row. Failures always write `"unsnapshotted"` and emit a
+/// non-silent warning.
+fn maybe_record_git_op(input: &HookInput, output: HookOutput) -> HookOutput {
+    let blocked = output.hook_specific_output.as_ref().is_some_and(|s| {
+        matches!(
+            s.permission_decision,
+            Some(PermissionDecision::Deny | PermissionDecision::Ask)
+        )
+    });
+    if blocked || input.cwd.is_empty() || !crate::ledger::is_git_write_command(&input.command) {
+        return output;
+    }
+    let Some(root) = find_git_root(Path::new(&input.cwd)) else {
+        return output;
+    };
+    let root_str = root.to_string_lossy().into_owned();
+    match record_op_by_app(&root_str, input) {
+        OpRecordOutcome::Snapshotted => output,
+        OpRecordOutcome::FailedAlreadyLogged(why) => attach_unsnapshotted_notice(output, &why),
+        OpRecordOutcome::TransportFailed(why) => {
+            crate::ledger::record_unsnapshotted_git_op(
+                &root_str,
+                &input.command,
+                (!input.session_id.trim().is_empty()).then_some(input.session_id.as_str()),
+                None,
+                None,
+                &why,
+                crate::ledger::ids::now_millis(),
+            );
+            attach_unsnapshotted_notice(output, &why)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn record_op_by_app(root: &str, input: &HookInput) -> OpRecordOutcome {
+    let Some(dir) = scan_profile(root) else {
+        return OpRecordOutcome::TransportFailed(
+            "no GitPulse app profile directory to record op snapshot".into(),
+        );
+    };
+    record_op_by_app_in(dir, root, input, OP_RECORD_APP_DEADLINE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn record_op_by_app(_root: &str, _input: &HookInput) -> OpRecordOutcome {
+    OpRecordOutcome::TransportFailed("app-side op recorder is unavailable off macOS".into())
+}
+
+#[cfg(target_os = "macos")]
+fn record_op_by_app_in(
+    dir: PathBuf,
+    root: &str,
+    input: &HookInput,
+    deadline: Duration,
+) -> OpRecordOutcome {
+    use crate::desktop::instance::{reach_owner, Request};
+
+    let request = Request::RecordGitOp {
+        id: mailbox_id("op"),
+        cwd: root.to_string(),
+        command: input.command.clone(),
+        session_id: (!input.session_id.trim().is_empty()).then(|| input.session_id.clone()),
+        task_id: None,
+    };
+    let answer = within_budget(deadline + Duration::from_millis(100), move || {
+        reach_owner(&dir, deadline)
+            .ok_or_else(|| "no GitPulse app is answering".to_string())?
+            .record_git_op(&request, deadline)
+    });
+    match answer {
+        Some(Ok(reply)) => {
+            if reply
+                .get("snapshotted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                OpRecordOutcome::Snapshotted
+            } else {
+                let err = reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("app-side op snapshot failed")
+                    .to_string();
+                OpRecordOutcome::FailedAlreadyLogged(err)
+            }
+        }
+        Some(Err(why)) => OpRecordOutcome::TransportFailed(why),
+        None => OpRecordOutcome::TransportFailed("the app missed its op-snapshot deadline".into()),
+    }
+}
+
+fn attach_unsnapshotted_notice(mut output: HookOutput, why: &str) -> HookOutput {
+    let note = format!(
+        "GitPulse warning: pre-op snapshot is unsnapshotted ({why}). This git write is not recoverable via GitPulse op-log undo."
+    );
+    output.system_message = Some(match output.system_message.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{note}"),
+        _ => note.clone(),
+    });
+    match &mut output.hook_specific_output {
+        Some(specific) if specific.permission_decision.is_none() => {
+            specific.additional_context = Some(match specific.additional_context.take() {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{note}"),
+                _ => note,
+            });
+        }
+        None => {
+            output.hook_specific_output = Some(HookSpecificOutput {
+                hook_event_name: PRE_TOOL_USE.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(note),
+            });
+        }
+        Some(_) => {}
+    }
+    output
 }
 
 /// [`command_gate_with`] before the permission mode is applied.
@@ -10863,5 +10995,277 @@ done
                 "Antigravity hook must never emit 0-byte stdout under GITPULSE_HOST=antigravity"
             );
         }
+    }
+
+    #[test]
+    fn hooks_module_never_writes_a_git_ref() {
+        let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hooks");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&hooks_dir).expect("read hooks dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.ends_with("_tests.rs"))
+            {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("read hook rs");
+            let prod = raw
+                .split_once("\n#[cfg(test)]\nmod ")
+                .map(|(head, _)| head)
+                .unwrap_or(&raw);
+            let sanitized = prod.replace("\"symbolic-ref\", \"--quiet\", \"--short\", \"HEAD\"", "");
+            for needle in [
+                "update-ref",
+                "commit-tree",
+                "refs/gitpulse",
+                "symbolic-ref",
+                "record_op_snapshot",
+                "undo_op_snapshot",
+            ] {
+                assert!(
+                    !sanitized.contains(needle),
+                    "{} must stay decide-only and never mention/write {needle}",
+                    path.display()
+                );
+            }
+            if path.file_name().and_then(|s| s.to_str()) != Some("worktree.rs") {
+                for needle in ["GitWriter", "git_writer"] {
+                    assert!(
+                        !sanitized.contains(needle),
+                        "{} must stay decide-only and never import {needle}",
+                        path.display()
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 7, "expected all hook source files, read {checked}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        use crate::procguard::LockedSpawn;
+        let mut cmd = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(args)
+            .output_locked()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn user_porcelain_lines(dir: &Path) -> Vec<String> {
+        use crate::procguard::LockedSpawn;
+        let mut cmd = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
+        let out = cmd
+            .current_dir(dir)
+            .args(["status", "--porcelain"])
+            .output_locked()
+            .expect("git status --porcelain");
+        assert!(
+            out.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| !line.is_empty() && *line != "?? .devcouncil/")
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gated_git_rebase_snapshots_pre_op_refs_and_stash_create_via_mailbox_without_touching_worktree_or_stash_list() {
+        use crate::test_support::git_in;
+        let (_dir, repo, _requests) = scoped_hook_fixture(false);
+        let bin_dir = tempfile::tempdir().expect("bin dir");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_manvi(bin_dir.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+
+        let repo_path = Path::new(&repo);
+        crate::test_support::trust_repo(repo_path);
+        git_in(repo_path, &["config", "user.name", "Ada"]);
+        git_in(repo_path, &["config", "user.email", "ada@gitpulse.dev"]);
+
+        // Set up diverged main and feature branches + an existing stash entry + dirty tracked file.
+        git_in(repo_path, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo_path.join("feat.txt"), "f1\n").unwrap();
+        git_in(repo_path, &["add", "feat.txt"]);
+        git_in(repo_path, &["commit", "-q", "-m", "feat-1"]);
+        let pre_feature_oid = git_stdout(repo_path, &["rev-parse", "refs/heads/feature"]);
+
+        git_in(repo_path, &["checkout", "-q", "main"]);
+        std::fs::write(repo_path.join("seed.txt"), "main-2\n").unwrap();
+        git_in(repo_path, &["add", "seed.txt"]);
+        git_in(repo_path, &["commit", "-q", "-m", "main-2"]);
+        let pre_main_oid = git_stdout(repo_path, &["rev-parse", "refs/heads/main"]);
+
+        // Seed one stash entry so we can verify `git stash list` is unchanged.
+        std::fs::write(repo_path.join("seed.txt"), "stashed-seed\n").unwrap();
+        git_in(repo_path, &["stash", "push", "-q", "-m", "existing-user-stash"]);
+        let stash_list_before = git_stdout(repo_path, &["stash", "list"]);
+
+        // Return to feature and make a tracked edit for stash-create capture.
+        git_in(repo_path, &["checkout", "-q", "feature"]);
+        std::fs::write(repo_path.join("feat.txt"), "wip-local-change\n").unwrap();
+        let dirty_before = user_porcelain_lines(repo_path);
+        assert_eq!(dirty_before, vec![" M feat.txt"]);
+
+        // Start temp app mailbox with op-recorder attached.
+        let profile = tempfile::tempdir().expect("profile");
+        let crate::desktop::instance::Claim::Primary(primary) =
+            crate::desktop::instance::claim(profile.path(), std::time::Duration::from_secs(2))
+        else {
+            panic!("expected primary instance");
+        };
+        primary.attach_gate(std::sync::Arc::new(serve_gate));
+        primary.attach_op_recorder(std::sync::Arc::new(|req| {
+            crate::engine::GitWriter::serve_op_record(req)
+        }));
+        let _reg = test_apps::register(repo_path, profile.path());
+
+        let out = gate_here(&bash_call(&repo, "git rebase main"));
+        assert!(
+            out.hook_specific_output
+                .as_ref()
+                .and_then(|s| s.permission_decision)
+                .is_none(),
+            "expected gated rebase allow: {out:?}"
+        );
+
+        // Snapshot must leave working tree and git stash list completely unchanged.
+        assert_eq!(user_porcelain_lines(repo_path), dirty_before);
+        assert_eq!(
+            std::fs::read_to_string(repo_path.join("feat.txt")).unwrap(),
+            "wip-local-change\n"
+        );
+        assert_eq!(git_stdout(repo_path, &["stash", "list"]), stash_list_before);
+
+        let listed = crate::engine::GitWriter::list_op_snapshots(&repo, 10).expect("list ops");
+        assert_eq!(listed.entries.len(), 1);
+        let snap = &listed.entries[0];
+        assert_eq!(snap.op_ref, "refs/gitpulse/ops/1");
+        assert_eq!(snap.head_ref.as_deref(), Some("refs/heads/feature"));
+        assert_eq!(snap.head_oid.as_deref(), Some(pre_feature_oid.as_str()));
+        assert!(snap.stash_oid.is_some(), "dirty tracked tree must yield stash_create oid");
+        assert!(
+            snap.refs.iter().any(|r| r.refname == "refs/heads/main" && r.oid == pre_main_oid),
+            "snapshot must capture pre-rebase main: {:?}",
+            snap.refs
+        );
+        assert!(
+            snap.refs.iter().any(|r| r.refname == "refs/heads/feature" && r.oid == pre_feature_oid),
+            "snapshot must capture pre-rebase feature: {:?}",
+            snap.refs
+        );
+
+        // Now execute real `git rebase main` (committing WIP first) and verify undo restores pre-rebase feature.
+        git_in(repo_path, &["checkout", "--", "feat.txt"]);
+        git_in(repo_path, &["rebase", "main"]);
+        let rebased_feature = git_stdout(repo_path, &["rev-parse", "refs/heads/feature"]);
+        assert_ne!(rebased_feature, pre_feature_oid);
+
+        let plan = crate::engine::GitWriter::prepare_op_undo(&repo, 1).expect("prepare undo");
+        crate::engine::GitWriter::undo_op_snapshot_with_gate(&repo, &plan, &mut |_| Ok(()))
+            .expect("undo rebase");
+        assert_eq!(
+            git_stdout(repo_path, &["rev-parse", "refs/heads/feature"]),
+            pre_feature_oid
+        );
+
+        primary.shutdown();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_or_unreachable_snapshot_logs_unsnapshotted_row_and_emits_non_silent_warning() {
+        let (_dir, repo, _requests) = scoped_hook_fixture(false);
+        let bin_dir = tempfile::tempdir().expect("bin dir");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_manvi(bin_dir.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+        let repo_path = Path::new(&repo);
+        crate::test_support::trust_repo(repo_path);
+
+        // 1. Unreachable mailbox -> TransportFailed fallback writes "unsnapshotted" + non-silent notice.
+        let out_offline = gate_here(&bash_call(&repo, "git rebase main"));
+        assert!(!out_offline.is_silent(), "offline snapshot must never stay silent");
+        assert!(
+            out_offline
+                .system_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsnapshotted"),
+            "warning must say unsnapshotted: {out_offline:?}"
+        );
+
+        // 2. Live mailbox returning failed snapshot -> app logs "unsnapshotted" + hook stays non-silent.
+        let profile = tempfile::tempdir().expect("profile");
+        let crate::desktop::instance::Claim::Primary(primary) =
+            crate::desktop::instance::claim(profile.path(), std::time::Duration::from_secs(2))
+        else {
+            panic!("expected primary instance");
+        };
+        primary.attach_op_recorder(std::sync::Arc::new(|req| {
+            crate::engine::GitWriter::serve_op_record(req)
+        }));
+        let _reg = test_apps::register(repo_path, profile.path());
+        crate::engine::git_writer::inject_next_op_snapshot_failure_for_test(
+            &repo,
+            "injected snapshot failure",
+        );
+
+        let out_failed = gate_here(&bash_call(&repo, "git reset --hard HEAD"));
+        assert!(!out_failed.is_silent(), "failed snapshot must never stay silent");
+        assert!(
+            out_failed
+                .system_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsnapshotted"),
+            "warning must say unsnapshotted: {out_failed:?}"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        assert_eq!(page.events.len(), 2);
+        for row in &page.events {
+            assert_eq!(row.object.as_deref(), Some("unsnapshotted"));
+            assert!(
+                row.detail_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("\"unsnapshotted\""),
+                "detail_json must mention unsnapshotted: {:?}",
+                row.detail_json
+            );
+        }
+
+        primary.shutdown();
     }
 }

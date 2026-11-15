@@ -1,7 +1,7 @@
 //! Tool lookup, scrubbed spawn, fixed argv, and scan scheduling for Kingfisher.
 
 use super::parse::{parse_kingfisher_json, SecretsReport};
-use super::report::{assemble, git_view, RunFacts};
+use super::report::{assemble, git_view, scan_exclusions, RunFacts};
 use crate::engine::git_cli::{
     run_observed, validate_repo, Incomplete, OutputStream, ProcessObserver,
 };
@@ -58,8 +58,12 @@ fn scan_jobs() -> usize {
 /// means finding both. Inline `kingfisher:ignore` directives stay honoured
 /// (no `--no-ignore`): they are the repository author's recorded decision,
 /// and the panel says they apply.
-pub fn build_scan_argv(repo: impl AsRef<Path>) -> Vec<String> {
-    vec![
+///
+/// `excluded` are absolute directories left out with `--exclude`
+/// ([`super::report::scan_exclusions`] chooses them and keeps out any path
+/// that would read as a glob).
+pub fn build_scan_argv(repo: impl AsRef<Path>, excluded: &[PathBuf]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
         "--no-update-check".into(),
         "scan".into(),
         repo.as_ref().to_string_lossy().into_owned(),
@@ -77,7 +81,34 @@ pub fn build_scan_argv(repo: impl AsRef<Path>) -> Vec<String> {
         "--jobs".into(),
         scan_jobs().to_string(),
         "--quiet".into(),
-    ]
+    ];
+    for tree in excluded {
+        argv.push("--exclude".into());
+        argv.push(tree.to_string_lossy().into_owned());
+    }
+    argv
+}
+
+/// Linked worktrees of `repo`, canonical, for [`super::report::scan_exclusions`]
+/// to keep the ones inside it. A listing that cannot be read leaves none out:
+/// the scan is then slower, never narrower.
+fn linked_worktrees(repo: &Path) -> Vec<PathBuf> {
+    match crate::engine::worktree::read_worktree_entries(repo) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| PathBuf::from(entry.path))
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .filter(|path| path != repo)
+            .collect(),
+        Err(error) => {
+            log::info!(
+                target: "secrets",
+                "worktrees not listed, so none are left out of the scan: {}",
+                error.message()
+            );
+            Vec::new()
+        }
+    }
 }
 
 pub fn build_version_argv() -> [&'static str; 1] {
@@ -204,6 +235,7 @@ pub fn report_from_exit(status: i32, stdout: &[u8], version: Option<String>) -> 
             duration_ms: 0,
             nested_repos_scanned: nested_repos_scanning_enabled(),
             max_file_size_mb: MAX_FILE_SIZE_MB,
+            excluded_paths: Vec::new(),
         },
     )
 }
@@ -352,7 +384,15 @@ pub fn scan_with_binary(
     if ticket.superseded() {
         return failed_report(SUPERSEDED, version);
     }
-    let argv = build_scan_argv(repo);
+    // Read before the scan so the same listing chooses what is left out and
+    // locates what is found.
+    let view = git_view(repo);
+    let excluded_paths = scan_exclusions(repo, view.as_ref().ok(), &linked_worktrees(repo));
+    let excluded: Vec<PathBuf> = excluded_paths
+        .iter()
+        .map(|rel| repo.join(rel.trim_end_matches('/')))
+        .collect();
+    let argv = build_scan_argv(repo, &excluded);
     let jobs = argv_value(&argv, "--jobs");
     let mut cmd = scrubbed_command(binary);
     cmd.args(&argv);
@@ -420,12 +460,13 @@ pub fn scan_with_binary(
         &stdout,
         version.clone(),
         repo,
-        || git_view(repo),
+        || view,
         RunFacts {
             scanned_at_ms: now_ms(),
             duration_ms,
             nested_repos_scanned: nested_repos_scanning_enabled(),
             max_file_size_mb: MAX_FILE_SIZE_MB,
+            excluded_paths,
         },
     );
     if !report.ok {

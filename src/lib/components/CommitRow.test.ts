@@ -5,6 +5,7 @@ import { render } from "svelte/server";
 import { compile } from "svelte/compiler";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 import CommitRow from "./CommitRow.svelte";
+import { interfaceStore } from "../stores/interfaceStore";
 
 const source = readFileSync(new URL("./CommitRow.svelte", import.meta.url), "utf8");
 
@@ -241,5 +242,33 @@ describe("CommitRow copy SHA control keyboard access", () => {
   it("renders the accessible name on the SHA button", () => {
     const { body } = render(CommitRow, { props: { row } });
     expect(body).toContain(`aria-label="Copy full SHA ${row.id}"`);
+  });
+});
+
+describe("CommitRow GitHub profile picture", () => {
+  const withPicture: VisualCommitRow = { ...row, author_email: "42+ada@users.noreply.github.com" };
+
+  it("overlays the picture on the initials base when a URL is known", () => {
+    const { body } = render(CommitRow, { props: { row: withPicture } });
+    expect(body).toContain('src="https://avatars.githubusercontent.com/u/42?s=64&amp;v=4"');
+    expect(body).toContain('referrerpolicy="no-referrer"');
+    expect(body).toContain("AL");
+  });
+
+  it("shows initials only when no URL is known", () => {
+    const { body } = render(CommitRow, { props: { row } });
+    expect(body).not.toContain("avatars.githubusercontent.com");
+    expect(body).toContain("AL");
+  });
+
+  it("shows initials only when the setting is off", () => {
+    interfaceStore.setShowGithubAvatars(false);
+    try {
+      const { body } = render(CommitRow, { props: { row: withPicture } });
+      expect(body).not.toContain("avatars.githubusercontent.com");
+      expect(body).toContain("AL");
+    } finally {
+      interfaceStore.setShowGithubAvatars(true);
+    }
   });
 });

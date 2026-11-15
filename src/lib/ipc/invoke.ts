@@ -144,6 +144,7 @@ export const COMMAND_DEADLINES_MS: Readonly<Record<string, number>> = {
   cmd_github_context: 60_000,
   cmd_github_runs: 30_000,
   cmd_github_workflows: 30_000,
+  cmd_devmap_status: 30_000,
 };
 
 export type DeferralRetryOptions = {

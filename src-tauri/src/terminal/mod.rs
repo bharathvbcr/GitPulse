@@ -30,6 +30,7 @@ pub mod port_probe;
 mod readiness;
 mod ring;
 pub mod scratch_media;
+pub mod session_ledger;
 pub mod shell_integration;
 mod sink;
 mod transcript;
@@ -39,6 +40,10 @@ use flow::{OutputFlow, Route};
 pub use ipc::{control_async, deliver_peer_wake_async, resize_async, write_async};
 pub use ring::RING_BYTES;
 use serde::{Deserialize, Serialize};
+pub use session_ledger::{
+    SessionEndState, SessionLedger, SessionLedgerOffer, SessionLedgerView, SessionReopenCheck,
+    TerminalResume, SESSION_LEDGER_EVENT,
+};
 use sink::OutputSlot;
 pub use sink::{OutputChannel, OutputSink, END_OF_OUTPUT};
 use std::collections::HashMap;
@@ -526,6 +531,8 @@ pub struct TerminalSessions {
     /// Option A capability tokens, parent->child lineage edges, and headless
     /// `vt100` screens for orchestrated child sessions.
     pub(crate) orchestration: Arc<orchestrate::OrchestrationRegistry>,
+    /// Durable per-tab recovery ledger (`session_ledger`).
+    pub(crate) session_ledger: Arc<session_ledger::SessionLedger>,
 }
 
 impl Default for TerminalSessions {
@@ -549,11 +556,52 @@ impl Default for TerminalSessions {
             ring_taps: Arc::default(),
             agent_meta: Arc::default(),
             orchestration: Arc::default(),
+            session_ledger: Arc::new(session_ledger::SessionLedger::in_memory()),
         }
     }
 }
 
 impl TerminalSessions {
+    /// Creates an isolated registry backed by `ledger` (used by persistence tests).
+    pub fn with_ledger(ledger: Arc<session_ledger::SessionLedger>) -> Self {
+        Self {
+            session_ledger: ledger,
+            ..Self::default()
+        }
+    }
+
+    /// Durable per-tab recovery ledger for hosted agent & shell tabs.
+    pub fn session_ledger(&self) -> &Arc<session_ledger::SessionLedger> {
+        &self.session_ledger
+    }
+
+    /// Marks every non-withdrawn running session as `AppQuit` before shutdown
+    /// sends `SIGHUP`, unless the quit chose to leave host sessions running.
+    pub fn mark_app_quit_sessions(&self) -> usize {
+        if self.leaves_sessions_running() {
+            return 0;
+        }
+        self.session_ledger.mark_app_quit()
+    }
+
+    /// Reconciles leftover `Running` rows on startup against currently live PTYs.
+    pub fn reconcile_session_ledger(&self) -> usize {
+        match list_sessions(self) {
+            Ok(listed) => {
+                let live_ids: std::collections::HashSet<String> =
+                    listed.into_iter().map(|s| s.id).collect();
+                self.session_ledger.reconcile_startup(&live_ids)
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "terminal",
+                    "skipping session ledger reconciliation because live sessions could not be queried: {error}"
+                );
+                0
+            }
+        }
+    }
+
     /// A registry whose sessions live in the terminal host described by
     /// `config`. Nothing connects until the first call (or [`Self::connect_host`]).
     #[cfg(unix)]
@@ -581,16 +629,24 @@ impl TerminalSessions {
     /// The app's registry: the host when the user has chosen to keep
     /// terminals running across quits (Settings → Agents), else in-process.
     pub fn from_settings() -> Self {
-        #[cfg(unix)]
-        if crate::tool_config::agent_defaults().keeps_terminals_running() {
-            match host::client::HostConfig::for_app() {
-                Ok(config) => return Self::with_host(config),
-                Err(error) => {
-                    log::error!(target: "terminal", "terminals stay in the app: the terminal host has no directory: {error}")
+        let mut sessions = {
+            #[cfg(unix)]
+            if crate::tool_config::agent_defaults().keeps_terminals_running() {
+                match host::client::HostConfig::for_app() {
+                    Ok(config) => Self::with_host(config),
+                    Err(error) => {
+                        log::error!(target: "terminal", "terminals stay in the app: the terminal host has no directory: {error}");
+                        Self::default()
+                    }
                 }
+            } else {
+                Self::default()
             }
-        }
-        Self::default()
+            #[cfg(not(unix))]
+            Self::default()
+        };
+        sessions.session_ledger = Arc::new(session_ledger::SessionLedger::for_app());
+        sessions
     }
 
     /// The terminal host's pid while connected; `None` in-process. For tests
@@ -619,7 +675,11 @@ impl TerminalSessions {
     pub fn bind_app<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
         #[cfg(unix)]
         if let Some(host) = &self.host {
-            host.set_events(Arc::new(AppEvents::new(app, self.incidents.clone())));
+            host.set_events(Arc::new(AppEvents::new(
+                app,
+                self.incidents.clone(),
+                self.session_ledger.clone(),
+            )));
         }
         #[cfg(not(unix))]
         let _ = app;
@@ -771,6 +831,11 @@ impl TerminalSessions {
     /// Records `meta` in this process's `agent_meta` map without forwarding to
     /// `gitpulse-ptyd` (used both locally and inside `gitpulse-ptyd` itself).
     pub(crate) fn record_agent_meta_local(&self, session_id: &str, meta: AgentSessionMeta) {
+        let _ = self.session_ledger.bind_native_id(
+            session_id,
+            &meta.agent,
+            &meta.conversation_id,
+        );
         let mut map = self
             .agent_meta
             .lock()
@@ -2561,7 +2626,11 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     output: OutputSink,
     observer: Arc<dyn SessionObserver>,
 ) -> Result<TerminalSpawned, CommandError> {
-    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
+    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(
+        app,
+        state.incidents.clone(),
+        state.session_ledger.clone(),
+    ));
     spawn_at(
         state,
         Place::Task {
@@ -2694,7 +2763,11 @@ fn spawn_session_inner<R: tauri::Runtime>(
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, CommandError> {
-    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(app, state.incidents.clone()));
+    let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(
+        app,
+        state.incidents.clone(),
+        state.session_ledger.clone(),
+    ));
     spawn_at(
         state,
         Place::Repo {

@@ -459,7 +459,8 @@ describe("the verdict stays total and stays honest", () => {
   };
   const cleanSecrets: SecretsReport = {
     ok: true, error: null, diagnostic: null, kingfisher_present: true, kingfisher_version: "2.7.0",
-    kingfisher_version_rejected: false, nested_repos_scanned: true, completeness: "complete",
+    kingfisher_version_rejected: false, nested_repos_scanned: true, excluded_paths: [],
+    completeness: "complete",
     findings: [], findings_total: 0, findings_unreadable: 0, findings_truncated: false,
     git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1,
   };

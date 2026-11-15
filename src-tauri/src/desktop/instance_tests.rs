@@ -410,6 +410,7 @@ fn malformed_frames_are_refused_and_the_owner_keeps_answering() {
         b"{\"v\":1,\"request\":{\"kind\":\"launch_missiles\"}}\n",
         b"{\"v\":1,\"request\":{\"kind\":\"open\",\"paths\":[\"relative\"]}}\n",
         b"{\"v\":1,\"request\":{\"kind\":\"notification\",\"id\":\"\",\"snooze\":false}}\n",
+        b"{\"v\":1,\"request\":{\"kind\":\"agent_session_meta\",\"terminal_id\":\"term-1\",\"agent\":\"claude\",\"conversation_id\":\"6f0a6d1e-1111-4222-8333-444455556666\",\"resume_argv\":[\"claude\",\"--resume\"]}}\n",
     ];
     for line in refused {
         let (mut stream, mut reader) = raw(dir.path());
@@ -766,6 +767,104 @@ fn a_full_frame_from_a_peer_that_then_left_is_refused_not_probed() {
         "{ended:?}"
     );
     assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
+/// Waits, bounded, until every descriptor of the peer's end is closed: the
+/// kernel's POLLHUP, which a forking test's copy of the descriptor would delay.
+fn wait_for_hang_up(control: &UnixStream) {
+    let until = std::time::Instant::now() + coverage_relaxed(Duration::from_secs(30));
+    loop {
+        let mut watched = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(control),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` for a descriptor `control` owns.
+        unsafe { libc::poll(&mut watched, 1, 10) };
+        if watched.revents & libc::POLLHUP != 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the peer's descriptors were never all closed, so it never hung up"
+        );
+    }
+}
+
+#[test]
+fn a_gate_asker_that_left_before_its_verdict_is_not_a_refused_launch() {
+    // The 13 "instance mailbox refused a launch: write: Broken pipe" warnings
+    // of one loaded session: an edit hook asks for a verdict, waits its 750 ms
+    // (`GATE_APP_DEADLINE`), judges the command itself and leaves. The owner's
+    // late verdict then meets a closed socket. Nothing was refused and no launch
+    // was involved; what is worth keeping is which answer was late, and by how
+    // much.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let control = server.try_clone().unwrap();
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_cwd: &str, _command: &str| {
+        wait_for_hang_up(&control);
+        Ok(serde_json::json!({ "decision": "allow" }))
+    }));
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::GateCommand {
+            id: "g1".into(),
+            cwd: "/".into(),
+            command: "ls".into(),
+        },
+    })
+    .unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        read_frame(&mut reader).unwrap().expect("greeting");
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(writer);
+        drop(reader);
+        served.join().unwrap()
+    });
+    let Err(ended) = outcome else {
+        panic!("an answer nobody was left to read was not delivered")
+    };
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Info, "{line}");
+    assert!(!line.contains("refused a launch"), "{line}");
+    assert!(line.contains("the gate"), "names what was asked: {line}");
+    assert!(line.contains(" ms"), "says how long the answer took: {line}");
+}
+
+#[test]
+fn an_undelivered_answer_stays_loud_unless_the_ask_was_read_only_and_its_asker_left() {
+    let epipe = || "write: Broken pipe (os error 32)".to_string();
+    let started = std::time::Instant::now();
+
+    // A delivery, orchestration or op record has already acted when its ack
+    // cannot be written: the asker does not know it happened.
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    let ended = Ended::after_ask(&server, "the agent delivery", false, started, epipe());
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Warn);
+    assert!(line.contains("the agent delivery"), "{line}");
+
+    // A read-only ask whose asker is still connected: the failure is not
+    // explained by its leaving.
+    let (server, _held) = UnixStream::pair().unwrap();
+    let ended = Ended::after_ask(&server, "the collision scan", true, started, epipe());
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+
+    // A read-only ask whose asker is gone fell back on its own deadline.
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    let ended = Ended::after_ask(&server, "the insights read", true, started, epipe());
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Info);
 }
 
 #[test]

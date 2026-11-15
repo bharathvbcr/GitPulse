@@ -165,3 +165,70 @@ describe("groupBuckets", () => {
     expect(groupBuckets([1, 2, 3], 0)).toEqual([]);
   });
 });
+
+describe("non-UTC and DST overlap bucketing", () => {
+  const activeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  it("preserves exact calendar days across a 25-hour fall-back transition", () => {
+    // 1 Nov 2026 in North America (25h day); 5 Apr 2026 in New Zealand (25h day).
+    for (const [year, month, prevMonth, prevDay, day, nextDay] of [
+      [2026, 11, 10, 31, 1, 2],
+      [2026, 4, 4, 4, 5, 6],
+    ]) {
+      const mm = String(month).padStart(2, "0");
+      const pm = String(prevMonth).padStart(2, "0");
+      const pd = String(prevDay).padStart(2, "0");
+      const dd = String(day).padStart(2, "0");
+      const nd = String(nextDay).padStart(2, "0");
+      const now = new Date(year, month - 1, nextDay + 1, 12, 0, 0, 0).getTime();
+      const commits = [
+        { timestamp: at(year, prevMonth, prevDay, 23, 30) },
+        { timestamp: at(year, month, day, 1, 30) },
+        { timestamp: at(year, month, day, 23, 30) },
+        { timestamp: at(year, month, nextDay, 0, 15) },
+      ];
+      const summary = bucketCommitsByDay(commits, 5, now);
+      const byDay = Object.fromEntries(summary.buckets.map((b) => [b.day, b.count]));
+      expect(byDay[`${year}-${pm}-${pd}`]).toBe(1);
+      expect(byDay[`${year}-${mm}-${dd}`]).toBe(2);
+      expect(byDay[`${year}-${mm}-${nd}`]).toBe(1);
+      expect(summary.total).toBe(4);
+    }
+  });
+
+  it.skipIf(activeZone !== "America/New_York")(
+    "buckets both 01:30 EDT and 01:30 EST instants into 2026-11-01 in America/New_York",
+    () => {
+      const now = new Date(2026, 10, 3, 12, 0, 0, 0).getTime();
+      const first0130Edt = Math.floor(Date.UTC(2026, 10, 1, 5, 30, 0) / 1000);
+      const second0130Est = Math.floor(Date.UTC(2026, 10, 1, 6, 30, 0) / 1000);
+      const summary = bucketCommitsByDay(
+        [{ timestamp: first0130Edt }, { timestamp: second0130Est }],
+        5,
+        now,
+      );
+      const byDay = Object.fromEntries(summary.buckets.map((b) => [b.day, b.count]));
+      expect(byDay["2026-11-01"]).toBe(2);
+      expect(summary.total).toBe(2);
+    },
+  );
+
+  it.skipIf(activeZone !== "Asia/Kolkata" && activeZone !== "Asia/Calcutta")(
+    "splits commits at the +05:30 IST midnight boundary rather than UTC midnight",
+    () => {
+      // 18:29 UTC is 23:59 IST on 2026-03-14; 18:31 UTC is 00:01 IST on 2026-03-15.
+      const beforeIstMidnight = Math.floor(Date.UTC(2026, 2, 14, 18, 29, 0) / 1000);
+      const afterIstMidnight = Math.floor(Date.UTC(2026, 2, 14, 18, 31, 0) / 1000);
+      const now = new Date(2026, 2, 15, 12, 0, 0, 0).getTime();
+      const summary = bucketCommitsByDay(
+        [{ timestamp: beforeIstMidnight }, { timestamp: afterIstMidnight }],
+        3,
+        now,
+      );
+      const byDay = Object.fromEntries(summary.buckets.map((b) => [b.day, b.count]));
+      expect(byDay["2026-03-14"]).toBe(1);
+      expect(byDay["2026-03-15"]).toBe(1);
+      expect(summary.total).toBe(2);
+    },
+  );
+});

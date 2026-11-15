@@ -26,6 +26,7 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
     kingfisher_version: "2.7.0",
     kingfisher_version_rejected: false,
     nested_repos_scanned: true,
+    excluded_paths: [],
     completeness: "complete",
     findings: [],
     findings_total: 0,
@@ -158,6 +159,27 @@ describe("cap and scope", () => {
     expect(notes).toContain("Symbolic links are not followed");
     expect(notes).toContain("kingfisher:ignore");
     expect(notes).toContain("Nested repositories");
+    expect(notes).not.toContain("Not scanned");
+  });
+
+  it("names every tree the scan left out", () => {
+    const notes = scopeNotes(
+      report({ excluded_paths: [".claude/worktrees/lane/", "src-tauri/target/", "tmp/"] }),
+    );
+    const left = notes.find((note) => note.startsWith("Not scanned"));
+    expect(left).toBeDefined();
+    for (const path of [".claude/worktrees/lane/", "src-tauri/target/", "tmp/"]) {
+      expect(left).toContain(path);
+    }
+  });
+
+  it("says how many trees it does not list when there are many", () => {
+    const many = Array.from({ length: 30 }, (_, i) => `p${i}/target/`);
+    const left = scopeNotes(report({ excluded_paths: many })).find((note) =>
+      note.startsWith("Not scanned"),
+    );
+    expect(left).toContain("p0/target/");
+    expect(left).toContain("and 20 more");
   });
 });
 
