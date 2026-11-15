@@ -19,7 +19,19 @@
  * shareable palette.
  */
 
-export const BUILTIN_BACKDROP_IDS = ["neural", "reactor", "hex", "circuit", "horizon"] as const;
+export const BUILTIN_BACKDROP_IDS = [
+  "neural",
+  "reactor",
+  "hex",
+  "circuit",
+  "horizon",
+  "scanlines",
+  "blueprint",
+  "nebula",
+  "orbit",
+  "skyline",
+  "warp",
+] as const;
 export type BuiltinBackdropId = (typeof BUILTIN_BACKDROP_IDS)[number];
 
 /** `none`, one of the built-ins, or the reader's own image (kept in IndexedDB). */
@@ -45,6 +57,12 @@ export const BUILTIN_BACKDROPS: readonly BuiltinBackdrop[] = [
   { id: "hex", label: "Hex plate", description: "Hexagonal armour plating, lit in red." },
   { id: "circuit", label: "Circuit", description: "Phosphor-green circuit traces." },
   { id: "horizon", label: "Horizon", description: "A retro sun over a perspective grid." },
+  { id: "scanlines", label: "CRT", description: "Amber phosphor scanlines with a curved-glass glow." },
+  { id: "blueprint", label: "Blueprint", description: "A drafting grid with dimension lines and a part outline." },
+  { id: "nebula", label: "Nebula", description: "A starfield with violet and teal gas clouds." },
+  { id: "orbit", label: "Orbit", description: "A ringed planet with orbit tracks and a small moon." },
+  { id: "skyline", label: "Skyline", description: "A neon city skyline at night." },
+  { id: "warp", label: "Warp", description: "Star streaks rushing toward a bright centre." },
 ];
 
 // --- drawing helpers ---------------------------------------------------------
@@ -287,7 +305,157 @@ function horizon(): string {
   );
 }
 
-const DRAW: Readonly<Record<BuiltinBackdropId, () => string>> = { neural, reactor, hex, circuit, horizon };
+function scanlines(): string {
+  return svg(
+    `<radialGradient id="glass" cx="50%" cy="45%" r="75%"><stop offset="0" stop-color="#3a2400"/><stop offset=".6" stop-color="#160d00"/><stop offset="1" stop-color="#050300"/></radialGradient>` +
+      `<pattern id="lines" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="4" height="2" fill="#ffb000" fill-opacity=".09"/></pattern>` +
+      `<radialGradient id="bloom" cx="50%" cy="45%" r="45%"><stop offset="0" stop-color="#ffb000" stop-opacity=".28"/><stop offset="1" stop-color="#ffb000" stop-opacity="0"/></radialGradient>`,
+    `<rect width="${W}" height="${H}" fill="url(#glass)"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#bloom)"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#lines)"/>` +
+      `<g fill="#ffb000" fill-opacity=".5" font-family="monospace" font-size="22">` +
+      ["$ git log --graph", "* 4f2a9c1 merge worktrees", "|\\", "| * 9b0e3d2 fix(terminal)", "* | 1c7f5aa feat(themes)", "|/", "* 06c1ca2 manvi: cloud pill", "$ _"]
+        .map((line, index) => `<text x="140" y="${260 + index * 44}">${line.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</text>`)
+        .join("") +
+      `</g>`,
+  );
+}
+
+function blueprint(): string {
+  const minor = 25;
+  return svg(
+    `<pattern id="minor" width="${minor}" height="${minor}" patternUnits="userSpaceOnUse"><path d="M${minor} 0H0V${minor}" fill="none" stroke="#9fd3ff" stroke-opacity=".12" stroke-width="1"/></pattern>` +
+      `<pattern id="major" width="${minor * 4}" height="${minor * 4}" patternUnits="userSpaceOnUse"><rect width="${minor * 4}" height="${minor * 4}" fill="url(#minor)"/><path d="M${minor * 4} 0H0V${minor * 4}" fill="none" stroke="#9fd3ff" stroke-opacity=".28" stroke-width="1.5"/></pattern>`,
+    `<rect width="${W}" height="${H}" fill="#0b2a4f"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#major)"/>` +
+      `<g fill="none" stroke="#e6f3ff" stroke-opacity=".7" stroke-width="2.5">` +
+      `<path d="M900 300h360l80 80v260l-80 80H900l-80-80V380z"/>` +
+      `<circle cx="1080" cy="510" r="110"/><circle cx="1080" cy="510" r="44"/>` +
+      `<path d="M900 300v-60M1260 300v-60M900 260h360" stroke-opacity=".5" stroke-width="1.5"/>` +
+      `<path d="M1400 380v260M1380 380h40M1380 640h40" stroke-opacity=".5" stroke-width="1.5"/>` +
+      `</g>` +
+      `<g fill="#e6f3ff" fill-opacity=".6" font-family="monospace" font-size="20">` +
+      `<text x="1050" y="250">360</text><text x="1420" y="515">260</text><text x="980" y="780">R110 / R44</text>` +
+      `</g>` +
+      `<rect x="80" y="820" width="420" height="110" fill="none" stroke="#e6f3ff" stroke-opacity=".5" stroke-width="2"/>` +
+      `<g fill="#e6f3ff" fill-opacity=".55" font-family="monospace" font-size="18"><text x="100" y="860">PART: MOUNT PLATE</text><text x="100" y="900">SCALE 1:2   SHEET 1/1</text></g>`,
+  );
+}
+
+function stars(seed: number, count: number, height = H): string {
+  const random = rng(seed);
+  let out = "";
+  for (let i = 0; i < count; i += 1) {
+    const r = random() < 0.08 ? 1.6 + random() * 1.2 : 0.5 + random() * 1.1;
+    out += `<circle cx="${n(random() * W)}" cy="${n(random() * height)}" r="${n(r)}" fill-opacity="${n(0.35 + random() * 0.6)}"/>`;
+  }
+  return `<g fill="#ffffff">${out}</g>`;
+}
+
+function nebula(): string {
+  return svg(
+    `<radialGradient id="a" cx="30%" cy="40%" r="45%"><stop offset="0" stop-color="#8a3cff" stop-opacity=".55"/><stop offset="1" stop-color="#8a3cff" stop-opacity="0"/></radialGradient>` +
+      `<radialGradient id="b" cx="68%" cy="62%" r="40%"><stop offset="0" stop-color="#19c3c8" stop-opacity=".45"/><stop offset="1" stop-color="#19c3c8" stop-opacity="0"/></radialGradient>` +
+      `<radialGradient id="c" cx="55%" cy="30%" r="30%"><stop offset="0" stop-color="#ff5fa2" stop-opacity=".3"/><stop offset="1" stop-color="#ff5fa2" stop-opacity="0"/></radialGradient>`,
+    `<rect width="${W}" height="${H}" fill="#04030c"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#a)"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#b)"/>` +
+      `<rect width="${W}" height="${H}" fill="url(#c)"/>` +
+      stars(0x5eed, 260),
+  );
+}
+
+function orbit(): string {
+  const cx = 1060;
+  const cy = 520;
+  return svg(
+    `<radialGradient id="planet" cx="38%" cy="35%" r="70%"><stop offset="0" stop-color="#ffd9a0"/><stop offset=".45" stop-color="#d0743c"/><stop offset="1" stop-color="#2a0f0a"/></radialGradient>` +
+      `<radialGradient id="moon" cx="35%" cy="35%" r="70%"><stop offset="0" stop-color="#e8eef5"/><stop offset="1" stop-color="#3b4452"/></radialGradient>`,
+    `<rect width="${W}" height="${H}" fill="#03050b"/>` +
+      stars(0x0b17, 200) +
+      `<g fill="none" stroke="#9fc4ff" stroke-opacity=".28" stroke-width="1.5" stroke-dasharray="3 9">` +
+      `<ellipse cx="${cx}" cy="${cy}" rx="520" ry="150" transform="rotate(-12 ${cx} ${cy})"/>` +
+      `<ellipse cx="${cx}" cy="${cy}" rx="700" ry="230" transform="rotate(-12 ${cx} ${cy})"/>` +
+      `</g>` +
+      `<ellipse cx="${cx}" cy="${cy}" rx="330" ry="70" transform="rotate(-12 ${cx} ${cy})" fill="none" stroke="#f0c48a" stroke-opacity=".55" stroke-width="16"/>` +
+      `<circle cx="${cx}" cy="${cy}" r="190" fill="url(#planet)"/>` +
+      `<path d="M${cx - 330} ${cy} A330 70 0 0 0 ${cx + 330} ${cy}" transform="rotate(-12 ${cx} ${cy})" fill="none" stroke="#f0c48a" stroke-opacity=".75" stroke-width="16"/>` +
+      `<circle cx="${cx - 560}" cy="${cy - 190}" r="38" fill="url(#moon)"/>`,
+  );
+}
+
+function skyline(): string {
+  const random = rng(0x5c1e);
+  let back = "";
+  let front = "";
+  let windows = "";
+  for (let x = 0; x < W; ) {
+    const w = 50 + random() * 90;
+    const h = 220 + random() * 320;
+    back += `<rect x="${n(x)}" y="${n(H - h - 60)}" width="${n(w)}" height="${n(h + 60)}"/>`;
+    x += w + 6;
+  }
+  for (let x = -20; x < W; ) {
+    const w = 70 + random() * 120;
+    const h = 140 + random() * 260;
+    const top = H - h;
+    front += `<rect x="${n(x)}" y="${n(top)}" width="${n(w)}" height="${n(h)}"/>`;
+    for (let wy = top + 18; wy < H - 20; wy += 22) {
+      for (let wx = x + 10; wx < x + w - 12; wx += 16) {
+        if (random() < 0.22) {
+          windows += `<rect x="${n(wx)}" y="${n(wy)}" width="7" height="10" fill="${random() < 0.5 ? "#ff4fd8" : "#36e3ff"}"/>`;
+        }
+      }
+    }
+    x += w + 10;
+  }
+  return svg(
+    `<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#07021a"/><stop offset=".7" stop-color="#3a0b52"/><stop offset="1" stop-color="#7a1a6a"/></linearGradient>`,
+    `<rect width="${W}" height="${H}" fill="url(#sky)"/>` +
+      stars(0x0c17, 90, 420) +
+      `<g fill="#1a0a33">${back}</g>` +
+      `<g fill="#0a0414">${front}</g>` +
+      `<g fill-opacity=".85">${windows}</g>` +
+      `<path d="M0 ${H - 2}H${W}" stroke="#ff4fd8" stroke-width="3" stroke-opacity=".7"/>`,
+  );
+}
+
+function warp(): string {
+  const random = rng(0x3a9b);
+  const cx = W / 2;
+  const cy = H / 2;
+  let streaks = "";
+  for (let i = 0; i < 220; i += 1) {
+    const angle = random() * Math.PI * 2;
+    const r0 = 40 + random() * 380;
+    const r1 = r0 + 60 + random() * 420;
+    const x0 = cx + Math.cos(angle) * r0;
+    const y0 = cy + Math.sin(angle) * r0 * 0.75;
+    const x1 = cx + Math.cos(angle) * r1;
+    const y1 = cy + Math.sin(angle) * r1 * 0.75;
+    streaks += `<path d="M${n(x0)} ${n(y0)}L${n(x1)} ${n(y1)}" stroke-width="${n(0.6 + (r1 / 900) * 2.4)}" stroke-opacity="${n(0.25 + random() * 0.6)}"/>`;
+  }
+  return svg(
+    `<radialGradient id="core" cx="50%" cy="50%" r="40%"><stop offset="0" stop-color="#e8f4ff"/><stop offset=".12" stop-color="#7fb8ff" stop-opacity=".7"/><stop offset=".5" stop-color="#2a3cff" stop-opacity=".15"/><stop offset="1" stop-color="#000" stop-opacity="0"/></radialGradient>`,
+    `<rect width="${W}" height="${H}" fill="#02030a"/>` +
+      `<g stroke="#bcd8ff" fill="none" stroke-linecap="round">${streaks}</g>` +
+      `<rect width="${W}" height="${H}" fill="url(#core)"/>`,
+  );
+}
+
+const DRAW: Readonly<Record<BuiltinBackdropId, () => string>> = {
+  neural,
+  reactor,
+  hex,
+  circuit,
+  horizon,
+  scanlines,
+  blueprint,
+  nebula,
+  orbit,
+  skyline,
+  warp,
+};
 
 const cache = new Map<BuiltinBackdropId, string>();
 

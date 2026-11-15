@@ -94,7 +94,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Theme presets",
     keywords:
-      "theme presets gallery templates skins looks hud neural reactor pure black oled amoled crimson red phosphor green synthwave paper my themes saved library save current",
+      "theme presets gallery templates skins looks hud neural reactor pure black oled amoled crimson red phosphor green synthwave paper amber crt blueprint midnight ide arctic solar dark daylight developer editor nebula orbital neon city hyperspace sci-fi space my themes saved library save current",
   },
   {
     id: "theme-file",
@@ -159,7 +159,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Wallpaper",
     keywords:
-      "wallpaper background image picture photo custom upload behind window desktop backdrop neural reactor hex circuit horizon",
+      "wallpaper background image picture photo custom upload behind window desktop backdrop neural reactor hex circuit horizon crt scanlines blueprint nebula stars space orbit planet skyline city warp",
     requires: "nativeMaterial",
   },
   {
