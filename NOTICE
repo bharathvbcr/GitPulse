@@ -26,6 +26,25 @@ and builds on the following open-source projects:
    Copyright (c) 2015-2020 The Gtk-rs Project Developers, Antoni Boucher.
    Licensed under MIT.
 
-5. MarkDev Renderer Crates (`src-tauri/vendor/markdev/crates/`)
+5. MarkDev Renderer Crates (`src-tauri/vendored/markdev-highlight`, `markdev-html`,
+   `markdev-md`, `markdev-vault`)
    https://github.com/bharathvbcr/MarkDev
    Copyright (c) 2026 Bharath Chandra Vaddaram (MIT License).
+
+6. DevCouncil Crates (`src-tauri/vendored/dc-evidence`, `dc-glob`, `dc-proc`,
+   `dc-redact`, `dc-regress`, `dc-regress-store`, `dc-store`, `devmap-analyze`,
+   `devmap-extract`, `devmap-query`, `devmap-resolve`, `devmap-store`)
+   https://github.com/bharathvbcr/DevCouncil
+   Copyright (c) 2026 Bharath Chandra Vaddaram.
+   Licensed under the Apache License, Version 2.0; you may not use these files
+   except in compliance with that License. A copy is at
+   https://www.apache.org/licenses/LICENSE-2.0. These crates are distributed on
+   an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+   or implied. Only `Cargo.toml`, `src/` and `build.rs` are vendored. Each
+   `Cargo.toml` is changed to replace workspace inheritance with concrete values,
+   and every such change is listed in `src-tauri/vendored/VENDOR.json`. The
+   source files are not edited, and `bun run vendor:check` compares each copy with
+   its upstream.
+
+The GitPulse name and logo are trademarks of Bharath Chandra Vaddaram and are not
+licensed under the MIT License. See TRADEMARKS.md.
