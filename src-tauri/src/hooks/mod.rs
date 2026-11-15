@@ -57,6 +57,7 @@ pub use notify_input::SESSION_END_HOST_TIMEOUT;
 use notify_outcome::send_unsupported as notify_send;
 pub use notify_outcome::{diagnostic, Diagnostic, HookError, SendError};
 pub mod signal_guard;
+mod turn_checkpoint;
 pub mod worktree;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -3691,8 +3692,12 @@ fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<
 /// CLI, and Antigravity IDE.
 pub fn run_peer_inbox(input: &HookInput) -> HookOutput {
     let owned = input.clone();
-    within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
-        .unwrap_or_else(HookOutput::silent)
+    let output = within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
+        .unwrap_or_else(HookOutput::silent);
+    if input.hook_event_name == "UserPromptSubmit" {
+        let _ = turn_checkpoint::at_turn_start(input);
+    }
+    output
 }
 
 fn trusted_hook_root(input: &HookInput) -> Option<PathBuf> {
@@ -3936,6 +3941,8 @@ pub(crate) fn stop_continue_in(
         let _ = mailbox.clear_stop_continue(&input.session_id);
     }
     let _ = upsert_hook_peer(&root, input, "idle");
+    // The turn really ends here: nothing continued it.
+    let _ = turn_checkpoint::at_turn_end(input);
     None
 }
 

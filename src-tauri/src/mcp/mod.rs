@@ -54,6 +54,8 @@ mod merge_conflicts_tool_tests;
 pub mod page;
 pub mod prompts;
 pub mod resources;
+#[cfg(test)]
+mod turn_checkpoints_tool_tests;
 pub mod uri;
 pub mod validate;
 // Unix-only: its `devmap` stand-in is a shell script.
@@ -599,6 +601,27 @@ tool_args! {
         task_id: Option<String> = Spec::bytes("Only events attributed to this task id", 1, LEDGER_FILTER_MAX_BYTES),
         session_id: Option<String> = Spec::bytes("Only events from this agent session id", 1, LEDGER_FILTER_MAX_BYTES),
         after_ref: Option<String> = Spec::bytes("Only events whose after_ref is exactly this (a commit or ref value). Not index-backed: stops at `limit` matches", 1, LEDGER_FILTER_MAX_BYTES),
+    }
+}
+
+tool_args! {
+    struct TurnCheckpointsArgs {
+        repo_path: String = repo_spec(),
+        id: Option<String> = Spec::bytes(
+            "A checkpoint id from the list (the digits of its stamp). With it, returns that checkpoint's patch instead of the list",
+            1,
+            20,
+        ),
+        against: Option<String> = Spec::bytes(
+            "With `id`: another of this worktree's checkpoint ids to compare against, instead of the checkpoint's parent commit",
+            1,
+            20,
+        ),
+        limit: Option<u32> = Spec::int(
+            "Maximum number of checkpoints listed (default 20, max 50)",
+            1,
+            crate::engine::turn_checkpoint::MAX_LIST_LIMIT as u64,
+        ),
     }
 }
 
@@ -1955,6 +1978,26 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": ["ok", "events", "returned", "truncated"]
             }),
+        ),
+        tool(
+            "gitpulse_turn_checkpoints",
+            "Turn checkpoints",
+            "Read this worktree's turn checkpoints: commits under `refs/gitpulse/turns/<key>/<stamp>` holding the worktree's files at an agent turn boundary, when the person turned `turn_checkpoints.enabled` on. Without `id`, lists them newest first (`id`, `created_at`, `label`, `event` `turn_start` or `turn_end`, `session_id`, `branch`, and `files`, `additions`, `deletions` against the previous checkpoint, the oldest against its parent commit; `stats_complete` false when a count was cut), bounded by `limit` with `truncated` true when older ones are not shown. With `id`, returns that checkpoint's patch against its parent commit, or against `against` (another checkpoint of this worktree): at most 256 KiB, `truncated` says when it was cut, and a credential shape in the patch is redacted (`redacted`). A checkpoint can be PARTIAL: `omissions` says how many untracked files it left out and why (files whose name starts with `.env`, files the leak scanner flagged, unreadable or special files, nested repositories, GitPulse's own state), and `wholesale` names the reason when no untracked file was taken at all (`cap_exceeded` with the cap and the found counts, `scan_failed`, `scan_timeout`, `listing_failed`); never read a checkpoint with `untracked_omitted` above 0 as the whole worktree. Ignored files are never captured. Checkpoints are visible only to the worktree that took them: ids from another worktree of the same repository do not resolve. Read-only: nothing is restored, and no ref, index or working file is written. An empty list means no checkpoint was recorded (the setting is off, the app was not running, or none was taken yet), not that nothing changed.",
+            TurnCheckpointsArgs::properties(),
+            &TurnCheckpointsArgs::required(),
+            ok_error_output(
+                json!({
+                    "key": { "type": "string" },
+                    "total": { "type": "integer" },
+                    "truncated": { "type": "boolean" },
+                    "checkpoints": {
+                        "type": "array",
+                        "items": { "type": "object" }
+                    },
+                    "diff": { "type": "object" }
+                }),
+                &[],
+            ),
         ),
         tool(
             "gitpulse_task_view",
@@ -3719,6 +3762,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }))
         }
         "gitpulse_ledger_events" => ledger_events(parse(name, arguments)?),
+        "gitpulse_turn_checkpoints" => Ok(turn_checkpoints(parse(name, arguments)?)),
         "gitpulse_task_view" => task_view(parse(name, arguments)?),
         "gitpulse_add_task" => {
             let a: AddTaskArgs = parse(name, arguments)?;
@@ -4893,6 +4937,36 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
 /// What a read or a write of a task that must already exist says when this
 /// machine has no board.
 const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
+
+/// `gitpulse_turn_checkpoints`: the worktree's checkpoint list, or one
+/// checkpoint's bounded patch. A read that could not run says `ok: false` and
+/// why; it is never an empty list.
+fn turn_checkpoints(a: TurnCheckpointsArgs) -> Value {
+    use crate::engine::turn_checkpoint as tc;
+    let refused = |error: String| json!({ "ok": false, "error": error, "checkpoints": [] });
+    match a.id.as_deref() {
+        Some(id) => match tc::diff_turn_checkpoint(&a.repo_path, id, a.against.as_deref()) {
+            Ok(diff) => json!({ "ok": true, "error": "", "diff": diff }),
+            Err(error) => refused(error),
+        },
+        None => {
+            if a.against.is_some() {
+                return refused("`against` needs an `id` to compare it with".into());
+            }
+            match tc::list_turn_checkpoints(&a.repo_path, a.limit.unwrap_or(20) as usize) {
+                Ok(list) => json!({
+                    "ok": true,
+                    "error": "",
+                    "key": list.key,
+                    "total": list.total,
+                    "truncated": list.truncated,
+                    "checkpoints": list.entries,
+                }),
+                Err(error) => refused(error),
+            }
+        }
+    }
+}
 
 fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
     let (address, caveat) = with_production_retry(|retry| read_target(&a.repo_path, retry))?;
@@ -6800,6 +6874,10 @@ mod tests {
         (
             "gitpulse_ledger_events",
             "the fixture ledger holds no events; page budgets are held by the ledger page tests",
+        ),
+        (
+            "gitpulse_turn_checkpoints",
+            "no fixture worktree holds a checkpoint; the list and patch bounds are held by the turn_checkpoint engine tests",
         ),
         (
             "gitpulse_import_tasks",
@@ -11018,6 +11096,7 @@ mod tests {
             ("gitpulse_merge_conflicts", RepoArgs),
             ("gitpulse_change_context", ChangeContextArgs),
             ("gitpulse_ledger_events", LedgerEventsArgs),
+            ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
             ("gitpulse_task_view", TaskViewArgs),
             ("gitpulse_add_task", AddTaskArgs),
             ("gitpulse_import_tasks", ImportTasksArgs),
@@ -11149,6 +11228,7 @@ mod tests {
                 ("gitpulse_merge_conflicts", RepoArgs),
                 ("gitpulse_change_context", ChangeContextArgs),
                 ("gitpulse_ledger_events", LedgerEventsArgs),
+                ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
                 ("gitpulse_task_view", TaskViewArgs),
                 ("gitpulse_add_task", AddTaskArgs),
                 ("gitpulse_import_tasks", ImportTasksArgs),

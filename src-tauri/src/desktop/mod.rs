@@ -452,7 +452,8 @@ pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
         | instance::Request::InsightsRead { .. }
         | instance::Request::TerminalOrchestrate { .. }
         | instance::Request::AgentDeliver { .. }
-        | instance::Request::RecordGitOp { .. } => {}
+        | instance::Request::RecordGitOp { .. }
+        | instance::Request::RecordTurnCheckpoint { .. } => {}
         // An agent's `gitpulse_browser_open`. The window opens the repository
         // and its dock's browser tab (`browseRequests.ts`); the request was
         // validated (absolute repository, loopback URL) before it got here.

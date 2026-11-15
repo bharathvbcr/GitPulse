@@ -6042,6 +6042,64 @@ pub fn record_unsnapshotted_git_op(
     })
 }
 
+/// Ledger action of a turn checkpoint attempt.
+pub const TURN_CHECKPOINT_ACTION: &str = "turn.checkpoint";
+
+/// Appends one row for a turn checkpoint attempt that reached the app:
+/// `checkpoint` is `captured`, `unchanged`, `coalesced`, `skipped` or `failed`.
+/// Only `captured` and `unchanged` are `ok`; an attempt that produced no
+/// checkpoint never reads as one that did. `omissions` carries the untracked
+/// files left out and why, so a partial snapshot is not mistaken for a whole one.
+#[allow(clippy::too_many_arguments)]
+pub fn record_turn_checkpoint_event(
+    repo_path: &str,
+    session_id: Option<&str>,
+    event: &str,
+    checkpoint: &str,
+    reason: Option<&str>,
+    ref_name: Option<&str>,
+    head: Option<&str>,
+    omissions: &serde_json::Value,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, None, now_ms);
+    let detail_json = serde_json::to_string(&serde_json::json!({
+        "source": "turn_checkpoint",
+        "event": event,
+        "checkpoint": checkpoint,
+        "reason": reason,
+        "ref": ref_name,
+        "omissions": omissions,
+    }))
+    .ok();
+    let produced = matches!(checkpoint, "captured" | "unchanged");
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("gitpulse-turn-checkpoint".to_string()),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        task_id: resolved_task,
+        action: TURN_CHECKPOINT_ACTION.to_string(),
+        object: Some(ref_name.map_or_else(|| checkpoint.to_string(), str::to_string)),
+        outcome: Some(if produced {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        }),
+        before_ref: head.map(str::to_string),
+        after_ref: ref_name
+            .filter(|_| checkpoint == "captured")
+            .map(str::to_string),
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
 /// Appends the restore row when snapshot `seq` is restored via CAS `update-ref`,
 /// recording `before_ref` and `after_ref` beside `occurred_at`.
 pub fn record_op_undo_event(

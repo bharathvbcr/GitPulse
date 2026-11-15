@@ -60,6 +60,8 @@ const MAX_PATH_BYTES: usize = 1024;
 /// The longest command line a hook may ask the app to judge. A longer one is
 /// judged by the hook's own path, which has no frame to fit in.
 const MAX_GATE_COMMAND_BYTES: usize = 48 * 1024;
+/// The longest label a turn-checkpoint request may carry.
+const MAX_CHECKPOINT_LABEL_BYTES: usize = 4 * 1024;
 /// Native notification identifiers are well under this; see
 /// `alerts::native_session_key` and `workbench::notifications::owned`, which
 /// validate them properly on the owner's side.
@@ -82,6 +84,14 @@ const MAX_ORCHESTRATE_HANDLERS: usize = 8;
 /// Agent A2A deliveries/kickoffs in flight at once: a share of
 /// [`MAX_GATE_HANDLERS`], bounded inside [`HANDLER_TIMEOUT`].
 const MAX_DELIVER_HANDLERS: usize = 4;
+/// Turn checkpoint captures in flight at once: a share of
+/// [`MAX_GATE_HANDLERS`], so the 14 slots left are always a verdict's. A capture
+/// outlives its hook's 1 s wait (scan bound plus git calls of up to 90 s each)
+/// and is asked at both boundaries of every turn, so it must not be able to
+/// hold more than a sliver. Two lets one worktree's start and another's end
+/// overlap; a third request is answered "busy" and its hook reports "not
+/// captured". Captures of one worktree already coalesce in the engine.
+const MAX_CHECKPOINT_HANDLERS: usize = 2;
 /// Longest prompt text an unattended `gitpulse_kickoff_agent` spawn may pass.
 const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
 /// Requests held for an owner whose window is not up yet.
@@ -216,6 +226,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
     },
+    /// Asks the app owner to take a turn checkpoint of the worktree at `cwd`
+    /// (`refs/gitpulse/turns/<key>/<stamp>`) at an agent turn boundary;
+    /// answered synchronously on the connection like [`Request::RecordGitOp`].
+    /// `event` is `turn_start` or `turn_end`. An owner that predates this
+    /// request refuses the unknown `kind` and the hook reports "not captured";
+    /// the protocol version is deliberately not bumped for it (see
+    /// [`Request::InsightsRead`]), and an old hook never sends it.
+    RecordTurnCheckpoint {
+        id: String,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        event: String,
+        /// A one-line label (what the turn ended on); redacted by the owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 }
 
 impl Request {
@@ -228,7 +255,8 @@ impl Request {
             | Request::InsightsRead { id, .. }
             | Request::TerminalOrchestrate { id, .. }
             | Request::AgentDeliver { id, .. }
-            | Request::RecordGitOp { id, .. } => Some(id),
+            | Request::RecordGitOp { id, .. }
+            | Request::RecordTurnCheckpoint { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -484,6 +512,39 @@ impl Request {
                     if tid.len() > MAX_NATIVE_ID || tid.chars().any(char::is_control) {
                         return Err("op-record task_id is too long or not printable".into());
                     }
+                }
+                Ok(())
+            }
+            Request::RecordTurnCheckpoint {
+                id,
+                cwd,
+                session_id,
+                event,
+                label,
+            } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("checkpoint request id is empty, too long or not printable".into());
+                }
+                if cwd.is_empty()
+                    || cwd.len() > MAX_PATH_BYTES
+                    || cwd.contains('\0')
+                    || !Path::new(cwd).is_absolute()
+                {
+                    return Err("checkpoint cwd must be an absolute path".into());
+                }
+                if !matches!(event.as_str(), "turn_start" | "turn_end") {
+                    return Err("checkpoint event must be turn_start or turn_end".into());
+                }
+                if let Some(sid) = session_id.as_deref() {
+                    if sid.len() > MAX_NATIVE_ID || sid.chars().any(char::is_control) {
+                        return Err("checkpoint session_id is too long or not printable".into());
+                    }
+                }
+                if label
+                    .as_deref()
+                    .is_some_and(|l| l.len() > MAX_CHECKPOINT_LABEL_BYTES)
+                {
+                    return Err("checkpoint label is too long".into());
                 }
                 Ok(())
             }
@@ -923,6 +984,19 @@ impl Secondary {
         self.answered(request, within)
     }
 
+    /// Asks the owner to take a turn checkpoint: the owner's reply to
+    /// [`Request::RecordTurnCheckpoint`].
+    pub fn record_turn_checkpoint(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::RecordTurnCheckpoint { .. }) {
+            return Err("not a turn-checkpoint request".into());
+        }
+        self.answered(request, within)
+    }
+
     fn answered(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
         let id = request
             .answered_id()
@@ -994,6 +1068,10 @@ pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String>
 /// Snapshots pre-op refs and `git stash create` under `refs/gitpulse/ops/<n>`.
 pub type OpRecordSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 
+/// Takes a turn checkpoint (`refs/gitpulse/turns/<key>/<stamp>`).
+pub type TurnCheckpointSink =
+    Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
+
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
 #[derive(Default)]
@@ -1012,11 +1090,14 @@ struct Shared {
     insights: Mutex<Option<InsightsSink>>,
     deliver: Mutex<Option<DeliverSink>>,
     op_record: Mutex<Option<OpRecordSink>>,
+    turn_checkpoint: Mutex<Option<TurnCheckpointSink>>,
     /// Insights reads in flight, a share of `gating` of their own.
     reading: AtomicUsize,
     orchestrate: Mutex<Option<OrchestrateSink>>,
     /// Agent deliveries in flight, a share of `gating` of their own.
     delivering: AtomicUsize,
+    /// Turn checkpoint captures in flight, a share of `gating` of their own.
+    checkpointing: AtomicUsize,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -1039,9 +1120,11 @@ impl Shared {
             insights: Mutex::new(None),
             deliver: Mutex::new(None),
             op_record: Mutex::new(None),
+            turn_checkpoint: Mutex::new(None),
             reading: AtomicUsize::new(0),
             orchestrate: Mutex::new(None),
             delivering: AtomicUsize::new(0),
+            checkpointing: AtomicUsize::new(0),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -1197,6 +1280,16 @@ impl Primary {
         *self
             .shared
             .op_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where turn checkpoint requests ([`Request::RecordTurnCheckpoint`]) are
+    /// answered. Until this is called they are refused.
+    pub fn attach_turn_checkpointer(&self, sink: TurnCheckpointSink) {
+        *self
+            .shared
+            .turn_checkpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1577,6 +1670,11 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if let Request::RecordGitOp { id, .. } = &request {
         return answer_op_record(stream, shared, id, &request).map_err(Ended::Refused);
     }
+    if let Request::RecordTurnCheckpoint { id, .. } = &request {
+        return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {
+            Ended::after_ask(stream, "the turn checkpoint", true, started, reason)
+        });
+    }
     let verdict = admit(shared, request);
     let ack = match &verdict {
         Ok(_) => Ack::accepted(),
@@ -1668,6 +1766,41 @@ fn answer_op_record(
     answer_asked(stream, shared, id, "the op log", || {
         attached(&shared.op_record, "the op log")?(request)
     })
+}
+
+fn answer_turn_checkpoint(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    request: &Request,
+) -> Result<(), String> {
+    let capturing = CheckpointSlot::take(shared);
+    answer_asked(stream, shared, id, "the turn checkpoint", || {
+        if capturing.is_none() {
+            return Err("the turn checkpoint is busy".to_string());
+        }
+        attached(&shared.turn_checkpoint, "the turn checkpoint")?(request)
+    })
+}
+
+/// One of the [`MAX_CHECKPOINT_HANDLERS`] turn checkpoints in flight, released
+/// on drop.
+struct CheckpointSlot<'a>(&'a Shared);
+
+impl<'a> CheckpointSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.checkpointing.fetch_add(1, Ordering::AcqRel) >= MAX_CHECKPOINT_HANDLERS {
+            shared.checkpointing.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for CheckpointSlot<'_> {
+    fn drop(&mut self) {
+        self.0.checkpointing.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The sink in `slot`, cloned out so its lock is not held while the answer is

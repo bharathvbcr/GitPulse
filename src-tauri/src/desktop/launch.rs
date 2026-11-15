@@ -114,6 +114,11 @@ pub fn establish() -> Launch {
                 primary.attach_op_recorder(std::sync::Arc::new(|request| {
                     crate::engine::GitWriter::serve_op_record(request)
                 }));
+                // Turn checkpoints (`refs/gitpulse/turns/*`) requested by the
+                // decide-only hook at turn boundaries, when the user enabled them.
+                primary.attach_turn_checkpointer(std::sync::Arc::new(|request| {
+                    crate::engine::turn_checkpoint::serve_turn_checkpoint(request)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch
