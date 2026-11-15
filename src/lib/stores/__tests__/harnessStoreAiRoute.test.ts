@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
+import { IpcError } from "../../ipc/invoke";
 import {
   createHarnessStore,
   deriveAiReadiness,
@@ -188,6 +189,33 @@ describe("the store", () => {
     await fallbackStore.selectModel({ base_url: local.base_url, model: "llama" });
     expect(old.calls.some((c) => c.cmd === "cmd_manvi_use")).toBe(false);
     expect(get(fallbackStore).preferred).toEqual({ base_url: local.base_url, model: "llama" });
+  });
+
+  it("accepting the loopback consent dialog remembers GitPulse's own selection and never writes Manvi's config", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    const invokeFn = (async (cmd: string, args?: Record<string, unknown>) => {
+      calls.push({ cmd, args: args ?? {} });
+      if (cmd === "cmd_ai_status") return ai(localManvi());
+      if (cmd === "cmd_manvi_use") return localManvi();
+      if (cmd === "cmd_ai_generate_commit_message" && !args?.baseUrl) {
+        throw new IpcError("ai_endpoint_unconfirmed", "Confirm where to send this.", {
+          base_url: "http://127.0.0.1:8080/v1",
+          model: "found",
+          runtime: "llama.cpp",
+          host: "127.0.0.1",
+          port: 8080,
+          label: "llama.cpp on 127.0.0.1:8080",
+        });
+      }
+      return { text: "ok" };
+    }) as Invoke;
+    const store = createHarnessStore({ invoke: invokeFn, confirm: async () => true });
+    await store.refreshAi();
+    await store.selectModel(null);
+    await store.generateCommitMessage("/repo");
+    await Promise.resolve();
+    expect(get(store).preferred).toEqual({ base_url: "http://127.0.0.1:8080/v1", model: "found" });
+    expect(calls.some((c) => c.cmd === "cmd_manvi_use")).toBe(false);
   });
 
   it("asks for the Claude credential when the status says cloud, and not for local", async () => {

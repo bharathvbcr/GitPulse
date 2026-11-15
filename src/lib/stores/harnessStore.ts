@@ -790,7 +790,12 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         cancelLabel: "Don't send",
       });
       if (!confirmed) return null;
-      void store.selectModel(found.selection);
+      // The dialog promises to remember this server for GitPulse's own
+      // loopback client, nothing more: Manvi's config is written only from
+      // the Manvi pane and the model pickers (`selectModel`).
+      savePreferred(found.selection);
+      update((s) => ({ ...s, preferred: found.selection }));
+      void probeAi(++probeToken);
       return found.selection;
     })();
     return consentFlight;
