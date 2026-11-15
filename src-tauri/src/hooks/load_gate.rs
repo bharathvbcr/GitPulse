@@ -116,6 +116,11 @@ pub(super) struct Gathered {
     pub state_dir: PathBuf,
     pub now: SystemTime,
     pub disk: DiskFacts,
+    /// Free bytes on the volume holding a path, `None` when it cannot be read;
+    /// the real reader, or a stand-in a test injects. It reads the volumes a
+    /// line names as its build directory, which are known only once the line
+    /// has been classified.
+    pub read_free: fn(&Path) -> Option<u64>,
 }
 
 /// What the disk checks need, read once per heavy command.
@@ -221,6 +226,7 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
         state_dir: marker_dir(),
         now: SystemTime::now(),
         disk,
+        read_free: real_free,
     };
     if mode == HostLoadHookMode::Off {
         return live(
@@ -230,7 +236,6 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
         );
     }
     let exempt = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|label| !label.is_empty());
-    let mut snapshot_free = None;
     let availability = match crate::tool_config::default_config_dir() {
         None => {
             Availability::Unavailable("there is no per-user config directory (HOME unset)".into())
@@ -238,41 +243,63 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
         Some(dir) => {
             let path = dir.join(crate::sysload::SNAPSHOT_FILE_NAME);
             let (report, snapshot) = crate::sysload::report(&path, crate::sysload::Clock::now());
-            snapshot_free = snapshot
-                .as_ref()
-                .filter(|_| report.state.governs())
-                .and_then(|s| s.host.free_disk.value());
             availability_of(&report, snapshot.as_ref())
         }
     };
     live(
         availability,
         exempt,
-        DiskFacts::from_settings(live_free_bytes(cwd, snapshot_free, |path| {
-            crate::sysload::free_bytes(path).value()
-        })),
+        DiskFacts::from_settings(live_free_bytes(
+            cwd,
+            std::env::current_dir().ok(),
+            real_free,
+        )),
     )
+}
+
+/// The real reader of [`Gathered::read_free`].
+fn real_free(path: &Path) -> Option<u64> {
+    crate::sysload::free_bytes(path).value()
 }
 
 /// Free bytes on the volume the command writes to, read now: the working
 /// directory the hook was given (`cwd`, which is the session's, and for an
 /// orchestrated child terminal is not this process's: the hook then runs inside
-/// the GitPulse app). When there is none, or it cannot be read, this process's
-/// own working directory, then the snapshot's reading (two seconds old, and of
-/// the volume holding GitPulse's state). `None` only when none of them can be
-/// read: never a number that was not measured.
+/// the GitPulse app).
+///
+/// A `cwd` that was given and cannot be read (relative, missing, denied) is
+/// `None`, never another volume's number: the process's directory, or the
+/// snapshot's reading of the volume holding GitPulse's state, would be
+/// reported as room the command may not have. Only when no `cwd` was given is
+/// the process's own directory the best guess there is.
 fn live_free_bytes(
     cwd: &str,
-    snapshot: Option<u64>,
+    process_dir: Option<PathBuf>,
     read: impl Fn(&Path) -> Option<u64>,
 ) -> Option<u64> {
-    let own = || std::env::current_dir().ok();
-    Some(cwd)
-        .filter(|cwd| !cwd.is_empty())
-        .map(PathBuf::from)
-        .and_then(|dir| read(&dir))
-        .or_else(|| own().and_then(|dir| read(&dir)))
-        .or(snapshot)
+    if cwd.is_empty() {
+        return process_dir.and_then(|dir| read(&dir));
+    }
+    let dir = Path::new(cwd);
+    dir.is_absolute().then(|| read(dir)).flatten()
+}
+
+/// Free space on a build directory's volume: that of its nearest ancestor
+/// that can be read, since the directory itself may not exist yet.
+fn free_at_or_above(dir: &Path, read: impl Fn(&Path) -> Option<u64>) -> Option<u64> {
+    dir.ancestors().find_map(read)
+}
+
+/// The free space a heavy line is judged on: the smallest reading among the
+/// volume it runs in and the build directories it names literally. A volume
+/// that cannot be read adds nothing; none readable is `None`.
+fn effective_free(cwd_free: Option<u64>, classified: &Classified, g: &Gathered) -> Option<u64> {
+    classified
+        .build_dirs
+        .iter()
+        .filter_map(|dir| free_at_or_above(Path::new(dir), g.read_free))
+        .chain(cwd_free)
+        .min()
 }
 
 /// What a sensor report and its snapshot allow the hook to act on.
@@ -381,7 +408,7 @@ fn disk_check(input: &HookInput, classified: &Classified, heavy: &Hit, g: &Gathe
         return DiskCall::Nothing;
     }
     let refuses = |mode: InputMode| d.refusing && mode == InputMode::Refuse;
-    let Some(free) = d.free_bytes else {
+    let Some(free) = effective_free(d.free_bytes, classified, g) else {
         let why = "free disk space could not be read";
         return match first_notice(g, input, why) {
             Notice::Repeat => DiskCall::Nothing,

@@ -39,6 +39,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         state_dir: dir.join("state"),
         now: SystemTime::now(),
         disk: plenty_of_disk(),
+        read_free: |_| None,
     }
 }
 
@@ -1287,9 +1288,9 @@ fn a_real_coverage_build_behind_a_subcommand_word_is_refused() {
 }
 
 #[test]
-fn free_space_is_read_where_the_command_runs_not_where_the_hook_does() {
+fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_volume() {
     let there = Path::new("/volumes/small/work");
-    let here = std::env::current_dir().unwrap();
+    let here = PathBuf::from("/volumes/big/hook");
     let read = |path: &Path| {
         if path == there {
             Some(5 * GIB)
@@ -1300,24 +1301,148 @@ fn free_space_is_read_where_the_command_runs_not_where_the_hook_does() {
         }
     };
     assert_eq!(
-        live_free_bytes("/volumes/small/work", Some(300 * GIB), read),
+        live_free_bytes("/volumes/small/work", Some(here.clone()), read),
         Some(5 * GIB),
         "the command's own directory wins"
     );
-    assert_eq!(live_free_bytes("", Some(300 * GIB), read), Some(500 * GIB));
     assert_eq!(
-        live_free_bytes("/gone", Some(300 * GIB), read),
+        live_free_bytes("", Some(here.clone()), read),
         Some(500 * GIB),
-        "an unreadable directory falls back to the process's"
+        "no cwd was given: the process's directory is the best guess"
     );
-    assert_eq!(
-        live_free_bytes("/gone", Some(300 * GIB), |_| None),
-        Some(300 * GIB),
-        "then to the snapshot"
+    // A cwd that was given and cannot be read is not "has room".
+    for cwd in ["/gone", "relative/dir", "."] {
+        assert_eq!(
+            live_free_bytes(cwd, Some(here.clone()), read),
+            None,
+            "{cwd:?} must not fall back to the hook process's volume"
+        );
+    }
+    assert_eq!(live_free_bytes("", None, read), None);
+    assert_eq!(live_free_bytes("", Some(here), |_| None), None);
+}
+
+/// A reader for the build-directory tests: `/small` is 5 GiB free, `/big` is
+/// 500, anything else (a directory that does not exist yet) cannot be read.
+fn volumes(path: &Path) -> Option<u64> {
+    if path == Path::new("/small") {
+        Some(5 * GIB)
+    } else if path == Path::new("/big") {
+        Some(500 * GIB)
+    } else {
+        None
+    }
+}
+
+fn on_volumes(dir: &Path, cwd_free_gib: u64) -> Gathered {
+    let mut g = with_free(dir, cwd_free_gib);
+    g.read_free = volumes;
+    g
+}
+
+#[test]
+fn a_literal_absolute_build_directory_is_read_too_and_the_stricter_answer_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    // The working directory has room; the named target directory's volume (its
+    // nearest existing ancestor, since the directory is new) does not.
+    for command in [
+        "cargo build --target-dir /small/new/target",
+        "cargo test --target-dir=/small/new/target",
+        "CARGO_TARGET_DIR=/small/new/target cargo build",
+        "env CARGO_TARGET_DIR=/small/t cargo test --lib",
+        "cd /repo && cargo build --target-dir /small/t",
+    ] {
+        let out = judged(command, &on_volumes(dir.path(), 200));
+        assert_eq!(
+            decision_of(&out),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+        assert!(
+            reason(&out).contains("5.0 GiB"),
+            "{command}: {}",
+            reason(&out)
+        );
+    }
+    // The target directory has room, the working directory does not.
+    let out = judged(
+        "cargo build --target-dir /big/t",
+        &on_volumes(dir.path(), 5),
     );
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    // Both have room: nothing to say.
+    assert!(judged(
+        "cargo build --target-dir /big/t",
+        &on_volumes(dir.path(), 200)
+    )
+    .is_silent());
+    // A relative or computed directory is not read: the working directory's
+    // answer stands.
+    assert!(judged(
+        "cargo build --target-dir target",
+        &on_volumes(dir.path(), 200)
+    )
+    .is_silent());
+    // An unreadable target volume adds nothing; the working directory decides.
+    assert!(judged(
+        "cargo build --target-dir /nowhere/t",
+        &on_volumes(dir.path(), 200)
+    )
+    .is_silent());
+}
+
+#[test]
+fn a_directory_changed_into_by_the_line_is_not_covered_and_the_docs_say_so() {
+    let dir = tempfile::tempdir().unwrap();
+    // `cd /small && cargo build` writes to /small, which the hook cannot know
+    // without evaluating the shell: only the cwd it was given is read.
+    assert!(judged("cd /small && cargo build", &on_volumes(dir.path(), 200)).is_silent());
+    let docs = include_str!("../../../docs/LOAD_GOVERNOR.md");
+    assert!(
+        docs.contains("cd /elsewhere && cargo build"),
+        "the uncovered case is named"
+    );
+}
+
+#[test]
+fn an_unreadable_given_cwd_advises_and_never_refuses_or_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 200);
+    g.disk.free_bytes = None;
+    let out = judged("cargo build", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+}
+
+#[test]
+fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relative_one() {
+    let serial = crate::test_support::env::env_serial();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let tools = root.path().join("tools.json");
+    std::fs::write(&tools, r#"{"version":1,"host_load_hook_mode":"enforce"}"#).unwrap();
+    let _env = crate::test_support::env::bind_env(&serial)
+        .set("HOME", &home)
+        .set("XDG_CONFIG_HOME", home.join(".config"))
+        .set(crate::tool_config::TOOL_CONFIG_ENV, &tools)
+        .invalidating(crate::tool_config::invalidate_cache);
+    let here = root.path().to_string_lossy().into_owned();
+    let free = gather_live(&here).disk.free_bytes;
+    assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+    let gone = root.path().join("missing").to_string_lossy().into_owned();
     assert_eq!(
-        live_free_bytes("/gone", None, |_| None),
+        gather_live(&gone).disk.free_bytes,
         None,
-        "could not read is not has room"
+        "a missing cwd is not has room"
+    );
+    assert_eq!(gather_live("relative/dir").disk.free_bytes, None);
+    assert!(
+        gather_live("").disk.free_bytes.is_some(),
+        "no cwd given: the process's own directory"
     );
 }

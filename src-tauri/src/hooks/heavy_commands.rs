@@ -220,6 +220,9 @@ struct Wrapper {
     /// When set, the program only wraps if its first operand is one of these
     /// (`pnpm exec vitest`, not `pnpm test`).
     verbs: &'static [&'static str],
+    /// Operands that follow its options (and its verb) before the command:
+    /// `timeout 10m cargo test` has one, the duration.
+    operands: usize,
 }
 
 const WRAPPERS: &[Wrapper] = &[
@@ -227,66 +230,97 @@ const WRAPPERS: &[Wrapper] = &[
         name: "env",
         value_flags: &["-u", "-C", "-S", "-P"],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "time",
         value_flags: &["-f", "-o"],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "nice",
         value_flags: &["-n"],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "nohup",
         value_flags: &[],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "exec",
         value_flags: &["-a"],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "command",
         value_flags: &[],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "builtin",
         value_flags: &[],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "npx",
         value_flags: &["-p", "--package", "-c"],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "bunx",
         value_flags: &[],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "pnpx",
         value_flags: &[],
         verbs: &[],
+        operands: 0,
     },
     Wrapper {
         name: "pnpm",
         value_flags: &["--filter", "-F", "--dir", "-C"],
         verbs: &["exec", "dlx"],
+        operands: 0,
     },
     Wrapper {
         name: "npm",
         value_flags: &["--prefix", "-C"],
         verbs: &["exec"],
+        operands: 0,
     },
     Wrapper {
         name: "bun",
         value_flags: &["--cwd"],
         verbs: &["x"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "timeout",
+        value_flags: &["-s", "--signal", "-k", "--kill-after"],
+        verbs: &[],
+        operands: 1,
+    },
+    Wrapper {
+        name: "caffeinate",
+        value_flags: &["-t", "-w"],
+        verbs: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "rustup",
+        value_flags: &[],
+        verbs: &["run"],
+        operands: 1,
     },
 ];
 
@@ -323,9 +357,19 @@ pub(super) struct Classified {
     /// A word of the table was in the line but the line could not be read, so
     /// nothing above says anything about it. Never a refusal.
     pub unreadable: bool,
+    /// Absolute build directories the line names literally (`--target-dir
+    /// /x`, `--target-dir=/x`, `CARGO_TARGET_DIR=/x`), in order: the volumes a
+    /// build writes to besides the working directory's.
+    pub build_dirs: Vec<String>,
 }
 
 impl Classified {
+    fn note_build_dir(&mut self, dir: &str) {
+        if dir.starts_with('/') && !self.build_dirs.iter().any(|seen| seen == dir) {
+            self.build_dirs.push(dir.to_string());
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.heavy.is_none() && self.advise.is_empty() && !self.unreadable
     }
@@ -402,9 +446,17 @@ fn skip_options(words: &[String], mut at: usize, value_flags: &[&str]) -> usize 
 
 fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
     let mut at = 0;
+    // `RUSTFLAGS=-Cinstrument-coverage` ahead of the program (or of `env`).
+    let mut instrumented = false;
     let program = loop {
         let Some(word) = words.get(at) else { return };
         if is_assignment(word) || KEYWORDS.contains(&word.as_str()) {
+            if let Some(("RUSTFLAGS", flags)) = word.split_once('=') {
+                instrumented |= flags.replace(' ', "").contains("-Cinstrument-coverage");
+            }
+            if let Some(("CARGO_TARGET_DIR", dir)) = word.split_once('=') {
+                out.note_build_dir(dir);
+            }
             at += 1;
             continue;
         }
@@ -425,11 +477,19 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
                 if !w.verbs.is_empty() {
                     at += 1;
                 }
+                at += w.operands;
             }
             None => break base,
         }
     };
     let args = &words[at + 1..];
+    note_target_dirs(args, out);
+    // The installed binary run by its own name is `cargo llvm-cov`.
+    let program = if program == "cargo-llvm-cov" && args.first().is_some_and(|a| a == "llvm-cov") {
+        "cargo"
+    } else {
+        program
+    };
     if SHELLS.contains(&program) {
         if args
             .first()
@@ -460,7 +520,8 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
             row,
             label: label_of(program, args, row),
         };
-        out.coverage_build |= coverage == Some(true);
+        out.coverage_build |=
+            coverage == Some(true) || (instrumented && builds_code(program, args, row));
         match row.kind {
             Kind::Heavy if out.heavy.is_none() => out.heavy = Some(hit),
             Kind::Heavy => {}
@@ -472,13 +533,42 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
     }
 }
 
+/// `--target-dir <abs>` and `--target-dir=<abs>` among a command's words.
+fn note_target_dirs(args: &[String], out: &mut Classified) {
+    for (i, word) in args.iter().enumerate() {
+        if word == "--" {
+            break;
+        }
+        if let Some(dir) = word.strip_prefix("--target-dir=") {
+            out.note_build_dir(dir);
+        } else if word == "--target-dir" {
+            if let Some(dir) = args.get(i + 1) {
+                out.note_build_dir(dir);
+            }
+        }
+    }
+}
+
+/// Whether this hit compiles code that `RUSTFLAGS=-Cinstrument-coverage` would
+/// instrument: a cargo build, test or bench, not a check or a clippy run.
+fn builds_code(program: &str, args: &[String], row: &Row) -> bool {
+    row.id == "cargo"
+        && program == "cargo"
+        && first_operand(args, row.value_flags).is_some_and(|at| {
+            matches!(
+                args[at].as_str(),
+                "build" | "b" | "test" | "t" | "bench" | "nextest"
+            )
+        })
+}
+
 /// `cargo llvm-cov`'s subcommands that read or remove its output and compile
 /// nothing.
 const LLVM_COV_NON_BUILDING: &[&str] = &["clean", "report", "show-env"];
 
 /// Options of `cargo llvm-cov` that take a value, so the value is not mistaken
 /// for the subcommand. This is the `<ARG>` options of `cargo llvm-cov --help`
-/// (cargo-llvm-cov 0.8.x), not a recollection of them.
+/// (cargo-llvm-cov 0.9.1, the installed one), not a recollection of them.
 const LLVM_COV_VALUE_FLAGS: &[&str] = &[
     "--output-path",
     "--output-dir",
@@ -611,6 +701,13 @@ fn llvm_cov_reading(words: &[String]) -> LlvmCov {
                 LlvmCov::Builds
             };
         }
+        // A cluster of plain short flags (`-vv`, `-qv`) is flags and nothing else.
+        if word.len() > 2
+            && !word.starts_with("--")
+            && word[1..].chars().all(|c| matches!(c, 'q' | 'r' | 'v'))
+        {
+            continue;
+        }
         // `--name=value` carries its value; a short option may too (`-j4`).
         let (name, inline) = match word.split_once('=') {
             Some((name, _)) => (name, true),
@@ -632,17 +729,24 @@ fn llvm_cov_reading(words: &[String]) -> LlvmCov {
     LlvmCov::Builds
 }
 
-/// The operand after `-c` in a shell's own options, when there is one.
+/// The operand after `-c` in a shell's own options, when there is one. Looks
+/// through option clusters (`-euo pipefail -c`, `-o pipefail -c`): an `o` in a
+/// cluster takes the next word as its value, whatever precedes the `c`.
 fn shell_script(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while let Some(word) = args.get(i) {
         i += 1;
-        if word == "--" || !word.starts_with('-') || word.len() < 2 {
+        if word == "--" || !(word.starts_with('-') || word.starts_with('+')) || word.len() < 2 {
             return None;
         }
-        if !word.starts_with("--") && word.contains('c') {
-            return args.get(i).map(String::as_str);
+        if word.starts_with("--") {
+            continue;
         }
+        let values = word.chars().filter(|c| matches!(c, 'o' | 'O')).count();
+        if word.starts_with('-') && word.contains('c') {
+            return args.get(i + values).map(String::as_str);
+        }
+        i += values;
     }
     None
 }

@@ -336,3 +336,104 @@ fn llvm_cov_clean_report_and_show_env_build_nothing_and_are_not_heavy() {
     assert_eq!(heavy("cargo test report").as_deref(), Some("cargo test"));
     assert_eq!(heavy("cargo test clean").as_deref(), Some("cargo test"));
 }
+
+#[test]
+fn timeout_caffeinate_and_rustup_run_are_seen_through() {
+    for command in [
+        "timeout 10m cargo test",
+        "timeout -k 5 -s TERM 10m cargo build",
+        "caffeinate -i cargo test",
+        "caffeinate -t 3600 cargo build",
+        "caffeinate -dimsu -w 123 cargo test",
+        "rustup run stable cargo test",
+        "rustup run nightly-2026-01-01 cargo build",
+        "timeout 5m caffeinate -i rustup run stable cargo test",
+    ] {
+        assert!(heavy(command).is_some(), "{command}");
+    }
+    for command in [
+        "timeout 10m ls",
+        "rustup update",
+        "rustup run stable rustc -V",
+    ] {
+        assert_eq!(heavy(command), None, "{command}");
+    }
+}
+
+#[test]
+fn a_shell_with_option_clusters_before_dash_c_is_read() {
+    for command in [
+        "bash -o pipefail -c 'cargo test'",
+        "bash -euo pipefail -c 'cargo test'",
+        "zsh -e -o errexit -c 'cargo build'",
+        "bash -lc 'cargo test'",
+        "sh -ec 'cargo test'",
+    ] {
+        assert!(heavy(command).is_some(), "{command}");
+    }
+    assert_eq!(heavy("bash -o pipefail script.sh"), None);
+}
+
+#[test]
+fn the_installed_binary_by_its_own_name_is_cargo_llvm_cov() {
+    assert_eq!(coverage("cargo-llvm-cov llvm-cov --lib"), Some(true));
+    assert_eq!(
+        coverage("~/.cargo/bin/cargo-llvm-cov llvm-cov nextest"),
+        Some(true)
+    );
+    assert_eq!(heavy("cargo-llvm-cov llvm-cov clean"), None);
+    assert_eq!(heavy("cargo-llvm-cov llvm-cov --version"), None);
+}
+
+#[test]
+fn rustflags_that_instrument_coverage_make_a_cargo_build_a_coverage_build() {
+    for command in [
+        "RUSTFLAGS=-Cinstrument-coverage cargo test",
+        "RUSTFLAGS=\"-C instrument-coverage\" cargo build",
+        "env RUSTFLAGS=-Cinstrument-coverage cargo test --lib",
+        "CARGO_BUILD_JOBS=2 RUSTFLAGS='-C instrument-coverage -Dwarnings' cargo nextest run",
+    ] {
+        assert_eq!(coverage(command), Some(true), "{command}");
+    }
+    for command in [
+        "RUSTFLAGS=-Dwarnings cargo test",
+        "RUSTFLAGS=-Cinstrument-coverage cargo check",
+        "cargo test",
+    ] {
+        assert_eq!(coverage(command), Some(false), "{command}");
+    }
+}
+
+#[test]
+fn clusters_of_plain_short_flags_do_not_hide_the_exempt_subcommand() {
+    for command in [
+        "cargo llvm-cov -vv clean",
+        "cargo llvm-cov -qv report",
+        "cargo llvm-cov -rv show-env",
+    ] {
+        assert_eq!(heavy(command), None, "{command}");
+    }
+    // A cluster that ends in an option taking a value is not read: a build.
+    assert_eq!(coverage("cargo llvm-cov -vp clean"), Some(true));
+}
+
+#[test]
+fn literal_absolute_build_directories_are_named_and_relative_ones_are_not() {
+    let dirs = |command: &str| classify(command).build_dirs;
+    assert_eq!(dirs("cargo build --target-dir /small/t"), ["/small/t"]);
+    assert_eq!(dirs("cargo build --target-dir=/small/t"), ["/small/t"]);
+    assert_eq!(dirs("CARGO_TARGET_DIR=/small/t cargo test"), ["/small/t"]);
+    assert_eq!(
+        dirs("env CARGO_TARGET_DIR=/small/t cargo test"),
+        ["/small/t"]
+    );
+    assert_eq!(
+        dirs("bash -c 'cargo test --target-dir /a' && cargo build --target-dir /b"),
+        ["/a", "/b"]
+    );
+    assert!(dirs("cargo build --target-dir target").is_empty());
+    assert!(dirs("CARGO_TARGET_DIR=\"$X/t\" cargo test").is_empty());
+    assert!(dirs("cargo build").is_empty());
+    // After a bare `--` the words are the test binary's.
+    assert!(dirs("cargo test -- --target-dir /small/t").is_empty());
+}
