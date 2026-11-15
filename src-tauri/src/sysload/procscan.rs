@@ -2775,12 +2775,12 @@ mod os {
     /// cannot be read is returned with `argv` and `env` empty of knowledge
     /// (`None`), so the caller cannot take it for one that uses nothing.
     pub(crate) fn read_use(pid: i32, buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
-        let basic = basic(pid)?;
-        if basic.zombie {
+        let first = basic(pid)?;
+        if first.zombie {
             return None;
         }
         let cwd = cwd(pid);
-        if basic.uid != uid() {
+        if first.uid != uid() {
             return Some(super::ProcessUse {
                 pid,
                 mine: false,
@@ -2800,12 +2800,29 @@ mod os {
                 argv: Some(argv),
                 env: Some(env),
             }),
-            None => super::process_exists(pid).then_some(super::ProcessUse {
-                pid,
-                mine: true,
-                cwd,
-                ..Default::default()
-            }),
+            // The kernel refused the argument block. A process that is
+            // exiting refuses it too, so ask once more and look at the
+            // process again: one that has gone or is a zombie holds no
+            // arguments and needs none read; one that is alive and still
+            // refuses is unreadable, and stays so in the table.
+            None => match full_procargs(pid, buf) {
+                Some((exe, argv, env)) => Some(super::ProcessUse {
+                    pid,
+                    mine: true,
+                    cwd,
+                    exe: Some(exe),
+                    argv: Some(argv),
+                    env: Some(env),
+                }),
+                None => basic(pid)
+                    .is_some_and(|now| !now.zombie && super::process_exists(pid))
+                    .then_some(super::ProcessUse {
+                        pid,
+                        mine: true,
+                        cwd,
+                        ..Default::default()
+                    }),
+            },
         }
     }
 
@@ -3310,17 +3327,23 @@ mod os {
                 .map(|item| String::from_utf8_lossy(item).into_owned())
                 .collect()
         };
+        let argv = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
+            .ok()
+            .map(split);
+        let env = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
+            .ok()
+            .map(split);
+        // A process that exited while it was read holds nothing to read.
+        if (argv.is_none() || env.is_none()) && stat(pid).is_none_or(|now| now.zombie) {
+            return None;
+        }
         Some(super::ProcessUse {
             pid,
             mine: true,
             cwd,
             exe: exe_path(pid),
-            argv: read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
-                .ok()
-                .map(split),
-            env: read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
-                .ok()
-                .map(split),
+            argv,
+            env,
         })
     }
 
@@ -3803,47 +3826,77 @@ pub(crate) mod tests {
         assert!(parse_procargs2(&[1, 0]).is_none());
     }
 
+    /// The child the real-process test runs: this very test binary, asked to
+    /// run only this test, which holds still until its stdin closes. A
+    /// platform binary such as `/bin/sh` shows no environment to a scan and a
+    /// copy of one is killed by the OS, so the test binary is the one program
+    /// that is both ours to spawn and readable.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn directory_use_child_holds_still_until_stdin_closes() {
+        if std::env::var_os("GITPULSE_DIR_USE_CHILD").is_none() {
+            return;
+        }
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn directory_use_child(
+        scratch: &Path,
+        elsewhere: &Path,
+        name_in_argument: bool,
+    ) -> std::process::Child {
+        use crate::procguard::LockedSpawn;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sysload::procscan::tests::directory_use_child_holds_still_until_stdin_closes",
+                "--nocapture",
+            ])
+            .env("GITPULSE_DIR_USE_CHILD", "1")
+            .current_dir(elsewhere)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if name_in_argument {
+            // Extra test filters are accepted and match nothing: the path
+            // reaches the process's argument list and does nothing else.
+            command.arg(scratch);
+        } else {
+            command.env("CARGO_TARGET_DIR", scratch);
+        }
+        command.spawn_locked().expect("spawn")
+    }
+
     /// The same shape against real processes: neither child stands in the
     /// directory, so the cwd-only check finds nothing and the new one finds
-    /// the child whose argument names it and the one running from inside it.
+    /// the child whose argument names it and the one whose environment does.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn real_processes_naming_a_directory_are_found_where_cwd_is_blind() {
-        use crate::procguard::LockedSpawn;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let scratch = root.join("scratch-target");
         let elsewhere = root.join("elsewhere");
         std::fs::create_dir_all(scratch.join("debug/deps")).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
-        let mut named = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30; :", "sh", "--target-dir"])
-            .arg(&scratch)
-            .current_dir(&elsewhere)
-            .stdin(std::process::Stdio::null())
-            .spawn_locked()
-            .expect("spawn");
-        let mut env_named = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30; :"])
-            .env("CARGO_TARGET_DIR", &scratch)
-            .current_dir(&elsewhere)
-            .stdin(std::process::Stdio::null())
-            .spawn_locked()
-            .expect("spawn");
-        let (named_pid, env_pid) = (
-            i32::try_from(named.id()).unwrap(),
-            i32::try_from(env_named.id()).unwrap(),
+        let mut by_argument = directory_use_child(&scratch, &elsewhere, true);
+        let mut by_environment = directory_use_child(&scratch, &elsewhere, false);
+        let (argument_pid, environment_pid) = (
+            i32::try_from(by_argument.id()).unwrap(),
+            i32::try_from(by_environment.id()).unwrap(),
         );
         let mut found = Vec::new();
-        for _ in 0..200 {
+        let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
             found = processes_using(&scratch).unwrap_or_default();
-            if found.contains(&named_pid) && found.contains(&env_pid) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+            found.contains(&argument_pid) && found.contains(&environment_pid)
+        });
         let blind = working_in(&scratch).expect("scan");
-        for child in [&mut named, &mut env_named] {
+        let detail = dir_use(&scratch).expect("scan").users;
+        for child in [&mut by_argument, &mut by_environment] {
+            drop(child.stdin.take());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -3851,8 +3904,18 @@ pub(crate) mod tests {
             blind.is_empty(),
             "the cwd-only check sees no process: {blind:?}"
         );
-        assert!(found.contains(&named_pid), "{named_pid} not in {found:?}");
-        assert!(found.contains(&env_pid), "{env_pid} not in {found:?}");
+        assert!(
+            seen,
+            "{argument_pid} (argument) and {environment_pid} (environment) not both in {found:?}"
+        );
+        assert!(
+            detail.contains(&(argument_pid, UseKind::Argument)),
+            "{detail:?}"
+        );
+        assert!(
+            detail.contains(&(environment_pid, UseKind::Environment)),
+            "{detail:?}"
+        );
     }
 
     /// A refusal before the dialog never shows it.
