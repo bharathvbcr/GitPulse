@@ -728,10 +728,13 @@ impl BindingHistory {
 /// * a repository with no ledger in any checkout costs no Git at all;
 /// * the ledger is read through a read-only connection: no directory or file
 ///   chmod, no WAL or synchronous pragma, no schema DDL, no cached handle;
-/// * legacy sibling ledgers are never migrated from here. If one holds rows
-///   the anchor has not imported, the binding cannot be ruled out, so the
-///   lookup refuses (`legacy_ledger_unconsolidated`) until GitPulse — which
-///   consolidates whenever it resolves the repository — has run there.
+/// * legacy sibling ledgers are never migrated from here. If one holds an
+///   unimported row the import would keep as a bind or unbind, the binding
+///   cannot be ruled out, so the lookup refuses (`legacy_ledger_unconsolidated`)
+///   until GitPulse — which consolidates whenever it resolves the repository —
+///   has run there. Unimported rows that cannot set a binding (anything but a
+///   bind or unbind, or one the import keeps as history only) do not refuse:
+///   the anchor already holds the answer consolidation would give.
 pub(crate) fn resolve_binding_readonly(
     repo_path: &str,
     worktree_path: &str,
@@ -746,8 +749,8 @@ pub(crate) fn resolve_binding_readonly(
         return Err(LedgerError::new(
             "legacy_ledger_unconsolidated",
             format!(
-                "the worktree ledger at {} holds history not yet consolidated into this \
-                 repository's ledger, so its task binding cannot be ruled out; open this \
+                "the worktree ledger at {} holds bind/unbind history not yet consolidated \
+                 into this repository's ledger, so its task binding cannot be ruled out; open this \
                  repository in GitPulse to consolidate it",
                 source.display()
             ),
@@ -2056,10 +2059,98 @@ mod readonly_tests {
         let resolved = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
         assert_eq!(resolved.map(|b| b.task_id).as_deref(), Some("TASK-LEGACY"));
 
-        // A later legacy row is unimported history again.
+        // Later rows in the sibling's own ledger are unimported again, but
+        // none of them can set a binding: a commit never could, and once the
+        // family's initial pass is over a sibling's bind is imported as
+        // history only. So they no longer refuse every command in every
+        // checkout; the answer is the one consolidation gives.
         record(&worktree);
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            task_id: Some("TASK-LATER".to_string()),
+            action: BIND.to_string(),
+            object: Some(worktree.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("a sibling bind after the initial pass");
+        let before = resolve_binding_readonly(&worktree, &worktree)
+            .expect("rows that cannot set a binding must not refuse");
+        assert_eq!(
+            before.as_ref().map(|b| b.task_id.as_str()),
+            Some("TASK-LEGACY")
+        );
+        repository_address(&repo).expect("GitPulse consolidates again");
+        let after = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+        assert_eq!(
+            before, after,
+            "the read-only answer differs from the consolidated one"
+        );
+    }
+
+    /// The refusal is for history that could decide the binding, not for any
+    /// unimported row. A sibling ledger holding only rows the import can never
+    /// turn into a binding answers now what GitPulse answers after
+    /// consolidating it — even before the family's initial pass, when a
+    /// sibling's bind rows would still count.
+    #[test]
+    fn unimported_history_that_cannot_bind_answers_as_consolidation_would() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        record(&worktree);
+
+        let before = resolve_binding_readonly(&worktree, &worktree)
+            .expect("a sibling holding no binding row must not refuse");
+        assert_eq!(before, None);
+        assert!(
+            !super::super::is_initialised(&repo),
+            "the hook lookup consolidated (created the anchor ledger)"
+        );
+
+        repository_address(&repo).expect("GitPulse consolidates");
+        let after = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+        assert_eq!(
+            before, after,
+            "the read-only answer differs from the consolidated one"
+        );
+    }
+
+    /// A sibling ledger that shrank below its import marker was replaced, and
+    /// consolidation re-reads it from the start under its recorded legacy
+    /// bound, so a bind or unbind inside that bound may still set a binding:
+    /// the lookup keeps refusing until GitPulse has re-read it.
+    #[test]
+    fn a_replaced_sibling_with_a_binding_row_inside_its_legacy_bound_refuses() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            task_id: Some("TASK-LEGACY".to_string()),
+            action: BIND.to_string(),
+            object: Some(worktree.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy binding row");
+        record(&worktree);
+        record(&worktree);
+        repository_address(&repo).expect("GitPulse consolidates");
+        resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+
+        let conn = rusqlite::Connection::open(crate::ledger::ledger_path(&worktree))
+            .expect("open the sibling ledger");
+        conn.execute("DELETE FROM events WHERE id > 1", [])
+            .expect("shrink the sibling below its marker");
+        drop(conn);
+
         let error = resolve_binding_readonly(&worktree, &worktree)
-            .expect_err("a new unimported row refuses again");
+            .expect_err("a re-read source may hold a binding row within its bound");
         assert_eq!(error.code, "legacy_ledger_unconsolidated", "{error}");
     }
 

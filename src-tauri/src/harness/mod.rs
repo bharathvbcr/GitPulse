@@ -1769,11 +1769,14 @@ mod scope_tests {
         let main_path_buf = main.path().canonicalize().expect("canonical repository");
         let main_path = main_path_buf.to_str().expect("utf8 repository");
 
-        // Legacy sibling history the anchor has not imported: Broken.
+        // Legacy sibling history the anchor has not imported, holding a row
+        // that could still set a binding: Broken. (A row that cannot — a
+        // commit — no longer refuses; see `ledger::bindings::readonly_tests`.)
         crate::ledger::append(crate::ledger::Draft {
             repo_path: worktree.clone(),
             worktree_path: Some(worktree.clone()),
-            action: "git.commit".to_string(),
+            object: Some(worktree.clone()),
+            action: crate::ledger::bindings::UNBIND.to_string(),
             actor_kind: Some(crate::ledger::ActorKind::Human),
             outcome: Some(crate::ledger::Outcome::Ok),
             ..Default::default()
