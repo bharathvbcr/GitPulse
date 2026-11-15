@@ -2296,6 +2296,25 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert!(stored.get("host_load_leases").is_none());
             assert!(stored.get("host_load_idle").is_none());
+
+            // A field that differs is the only one written: the slot count
+            // stays unwritten so a later default change still reaches this
+            // person.
+            set_host_load_settings(HostLoadSettings {
+                leases: HostLoadLeases {
+                    wait_max_s: 900,
+                    ..HostLoadLeases::default()
+                },
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                stored["host_load_leases"],
+                serde_json::json!({"wait_max_s": 900})
+            );
         });
     }
 
