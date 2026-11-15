@@ -121,6 +121,13 @@ pub(super) struct LeaseFacts {
     pub not_gated: Option<String>,
     /// Who holds the slots when every one is held.
     pub full: Option<String>,
+    /// Why no build may start at all: the governor's load refuses new work
+    /// (Severe, or launches not admitted). Not the same as every slot held.
+    pub refusing: Option<String>,
+    /// How long a build waits for a slot before it starts without one.
+    pub wait_max_s: u64,
+    /// How long it keeps waiting while load refuses, before it gives up.
+    pub wait_hard_s: u64,
 }
 
 #[cfg(unix)]
@@ -132,22 +139,33 @@ fn live_lease_facts(input: &HookInput, availability: &Availability) -> LeaseFact
     if !on {
         return LeaseFacts::default();
     }
-    let gated = std::env::var_os(super::lease_wrapper::BIN_ENV).is_some()
-        || config
-            .as_deref()
-            .is_some_and(|c| super::lease_wrapper::session_has_path(c, &input.session_id));
+    // Gated means verified: the session-start hook wrote the PATH line to
+    // CLAUDE_ENV_FILE and recorded that it did. GITPULSE_LEASE_BIN alone says
+    // only how the process was started, and a shell startup file can still put
+    // another cargo ahead of the lease folder.
+    let gated = config
+        .as_deref()
+        .is_some_and(|c| super::lease_wrapper::session_has_path(c, &input.session_id));
     let not_gated = (!gated).then(|| {
-        "this session's PATH does not start with GitPulse's lease folder (GITPULSE_LEASE_BIN is not set, and the session-start hook did not add it); start the session from GitPulse, or keep GitPulse's session-start hook enabled".to_string()
+        "the session-start hook has not confirmed that this session's PATH starts with GitPulse's lease folder (it records that when it writes the folder to CLAUDE_ENV_FILE); a shell startup file may also put another cargo ahead of it. Keep GitPulse's session-start hook enabled".to_string()
+    });
+    let load = match availability {
+        Availability::Verdict { verdict, .. } => Load::Verdict(*verdict),
+        Availability::Unavailable(why) => Load::Unknown(why.clone()),
+    };
+    let cap = capacity(settings.slots, &load);
+    let refusing = cap.refuses.then(|| {
+        cap.note
+            .clone()
+            .unwrap_or_else(|| "the host load is too high".to_string())
     });
     let full = (|| {
+        if cap.refuses {
+            return None;
+        }
         let dir = Dir::open(&lease::lease_dir(config.as_deref()?)).ok()?;
-        let load = match availability {
-            Availability::Verdict { verdict, .. } => Load::Verdict(*verdict),
-            Availability::Unavailable(why) => Load::Unknown(why.clone()),
-        };
-        let cap = capacity(settings.slots, &load);
         let board = dir.board(&Own::default());
-        if !board.unreadable.is_empty() || board.holders.len() < cap.slots as usize {
+        if !board.unreadable.is_empty() || board.occupied() < cap.slots as usize {
             return None;
         }
         let who: Vec<String> = board
@@ -165,6 +183,9 @@ fn live_lease_facts(input: &HookInput, availability: &Availability) -> LeaseFact
         on,
         not_gated,
         full,
+        refusing,
+        wait_max_s: settings.wait_max_s,
+        wait_hard_s: settings.wait_hard_s,
     }
 }
 
@@ -203,9 +224,15 @@ fn lease_lines(
             )),
         }
     }
-    if let Some(who) = &facts.full {
+    if let Some(why) = &facts.refusing {
         lines.push(format!(
-            "Every build slot is held ({who}), so this will queue; give the Bash call a 600000 ms timeout or run it in the background."
+            "Host load is refusing new builds ({why}), so this build will wait for it to clear for up to {} minutes and then give up without building. A Bash call does not wait that long: run it in the background, or try again later.",
+            facts.wait_hard_s / 60
+        ));
+    } else if let Some(who) = &facts.full {
+        lines.push(format!(
+            "Every build slot is held ({who}), so this will queue for up to {} minutes and then start without a slot. A Bash call does not wait that long: run it in the background.",
+            facts.wait_max_s / 60
         ));
     }
     lines

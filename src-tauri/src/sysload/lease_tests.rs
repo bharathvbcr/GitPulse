@@ -132,8 +132,14 @@ fn only_as_many_waiters_as_there_are_free_slots_may_take_one() {
 #[test]
 fn a_session_is_named_by_its_terminal_then_its_run_then_its_agent_then_its_parent() {
     let parent = (77, 5);
+    // A task run in a PTY carries both ids: it is a run, and does not queue as
+    // a person at a terminal. Only a terminal with no run id is a person's.
     assert_eq!(
         session_of(Some("term-1"), Some("run-1"), Some((9, 9)), parent),
+        ("run:run-1".into(), Priority::Run)
+    );
+    assert_eq!(
+        session_of(Some("term-1"), None, Some((9, 9)), parent),
         ("terminal:term-1".into(), Priority::Terminal)
     );
     assert_eq!(
@@ -460,4 +466,51 @@ mod disk {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(Dir::open(&link).is_err());
     }
+}
+
+#[test]
+fn a_waiting_wrapper_and_a_proxys_child_are_not_builds_that_bypassed_the_wrapper() {
+    use std::collections::HashSet;
+    // (pid, ppid, is a leased build by argv)
+    let rows = [
+        (1, 0, false),
+        (10, 1, false), // a shell
+        (20, 10, true), // a wrapper waiting for a slot: argv is `cargo build`
+        (30, 10, true), // a build holding a slot (exec'd wrapper)
+        (31, 30, true), // its child
+        (40, 10, true), // a rustup proxy that runs the real cargo as a child
+        (41, 40, true), // the toolchain cargo
+        (50, 10, true), // a build that never went through the wrapper
+        (60, 10, false),
+    ];
+    let covered: HashSet<i32> = [20, 30].into_iter().collect();
+    // Only the proxy chain (one build) and the bypassing build count.
+    assert_eq!(count_unleased(&rows, &covered), 2);
+    // Without the holder and the waiter being known, all four roots count: the
+    // waiting wrapper was the false positive.
+    assert_eq!(count_unleased(&rows, &HashSet::new()), 4);
+}
+
+#[test]
+fn a_queue_only_status_does_not_claim_to_have_counted_what_it_skipped() {
+    let temp = tempfile::tempdir().unwrap();
+    let load = Load::Unknown("test".into());
+    let settings = crate::tool_config::HostLoadLeases::default();
+    let out = status(
+        Some(temp.path()),
+        &settings,
+        &load,
+        Err("skipped".into()),
+        false,
+    );
+    assert_eq!(out.unleased_running, None);
+    assert!(out
+        .unleased_error
+        .as_deref()
+        .unwrap()
+        .contains("queue-only"));
+    assert_eq!(out.misses, None);
+    // A capped miss count is carried as a floor.
+    let capped = status(Some(temp.path()), &settings, &load, Ok((7, true)), false);
+    assert_eq!((capped.misses, capped.misses_truncated), (Some(7), true));
 }

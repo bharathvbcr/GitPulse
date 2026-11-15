@@ -388,6 +388,32 @@ const NEVER_LEASED: &[(&str, &[&str])] = &[
 /// a row that leases, and not a verb that never does.
 pub(super) fn leased(program: &str, args: &[String]) -> bool {
     let name = base_name(program);
+    // A call that only prints help builds nothing. After `--` the words belong
+    // to the program being run, so `cargo test -- --help` still builds.
+    if args
+        .iter()
+        .take_while(|word| word.as_str() != "--")
+        .any(|word| word == "--help" || word == "-h")
+    {
+        return false;
+    }
+    // `cargo llvm-cov clean`, `report` and `show-env` build nothing, and
+    // cleaning has to work on a full disk: the owner's shim exempts them too.
+    if name == "cargo" {
+        let value_flags = ROWS
+            .iter()
+            .find(|row| row.programs.contains(&"cargo"))
+            .map_or(NONE, |row| row.value_flags);
+        if let Some(at) = first_operand(args, value_flags) {
+            if args[at] == "llvm-cov"
+                && args
+                    .get(at + 1)
+                    .is_some_and(|sub| matches!(sub.as_str(), "clean" | "report" | "show-env"))
+            {
+                return false;
+            }
+        }
+    }
     if let Some((_, verbs)) = NEVER_LEASED.iter().find(|(p, _)| *p == name) {
         let value_flags = ROWS
             .iter()

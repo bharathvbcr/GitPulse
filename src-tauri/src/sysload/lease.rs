@@ -161,6 +161,17 @@ pub struct Board {
     /// Slot files and tickets that could not be read: counted, never read as
     /// "free".
     pub unreadable: Vec<String>,
+    /// The slot numbers among them. A slot nobody can read may be held, so it
+    /// counts against the capacity and is never offered as free.
+    pub unreadable_slots: Vec<usize>,
+}
+
+impl Board {
+    /// Slots in use: the ones with a holder and the ones that could not be
+    /// read.
+    pub fn occupied(&self) -> usize {
+        self.holders.len() + self.unreadable_slots.len()
+    }
 }
 
 /// What the governor's verdict is, as far as this module is concerned.
@@ -265,11 +276,13 @@ pub fn session_of(
 ) -> (String, Priority) {
     let plain =
         |s: &&str| !s.is_empty() && s.len() <= 128 && s.chars().all(|c| c.is_ascii_graphic());
-    if let Some(id) = terminal_session.filter(plain) {
-        return (format!("terminal:{id}"), Priority::Terminal);
-    }
+    // A task run is a run even when it runs in a PTY of its own: only a
+    // person's terminal has a terminal session id and no run id.
     if let Some(id) = run_id.filter(plain) {
         return (format!("run:{id}"), Priority::Run);
+    }
+    if let Some(id) = terminal_session.filter(plain) {
+        return (format!("terminal:{id}"), Priority::Terminal);
     }
     match ancestor {
         Some((pid, start)) => (format!("agent:{pid}-{start}"), Priority::Observed),
@@ -303,6 +316,9 @@ pub struct LeaseStatus {
     pub links_missing: Option<String>,
     /// Builds that ran unleased in the last 15 minutes, counted from markers.
     pub misses: Option<u32>,
+    /// The marker directory held more entries than one read looks at, so
+    /// `misses` is a floor.
+    pub misses_truncated: bool,
     pub misses_error: Option<String>,
     /// Heavy builds running that hold no slot (and have no holder above them):
     /// something that never went through the wrapper.
@@ -312,28 +328,26 @@ pub struct LeaseStatus {
     pub now_mono_ns: u64,
 }
 
-/// Counts heavy builds in the process table that hold no slot. `Err` when the
-/// table could not be read.
-#[cfg(unix)]
-pub fn unleased_running(holders: &[LeaseHolder]) -> Result<u32, String> {
-    let table = super::procscan::signal_table()?;
+/// Counts the leased builds among `rows` (`pid`, `ppid`, whether its argv is a
+/// leased build) that hold no slot, are not a wrapper waiting for one, and are
+/// not the child of another counted build. `covered` holds the pids of slot
+/// holders and of waiting wrappers; a descendant of one is covered too. A
+/// proxy that starts the real tool as a child (rustup's `cargo`) is one build.
+pub fn count_unleased(rows: &[(i32, i32, bool)], covered: &std::collections::HashSet<i32>) -> u32 {
     let parent: std::collections::HashMap<i32, i32> =
-        table.rows.iter().map(|r| (r.pid, r.ppid)).collect();
-    let held: std::collections::HashSet<i32> = holders.iter().map(|h| h.pid).collect();
+        rows.iter().map(|&(pid, ppid, _)| (pid, ppid)).collect();
+    let leased: std::collections::HashSet<i32> = rows
+        .iter()
+        .filter(|(_, _, leased)| *leased)
+        .map(|&(pid, _, _)| pid)
+        .collect();
     let mut count = 0;
-    for row in &table.rows {
-        let Some(argv) = &row.argv else { continue };
-        let Some((program, args)) = argv.split_first() else {
-            continue;
-        };
-        if row.real_uid() != table.me_uid || !crate::hooks::build_is_leased(program, args) {
-            continue;
-        }
-        let mut at = row.pid;
-        let mut covered = false;
-        for _ in 0..32 {
-            if held.contains(&at) {
-                covered = true;
+    for &pid in &leased {
+        let mut at = pid;
+        let mut skip = false;
+        for step in 0..32 {
+            if covered.contains(&at) || (step > 0 && leased.contains(&at)) {
+                skip = true;
                 break;
             }
             match parent.get(&at) {
@@ -341,24 +355,52 @@ pub fn unleased_running(holders: &[LeaseHolder]) -> Result<u32, String> {
                 _ => break,
             }
         }
-        if !covered {
+        if !skip {
             count += 1;
         }
     }
-    Ok(count)
+    count
+}
+
+/// Counts heavy builds in the process table that hold no slot. `Err` when the
+/// table could not be read.
+#[cfg(unix)]
+pub fn unleased_running(holders: &[LeaseHolder], waiters: &[LeaseWaiter]) -> Result<u32, String> {
+    let table = super::procscan::signal_table()?;
+    let covered: std::collections::HashSet<i32> = holders
+        .iter()
+        .map(|h| h.pid)
+        .chain(waiters.iter().map(|w| w.record.pid))
+        .collect();
+    let rows: Vec<(i32, i32, bool)> = table
+        .rows
+        .iter()
+        .map(|row| {
+            let leased = row.real_uid() == table.me_uid
+                && row.argv.as_ref().is_some_and(|argv| {
+                    argv.split_first()
+                        .is_some_and(|(program, args)| crate::hooks::build_is_leased(program, args))
+                });
+            (row.pid, row.ppid, leased)
+        })
+        .collect();
+    Ok(count_unleased(&rows, &covered))
 }
 
 #[cfg(not(unix))]
-pub fn unleased_running(_holders: &[LeaseHolder]) -> Result<u32, String> {
+pub fn unleased_running(_holders: &[LeaseHolder], _waiters: &[LeaseWaiter]) -> Result<u32, String> {
     Err("build leases are not supported on this platform".into())
 }
 
 /// The lease state for Health: the setting, the governor's verdict, the board.
+/// `scan_processes` false skips the process-table read behind
+/// `unleased_running`.
 pub fn status(
     config_dir: Option<&Path>,
     settings: &crate::tool_config::HostLoadLeases,
     load: &Load,
-    misses: Result<usize, String>,
+    misses: Result<(usize, bool), String>,
+    scan_processes: bool,
 ) -> LeaseStatus {
     let capacity = capacity(settings.slots, load);
     let mut out = LeaseStatus {
@@ -371,13 +413,17 @@ pub fn status(
         error: None,
         links_missing: None,
         misses: None,
+        misses_truncated: false,
         misses_error: None,
         unleased_running: None,
         unleased_error: None,
         now_mono_ns: super::Clock::now().mono_ns,
     };
     match misses {
-        Ok(n) => out.misses = Some(u32::try_from(n).unwrap_or(u32::MAX)),
+        Ok((n, truncated)) => {
+            out.misses = Some(u32::try_from(n).unwrap_or(u32::MAX));
+            out.misses_truncated = truncated;
+        }
         Err(why) => out.misses_error = Some(why),
     }
     let Some(config) = config_dir else {
@@ -385,12 +431,10 @@ pub fn status(
         return out;
     };
     let bin = bin_dir(config);
-    if let Some(missing) = LINKED_PROGRAMS
-        .iter()
-        .find(|p| bin.join(p).symlink_metadata().is_err())
-    {
-        out.links_missing = Some(format!("{} does not exist", bin.join(missing).display()));
-    }
+    let hook = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("gitpulse-hook")));
+    out.links_missing = links_problem(&bin, hook.as_deref());
     #[cfg(unix)]
     {
         match Dir::open(&lease_dir(config)) {
@@ -407,9 +451,15 @@ pub fn status(
     {
         out.error = Some("build leases are not supported on this platform".into());
     }
-    match unleased_running(&out.holders) {
-        Ok(n) => out.unleased_running = Some(n),
-        Err(why) => out.unleased_error = Some(why),
+    if scan_processes {
+        match unleased_running(&out.holders, &out.queue) {
+            Ok(n) => out.unleased_running = Some(n),
+            Err(why) => out.unleased_error = Some(why),
+        }
+    } else {
+        // The process table is the costly part of a read. A caller that asked
+        // for the queue alone is told this was not read, not that it was zero.
+        out.unleased_error = Some("not read: this was a queue-only read".into());
     }
     out
 }
@@ -441,6 +491,36 @@ fn parse_record(bytes: &[u8]) -> Option<LeaseRecord> {
 /// The programs the app links into [`bin_dir`].
 pub const LINKED_PROGRAMS: [&str; 2] = ["cargo", "go"];
 
+/// Why the links in `bin` do not work, or `None` when every one resolves to a
+/// file (a dangling link is not a link) and, where `hook` is known, to that
+/// binary.
+pub fn links_problem(bin: &Path, hook: Option<&Path>) -> Option<String> {
+    let want = hook.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    for name in LINKED_PROGRAMS {
+        let link = bin.join(name);
+        if link.symlink_metadata().is_err() {
+            return Some(format!("{} does not exist", link.display()));
+        }
+        let Ok(target) = std::fs::canonicalize(&link) else {
+            return Some(format!(
+                "{} points at something that does not exist",
+                link.display()
+            ));
+        };
+        if !target.is_file() {
+            return Some(format!("{} does not point at a file", link.display()));
+        }
+        if want.as_ref().is_some_and(|want| *want != target) {
+            return Some(format!(
+                "{} points at {}, not at this GitPulse's gitpulse-hook",
+                link.display(),
+                target.display()
+            ));
+        }
+    }
+    None
+}
+
 /// `PATH` with `bin` first, once: an entry already there is moved to the
 /// front, never duplicated.
 pub fn path_with_bin_first(bin: &Path, existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
@@ -463,11 +543,9 @@ pub fn launch_env(
 ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
     let bin = config_dir.map(bin_dir);
     let usable = enabled
-        && bin.as_deref().is_some_and(|bin| {
-            LINKED_PROGRAMS
-                .iter()
-                .all(|p| bin.join(p).symlink_metadata().is_ok())
-        });
+        && bin
+            .as_deref()
+            .is_some_and(|bin| links_problem(bin, None).is_none());
     match (usable, bin) {
         (true, Some(bin)) => vec![
             ("PATH", Some(path_with_bin_first(&bin, existing_path))),
@@ -702,6 +780,7 @@ mod unix {
                     Ok(None) => continue,
                     Err(why) => {
                         board.unreadable.push(why);
+                        board.unreadable_slots.push(slot);
                         continue;
                     }
                 };
@@ -718,9 +797,12 @@ mod unix {
                         .filter(|record| record.pid == pid);
                         board.holders.push(LeaseHolder { slot, pid, record });
                     }
-                    Err(error) => board
-                        .unreadable
-                        .push(format!("could not probe {}: {error}", path.display())),
+                    Err(error) => {
+                        board
+                            .unreadable
+                            .push(format!("could not probe {}: {error}", path.display()));
+                        board.unreadable_slots.push(slot);
+                    }
                 }
             }
         }
@@ -853,8 +935,15 @@ mod unix {
         /// The lowest slot file nobody holds, among the ones `board` saw and
         /// the calling process's own.
         pub fn lowest_free(board: &Board, own: &Own) -> Option<usize> {
-            (1..=SLOT_FILES).find(|slot| {
-                own.slot != Some(*slot) && !board.holders.iter().any(|h| h.slot == *slot)
+            Self::free_slots(board, own).next()
+        }
+
+        /// Every slot file nobody holds and that could be read, lowest first.
+        pub fn free_slots<'a>(board: &'a Board, own: &'a Own) -> impl Iterator<Item = usize> + 'a {
+            (1..=SLOT_FILES).filter(move |slot| {
+                own.slot != Some(*slot)
+                    && !board.holders.iter().any(|h| h.slot == *slot)
+                    && !board.unreadable_slots.contains(slot)
             })
         }
 

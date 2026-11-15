@@ -32,6 +32,9 @@ const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
 /// test releases it.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 echo "start $TAG verb=$1 held=$GITPULSE_LEASE_HELD shim=$CARGO_SLOT_HELD jobs=$CARGO_BUILD_JOBS inc=$CARGO_INCREMENTAL" >> "$LOG"
+if [ -n "$SIGPIPE_FILE" ]; then
+  perl -e 'print defined($SIG{PIPE}) ? $SIG{PIPE} : "DEFAULT"' > "$SIGPIPE_FILE"
+fi
 if [ -n "$DAEMON_PID_FILE" ]; then
   sleep 120 &
   echo $! > "$DAEMON_PID_FILE"
@@ -449,4 +452,22 @@ fn leases_switched_off_in_settings_run_every_build_at_once() {
     assert!(!world.lease_dir().exists(), "off creates no lease state");
     world.release();
     world.finish();
+}
+
+/// Rust's runtime ignores SIGPIPE, and an ignored signal survives `exec`: a
+/// build the wrapper starts must have the default back, or `cargo build | head`
+/// never ends the way it does from a shell.
+#[test]
+fn a_leased_build_does_not_inherit_an_ignored_sigpipe() {
+    let mut world = World::new(r#"{"slots":2}"#);
+    let seen = world.tmp.join("sigpipe");
+    let (mut command, _stderr) = world.command("a", &["build"]);
+    command.env("NO_WAIT", "1").env("SIGPIPE_FILE", &seen);
+    let status = command.spawn_locked().unwrap().wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        "DEFAULT",
+        "the build must start with SIGPIPE at its default"
+    );
 }

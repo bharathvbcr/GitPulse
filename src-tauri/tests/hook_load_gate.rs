@@ -86,6 +86,19 @@ impl World {
         mode: &str,
         tool_use_id: &str,
     ) -> (Option<i32>, String) {
+        self.ask_env(session, command, mode, tool_use_id, None)
+    }
+
+    /// As [`World::ask_as`], with `GITPULSE_LEASE_BIN` set the way a session
+    /// GitPulse launched has it.
+    fn ask_env(
+        &self,
+        session: &str,
+        command: &str,
+        mode: &str,
+        tool_use_id: &str,
+        lease_bin: Option<&Path>,
+    ) -> (Option<i32>, String) {
         let payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -105,6 +118,8 @@ impl World {
             .env("GITPULSE_TOOL_CONFIG", &self.config)
             .env("GITPULSE_MANVI_BIN", self.home.join("no-such-manvi"))
             .env_remove("MAC_HEAVY_LABEL")
+            .env_remove("GITPULSE_LEASE_BIN")
+            .envs(lease_bin.map(|bin| ("GITPULSE_LEASE_BIN", bin)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -399,7 +414,7 @@ fn a_heavy_command_with_all_slots_held_is_told_it_will_queue() {
         "it names who holds it: {context}"
     );
     assert!(
-        context.contains("600000 ms timeout or run it in the background"),
+        context.contains("run it in the background") && !context.contains("600000"),
         "{context}"
     );
     // A build that is not leased is not told about a queue.
@@ -481,4 +496,19 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
         "toolu_3",
     );
     assert!(out.contains("did NOT lease-gate this build"), "{out}");
+}
+
+#[test]
+fn a_session_with_only_the_launch_variable_is_not_called_lease_gated() {
+    // GITPULSE_LEASE_BIN says how the process was started, not what a shell it
+    // opens resolves `cargo` to: a startup file can put another cargo first.
+    // Only the session-start hook's record of the PATH line makes a session
+    // gated.
+    let world = World::new();
+    let bin = config_dir(&world.home).join("lease-bin");
+    let (_, out) = world.ask_env(SESSION, "cargo build", "default", "toolu_1", Some(&bin));
+    assert!(
+        out.contains("did NOT lease-gate this build"),
+        "a launched session with no recorded PATH line is not verified: {out}"
+    );
 }

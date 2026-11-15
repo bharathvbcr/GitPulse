@@ -294,3 +294,32 @@ fn a_build_by_argv_is_leased_whatever_path_named_the_program() {
         assert!(!leased(program, &args), "{program} has no lease row");
     }
 }
+
+#[test]
+fn llvm_cov_report_clean_and_show_env_and_help_only_calls_are_never_leased() {
+    // The owner's shim lets these straight through: they build nothing, and a
+    // clean has to work on a full disk.
+    for (program, args) in [
+        ("cargo", vec!["llvm-cov", "report"]),
+        (
+            "cargo",
+            vec!["+nightly", "llvm-cov", "clean", "--workspace"],
+        ),
+        ("cargo", vec!["llvm-cov", "show-env"]),
+        ("cargo", vec!["build", "--help"]),
+        ("cargo", vec!["test", "-h"]),
+        ("go", vec!["build", "-h"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(!leased(program, &args), "{program} {args:?} must not lease");
+    }
+    // A coverage run and a help flag meant for the test binary still build.
+    for (program, args) in [
+        ("cargo", vec!["llvm-cov", "--workspace"]),
+        ("cargo", vec!["llvm-cov", "nextest"]),
+        ("cargo", vec!["test", "--", "--help"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(leased(program, &args), "{program} {args:?} must lease");
+    }
+}

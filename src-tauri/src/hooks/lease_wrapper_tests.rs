@@ -395,11 +395,15 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
         "{none:?}"
     );
     assert!(!session_has_path(&config, "sess-3"));
-    assert_eq!(
-        route_session("sess-4", None, Some(&config), true),
-        Route::Launched
+    // A launched session with no env file is NOT verified as gated: a shell
+    // startup file can put another cargo ahead of the lease folder, and only
+    // the env file line puts it back.
+    let launched_alone = route_session("sess-4", None, Some(&config), true);
+    assert!(
+        matches!(&launched_alone, Route::Skipped(w) if w.contains("cannot be verified")),
+        "{launched_alone:?}"
     );
-    assert!(session_has_path(&config, "sess-4"));
+    assert!(!session_has_path(&config, "sess-4"));
     // A folder that cannot be quoted safely is refused, not escaped.
     let hostile = temp.path().join("we\"ird$dir");
     lease::ensure_links(&hostile, &hook).unwrap();
@@ -408,4 +412,163 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
         matches!(&route, Route::Skipped(w) if w.contains("quoted")),
         "{route:?}"
     );
+}
+
+fn routed(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let config = temp.path().join("config");
+    let hook = temp.path().join("gitpulse-hook");
+    std::fs::write(&hook, "x").unwrap();
+    lease::ensure_links(&config, &hook).unwrap();
+    (config, temp.path().join("env"))
+}
+
+#[test]
+fn a_launched_session_also_gets_the_path_line_and_is_gated_only_once_that_is_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, env_file) = routed(&temp);
+    let route = route_session("sess-l", Some(env_file.as_os_str()), Some(&config), true);
+    assert_eq!(route, Route::Launched);
+    let written = std::fs::read_to_string(&env_file).unwrap();
+    assert_eq!(
+        written,
+        format!(
+            "export PATH=\"{}:$PATH\"\n",
+            lease::bin_dir(&config).display()
+        ),
+        "a launched session needs the line too: a shell startup file re-prepends another cargo"
+    );
+    assert!(session_has_path(&config, "sess-l"));
+}
+
+#[test]
+fn the_env_file_line_is_written_once_however_often_the_session_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, env_file) = routed(&temp);
+    // No trailing newline on what was there: the line must not be glued on.
+    std::fs::write(&env_file, "export KEEP=1").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            route_session("sess-i", Some(env_file.as_os_str()), Some(&config), false),
+            Route::EnvFile
+        );
+    }
+    let written = std::fs::read_to_string(&env_file).unwrap();
+    let line = format!(
+        "export PATH=\"{}:$PATH\"",
+        lease::bin_dir(&config).display()
+    );
+    assert_eq!(written, format!("export KEEP=1\n{line}\n"));
+}
+
+#[test]
+fn a_launched_session_with_an_unusable_id_writes_and_records_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, env_file) = routed(&temp);
+    let route = route_session("../escape", Some(env_file.as_os_str()), Some(&config), true);
+    assert!(
+        matches!(&route, Route::Skipped(w) if w.contains("usable id")),
+        "{route:?}"
+    );
+    assert!(
+        !env_file.exists(),
+        "nothing is written for a session that cannot be recorded"
+    );
+}
+
+#[test]
+fn a_dangling_link_is_not_a_link() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, env_file) = routed(&temp);
+    let bin = lease::bin_dir(&config);
+    assert_eq!(lease::links_problem(&bin, None), None);
+    std::fs::remove_file(temp.path().join("gitpulse-hook")).unwrap();
+    // The links are still there, and point at nothing.
+    assert!(bin.join("cargo").symlink_metadata().is_ok());
+    let problem = lease::links_problem(&bin, None).unwrap();
+    assert!(problem.contains("does not exist"), "{problem}");
+    let route = route_session("sess-d", Some(env_file.as_os_str()), Some(&config), false);
+    assert!(
+        matches!(&route, Route::Skipped(w) if w.contains("do not work")),
+        "{route:?}"
+    );
+    assert!(
+        lease::launch_env(Some(&config), None, true)
+            .iter()
+            .all(|(_, value)| value.is_none()),
+        "a dangling link adds nothing to a launched PATH"
+    );
+}
+
+#[test]
+fn links_that_point_at_another_binary_are_not_this_gitpulses() {
+    let temp = tempfile::tempdir().unwrap();
+    let (config, _) = routed(&temp);
+    let other = temp.path().join("other-hook");
+    std::fs::write(&other, "y").unwrap();
+    let bin = lease::bin_dir(&config);
+    assert_eq!(
+        lease::links_problem(&bin, Some(&temp.path().join("gitpulse-hook"))),
+        None
+    );
+    let problem = lease::links_problem(&bin, Some(&other)).unwrap();
+    assert!(problem.contains("not at this GitPulse"), "{problem}");
+}
+
+#[test]
+fn the_miss_count_says_when_it_read_only_part_of_the_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    for n in 0..5 {
+        std::fs::write(temp.path().join(format!("{MISS_PREFIX}{n}")), b"").unwrap();
+    }
+    assert_eq!(misses_in(temp.path(), 100).unwrap(), (5, false));
+    let (count, truncated) = misses_in(temp.path(), 3).unwrap();
+    assert!(truncated, "five entries, three read");
+    assert!(count <= 3);
+    assert_eq!(
+        misses_in(&temp.path().join("absent"), 3).unwrap(),
+        (0, false)
+    );
+}
+
+#[test]
+fn a_slot_file_that_cannot_be_read_is_passed_over_and_counts_as_held() {
+    let (temp, dir) = dir();
+    // Slot 1 is a symlink: refused by the private-record open, so unreadable.
+    let target = temp.path().join("elsewhere");
+    std::fs::write(&target, b"").unwrap();
+    symlink(&target, dir.root().join("slot-1")).unwrap();
+    let board = dir.board(&crate::sysload::lease::Own::default());
+    assert_eq!(board.unreadable_slots, vec![1]);
+    assert_eq!(board.occupied(), 1);
+    assert_eq!(
+        Dir::lowest_free(&board, &crate::sysload::lease::Own::default()),
+        Some(2)
+    );
+
+    let mut ports = Fake::new(verdict(Tier::Clear, true));
+    let acquired = acquire(&dir, &mine(ports.now), &policy(), &mut ports)
+        .expect("one bad slot file must not abort the wait");
+    let Acquired::Granted { grant, .. } = acquired else {
+        panic!("{acquired:?}")
+    };
+    assert_eq!(grant.slot, 2);
+}
+
+#[test]
+fn an_unreadable_slot_uses_up_a_slot_of_the_capacity() {
+    let (temp, dir) = dir();
+    let target = temp.path().join("elsewhere");
+    std::fs::write(&target, b"").unwrap();
+    symlink(&target, dir.root().join("slot-1")).unwrap();
+    let mut one = policy();
+    one.slots = 1;
+    one.wait_max = Duration::from_secs(4);
+    let mut ports = Fake::new(verdict(Tier::Clear, true));
+    // One slot, and the only readable-or-not file is unreadable: it may be
+    // held, so the build waits and then overflows rather than taking slot 2.
+    let acquired = acquire(&dir, &mine(ports.now), &one, &mut ports).unwrap();
+    let Acquired::Overflow { waited, .. } = acquired else {
+        panic!("{acquired:?}")
+    };
+    assert!(waited >= Duration::from_secs(4));
 }

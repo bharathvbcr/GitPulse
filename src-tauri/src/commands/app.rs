@@ -260,8 +260,13 @@ pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, Ip
 /// many may run and why, builds that ran unleased, and heavy builds running
 /// with no slot. Read-only: nothing here takes, frees or moves a slot.
 #[tauri::command(async)]
-pub async fn cmd_host_load_leases() -> Result<crate::sysload::lease::LeaseStatus, IpcError> {
-    off_thread(|| {
+pub async fn cmd_host_load_leases(
+    queue_only: Option<bool>,
+) -> Result<crate::sysload::lease::LeaseStatus, IpcError> {
+    // A caller that only wants the queue (the terminal pill) skips the process
+    // table and the marker directory; what it did not read says so.
+    let full = !queue_only.unwrap_or(false);
+    off_thread(move || {
         let report = crate::sysload::governor_report();
         let verdict = &report.verdict;
         let load = if verdict.sensor.governs() {
@@ -270,7 +275,11 @@ pub async fn cmd_host_load_leases() -> Result<crate::sysload::lease::LeaseStatus
             crate::sysload::lease::Load::Unknown(verdict.message.clone())
         };
         #[cfg(unix)]
-        let misses = crate::hooks::lease_wrapper::misses();
+        let misses = if full {
+            crate::hooks::lease_wrapper::misses()
+        } else {
+            Err("not read: this was a queue-only read".to_string())
+        };
         #[cfg(not(unix))]
         let misses = Err("build leases are not supported on this platform".to_string());
         Ok(crate::sysload::lease::status(
@@ -278,6 +287,7 @@ pub async fn cmd_host_load_leases() -> Result<crate::sysload::lease::LeaseStatus
             &crate::tool_config::host_load_leases(),
             &load,
             misses,
+            full,
         ))
     })
     .await

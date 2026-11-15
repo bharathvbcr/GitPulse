@@ -175,6 +175,30 @@ pub fn waiting_line(
     )
 }
 
+/// Takes the lowest slot that can be had. A slot whose file cannot be used is
+/// passed over for the next one, so one bad file never aborts the wait: `Err`
+/// only when every free slot failed that way. `Ok(None)` is a lost race (or no
+/// free slot), which the caller answers by reading the board again.
+fn take_any(
+    dir: &Dir,
+    board: &lease::Board,
+    own: &lease::Own,
+    record: &LeaseRecord,
+) -> Result<Option<Grant>, String> {
+    let mut failed = None;
+    for slot in Dir::free_slots(board, own) {
+        match dir.take(slot, record) {
+            Ok(Some(grant)) => return Ok(Some(grant)),
+            Ok(None) => return Ok(None),
+            Err(why) => failed = Some(why),
+        }
+    }
+    match failed {
+        Some(why) => Err(why),
+        None => Ok(None),
+    }
+}
+
 /// Waits for a slot. `Err` only when the queue cannot be used at all, which
 /// the caller reports as "not leased" and runs the build anyway.
 pub fn acquire(
@@ -210,7 +234,8 @@ pub fn acquire(
             .iter()
             .position(|w| w.name == ticket.name)
             .unwrap_or(0);
-        let held = board.holders.len();
+        // A slot file nobody can read may be held: it counts as held.
+        let held = board.occupied();
         let granted_at = |overflow: bool| LeaseRecord {
             granted_mono_ns: Some(now),
             tier_at_grant: cap.tier,
@@ -223,25 +248,23 @@ pub fn acquire(
         };
 
         if may_take(rank, held, &cap) {
-            if let Some(slot) = Dir::lowest_free(&board, &own) {
-                if let Some(grant) = dir.take(slot, &granted_at(false))? {
-                    // Two waiters that read the same free slot at once cannot
-                    // both keep it: the one that finds more held than the
-                    // count allows lets go and asks again.
-                    let after = dir.board(&Own {
-                        slot: Some(grant.slot),
-                        ticket: Some(ticket.name.clone()),
+            if let Some(grant) = take_any(dir, &board, &own, &granted_at(false))? {
+                // Two waiters that read the same free slot at once cannot
+                // both keep it: the one that finds more held than the
+                // count allows lets go and asks again.
+                let after = dir.board(&Own {
+                    slot: Some(grant.slot),
+                    ticket: Some(ticket.name.clone()),
+                });
+                if after.occupied() < cap.slots as usize {
+                    ticket.withdraw();
+                    return Ok(Acquired::Granted {
+                        grant,
+                        waited,
+                        capacity: cap,
                     });
-                    if after.holders.len() < cap.slots as usize {
-                        ticket.withdraw();
-                        return Ok(Acquired::Granted {
-                            grant,
-                            waited,
-                            capacity: cap,
-                        });
-                    }
-                    drop(grant);
                 }
+                drop(grant);
             }
         }
 
@@ -251,10 +274,9 @@ pub fn acquire(
                 return Ok(Acquired::GaveUp { waited });
             }
         } else if waited >= policy.wait_max {
-            let grant = match Dir::lowest_free(&board, &own) {
-                Some(slot) => dir.take(slot, &granted_at(true))?,
-                None => None,
-            };
+            // An overflow runs without a slot when none can be had; it does not
+            // fail the build over a slot file it cannot use.
+            let grant = take_any(dir, &board, &own, &granted_at(true)).unwrap_or(None);
             ticket.withdraw();
             return Ok(Acquired::Overflow { grant, waited });
         }
@@ -380,8 +402,12 @@ fn exec(
         .collect();
     // SAFETY: `path`, every `argv` and `envp` entry are NUL-terminated and
     // outlive the call, and both pointer arrays end in a null pointer. On
-    // success this never returns; on failure nothing was changed.
+    // success this never returns; on failure nothing was changed. Rust's
+    // runtime ignores SIGPIPE at start and an ignored signal survives `exec`,
+    // so the build would never die on a closed pipe the way a shell's child
+    // does (`cargo build | head`): put the default back first.
     unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
     }
     std::io::Error::last_os_error()
@@ -707,17 +733,26 @@ fn record_miss(why: &str) {
 }
 
 /// How many builds ran unleased in the last 15 minutes, counted from the
-/// markers, or `Err` when they cannot be read (never `Ok(0)` for that).
-pub fn misses() -> Result<usize, String> {
-    let dir = marker_dir();
-    let entries = match std::fs::read_dir(&dir) {
+/// markers, and whether the directory held more entries than one read looks at
+/// (then the count is a floor). `Err` when they cannot be read, never
+/// `Ok((0, false))` for that.
+pub fn misses() -> Result<(usize, bool), String> {
+    misses_in(&marker_dir(), super::advisory_once::PRUNE_SCAN)
+}
+
+/// [`misses`] over `dir`, reading at most `cap` entries.
+pub fn misses_in(dir: &Path, cap: usize) -> Result<(usize, bool), String> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, false)),
         Err(error) => return Err(format!("could not read {}: {error}", dir.display())),
     };
     let now = std::time::SystemTime::now();
-    Ok(entries
-        .take(super::advisory_once::PRUNE_SCAN)
+    let read: Vec<_> = entries.take(cap.saturating_add(1)).collect();
+    let truncated = read.len() > cap;
+    let count = read
+        .into_iter()
+        .take(cap)
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with(MISS_PREFIX))
         .filter(|e| {
@@ -727,7 +762,8 @@ pub fn misses() -> Result<usize, String> {
                 .and_then(|t| now.duration_since(t).ok())
                 .is_some_and(|age| age <= super::advisory_once::MARKER_TTL)
         })
-        .count())
+        .count();
+    Ok((count, truncated))
 }
 
 /* ── How a session that GitPulse did not launch gets the wrapper ─────────── */
@@ -785,7 +821,8 @@ fn record_session_path(config: &Path, session: &str) -> Result<(), String> {
 /// What the session-start hook did about the wrapper for one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// GitPulse launched the session with the folder on its PATH.
+    /// GitPulse launched the session with the folder on its PATH, and the line
+    /// that keeps it first was also written to `CLAUDE_ENV_FILE`.
     Launched,
     /// The folder was added through `CLAUDE_ENV_FILE`.
     EnvFile,
@@ -798,7 +835,7 @@ impl Route {
     pub fn describe(&self) -> String {
         match self {
             Self::Launched => {
-                "build leases: on (GitPulse launched this session with its lease folder on PATH)"
+                "build leases: on (GitPulse launched this session with its lease folder on PATH, and the lease folder is put first again before each Bash command)"
                     .into()
             }
             Self::EnvFile => {
@@ -832,26 +869,21 @@ pub fn route_session(
         return Route::Skipped("there is no per-user config directory (HOME unset)".into());
     };
     let bin = lease::bin_dir(config);
-    if !lease::LINKED_PROGRAMS
-        .iter()
-        .all(|p| bin.join(p).symlink_metadata().is_ok())
-    {
+    if let Some(problem) = lease::links_problem(&bin, None) {
         return Route::Skipped(format!(
-            "the cargo and go links in {} do not exist: GitPulse has not made them (is the app running, and is gitpulse-hook beside it?)",
+            "the cargo and go links in {} do not work ({problem}): GitPulse has not made them, or they are stale (is the app running, and is gitpulse-hook beside it?)",
             bin.display()
         ));
     }
-    if launched {
-        // Only a record, so the command gate knows this session is gated.
-        let _ = record_session_path(config, session);
-        return Route::Launched;
-    }
     let Some(env_file) = env_file else {
-        return Route::Skipped(
+        return Route::Skipped(if launched {
+            "GitPulse started this session with its lease folder first on PATH, but this host gave the hook no CLAUDE_ENV_FILE to keep it there, and a shell startup file (such as ~/.zshenv) can put another cargo ahead of it, so the gate cannot be verified".into()
+        } else {
             "this host gave the hook no CLAUDE_ENV_FILE, and the session was not launched from GitPulse"
-                .into(),
-        );
+                .into()
+        });
     };
+    // Validated before anything is written or recorded.
     if !plain_session(session) {
         return Route::Skipped("the session has no usable id to record".into());
     }
@@ -862,20 +894,42 @@ pub fn route_session(
             bin.display()
         ));
     }
-    use std::io::Write as _;
-    let line = format!("export PATH=\"{bin_text}:$PATH\"\n");
-    let written = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(env_file)
-        .and_then(|mut file| file.write_all(line.as_bytes()));
-    if let Err(error) = written {
+    let line = format!("export PATH=\"{bin_text}:$PATH\"");
+    if let Err(error) = append_line_once(env_file, &line) {
         return Route::Skipped(format!("could not write CLAUDE_ENV_FILE: {error}"));
     }
     match record_session_path(config, session) {
+        Ok(()) if launched => Route::Launched,
         Ok(()) => Route::EnvFile,
         Err(why) => Route::Skipped(why),
     }
+}
+
+/// Appends `line` to `path` unless a line equal to it is already there, so a
+/// session-start hook that runs more than once does not stack copies. The file
+/// is appended to, never replaced. `Ok(true)` when it wrote.
+fn append_line_once(path: &OsStr, line: &str) -> std::io::Result<bool> {
+    use std::io::{Read as _, Write as _};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let mut text = Vec::new();
+    (&file).take(1 << 20).read_to_end(&mut text)?;
+    if text.split(|b| *b == b'\n').any(|l| l == line.as_bytes()) {
+        return Ok(false);
+    }
+    // A file that does not end in a newline must not have this glued to its
+    // last line.
+    let mut out = Vec::with_capacity(line.len() + 2);
+    if text.last().is_some_and(|b| *b != b'\n') {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    file.write_all(&out)?;
+    Ok(true)
 }
 
 #[cfg(test)]
