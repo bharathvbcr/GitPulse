@@ -5967,18 +5967,23 @@ pub fn record_op_snapshot_event(
     seq: u64,
     stash_oid: Option<&str>,
     ref_count: usize,
+    prune_error: Option<&str>,
     now_ms: u64,
 ) -> Option<i64> {
     let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
-    let detail_json = serde_json::to_string(&serde_json::json!({
+    let mut detail = serde_json::json!({
         "source": "op_log",
         "snapshot": OP_SNAPSHOT_OK,
         "seq": seq,
         "op_ref": op_ref,
         "stash_oid": stash_oid,
         "ref_count": ref_count,
-    }))
-    .ok();
+    });
+    // The snapshot is real; only retention failed. Present only when it did.
+    if let (Some(error), Some(fields)) = (prune_error, detail.as_object_mut()) {
+        fields.insert("prune_error".to_string(), error.into());
+    }
+    let detail_json = serde_json::to_string(&detail).ok();
     record(Draft {
         repo_path: anchor,
         worktree_path: worktree,
