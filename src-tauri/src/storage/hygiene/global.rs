@@ -288,6 +288,13 @@ pub struct CleanerInventory {
     /// and not judged either. Internal to the run path like `incomplete_repos`.
     #[serde(skip)]
     pub shed_repos: u32,
+    /// Every enabled reclaim scope's pass ran over every discovered
+    /// repository. A pass cut short by the inventory budget, a cancellation
+    /// or a worktree listing that failed leaves it false, and such an
+    /// inventory is not a preview of those scopes: a later run could
+    /// otherwise act on candidates nobody was shown. Internal to the run path.
+    #[serde(skip)]
+    pub scopes_complete: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerItem {
@@ -809,14 +816,19 @@ impl Cleaner {
         let config = self.state()?.config;
         // The preview shows every enabled scope, previewed or not: seeing
         // what a scope would take is the point of it.
-        let inventory = self.inspect(&config, config.scopes, true)?;
-        if config.scopes.any() {
+        let mut inventory = self.inspect(&config, config.scopes, true)?;
+        if let Some(previewed) = previewed_by(&inventory, config.scopes) {
             self.update(|saved| {
-                if saved.config.scopes == config.scopes {
-                    saved.previewed_scopes = Some(config.scopes);
+                if saved.config.scopes == previewed {
+                    saved.previewed_scopes = Some(previewed);
                 }
                 Ok(())
             })?;
+        } else if config.scopes.any() {
+            push_issue(
+                &mut inventory.issues,
+                "This inspection did not finish every enabled reclaim scope, so it does not count as their preview and no run uses them yet. Inspect again when the host is less busy.".into(),
+            );
         }
         Ok(inventory)
     }
@@ -837,6 +849,8 @@ impl Cleaner {
             candidates: vec![],
             incomplete_repos: BTreeSet::new(),
             shed_repos: 0,
+            // Repositories discovery never reached were not shown either.
+            scopes_complete: !found.partial,
         };
         let start = Instant::now();
         let discovered: BTreeSet<PathBuf> = found.repos.clone();
@@ -846,6 +860,7 @@ impl Cleaner {
                 || result.candidates.len() >= 512
             {
                 result.partial = true;
+                result.scopes_complete = false;
                 result
                     .issues
                     .push("Inventory budget reached or cancelled".into());
@@ -1033,6 +1048,7 @@ impl Cleaner {
             let infos = match crate::engine::worktree::list_worktrees_lite(repo_path) {
                 Ok(infos) => infos,
                 Err(e) => {
+                    result.scopes_complete = false;
                     note(
                         result,
                         &e,
@@ -1047,6 +1063,7 @@ impl Cleaner {
             {
                 if over_budget(result) {
                     result.partial = true;
+                    result.scopes_complete = false;
                     push_issue(
                         &mut result.issues,
                         "Inventory budget reached or cancelled".into(),
@@ -1121,7 +1138,9 @@ impl Cleaner {
                 }
             }
         }
-        if scopes.prune_worktrees && !over_budget(result) {
+        if scopes.prune_worktrees && over_budget(result) {
+            result.scopes_complete = false;
+        } else if scopes.prune_worktrees {
             match crate::storage::stale_worktrees::stale_worktrees_with(
                 repo_path,
                 scopes.worktree_idle_days,
@@ -1153,11 +1172,14 @@ impl Cleaner {
                         });
                     }
                 }
-                Err(e) => note(
-                    result,
-                    &e,
-                    format!("{repo_path}: stale worktrees could not be listed"),
-                ),
+                Err(e) => {
+                    result.scopes_complete = false;
+                    note(
+                        result,
+                        &e,
+                        format!("{repo_path}: stale worktrees could not be listed"),
+                    )
+                }
             }
         }
     }
@@ -1579,6 +1601,12 @@ impl Cleaner {
     }
 }
 
+/// The scope set an inspection previews: the enabled set, when at least one
+/// scope is on and every enabled scope's pass ran to the end; otherwise none.
+fn previewed_by(inventory: &CleanerInventory, scopes: ReclaimScopes) -> Option<ReclaimScopes> {
+    (scopes.any() && inventory.scopes_complete).then_some(scopes)
+}
+
 /// Splits an inventory's candidates into those whose repository was read in
 /// full and those that must be left alone, returning the eligible ones and how
 /// many were dropped.
@@ -1684,7 +1712,14 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
     if !status_in(&root, None)?.is_empty() {
         return Err("Worktree has uncommitted work; global cleanup preserves it".into());
     }
-    leases_clear(worktree, Some(branch))
+    // The task store is per checkout: the worktree's own store refuses on any
+    // lease, the main checkout's on one that names this branch or none.
+    leases_clear(worktree, None)?;
+    let main = crate::engine::worktree::list_worktrees_lite(worktree)?
+        .into_iter()
+        .find(|info| info.is_main)
+        .ok_or("The main checkout of this worktree could not be found")?;
+    leases_clear(&main.path, Some(branch))
 }
 
 /// What one state refusal covers, so a refusal is asked once per run per

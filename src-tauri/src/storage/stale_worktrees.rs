@@ -8,12 +8,15 @@
 //!   covers agent sessions, shells and builds alike);
 //! - it is not locked and git does not already call it prunable;
 //! - its tree is clean (`git status` printed nothing);
-//! - no active task lease names its branch;
+//! - no active task lease in the main checkout's store names its branch (or
+//!   names none), and the worktree's own store holds none: the store is per
+//!   checkout, and a lane's agent leases in its own;
 //! - it has been idle at least a day (its last commit and its index, which
 //!   checkout, staging and status refreshes touch), so a lane created moments
 //!   ago with no commits of its own is not "integrated and finished";
 //! - its HEAD is integrated into the main worktree's branch, or it has been
-//!   idle for the threshold.
+//!   idle for the threshold. A detached HEAD keeps its commits by HEAD
+//!   alone, so it must be integrated.
 //!
 //! A check that could not run is never read as one that passed: the worktree
 //! is then not stale, and the reason says which check could not answer.
@@ -200,6 +203,15 @@ pub(crate) fn stale_worktrees_with(
             row.reasons
                 .push("an active task lease may name its branch".into());
         }
+        // The task store is per checkout: a lane can hold leases in its own.
+        let own = crate::tasks::view(&info.path);
+        if !own.error.is_empty() {
+            row.reasons
+                .push("its own task store could not be read".into());
+        } else if !own.leases.is_empty() {
+            row.reasons
+                .push("its own task store holds an active lease".into());
+        }
         match last_activity(path) {
             Ok(at) => row.idle_days = Some(now.saturating_sub(at) / 86_400),
             Err(e) => row
@@ -218,6 +230,15 @@ pub(crate) fn stale_worktrees_with(
                     )
                 });
             }
+        }
+        // A detached worktree's commits are held by its HEAD alone: removing
+        // it leaves anything not on the main branch on no ref at all, so only
+        // an integrated one can be stale, however long it has been idle.
+        if info.branch.is_none() && row.integrated != Some(true) {
+            row.reasons.push(
+                "it is detached and not integrated, so removing it would leave its commits on no branch"
+                    .into(),
+            );
         }
         row.stale = row.reasons.is_empty()
             && row.processes == Some(0)
@@ -413,6 +434,70 @@ mod tests {
         assert!(!done.stale, "{done:?}");
         assert!(
             done.reasons.iter().any(|r| r.contains("active within")),
+            "{done:?}"
+        );
+    }
+
+    /// A detached worktree holds its commits by HEAD alone; idle or not, it
+    /// is stale only when those commits are on the main branch.
+    #[test]
+    fn a_detached_unintegrated_worktree_is_never_stale() {
+        let (_temp, root) = fixture();
+        let busy = root.join("busy");
+        git(&busy, &["checkout", "-q", "--detach"]);
+        git(&root.join("repo"), &["branch", "-D", "busy"]);
+        let none: ProcessesIn<'_> = &|_| Ok(vec![]);
+        let report = stale_worktrees_with(
+            root.join("repo").to_str().unwrap(),
+            7,
+            none,
+            false,
+            later(30),
+        )
+        .unwrap();
+        let row = row(&report, "busy");
+        assert_eq!(row.branch, None);
+        assert_eq!(row.integrated, Some(false));
+        assert!(!row.stale, "{row:?}");
+        assert!(
+            row.reasons.iter().any(|r| r.contains("detached")),
+            "{row:?}"
+        );
+    }
+    /// The task store is per checkout: a lane's agent leases its task in the
+    /// lane's own `.devcouncil/state.sqlite`, which the repository's store
+    /// never sees. A lease there keeps the worktree out of the stale list.
+    #[test]
+    fn a_lease_in_the_worktrees_own_task_store_is_never_stale() {
+        let (_temp, root) = fixture();
+        // Ignored, as GitPulse's own repository ignores it, so the store
+        // does not make the tree dirty and the lease is what is judged.
+        std::fs::write(root.join("repo/.git/info/exclude"), ".devcouncil/\n").unwrap();
+        let db = crate::tasks::store_path(root.join("done").to_str().unwrap());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO task_leases (id, task_id, owner, lease_token, status, created_at, expires_at)
+                 VALUES ('l', 'TASK-1', 'agent', 'token', 'active', '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let none: ProcessesIn<'_> = &|_| Ok(vec![]);
+        let report = stale_worktrees_with(
+            root.join("repo").to_str().unwrap(),
+            7,
+            none,
+            false,
+            later(2),
+        )
+        .unwrap();
+        let done = row(&report, "done");
+        assert_eq!(done.clean, Some(true), "{done:?}");
+        assert!(!done.stale, "{done:?}");
+        assert!(
+            done.reasons.iter().any(|r| r.contains("own task store")),
             "{done:?}"
         );
     }

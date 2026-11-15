@@ -2088,6 +2088,66 @@ fn a_worktree_cache_is_reclaimed_only_after_its_scope_was_previewed() {
     assert!(!cleaner.state().unwrap().scopes_previewed);
 }
 
+/// The task store is per checkout. A lane's lease may live in the main
+/// checkout's store (naming the lane's branch) or in the lane's own; the
+/// worktree scopes read both. Before, only the worktree's own store was read,
+/// so a lease the main checkout held for the lane's branch was never seen.
+#[cfg(unix)]
+#[test]
+fn a_lease_on_the_worktrees_branch_in_either_task_store_holds_its_cache() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("lease-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".devcouncil/\n").unwrap();
+    let lease = |checkout: &std::path::Path, id: &str, branch: Option<&str>| {
+        let db = crate::tasks::store_path(checkout.to_str().unwrap());
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO task_leases (id, task_id, owner, lease_token, status, branch, created_at, expires_at)
+                 VALUES (?1, ?1, 'agent', 'token', 'active', ?2, '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+                rusqlite::params![id, branch],
+            )
+            .unwrap();
+        db
+    };
+    let scopes = super::ReclaimScopes {
+        worktree_caches: true,
+        ..Default::default()
+    };
+    scoped(&cleaner, &root, scopes);
+
+    // The main checkout's store leases the lane's branch.
+    let main_store = lease(&repo, "main-held", Some("agent-x"));
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "main-lease-run");
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(
+        run.items
+            .iter()
+            .any(|item| item.message.contains("active task leases")),
+        "{run:?}"
+    );
+    fs::remove_dir_all(main_store.parent().unwrap()).unwrap();
+
+    // The lane's own store holds a lease, whatever branch it names.
+    lease(&wt, "own-held", Some("some-other-branch"));
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "own-lease-run");
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+}
+
 /// The worktree scopes judge the worktree, not the repository: uncommitted
 /// work in the main checkout does not hold a clean worktree's cache, and
 /// uncommitted work in the worktree does.
@@ -2355,4 +2415,44 @@ fn dry_run_reclaim_table() {
             w.reasons.join("; ")
         );
     }
+}
+
+/// An inspection cut short (here by a cancellation, in the third dry run on
+/// 2026-11-14 by the 120-second budget) never showed some scope's candidates,
+/// so it is not their preview: a later, calmer run would act on worktrees
+/// nobody was shown.
+#[cfg(unix)]
+#[test]
+fn an_inspection_cut_short_does_not_count_as_a_preview() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("cut-short-state"),
+    );
+    let cleaner = Arc::new(service);
+    worktree_with_cargo_target(&root);
+    let scopes = super::ReclaimScopes {
+        prune_worktrees: true,
+        ..Default::default()
+    };
+    let config = scoped(&cleaner, &root, scopes);
+    cleaner
+        .cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cut = cleaner.inspect(&config, scopes, true).unwrap();
+    assert!(!cut.scopes_complete, "{cut:?}");
+    assert_eq!(super::previewed_by(&cut, scopes), None);
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let whole = cleaner.inspect(&config, scopes, true).unwrap();
+    assert!(whole.scopes_complete, "{:?}", whole.issues);
+    assert_eq!(super::previewed_by(&whole, scopes), Some(scopes));
+    assert_eq!(
+        super::previewed_by(&whole, super::ReclaimScopes::default()),
+        None,
+        "nothing enabled is nothing previewed"
+    );
 }

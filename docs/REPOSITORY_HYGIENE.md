@@ -155,9 +155,9 @@ none of them and says so.
 
 | Setting | What it adds | Vetoes kept |
 | --- | --- | --- |
-| **Reclaim build caches in idle linked worktrees** (`scopes.worktree_caches`) | Linked worktrees under the roots (including `.claude/worktrees/*` and `.gitpulse/worktrees/*`, which discovery never enters) are inventoried, and the caches worktree creation clones into them (`target`, `.turbo`) become candidates | No process working anywhere in the worktree; its tree clean; no task lease naming its branch (or naming none); producer evidence, ignored and untracked; nothing open; nothing modified for the idle days. Budgeted by clone-private bytes, not logical size |
+| **Reclaim build caches in idle linked worktrees** (`scopes.worktree_caches`) | Linked worktrees under the roots (including `.claude/worktrees/*` and `.gitpulse/worktrees/*`, which discovery never enters) are inventoried, and the caches worktree creation clones into them (`target`, `.turbo`) become candidates | No process working anywhere in the worktree; its tree clean; no task lease in the main checkout's store naming its branch (or naming none), and none at all in the worktree's own store; producer evidence, ignored and untracked; nothing open; nothing modified for the idle days. Budgeted by clone-private bytes, not logical size |
 | **Judge uncommitted work per project** (`scopes.per_tree_vetoes`) | Uncommitted work refuses a repository's output only when it is in the project directory that produced it | Task leases stay repository-wide; every other check unchanged |
-| **Remove stale linked worktrees** (`scopes.prune_worktrees`) | Linked worktrees the stale-worktree report calls stale are removed with `git worktree remove`, never forced; the branch is kept | No process inside, clean, unlocked, and integrated into the main worktree's branch or idle past the idle days |
+| **Remove stale linked worktrees** (`scopes.prune_worktrees`) | Linked worktrees the stale-worktree report calls stale are removed with `git worktree remove`, never forced; the branch is kept | No process inside, clean, unlocked, no task lease in either store, idle at least a day, and integrated into the main worktree's branch or idle past the idle days; a detached HEAD must be integrated |
 
 The idle threshold (`scopes.worktree_idle_days`) defaults to 7 days and cannot
 go below DevCouncil's scheduled-retention minimum of 7. `node_modules` is never
@@ -167,8 +167,10 @@ offered: DevCouncil's `protected_artifact` preserves it.
 
 **Insights → Storage → Stale worktrees** lists the linked worktrees nobody is
 using: no process works in them (the process table, which covers agent
-sessions, shells and builds alike), unlocked, clean, and integrated or idle past
-the threshold, with what removing each frees in clone-private bytes. A check
+sessions, shells and builds alike), unlocked, clean, holding no task lease
+(the task store is per checkout, so both the main checkout's and the worktree's
+own are read), and integrated or idle past the threshold (a detached HEAD must
+be integrated), with what removing each frees in clone-private bytes. A check
 that could not run makes the worktree not stale and names the check. Nothing is
 removed except by a click, which goes through the guarded worktree removal.
 
