@@ -744,23 +744,44 @@ on. A `disk` entry written before this existed has no `auto` marker and stays
 the person's own.
 
 **The fill rule** (`disk_filling`, `sysload/diskrate.rs`, `thresholds.rs`). The
-writer keeps a bounded history of free space and publishes the fall in bytes
-per minute as a reading in the snapshot; the pure assessment turns it into
-minutes until the severe floor and compares that with two horizons (30 and 10
-minutes by default, each editable, with a mode of its own: off, slow, or also
-refuse). The rate is the smallest of four least-squares falls: the last minute,
-and each third of the last three minutes. The long window is read in thirds so
-that a one-off event (a copy, a compile burst) shorter than a minute leaves a
-flat third and reads as no fall, however large it was; fitting the whole window
-read a step of h GiB as about 1.5 h over the window length and refused launches
-for a burst that was already over. A fill that goes on, and a staircase of
-steps each minute, fall in every third. Unknown is never a rate: too few
-samples, a gap in the timestamps, a new boot, a step no disk can make (a
-remount) and a reading that cannot be taken all leave it unknown. While it is
-unknown the rule is silent and no warning is added, so Health says why: "Fill
-rate: warming up", or "not available" when the app that wrote the snapshot is an
-older build or free space can't be read. The rate and the exact binding are in
-the trace record.
+writer keeps a bounded history of free space and publishes two rates, in bytes
+of free space lost per minute, as readings in the snapshot. The pure assessment
+turns each into minutes until the severe floor and compares it with a horizon
+(30 and 10 minutes by default, each editable, with a mode of its own: off,
+slow, or also refuse). The two tiers ask different questions, because the
+original defect was a burst *refusing* launches while shedding on a burst was
+always acceptable:
+
+* **Elevated** uses the *quick* rate: the smaller of the least-squares falls
+  over the last minute and the last three, or the leave-one-burst-out rate
+  when that is larger.
+* **Severe** uses the *sustained* rate: the larger of the leave-one-burst-out
+  rate and the net fall over the last ten minutes. Leave-one-burst-out (three
+  minutes) is the net fall less the largest net fall inside any 60 s
+  sub-window, over the window less those 60 s: zero for one burst of a minute
+  or less however large, exact for a steady fall, and positive across pauses.
+  The net fall divides by the longer of its history and five minutes, so a
+  cold start does not inflate it and a lone burst reads as at most its size
+  over five minutes: it can refuse only when it alone ate half of what is left
+  above the floor.
+
+What was rejected, from the model behind this: fitting the whole window reads a
+step of h GiB as about 1.5 h over the window and refused launches for a burst
+that was already over; requiring every slice of the window to fall reads zero
+whenever a pause covers a slice, so 5 GiB every 90 s never bound. A build that
+writes in lumps with pauses (5 GiB every 60 to 90 s, 8 GiB/min for 40 s of every
+120) is sustained by the net fall whatever the pauses: the tests ride through
+pauses of 80 s, and the net fall keeps a lump for ten minutes. A write of a few minutes
+(20 GiB/min for two minutes) is a fall while it lasts, and refuses then.
+
+Unknown is never a rate. Too few samples, a gap in the timestamps (a sampler
+that stalls over ten seconds every two minutes never builds a history), a new
+boot and a step no disk can make all leave it `NotYet`. Each reason is its own
+state, decided in Rust and worded by Health and the Settings row: *warming
+up*; *off* (`host_load.enabled` is off); *older build* (a record written before
+the readings existed); *not available on this platform*; *can't be read* (from
+the first tick). The rule is silent in each, and a measured zero says "not
+falling". The rates and the exact binding are in the trace record.
 
 **What an older reader does.** The snapshot's verdict byte carries `low_disk`
 for a disk-filling binding, which every build reads; the exact binding rides in
@@ -770,14 +791,33 @@ the byte it does know is what it reads.
 
 **The command gate's disk checks** (`hooks/load_gate.rs`) read free space live,
 on the volume the command writes to: the `cwd` the hook is given, which for an
-orchestrated child terminal is not the hook process's own directory. They
-refuse a coverage build (any `cargo llvm-cov` in the line that builds; `clean`,
-`report` and `show-env` build nothing and are never refused) below its headroom
-(60 GiB by default) and any heavy build below the severe floor. They follow the
-same two switches as everything else here: with `host_load.enabled` off nothing
-is measured and they say nothing, and with `host_load.govern_launches` off they
-advise and never refuse. A reading that could not be taken is said once per
-session; it is never a pass.
+orchestrated child terminal is not the hook process's own directory, and any
+build directory the line names literally and absolutely (`--target-dir
+/abs`, `--target-dir=/abs`, `CARGO_TARGET_DIR=/abs` ahead of the program),
+read at its nearest existing ancestor; the smaller reading decides. A `cwd`
+that was given but is relative, missing or unreadable is *could not read*
+(said once per session, never a refusal and never "has room"): the process's
+own directory is used only when no `cwd` was given. They refuse a coverage
+build below its headroom (60 GiB by default) and any heavy build below the
+severe floor. A coverage build is a `cargo llvm-cov` that builds anywhere in
+the line (also by its own binary name, `cargo-llvm-cov llvm-cov`) or a cargo
+build or test run with `RUSTFLAGS` containing `-C instrument-coverage` ahead
+of it; `clean`, `report`, `show-env`, `--help` and `--version` build nothing
+and are never refused. They follow the same two switches as everything else
+here: with `host_load.enabled` off nothing is measured and they say nothing,
+and with `host_load.govern_launches` off they advise and never refuse.
+
+**Not covered, by name.** `cd /elsewhere && cargo build` writes to
+`/elsewhere`, which the hook cannot know without evaluating the shell; only
+the `cwd` it was given and the literal build directories above are read.
+`sudo`, `xargs`, `env --chdir`, cargo aliases, a build directory from a shell
+variable, and `eval "$(cargo llvm-cov show-env ...)"; cargo test` are not
+seen: that last one runs an *instrumented* build after a `show-env` that
+itself builds nothing, and it gets only the ordinary floor check, not the
+coverage headroom. Wrappers seen through: `env`, `time`, `nice`, `nohup`,
+`exec`, `command`, `timeout <duration>`, `caffeinate`, `rustup run
+<toolchain>`, `npx`, `pnpm`/`npm`/`bun` exec forms, and `bash -c` with option
+clusters such as `-o pipefail` or `-euo pipefail`.
 
 **Storage.** The guards (`fill`, `coverage`) are a top-level
 `host_load_disk_guard` key of their own, not inside `host_load_thresholds`: a
