@@ -68,6 +68,13 @@ pub struct RangeLimits {
 
 impl RangeLimits {
     /// What a push from GitPulse is scanned within.
+    ///
+    /// Measured by `benches/leak_scan.rs` (2026-11-15, 18 CPUs, load 16):
+    /// 20 commits of 50 added lines scan in 228 ms p50 and 500 commits
+    /// (2.3 MB of patch) in 792 ms p50. So the commit limit is reached at
+    /// about 2.6 s of scanning on such commits, the time limit is for
+    /// large commits or a starved host, and the byte limit sits about a
+    /// hundred times above the 500-commit row.
     pub const DEFAULT: Self = Self {
         commits: 2_000,
         patch_bytes: 256 * 1024 * 1024,
