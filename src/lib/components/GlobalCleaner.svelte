@@ -4,8 +4,9 @@
   import { hostPlatform } from "../stores/platformStore";
   import { closedAppSchedulingReason } from "../ui/platformCopy";
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
-  import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
-  import { cleanupAllowed, coverageNotice } from "../storage/hygiene/globalEligibility";
+  import type { CleanerConfig, CleanerInventory, CleanerState, CloneBudget, ReclaimScopes } from "../storage/hygiene/globalTypes";
+  import { anyScopeOn, cloneBudgetOf, scopeLabel, scopesOf } from "../storage/hygiene/reclaimConfig";
+  import { cleanupAllowed, coverageNotice, itemStatusLabel, runRowsSummary } from "../storage/hygiene/globalEligibility";
   import { humanBytes } from "../storage/format";
   import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -28,6 +29,25 @@
   let loading = false;
   /** Coverage warning for an inventory that could not read everything; never a refusal. */
   const coverage = $derived(coverageNotice(inventory));
+  const GIB = 1073741824;
+  const IDLE_DAY_CHOICES = [7, 14, 30, 90];
+  const CLONE_CHOICES = [2, 4, 8, 16];
+  const PRIVATE_BYTE_CHOICES = [0, 50 * GIB, 100 * GIB, 200 * GIB];
+  /** The draft's scopes and budget with the backend defaults filled in; the wire omits them while at default. */
+  const scopes = $derived(draft ? scopesOf(draft) : null);
+  const budget = $derived(draft ? cloneBudgetOf(draft) : null);
+  /** The saved policy turns a scope on, but nobody has inspected it yet: no run uses it. */
+  const scopesAwaitPreview = $derived(cleaner ? anyScopeOn(scopesOf(cleaner.config)) && !cleaner.scopes_previewed : false);
+  /** A saved value outside the presets stays selectable instead of silently reading as the first option. */
+  const withCurrent = (choices: number[], current: number) => (choices.includes(current) ? choices : [...choices, current].sort((a, b) => a - b));
+  function setScope<K extends keyof ReclaimScopes>(key: K, value: ReclaimScopes[K]) {
+    if (!draft) return;
+    draft.scopes = { ...scopesOf(draft), [key]: value }; edited();
+  }
+  function setBudget<K extends keyof CloneBudget>(key: K, value: CloneBudget[K]) {
+    if (!draft) return;
+    draft.clone_budget = { ...cloneBudgetOf(draft), [key]: value }; edited();
+  }
   const paths = (text: string) => text.split("\n").map(p => p.trim()).filter(Boolean);
 
   function accept(next: CleanerState, reset = false) {
@@ -125,6 +145,26 @@
       <p class="text-textMuted">{closedAppSchedulingReason($hostPlatform.os, cleaner.background_supported)} Otherwise, schedules run while GitPulse is open, including in the background. A missed run is attempted once after restart or wake. Scheduling is off until you save it here.</p>
       <p class="text-textMuted">Next scheduled run: {cleaner.config.enabled ? new Date(cleaner.config.next_run_at * 1000).toLocaleString() : "Off"}</p>
     </div>
+    {#if scopes && budget}
+    <div class="gp-card p-3 space-y-2" aria-label="Reclaim more">
+      <strong>Reclaim more (off by default)</strong>
+      {#if scopesAwaitPreview}<p role="status" class="gp-notice" data-tone="warn">No run, scheduled or manual, uses these scopes until you inspect saved roots with this exact set. Saving a change to them clears that.</p>{/if}
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Reclaim build caches in idle linked worktrees" checked={scopes.worktree_caches} onchange={(next) => setScope("worktree_caches", next)} />Reclaim build caches in idle linked worktrees</label>
+      <p class="text-textMuted">Deletes regenerable build caches (<span class="font-mono">target</span>, <span class="font-mono">.turbo</span>) inside linked worktrees that no process is using, whose tree is clean and whose cache has been untouched for the idle period below. The worktree and its source stay.</p>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Judge uncommitted work per directory, not per repository" checked={scopes.per_tree_vetoes} onchange={(next) => setScope("per_tree_vetoes", next)} />Judge uncommitted work per directory, not per repository</label>
+      <p class="text-textMuted">Makes uncommitted changes protect only the directory that produced the output, so an unrelated dirty file elsewhere in a monorepo no longer blocks cleaning it. This can make more output eligible for permanent removal.</p>
+      <label class="flex items-center gap-2"><Checkbox ariaLabel="Remove stale linked worktrees" checked={scopes.prune_worktrees} onchange={(next) => setScope("prune_worktrees", next)} />Remove stale linked worktrees</label>
+      <p class="text-textMuted">Removes the whole worktree directory, source files included, when no process is inside it, it is clean and unlocked, and its commits are merged or idle past the period below. Branches are not deleted. Unpushed work in a clean worktree on its own branch is only protected if that branch is merged or idle.</p>
+      <label>Idle period for these scopes <select aria-label="Worktree idle days" class="gp-select ml-1" value={scopes.worktree_idle_days} onchange={(e) => setScope("worktree_idle_days", Number(e.currentTarget.value))}>{#each withCurrent(IDLE_DAY_CHOICES, scopes.worktree_idle_days) as days}<option value={days}>{days} days</option>{/each}</select></label>
+    </div>
+    <div class="gp-card p-3 space-y-2" aria-label="Build-cache clones">
+      <strong>Build-cache clones</strong>
+      <label class="block">Worktrees that may hold a cloned Cargo target <select aria-label="Maximum cloned targets" class="gp-select ml-1" value={budget.max_target_clones} onchange={(e) => setBudget("max_target_clones", Number(e.currentTarget.value))}>{#each [...withCurrent(CLONE_CHOICES, budget.max_target_clones).filter(n => n !== 0), 0] as n}<option value={n}>{n === 0 ? "No limit" : n}</option>{/each}</select></label>
+      <p class="text-textMuted">Past this many in one repository, a new worktree is created without a cloned target and says why. A clone shares its blocks with the main checkout and costs little disk until it is rebuilt; a worktree without one builds cold, which costs far more, so the default is no limit.</p>
+      <label class="block">Advisory total for linked worktrees' private bytes <select aria-label="Advisory private bytes" class="gp-select ml-1" value={budget.max_private_bytes} onchange={(e) => setBudget("max_private_bytes", Number(e.currentTarget.value))}>{#each withCurrent(PRIVATE_BYTE_CHOICES, budget.max_private_bytes) as bytes}<option value={bytes}>{bytes === 0 ? "No limit" : humanBytes(bytes)}</option>{/each}</select></label>
+      <p class="text-textMuted">Storage shows a notice when linked worktrees would free more than this. It never deletes anything or blocks creation.</p>
+    </div>
+    {/if}
     <p class="text-textMuted">Only ignored output with recognized producer evidence is eligible. Dirty repositories, active tasks, recent files, symlinks, environments, dependencies and persistent state are preserved. Shared package caches and folders that are not Git repositories are excluded from scheduled sweeps.</p>
     </fieldset>
     <div class="flex flex-wrap gap-2">
@@ -138,14 +178,14 @@
         <strong>{inventory.repositories} repositories · {inventory.candidates.length} output candidates · {inventory.visited_entries.toLocaleString()} entries inspected</strong>
         {#if coverage}<p class="gp-notice" data-tone="warn">{coverage}</p>{/if}
         {#each inventory.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}
-        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted">{row.provider}</p></div><span class="shrink-0">{humanBytes(row.bytes)}</span></div>{/each}</div>
+        <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted"><span class="gp-chip" data-kind="label" data-testid="candidate-scope">{scopeLabel(row.scope)}</span> {row.provider}</p></div><span class="shrink-0 text-right">{humanBytes(row.bytes)}{#if row.private_bytes !== undefined}<span class="block text-textMuted">frees {humanBytes(row.private_bytes)}</span>{/if}</span></div>{/each}</div>
         <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
         <button class="gp-btn" data-variant="danger" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
       </div>
     {/if}
     {#if cleaner.history.length}
       <details open><summary class="font-semibold cursor-pointer">Recent cleanup runs ({cleaner.history.length})</summary>
-        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {run.items.length} targets reported</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {item.status}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
+        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {runRowsSummary(run)}</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {itemStatusLabel(item.status)}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
       </details>
     {/if}
     <details><summary class="cursor-pointer">DevCouncil agent hygiene rules</summary><p class="mt-2 whitespace-pre-wrap text-textMuted">{cleaner.agent_rules}</p></details>

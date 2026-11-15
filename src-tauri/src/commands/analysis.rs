@@ -98,6 +98,25 @@ pub async fn cmd_storage_scan(
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 
+/// Linked worktrees nobody is using, with what removing each would free.
+/// Read-only: removal is the person's click through `cmd_remove_worktree`.
+/// The idle threshold is the cleaner policy's `worktree_idle_days`, so the
+/// report and the opt-in prune scope judge staleness the same way.
+#[tauri::command(async)]
+pub async fn cmd_storage_stale_worktrees(
+    repo_path: String,
+) -> Result<crate::storage::stale_worktrees::StaleWorktreeReport, IpcError> {
+    off_thread(move || {
+        let idle_days = crate::storage::hygiene::global::service()?
+            .state()?
+            .config
+            .scopes
+            .worktree_idle_days;
+        crate::storage::stale_worktrees::stale_worktrees(&repo_path, idle_days)
+    })
+    .await
+}
+
 /// What the Storage panel's "Write commit-graph" click would run: the exact
 /// argv and the common directory it writes under. Reads files only; refused
 /// when no write is offered (graph present and fresh, no history, state

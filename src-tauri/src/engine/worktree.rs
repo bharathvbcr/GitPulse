@@ -3649,6 +3649,10 @@ pub struct WorktreeCreated {
     /// its account and nothing is known to be plentiful.
     #[serde(default)]
     pub disk_unknown: bool,
+    /// A Cargo `target` was not cloned because the build-cache clone budget
+    /// was reached. Advice, not a failure: the worktree was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_budget: Option<String>,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
     /// Hooks were asked for and the repository's file lists some that were not
@@ -3742,7 +3746,7 @@ pub fn add_worktree_extended(
     cow_caches: bool,
     run_hooks: bool,
 ) -> Result<WorktreeCreated, CommandError> {
-    let selection = crate::engine::cow_clone::CacheSelection::default();
+    let selection = crate::engine::cow_clone::CacheSelection::for_new_worktree();
     add_worktree_cached(
         repo_path,
         target_path,
@@ -3804,6 +3808,7 @@ pub fn add_worktree_configured(
             cache_error: sparse.cache_error,
             low_disk: None,
             disk_unknown: false,
+            clone_budget: None,
             hook_error: None,
             hook_notice: None,
             devmap: sparse.devmap,
@@ -3831,7 +3836,7 @@ pub fn add_worktree_configured(
         return Ok(created);
     }
 
-    let selection = crate::engine::cow_clone::CacheSelection::default();
+    let selection = crate::engine::cow_clone::CacheSelection::for_new_worktree();
     add_worktree_with_devmap(
         repo_path,
         target_path,
@@ -3889,6 +3894,7 @@ pub fn add_worktree_with_devmap(
         cache_error: None,
         low_disk: None,
         disk_unknown: false,
+        clone_budget: None,
         hook_error: None,
         hook_notice: None,
         devmap: DevmapOutcome::NotRequested,
@@ -3947,6 +3953,7 @@ pub fn add_worktree_with_devmap(
                 created.cache_error = report.error();
                 created.low_disk = report.low_disk;
                 created.disk_unknown = report.disk_unknown;
+                created.clone_budget = report.clone_budget;
             }
             Err(error) => created.cache_error = Some(error.into_message()),
         }
@@ -7541,7 +7548,7 @@ fn clone_scoped_caches_for_cone(
     worktree: &Path,
     cone_dirs: &[String],
 ) -> (Vec<String>, Option<String>) {
-    let selection = crate::engine::cow_clone::CacheSelection::default();
+    let selection = crate::engine::cow_clone::CacheSelection::for_new_worktree();
     let mut cloned_names = Vec::new();
     let mut errors = Vec::new();
 

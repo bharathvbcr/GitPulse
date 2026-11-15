@@ -36,6 +36,7 @@ pub(crate) mod clone_size;
 pub mod commit_graph;
 pub mod hygiene;
 pub mod repo_tuning;
+pub mod stale_worktrees;
 #[cfg(test)]
 mod walk_adversarial;
 #[cfg(test)]
@@ -184,6 +185,13 @@ pub struct ArtifactDir {
     /// existed claims no completeness, so an older record fails closed.
     #[serde(default)]
     pub scan_complete: bool,
+    /// What deleting this directory frees now: clone-private bytes on a
+    /// volume that holds clones, the logical size on one that cannot. Absent
+    /// when the tree was not read in full, a file's private size was not
+    /// read, or nothing reads how much reflinks share. The global cleaner's
+    /// worktree scope charges its byte budget with this, not with `bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,8 +214,22 @@ pub struct WorktreeUsage {
     pub path: String,
     pub name: String,
     pub branch: Option<String>,
+    /// Logical bytes: what the files say they hold. A floor when `truncated`.
     pub bytes: u64,
     pub truncated: bool,
+    /// What deleting this worktree would free now: its clone-private bytes,
+    /// hard-linked files excluded. A worktree whose `target/` was cloned from
+    /// the main checkout's is logically tens of gigabytes and privately a
+    /// fraction of that. Absent when any file's private size was not read or
+    /// the platform cannot read it; then only `bytes` is known, as an upper
+    /// bound. Counted over the same files as `bytes`, so a floor too when
+    /// `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+    /// Regular files the walk counted, so a truncated size carries how far it
+    /// got as well as the floor it reached.
+    #[serde(default)]
+    pub files_counted: u64,
 }
 
 /// Breakdown of the (common) git directory itself.
@@ -402,6 +424,11 @@ pub struct StorageReport {
     /// Linked worktrees with their on-disk size. The MAIN worktree's tree is
     /// already `totals.worktree_bytes`; only additional worktrees appear here.
     pub worktrees: Vec<WorktreeUsage>,
+    /// Linked worktrees the repository has, sized or not. `worktrees` holds at
+    /// most the sizing cap; when this is larger the rest were not measured, and
+    /// the report says how many rather than implying the list is all of them.
+    #[serde(default)]
+    pub worktrees_listed: u32,
     pub branches: BranchStorageSummary,
     /// Ranked reclaim audit, largest recoverable first.
     #[serde(default)]
@@ -920,10 +947,59 @@ impl LargeFileCollector {
 /// Symlinks are never followed (their own link size counts, targets do not).
 /// Returns the byte floor plus whether any budget cut the walk short.
 fn size_tree(root: &Path, budget: &mut WalkBudget) -> (u64, bool) {
-    size_tree_scoped(root, budget, false)
+    size_tree_scoped(root, budget, false, None)
 }
 
-fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64, bool) {
+/// What deleting a whole tree would free now, tallied during the same walk
+/// that sums its logical size. On a volume that holds clones, a tree cloned
+/// from another (a worktree's `target/` copied with `clonefile`) is logically
+/// whole and privately almost nothing; its logical size says nothing about
+/// what removing it returns to the disk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrivateTally {
+    /// Clone-private bytes of the singly linked files whose private size was
+    /// read.
+    pub(crate) bytes: u64,
+    /// Regular files whose private size could not be read.
+    pub(crate) unread: u64,
+    /// Logical bytes in files with another hard link: deleting this name
+    /// frees none of them while the other stands, so they are not in `bytes`.
+    pub(crate) hard_linked: u64,
+}
+
+impl PrivateTally {
+    /// The bytes deleting the tree frees now, or `None` when some file's
+    /// private size was not read, or this platform cannot read it at all.
+    pub(crate) fn freed(&self) -> Option<u64> {
+        (cfg!(target_os = "macos") && self.unread == 0).then_some(self.bytes)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn add_file(&mut self, facts: &FileFacts) {
+        #[cfg(unix)]
+        if facts.nlink > 1 {
+            self.hard_linked = self.hard_linked.saturating_add(facts.len);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        match facts.private {
+            Some(private) => self.bytes = self.bytes.saturating_add(private),
+            None => self.unread = self.unread.saturating_add(1),
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = facts;
+            self.unread = self.unread.saturating_add(1);
+        }
+    }
+}
+
+fn size_tree_scoped(
+    root: &Path,
+    budget: &mut WalkBudget,
+    is_git: bool,
+    mut private: Option<&mut PrivateTally>,
+) -> (u64, bool) {
     let mut total = 0u64;
     // (dir, depth, in_artifact)
     let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, is_git)];
@@ -1002,7 +1078,21 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
                 stack.push((entry.path(), depth + 1, child_in_artifact));
             } else if file_type.is_file() {
                 budget.files_visited += 1;
-                if let Some(meta) = budget.stat(&entry.path(), true) {
+                // With a private tally, one `getattrlist` per file (macOS)
+                // reads the length and the clone-private size together, so
+                // asking costs no syscall beyond the `stat` made without it.
+                if let Some(tally) = private.as_deref_mut() {
+                    if let Some(facts) = budget.file_facts(&entry.path()) {
+                        #[cfg(unix)]
+                        let is_dup = facts.nlink > 1 && !seen_inodes.insert((facts.dev, facts.ino));
+                        #[cfg(not(unix))]
+                        let is_dup = false;
+                        if !is_dup {
+                            total += facts.len;
+                            tally.add_file(&facts);
+                        }
+                    }
+                } else if let Some(meta) = budget.stat(&entry.path(), true) {
                     let logical_len = meta.len();
                     #[cfg(unix)]
                     let is_dup = if meta.nlink() > 1 {
@@ -1824,6 +1914,49 @@ fn walk_worktree(
     total
 }
 
+/// Sizes one linked worktree, logical and clone-private bytes in one walk,
+/// under its own file budget and the caller's deadline.
+fn size_linked_worktree(
+    info: &crate::engine::WorktreeInfo,
+    deadline: Instant,
+) -> (WorktreeUsage, WalkBudget) {
+    size_worktree_at(&info.path, &info.name, info.branch.as_deref(), deadline)
+}
+
+fn size_worktree_at(
+    path_text: &str,
+    name: &str,
+    branch: Option<&str>,
+    deadline: Instant,
+) -> (WorktreeUsage, WalkBudget) {
+    let path = PathBuf::from(path_text);
+    let mut budget = WalkBudget::with_limits(deadline, MAX_FILES_PER_WORKTREE);
+    let mut private = PrivateTally::default();
+    let (bytes, truncated) = size_tree_scoped(&path, &mut budget, false, Some(&mut private));
+    let truncated = truncated || budget.truncated;
+    let usage = WorktreeUsage {
+        path: path_text.to_string(),
+        name: name.to_string(),
+        branch: branch.map(str::to_string),
+        bytes,
+        truncated,
+        private_bytes: private.freed(),
+        files_counted: budget.files_visited,
+    };
+    (usage, budget)
+}
+
+/// [`size_linked_worktree`] for callers outside the scan: the stale-worktree
+/// report sizes the worktrees it lists the same way.
+pub(crate) fn measure_linked_worktree(
+    path: &str,
+    name: &str,
+    branch: Option<&str>,
+    deadline: Instant,
+) -> WorktreeUsage {
+    size_worktree_at(path, name, branch, deadline).0
+}
+
 /// Sizes linked worktrees (never the main one — it is the scanned tree
 /// itself). Each linked worktree receives its own file budget bounded by the
 /// global scan deadline so a large worktree cannot starve other scans.
@@ -1840,21 +1973,12 @@ fn collect_worktree_usage(
         .filter(|i| !i.is_main)
         .take(MAX_SIZED_WORKTREES)
     {
-        let path = PathBuf::from(&info.path);
-        let mut wt_budget = WalkBudget::with_limits(deadline, MAX_FILES_PER_WORKTREE);
-        let (bytes, truncated) = size_tree(&path, &mut wt_budget);
+        let (usage, wt_budget) = size_linked_worktree(info, deadline);
         tally.add(&wt_budget);
-        let is_trunc = truncated || wt_budget.truncated;
-        if is_trunc {
+        if usage.truncated {
             any_truncated = true;
         }
-        out.push(WorktreeUsage {
-            path: info.path.clone(),
-            name: info.name.clone(),
-            branch: info.branch.clone(),
-            bytes,
-            truncated: is_trunc,
-        });
+        out.push(usage);
     }
     let listed = infos.iter().filter(|i| !i.is_main).count();
     if listed > MAX_SIZED_WORKTREES {
@@ -2103,6 +2227,22 @@ impl ReclaimSizing {
 }
 
 impl FoundArtifact {
+    /// What deleting this scope frees now, when that is known: only for a
+    /// tree read to the end, and only where [`Self::sizing`] states it.
+    fn freed_bytes(&self) -> Option<u64> {
+        if !self.complete {
+            return None;
+        }
+        match self.sizing() {
+            #[cfg(target_os = "macos")]
+            ReclaimSizing::Private { bytes, .. } => Some(bytes),
+            #[cfg(not(target_os = "linux"))]
+            ReclaimSizing::Logical => Some(self.bytes),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// What this scope's bytes mean. The volume is asked per scope: a mount
     /// inside the repository may differ from the repository's own.
     fn sizing(&self) -> ReclaimSizing {
@@ -2422,7 +2562,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
     if count_objects_unread {
         git_budget.note_unread();
     }
-    let (raw_git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut git_budget, true);
+    let (raw_git_dir_bytes, git_truncated) =
+        size_tree_scoped(&git_dir, &mut git_budget, true, None);
     let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut git_budget);
     let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut git_budget);
     let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut git_budget);
@@ -2486,6 +2627,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
                     tracked_files: 0,
                     checks_unexamined: false,
                     scan_complete: found.complete,
+                    private_bytes: found.freed_bytes(),
                 },
             )
         })
@@ -2574,6 +2716,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
         git: git_storage,
         artifacts,
         largest_files: large_files,
+        worktrees_listed: u32::try_from(worktree_infos.iter().filter(|i| !i.is_main).count())
+            .unwrap_or(u32::MAX),
         worktrees,
         branches,
         reclaim,
@@ -2737,6 +2881,7 @@ mod tests {
             tracked_files: 0,
             checks_unexamined: unexamined,
             scan_complete: true,
+            private_bytes: None,
         }
     }
 
@@ -3020,6 +3165,46 @@ mod tests {
         assert_eq!(status, 0, "clonefile: {}", io::Error::last_os_error());
     }
 
+    /// Measured 2026-11-14: four agent worktrees each read 61.9 GiB because
+    /// their `target/` was cloned from the main checkout's. Their size is
+    /// logical; what removing one frees is its clone-private bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_linked_worktree_cloned_from_another_reports_what_removing_it_frees() {
+        const LEN: usize = 4 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let payload: Vec<u8> = (0..LEN)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+            .collect();
+        let anchor = root.join("anchor-target");
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::fs::write(anchor.join("blob.bin"), &payload).unwrap();
+        std::fs::File::open(anchor.join("blob.bin"))
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let worktree = root.join("agent-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        clone_dir(&anchor, &worktree.join("target"));
+        std::fs::write(worktree.join("own.txt"), vec![b'o'; 4096]).unwrap();
+        let usage = measure_linked_worktree(
+            worktree.to_str().unwrap(),
+            "agent-wt",
+            Some("agent"),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(!usage.truncated);
+        assert_eq!(usage.bytes, (LEN + 4096) as u64, "{usage:?}");
+        assert_eq!(usage.files_counted, 2);
+        let private = usage.private_bytes.expect("APFS reports private sizes");
+        assert!(
+            private < (LEN / 4) as u64,
+            "the cloned 4 MiB is shared, not freed by removal: {usage:?}"
+        );
+        assert!(private >= 4096, "the worktree's own file is: {usage:?}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_cloned_directory_is_not_reported_as_fully_reclaimable() {
@@ -3114,6 +3299,7 @@ mod tests {
             tracked_files: 0,
             checks_unexamined: false,
             scan_complete: true,
+            private_bytes: None,
         };
         let sizing = HashMap::from([(
             "node_modules".to_string(),
@@ -3201,6 +3387,7 @@ mod tests {
             tracked_files: 0,
             checks_unexamined: false,
             scan_complete: true,
+            private_bytes: None,
         };
         let sizing = HashMap::from([("target".to_string(), sizing)]);
         let (items, _) = build_reclaim(
@@ -3336,6 +3523,7 @@ mod tests {
             tracked_files: 0,
             checks_unexamined: false,
             scan_complete: false,
+            private_bytes: None,
         };
         let sizing = HashMap::from([(
             "target".to_string(),
@@ -3390,6 +3578,7 @@ mod tests {
             tracked_files: 0,
             checks_unexamined: false,
             scan_complete: true,
+            private_bytes: None,
         };
         let sizing = HashMap::from([(
             "target".to_string(),

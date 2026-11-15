@@ -37,6 +37,8 @@ export interface ArtifactDir {
    * floors and may be true for reasons unrelated to this tree.
    */
   scan_complete?: boolean;
+  /** What deleting the directory frees now; absent when not known. */
+  private_bytes?: number;
 }
 
 export interface LargeFile {
@@ -48,8 +50,13 @@ export interface WorktreeUsage {
   path: string;
   name: string;
   branch: string | null;
+  /** Logical bytes; a floor when `truncated`. */
   bytes: number;
   truncated: boolean;
+  /** What removing the worktree frees now (clone-private bytes); absent when unread. */
+  private_bytes?: number;
+  /** Regular files counted, so a truncated size says how far it got. */
+  files_counted: number;
 }
 
 export interface GitStorage {
@@ -333,6 +340,8 @@ export interface StorageReport {
   artifacts: ArtifactDir[];
   largest_files: LargeFile[];
   worktrees: WorktreeUsage[];
+  /** Linked worktrees the repository has, sized or not. */
+  worktrees_listed: number;
   branches: BranchStorageSummary;
   reclaim: ReclaimItem[];
   reclaim_summary: ReclaimSummary;
