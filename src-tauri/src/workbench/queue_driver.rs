@@ -368,8 +368,10 @@ pub(super) fn verify_combined(
                         lookup_repository_identity(store, repository_id, &mut repo_cache)
                     })?;
                     let (gate, latest_head) = state.with_store(|store| {
-                        let gate = verification_gate::check(store, task_id, &repo_identity);
-                        let latest_head = verification_gate::latest(store, task_id)
+                        let memo = verification_gate::Memo::shared();
+                        let gate = verification_gate::check(memo, store, task_id, &repo_identity);
+                        let latest_head = memo
+                            .latest(store, task_id)
                             .ok()
                             .flatten()
                             .and_then(|rec| optional_hex_oid(Some(&rec.head)));

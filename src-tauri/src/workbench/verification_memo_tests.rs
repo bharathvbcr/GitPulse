@@ -382,6 +382,98 @@ fn a_commit_that_leaves_the_files_looking_unchanged_is_seen() {
     );
 }
 
+/// `PRAGMA data_version` is not a write-ahead-log feature: in a rollback-journal
+/// database the counter moves when another connection commits all the same. A
+/// store in that mode (a profile somebody switched, or a copy) is never answered
+/// from a stale hold: every newer record, written through another connection, is
+/// the answer to the very next ask, and an ask with no write between is held.
+#[test]
+fn a_rollback_journal_store_answers_what_was_last_committed() {
+    let (_d, path) = profile();
+    drop(fixture_store(&path));
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        mode, "delete",
+        "the store was not switched to a rollback journal"
+    );
+    // `open_readonly` only names the file for the memo and leaves the mode as set.
+    let reader = Store::open_readonly(&path).unwrap();
+    let mode: String = reader
+        .connection()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let memo = Memo::new();
+    let walks = seam::walks(&path);
+    assert_eq!(outcome(&memo, &reader, "a").as_deref(), Some("passed"));
+    assert_eq!(outcome(&memo, &reader, "a").as_deref(), Some("passed"));
+    assert_eq!(seam::walks(&path) - walks, 1, "no write, so one walk");
+    for round in 0..6 {
+        let newest = if round % 2 == 0 { "failed" } else { "degraded" };
+        writer
+            .execute(
+                "INSERT INTO evidence (type, task_id, data_json) VALUES (?1, 'a', ?2)",
+                rusqlite::params![
+                    EVIDENCE_TYPE,
+                    format!(r#"{{"item_id":"a","state":"settled","outcome":"{newest}"}}"#)
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            outcome(&memo, &reader, "a").as_deref(),
+            Some(newest),
+            "round {round}: a record committed by another connection was not the answer"
+        );
+    }
+    assert_eq!(
+        seam::walks(&path) - walks,
+        7,
+        "one walk per commit, none without one"
+    );
+}
+
+/// A store the memo's own read-only connection cannot open (here: the file lost
+/// its read permission after the caller opened it) is read through the caller's
+/// connection on every call and is never held, and what it reads is current.
+/// Needs a user the file mode applies to, so it is skipped for root.
+#[cfg(unix)]
+#[test]
+fn a_store_the_memo_cannot_open_is_read_through_the_callers_connection() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, path) = profile();
+    let store = fixture_store(&path);
+    let original = std::fs::metadata(&path).unwrap().permissions();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let applies = std::fs::File::open(&path).is_err();
+    if applies {
+        let memo = Memo::new();
+        let walks = seam::walks(&path);
+        assert_eq!(outcome(&memo, &store, "a").as_deref(), Some("passed"));
+        put(&store, "a", "failed");
+        assert_eq!(
+            outcome(&memo, &store, "a").as_deref(),
+            Some("failed"),
+            "the caller's own write was not the answer"
+        );
+        assert_eq!(outcome(&memo, &store, "a").as_deref(), Some("failed"));
+        assert_eq!(
+            seam::walks(&path) - walks,
+            3,
+            "read each time, held for nobody"
+        );
+        assert_eq!(memo.held_bytes(), 0);
+    }
+    std::fs::set_permissions(&path, original).unwrap();
+    assert!(
+        applies,
+        "NOT TESTED: this user can read a mode-000 file (root?), so the memo's own \
+         connection could not be made to fail to open"
+    );
+}
+
 #[test]
 fn a_failed_read_leaves_no_stale_answer_and_the_next_good_read_is_exact() {
     let (_d, path) = profile();
@@ -566,17 +658,64 @@ fn one_budget_covers_every_store() {
     let probe = Memo::new();
     assert_eq!(outcome(&probe, &one, "never"), None);
     let whole = probe.held_bytes();
-    // Room for one store's whole answer and a little more, not for two.
+    // Room for one store's whole answer and a little more, not for two whole
+    // ones. The second store's walk is told what is left, so it keeps only the
+    // task asked about, which fits: both answers are held and neither store is
+    // walked again, however the two are interleaved.
     let memo = Memo::with_budget(whole + whole / 2);
-    assert_eq!(outcome(&memo, &one, "never"), None);
-    assert_eq!(outcome(&memo, &two, "never"), None);
-    assert_eq!(outcome(&memo, &one, "never"), None);
-    assert_eq!(outcome(&memo, &two, "never"), None);
+    for _ in 0..3 {
+        assert_eq!(outcome(&memo, &one, "never"), None);
+        assert_eq!(outcome(&memo, &two, "never"), None);
+    }
     assert!(memo.held_bytes() <= whole + whole / 2);
     let (a, b) = (seam::walks(&first), seam::walks(&second));
     // `probe` walked `first` once too.
     assert_eq!(a, 2, "the first store's answer stayed held");
-    assert_eq!(b, 2, "the second did not fit and is read each time");
+    assert_eq!(
+        b, 1,
+        "the second kept what it was asked about and stayed held"
+    );
+}
+
+/// Two stores whose answers do not fit together: the one asked last holds what
+/// it was asked about and the one asked longest ago gives up its own, so a run
+/// of asks of either walks once rather than on every call. Switching back walks
+/// once more, because that store's answer was the one given up.
+#[test]
+fn stores_that_do_not_fit_together_each_walk_once_per_run_of_asks() {
+    let (_d1, first) = profile();
+    let (_d2, second) = profile();
+    let one = fixture_store(&first);
+    let two = fixture_store(&second);
+    let tasks = ids(&["a", "b", "c"]);
+    let probe = Memo::new();
+    assert_eq!(probe.latest_many(&one, &tasks).unwrap().len(), 3);
+    let three = probe.held_bytes();
+    let budget = three + three / 2;
+    let memo = Memo::with_budget(budget);
+    let ask = |store: &Store| {
+        for _ in 0..4 {
+            assert_eq!(memo.latest_many(store, &tasks).unwrap().len(), 3);
+            assert!(memo.held_bytes() <= budget, "{} held", memo.held_bytes());
+        }
+    };
+    let walks = |path: &Path| seam::walks(path);
+    let (a0, b0) = (walks(&first), walks(&second));
+    ask(&one);
+    assert_eq!(walks(&first) - a0, 1, "four asks of the first store");
+    ask(&two);
+    assert_eq!(walks(&second) - b0, 1, "four asks of the second store");
+    assert_eq!(
+        walks(&first) - a0,
+        1,
+        "the first store was not walked while the second was asked"
+    );
+    ask(&one);
+    assert_eq!(
+        walks(&first) - a0,
+        2,
+        "the second store's run took the room, so the first walks once more"
+    );
 }
 
 #[test]

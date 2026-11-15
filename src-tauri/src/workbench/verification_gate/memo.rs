@@ -37,9 +37,12 @@
 //! so is the absence.
 //!
 //! What is held is bounded: one byte budget across every store this memo holds
-//! ([`MAX_BYTES`], counting keys and per-entry overhead). A walk that does not
-//! fit keeps only the tasks asked about; if even those do not fit, nothing is
-//! held and each call reads.
+//! ([`MAX_BYTES`], counting keys and per-entry overhead). A walk keeps the whole
+//! table's newest records only while they fit in what the other stores have
+//! left, and past that only the tasks asked about. If even those do not fit,
+//! the stores asked longest ago give up what they hold, and if they still do
+//! not fit (an answer bigger than the whole budget) nothing is held and each
+//! call reads.
 //!
 //! A change is not applied incrementally. Rows above the highest id already
 //! seen would be all that is new if `evidence` were append-only, and no writer
@@ -129,32 +132,53 @@ struct Slot {
 }
 
 impl Slot {
-    /// Replaces what is held, charging the memo's budget; what does not fit is
-    /// not held.
-    fn hold(&mut self, held: Option<Held>) {
-        let new = held.as_ref().map_or(0, |held| held.bytes);
+    /// Replaces what is held, charging the memo's budget. When the memo's other
+    /// stores leave too little room, `make_room` is asked to free the shortfall
+    /// from the least recently used of them, and what still does not fit is not
+    /// held (an answer bigger than the whole budget is never held).
+    fn hold(&mut self, held: Held, make_room: &dyn Fn(usize)) {
+        let new = held.bytes;
         let old = self.charged;
         let max = self.max_bytes;
-        let fits = self
-            .used
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                let others = used.saturating_sub(old);
-                (others + new <= max).then_some(others + new)
-            })
-            .is_ok();
+        let charge = |slot: &Slot| {
+            slot.used
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    let others = used.saturating_sub(old);
+                    (others + new <= max).then_some(others + new)
+                })
+                .is_ok()
+        };
+        let mut fits = new <= max && charge(self);
+        if !fits && new <= max {
+            let others = self.used.load(Ordering::SeqCst).saturating_sub(old);
+            make_room((others + new).saturating_sub(max));
+            fits = charge(self);
+        }
         if fits {
             self.charged = new;
-            self.held = held;
+            self.held = Some(held);
         } else {
-            self.used.fetch_sub(old, Ordering::SeqCst);
-            self.charged = 0;
-            self.held = None;
+            self.release();
         }
     }
 
+    /// Holds nothing and returns what was charged.
+    fn release(&mut self) {
+        self.used.fetch_sub(self.charged, Ordering::SeqCst);
+        self.charged = 0;
+        self.held = None;
+    }
+
     fn reset(&mut self) {
-        self.hold(None);
+        self.release();
         self.probe = None;
+    }
+
+    /// What is left of the memo's budget, the bytes this store holds counted as
+    /// still held.
+    fn room(&self) -> usize {
+        self.max_bytes
+            .saturating_sub(self.used.load(Ordering::SeqCst))
     }
 
     /// `wanted`'s newest records, read through the caller's own connection and
@@ -173,6 +197,7 @@ impl Slot {
         path: &Path,
         store: &Store,
         wanted: &HashSet<&str>,
+        make_room: &dyn Fn(usize),
     ) -> Result<HashMap<String, Entry>, String> {
         let Some(now) = FileId::at(path) else {
             return self.read_direct(store, wanted);
@@ -207,12 +232,16 @@ impl Slot {
             .as_ref()
             .is_some_and(|held| held.version != before)
         {
-            self.hold(None);
+            self.release();
         }
+        // The walk keeps every task only while that fits in what the memo has
+        // left, whoever holds the rest: an answer that cannot be held would
+        // have been walked for nothing.
+        let room = self.room();
         let walked = match self
             .probe
             .as_ref()
-            .map(|probe| walk(probe.connection(), wanted, self.max_bytes))
+            .map(|probe| walk(probe.connection(), wanted, room))
         {
             Some(Ok(walked)) => walked,
             Some(Err(error)) => {
@@ -229,7 +258,7 @@ impl Slot {
         if after != Some(before) {
             // Something committed while the walk ran. The answer is what the
             // walk read; it is not held under a counter it was not read at.
-            self.hold(None);
+            self.release();
             return Ok(found);
         }
         let next = match self.held.take() {
@@ -249,7 +278,7 @@ impl Slot {
                 bytes: walked.bytes,
             },
         };
-        self.hold(Some(next));
+        self.hold(next, make_room);
         Ok(found)
     }
 }
@@ -344,7 +373,26 @@ impl Memo {
         };
         let slot = self.slot_for(path);
         let mut slot = crate::supervisor::lock_or_recover(&slot);
-        slot.resolve(path, store, wanted)
+        slot.resolve(path, store, wanted, &|need| self.make_room(need))
+    }
+
+    /// Frees at least `need` bytes of the budget, if it can, from the stores
+    /// that were asked longest ago (the registry is oldest first). A store
+    /// somebody is reading right now is not waited for: the caller already holds
+    /// its own store's lock, so waiting on another's could deadlock, and a busy
+    /// store is the most recently used by definition.
+    fn make_room(&self, need: usize) {
+        let slots = crate::supervisor::lock_or_recover(&self.slots);
+        let mut freed = 0usize;
+        for (_, slot) in slots.iter() {
+            if freed >= need {
+                break;
+            }
+            if let Ok(mut slot) = slot.try_lock() {
+                freed += slot.charged;
+                slot.release();
+            }
+        }
     }
 
     fn slot_for(&self, path: &Path) -> Arc<Mutex<Slot>> {

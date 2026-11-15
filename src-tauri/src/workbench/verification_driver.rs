@@ -405,6 +405,7 @@ impl Driver {
             }
             Step::Promote => {
                 let outcome = gate::check(
+                    backend.memo(),
                     store,
                     id,
                     &repository_identity(store, card).unwrap_or_default(),

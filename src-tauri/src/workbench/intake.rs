@@ -1827,8 +1827,14 @@ pub(crate) fn complete_task(
         // An agent's `done` is a claim: it lands as `done` only where Manvi's
         // verification passed for the work as it stands. A task already done
         // is never judged again (a retry is `unchanged`).
-        let gate = (status == "done" && previous != "done")
-            .then(|| verification_gate::check(store, &id, &repository_identity));
+        let gate = (status == "done" && previous != "done").then(|| {
+            verification_gate::check(
+                verification_gate::Memo::shared(),
+                store,
+                &id,
+                &repository_identity,
+            )
+        });
         let held = match &gate {
             Some(verification_gate::Gate::Held(reason)) => Some(reason.clone()),
             _ => None,

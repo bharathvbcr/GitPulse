@@ -123,22 +123,6 @@ pub(crate) enum Gate {
     Held(String),
 }
 
-/// The newest verification record for `item_id`, `None` when the item has
-/// never been verified, as the host's shared [`Memo`] reads it.
-///
-/// The newest evidence row of this type decides, and an unparseable one is an
-/// error rather than a skip: skipping it would let an older `passed` row stand
-/// in for a newer verdict nobody could read.
-///
-/// This is [`Memo::latest`] and there is no second reader: one walk of the
-/// table, newest first, that stops as soon as the card is found, and that is
-/// held while the store has not changed. A card never verified costs the whole
-/// walk once. Callers that carry a backend ask the backend's memo instead, so a
-/// test can give each run its own.
-pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, String> {
-    Memo::shared().latest(store, item_id)
-}
-
 fn parse_record(data: &str) -> Result<Record, String> {
     serde_json::from_str(data).map_err(|e| {
         format!(
@@ -148,9 +132,13 @@ fn parse_record(data: &str) -> Result<Record, String> {
 }
 
 /// The gate for a claim of `done` on `item_id`, a task of the repository whose
-/// identity is `repository_identity`.
-pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> Gate {
-    match latest(store, item_id) {
+/// identity is `repository_identity`, judged on the newest record `memo` holds
+/// for it ([`Memo::latest`]: the one reader, a single newest-first walk held
+/// while the store has not changed). The caller names the memo: a caller that
+/// carries a backend asks the backend's, so a test can give each run its own,
+/// and one with none asks [`Memo::shared`].
+pub(crate) fn check(memo: &Memo, store: &Store, item_id: &str, repository_identity: &str) -> Gate {
+    match memo.latest(store, item_id) {
         Err(reason) => Gate::Held(reason),
         Ok(None) => Gate::Held(
             "no verification record exists for this task: Manvi's work.verify.task has not judged it".into(),

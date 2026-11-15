@@ -284,7 +284,7 @@ fn a_sidecar_that_is_down_is_recorded_as_could_not_run_not_failed_and_not_retrie
     assert_eq!(driver.sweep(&store, &fake), Report::default());
     assert!(fake.starts.borrow().is_empty());
     let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
-    let held = gate::check(&store, &id, &identity);
+    let held = gate::check(fake.memo(), &store, &id, &identity);
     assert!(matches!(held, gate::Gate::Held(m) if m.contains("could not run")));
 }
 
@@ -517,11 +517,12 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
         )
         .unwrap();
     let ids = [id.clone(), other.clone(), never.clone()];
-    let batch = Memo::new().latest_many(&store, &ids).unwrap();
+    let memo = Memo::new();
+    let batch = memo.latest_many(&store, &ids).unwrap();
     for one in &ids {
         assert_eq!(
             batch.get(one),
-            gate::latest(&store, one).unwrap().as_ref(),
+            Memo::new().latest(&store, one).unwrap().as_ref(),
             "{one}"
         );
     }
@@ -553,7 +554,10 @@ fn the_per_card_read_finds_a_verdict_behind_more_than_a_page_of_other_evidence()
     let head = head_of(&repo);
     store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
     bury_under_other_evidence(&store, &id);
-    let found = gate::latest(&store, &id).unwrap().expect("the verdict");
+    let found = Memo::new()
+        .latest(&store, &id)
+        .unwrap()
+        .expect("the verdict");
     assert_eq!(found.outcome, "passed");
 }
 
@@ -1770,20 +1774,29 @@ fn a_host_that_is_closing_refuses_the_wait() {
 fn sweeps_and_a_board_read_of_an_unchanged_store_walk_it_once() {
     use crate::workbench::verification_gate::memo::seam;
     let (_d, store, repo, id) = setup();
+    // The claim judges the card through the host's shared memo (`complete_task`
+    // has no backend), which walks the table once. That walk is the baseline: a
+    // sweep through the fake's own memo is a second memo meeting the store for
+    // the first time, so its first read walks once more, and nothing after it
+    // does. Nothing writes in between: a probe that watched `data_version`,
+    // `schema_version`, the driver connection's `total_changes` and every
+    // table's row count across the sweeps saw all of them hold still.
     claim(&store, &repo, &id);
     let path = std::path::PathBuf::from(store.connection().path().unwrap());
+    let claimed = seam::walks(&path);
+    assert_eq!(claimed, 1, "the claim walks the table once");
     let fake = Fake::new();
     let mut driver = Driver::default();
-    // The first sweep starts the verification, and starting one reads and
-    // writes the profile (the sweep's own commits), so the second still finds a
-    // store that moved under it. What follows is a store nobody writes to.
-    for _ in 0..2 {
-        driver.sweep(&store, &fake);
-    }
+    let first = driver.sweep(&store, &fake);
+    assert_eq!(first.started, 1, "{first:?}");
+    assert_eq!(
+        seam::walks(&path),
+        claimed + 1,
+        "the fake's memo walks once for the first sweep"
+    );
     let walked = seam::walks(&path);
-    assert!((1..=2).contains(&walked), "{walked} walks for two sweeps");
     for _ in 0..5 {
-        driver.sweep(&store, &fake);
+        assert_eq!(driver.sweep(&store, &fake), Report::default());
     }
     let board = Store::open_readonly(&path).unwrap();
     status_batch(&board, &fake, std::slice::from_ref(&id)).unwrap();
@@ -1799,8 +1812,9 @@ fn sweeps_and_a_board_read_of_an_unchanged_store_walk_it_once() {
 #[test]
 fn the_driver_reopens_a_store_that_was_replaced() {
     use crate::workbench::verification_driver::driver_store;
+    let memo = Memo::new();
     let verdict_of = |store: &Store| {
-        gate::latest(store, "a")
+        memo.latest(store, "a")
             .unwrap()
             .map(|record| record.outcome)
     };

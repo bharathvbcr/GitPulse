@@ -394,7 +394,7 @@ pub(crate) fn post_for_task(
     let remote = crate::github::discover_github_remote(repo_path)?
         .ok_or_else(|| "No GitHub remote configured".to_string())?;
     let record = match store {
-        Ok(store) => super::verification_gate::latest(store, item_id),
+        Ok(store) => super::verification_gate::Memo::shared().latest(store, item_id),
         Err(e) => Err(e),
     };
     // The worktree the verdict was taken in when the record names one of this
