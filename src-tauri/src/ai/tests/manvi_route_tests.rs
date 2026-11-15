@@ -203,7 +203,7 @@ fn a_manvi_without_the_op_gets_the_one_clear_update_message() {
     .expect_err("an old Manvi cannot serve Claude");
     assert_eq!(
         error.message(),
-        "This Manvi does not offer work.assist.complete. Update Manvi to use Claude for GitPulse's AI features."
+        "This Manvi does not offer work.assist.complete. Update Manvi to run GitPulse's AI features through it."
     );
 }
 

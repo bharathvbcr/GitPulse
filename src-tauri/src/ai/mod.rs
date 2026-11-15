@@ -99,7 +99,7 @@ pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";
 const ASSIST_MAX_SYSTEM_BYTES: usize = 32_768;
 const ASSIST_MAX_USER_BYTES: usize = 2_097_152;
 /// What the user reads when Manvi predates the op.
-pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to use Claude for GitPulse's AI features.";
+pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to run GitPulse's AI features through it.";
 
 /// A failed `work.assist.complete` call: the worker's code and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,11 +748,10 @@ struct AssistReply {
 
 fn assist_call(cloud: &ManviRoute, params: Value) -> Result<AssistReply, CommandError> {
     let raw = (cloud.complete)(params).map_err(|e| CommandError::from(e.user_message()))?;
-    let reply: AssistReply = serde_json::from_value(raw).map_err(|e| {
-        CommandError::from(format!("Manvi returned an unreadable Claude reply: {e}"))
-    })?;
+    let reply: AssistReply = serde_json::from_value(raw)
+        .map_err(|e| CommandError::from(format!("Manvi returned an unreadable reply: {e}")))?;
     if !reply.ok {
-        return Err("Manvi did not accept the Claude request.".into());
+        return Err("Manvi did not accept the request.".into());
     }
     Ok(reply)
 }
@@ -804,7 +803,7 @@ fn run_manvi(
     }
     if turn.system.len() > ASSIST_MAX_SYSTEM_BYTES || !fits(&turn) {
         return Err(
-            "The request does not fit Claude's context window under Manvi's size check.".into(),
+            "The request does not fit the model's context window under Manvi's size check.".into(),
         );
     }
 

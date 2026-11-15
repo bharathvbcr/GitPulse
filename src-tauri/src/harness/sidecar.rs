@@ -2593,7 +2593,7 @@ fn missing_op_message(op: &str) -> String {
             "managed runs"
         }
         "work.runs.managed.continue" => "follow-ups to a managed run",
-        "work.assist.complete" => "Claude for GitPulse's AI features",
+        "work.assist.complete" => "GitPulse's AI features through Manvi",
         _ => "task enhancements",
     };
     format!("This Manvi binary does not advertise {op}. Update Manvi to use {feature}.")
