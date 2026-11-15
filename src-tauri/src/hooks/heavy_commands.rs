@@ -307,6 +307,10 @@ pub(super) struct Hit {
     pub row: &'static Row,
     /// The program and its verb, as in `cargo test`: never the whole line.
     pub label: String,
+    /// `cargo llvm-cov` that builds: it writes instrumented output many times
+    /// the size of an ordinary build's, so the load gate asks for disk headroom
+    /// before it starts (`load_gate`).
+    pub coverage_build: bool,
 }
 
 #[derive(Debug, Default)]
@@ -444,9 +448,17 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
         if !row.programs.iter().any(|p| glob_eq(p, program)) || !row_matches(row, args) {
             continue;
         }
+        let coverage = llvm_cov(program, args, row);
+        if coverage == Some(false) {
+            // `cargo llvm-cov clean|report|show-env` builds nothing: not heavy.
+            // `clean` is the command that gives the disk back, and refusing it
+            // for a full disk would be the failure the gate exists to prevent.
+            continue;
+        }
         let hit = Hit {
             row,
             label: label_of(program, args, row),
+            coverage_build: coverage == Some(true),
         };
         match row.kind {
             Kind::Heavy if out.heavy.is_none() => out.heavy = Some(hit),
@@ -457,6 +469,43 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
             Kind::Advise => {}
         }
     }
+}
+
+/// `cargo llvm-cov`'s subcommands that read or remove its output and compile
+/// nothing.
+const LLVM_COV_NON_BUILDING: &[&str] = &["clean", "report", "show-env"];
+
+/// Options of `cargo llvm-cov` that take a value, so the value is not mistaken
+/// for the subcommand.
+const LLVM_COV_VALUE_FLAGS: &[&str] = &[
+    "--manifest-path",
+    "--package",
+    "-p",
+    "--profile",
+    "--target",
+    "--features",
+    "-F",
+    "--target-dir",
+    "--output-dir",
+    "--output-path",
+    "--ignore-filename-regex",
+    "--jobs",
+    "-j",
+];
+
+/// For `cargo llvm-cov`: whether the invocation builds (`Some(true)`) or only
+/// reads or removes output (`Some(false)`); `None` for anything else.
+fn llvm_cov(program: &str, args: &[String], row: &Row) -> Option<bool> {
+    if row.id != "cargo" || program != "cargo" {
+        return None;
+    }
+    let at = first_operand(args, row.value_flags)?;
+    if args[at] != "llvm-cov" {
+        return None;
+    }
+    let sub = skip_options(args, at + 1, LLVM_COV_VALUE_FLAGS);
+    let sub = args.get(sub).map(String::as_str);
+    Some(!sub.is_some_and(|word| LLVM_COV_NON_BUILDING.contains(&word)))
 }
 
 /// The operand after `-c` in a shell's own options, when there is one.

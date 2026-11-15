@@ -221,3 +221,48 @@ fn the_prefilter_does_not_hide_a_row_from_the_table() {
     assert!(!names_a_program("git status"));
     assert!(!names_a_program("echo hello"));
 }
+
+fn coverage(command: &str) -> Option<bool> {
+    classify(command).heavy.map(|hit| hit.coverage_build)
+}
+
+#[test]
+fn a_coverage_build_is_told_from_the_other_heavy_commands_through_wrappers_and_shells() {
+    for command in [
+        "cargo llvm-cov",
+        "cargo llvm-cov --lib",
+        "cargo llvm-cov nextest",
+        "cargo llvm-cov --no-report --workspace",
+        "cargo +nightly llvm-cov --manifest-path src-tauri/Cargo.toml --lib",
+        "env CARGO_BUILD_JOBS=2 cargo llvm-cov --lib",
+        "bash -c 'cd src-tauri && cargo llvm-cov --lib'",
+        "/Users/x/.claude-bin/cargo llvm-cov",
+    ] {
+        assert_eq!(coverage(command), Some(true), "{command}");
+    }
+    for command in [
+        "cargo test",
+        "cargo build",
+        "cargo test llvm-cov",
+        "go test ./...",
+    ] {
+        assert_eq!(coverage(command), Some(false), "{command}");
+    }
+}
+
+#[test]
+fn llvm_cov_clean_report_and_show_env_build_nothing_and_are_not_heavy() {
+    for command in [
+        "cargo llvm-cov clean",
+        "cargo llvm-cov clean --workspace",
+        "cargo llvm-cov report --html",
+        "cargo llvm-cov show-env --export-prefix",
+        "cargo +nightly llvm-cov --manifest-path src-tauri/Cargo.toml clean",
+        "bash -c 'cargo llvm-cov clean'",
+    ] {
+        assert_eq!(heavy(command), None, "{command}");
+    }
+    // A test filter that happens to be named like a subcommand still builds.
+    assert_eq!(heavy("cargo test report").as_deref(), Some("cargo test"));
+    assert_eq!(heavy("cargo test clean").as_deref(), Some("cargo test"));
+}
