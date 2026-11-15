@@ -36,7 +36,10 @@
 //! - A host that is shutting down stops the sweep without writing.
 
 use super::intake::{self, HELD_MARKER};
-use super::verification_gate::{self as gate, Gate, Record, EVIDENCE_TYPE, STATE_COULD_NOT_RUN};
+use super::store_probe::FileId;
+use super::verification_gate::{
+    self as gate, Gate, Memo, Record, EVIDENCE_TYPE, STATE_COULD_NOT_RUN,
+};
 use super::{query, WorkbenchError, WorkbenchState};
 use crate::ipc_error::CommandError;
 use dc_store::Store;
@@ -107,6 +110,11 @@ pub(crate) trait Backend {
     fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError>;
     fn now(&self) -> Instant;
     fn cancelled(&self) -> bool;
+    /// The verdicts this backend's reads share. The host's one, unless a test
+    /// gives its backend a memo of its own.
+    fn memo(&self) -> &Memo {
+        Memo::shared()
+    }
 }
 
 /// A verification this process started or adopted.
@@ -316,7 +324,7 @@ impl Driver {
         // batch fail, each card is read alone, so one card's unreadable
         // record stays that card's.
         let ids: Vec<String> = held.iter().map(|(_, _, id)| id.clone()).collect();
-        let batch = gate::latest_many(store, &ids);
+        let batch = backend.memo().latest_many(store, &ids);
         let mut seen = HashSet::new();
         for (card, target, id) in &held {
             if backend.cancelled() {
@@ -324,7 +332,7 @@ impl Driver {
             }
             let latest = match &batch {
                 Ok(found) => Ok(found.get(id).cloned()),
-                Err(_) => gate::latest(store, id),
+                Err(_) => backend.memo().latest(store, id),
             };
             let key = (id.clone(), target.head.clone());
             seen.insert(key.clone());
@@ -520,7 +528,10 @@ pub(crate) fn status(
     backend: &dyn Backend,
     id: &str,
 ) -> Result<Value, WorkbenchError> {
-    let record = gate::latest(store, id).map_err(|m| WorkbenchError::new("store_error", m))?;
+    let record = backend
+        .memo()
+        .latest(store, id)
+        .map_err(|m| WorkbenchError::new("store_error", m))?;
     Ok(describe(record, backend, &mut HashMap::new(), true))
 }
 
@@ -545,8 +556,10 @@ pub(crate) fn status_batch(
     }
     let mut heads = HashMap::new();
     let mut items = serde_json::Map::new();
-    let mut records =
-        gate::latest_many(store, ids).map_err(|m| WorkbenchError::new("store_error", m))?;
+    let mut records = backend
+        .memo()
+        .latest_many(store, ids)
+        .map_err(|m| WorkbenchError::new("store_error", m))?;
     for id in ids {
         if let Some(record) = records.remove(id) {
             items.insert(
@@ -801,7 +814,7 @@ pub(crate) fn judge_candidate_with(
         if backend.cancelled() {
             return Err("Verification stopped because GitPulse closed.".into());
         }
-        match gate::latest(store, task_id) {
+        match backend.memo().latest(store, task_id) {
             Err(why) => return Err(why),
             Ok(Some(record)) if verdict_covers(&record, candidate) => {
                 let scratch_text = scratch
@@ -1046,13 +1059,14 @@ impl Backend for HostBackend {
 /// checked on every call, which is one `stat`.
 pub(crate) fn driver_store(
     path: Option<std::path::PathBuf>,
-    held: &mut Option<(Store, gate::memo::FileIdentity)>,
+    held: &mut Option<(Store, FileId)>,
 ) -> Option<&Store> {
-    let current = path.as_deref().and_then(gate::memo::FileIdentity::of);
-    if held
-        .as_ref()
-        .is_some_and(|(_, opened)| Some(*opened) != current)
-    {
+    let current = path.as_deref().and_then(FileId::at);
+    if held.as_ref().is_some_and(|(_, opened)| {
+        current
+            .as_ref()
+            .is_none_or(|current| opened.replaced_by(current))
+    }) {
         *held = None;
     }
     if held.is_none() {
@@ -1070,7 +1084,7 @@ pub(crate) fn install(host: WorkbenchState) {
         let mut driver = Driver::default();
         // Its own connection: a sweep waits on the sidecar, and the
         // board's reads must not queue behind that.
-        let mut own: Option<(Store, gate::memo::FileIdentity)> = None;
+        let mut own: Option<(Store, FileId)> = None;
         while host.check_open().is_ok() {
             if let Some(open) = driver_store(host.profile_path().ok(), &mut own) {
                 let report = driver.sweep(open, &backend);

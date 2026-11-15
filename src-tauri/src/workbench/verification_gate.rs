@@ -21,15 +21,14 @@
 //! record) is a hold that says so, never a quiet pass.
 
 pub(crate) mod memo;
+pub(crate) use memo::Memo;
 
 use super::intake::resolve;
 use super::WorkbenchError;
 use crate::ipc_error::CommandError;
 use dc_store::Store;
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::path::Path;
 
 /// The dc-store evidence type Manvi stores a verification record under.
@@ -77,6 +76,43 @@ pub(crate) struct Record {
     pub critic_summary: String,
 }
 
+impl Record {
+    /// Bytes of heap this record holds, for the memo's budget: the text of each
+    /// field and of each criterion, finding and degraded line, and their
+    /// headers.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        const STRING: usize = std::mem::size_of::<String>();
+        let fields = [
+            &self.request_id,
+            &self.item_id,
+            &self.state,
+            &self.outcome,
+            &self.worktree,
+            &self.head,
+            &self.critic_summary,
+        ]
+        .iter()
+        .map(|text| text.len())
+        .sum::<usize>();
+        let criteria: usize = self
+            .criteria
+            .iter()
+            .map(|criterion| {
+                std::mem::size_of::<Criterion>()
+                    + criterion.text.len()
+                    + criterion.status.len()
+                    + criterion
+                        .findings
+                        .iter()
+                        .map(|finding| STRING + finding.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let degraded: usize = self.degraded.iter().map(|line| STRING + line.len()).sum();
+        std::mem::size_of::<Self>() + fields + criteria + degraded
+    }
+}
+
 /// What the gate decided for a claim of `done`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Gate {
@@ -88,38 +124,19 @@ pub(crate) enum Gate {
 }
 
 /// The newest verification record for `item_id`, `None` when the item has
-/// never been verified.
+/// never been verified, as the host's shared [`Memo`] reads it.
 ///
-/// Evidence rows are append-only and the newest row for a request is its
-/// current state, so the newest row of this type decides. An unparseable row
-/// is an error rather than a skip: skipping it would let an older `passed`
-/// row stand in for a newer verdict nobody could read.
+/// The newest evidence row of this type decides, and an unparseable one is an
+/// error rather than a skip: skipping it would let an older `passed` row stand
+/// in for a newer verdict nobody could read.
 ///
-/// One row is asked for, newest first, so the walk stops at the card's newest
-/// verification. It used to read a page of the card's whole history (up to
-/// 10,001 rows, each decoded) to use the first one, and called a verdict
-/// behind a page of other evidence "too long to establish". A card never
-/// verified still walks the whole table (`evidence` has no index on
-/// `task_id`); ask [`latest_many`] for more than one card. When
-/// [`latest_many`] holds an answer that is still exact, that answer is used
-/// and nothing is walked.
+/// This is [`Memo::latest`] and there is no second reader: one walk of the
+/// table, newest first, that stops as soon as the card is found, and that is
+/// held while the store has not changed. A card never verified costs the whole
+/// walk once. Callers that carry a backend ask the backend's memo instead, so a
+/// test can give each run its own.
 pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, String> {
-    // A held answer that is still exact is the same newest row without the walk.
-    if let Some(held) = memo::held_text(store, item_id) {
-        return held.map(|data| parse_record(&data)).transpose();
-    }
-    store
-        .connection()
-        .query_row(
-            "SELECT data_json FROM evidence WHERE task_id = ?1 AND type = ?2
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![item_id, EVIDENCE_TYPE],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| format!("the verification evidence could not be read: {e}"))?
-        .map(|data| parse_record(&data))
-        .transpose()
+    Memo::shared().latest(store, item_id)
 }
 
 fn parse_record(data: &str) -> Result<Record, String> {
@@ -128,35 +145,6 @@ fn parse_record(data: &str) -> Result<Record, String> {
             "the newest verification record could not be parsed, so no verdict is established: {e}"
         )
     })
-}
-
-/// [`latest`] for many tasks at once: each task's newest verification record,
-/// absent for a task that has none.
-///
-/// The board asks this for every card it shows, on every refresh, and the
-/// driver for every held card on every sweep. `evidence` has no index on
-/// `task_id` (dc-store's schema), so [`latest`] per card was one walk of the
-/// whole table per card: 4 s for 60 cards on an 82k-row profile, holding a
-/// storage slot throughout. This is one walk for them all, and the walk's
-/// answer is kept (see [`Memo`]) for as long as the store files are provably
-/// as they were: a store nobody wrote to is not walked again.
-pub(crate) fn latest_many(
-    store: &Store,
-    item_ids: &[String],
-) -> Result<std::collections::HashMap<String, Record>, String> {
-    if item_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let wanted: HashSet<&str> = item_ids.iter().map(String::as_str).collect();
-    memo::with_newest(store, &wanted, |newest| {
-        let mut found = std::collections::HashMap::new();
-        for id in item_ids {
-            if let Some(data) = newest.get(id) {
-                found.insert(id.clone(), parse_record(data)?);
-            }
-        }
-        Ok(found)
-    })?
 }
 
 /// The gate for a claim of `done` on `item_id`, a task of the repository whose

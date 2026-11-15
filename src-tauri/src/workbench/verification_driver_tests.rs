@@ -11,7 +11,7 @@ use crate::workbench::verification_driver::{
     target_of, verdict_covers, verification_base, Backend, Driver, Facts, Report, Step, Target,
     MAX_ACTIVE,
 };
-use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
+use crate::workbench::verification_gate::{self as gate, Memo, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
 use dc_store::Store;
 use serde_json::{json, Value};
@@ -28,6 +28,8 @@ struct Fake {
     head_error: RefCell<Option<String>>,
     /// When set, `base_of` returns this instead of a base.
     base_error: RefCell<Option<String>>,
+    /// Its own memo, so what one test reads is not another's to evict.
+    memo: Memo,
 }
 
 impl Fake {
@@ -40,6 +42,7 @@ impl Fake {
             epoch: Instant::now(),
             head_error: RefCell::new(None),
             base_error: RefCell::new(None),
+            memo: Memo::new(),
         }
     }
 }
@@ -72,6 +75,9 @@ impl Backend for Fake {
     }
     fn cancelled(&self) -> bool {
         self.cancelled.get()
+    }
+    fn memo(&self) -> &Memo {
+        &self.memo
     }
 }
 
@@ -511,7 +517,7 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
         )
         .unwrap();
     let ids = [id.clone(), other.clone(), never.clone()];
-    let batch = gate::latest_many(&store, &ids).unwrap();
+    let batch = Memo::new().latest_many(&store, &ids).unwrap();
     for one in &ids {
         assert_eq!(
             batch.get(one),
@@ -521,7 +527,7 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
     }
     assert_eq!(batch[&id].outcome, "passed");
     assert!(!batch.contains_key(&never));
-    assert!(gate::latest_many(&store, &[]).unwrap().is_empty());
+    assert!(Memo::new().latest_many(&store, &[]).unwrap().is_empty());
 }
 
 /// Records more evidence of another kind for `item` than one evidence page
@@ -1768,13 +1774,24 @@ fn sweeps_and_a_board_read_of_an_unchanged_store_walk_it_once() {
     let path = std::path::PathBuf::from(store.connection().path().unwrap());
     let fake = Fake::new();
     let mut driver = Driver::default();
-    seam::advance_clock(Duration::from_secs(3));
+    // The first sweep starts the verification, and starting one reads and
+    // writes the profile (the sweep's own commits), so the second still finds a
+    // store that moved under it. What follows is a store nobody writes to.
+    for _ in 0..2 {
+        driver.sweep(&store, &fake);
+    }
+    let walked = seam::walks(&path);
+    assert!((1..=2).contains(&walked), "{walked} walks for two sweeps");
     for _ in 0..5 {
         driver.sweep(&store, &fake);
     }
     let board = Store::open_readonly(&path).unwrap();
     status_batch(&board, &fake, std::slice::from_ref(&id)).unwrap();
-    assert_eq!(seam::walks(&path), 1, "five sweeps and one board read");
+    assert_eq!(
+        seam::walks(&path),
+        walked,
+        "five more sweeps and a board read of an unchanged store walked it again"
+    );
 }
 
 /// The driver's own connection follows the profile: it is reopened when the
