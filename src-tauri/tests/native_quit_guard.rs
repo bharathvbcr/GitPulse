@@ -190,7 +190,7 @@ mod child {
         context.config_mut().app.windows.clear();
         let app = tauri::Builder::default()
             .manage(DesktopState::default())
-            .manage(gitpulse_lib::terminal::TerminalSessions::default())
+            .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
             .on_web_content_process_terminate(webcrash::on_terminated)
             // A page of its own: a debug build points `WebviewUrl::App` at the
             // dev server, which a test cannot assume is running.

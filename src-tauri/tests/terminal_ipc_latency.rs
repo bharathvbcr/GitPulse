@@ -21,7 +21,7 @@ use gitpulse_lib::terminal::{
     acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, TerminalSessions,
     GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -1042,8 +1042,12 @@ fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
     }
 
     // Many more, dropped at random points on a lane that is draining: each
-    // either never ran or ran once, in order.
-    let mut kept = Vec::new();
+    // either never ran or ran once, in order. Keep at most 4 kept writes
+    // unawaited at once (4 * 7 = 28 < INPUT_QUEUE_CAPACITY) so cross-process
+    // host round-trips cannot overflow the 64-slot burst bound while queued
+    // skips and raced drops still interleave.
+    let mut kept_ids = Vec::new();
+    let mut in_flight = VecDeque::new();
     for n in 0..1000usize {
         let mut call = Box::pin(cmd_terminal_write(
             handle.state::<TerminalSessions>(),
@@ -1053,16 +1057,21 @@ fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
         ));
         let polled = poll_once(&mut call);
         if n % 7 == 0 {
+            kept_ids.push(n);
             match polled {
                 Poll::Ready(result) => result.unwrap(),
-                Poll::Pending => kept.push((n, call)),
+                Poll::Pending => {
+                    in_flight.push_back(call);
+                    if in_flight.len() >= 4 {
+                        tauri::async_runtime::block_on(in_flight.pop_front().unwrap()).unwrap();
+                    }
+                }
             }
         } else if n % 5 == 0 {
             std::thread::sleep(Duration::from_micros(200));
         }
     }
-    let kept_ids: Vec<usize> = kept.iter().map(|(n, _)| *n).collect();
-    for (_, call) in kept {
+    for call in in_flight {
         tauri::async_runtime::block_on(call).unwrap();
     }
     write_now(&handle, &id, token(5, 0)).unwrap();

@@ -393,7 +393,18 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let terminals = gitpulse_lib::terminal::TerminalSessions::default();
+    let host_dir = tempfile::Builder::new()
+        .prefix("ph")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    let terminals = gitpulse_lib::terminal::TerminalSessions::with_host(
+        gitpulse_lib::terminal::host::client::HostConfig {
+            dir: host_dir.path().to_path_buf(),
+            binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
+            idle_exit: Some(std::time::Duration::from_secs(3)),
+            log_dir: Some(host_dir.path().join("logs")),
+        },
+    );
     let spawn = gitpulse_lib::terminal::spawn_session(
         app.handle(),
         &terminals,

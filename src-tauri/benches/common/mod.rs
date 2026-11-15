@@ -548,3 +548,36 @@ impl Report {
         }
     }
 }
+
+/// A session registry for benchmarks. On Unix every bench gets its own
+/// short-path host directory so `sun_path` stays under the OS limit and the
+/// binary is resolved via `GITPULSE_PTYD` / `bundled_binary`.
+pub fn terminals() -> gitpulse_lib::terminal::TerminalSessions {
+    #[cfg(unix)]
+    {
+        static HOST_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static NEXT_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = HOST_ROOT.get_or_init(|| {
+            let base = std::env::temp_dir().canonicalize().expect("temp dir");
+            tempfile::Builder::new()
+                .prefix("bh")
+                .tempdir_in(base)
+                .expect("bench host root")
+        });
+        let id = NEXT_HOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = root.path().join(format!("h{id}"));
+        std::fs::create_dir_all(&dir).expect("bench host dir");
+        gitpulse_lib::terminal::TerminalSessions::with_host(
+            gitpulse_lib::terminal::host::client::HostConfig {
+                binary: None,
+                idle_exit: Some(Duration::from_secs(3)),
+                log_dir: Some(dir.join("logs")),
+                dir,
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        gitpulse_lib::terminal::TerminalSessions::default()
+    }
+}
