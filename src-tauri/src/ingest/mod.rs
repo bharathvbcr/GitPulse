@@ -2879,6 +2879,8 @@ mod watermark_tests {
 }
 
 #[cfg(test)]
+mod catch_up_progress_tests;
+#[cfg(test)]
 mod codex_tests;
 #[cfg(test)]
 mod event_time_tests;

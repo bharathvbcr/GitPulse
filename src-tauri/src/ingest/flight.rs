@@ -263,8 +263,13 @@ where
     // record for anything that escapes that.
     crate::supervisor::spawn_once("catch-up", "catch-up", move || {
         let budget = Budget::within(wait);
+        // A catch-up is housekeeping for the ledger, never the answer to a
+        // click: its children are admitted as Background so that a pass over
+        // dozens of worktrees cannot spend the reactive spawn budget the
+        // interface reads from. The class is entered here, on the worker,
+        // because a thread hop would otherwise start the pass as Reactive.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            work(&budget, &flight.progress)
+            crate::engine::process::with_background_processes(|| work(&budget, &flight.progress))
         }))
         .unwrap_or_else(|_| CatchUp {
             error: "catch-up panicked".into(),
