@@ -61,11 +61,11 @@ pub use disk::{
     block_size, free_bytes, physical_memory, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR,
 };
 pub use governor::{
-    admit, admit_anyway, admit_on, decide, disk_remedy_due, exec_latency, grant_override, note_launch_advisory,
-    report as governor_report, shed, shed_cause, shed_is_disk_only, Admitted, Advisory, Binding,
-    Governor, GovernorPulse, GovernorReport, GovernorVerdict, Input as GovernorInput, Observation,
-    Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE,
-    REFUSAL_NOTICE_AFTER,
+    admit, admit_anyway, admit_on, decide, disk_remedy_due, exec_latency, grant_override,
+    note_launch_advisory, report as governor_report, shed, shed_cause, shed_is_disk_only, Admitted,
+    Advisory, Binding, Governor, GovernorPulse, GovernorReport, GovernorVerdict,
+    Input as GovernorInput, Observation, Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES,
+    EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
 };
 #[cfg(test)]
 pub(crate) use governor::{
