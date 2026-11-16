@@ -11,6 +11,20 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **The Secrets scan no longer needs Kingfisher.** Health's working-tree
+  secrets scan is now GitPulse's own in-process scanner (`leak_scan`, the
+  vendored `dc-redact` credential table): it reads every tracked file and every
+  untracked file git does not ignore, with a per-file cap, a byte budget and a
+  time limit, and lists every file it could not read. A scan with any skip is
+  partial, never clean. The report names its engine. Kingfisher is now the
+  opt-in "Deep scan with Kingfisher" button (and `cmd_scan_secrets` takes an
+  optional `deep` argument), shown when it is installed; it is the only scan
+  that also reads ignored files. The in-process scan recognises far fewer
+  credential shapes than Kingfisher; see the recall tables in
+  `docs/PERFORMANCE.md`.
+
 ## [1.99.0] - 2026-11-15
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
