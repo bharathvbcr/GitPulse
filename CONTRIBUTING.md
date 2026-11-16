@@ -264,7 +264,7 @@ flowchart TD
 | `bun run test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `bun run test:tz` | Runs local-time frontend tests (due dates, pulse metrics, commit cadence) across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata` to catch timezone and DST regressions |
 | `bun run gusset:check` | Runs `go/cmd/gusset-check` (`Go 1.27.4`) against DevCouncil's umbrella archive when sibling `DevCouncil` and `gusset` checkouts are present |
-| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (329 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (331 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
@@ -446,7 +446,7 @@ GitPulse/
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 ├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (329 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (331 handlers)
     ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

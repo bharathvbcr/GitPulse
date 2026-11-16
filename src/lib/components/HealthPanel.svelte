@@ -131,6 +131,7 @@
   import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
   import type { CodeintelDeadSymbol, CodeintelStatus } from "../codeintel/types";
   import Skeleton from "./Skeleton.svelte";
+  import MissingToolNotice from "./MissingToolNotice.svelte";
 
   /** Headlines of the two failures whose reason is the scanner's or the model's own text. */
   const SCAN_FAILED = describeFailure({ verb: "scan", object: "this repository" }, "").headline;
@@ -169,12 +170,17 @@
    * Whether this repository has a devmap code graph at all.
    *
    * Three features query it — impact edges in the diff pane, symbol search in
-   * the palette, dead symbols below — and each of them renders nothing when
-   * the graph is missing. Without this, "there is no code graph here" and
-   * "the graph is here and found nothing" are the same blank space, and a
-   * reader has no way to tell which they are looking at.
+   * the palette, dead symbols below. The diff pane, palette and Suspects each
+   * say so themselves through `MissingToolNotice`; this is the Health view of
+   * the same fact, so "there is no code graph here" and "the graph is here and
+   * found nothing" are never the same blank space.
    */
   let codegraph = $state<CodeintelStatus | null>(null);
+  /**
+   * Set when the status read itself failed (as opposed to answering that there
+   * is no graph). A read that could not run must not show the install prompt.
+   */
+  let codegraphReadError = $state<string | null>(null);
   let loading = $state(false);
   /**
    * The failure holding automatic audits off for this repository, when one is.
@@ -639,13 +645,14 @@
       // An IPC-level failure is folded into the same unavailable shape the
       // command itself uses, so "could not ask" never renders as "asked, and
       // there is no graph".
+      codegraphReadError = graph.status === "fulfilled" ? null : formatError(graph.reason);
       codegraph =
         graph.status === "fulfilled"
           ? graph.value
           : {
               available: false,
               db_path: "",
-              reason: formatError(graph.reason),
+              reason: codegraphReadError,
             };
       if (deps.status === "fulfilled") {
         healthCache.set(repoPath, {
@@ -667,7 +674,8 @@
       deadSymbolsTruncated = false;
       deadSymbolsIncomplete = null;
       deadSymbolsReason = formatError(err);
-      codegraph = { available: false, db_path: "", reason: formatError(err) };
+      codegraphReadError = formatError(err);
+      codegraph = { available: false, db_path: "", reason: codegraphReadError };
     } finally {
       if (guard.isLive()) loading = false;
     }
@@ -1058,6 +1066,7 @@
         deadSymbolsTruncated = false;
         deadSymbolsIncomplete = null;
         codegraph = null;
+        codegraphReadError = null;
       }
       if (github) {
         dependabot = github.dependabot;
@@ -1903,15 +1912,22 @@
             </p>
           </div>
         {:else if codegraph}
-          <div role="status" class="gp-notice" data-tone="warn">
-            <div class="min-w-0 flex-1">
-              No code map for this repository — impact edges, symbol search and dead-code
-              detection have nothing to read.
-              {#if codegraph.reason}
-                <span class="text-textMuted font-mono">({codegraph.reason})</span>
-              {/if}
+          {#if codegraphReadError}
+            <div role="status" class="gp-notice" data-tone="unknown">
+              <div class="min-w-0 flex-1">
+                Couldn't read the code map status: {codegraphReadError}. That is not the same as
+                there being no code map.
+              </div>
             </div>
-          </div>
+          {:else}
+            <MissingToolNotice
+              repoPath={$currentRepoPath}
+              graph={codegraph}
+              reason={codegraph.reason}
+              feature="impact edges, symbol search and dead-code detection"
+              onBuilt={() => void scan()}
+            />
+          {/if}
         {:else}
           <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Code map status has not been read for this repository.</div>
@@ -1967,6 +1983,13 @@
             total={deadSymbols.length}
             noun="candidates"
             bind:expanded={expandedLists["dead-code"]}
+          />
+        {:else if codegraph && !codegraph.available && !codegraphReadError}
+          <MissingToolNotice
+            repoPath={$currentRepoPath}
+            graph={codegraph}
+            feature="the dead-code table"
+            onBuilt={() => void scan()}
           />
         {:else}
           <div role="status" class="gp-notice" data-tone="unknown">

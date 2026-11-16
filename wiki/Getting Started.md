@@ -10,7 +10,7 @@ and configure optional integrations.
 | Install or update | [[Installation]] |
 | Find a view or section | [[Views]] |
 | Look up a shortcut | [[Keyboard Shortcuts]] |
-| Connect an agent | [[MCP and Agents]] |
+| Connect an agent (Settings → Agents → Connect your agent) | [[MCP and Agents]] |
 | Understand trust and network boundaries | [[Security]] |
 | Resolve an error | [[Troubleshooting]] |
 

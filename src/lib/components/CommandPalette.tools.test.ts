@@ -12,7 +12,17 @@ describe("CommandPalette optional-tools entry points", () => {
   it("distinguishes cannot-search from zero symbol hits", () => {
     expect(source).toContain("symbolSearchNote");
     expect(source).toContain("not the same as zero matches");
-    expect(source).toContain("Set up code map");
+    // The Set up / Build index call-to-action is the shared notice, mounted
+    // only when symbol search failed; a bare "Set up code map" button here
+    // offered install for timeouts and other failures too.
+    expect(source).toContain('<MissingToolNotice repoPath={repoPath}');
+    expect(source).toContain('mode === "symbols" && searchResult.failed');
+    expect(source).not.toContain('openSetupWizard("devmap", "explain"); }}>Set up code map');
+    // A failed symbol search hands its note to the notice, which prints it
+    // once; the palette's own note block stands aside so the reason is not
+    // printed again above an install prompt.
+    expect(source).toContain("otherText={searchNote}");
+    expect(source).toContain('(searchNote || historyNote) && !(mode === "symbols" && searchResult.failed)');
   });
 
   it("offers optional tools setup from the palette", () => {

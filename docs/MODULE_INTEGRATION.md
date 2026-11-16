@@ -61,7 +61,7 @@ flowchart TD
     subgraph GitPulseHost["GitPulse Desktop Host"]
         direction TB
         UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
-        RustIPC["Rust Core (329 Handlers, Tauri 2 IPC)"]
+        RustIPC["Rust Core (331 Handlers, Tauri 2 IPC)"]
         InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
         CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
         HarnessClient["Harness Client & Grants<br/>(<code>src-tauri/src/harness/</code>)"]
@@ -407,7 +407,7 @@ instead of leaving an unbounded buffer behind an apparently idle connection.
 4. Refresh the installed devmap/Manvi binaries from those validated sources.
    Run `bun run check:vendor-schema`, then `bun run ci:local` against the final
    GitPulse snapshot.
-5. Rebuild the native app and refresh MCP with `bun run mcp:install`. Verify
+5. Rebuild the native app and, for a source checkout, refresh MCP with `bun run mcp:install` (an app install picks up the bundled binaries it links through Connect). Verify
    `bun run mcp:doctor`, installed file hashes and a real code-intelligence
    query. Restart long-lived host processes to load the replacement binaries.
 

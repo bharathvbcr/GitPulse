@@ -32,6 +32,20 @@ pub async fn cmd_mcp_info() -> Result<crate::insights::McpInfo, IpcError> {
     off_thread(|| Ok(crate::insights::mcp_info())).await
 }
 
+/// What connecting an installed agent to the GitPulse MCP server would do.
+/// Read-only: it stats `~/.local/bin` and asks each agent CLI `mcp get`.
+#[tauri::command(async)]
+pub async fn cmd_agent_connect_plan() -> Result<crate::agent_connect::ConnectPlan, IpcError> {
+    off_thread(|| Ok(crate::agent_connect::plan_for_this_app())).await
+}
+
+/// Applies the connect plan after the user confirmed the one shown. Rebuilds
+/// the plan itself, so only what is true now is written.
+#[tauri::command(async)]
+pub async fn cmd_agent_connect_apply() -> Result<crate::agent_connect::ConnectOutcome, IpcError> {
+    off_thread(|| Ok(crate::agent_connect::apply_for_this_app())).await
+}
+
 /// Probe whether `devmap` / `manvi` are installed, which path answered, and
 /// whether a sibling checkout can feed an in-app install.
 #[tauri::command(async)]

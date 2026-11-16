@@ -12039,23 +12039,34 @@ done
         #[test]
         fn gitpulse_hook_binary_emits_json_object_under_antigravity_env_on_empty_payload() {
             use crate::procguard::LockedSpawn;
-            let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("debug")
-                .join("gitpulse-hook");
-            if !bin.exists() {
-                let status = std::process::Command::new("cargo")
-                    .args([
-                        "build",
-                        "--manifest-path",
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-                        "--bin",
-                        "gitpulse-hook",
-                    ])
-                    .status_locked()
-                    .expect("build gitpulse-hook");
-                assert!(status.success());
-            }
+            // Ask cargo where it put the binary rather than guessing a path:
+            // a hardcoded CARGO_MANIFEST_DIR/target misses CARGO_TARGET_DIR and
+            // `build.target-dir`, and the test binary itself may run from a
+            // copy elsewhere. The build is a no-op when the binary is fresh.
+            let built = std::process::Command::new("cargo")
+                .args([
+                    "build",
+                    "--manifest-path",
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+                    "--bin",
+                    "gitpulse-hook",
+                    "--message-format=json",
+                ])
+                .output_locked()
+                .expect("build gitpulse-hook");
+            assert!(
+                built.status.success(),
+                "cargo build --bin gitpulse-hook failed: {}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let bin = String::from_utf8_lossy(&built.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|m| {
+                    m["reason"] == "compiler-artifact" && m["target"]["name"] == "gitpulse-hook"
+                })
+                .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+                .expect("cargo reported no gitpulse-hook executable");
             let mut child = std::process::Command::new(&bin)
                 .arg("peer-inbox")
                 .env("GITPULSE_HOST", "antigravity")
@@ -12063,7 +12074,7 @@ done
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn_locked()
-                .expect("spawn gitpulse-hook");
+                .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
             {
                 use std::io::Write;
                 child

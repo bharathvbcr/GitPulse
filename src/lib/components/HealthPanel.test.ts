@@ -107,3 +107,26 @@ describe("HealthPanel scan-failure banner", () => {
     expect(source).toContain("{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? \"\")}");
   });
 });
+
+describe("HealthPanel missing-code-map notice", () => {
+  it("offers Set up / Build index on both cards when the graph is missing", () => {
+    const graphCard = source.slice(source.indexOf('<HealthSection id="code-graph">'), source.indexOf('id="dead-code"'));
+    expect(graphCard).toContain("<MissingToolNotice");
+    expect(graphCard).toContain("graph={codegraph}");
+    const deadCard = source.slice(source.indexOf('id="dead-code"'), source.indexOf("<TerminalIncidentsSection"));
+    expect(deadCard).toContain("<MissingToolNotice");
+    // The raw reason is no longer printed inline.
+    expect(graphCard).not.toContain("({codegraph.reason})");
+  });
+
+  it("does not offer install when the status read itself failed", () => {
+    expect(source).toContain("codegraphReadError = graph.status === \"fulfilled\" ? null : formatError(graph.reason);");
+    expect(source).toContain("{#if codegraphReadError}");
+    expect(source).toContain("codegraph && !codegraph.available && !codegraphReadError");
+    expect(source).toContain("That is not the same as");
+  });
+
+  it("rebuilds the scan after a successful Build index", () => {
+    expect(source).toContain("onBuilt={() => void scan()}");
+  });
+});

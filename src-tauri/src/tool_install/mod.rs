@@ -1236,9 +1236,16 @@ fn finish_ok(
         .path
         .as_deref()
         .and_then(|path| tool_config::set_binary(tool, path).err());
+    // Whatever rung produced it, a devmap whose store this build cannot read
+    // is not an install: it would be reported as done and then refused.
+    let incompatible = if tool == ExternalTool::Devmap && status.installed {
+        devmap_too_old(verify_devmap().store_schema)
+    } else {
+        None
+    };
     InstallOutcome {
         tool,
-        ok: status.installed && persist_error.is_none(),
+        ok: status.installed && persist_error.is_none() && incompatible.is_none(),
         binary: status.path.clone(),
         lookup: Some(status.lookup.clone()),
         version: status.version.clone(),
@@ -1254,6 +1261,8 @@ fn finish_ok(
                 "{} installed but its path could not be saved: {error}",
                 tool.as_str()
             ))
+        } else if let Some(reason) = incompatible {
+            Some(format!("devmap installed but is {reason}"))
         } else if status.installed {
             None
         } else {
@@ -1878,6 +1887,17 @@ fn parse_doctor_json(v: &serde_json::Value) -> DoctorSchemas {
     }
 }
 
+/// `Some("too old for this GitPulse: writes schema N, needs ≥ M")` when a
+/// devmap reports a store schema below what this build's reader accepts
+/// (`MIN_READER_SCHEMA_VERSION`). An unreported schema is not "too old": that
+/// is "unverified", which [`verify_devmap`] reports as not ok on its own.
+fn devmap_too_old(spoken: Option<i32>) -> Option<String> {
+    let minimum = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
+    spoken
+        .filter(|n| *n < minimum)
+        .map(|n| format!("too old for this GitPulse: writes schema {n}, needs ≥ {minimum}"))
+}
+
 fn verify_devmap() -> VerifyReport {
     let expected_store = crate::codeintel::SUPPORTED_STORE_SCHEMA;
     let expected_cg = devmap_query::code_graph::CODE_GRAPH_SCHEMA_VERSION;
@@ -1927,6 +1947,8 @@ fn verify_devmap() -> VerifyReport {
                             "doctor ok — expected_schema_version {expected_store}, code_graph_schema_version {}",
                             cg.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
                         )
+                    } else if let Some(reason) = devmap_too_old(spoken) {
+                        reason
                     } else {
                         format!(
                             "doctor expected_schema_version {:?} ≠ vendored {expected_store}",
@@ -1985,6 +2007,8 @@ fn verify_devmap() -> VerifyReport {
         binary: Some(binary),
         detail: if ok {
             format!("version handshake ok — store schema {expected_store}")
+        } else if let Some(reason) = devmap_too_old(store) {
+            reason
         } else {
             format!(
                 "version text did not confirm store schema {expected_store}: {}",
@@ -2713,6 +2737,66 @@ mod tests {
         assert!(
             keep.exists(),
             "directory named like a binary was removed: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_devmap_below_the_reader_minimum_is_too_old_and_an_unknown_one_is_not() {
+        let min = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
+        assert_eq!(
+            devmap_too_old(Some(22)).as_deref(),
+            Some(format!("too old for this GitPulse: writes schema 22, needs ≥ {min}").as_str())
+        );
+        assert!(devmap_too_old(Some(min)).is_none());
+        assert!(devmap_too_old(Some(min + 1)).is_none());
+        assert!(devmap_too_old(None).is_none());
+    }
+
+    /// Installing a devmap that writes schema 22 (what DevCouncil v0.2.3
+    /// ships) through any rung must end in "incompatible", not "installed".
+    #[cfg(unix)]
+    #[test]
+    fn installing_a_devmap_that_writes_an_old_schema_is_reported_incompatible() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let dir = TempDir::new().unwrap();
+        let binary = audit_binary(
+            dir.path(),
+            r#"case "$1" in
+doctor) echo '{"schema_version":null,"expected_schema_version":22,"code_graph_schema_version":2}';;
+*) echo 'devmap 0.2.3 (store schema 22)';;
+esac"#,
+        );
+        let cfg = dir.path().join("tools.json");
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg)
+            .set("GITPULSE_DEVMAP_BIN", &binary)
+            .invalidating(crate::tool_config::invalidate_cache)
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
+        let outcome = finish_ok(
+            ExternalTool::Devmap,
+            InstallRung::PrebuiltRelease,
+            "fixture".into(),
+            None,
+            String::new(),
+            String::new(),
+            Some(0),
+        );
+        assert!(
+            !outcome.ok,
+            "an unreadable devmap was reported installed: {outcome:?}"
+        );
+        let reason = outcome.reason.expect("a reason");
+        assert!(
+            reason.contains("too old for this GitPulse: writes schema 22, needs ≥"),
+            "{reason}"
+        );
+        let report = verify_devmap();
+        assert!(!report.ok);
+        assert!(
+            report.detail.contains("too old for this GitPulse"),
+            "{}",
+            report.detail
         );
     }
 

@@ -1,5 +1,7 @@
 <script lang="ts">
   import SettingsModal from "../src/lib/components/SettingsModal.svelte";
+  // App mounts this once; panels that confirm through askConfirm render nothing without it.
+  import PromptModal from "../src/lib/components/PromptModal.svelte";
 
   let isOpen = $state(true);
   // Exposed so the probe can drive the closed -> open transition, which is
@@ -8,3 +10,4 @@
 </script>
 
 <SettingsModal {isOpen} onClose={() => (isOpen = false)} />
+<PromptModal />

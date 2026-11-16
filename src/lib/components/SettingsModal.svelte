@@ -87,6 +87,7 @@
   } from "../ui/manviFocus";
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
+  import AgentConnectPanel from "./AgentConnectPanel.svelte";
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
@@ -1345,6 +1346,9 @@
                         {/if}
                       </div>
                     {/if}
+                    <div class="pt-3">
+                      <AgentConnectPanel active={isOpen && activeSection === "agents"} />
+                    </div>
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["external-tools"])}>

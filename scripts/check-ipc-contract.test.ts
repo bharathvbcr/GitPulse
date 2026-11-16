@@ -338,8 +338,13 @@ describe("annotated but unregistered commands", () => {
     // 322 with cmd_terminal_deliver_peer (wakes a quiescent Antigravity CLI
     // terminal session for a peer message), which the A2A branch added, plus
     // cmd_list_op_snapshots and cmd_undo_op_snapshot (op log undo) and the
-    // terminal session-ledger handlers on this tree.
-    expect(found.size).toBe(329);
+    // terminal session-ledger handlers on this tree. 331 with
+    // cmd_agent_connect_plan and cmd_agent_connect_apply (Connect your agent)
+    // and cmd_storage_stale_worktrees (worktree storage), which met when the
+    // storage branch took main.
+    expect(found.size).toBe(331);
+    expect(found.has("cmd_agent_connect_plan")).toBe(true);
+    expect(found.has("cmd_agent_connect_apply")).toBe(true);
     expect(found.has("cmd_list_op_snapshots")).toBe(true);
     expect(found.has("cmd_undo_op_snapshot")).toBe(true);
     expect(found.has("cmd_terminal_deliver_peer")).toBe(true);
