@@ -1843,7 +1843,7 @@ fn answer_gate(
     cwd: &str,
     command: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the gate", || {
+    answer_asked(stream, shared, id, "the gate", true, || {
         attached(&shared.gate, "the gate")?(cwd, command)
     })
 }
@@ -1859,7 +1859,7 @@ fn answer_scan(
     repo: &str,
     path: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the collision scan", || {
+    answer_asked(stream, shared, id, "the collision scan", true, || {
         attached(&shared.collision, "the collision scan")?(repo, path)
     })
 }
@@ -1876,7 +1876,7 @@ fn answer_insights(
     repo: &str,
 ) -> Result<(), String> {
     let reading = ReadSlot::take(shared);
-    answer_asked(stream, shared, id, "the insights read", || {
+    answer_asked(stream, shared, id, "the insights read", true, || {
         if reading.is_none() {
             return Err("the insights read is busy".to_string());
         }
@@ -1891,7 +1891,7 @@ fn answer_agent_deliver(
     request: &Request,
 ) -> Result<(), String> {
     let delivering = DeliverSlot::take(shared);
-    answer_asked(stream, shared, id, "the agent delivery", || {
+    answer_asked(stream, shared, id, "the agent delivery", false, || {
         if delivering.is_none() {
             return Err("the agent delivery is busy".to_string());
         }
@@ -1906,7 +1906,7 @@ fn answer_op_record(
     request: &Request,
     not_after_send: Instant,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the op log", || {
+    answer_asked(stream, shared, id, "the op log", false, || {
         attached(&shared.op_record, "the op log")?(request, not_after_send)
     })
 }
@@ -1918,7 +1918,7 @@ fn answer_turn_checkpoint(
     request: &Request,
 ) -> Result<(), String> {
     let capturing = CheckpointSlot::take(shared);
-    answer_asked(stream, shared, id, "the turn checkpoint", || {
+    answer_asked(stream, shared, id, "the turn checkpoint", false, || {
         if capturing.is_none() {
             return Err("the turn checkpoint is busy".to_string());
         }
@@ -1955,15 +1955,31 @@ fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> 
         .ok_or_else(|| format!("{name} is not attached"))
 }
 
+/// What a read-only ask reports when its asker had already hung up by the time
+/// the owner got to it: [`Ended::after_ask`] reads it as the asker leaving.
+const ASKER_GONE: &str =
+    "the asker hung up before its answer was started, so no answer was worked out";
+
 /// Runs `call` for a request answered on its own connection, and writes its
 /// reply, or its error as a refusal. A reply that would not fit one frame is a
 /// refusal too: the asker reads it at once and reads for itself, instead of
 /// waiting out its deadline on a frame it cannot take.
+///
+/// `abandonable` is for an ask whose asker works the answer out itself when it
+/// gives up (a gate verdict, a collision scan, an insights read). Such an ask
+/// is not started once the socket reads as hung up with nothing queued, because
+/// the answer would be computed for nobody and again by the asker, which is
+/// what drained the git spawn budget under load. The check is `recv` with
+/// `MSG_PEEK`: only an end-of-file or a reset says the asker is gone, and
+/// anything else, including a failure of the check itself, computes the answer
+/// as it always did. An ask that acts for the world (a delivery, an op record,
+/// a checkpoint) is never abandonable: its work is not for the asker's ears.
 fn answer_asked(
     stream: &mut UnixStream,
     shared: &Shared,
     id: &str,
     name: &str,
+    abandonable: bool,
     call: impl FnOnce() -> Result<serde_json::Value, String>,
 ) -> Result<(), String> {
     let slot = GateSlot::take(shared);
@@ -1971,6 +1987,8 @@ fn answer_asked(
         Err("GitPulse is quitting".to_string())
     } else if slot.is_none() {
         Err(format!("{name} is busy"))
+    } else if abandonable && crate::local_socket::peer_hung_up_silently(stream) {
+        return Err(ASKER_GONE.to_string());
     } else {
         call()
     };
