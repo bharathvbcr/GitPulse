@@ -2496,6 +2496,32 @@ fn a_process_naming_a_worktree_refuses_the_worktree_veto() {
     );
 }
 
+/// A task store that cannot be read is a lease check that could not run: the
+/// refusal is the typed "never judged" kind, not a rule that kept the folder.
+#[test]
+fn an_unreadable_task_store_is_an_unexamined_lease_check() {
+    let (_temp, _cleaner, code) = fixture();
+    let worktree = repo(&code, "lane");
+    // Ignored, so the worktree reads clean and the lease check is reached.
+    fs::write(worktree.join(".git/info/exclude"), ".devcouncil/\n").unwrap();
+    fs::create_dir_all(worktree.join(".devcouncil")).unwrap();
+    fs::write(
+        worktree.join(".devcouncil/state.sqlite"),
+        b"this is not a database",
+    )
+    .unwrap();
+    let path = worktree.to_str().unwrap();
+    let leases = super::leases_clear(path, None).expect_err("the store cannot be read");
+    assert!(super::shed_under_load(&leases), "{}", leases.message());
+    assert!(
+        leases.message().contains("could not be checked"),
+        "{}",
+        leases.message()
+    );
+    let quiet = super::quiet_worktree(path, None).expect_err("the store cannot be read");
+    assert!(super::shed_under_load(&quiet), "{}", quiet.message());
+}
+
 /// A full or filling disk makes an enabled schedule due, once per gap. Any
 /// other reason the host sheds work, a disabled schedule and a run in
 /// progress change nothing. It moves the schedule and nothing else: scopes
@@ -3163,6 +3189,7 @@ fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
     let session_target = pad.join("target-s");
     old_cargo_target(&session_target);
     fs::write(pad.join("notes.txt"), "keep").unwrap();
+    quiet_session_folder(&pad);
 
     let mut c = config(&cleaner, &root);
     c.scopes.agent_scratch_builds = true;
@@ -3248,4 +3275,433 @@ fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
     assert!(wt.join(".gitpulse/scratch/notes.txt").is_file());
     assert!(repo.join(".claude/skills/a.md").is_file());
     assert!(wt.join("Cargo.toml").is_file());
+}
+
+/// Makes a session folder look like a finished one's: its own time, its
+/// scratchpad's and what is directly in the scratchpad 30 days old (a build
+/// folder's contents are aged by the fixture that made it).
+fn quiet_session_folder(scratchpad: &std::path::Path) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    let set = |p: &std::path::Path| {
+        if let Ok(file) = fs::File::open(p) {
+            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
+        }
+    };
+    for entry in fs::read_dir(scratchpad).into_iter().flatten().flatten() {
+        set(&entry.path());
+    }
+    set(scratchpad);
+    if let Some(session) = scratchpad.parent() {
+        set(session);
+    }
+}
+
+/// A cleaner whose home, Claude configuration directories, process table and
+/// `/tmp` are the test's, with one removable scratch build in a worktree.
+fn long_lived_fixture() -> (
+    tempfile::TempDir,
+    Arc<Cleaner>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use crate::sysload::procscan::DirUse;
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let home = base.join("home");
+    let temp_root = base.join("faketmp");
+    fs::create_dir_all(&temp_root).unwrap();
+    fs::create_dir_all(home.join(".cache/huggingface/hub")).unwrap();
+    fs::write(
+        home.join(".cache/huggingface/hub/model.bin"),
+        vec![b'm'; 4096],
+    )
+    .unwrap();
+    let mut service = Cleaner::new(base.join("ll-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: |_| Ok(DirUse::default()),
+        temp_root,
+    });
+    service.long_lived_machine = Some((home.clone(), vec![home.join(".claude")]));
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".gitpulse/\ntmp/\n").unwrap();
+    let scratch = wt.join(".gitpulse/scratch/target-a");
+    old_cargo_target(&scratch);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    (temp, cleaner, root, repo, scratch)
+}
+
+fn candidate_paths(inventory: &super::CleanerInventory) -> Vec<String> {
+    let mut paths: Vec<String> = inventory
+        .candidates
+        .iter()
+        .map(|c| c.path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Whatever the long-lived list names, including a directory inside a reclaim
+/// root and the very folder a scope offers, it is only reported: the candidates
+/// are the ones the scopes alone would offer, a reported directory that is not a
+/// candidate survives a run, and nothing the run records names it.
+#[test]
+fn long_lived_data_is_reported_and_never_a_candidate_or_removed() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, repo, scratch) = long_lived_fixture();
+    let baseline = cleaner.inventory().unwrap();
+    assert!(!baseline.candidates.is_empty(), "{baseline:?}");
+    assert!(
+        baseline
+            .long_lived
+            .iter()
+            .any(|r| r.label == "Hugging Face cache" && r.bytes == Some(4096)),
+        "{:?}",
+        baseline.long_lived
+    );
+    let keep = repo.join("data-store");
+    fs::create_dir_all(&keep).unwrap();
+    fs::write(keep.join("precious.db"), "do not delete").unwrap();
+    let mut c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![
+        keep.to_string_lossy().into_owned(),
+        scratch.to_string_lossy().into_owned(),
+    ];
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        candidate_paths(&preview),
+        candidate_paths(&baseline),
+        "the list neither adds nor removes a candidate"
+    );
+    let keep_text = keep.to_string_lossy().into_owned();
+    assert!(
+        !preview
+            .candidates
+            .iter()
+            .any(|c| c.path == keep_text || Path::new(&c.path).starts_with(&keep)),
+        "{preview:?}"
+    );
+    assert!(preview
+        .long_lived
+        .iter()
+        .any(|r| r.path == keep_text && r.bytes == Some(13)));
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "long-lived-run");
+    assert!(
+        !scratch.exists(),
+        "the scope's own candidate is still removed: {run:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(keep.join("precious.db")).unwrap(),
+        "do not delete"
+    );
+    assert!(
+        !format!("{run:?}").contains("data-store"),
+        "a reported path is not an item of the run: {run:?}"
+    );
+}
+
+/// A walk that could not read part of a path is a floor in the report, and it
+/// leaves the approval of the scope exactly as the same preview without it.
+#[cfg(unix)]
+#[test]
+fn a_cut_short_long_lived_walk_is_a_floor_and_leaves_the_approval_alone() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, repo, _scratch) = long_lived_fixture();
+    let without = cleaner.inventory().unwrap();
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    let data = repo.join("big-data");
+    fs::create_dir_all(data.join("sealed")).unwrap();
+    fs::write(data.join("a.bin"), vec![b'a'; 100]).unwrap();
+    fs::write(data.join("sealed/b.bin"), vec![b'b'; 900]).unwrap();
+    let mut c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![data.to_string_lossy().into_owned()];
+    cleaner.save(c).unwrap();
+    let _sealed = deny(&data.join("sealed"));
+    let preview = cleaner.inventory().unwrap();
+    let row = preview
+        .long_lived
+        .iter()
+        .find(|r| r.path == data.to_string_lossy())
+        .unwrap();
+    assert!(row.at_least && row.bytes == Some(100), "{row:?}");
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "the approval stands"
+    );
+    assert_eq!(preview.partial, without.partial);
+    assert_eq!(preview.scopes_complete, without.scopes_complete);
+    assert_eq!(candidate_paths(&preview), candidate_paths(&without));
+}
+
+/// The list is validated where it is saved, with the reason.
+#[test]
+fn the_long_lived_list_is_validated_when_saved() {
+    let (_temp, cleaner, root) = fixture();
+    let home = root.parent().unwrap().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut service = Cleaner::new(root.parent().unwrap().join("v-state"));
+    service.long_lived_machine = Some((home.clone(), vec![]));
+    let _ = cleaner;
+    let save = |paths: Vec<String>| {
+        let mut c = config(&service, &root);
+        c.long_lived_paths = paths;
+        service.save(c)
+    };
+    let ok = home.join("models");
+    fs::create_dir_all(&ok).unwrap();
+    assert!(save(vec![ok.to_string_lossy().into_owned()]).is_ok());
+    for (path, why) in [
+        ("relative", "absolute"),
+        ("/", "filesystem root"),
+        (home.to_str().unwrap(), "home directory"),
+        (root.to_str().unwrap(), "contains the repository root"),
+        ("/definitely/not/here", "cannot be read"),
+    ] {
+        let error = save(vec![path.to_string()]).expect_err(path);
+        assert!(error.message().contains(why), "{path}: {}", error.message());
+    }
+    let too_many: Vec<String> = (0..=super::super::long_lived::MAX_USER_PATHS)
+        .map(|n| format!("/x/{n}"))
+        .collect();
+    assert!(save(too_many).is_err());
+}
+
+/// A state with no long-lived paths is readable by the build before the field
+/// existed; adding one writes a field that build refuses, like a scope.
+#[test]
+fn an_empty_long_lived_list_keeps_the_state_readable_by_the_older_build() {
+    let (_temp, cleaner, root) = fixture();
+    let read = |cleaner: &Cleaner| -> Result<ParentSaved, String> {
+        let bytes = fs::read(cleaner.dir.join("state.json")).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    };
+    let data = root.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let mut c = config(&cleaner, &root);
+    cleaner.save(c.clone()).unwrap();
+    read(&cleaner).expect("an empty list writes no field");
+    c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![data.to_string_lossy().into_owned()];
+    cleaner.save(c.clone()).unwrap();
+    assert!(
+        read(&cleaner).is_err(),
+        "a listed path writes a field the older build refuses"
+    );
+    c = cleaner.state().unwrap().config;
+    c.long_lived_paths.clear();
+    cleaner.save(c).unwrap();
+    read(&cleaner).expect("emptied again, readable again");
+}
+
+static TOUCH_AT_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static USE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNREADABLE_FROM_CALL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The process table as these end-to-end tests drive it: unreadable on demand,
+/// and, at the numbered call, a build touching the session's `.rustc_info.json`
+/// (a file the removal unlinks last), which is how a removal is made to stop
+/// part way. Statics because the machine seam is a plain function.
+fn scripted_use(dir: &Path) -> Result<crate::sysload::procscan::DirUse, String> {
+    use std::sync::atomic::Ordering;
+    let call = USE_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    let from = UNREADABLE_FROM_CALL.load(Ordering::SeqCst);
+    if from > 0 && call >= from {
+        return Err("the process table could not be read".into());
+    }
+    if call == TOUCH_AT_CALL.load(Ordering::SeqCst) {
+        let _ = fs::write(
+            dir.join("scratchpad/target-a/.rustc_info.json"),
+            "{\"touched\":true}",
+        );
+    }
+    Ok(crate::sysload::procscan::DirUse::default())
+}
+
+/// Two finished sessions, each with a 4,141-byte build folder, a cleaner with
+/// the agent scope on and previewed, and the scripted process table.
+fn two_session_cleaner(cap: u64) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    use std::sync::atomic::Ordering;
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let temp_root = base.join("faketmp");
+    let uid = super::super::agent::current_uid();
+    let mut targets = Vec::new();
+    for id in ["session-0001-aaaaaaaa", "session-0002-bbbbbbbb"] {
+        let pad = temp_root.join(format!("claude-{uid}/proj/{id}/scratchpad"));
+        let target = pad.join("target-a");
+        old_cargo_target(&target);
+        quiet_session_folder(&pad);
+        targets.push(target);
+    }
+    let mut service = Cleaner::new(base.join("two-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: scripted_use,
+        temp_root,
+    });
+    service.long_lived_machine = Some((base.join("home"), vec![]));
+    let cleaner = Arc::new(service);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    c.max_run_bytes = cap;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .filter(|c| c.scope == "agent-session-scratch")
+            .count(),
+        2,
+        "{preview:?}"
+    );
+    (temp, cleaner, targets)
+}
+
+/// A removal that stops at 90% leaves its bytes gone, and they count: the run
+/// charges them, records the row as partly removed (not skipped), and the next
+/// candidate meets what is left of the cap. Charging only completed removals let
+/// a second 40 GB candidate in under a 50 GB cap.
+#[test]
+fn a_partly_removed_candidate_is_charged_and_the_next_one_meets_the_cap() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = two_session_cleaner(6_000);
+    let saved = cleaner.state().unwrap().config;
+    USE_CALLS.store(0, Ordering::SeqCst);
+    // Calls 1 and 2 are the run's own inspection; 3 is the first delete-time
+    // re-judgement and 4 the re-check right before its first unlink.
+    TOUCH_AT_CALL.store(4, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "partial-run");
+    let session_rows: Vec<_> = run
+        .items
+        .iter()
+        .filter(|i| i.path.contains("target-a"))
+        .collect();
+    let partial: Vec<_> = session_rows
+        .iter()
+        .filter(|i| i.status == "partially_removed")
+        .collect();
+    assert_eq!(partial.len(), 1, "{:?}", run.items);
+    assert!(partial[0].bytes_before >= 4096, "{:?}", partial[0]);
+    // The size after is unknown, not zero: the row must not read as emptied.
+    assert_eq!(partial[0].bytes_after, None, "{:?}", partial[0]);
+    assert!(partial[0]
+        .message
+        .contains("count against the run's byte limit"));
+    let refused: Vec<_> = session_rows
+        .iter()
+        .filter(|i| i.status == "skipped")
+        .collect();
+    assert_eq!(refused.len(), 1, "{:?}", run.items);
+    assert!(
+        refused[0]
+            .message
+            .contains("exceeds the remaining byte budget"),
+        "{:?}",
+        refused[0]
+    );
+    let intact = targets
+        .iter()
+        .filter(|t| t.join("debug/app.o").exists())
+        .count();
+    assert_eq!(intact, 1, "the second candidate was never touched");
+    assert_eq!(run.status, "completed_with_skips");
+}
+
+/// A check that could not run at delete time is an unexamined row, counted, and
+/// nothing is removed: the process table unreadable after a good preview.
+#[test]
+fn a_check_that_could_not_run_at_delete_time_is_an_unexamined_row() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = two_session_cleaner(10 * 1024 * 1024 * 1024);
+    let saved = cleaner.state().unwrap().config;
+    // The run's own inspection reads the table twice (one candidate each); the
+    // third reading is the first delete-time re-judgement, and every later one
+    // fails.
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(3, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "unexamined-run");
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let rows: Vec<_> = run
+        .items
+        .iter()
+        .filter(|i| i.path.contains("target-a"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{:?}", run.items);
+    for row in rows {
+        assert_eq!(row.status, "unexamined", "{row:?}");
+        assert!(row.message.contains("Could not examine"), "{row:?}");
+    }
+    assert!(run.unexamined >= 2, "{run:?}");
+    assert!(
+        targets.iter().all(|t| t.join("debug/app.o").exists()),
+        "nothing was removed"
+    );
+}
+
+/// A due scheduled run waits while the host sheds background work for a reason
+/// other than the disk, runs when the disk alone is the reason, and runs when
+/// nothing is shed. With no governor in the process (the headless run) it never
+/// waits. Through the real accessors, with a governor that has history.
+#[test]
+fn a_due_scheduled_run_waits_for_every_pressure_but_the_disk() {
+    use crate::sysload::{inject_governor_with_history, GovernorInput, Level, Reading, Readings};
+    let history =
+        |input: GovernorInput| inject_governor_with_history(std::iter::repeat_n(input, 10));
+    let low_disk = || GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(8 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    };
+    assert!(
+        !super::scheduled_run_waits(),
+        "no governor in this thread: it runs"
+    );
+    {
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        assert!(crate::sysload::shed().background, "the fixture sheds");
+        assert!(super::scheduled_run_waits(), "memory Severe: it waits");
+    }
+    {
+        let _disk = history(low_disk());
+        assert!(crate::sysload::shed().background);
+        assert!(!super::scheduled_run_waits(), "the disk alone: it runs");
+    }
+    {
+        let mut both = low_disk();
+        both.level = Some(Level::Critical);
+        let _both = history(both);
+        assert!(super::scheduled_run_waits(), "disk and memory: it waits");
+    }
+    {
+        let _clear = history(GovernorInput::test_pressure(Level::Normal));
+        assert!(!super::scheduled_run_waits(), "nothing shed: it runs");
+    }
+}
+
+/// Only a preview that measures reports; a run, which does not, carries none.
+#[test]
+fn a_run_inspection_does_not_build_the_long_lived_list() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, _repo, _scratch) = long_lived_fixture();
+    let config = cleaner.state().unwrap().config;
+    let run_view = cleaner.inspect(&config, config.scopes, false).unwrap();
+    assert!(run_view.long_lived.is_empty(), "{:?}", run_view.long_lived);
+    assert!(!cleaner.inventory().unwrap().long_lived.is_empty());
 }

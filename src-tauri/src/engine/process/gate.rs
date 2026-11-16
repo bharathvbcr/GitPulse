@@ -461,13 +461,11 @@ pub(crate) fn with_disk_only_answer<T>(answer: bool, body: impl FnOnce() -> T) -
 /// A full disk is the one pressure the cleaner exists to relieve, and the
 /// governor sheds reactive work under it like any other: a run started because
 /// the disk is full would then find every check refused and delete nothing.
-/// This admits only when `crate::sysload::shed_is_disk_only()` holds: the host
-/// is shedding, every input other than the disk has read Clear for a while, and
-/// a disk input is Elevated or above. It is false when anything else is
-/// wrong (memory, swap, CPU, thermal, compressor, the battery input at
-/// Elevated) and when this process has no governor (the headless run, the MCP
-/// server, a hook), so the cleaner never adds load to a host that is short of
-/// something else. It changes nothing for a class that is not shed, and it
+/// This admits only when `crate::sysload::shed_is_disk_only()` holds; that
+/// function owns the definition (it is the governor's, and it answers false on
+/// any doubt: another input not clear, no history, an unavailable sensor, no
+/// governor in this process, as in the headless run, the MCP server or a hook).
+/// So the cleaner never adds load to a host that is short of something else. It changes nothing for a class that is not shed, and it
 /// never makes a spawn cheaper: the slot and rate budgets still apply. The
 /// caller must only spawn one read-only check inside it, never a scan: any
 /// other spawn on the same thread inside the body would be admitted too.

@@ -69,6 +69,13 @@ pub struct CleanerConfig {
     /// the saved state while at its default.
     #[serde(default, skip_serializing_if = "CloneBudget::is_default")]
     pub clone_budget: CloneBudget,
+    /// Absolute directories the person wants listed, with their size, in the
+    /// preview's "long-lived data" section. Report-only: never a candidate and
+    /// never removed. Left out of the saved state while empty, so a build from
+    /// before this field existed (whose reader refuses unknown fields) still
+    /// reads the file until a person adds one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub long_lived_paths: Vec<String>,
 }
 
 /// Opt-in reclaim scopes. Each one widens what the cleaner may delete.
@@ -262,6 +269,7 @@ impl Default for CleanerConfig {
             max_targets: 20,
             scopes: ReclaimScopes::default(),
             clone_budget: CloneBudget::default(),
+            long_lived_paths: vec![],
         }
     }
 }
@@ -286,6 +294,16 @@ impl CleanerConfig {
             })
         {
             return Err("Invalid cleaner path inventory".into());
+        }
+        if self.long_lived_paths.len() > super::long_lived::MAX_USER_PATHS {
+            return Err(format!(
+                "At most {} long-lived data paths may be listed",
+                super::long_lived::MAX_USER_PATHS
+            )
+            .into());
+        }
+        for path in &self.long_lived_paths {
+            super::long_lived::check_shape(path)?;
         }
         devmap_query::hygiene::validate_retention(self.scopes.worktree_idle_days, true)
             .map_err(|e| format!("Worktree idle days: {e}"))?;
@@ -349,6 +367,12 @@ pub struct CleanerInventory {
     /// Temp directories nobody can account for. Reported, never removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leaked_temp: Vec<super::agent::LeakedTemp>,
+    /// Long-lived data GitPulse does NOT clean, with sizes, so a full disk the
+    /// cleaner found nothing to free has an explanation. Report-only: filled
+    /// only by a preview that measures, never part of a run, and nothing in it
+    /// is a candidate or reaches a removal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub long_lived: Vec<super::long_lived::LongLivedItem>,
     /// Repositories whose inventory could not be enumerated at all, so no
     /// candidate from them can be trusted: the scan returned an error
     /// (including `REPOSITORY_TRUST_REQUIRED`), git declined to answer whether
@@ -504,6 +528,10 @@ pub struct Cleaner {
     /// registries, nor the real `/tmp`.
     #[cfg(test)]
     agent_machine: Option<AgentMachine>,
+    /// The home directory and Claude config directories the long-lived report
+    /// reads, as a test supplies them in place of the real ones.
+    #[cfg(test)]
+    long_lived_machine: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 /// The parts of the machine the agent scratch scopes read, as a test supplies
@@ -561,7 +589,47 @@ impl Cleaner {
             state_after_read: None,
             #[cfg(test)]
             agent_machine: None,
+            #[cfg(test)]
+            long_lived_machine: None,
         }
+    }
+    /// The home directory the long-lived report lists under.
+    fn long_lived_home(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some((home, _)) = &self.long_lived_machine {
+            return home.clone();
+        }
+        super::home_dir().unwrap_or_else(|_| PathBuf::from("/nonexistent-home"))
+    }
+    /// Every Claude configuration directory the code knows (the same set the
+    /// session detector reads), not only `~/.claude`.
+    fn long_lived_claude_dirs(&self, issues: &mut Vec<String>) -> Vec<PathBuf> {
+        #[cfg(test)]
+        if let Some((_, dirs)) = &self.long_lived_machine {
+            return dirs.clone();
+        }
+        let found = crate::workbench::conversation::claude_config_dirs();
+        if let Some(error) = &found.error {
+            push_issue(
+                issues,
+                format!("Claude configuration directories could not all be listed, so the long-lived data list may miss some: {error}"),
+            );
+        }
+        found.dirs
+    }
+    /// The long-lived data report for a preview that measures. It runs after
+    /// the inspection, outside every reclaim scope: it adds rows and issues
+    /// and touches nothing an approval depends on.
+    fn long_lived_report(&self, config: &CleanerConfig, inventory: &mut CleanerInventory) {
+        let home = self.long_lived_home();
+        let claude_dirs = self.long_lived_claude_dirs(&mut inventory.issues);
+        inventory.long_lived = super::long_lived::report(
+            &config.long_lived_paths,
+            &config.roots,
+            &home,
+            &claude_dirs,
+            &self.cancel,
+        );
     }
     /// The live Claude sessions, read now.
     fn agent_live(&self) -> super::agent::LiveSessions {
@@ -723,10 +791,9 @@ impl Cleaner {
         now: u64,
     ) -> Result<Option<u64>, CommandError> {
         self.expire_disk_forward(now)?;
-        // `disk_only` is `crate::sysload::shed_is_disk_only()`: the host is
-        // shedding, every other input has read Clear for a while, and a disk
-        // input is Elevated or above. The same answer admits the cleaner's own
-        // read-only checks, so a run brought forward is a run that can look.
+        // `disk_only` is `crate::sysload::shed_is_disk_only()`, which owns the
+        // definition. The same answer admits the cleaner's own read-only
+        // checks, so a run brought forward is a run that can look.
         if !disk_only {
             return Ok(None);
         }
@@ -929,6 +996,16 @@ impl Cleaner {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        // Checked against the filesystem and the normalized roots, after
+        // them: a path that contains a root is refused with the reason.
+        let home = self.long_lived_home();
+        for path in &config.long_lived_paths {
+            super::long_lived::validate_user_path(path, &config.roots, &home)?;
+        }
+        let mut distinct = BTreeSet::new();
+        config
+            .long_lived_paths
+            .retain(|p| distinct.insert(p.clone()));
         if config.enabled && !cfg!(unix) {
             return Err("Scheduled cleanup is unavailable on this platform".into());
         }
@@ -1066,6 +1143,10 @@ impl Cleaner {
                 "This inspection did not finish every enabled reclaim scope, so it does not count as their preview and no run uses them yet. Inspect again when the host is less busy.".into(),
             );
         }
+        // After the approval is settled and outside every scope: this only adds
+        // a report, so however it ends (budget spent, a path unreadable) it
+        // cannot change `partial`, `scopes_complete` or a preview.
+        self.long_lived_report(&config, &mut inventory);
         Ok(inventory)
     }
     /// Reads the roots and builds the inventory. The read-only git checks it
@@ -1098,6 +1179,7 @@ impl Cleaner {
             candidates: vec![],
             kept: vec![],
             leaked_temp: vec![],
+            long_lived: vec![],
             incomplete_repos: BTreeSet::new(),
             shed_repos: 0,
             // Repositories discovery never reached were not shown either.
@@ -1893,18 +1975,37 @@ impl Cleaner {
                         deadline: Instant::now() + Duration::from_secs(60),
                         target_budget: super::agent::CARGO_TARGET_BUDGET,
                     };
-                    let freed = super::agent::remove_judged(&candidate, &ctx, remaining).map_err(
-                        |refusal| match refusal {
-                            // A check that could not run is recorded as
-                            // unexamined, like one the host shed: the folder
-                            // was never judged.
-                            super::agent::Refusal::Unexamined(why) => CommandError::typed(
-                                IpcErrorKind::DeferredUnderLoad,
-                                format!("{} {why}", super::agent::COULD_NOT_CHECK),
-                            ),
-                            super::agent::Refusal::Kept(why) => CommandError::from(why),
-                        },
-                    )?;
+                    let freed = match super::agent::remove_judged(&candidate, &ctx, remaining) {
+                        Ok(freed) => freed,
+                        // Part of it is already gone: charge what was removed
+                        // (the byte cap is on bytes removed, not on bytes
+                        // that finished), record the row as partly removed,
+                        // not skipped, and let the next candidate meet the
+                        // cap that is left.
+                        Err(super::agent::Refusal::PartlyRemoved { why, bytes }) => {
+                            attempted = attempted.saturating_add(bytes);
+                            // `bytes_before` stays the candidate's size and
+                            // `bytes_after` stays unset (unknown): the bytes
+                            // removed are in the message and charged to the byte cap.
+                            row.status = "partially_removed".into();
+                            row.message = format!(
+                                "Stopped part way: {bytes} bytes of this agent scratch build were already removed and count against the run's byte limit. {why}"
+                            );
+                            return Ok(());
+                        }
+                        Err(refusal) => {
+                            return Err(match refusal {
+                                // A check that could not run is recorded as
+                                // unexamined, like one the host shed: the
+                                // folder was never judged.
+                                super::agent::Refusal::Unexamined(why) => CommandError::typed(
+                                    IpcErrorKind::DeferredUnderLoad,
+                                    format!("{} {why}", super::agent::COULD_NOT_CHECK),
+                                ),
+                                other => CommandError::from(other.message()),
+                            });
+                        }
+                    };
                     attempted = attempted.saturating_add(freed);
                     row.status = "completed".into();
                     row.message = format!(
@@ -2173,7 +2274,12 @@ fn status_in(root: &Path, under: Option<&str>) -> Result<Vec<u8>, CommandError> 
 fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandError> {
     let tasks = crate::tasks::view(repo);
     if !tasks.error.is_empty() {
-        return Err(format!("Task activity could not be checked: {}", tasks.error).into());
+        // A check that could not run: recorded as unexamined, not as a rule
+        // that kept the folder.
+        return Err(CommandError::typed(
+            IpcErrorKind::DeferredUnderLoad,
+            format!("Task activity could not be checked: {}", tasks.error),
+        ));
     }
     let applies = |lease: &crate::tasks::TaskLease| match branch {
         None => true,
@@ -2216,10 +2322,12 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
         Ok(pids) if pids.is_empty() => {}
         Ok(pids) => return Err(format!("{} process(es) use this worktree", pids.len()).into()),
         Err(e) => {
-            return Err(format!(
-            "Whether a process works in this worktree could not be read, so it was left alone: {e}"
-        )
-            .into())
+            return Err(CommandError::typed(
+                IpcErrorKind::DeferredUnderLoad,
+                format!(
+                    "Whether a process works in this worktree could not be read, so it was left alone: {e}"
+                ),
+            ))
         }
     }
     if !status_in(&root, None)?.is_empty() {
@@ -2231,7 +2339,12 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
     let main = listed_worktrees(worktree)?
         .into_iter()
         .find(|info| info.is_main)
-        .ok_or("The main checkout of this worktree could not be found")?;
+        .ok_or_else(|| {
+            CommandError::typed(
+                IpcErrorKind::DeferredUnderLoad,
+                "The main checkout of this worktree could not be found",
+            )
+        })?;
     leases_clear(&main.path, Some(branch))
 }
 
@@ -2288,6 +2401,22 @@ pub fn service() -> Result<&'static Arc<Cleaner>, CommandError> {
     Ok(SERVICE.get_or_init(|| Arc::new(Cleaner::new(dir))))
 }
 
+/// Set while a due scheduled run is being held back, so the wait is logged once.
+static WAITING_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a due scheduled run waits for the host. A run walks up to 600,000
+/// entries per target and holds a snapshot of them, and its git checks are shed
+/// under load, so starting it while the host is short of memory, swap, CPU or
+/// anything else only adds load and then deletes nothing. It waits while the
+/// host sheds background work for a reason other than the disk; with the disk
+/// the only reason it runs, because the run is what relieves it. Only the
+/// in-app scheduler asks: a person's own preview or run is never deferred, and
+/// the headless run has no governor in its process (`shed()` is then not
+/// shedding), so it never waits.
+pub(super) fn scheduled_run_waits() -> bool {
+    crate::sysload::shed().background && !crate::sysload::shed_is_disk_only()
+}
+
 pub fn start_scheduler() -> Result<(), CommandError> {
     let cleaner = Arc::clone(service()?);
     if SCHEDULER_STARTED.swap(true, Ordering::SeqCst) {
@@ -2312,8 +2441,17 @@ pub fn start_scheduler() -> Result<(), CommandError> {
                     && !state.running
                     && super::now() >= state.config.next_run_at =>
             {
-                if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
-                    log::warn!("Scheduled cleaner could not start: {e}", e = e.message());
+                if scheduled_run_waits() {
+                    // Stays due: the next tick asks again. One line when it
+                    // starts waiting, not one every 30 seconds.
+                    if !WAITING_LOGGED.swap(true, Ordering::Relaxed) {
+                        log::info!("Scheduled cleaner is waiting: the host is shedding background work for a reason other than the disk");
+                    }
+                } else {
+                    WAITING_LOGGED.store(false, Ordering::Relaxed);
+                    if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
+                        log::warn!("Scheduled cleaner could not start: {e}", e = e.message());
+                    }
                 }
             }
             Ok(_) => {}

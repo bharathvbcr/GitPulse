@@ -16,6 +16,7 @@
   let inventory = $state<CleanerInventory | null>(null);
   let rootsText = $state("");
   let exclusionsText = $state("");
+  let longLivedText = $state("");
   let dirty = $state(false);
   let busy = $state(false);
   let inspecting = $state(false);
@@ -60,7 +61,7 @@
     cleaner = next;
     if (!dirty || reset) {
       draft = { ...next.config, roots: [...next.config.roots], exclusions: [...next.config.exclusions] };
-      rootsText = draft.roots.join("\n"); exclusionsText = draft.exclusions.join("\n"); dirty = false;
+      rootsText = draft.roots.join("\n"); exclusionsText = draft.exclusions.join("\n"); longLivedText = (draft.long_lived_paths ?? []).join("\n"); dirty = false;
     }
   }
   async function refresh() {
@@ -87,7 +88,7 @@
   async function save() {
     if (!draft || busy) return;
     const mine = epoch; busy = true; error = null; notice = null;
-    const config = { ...draft, roots: paths(rootsText), exclusions: paths(exclusionsText) };
+    const config = { ...draft, roots: paths(rootsText), exclusions: paths(exclusionsText), long_lived_paths: paths(longLivedText) };
     if (config.enabled && config.next_run_at === 0) config.next_run_at = Math.floor(Date.now()/1000) + config.interval_hours * 3600;
     try {
       const next = await invoke<CleanerState>("cmd_cleaner_save", { config });
@@ -138,6 +139,7 @@
       <label class="space-y-1">Repository roots · one absolute directory per line<textarea aria-label="Repository roots" class="gp-field-multi block w-full font-mono" rows="3" bind:value={rootsText} oninput={edited} disabled={busy}></textarea></label>
       <label class="space-y-1">Excluded directories · one absolute directory per line<textarea aria-label="Excluded directories" class="gp-field-multi block w-full font-mono" rows="3" bind:value={exclusionsText} oninput={edited} disabled={busy}></textarea></label>
     </div>
+    <label class="space-y-1 block">Long-lived data to list · one absolute directory per line (listed with its size, never cleaned)<textarea aria-label="Long-lived data directories" class="gp-field-multi block w-full font-mono" rows="2" bind:value={longLivedText} oninput={edited} disabled={busy}></textarea></label>
     <button class="gp-btn" data-size="sm" onclick={addRoot} disabled={busy}><FolderPlus size={12} />Add repository root</button>
     <div class="flex flex-wrap gap-4">
       <label>Sweeps keep output modified within <select aria-label="Global retention" class="gp-select ml-1" bind:value={draft.retention_days} onchange={edited}><option value={7}>7 days</option><option value={14}>14 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select></label>
@@ -199,6 +201,13 @@
           <div class="space-y-1" data-testid="leaked-temp">
             <strong>Temp directories nobody can account for (listed only, never removed)</strong>
             {#each inventory.leaked_temp as leak (leak.path)}<p class="py-1"><span class="font-mono break-all">{leak.path}</span><span class="block text-textMuted">{leak.bytes === null ? "size not fully measured" : humanBytes(leak.bytes)} · {leak.age_days} days old · {leak.reason}</span></p>{/each}
+          </div>
+        {/if}
+        {#if inventory.long_lived?.length}
+          <div class="space-y-1" data-testid="long-lived">
+            <strong>Long-lived data · not cleaned by GitPulse</strong>
+            <p class="text-textMuted">Where space is held by data this cleaner never touches. Listed so a full disk has an explanation; manage it with the tool that owns it.</p>
+            {#each inventory.long_lived as item (item.path)}<p class="py-1"><span class="text-textMuted">{item.label}</span> <span class="font-mono break-all">{item.path}</span><span class="block text-textMuted" data-testid="long-lived-size">{item.error ? item.error :item.bytes === undefined || item.bytes === null ? "size unknown" : `${item.at_least ? "at least " : ""}${humanBytes(item.bytes)}`}</span></p>{/each}
           </div>
         {/if}
         <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>

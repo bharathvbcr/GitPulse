@@ -64,6 +64,12 @@ pub fn relative_path(value: &str) -> Result<&Path, String> {
 }
 
 pub fn no_symlinks(path: &Path) -> Result<(), String> {
+    no_symlinks_checked(path).map_err(|e| e.message())
+}
+
+/// [`no_symlinks`] keeping apart a symlink on the way (`Refused`: an answer)
+/// from a component that could not be inspected (`CouldNotRead`: no answer).
+pub fn no_symlinks_checked(path: &Path) -> Result<(), WalkError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
@@ -82,14 +88,14 @@ pub fn no_symlinks(path: &Path) -> Result<(), String> {
             continue;
         }
         if fs::symlink_metadata(&current)
-            .map_err(|e| format!("{}: {e}", current.display()))?
+            .map_err(|e| WalkError::CouldNotRead(format!("{}: {e}", current.display())))?
             .file_type()
             .is_symlink()
         {
-            return Err(format!(
+            return Err(WalkError::Refused(format!(
                 "Symlink paths are not eligible: {}",
                 current.display()
-            ));
+            )));
         }
     }
     Ok(())
@@ -114,6 +120,9 @@ impl Budget {
 /// say "too large to verify" rather than "refused" compares against this.
 pub const BUDGET_EXCEEDED: &str =
     "Measurement incomplete: traversal budget exceeded. Cleanup is unavailable.";
+/// The walk's clock ran out.
+pub const TIME_EXCEEDED: &str =
+    "Measurement incomplete: traversal time budget exceeded. Cleanup is unavailable.";
 
 /// Why a walk did not produce a snapshot. The kinds are different facts: a
 /// rule refused the tree (`Refused`), the walk could not look (`CouldNotRead`,
@@ -125,8 +134,12 @@ pub enum WalkError {
     Refused(String),
     /// An entry could not be listed or read.
     CouldNotRead(String),
-    /// The walk spent its entries or its time.
+    /// The walk visited more entries (or went deeper) than its budget: the
+    /// tree is too large to verify, an answer about the tree.
     Budget,
+    /// The walk ran out of time before it finished: not an answer about the
+    /// tree, only that looking was not completed.
+    TimedOut,
     Cancelled,
 }
 
@@ -141,6 +154,7 @@ impl WalkError {
         match self {
             Self::Refused(message) | Self::CouldNotRead(message) => message.clone(),
             Self::Budget => BUDGET_EXCEEDED.into(),
+            Self::TimedOut => TIME_EXCEEDED.into(),
             Self::Cancelled => "Cancelled".into(),
         }
     }
@@ -200,11 +214,11 @@ fn walk(
     if cancel.load(Ordering::Relaxed) {
         return Err(WalkError::Cancelled);
     }
-    if Instant::now() >= deadline
-        || result.entries.len() >= max_entries
-        || relative.components().count() > MAX_DEPTH
-    {
+    if result.entries.len() >= max_entries || relative.components().count() > MAX_DEPTH {
         return Err(WalkError::Budget);
+    }
+    if Instant::now() >= deadline {
+        return Err(WalkError::TimedOut);
     }
     // `join("")` appends a separator, and a trailing slash makes lstat follow
     // a symlinked root: the walk then measured the target as if it were the root.
@@ -294,7 +308,7 @@ pub fn require_age(snapshot: &Snapshot, days: u32, now: SystemTime) -> Result<()
 
 #[cfg(unix)]
 mod unix {
-    use super::{Snapshot, Stamp};
+    use super::{PartialRemoval, Snapshot, Stamp};
     use std::ffi::CString;
     use std::fs::File;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -334,15 +348,24 @@ mod unix {
     /// Removes the reviewed entries. A failure after some were already
     /// unlinked says so: the directory is then partly gone, and "Entry was
     /// replaced" alone reads as if nothing had happened.
-    pub fn remove(root: &Path, expected: &Snapshot, cancel: &AtomicBool) -> Result<(), String> {
+    pub fn remove(
+        root: &Path,
+        expected: &Snapshot,
+        cancel: &AtomicBool,
+    ) -> Result<u64, PartialRemoval> {
         let mut removed = 0usize;
-        remove_counted(root, expected, cancel, &mut removed).map_err(|error| {
-            if removed == 0 || error.contains("already have been removed") {
-                error
-            } else {
-                format!("{error}; {removed} reviewed entries were already removed")
-            }
-        })
+        let mut bytes = 0u64;
+        remove_counted(root, expected, cancel, &mut removed, &mut bytes)
+            .map(|()| bytes)
+            .map_err(|error| PartialRemoval {
+                error: if removed == 0 || error.contains("already have been removed") {
+                    error
+                } else {
+                    format!("{error}; {removed} reviewed entries were already removed")
+                },
+                entries: removed,
+                bytes,
+            })
     }
 
     fn remove_counted(
@@ -350,6 +373,7 @@ mod unix {
         expected: &Snapshot,
         cancel: &AtomicBool,
         removed: &mut usize,
+        removed_bytes: &mut u64,
     ) -> Result<(), String> {
         let slash = File::open("/").map_err(|e| e.to_string())?;
         let absolute = root.strip_prefix("/").map_err(|e| e.to_string())?;
@@ -446,8 +470,47 @@ mod unix {
                 return Err(std::io::Error::last_os_error().to_string());
             }
             *removed += 1;
+            if !approved.directory {
+                *removed_bytes = removed_bytes.saturating_add(approved.len);
+            }
         }
         Ok(())
+    }
+}
+
+/// A removal that stopped before it finished: why, and what it had already
+/// unlinked. The bytes are real and gone whatever the error, so a caller that
+/// budgets a run charges them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRemoval {
+    pub error: String,
+    /// Reviewed entries already unlinked.
+    pub entries: usize,
+    /// Bytes of the files among them.
+    pub bytes: u64,
+}
+
+/// Removes the reviewed entries and says how many bytes it removed, on failure
+/// too.
+pub fn remove_reviewed_counted(
+    root: &Path,
+    expected: &Snapshot,
+    cancel: &AtomicBool,
+) -> Result<u64, PartialRemoval> {
+    #[cfg(unix)]
+    {
+        unix::remove(root, expected, cancel)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, expected, cancel);
+        Err(PartialRemoval {
+            error:
+                "Local artifact cleanup is unavailable on this platform; use the native build tool"
+                    .into(),
+            entries: 0,
+            bytes: 0,
+        })
     }
 }
 
@@ -456,18 +519,9 @@ pub fn remove_reviewed(
     expected: &Snapshot,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        unix::remove(root, expected, cancel)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, expected, cancel);
-        Err(
-            "Local artifact cleanup is unavailable on this platform; use the native build tool"
-                .into(),
-        )
-    }
+    remove_reviewed_counted(root, expected, cancel)
+        .map(|_| ())
+        .map_err(|partial| partial.error)
 }
 
 #[cfg(test)]
@@ -624,6 +678,27 @@ mod tests {
         .expect_err("more than three entries");
         assert_eq!(error, super::WalkError::Budget);
         assert_eq!(error.message(), super::BUDGET_EXCEEDED);
+    }
+
+    /// Running out of time is not the tree being too large: it is a walk that
+    /// did not finish, and says so differently.
+    #[test]
+    fn a_walk_that_runs_out_of_time_is_not_a_too_large_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        cargo_layout(&root.join("t"), true);
+        let error = super::snapshot_within(
+            &root.join("t"),
+            true,
+            &AtomicBool::new(false),
+            super::Budget {
+                entries: 1_000_000,
+                seconds: 0,
+            },
+        )
+        .expect_err("no time at all");
+        assert_eq!(error, super::WalkError::TimedOut);
+        assert_eq!(error.message(), super::TIME_EXCEEDED);
     }
 
     #[test]

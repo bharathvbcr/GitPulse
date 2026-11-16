@@ -16,6 +16,8 @@ export interface CleanerConfig {
   max_targets: number;
   scopes?: ReclaimScopes;
   clone_budget?: CloneBudget;
+  /** Absolute directories listed (never cleaned) in the preview's long-lived data section. Omitted from the wire while empty. */
+  long_lived_paths?: string[];
 }
 /** `scope` is "repository", "worktree-cache", "prune-worktree", "agent-session-scratch", "agent-repo-scratch" or "agent-claude-target"; for the last three `path` is absolute. `evidence` says who made an agent scratch build and why it is believed idle. */
 export interface CleanerCandidate { repo_path: string; path: string; provider: string; bytes: number; scope: string; private_bytes?: number; evidence?: string[]; }
@@ -23,7 +25,9 @@ export interface CleanerCandidate { repo_path: string; path: string; provider: s
 export interface KeptItem { path: string; scope: string; reason: string; }
 /** A temp directory nobody can account for. Reported, never removed; `bytes` is null when the walk did not finish. */
 export interface LeakedTemp { path: string; bytes: number | null; age_days: number; reason: string; }
-export interface CleanerInventory { candidates: CleanerCandidate[]; repositories: number; visited_entries: number; partial: boolean; issues: string[]; kept?: KeptItem[]; leaked_temp?: LeakedTemp[]; }
+/** Data GitPulse does not clean. `bytes` is logical size, a floor when `at_least`; `error` is set instead of `bytes` when the path could not be read (not zero). */
+export interface LongLivedItem { label: string; path: string; bytes?: number | null; at_least?: boolean; error?: string | null; }
+export interface CleanerInventory { candidates: CleanerCandidate[]; repositories: number; visited_entries: number; partial: boolean; issues: string[]; kept?: KeptItem[]; leaked_temp?: LeakedTemp[]; long_lived?: LongLivedItem[]; }
 export interface CleanerItem { repo_path: string; path: string; status: string; message: string; bytes_before: number; bytes_after: number | null; }
 export interface CleanerRun { id: string; trigger: string; started_at: number; finished_at: number; status: string; repositories: number; partial: boolean; issues: string[]; items: CleanerItem[]; unlisted?: number; unexamined?: number; }
 export interface CleanerState { config: CleanerConfig; history: CleanerRun[]; running: boolean; supported: boolean; background_supported: boolean; background_error: string | null; agent_rules: string; scopes_previewed: boolean; }

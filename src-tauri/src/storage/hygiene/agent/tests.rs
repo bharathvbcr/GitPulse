@@ -51,6 +51,52 @@ fn cargo_target(dir: &Path, days_old: u64) {
     age(dir, days_old);
 }
 
+/// Every session folder under `root` made old at its own level, the way a
+/// finished session's folder is: the session folder, its `tasks/` and
+/// `scratchpad/` and what is directly in them (not what is inside a build
+/// folder). A fixture that writes into a scratchpad makes its folders new.
+fn quiet_sessions(root: &Path, days: u64) {
+    let when = SystemTime::now() - Duration::from_secs(days * 86_400);
+    let set = |p: &Path| {
+        if let Ok(file) = fs::File::open(p) {
+            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
+        }
+    };
+    let Ok(users) = fs::read_dir(root) else {
+        return;
+    };
+    for user in users
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("claude-"))
+    {
+        for project in fs::read_dir(user.path()).into_iter().flatten().flatten() {
+            for session in fs::read_dir(project.path()).into_iter().flatten().flatten() {
+                for level in [
+                    session.path(),
+                    session.path().join("tasks"),
+                    session.path().join("scratchpad"),
+                ] {
+                    for entry in fs::read_dir(&level).into_iter().flatten().flatten() {
+                        // The entry's own time only: a dir's contents are the
+                        // build folder's business (its age is tested apart).
+                        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                            set(&entry.path());
+                        }
+                    }
+                    set(&level);
+                }
+            }
+        }
+    }
+}
+
+/// The scan as the other tests mean it: over session folders that have been
+/// quiet. The recency tests call `super::scan_sessions` directly.
+fn scan_sessions(root: &Path, uid: u32, ctx: &Context<'_>, measure: bool) -> Scan {
+    quiet_sessions(root, 30);
+    super::scan_sessions(root, uid, ctx, measure)
+}
+
 fn scratchpad(root: &Path, id: &str) -> PathBuf {
     let pad = root.join(format!("claude-{UID}/proj/{id}/scratchpad"));
     fs::create_dir_all(&pad).unwrap();
@@ -281,6 +327,9 @@ fn a_symlink_never_leads_the_removal_outside_the_scope() {
         scan_sessions(&root, UID, ctx, false)
     });
     assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+    // (The link was made just now, so it also makes the session look active;
+    // it is gone before the next scan, which is about the replaced candidate.)
+    fs::remove_file(pad.join("linked")).unwrap();
     // A real candidate replaced by a symlink after the preview.
     let target = pad.join("cargo-target");
     cargo_target(&target, 30);
@@ -873,6 +922,42 @@ fn the_cleaners_git_checks_are_answered_under_a_full_disk_only_with_relief() {
     let (ignored, _, listed) = crate::engine::process::with_disk_only_answer(false, asks);
     assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
     assert!(!listed);
+
+    // Through the real accessor, no seam: a governor with history. The disk
+    // alone Severe answers the helpers; memory Severe beside it does not.
+    drop(_disk);
+    let disk_input = |memory: Level| GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(8 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(memory)
+    };
+    let held = crate::sysload::inject_governor_with_history(std::iter::repeat_n(
+        disk_input(Level::Normal),
+        10,
+    ));
+    assert!(crate::sysload::shed_is_disk_only());
+    let (ignored, tracked, listed) = asks();
+    assert_eq!(ignored, GitAnswer::Yes, "the disk alone: admitted");
+    assert_eq!(tracked, GitAnswer::No);
+    assert!(listed);
+    assert!(
+        !crate::engine::worktree::list_worktrees_lite(repo.to_str().unwrap()).is_ok(),
+        "a spawn outside the helpers is still shed"
+    );
+    drop(held);
+    let _memory = crate::sysload::inject_governor_with_history(std::iter::repeat_n(
+        disk_input(Level::Critical),
+        10,
+    ));
+    assert!(!crate::sysload::shed_is_disk_only());
+    let (ignored, _, listed) = asks();
+    assert!(
+        matches!(ignored, GitAnswer::Unknown(_)),
+        "memory Severe beside the disk: the helpers are shed ({ignored:?})"
+    );
+    assert!(!listed);
 }
 
 fn empty_inventory() -> super::super::global::CleanerInventory {
@@ -884,6 +969,7 @@ fn empty_inventory() -> super::super::global::CleanerInventory {
         candidates: vec![],
         kept: vec![],
         leaked_temp: vec![],
+        long_lived: vec![],
         incomplete_repos: BTreeSet::new(),
         shed_repos: 0,
         scopes_complete: true,
@@ -1184,8 +1270,13 @@ fn a_marked_target_holding_foreign_files_at_its_top_level_is_kept() {
 /// folder, even with every marker.
 #[test]
 fn a_marked_folder_under_a_repositorys_tmp_needs_a_build_folder_name() {
-    let (_temp, repo) = temp_root();
-    for name in ["build-out", "my-target", "target-2", "target"] {
+    let (_temp, root) = temp_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
+    fs::write(repo.join(".git/info/exclude"), "/tmp/\n").unwrap();
+    for name in ["build-out", "x-target", "target-x", "target"] {
         cargo_target(&repo.join("tmp").join(name), 30);
     }
     let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
@@ -1196,16 +1287,26 @@ fn a_marked_folder_under_a_repositorys_tmp_needs_a_build_folder_name() {
         "{:?}",
         scan.kept
     );
-    // The three accepted names pass the naming rule; git is what keeps them
-    // here (this directory is no repository), and not one is offered as named.
-    assert!(!scan
-        .kept
+    // The three build-folder names are found and offered (the repository
+    // ignores `tmp/`, nothing is tracked, and they are old).
+    let mut offered: Vec<String> = scan
+        .candidates
         .iter()
-        .any(|k| k.path.ends_with("my-target") && k.reason.contains("not named like")));
-    assert!(!scan
-        .kept
-        .iter()
-        .any(|k| k.path.ends_with("target-2") && k.reason.contains("not named like")));
+        .map(|c| {
+            Path::new(&c.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    offered.sort();
+    assert_eq!(
+        offered,
+        ["target", "target-x", "x-target"],
+        "{:?}",
+        scan.kept
+    );
 }
 
 /// A plain folder named like a build folder, in a session's scratchpad, that
@@ -1322,4 +1423,511 @@ fn a_blind_session_detector_makes_the_folder_unexamined() {
     assert_eq!(scan.unexamined, 1);
     assert!(!scan.complete);
     assert!(kept_reason(&scan, OLD).reason.starts_with(COULD_NOT_CHECK));
+}
+
+/// Restores a directory's mode when dropped, so a failing assertion cannot
+/// leave a fixture the temp directory cannot remove.
+#[cfg(unix)]
+struct Mode(PathBuf);
+#[cfg(unix)]
+impl Mode {
+    fn set(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        Self(path.to_path_buf())
+    }
+}
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+fn marked_targets(parent: &Path, count: usize) {
+    for n in 0..count {
+        cargo_target(&parent.join(format!("t{n:02}")), 30);
+    }
+}
+
+/// A scan root that cannot be listed at all is unexamined, not an empty root:
+/// nothing in it was looked at.
+#[cfg(unix)]
+#[test]
+fn a_root_that_cannot_be_listed_is_unexamined_not_empty() {
+    let (_temp, root) = temp_root();
+    let sealed = root.join("sealed");
+    fs::create_dir_all(&sealed).unwrap();
+    let _mode = Mode::set(&sealed, 0o000);
+    let scan = run(&nobody(), &idle, |ctx| {
+        let mut scan = Scan::default();
+        let found = find_targets(&sealed, &mut scan, SCOPE_REPOSITORY, ctx);
+        assert!(found.is_empty());
+        scan
+    });
+    assert_eq!(scan.unexamined, 1, "{:?}", scan.kept);
+}
+
+/// A wrapper folder that cannot be listed is a could-not-look with a named
+/// issue; more marked children than the cap gets the cap's own message; a
+/// symlinked child is never followed.
+#[cfg(unix)]
+#[test]
+fn a_wrapper_that_cannot_be_listed_or_holds_too_many_is_said_so_and_a_symlink_is_not_followed() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    // Listable by neither: x but no r (its markers can be stat'ed, not listed).
+    let sealed = pad.join("target-sealed");
+    fs::create_dir_all(&sealed).unwrap();
+    let _mode = Mode::set(&sealed, 0o111);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(scan.candidates.is_empty());
+    assert_eq!(scan.unexamined, 1, "{:?}", scan.kept);
+    assert!(!scan.complete);
+    assert!(
+        scan.issues
+            .iter()
+            .any(|i| i.contains("target-sealed") && i.contains("could not be examined")),
+        "{:?}",
+        scan.issues
+    );
+    drop(_mode);
+    fs::remove_dir(&sealed).unwrap();
+
+    // The cap: one wrapper with more marked children than a root may offer.
+    let wrap = pad.join("target-many");
+    fs::create_dir_all(&wrap).unwrap();
+    marked_targets(&wrap, MAX_TARGETS_PER_ROOT + 1);
+    age(&wrap, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), MAX_TARGETS_PER_ROOT);
+    assert!(!scan.complete);
+    assert!(
+        scan.issues
+            .iter()
+            .any(|i| i.contains("the per-root cap") && i.contains("preview again")),
+        "the same message the main loop gives: {:?}",
+        scan.issues
+    );
+    fs::remove_dir_all(&wrap).unwrap();
+
+    // A symlink inside a wrapper to a marked target elsewhere.
+    let outside = root.join("outside-target");
+    cargo_target(&outside, 30);
+    let wrapper = pad.join("target-link");
+    fs::create_dir_all(&wrapper).unwrap();
+    std::os::unix::fs::symlink(&outside, wrapper.join("inner")).unwrap();
+    age(&wrapper, 30);
+    quiet_sessions(&root, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(
+        !scan
+            .candidates
+            .iter()
+            .any(|c| c.path.contains("inner") || c.path.contains("outside")),
+        "{:?}",
+        scan.candidates
+    );
+}
+
+/// A folder in which something was modified within the retention is not
+/// finished, whatever the detector says: a session the detector cannot see (a
+/// renamed launcher, a wrapper-dropped process) still writes in its own folder.
+#[test]
+fn a_session_the_detector_cannot_see_is_kept_while_its_folder_is_recent() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    cargo_target(&pad.join("target-x"), 30);
+    let tasks = pad.parent().unwrap().join("tasks");
+    fs::create_dir_all(&tasks).unwrap();
+    fs::write(tasks.join("out.log"), "running").unwrap();
+    // The detector sees nothing and nothing is unidentified.
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+    assert!(kept_reason(&scan, "target-x")
+        .reason
+        .contains("too recent: something in the session folder"));
+    assert_eq!(scan.unexamined, 0, "an answer, not a failure to look");
+    // The same folder, quiet for a month, is offered, with the evidence line.
+    quiet_sessions(&root, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+    assert!(
+        scan.candidates[0]
+            .evidence
+            .iter()
+            .any(|e| e.contains("nothing in the session folder was modified for")),
+        "{:?}",
+        scan.candidates[0].evidence
+    );
+}
+
+/// The session folder's three listings: unreadable, past their bound and dated
+/// in the future are each not "quiet".
+#[cfg(unix)]
+#[test]
+fn a_session_folder_whose_age_cannot_be_read_or_trusted_is_not_quiet() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let session = pad.parent().unwrap().to_path_buf();
+    quiet_sessions(&root, 30);
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = Context {
+        now: now(),
+        retention_days: 7,
+        live: &live,
+        use_of: &idle,
+        cancel: &cancel,
+        deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: CARGO_TARGET_BUDGET,
+    };
+    assert!(session_quiet(&session, &ctx).unwrap() >= 29);
+    // Unreadable: a tasks folder that cannot be listed.
+    let tasks = session.join("tasks");
+    fs::create_dir_all(&tasks).unwrap();
+    {
+        let _mode = Mode::set(&tasks, 0o000);
+        let refusal = session_quiet(&session, &ctx).unwrap_err();
+        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    }
+    // Cut by the bound: more entries than the listing reads.
+    for n in 0..=SESSION_LISTING_BOUND {
+        fs::write(tasks.join(format!("f{n}")), "").unwrap();
+    }
+    quiet_sessions(&root, 30);
+    let refusal = session_quiet(&session, &ctx).unwrap_err();
+    assert!(
+        matches!(&refusal, Refusal::Unexamined(why) if why.contains("more than")),
+        "{refusal:?}"
+    );
+    fs::remove_dir_all(&tasks).unwrap();
+    // A modification time in the future keeps it.
+    let future = SystemTime::now() + Duration::from_secs(10 * 86_400);
+    fs::File::open(pad.join("..").join("scratchpad"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(future))
+        .unwrap();
+    let refusal = session_quiet(&session, &ctx).unwrap_err();
+    assert!(
+        matches!(&refusal, Refusal::Kept(why) if why.contains("future")),
+        "{refusal:?}"
+    );
+}
+
+/// A nested marked target and a target-triple directory are looked into: the
+/// first must itself pass, and every child of the second must be a profile
+/// directory or an accepted sibling. A profile is also recognised by `deps` alone.
+#[test]
+fn a_nested_target_and_a_triple_directory_are_checked_not_waved_through() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let build = |name: &str, extra: &dyn Fn(&Path)| {
+        let target = pad.join(name);
+        cargo_target(&target, 30);
+        extra(&target);
+        age(&target, 30);
+    };
+    build("target-nested", &|t| {
+        cargo_target(&t.join("llvm-cov-target"), 30);
+        fs::create_dir_all(t.join("llvm-cov-target/my-notes")).unwrap();
+        fs::write(t.join("llvm-cov-target/my-notes/a.txt"), "mine").unwrap();
+    });
+    build("target-triple", &|t| {
+        fs::create_dir_all(t.join("aarch64-apple-darwin/release")).unwrap();
+        fs::write(t.join("aarch64-apple-darwin/release/.cargo-lock"), "").unwrap();
+        fs::create_dir_all(t.join("aarch64-apple-darwin/stuff")).unwrap();
+    });
+    build("target-deps-only", &|t| {
+        fs::create_dir_all(t.join("custom/deps")).unwrap();
+    });
+    build("target-clean-nested", &|t| {
+        cargo_target(&t.join("llvm-cov-target"), 30);
+    });
+    build("target-too-deep", &|t| {
+        cargo_target(&t.join("a-target"), 30);
+        cargo_target(&t.join("a-target/b-target"), 30);
+    });
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    let offered: Vec<String> = scan
+        .candidates
+        .iter()
+        .filter_map(|c| {
+            Path::new(&c.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .collect();
+    let reason = |name: &str| kept_reason(&scan, name).reason.clone();
+    assert!(
+        reason("target-nested").contains("llvm-cov-target/my-notes"),
+        "{}",
+        reason("target-nested")
+    );
+    assert!(
+        reason("target-triple").contains("aarch64-apple-darwin/stuff"),
+        "{}",
+        reason("target-triple")
+    );
+    assert!(
+        reason("target-too-deep").contains("nested more than"),
+        "{}",
+        reason("target-too-deep")
+    );
+    for ok in ["target-deps-only", "target-clean-nested"] {
+        assert!(
+            offered.contains(&ok.to_string()),
+            "{ok}: {offered:?} / {:?}",
+            scan.kept
+        );
+    }
+    assert_eq!(scan.unexamined, 0);
+}
+
+/// Every place the layout rule cannot read is could-not-look, not "foreign" and
+/// not "fine".
+#[cfg(unix)]
+#[test]
+fn the_layout_rule_names_what_it_could_not_read() {
+    let (_temp, root) = temp_root();
+    let target = root.join("target-x");
+    cargo_target(&target, 30);
+    fs::create_dir_all(target.join("triple/release")).unwrap();
+    fs::write(target.join("triple/release/.cargo-lock"), "").unwrap();
+    fs::create_dir_all(target.join("triple/odd")).unwrap();
+    // A triple child that cannot be inspected.
+    {
+        let _mode = Mode::set(&target.join("triple/odd"), 0o000);
+        // Inspecting `odd` itself (is_profile) fails: it is x-less.
+        let refusal = foreign_top_level(&target, 0).unwrap_err();
+        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    }
+    // A top level that cannot be listed.
+    {
+        let _mode = Mode::set(&target, 0o000);
+        let refusal = foreign_top_level(&target, 0).unwrap_err();
+        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    }
+    // A nested target that cannot be read.
+    let nested = target.join("llvm-cov-target");
+    cargo_target(&nested, 30);
+    {
+        let _mode = Mode::set(&nested, 0o000);
+        let refusal = foreign_top_level(&target, 0).unwrap_err();
+        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    }
+    // A nested target whose folder reads but whose marker file does not: the
+    // folder was not judged, so it is neither accepted nor called foreign.
+    {
+        let _mode = Mode::set(&nested.join("CACHEDIR.TAG"), 0o000);
+        let refusal = foreign_top_level(&target, 0).unwrap_err();
+        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    }
+}
+
+/// An unreadable marker is no evidence either way.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_marker_is_unexamined_not_no_markers() {
+    let (_temp, root) = temp_root();
+    let target = root.join("target-x");
+    cargo_target(&target, 30);
+    let _mode = Mode::set(&target.join("CACHEDIR.TAG"), 0o000);
+    let refusal = cargo_evidence(&target).unwrap_err();
+    assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    drop(_mode);
+    fs::remove_file(target.join("CACHEDIR.TAG")).unwrap();
+    assert!(
+        matches!(cargo_evidence(&target), Err(Refusal::Kept(_))),
+        "absent is an answer"
+    );
+}
+
+/// A folder this scan cannot look at (an error other than "not found") is
+/// unexamined with an issue line and an incomplete scan, in every scope; absent
+/// is just absent.
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
+    // Sessions: the scope root listable, a project folder not inspectable.
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let scope_root = root.join(format!("claude-{UID}"));
+    let _scope = Mode::set(&scope_root, 0o444);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    assert!(
+        scan.issues
+            .iter()
+            .any(|i| i.contains("could not be examined")),
+        "{:?}",
+        scan.issues
+    );
+    drop(_scope);
+    let _ = pad;
+    // Repository scratch.
+    let (_temp2, root2) = temp_root();
+    let repo = root2.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let _repo = Mode::set(&repo, 0o444);
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    drop(_repo);
+    // `.claude` targets.
+    let (_temp3, root3) = temp_root();
+    let checkout = root3.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let _checkout = Mode::set(&checkout, 0o444);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_claude_targets(std::slice::from_ref(&checkout), ctx, false)
+    });
+    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    drop(_checkout);
+    // Absent is absent: no scratch, no `.claude`, nothing unexamined.
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert_eq!((scan.unexamined, scan.complete), (0, true));
+    // A folder whose entries cannot be inspected inside a scratch root.
+    let (_temp4, root4) = temp_root();
+    let pad4 = scratchpad(&root4, OLD);
+    cargo_target(&pad4.join("target-a"), 30);
+    let _pad = Mode::set(&pad4, 0o444);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root4, UID, ctx, false)
+    });
+    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+}
+
+/// The judgement's own could-not-look cases: a path component that cannot be
+/// inspected, and a walk that ran out of time (as against one past its entry
+/// budget, which is an answer).
+#[cfg(unix)]
+#[test]
+fn a_judgement_that_could_not_look_or_ran_out_of_time_is_unexamined() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let target = pad.join("cargo-target");
+    cargo_target(&target, 30);
+    quiet_sessions(&root, 30);
+    let scope_root = root.join(format!("claude-{UID}"));
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let context = |budget: tree::Budget| Context {
+        now: now(),
+        retention_days: 7,
+        live: &live,
+        use_of: &idle,
+        cancel: &cancel,
+        deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: budget,
+    };
+    let session = pad.parent().unwrap().to_path_buf();
+    let id = OLD;
+    let judged = |ctx: &Context<'_>| {
+        judge(
+            &scope_root,
+            &target,
+            &pad,
+            Some((id, session.as_path())),
+            ctx,
+        )
+        .err()
+    };
+    assert!(
+        judged(&context(CARGO_TARGET_BUDGET)).is_none(),
+        "the fixture is judged fine"
+    );
+    // Time: an unexamined row, so the run comes back sooner.
+    let timed_out = judged(&context(tree::Budget {
+        entries: 1_000_000,
+        seconds: 0,
+    }))
+    .unwrap();
+    assert!(matches!(timed_out, Refusal::Unexamined(_)), "{timed_out:?}");
+    // Entries: the tree is too large, which is an answer.
+    let too_large = judged(&context(tree::Budget {
+        entries: 3,
+        seconds: 30,
+    }))
+    .unwrap();
+    assert!(
+        matches!(&too_large, Refusal::Kept(why) if why.contains("too large")),
+        "{too_large:?}"
+    );
+    // A component that cannot be inspected on the way to the target.
+    let _pad = Mode::set(&pad, 0o444);
+    let unreadable = judged(&context(CARGO_TARGET_BUDGET)).unwrap();
+    assert!(
+        matches!(unreadable, Refusal::Unexamined(_)),
+        "{unreadable:?}"
+    );
+}
+
+/// A removal that stops part way after unlinking files reports those bytes,
+/// instead of reading as a refusal that removed nothing.
+#[test]
+fn a_removal_stopped_part_way_reports_the_bytes_it_removed() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let target = pad.join("cargo-target");
+    cargo_target(&target, 30);
+    quiet_sessions(&root, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    let candidate = scan.candidates[0].clone();
+    let calls = Cell::new(0);
+    // The second reading (right before the first unlink) is the moment a build
+    // touches `.rustc_info.json`, which is unlinked last: everything before it
+    // is already gone when the removal reaches it.
+    let touches_a_late_file = |_: &Path| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 2 {
+            fs::write(target.join(".rustc_info.json"), "{\"changed\":true}").unwrap();
+        }
+        Ok(DirUse::default())
+    };
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = Context {
+        now: now(),
+        retention_days: 7,
+        live: &live,
+        use_of: &touches_a_late_file,
+        cancel: &cancel,
+        deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: CARGO_TARGET_BUDGET,
+    };
+    let failure = remove_judged(&candidate, &ctx, u64::MAX).unwrap_err();
+    let Refusal::PartlyRemoved { why, bytes } = &failure else {
+        panic!("a partial removal is not a plain refusal: {failure:?}");
+    };
+    assert!(
+        *bytes >= 4096,
+        "the 4096-byte file was already unlinked: {bytes}"
+    );
+    assert!(why.contains("changed after preview"), "{why}");
+    assert!(
+        !target.join("debug/app.o").exists(),
+        "the earlier entries are gone"
+    );
+    assert!(
+        target.join(".rustc_info.json").is_file(),
+        "the changed one stays"
+    );
+    assert!(failure.message().contains("partly removed"));
 }

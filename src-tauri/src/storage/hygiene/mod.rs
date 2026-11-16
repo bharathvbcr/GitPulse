@@ -3,6 +3,7 @@ pub(crate) mod agent;
 pub(crate) mod background;
 mod discovery;
 pub mod global;
+pub(crate) mod long_lived;
 pub mod providers;
 pub(crate) mod tree;
 

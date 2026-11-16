@@ -487,6 +487,63 @@ fn disk_relief_admits_checks_for_a_disk_cause_only() {
     }
 }
 
+/// The same admission through the process-wide accessor, with no seam: a
+/// governor that has history, as the app's sampler builds one. A relieved spawn
+/// is admitted when the disk alone is Severe, shed without relief, and shed with
+/// relief when anything else is wrong beside the disk.
+#[test]
+fn disk_relief_follows_the_real_accessor() {
+    use super::{with_admission, with_disk_relief, Admission, Refusal};
+    use crate::sysload::{
+        inject_governor_with_history, shed_is_disk_only, GovernorInput, Level, Reading, Readings,
+    };
+    let gate = super::SpawnGate::new(8);
+    let spawn = || {
+        with_admission(Admission::Reactive, || {
+            gate.acquire_until(Instant::now() + Duration::from_secs(10), &|| false)
+                .err()
+        })
+    };
+    let shed = |r: Option<Refusal>| matches!(r, Some(Refusal::Pressure { .. }));
+    let disk_only = |free_gib: u64| GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(free_gib << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    };
+    let _disk = inject_governor_with_history(std::iter::repeat_n(disk_only(8), 10));
+    assert!(shed_is_disk_only(), "the fixture is a disk-only Severe");
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "relieved and disk-only: admitted"
+    );
+    assert!(shed(spawn()), "the same spawn without relief is shed");
+    drop(_disk);
+
+    // CPU Elevated beside a Severe disk.
+    let mut busy = disk_only(8);
+    busy.readings.load = Reading::Value([4.0 * 18.0; 3]);
+    let _cpu = inject_governor_with_history(std::iter::repeat_n(busy, 10));
+    assert!(!shed_is_disk_only());
+    assert!(
+        shed(with_disk_relief(spawn)),
+        "CPU Elevated: relief admits nothing"
+    );
+    drop(_cpu);
+
+    // Memory Critical beside a Severe disk.
+    let mut memory = disk_only(8);
+    memory.level = Some(Level::Critical);
+    let _memory = inject_governor_with_history(std::iter::repeat_n(memory, 10));
+    assert!(!shed_is_disk_only());
+    assert!(
+        shed(with_disk_relief(spawn)),
+        "memory Severe: relief admits nothing"
+    );
+}
+
 /// A waiting user action takes the next free slot even with refreshes
 /// queued ahead of it.
 #[test]
