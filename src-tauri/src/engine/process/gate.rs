@@ -328,6 +328,9 @@ fn thread_default_admission() -> Admission {
 
 thread_local! {
     static ADMISSION: Cell<Admission> = Cell::new(thread_default_admission());
+    /// Whether this thread's spawns are admitted while the only thing the
+    /// governor binds on is the disk (see [`with_disk_relief`]).
+    static DISK_RELIEF: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's background spawns wait for budget; a thread
     /// starts in the process default, like [`ADMISSION`].
     static AWAITS_BUDGET: Cell<bool> =
@@ -415,6 +418,25 @@ pub(crate) fn with_spawn_source<T>(source: &'static str, body: impl FnOnce() -> 
 pub(crate) fn with_background_budget_wait<T>(awaits: bool, body: impl FnOnce() -> T) -> T {
     let _restore = std::mem::DropGuard::new(AWAITS_BUDGET.replace(awaits), |prev| {
         AWAITS_BUDGET.set(prev);
+    });
+    body()
+}
+
+/// Runs `body` with the cleaner's bounded, read-only checks admitted while the
+/// host sheds work for the disk alone.
+///
+/// A full disk is the one pressure the cleaner exists to relieve, and the
+/// governor sheds reactive work under it like any other: a run started because
+/// the disk is full would then find every check refused and delete nothing.
+/// This admits only when the verdict's cause is [`Binding::LowDisk`] or
+/// [`Binding::DiskFilling`]. Under memory, swap, CPU, thermal or compressor
+/// pressure the same spawns are still shed, so the cleaner never adds load to a
+/// host that is short of something else. It changes nothing for a class that is
+/// not shed, and it never makes a spawn cheaper: the slot and rate budgets still
+/// apply. The caller must only spawn read-only checks inside it.
+pub(crate) fn with_disk_relief<T>(body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(DISK_RELIEF.replace(true), |prev| {
+        DISK_RELIEF.set(prev);
     });
     body()
 }
@@ -507,8 +529,8 @@ pub(super) struct PostActionCredit {
     pub(super) until: Instant,
 }
 
-pub(in crate::engine::process) fn post_action_credits(
-) -> &'static Mutex<HashMap<PathBuf, PostActionCredit>> {
+pub(in crate::engine::process) fn post_action_credits()
+-> &'static Mutex<HashMap<PathBuf, PostActionCredit>> {
     static CREDITS: OnceLock<Mutex<HashMap<PathBuf, PostActionCredit>>> = OnceLock::new();
     CREDITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -821,11 +843,7 @@ pub(super) fn report_label(label: &str) -> String {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
                 && !word.starts_with('.');
-            if plain {
-                word
-            } else {
-                "…"
-            }
+            if plain { word } else { "…" }
         })
         .collect();
     if words.is_empty() {
@@ -1122,7 +1140,12 @@ impl SpawnGate {
         // credited to one (`take_post_action_credit` promoted it already).
         if !interactive {
             let shed = crate::sysload::shed();
-            if (background && shed.background) || (!background && shed.reactive) {
+            let disk_only = DISK_RELIEF.get()
+                && matches!(
+                    shed.cause,
+                    Some(crate::sysload::Binding::LowDisk | crate::sysload::Binding::DiskFilling)
+                );
+            if !disk_only && ((background && shed.background) || (!background && shed.reactive)) {
                 let refusal = Refusal::Pressure {
                     reactive: !background,
                     cause: shed.cause,
