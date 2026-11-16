@@ -100,15 +100,19 @@ pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport,
         .await
 }
 
-/// On-demand Kingfisher secrets scan of the working tree.
+/// On-demand secrets scan of the working tree.
 ///
-/// Kingfisher stdout is parsed in memory and dropped — never logged. A missed
-/// or truncated scan returns `ok: false` and is never implied clean.
+/// The in-process scanner answers by default. `deep` (absent means false, so
+/// an older caller keeps working) runs Kingfisher instead: the opt-in scan that
+/// also reads ignored files. Kingfisher stdout is parsed in memory and dropped
+/// — never logged. A missed or truncated scan returns `ok: false`, and a scan
+/// that skipped inputs is `partial`; neither is ever implied clean.
 #[tauri::command(async)]
 pub async fn cmd_scan_secrets(
     repo_path: String,
+    deep: Option<bool>,
 ) -> Result<crate::secrets::SecretsReport, IpcError> {
-    off_thread(move || crate::secrets::scan_secrets(&repo_path)).await
+    off_thread(move || crate::secrets::scan_working_tree(&repo_path, deep.unwrap_or(false))).await
 }
 
 /// Full disk-usage scan of the repository (git internals, build/cache

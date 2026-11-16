@@ -6,6 +6,7 @@
 
 use super::parse::{
     Envelope, RawFinding, ScanCompleteness, SecretFinding, SecretLocation, SecretsReport,
+    ENGINE_KINGFISHER,
 };
 use crate::ipc_error::CommandError;
 use std::collections::{HashMap, HashSet};
@@ -299,6 +300,7 @@ pub(crate) fn assemble(
 
     SecretsReport {
         ok,
+        engine: ENGINE_KINGFISHER.to_string(),
         error,
         diagnostic: None,
         kingfisher_present: true,
@@ -319,5 +321,7 @@ pub(crate) fn assemble(
         max_file_size_mb: facts.max_file_size_mb,
         scanned_at_ms: facts.scanned_at_ms,
         duration_ms: facts.duration_ms,
+        skipped_total: 0,
+        skipped: Vec::new(),
     }
 }

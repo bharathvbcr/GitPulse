@@ -1,4 +1,9 @@
-//! Optional Kingfisher secret scan for the Insights Secrets section.
+//! The Insights Secrets section's working-tree scan.
+//!
+//! [`scan_working_tree`] answers it with the in-process scanner
+//! (`crate::leak_scan::worktree`) by default; Kingfisher is the opt-in deep
+//! scan, which also reads the files git ignores. The rest of this module is
+//! the Kingfisher side:
 //!
 //! Resolves `kingfisher` like every other external tool (PATH, then the
 //! GUI-launch fallback directories), spawns it with a scrubbed environment,
@@ -8,16 +13,23 @@
 //! fingerprints stay in this process; the webview gets an ordinal instead.
 
 mod parse;
+mod primary;
 mod report;
 mod run;
 
-pub use parse::{ScanCompleteness, SecretFinding, SecretLocation, SecretsReport};
+pub use parse::{
+    ScanCompleteness, SecretFinding, SecretLocation, SecretSkip, SecretsReport, ENGINE_KINGFISHER,
+};
+pub use primary::scan_working_tree;
 pub use report::MAX_FINDINGS;
 pub use run::{
     build_scan_argv, build_scrubbed_env, build_version_argv, nested_repos_scanning_enabled,
     report_from_exit, resolve_kingfisher, scan_secrets, scan_with_binary, ScanTicket,
     MAX_FILE_SIZE_MB, SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
 };
+
+#[cfg(test)]
+mod primary_tests;
 
 #[cfg(test)]
 mod tests {
