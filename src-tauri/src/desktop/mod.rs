@@ -1077,12 +1077,21 @@ where
         }
     })
     .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        receiver.recv_timeout(std::time::Duration::from_secs(10))
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| format!("The main-thread update did not finish: {error}"))?
+    wait_for_main_thread(receiver)
+        .await?
+        .map_err(|error| format!("The main-thread update did not finish: {error}"))?
+}
+
+/// Waits, off the async runtime, up to [`MAIN_THREAD_WAIT`] for what the main
+/// thread sends back. Every main-thread caller waits through this one blocking
+/// start, so a stalled AppKit loop costs each caller one pool thread for a
+/// bounded time and never more.
+async fn wait_for_main_thread<T: Send + 'static>(
+    receiver: std::sync::mpsc::Receiver<T>,
+) -> Result<Result<T, std::sync::mpsc::RecvTimeoutError>, String> {
+    tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(MAIN_THREAD_WAIT))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The newest menu presentation waiting for the main thread, and the callers
@@ -1182,11 +1191,7 @@ impl MenuStateSlot {
 async fn await_menu_outcome(
     receiver: std::sync::mpsc::Receiver<Result<(), String>>,
 ) -> Result<(), String> {
-    let outcome =
-        tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(MAIN_THREAD_WAIT))
-            .await
-            .map_err(|error| error.to_string())?;
-    match outcome {
+    match wait_for_main_thread(receiver).await? {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             log::warn!(
