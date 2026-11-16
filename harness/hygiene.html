@@ -224,6 +224,19 @@
     check("closed-app scheduling requires explicit saved consent",closedSave.args.config.run_when_closed===true&&closedSave.args.config.enabled===true);
     closedSave.resolve({...structuredClone(globalState),background_supported:true,config:{...closedSave.args.config,revision:4}});await settle();
     button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,config:{...closedSave.args.config,revision:4}});await settle();
+    // A due scheduled clean held back for the host says why, in the status the panel reads; absent otherwise.
+    check("no waiting notice while the status carries none",root.querySelector('[data-testid="scheduled-wait"]')===null);
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,config:{...globalState.config,enabled:true,next_run_at:1},scheduled_wait:"the kernel reports memory pressure"});await settle();
+    const waitNotice=root.querySelector('[data-testid="scheduled-wait"]')?.textContent??"";
+    check("a due scheduled clean that is waiting says why and how to proceed",waitNotice==="The scheduled clean is due and waiting: the kernel reports memory pressure. It runs when that clears, or run it now.");
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,config:{...globalState.config,enabled:true,next_run_at:1}});await settle();
+    check("the waiting notice goes when the status stops carrying it",root.querySelector('[data-testid="scheduled-wait"]')===null);
+    // A run that stopped part way is neither completed nor skipped, and says what was removed.
+    const partlyRun={id:"r-partly",trigger:"scheduled",started_at:1,finished_at:2,status:"completed_with_skips",repositories:0,partial:false,issues:[],items:[{repo_path:"/private/tmp/claude-501",path:"/private/tmp/claude-501/proj/s1/scratchpad/target-a",status:"partially_removed",message:"Stopped part way: 4096 bytes of this agent scratch build were already removed and count against the run's byte limit. File content changed after preview; stopped before removing it",bytes_before:9000,bytes_after:null}]};
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,history:[partlyRun]});await settle();
+    const partlyText=root.textContent;
+    check("a partly removed row says so and shows the bytes already removed",partlyText.includes("partly removed")&&partlyText.includes("4096 bytes of this agent scratch build were already removed"));
+    check("a partly removed row does not read as completed, skipped or emptied",!/target-a · (completed|skipped)/.test(partlyText)&&!partlyText.includes("After unavailable")&&partlyText.includes("the rest was left in place"));
     await unmount(component);
     check("global view unmount does not cancel a saved schedule",calls.at(-1).cmd==="cmd_cleaner_state");
     check("no browser crashes or rejected promises",crashes.length===0);

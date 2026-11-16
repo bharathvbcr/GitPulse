@@ -88,7 +88,7 @@ pub fn no_symlinks_checked(path: &Path) -> Result<(), WalkError> {
             continue;
         }
         if fs::symlink_metadata(&current)
-            .map_err(|e| WalkError::CouldNotRead(format!("{}: {e}", current.display())))?
+            .map_err(|e| WalkError::io(&current, &e))?
             .file_type()
             .is_symlink()
         {
@@ -132,8 +132,12 @@ pub enum WalkError {
     /// What was found inside is not eligible: a symlink, a special file, a
     /// protected name.
     Refused(String),
-    /// An entry could not be listed or read.
+    /// An entry could not be listed or read, for a reason that may clear.
     CouldNotRead(String),
+    /// The operating system said this process may not read an entry
+    /// (permission denied). That is a lasting property of the folder: an
+    /// answer about it, not an unfinished look.
+    Denied(String),
     /// The walk visited more entries (or went deeper) than its budget: the
     /// tree is too large to verify, an answer about the tree.
     Budget,
@@ -141,6 +145,18 @@ pub enum WalkError {
     /// tree, only that looking was not completed.
     TimedOut,
     Cancelled,
+}
+
+impl WalkError {
+    /// A read failure of `path`, kept apart by whether it can clear.
+    fn io(path: &Path, error: &std::io::Error) -> Self {
+        let message = format!("{}: {error}", path.display());
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Self::Denied(message)
+        } else {
+            Self::CouldNotRead(message)
+        }
+    }
 }
 
 impl From<String> for WalkError {
@@ -152,7 +168,9 @@ impl From<String> for WalkError {
 impl WalkError {
     pub fn message(&self) -> String {
         match self {
-            Self::Refused(message) | Self::CouldNotRead(message) => message.clone(),
+            Self::Refused(message) | Self::CouldNotRead(message) | Self::Denied(message) => {
+                message.clone()
+            }
             Self::Budget => BUDGET_EXCEEDED.into(),
             Self::TimedOut => TIME_EXCEEDED.into(),
             Self::Cancelled => "Cancelled".into(),
@@ -179,6 +197,10 @@ pub fn snapshot_within(
         newest: 0,
     };
     let deadline = Instant::now() + Duration::from_secs(budget.seconds);
+    #[cfg(unix)]
+    let mut inodes = Inodes::new();
+    #[cfg(not(unix))]
+    let mut inodes: Inodes = ();
     walk(
         root,
         Path::new(""),
@@ -186,9 +208,35 @@ pub fn snapshot_within(
         (deadline, budget.entries),
         cancel,
         &mut result,
+        &mut inodes,
     )?;
+    #[cfg(unix)]
+    {
+        result.bytes = inodes
+            .values()
+            .filter(|file| file.links_in_tree >= file.links)
+            .fold(result.bytes, |sum, file| sum.saturating_add(file.len));
+    }
     Ok(result)
 }
+
+/// What the walk saw of each distinct file (device, inode): its size, how many
+/// names the filesystem says it has, and how many of them are inside the tree.
+/// A Cargo target hard-links heavily (an uplifted binary beside its `deps`
+/// copy, `incremental` beside `build`), so bytes are counted per file, not per
+/// name, and only for a file every name of which is inside the tree: removing
+/// the tree frees nothing for a file that keeps a name outside it.
+#[cfg(unix)]
+struct SeenFile {
+    len: u64,
+    links: u64,
+    links_in_tree: u64,
+}
+#[cfg(unix)]
+type Inodes = std::collections::HashMap<(u64, u64), SeenFile>;
+/// Nothing to track without inode identities.
+#[cfg(not(unix))]
+type Inodes = ();
 
 /// The first entry of a snapshot that lives on another device than its root: a
 /// mount point inside the candidate. Removing the candidate would reach into a
@@ -210,6 +258,7 @@ fn walk(
     (deadline, max_entries): (Instant, usize),
     cancel: &AtomicBool,
     result: &mut Snapshot,
+    inodes: &mut Inodes,
 ) -> Result<(), WalkError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(WalkError::Cancelled);
@@ -227,7 +276,7 @@ fn walk(
     } else {
         root.join(relative)
     };
-    let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = fs::symlink_metadata(&path).map_err(|e| WalkError::io(&path, &e))?;
     if meta.file_type().is_symlink() {
         // A symlinked root measures nothing: returning an empty snapshot made
         // the inventory report 0 bytes for a cache it never looked at.
@@ -272,12 +321,26 @@ fn walk(
     let stamp = Stamp::read(&meta)?;
     result.newest = result.newest.max(stamp.modified);
     if meta.is_file() {
-        result.bytes = result.bytes.saturating_add(meta.len());
+        #[cfg(unix)]
+        {
+            let seen = inodes.entry(stamp.identity).or_insert(SeenFile {
+                len: meta.len(),
+                links: meta.nlink().max(1),
+                links_in_tree: 0,
+            });
+            seen.links_in_tree += 1;
+        }
+        // No inode identity here: every name counts as its own file.
+        #[cfg(not(unix))]
+        {
+            let _ = &inodes;
+            result.bytes = result.bytes.saturating_add(meta.len());
+        }
     }
     result.entries.insert(relative.to_path_buf(), stamp);
     if meta.is_dir() {
-        for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+        for entry in fs::read_dir(&path).map_err(|e| WalkError::io(&path, &e))? {
+            let entry = entry.map_err(|e| WalkError::io(&path, &e))?;
             walk(
                 root,
                 &relative.join(entry.file_name()),
@@ -285,6 +348,7 @@ fn walk(
                 (deadline, max_entries),
                 cancel,
                 result,
+                inodes,
             )?;
         }
     }
@@ -345,6 +409,29 @@ mod unix {
         Ok(current)
     }
 
+    /// Whether a file still matches its stamp from the preview. Its size must
+    /// match. A file none of whose names this removal has unlinked must also
+    /// have the same change time. One it has (another name of the same file)
+    /// has a new change time because of that unlink, so the change time is
+    /// excused and the modification time, which our unlink does not move, is
+    /// checked instead: a write after the preview still stops the removal.
+    pub(super) fn file_unchanged(
+        approved: &Stamp,
+        size: i64,
+        changed: (i64, i64),
+        modified: u128,
+        other_name_unlinked: bool,
+    ) -> bool {
+        if u64::try_from(size).ok() != Some(approved.len) {
+            return false;
+        }
+        if other_name_unlinked {
+            modified == approved.modified
+        } else {
+            changed == approved.changed
+        }
+    }
+
     /// Removes the reviewed entries. A failure after some were already
     /// unlinked says so: the directory is then partly gone, and "Entry was
     /// replaced" alone reads as if nothing had happened.
@@ -394,6 +481,9 @@ mod unix {
         // and a run that stops half way leaves a partly removed folder.
         let deadline = Instant::now()
             + Duration::from_secs(60 + u64::try_from(expected.entries.len() / 5_000).unwrap_or(0));
+        // Files of which this removal has already unlinked a name.
+        let mut unlinked_files: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::new();
         // Children sort after their parents in BTreeMap; reverse traversal
         // deletes only reviewed leaves, then empty directories. New entries
         // survive and cause ENOTEMPTY, never an unreviewed recursive sweep.
@@ -444,15 +534,28 @@ mod unix {
             }
             #[allow(clippy::unnecessary_cast)]
             let changed = (raw.st_ctime as i64, raw.st_ctime_nsec as i64);
+            let modified = u128::try_from(
+                i128::from(raw.st_mtime) * 1_000_000_000 + i128::from(raw.st_mtime_nsec),
+            )
+            .unwrap_or(0);
+            // A file that has several names changes its ctime when another
+            // name is unlinked. If this removal has already unlinked a name of
+            // this very file, that is expected and everything else is checked.
             if !approved.directory
-                && (raw.st_size < 0
-                    || u64::try_from(raw.st_size).ok() != Some(approved.len)
-                    || changed != approved.changed)
+                && !file_unchanged(
+                    approved,
+                    raw.st_size,
+                    changed,
+                    modified,
+                    unlinked_files.contains(&identity),
+                )
             {
                 return Err(
                     "File content changed after preview; stopped before removing it".into(),
                 );
             }
+            let frees_it = raw.st_nlink <= 1;
+            let has_other_names = raw.st_nlink > 1;
             // SAFETY: the leaf is relative to an open, non-symlink parent.
             // unlinkat never traverses the final component, even in a race.
             if unsafe {
@@ -471,7 +574,15 @@ mod unix {
             }
             *removed += 1;
             if !approved.directory {
-                *removed_bytes = removed_bytes.saturating_add(approved.len);
+                // Only the unlink of a file's last name frees it: a file that
+                // keeps a name outside the tree is not freed, and a file with
+                // several names inside is counted once, on its last.
+                if frees_it {
+                    *removed_bytes = removed_bytes.saturating_add(approved.len);
+                }
+                if has_other_names {
+                    unlinked_files.insert(identity);
+                }
             }
         }
         Ok(())
@@ -699,6 +810,153 @@ mod tests {
         .expect_err("no time at all");
         assert_eq!(error, super::WalkError::TimedOut);
         assert_eq!(error.message(), super::TIME_EXCEEDED);
+    }
+
+    /// A tree holding `names` as hard links of one `len`-byte file.
+    #[cfg(unix)]
+    fn linked_tree(root: &Path, names: &[&str], len: usize) {
+        fs::create_dir_all(root).unwrap();
+        let first = root.join(names[0]);
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, vec![b'x'; len]).unwrap();
+        for name in &names[1..] {
+            let to = root.join(name);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::hard_link(&first, &to).unwrap();
+        }
+    }
+
+    /// Cargo hard-links heavily: removing one name changes the ctime of the
+    /// others, which the per-file check read as "content changed after
+    /// preview". A target holding two names of one file stopped half way.
+    #[cfg(unix)]
+    #[test]
+    fn two_hard_links_inside_a_tree_remove_completely_and_count_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("t");
+        linked_tree(&root, &["debug/foo", "debug/deps/foo-1234"], 4096);
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        assert_eq!(reviewed.bytes, 4096, "one file, two names: counted once");
+        let freed = super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false))
+            .expect("every name of the file is inside the tree");
+        assert_eq!(freed, 4096);
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn three_hard_links_and_two_separate_pairs_remove_completely() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("t");
+        linked_tree(&root, &["a/x", "b/x", "c/deeper/x"], 1000);
+        linked_tree(&root.join("pair"), &["p", "q"], 500);
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        assert_eq!(reviewed.bytes, 1500);
+        let freed =
+            super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false)).unwrap();
+        assert_eq!(freed, 1500);
+        assert!(!root.exists());
+    }
+
+    /// A name outside the tree keeps the file: removing the tree unlinks the
+    /// names inside, changes the outside name's ctime and nothing else, frees
+    /// nothing, and says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_outside_the_tree_is_removed_without_touching_it_or_counting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let outside = base.join("outside.bin");
+        fs::write(&outside, vec![b'o'; 2048]).unwrap();
+        let root = base.join("t");
+        fs::create_dir_all(root.join("debug")).unwrap();
+        fs::hard_link(&outside, root.join("debug/linked")).unwrap();
+        fs::write(root.join("debug/own"), vec![b'x'; 100]).unwrap();
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        assert_eq!(reviewed.bytes, 100, "the linked file stays: not freed");
+        let freed =
+            super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false)).unwrap();
+        assert_eq!(freed, 100);
+        assert!(!root.exists());
+        assert_eq!(fs::read(&outside).unwrap(), vec![b'o'; 2048]);
+    }
+
+    /// A file changed after the preview still stops the removal, through either
+    /// of its names, before anything is unlinked.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_changed_after_the_preview_stops_the_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("t");
+        linked_tree(&root, &["debug/foo", "debug/deps/foo-1234"], 4096);
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        fs::write(root.join("debug/deps/foo-1234"), vec![b'y'; 4096]).unwrap();
+        let partial = super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false))
+            .expect_err("the content changed");
+        assert!(
+            partial.error.contains("changed after preview"),
+            "{partial:?}"
+        );
+        assert!(root.join("debug/foo").exists());
+        assert!(root.join("debug/deps/foo-1234").exists());
+    }
+
+    /// What a name whose file this removal already unlinked another name of may
+    /// differ in: the ctime, nothing else. Any other entry is checked in full.
+    #[cfg(unix)]
+    #[test]
+    fn the_unchanged_check_excuses_only_the_ctime_of_an_already_unlinked_file() {
+        let approved = super::Stamp {
+            directory: false,
+            len: 10,
+            modified: 5_000_000_000,
+            identity: (1, 2),
+            changed: (7, 0),
+        };
+        let now = |size, changed, modified, unlinked| {
+            super::unix::file_unchanged(&approved, size, changed, modified, unlinked)
+        };
+        assert!(now(10, (7, 0), 5_000_000_000, false));
+        assert!(
+            !now(10, (8, 0), 5_000_000_000, false),
+            "a file none of whose names was touched is checked in full"
+        );
+        assert!(
+            now(10, (8, 0), 5_000_000_000, true),
+            "our own unlink moved it"
+        );
+        assert!(!now(11, (8, 0), 5_000_000_000, true), "size");
+        assert!(!now(10, (8, 0), 5_000_000_001, true), "content written");
     }
 
     #[test]

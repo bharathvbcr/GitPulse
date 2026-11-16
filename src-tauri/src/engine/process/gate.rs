@@ -425,9 +425,11 @@ pub(crate) fn with_background_budget_wait<T>(awaits: bool, body: impl FnOnce() -
 
 /// Whether this thread's spawn is admitted although the host is shedding: the
 /// thread asked for disk relief (see [`with_disk_relief`]) and the governor says
-/// the disk is the only thing the host is short of
-/// ([`crate::sysload::shed_is_disk_only`]). The relief flag is read first, so a
-/// thread that never asked costs no governor lock.
+/// the disk remedy is due ([`crate::sysload::disk_remedy_due`]: the disk is the
+/// only thing the host is short of, or free disk is below the Severe floor
+/// whatever else is pressed, because a nearly full disk brings memory
+/// pressure with it). The relief flag is read first, so a thread that never
+/// asked costs no governor lock.
 fn disk_relief_applies() -> bool {
     if !DISK_RELIEF.get() {
         return false;
@@ -436,7 +438,7 @@ fn disk_relief_applies() -> bool {
     if let Some(forced) = DISK_ONLY_FOR_TEST.get() {
         return forced;
     }
-    crate::sysload::shed_is_disk_only()
+    crate::sysload::disk_remedy_due()
 }
 
 #[cfg(test)]
@@ -456,16 +458,19 @@ pub(crate) fn with_disk_only_answer<T>(answer: bool, body: impl FnOnce() -> T) -
 }
 
 /// Runs `body` with the cleaner's bounded, read-only checks admitted while the
-/// host sheds work for the disk alone.
+/// host sheds work for the disk remedy.
 ///
 /// A full disk is the one pressure the cleaner exists to relieve, and the
 /// governor sheds reactive work under it like any other: a run started because
 /// the disk is full would then find every check refused and delete nothing.
-/// This admits only when `crate::sysload::shed_is_disk_only()` holds; that
-/// function owns the definition (it is the governor's, and it answers false on
-/// any doubt: another input not clear, no history, an unavailable sensor, no
-/// governor in this process, as in the headless run, the MCP server or a hook).
-/// So the cleaner never adds load to a host that is short of something else. It changes nothing for a class that is not shed, and it
+/// This admits only when `crate::sysload::disk_remedy_due()` holds; that
+/// function owns the definition (it is the governor's: the disk is the only
+/// reason the host sheds, or free disk is below the Severe floor on a fresh
+/// reading whatever else is pressed; it answers false on any doubt: no
+/// history for the first branch, an unavailable sensor, no governor in this
+/// process, as in the headless run, the MCP server or a hook). Low disk at
+/// Elevated, or the fill projection alone, with something else pressed, is not
+/// due. It changes nothing for a class that is not shed, and it
 /// never makes a spawn cheaper: the slot and rate budgets still apply. The
 /// caller must only spawn one read-only check inside it, never a scan: any
 /// other spawn on the same thread inside the body would be admitted too.
@@ -474,6 +479,40 @@ pub(crate) fn with_disk_relief<T>(body: impl FnOnce() -> T) -> T {
         DISK_RELIEF.set(prev);
     });
     body()
+}
+
+/// The load governor's verdict for one spawn of `class`, and the only reader of
+/// it: the refusal the gate gives under pressure, or `None` when the class is
+/// not shed (a user action never is) or the disk remedy's relief applies.
+fn pressure_refusal(class: Admission) -> Option<Refusal> {
+    if class == Admission::Interactive {
+        return None;
+    }
+    let background = class == Admission::Background;
+    let shed = crate::sysload::shed();
+    let disk_only = disk_relief_applies();
+    (!disk_only && ((background && shed.background) || (!background && shed.reactive))).then_some(
+        Refusal::Pressure {
+            reactive: !background,
+            cause: shed.cause,
+        },
+    )
+}
+
+/// Why a background spawn made now, under the disk remedy's relief, would be
+/// refused for pressure (the end of a sentence), or `None` when it would not.
+/// For a caller that must decide before it starts work: it asks the gate's own
+/// judgement, so "the work waits" and "its checks would be refused" cannot
+/// disagree.
+pub(crate) fn background_deferral_cause() -> Option<&'static str> {
+    match with_disk_relief(|| pressure_refusal(Admission::Background)) {
+        Some(Refusal::Pressure { cause, .. }) => Some(
+            cause
+                .unwrap_or(crate::sysload::Binding::MemoryPressure)
+                .cause_phrase(),
+        ),
+        _ => None,
+    }
 }
 
 /// Applies only inside a synchronous blocking operation.
@@ -1177,21 +1216,13 @@ impl SpawnGate {
         // memory pressure these classes are refused at once with the
         // deferral marker. A user action is never shed, and neither is a read
         // credited to one (`take_post_action_credit` promoted it already).
-        if !interactive {
-            let shed = crate::sysload::shed();
-            let disk_only = disk_relief_applies();
-            if !disk_only && ((background && shed.background) || (!background && shed.reactive)) {
-                let refusal = Refusal::Pressure {
-                    reactive: !background,
-                    cause: shed.cause,
-                };
-                self.state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .counters[class.index()]
-                .count(refusal);
-                return Err((refusal, None));
-            }
+        if let Some(refusal) = pressure_refusal(class) {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .counters[class.index()]
+            .count(refusal);
+            return Err((refusal, None));
         }
         let rate_limited = self.refill_per_sec != u32::MAX
             && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);

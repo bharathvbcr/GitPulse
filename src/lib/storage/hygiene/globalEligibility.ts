@@ -48,7 +48,20 @@ export function coverageNotice(inventory: CleanerInventory | null): string | nul
  */
 export function itemStatusLabel(status: string): string {
   if (status === "unexamined") return "couldn't examine";
+  // Some of it is gone and the rest stays: neither "completed" nor "skipped".
+  if (status === "partially_removed") return "partly removed";
   return status.replaceAll("_", " ");
+}
+
+/**
+ * The sentence for a due scheduled clean that is waiting for the host, or null.
+ * The reason is the load governor's own phrase (in memory only, never saved),
+ * present only while the schedule is enabled, due and idle.
+ */
+export function scheduledWaitNotice(state: { scheduled_wait?: string | null }): string | null {
+  const reason = state.scheduled_wait?.trim();
+  if (!reason) return null;
+  return `The scheduled clean is due and waiting: ${reason}. It runs when that clears, or run it now.`;
 }
 
 /**
@@ -60,6 +73,8 @@ export function runRowsSummary(run: CleanerRun): string {
   const listed = `${run.items.length} targets reported`;
   const parts = [listed];
   if (run.unlisted) parts.push(`${run.unlisted} more not listed`);
-  if (run.unexamined) parts.push(`${run.unexamined} couldn't be examined under load`);
+  // Not "under load": a folder that could not be checked is not always the
+  // host shedding work. The run's issues say which reason applied.
+  if (run.unexamined) parts.push(`${run.unexamined} couldn't be examined`);
   return parts.join(" · ");
 }

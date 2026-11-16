@@ -446,12 +446,10 @@ fn disk_relief_admits_checks_for_a_disk_cause_only() {
         ),
         "disk-only, but the thread never asked for relief: shed"
     );
-    assert!(
-        matches!(
-            with_disk_relief(reactive),
-            Some(Refusal::Pressure { reactive: true, .. })
-        ),
-        "relief asked and the real accessor, which has no history here: shed"
+    assert_eq!(
+        with_disk_relief(reactive),
+        None,
+        "relief asked and the real accessor: free disk is under the Severe floor, so the remedy is due"
     );
     assert!(
         with_disk_only_answer(true, reactive).is_some(),
@@ -522,25 +520,51 @@ fn disk_relief_follows_the_real_accessor() {
     assert!(shed(spawn()), "the same spawn without relief is shed");
     drop(_disk);
 
-    // CPU Elevated beside a Severe disk.
+    // CPU Elevated beside a Severe disk: not the disk alone, but free disk is
+    // below the Severe floor, so the remedy is due whatever else is pressed.
     let mut busy = disk_only(8);
     busy.readings.load = Reading::Value([4.0 * 18.0; 3]);
     let _cpu = inject_governor_with_history(std::iter::repeat_n(busy, 10));
     assert!(!shed_is_disk_only());
-    assert!(
-        shed(with_disk_relief(spawn)),
-        "CPU Elevated: relief admits nothing"
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "disk below the Severe floor and CPU Elevated: admitted"
     );
     drop(_cpu);
 
-    // Memory Critical beside a Severe disk.
+    // Memory Critical beside a Severe disk: a nearly full disk brings memory
+    // pressure with it; the relieved check proceeds, an unrelieved one is shed.
     let mut memory = disk_only(8);
     memory.level = Some(Level::Critical);
     let _memory = inject_governor_with_history(std::iter::repeat_n(memory, 10));
     assert!(!shed_is_disk_only());
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "disk below the Severe floor and memory Severe: admitted"
+    );
+    assert!(shed(spawn()), "without relief it is shed");
+    drop(_memory);
+
+    // Low disk only Elevated (24 GiB, between the floors) with memory Severe.
+    let mut elevated = disk_only(24);
+    elevated.level = Some(Level::Critical);
+    let _elevated = inject_governor_with_history(std::iter::repeat_n(elevated, 10));
     assert!(
         shed(with_disk_relief(spawn)),
-        "memory Severe: relief admits nothing"
+        "disk Elevated and memory Severe: relief admits nothing"
+    );
+    drop(_elevated);
+
+    // The fill projection alone (space well above the floor) with memory Severe.
+    let mut filling = GovernorInput::test_pressure(Level::Critical);
+    filling.readings.free_disk = Reading::Value(40 << 30);
+    filling.readings.disk_fill_sustained = Reading::Value(10 << 30);
+    let _filling = inject_governor_with_history(std::iter::repeat_n(filling, 10));
+    assert!(
+        shed(with_disk_relief(spawn)),
+        "a fill projection alone with memory Severe: relief admits nothing"
     );
 }
 

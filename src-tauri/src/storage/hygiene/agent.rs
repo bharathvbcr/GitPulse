@@ -129,6 +129,11 @@ pub(super) enum Refusal {
     Kept(String),
     /// A check could not run, so the folder is kept without having been judged.
     Unexamined(String),
+    /// The OS says GitPulse may not read it, or a listing is over its bound:
+    /// a lasting property of this one folder. An answer, like `Kept`, but
+    /// kept apart from "no markers, so not Cargo's" so a caller that treats a
+    /// refused marker check as "not a target" can tell them apart.
+    Denied(String),
     /// Examined and kept like `Kept`, because a running Claude session cannot
     /// be matched to a session folder. Its own variant, not a message to match
     /// on: the scan states it once as its own issue line.
@@ -142,7 +147,7 @@ pub(super) enum Refusal {
 impl Refusal {
     pub(super) fn message(&self) -> String {
         match self {
-            Self::Kept(why) | Self::SessionUnmatched(why) => why.clone(),
+            Self::Kept(why) | Self::SessionUnmatched(why) | Self::Denied(why) => why.clone(),
             Self::PartlyRemoved { why, bytes } => {
                 format!("partly removed ({bytes} bytes were already gone): {why}")
             }
@@ -163,7 +168,37 @@ impl From<&str> for Refusal {
     }
 }
 
+/// What a failed read means. The rule, once, for every site here:
+///
+/// - a lasting property of ONE folder is an answer about it, not an unfinished
+///   scan: permission denied on a folder or marker, a listing over its entry
+///   bound. It is `Kept` with a reason that says so, listed, never offered, and
+///   the scan stays complete;
+/// - a could-not-look that may clear on its own stays `Unexamined` and the
+///   scan incomplete: the host shed the check, the process table or a process
+///   could not be read, a time budget ran out, a cancelled walk, any other I/O
+///   error.
+///
+/// Why the line matters: one incomplete scan clears the shared
+/// `scopes_complete` flag, which approves no reclaim scope at all.
+fn read_failure(what: impl std::fmt::Display, error: &std::io::Error) -> Refusal {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        Refusal::Denied(format!("{what}: GitPulse may not read it ({error})"))
+    } else {
+        Refusal::Unexamined(format!("{what}: {error}"))
+    }
+}
+
 impl Scan {
+    /// [`Scan::unreadable`] for an I/O error, by the rule on [`read_failure`]: a
+    /// folder GitPulse may not read is kept and listed, the scan complete.
+    fn unreadable_io(&mut self, path: &Path, scope: &str, what: &str, error: &std::io::Error) {
+        match read_failure(what, error) {
+            Refusal::Unexamined(_) => self.unreadable(path, scope, format!("{what}: {error}")),
+            answered => self.refuse(path, scope, &answered),
+        }
+    }
+
     fn keep(&mut self, path: &Path, scope: &str, reason: impl Into<String>) {
         if self.kept.len() < MAX_KEPT {
             self.kept.push(KeptItem {
@@ -197,7 +232,7 @@ impl Scan {
         for item in listing {
             match item {
                 Ok(entry) => out.push(entry),
-                Err(e) => self.unreadable(dir, scope, format!("an entry could not be read: {e}")),
+                Err(e) => self.unreadable_io(dir, scope, "an entry could not be read", &e),
             }
         }
         out
@@ -220,7 +255,7 @@ impl Scan {
             Ok(meta) => meta.is_dir(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
-                self.unreadable(path, scope, format!("it could not be inspected: {e}"));
+                self.unreadable_io(path, scope, "it could not be inspected", &e);
                 false
             }
         }
@@ -267,9 +302,10 @@ impl Scan {
             ));
         }
         if self.unexamined > 0 {
-            inventory.shed_repos = inventory.shed_repos.saturating_add(self.unexamined);
+            inventory.unchecked_folders =
+                inventory.unchecked_folders.saturating_add(self.unexamined);
             inventory.issues.push(format!(
-                "{} agent scratch folder(s) could not be checked and were kept; the run counts them as unexamined and tries again sooner",
+                "{} agent scratch folder(s) could not be checked and were kept (each reason is in the kept list); the run counts them as unexamined and tries again sooner",
                 self.unexamined
             ));
         }
@@ -390,6 +426,63 @@ pub(crate) struct Context<'a> {
     /// What the strict walk of one Cargo target may spend; see
     /// [`CARGO_TARGET_BUDGET`].
     pub target_budget: tree::Budget,
+    /// What this run has itself removed, per session folder. `None` for a scan
+    /// that removes nothing.
+    pub removals: Option<&'a SelfRemovals>,
+}
+
+/// What one run removed from one session folder: the instant just before its
+/// first removal there, and the directories whose entry it removed.
+#[derive(Clone)]
+struct SelfRemoval {
+    since: u64,
+    dirs: std::collections::HashSet<PathBuf>,
+}
+
+/// The run's own removals, so the recency guard does not mistake them for a
+/// session writing.
+///
+/// Removing a target changes its parent directory's modification time (the
+/// scratchpad, or the wrapper folder). The guard is judged again for every
+/// candidate at delete time, so without this the second target of one finished
+/// session would be refused as "too recent" for a whole retention period.
+/// `session_quiet` ignores the modification time of those parent directories
+/// only, only when it is at or after the recorded instant, and reads the
+/// entries inside them instead: a file a live session writes afterwards still
+/// keeps the folder. Never `tasks/`, never a file, never any other directory.
+#[derive(Default)]
+pub(crate) struct SelfRemovals {
+    by_session: std::sync::Mutex<std::collections::HashMap<PathBuf, SelfRemoval>>,
+}
+
+impl SelfRemovals {
+    /// Called just before the run unlinks the first entry of a target whose
+    /// parent directory is `parent`, inside `session_dir`. The instant is kept
+    /// from the first call per session folder.
+    fn note_removal(&self, session_dir: &Path, parent: &Path) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut by_session = self
+            .by_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = by_session
+            .entry(session_dir.to_path_buf())
+            .or_insert_with(|| SelfRemoval {
+                since: now,
+                dirs: std::collections::HashSet::new(),
+            });
+        entry.dirs.insert(parent.to_path_buf());
+    }
+
+    fn of(&self, session_dir: &Path) -> Option<SelfRemoval> {
+        self.by_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_dir)
+            .cloned()
+    }
 }
 
 /// What a judgement approves: the reviewed tree to remove and why it was
@@ -417,10 +510,10 @@ pub(super) fn cargo_evidence(dir: &Path) -> Result<(), Refusal> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => Ok(meta.is_file()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(Refusal::Unexamined(format!(
-                "{} could not be inspected: {e}",
-                path.display()
-            ))),
+            Err(e) => Err(read_failure(
+                format!("{} could not be inspected", path.display()),
+                &e,
+            )),
         }
     };
     let tag = dir.join("CACHEDIR.TAG");
@@ -433,10 +526,10 @@ pub(super) fn cargo_evidence(dir: &Path) -> Result<(), Refusal> {
         // Not text at all: an answer about the file, not a failure to read it.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => text.clear(),
         Err(e) => {
-            return Err(Refusal::Unexamined(format!(
-                "{} could not be read: {e}",
-                tag.display()
-            )));
+            return Err(read_failure(
+                format!("{} could not be read", tag.display()),
+                &e,
+            ));
         }
     }
     if !text.starts_with(CARGO_SIGNATURE) {
@@ -480,7 +573,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
             let entry = match item {
                 Ok(entry) => entry,
                 Err(e) => {
-                    scan.unreadable(&dir, scope, format!("an entry could not be read: {e}"));
+                    scan.unreadable_io(&dir, scope, "an entry could not be read", &e);
                     continue;
                 }
             };
@@ -490,7 +583,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
                 // Gone since the listing: nothing to look at.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    scan.unreadable(&path, scope, format!("it could not be inspected: {e}"));
+                    scan.unreadable_io(&path, scope, "it could not be inspected", &e);
                     continue;
                 }
             };
@@ -499,7 +592,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let evidence = cargo_evidence(&path);
-            if let Err(refusal @ Refusal::Unexamined(_)) = &evidence {
+            if let Err(refusal @ (Refusal::Unexamined(_) | Refusal::Denied(_))) = &evidence {
                 scan.refuse(&path, scope, refusal);
                 continue;
             }
@@ -542,7 +635,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
         let children = match std::fs::read_dir(&wrapper) {
             Ok(children) => children,
             Err(e) => {
-                scan.unreadable(&wrapper, scope, format!("it could not be listed: {e}"));
+                scan.unreadable_io(&wrapper, scope, "it could not be listed", &e);
                 continue;
             }
         };
@@ -550,7 +643,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
             let child = match item {
                 Ok(child) => child,
                 Err(e) => {
-                    scan.unreadable(&wrapper, scope, format!("an entry could not be read: {e}"));
+                    scan.unreadable_io(&wrapper, scope, "an entry could not be read", &e);
                     continue;
                 }
             };
@@ -561,13 +654,13 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    scan.unreadable(&path, scope, format!("it could not be inspected: {e}"));
+                    scan.unreadable_io(&path, scope, "it could not be inspected", &e);
                     continue;
                 }
             }
             match cargo_evidence(&path) {
                 Ok(()) => {}
-                Err(refusal @ Refusal::Unexamined(_)) => {
+                Err(refusal @ (Refusal::Unexamined(_) | Refusal::Denied(_))) => {
                     scan.refuse(&path, scope, &refusal);
                     continue;
                 }
@@ -608,7 +701,7 @@ fn judge(
     ctx: &Context<'_>,
 ) -> Result<Verdict, Refusal> {
     let root = crate::engine::process::canonicalize_plain(scope_root)
-        .map_err(|e| Refusal::Unexamined(format!("its scope root could not be resolved: {e}")))?;
+        .map_err(|e| read_failure("its scope root could not be resolved", &e))?;
     if !target.is_absolute()
         || target
             .components()
@@ -618,10 +711,11 @@ fn judge(
     }
     tree::no_symlinks_checked(target).map_err(|e| match e {
         tree::WalkError::CouldNotRead(why) => Refusal::Unexamined(why),
+        tree::WalkError::Denied(why) => Refusal::Denied(format!("GitPulse may not read it: {why}")),
         other => Refusal::Kept(other.message()),
     })?;
     let real = crate::engine::process::canonicalize_plain(target)
-        .map_err(|e| Refusal::Unexamined(format!("it could not be resolved: {e}")))?;
+        .map_err(|e| read_failure("it could not be resolved", &e))?;
     if real != target || !real.starts_with(&root) || real == root {
         return Err("it is not inside the folder this scope covers".into());
     }
@@ -700,6 +794,9 @@ fn judge(
                 ctx.target_budget.seconds
             )),
             tree::WalkError::CouldNotRead(why) => Refusal::Unexamined(why),
+            tree::WalkError::Denied(why) => {
+                Refusal::Denied(format!("GitPulse may not read it: {why}"))
+            }
             tree::WalkError::Cancelled => Refusal::Unexamined("the walk was cancelled".into()),
         },
     )?;
@@ -779,30 +876,45 @@ fn foreign_top_level(target: &Path, depth: usize) -> Result<Option<String>, Refu
     // here), `.fingerprint` and `deps` (the documented layout).
     // A directory that cannot be looked into is not a foreign one: the check
     // could not run, which is a different answer from "not Cargo's".
+    //
+    // The names must be what Cargo writes: `.fingerprint` and `deps` real
+    // directories, `.cargo-lock` a regular file, never a symlink and never a
+    // plain file standing in for a directory.
     let is_profile = |dir: &Path| -> Result<bool, Refusal> {
-        for name in [".cargo-lock", ".fingerprint", "deps"] {
+        for (name, directory) in [
+            (".cargo-lock", false),
+            (".fingerprint", true),
+            ("deps", true),
+        ] {
             match std::fs::symlink_metadata(dir.join(name)) {
-                Ok(_) => return Ok(true),
+                Ok(meta) if (directory && meta.is_dir()) || (!directory && meta.is_file()) => {
+                    return Ok(true);
+                }
+                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(Refusal::Unexamined(format!(
-                        "{} could not be read: {e}",
-                        dir.display()
-                    )));
+                    return Err(read_failure(
+                        format!("{} could not be read", dir.display()),
+                        &e,
+                    ));
                 }
             }
         }
         Ok(false)
     };
     let entries = std::fs::read_dir(target)
-        .map_err(|e| Refusal::Unexamined(format!("its top level could not be listed: {e}")))?;
+        .map_err(|e| read_failure("its top level could not be listed", &e))?;
     let mut names: Vec<(String, PathBuf, std::fs::Metadata)> = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| Refusal::Unexamined(format!("its top level could not be listed: {e}")))?;
+    for (seen, entry) in entries.enumerate() {
+        if seen >= TOP_LEVEL_LISTING_BOUND {
+            return Err(Refusal::Denied(format!(
+                "its top level holds more than {TOP_LEVEL_LISTING_BOUND} entries, so it was not checked"
+            )));
+        }
+        let entry = entry.map_err(|e| read_failure("its top level could not be listed", &e))?;
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| Refusal::Unexamined(format!("its top level could not be read: {e}")))?;
+            .map_err(|e| read_failure("its top level could not be read", &e))?;
         names.push((entry.file_name().to_string_lossy().into_owned(), path, meta));
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
@@ -829,7 +941,9 @@ fn foreign_top_level(target: &Path, depth: usize) -> Result<Option<String>, Refu
                         }
                         true
                     }
-                    Err(refusal @ Refusal::Unexamined(_)) => return Err(refusal),
+                    Err(refusal @ (Refusal::Unexamined(_) | Refusal::Denied(_))) => {
+                        return Err(refusal)
+                    }
                     Err(_) => {
                         // A target-triple directory: a profile directory and
                         // otherwise only what a profile's siblings may be.
@@ -857,6 +971,11 @@ fn foreign_top_level(target: &Path, depth: usize) -> Result<Option<String>, Refu
 /// is one).
 const MAX_NESTED_TARGETS: usize = 1;
 
+/// Entries read from the top level of a target (and of a triple directory in
+/// it). More than this is an answer about that folder, not a scan left
+/// unfinished.
+const TOP_LEVEL_LISTING_BOUND: usize = 5_000;
+
 /// What a directory that might be a target-triple directory turned out to be.
 enum TripleReading {
     /// It holds no profile directory.
@@ -875,17 +994,22 @@ fn triple_foreign(
     dir: &Path,
     is_profile: &dyn Fn(&Path) -> Result<bool, Refusal>,
 ) -> Result<TripleReading, Refusal> {
-    let listing = |e: std::io::Error| {
-        Refusal::Unexamined(format!("{} could not be listed: {e}", dir.display()))
-    };
+    let listing =
+        |e: std::io::Error| read_failure(format!("{} could not be listed", dir.display()), &e);
     let mut children = Vec::new();
-    for item in std::fs::read_dir(dir).map_err(listing)? {
+    for (seen, item) in std::fs::read_dir(dir).map_err(listing)?.enumerate() {
+        if seen >= TOP_LEVEL_LISTING_BOUND {
+            return Err(Refusal::Denied(format!(
+                "{} holds more than {TOP_LEVEL_LISTING_BOUND} entries, so it was not checked",
+                dir.display()
+            )));
+        }
         let child = item.map_err(listing)?;
         let meta = std::fs::symlink_metadata(child.path()).map_err(|e| {
-            Refusal::Unexamined(format!(
-                "{} could not be inspected: {e}",
-                child.path().display()
-            ))
+            read_failure(
+                format!("{} could not be inspected", child.path().display()),
+                &e,
+            )
         })?;
         children.push((
             child.file_name().to_string_lossy().into_owned(),
@@ -936,10 +1060,46 @@ fn accepted_file(name: &str) -> bool {
 /// has been quiet, in whole days, or why that could not be shown. A running
 /// session writes there continually, so this holds even for a Claude process
 /// the detector does not recognise or a session whose id changed after launch.
-/// A listing it cannot read in full, or one the bound cut, is unexamined; a
-/// modification time in the future keeps the folder.
+/// A listing GitPulse may not read, or one over the bound, is an answer about
+/// this folder (kept, said so); a listing that failed for a reason that may
+/// clear is unexamined. A modification time in the future keeps the folder.
 fn session_quiet(session_dir: &Path, ctx: &Context<'_>) -> Result<u64, Refusal> {
+    let own = ctx.removals.and_then(|removals| removals.of(session_dir));
     let mut newest: u64 = 0;
+    let mut note = |modified: std::io::Result<SystemTime>, what: &Path| -> Result<(), Refusal> {
+        let modified = modified.map_err(|e| {
+            read_failure(
+                format!("{} has no readable modification time", what.display()),
+                &e,
+            )
+        })?;
+        let seconds = modified
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                Refusal::Kept(format!(
+                    "{} is dated before 1970, so its age cannot be trusted",
+                    what.display()
+                ))
+            })?
+            .as_secs();
+        if seconds > ctx.now.saturating_add(60) {
+            return Err(Refusal::Kept(format!(
+                "{} is dated in the future, so the session cannot be shown quiet",
+                what.display()
+            )));
+        }
+        // The one kind of directory time this run's own removal changes: the
+        // parent of a target it removed. Its entries are read instead, so a
+        // file a live session writes afterwards still keeps the folder.
+        if own
+            .as_ref()
+            .is_some_and(|own| own.dirs.contains(what) && seconds >= own.since)
+        {
+            return Ok(());
+        }
+        newest = newest.max(seconds);
+        Ok(())
+    };
     for dir in [
         session_dir.to_path_buf(),
         session_dir.join("tasks"),
@@ -949,62 +1109,26 @@ fn session_quiet(session_dir: &Path, ctx: &Context<'_>) -> Result<u64, Refusal> 
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir != session_dir => continue,
             Err(e) => {
-                return Err(Refusal::Unexamined(format!(
-                    "{} could not be inspected: {e}",
-                    dir.display()
-                )));
+                return Err(read_failure(
+                    format!("{} could not be inspected", dir.display()),
+                    &e,
+                ));
             }
         };
-        let mut note =
-            |modified: std::io::Result<SystemTime>, what: &Path| -> Result<(), Refusal> {
-                let modified = modified.map_err(|e| {
-                    Refusal::Unexamined(format!(
-                        "{} has no readable modification time: {e}",
-                        what.display()
-                    ))
-                })?;
-                let seconds = modified
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| {
-                        Refusal::Kept(format!(
-                            "{} is dated before 1970, so its age cannot be trusted",
-                            what.display()
-                        ))
-                    })?
-                    .as_secs();
-                if seconds > ctx.now.saturating_add(60) {
-                    return Err(Refusal::Kept(format!(
-                        "{} is dated in the future, so the session cannot be shown quiet",
-                        what.display()
-                    )));
-                }
-                newest = newest.max(seconds);
-                Ok(())
-            };
         note(meta.modified(), &dir)?;
         if !meta.is_dir() {
             continue;
         }
-        let listing = std::fs::read_dir(&dir).map_err(|e| {
-            Refusal::Unexamined(format!("{} could not be listed: {e}", dir.display()))
-        })?;
-        for (seen, item) in listing.enumerate() {
-            if seen >= SESSION_LISTING_BOUND {
-                return Err(Refusal::Unexamined(format!(
-                    "{} holds more than {SESSION_LISTING_BOUND} entries, so its newest file was not read",
-                    dir.display()
-                )));
+        let mut wrappers = Vec::new();
+        list_newest(&dir, &mut note, &mut |path| {
+            if own.as_ref().is_some_and(|own| own.dirs.contains(path)) {
+                wrappers.push(path.to_path_buf());
             }
-            let entry = item.map_err(|e| {
-                Refusal::Unexamined(format!("{} could not be listed: {e}", dir.display()))
-            })?;
-            let meta = entry.metadata().map_err(|e| {
-                Refusal::Unexamined(format!(
-                    "{} could not be inspected: {e}",
-                    entry.path().display()
-                ))
-            })?;
-            note(meta.modified(), &entry.path())?;
+        })?;
+        // A wrapper this run removed a child of: its own time is the run's
+        // doing, so what is inside it is read instead.
+        for wrapper in wrappers {
+            list_newest(&wrapper, &mut note, &mut |_| {})?;
         }
     }
     let days = ctx.now.saturating_sub(newest) / 86_400;
@@ -1015,6 +1139,43 @@ fn session_quiet(session_dir: &Path, ctx: &Context<'_>) -> Result<u64, Refusal> 
         )));
     }
     Ok(days)
+}
+
+/// What [`session_quiet`] does with one modification time it reads.
+type NoteTime<'a> = dyn FnMut(std::io::Result<SystemTime>, &Path) -> Result<(), Refusal> + 'a;
+
+/// Reads each entry of `listed` (bounded) into `note`, and tells `directory`
+/// about every entry that is a directory. By the rule on [`read_failure`]: a
+/// listing GitPulse may not read, or one over the bound, is an answer about
+/// this folder; another failure is a could-not-look.
+fn list_newest(
+    listed: &Path,
+    note: &mut NoteTime<'_>,
+    directory: &mut dyn FnMut(&Path),
+) -> Result<(), Refusal> {
+    let listing = std::fs::read_dir(listed)
+        .map_err(|e| read_failure(format!("{} could not be listed", listed.display()), &e))?;
+    for (seen, item) in listing.enumerate() {
+        if seen >= SESSION_LISTING_BOUND {
+            return Err(Refusal::Denied(format!(
+                "{} holds more than {SESSION_LISTING_BOUND} entries, so its newest file was not read",
+                listed.display()
+            )));
+        }
+        let entry = item
+            .map_err(|e| read_failure(format!("{} could not be listed", listed.display()), &e))?;
+        let meta = entry.metadata().map_err(|e| {
+            read_failure(
+                format!("{} could not be inspected", entry.path().display()),
+                &e,
+            )
+        })?;
+        note(meta.modified(), &entry.path())?;
+        if meta.is_dir() {
+            directory(&entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// Entries read from one of a session folder's three listings.
@@ -1090,11 +1251,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
         let sessions = match std::fs::read_dir(&project_dir) {
             Ok(sessions) => sessions,
             Err(e) => {
-                scan.unreadable(
-                    &project_dir,
-                    SCOPE_SESSION,
-                    format!("it could not be listed: {e}"),
-                );
+                scan.unreadable_io(&project_dir, SCOPE_SESSION, "it could not be listed", &e);
                 continue;
             }
         };
@@ -1228,11 +1385,7 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
         let entries = match std::fs::read_dir(&claude) {
             Ok(entries) => entries,
             Err(e) => {
-                scan.unreadable(
-                    &claude,
-                    SCOPE_CLAUDE,
-                    format!("it could not be listed: {e}"),
-                );
+                scan.unreadable_io(&claude, SCOPE_CLAUDE, "it could not be listed", &e);
                 continue;
             }
         };
@@ -1252,7 +1405,7 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
         for target in targets {
             match cargo_evidence(&target) {
                 Ok(()) => {}
-                Err(refusal @ Refusal::Unexamined(_)) => {
+                Err(refusal @ (Refusal::Unexamined(_) | Refusal::Denied(_))) => {
                     scan.refuse(&target, SCOPE_CLAUDE, &refusal);
                     continue;
                 }
@@ -1451,9 +1604,11 @@ pub(super) fn remove_judged(
 ) -> Result<u64, Refusal> {
     let scope_root = Path::new(&candidate.repo_path);
     let target = Path::new(&candidate.path);
+    let mut session_of_target: Option<PathBuf> = None;
     let verdict = match candidate.scope.as_str() {
         SCOPE_SESSION => {
             let (id, session_dir, scratchpad) = session_of(scope_root, target)?;
+            session_of_target = Some(session_dir.clone());
             judge(
                 scope_root,
                 target,
@@ -1475,6 +1630,14 @@ pub(super) fn remove_judged(
     // first deletion. A build that starts after this is not prevented; removal
     // stops at the first entry that changed since the review.
     let _ = unused_now(ctx, &verdict.guarded)?;
+    // Taken just before the first unlink: the removal changes the target's
+    // parent directory's time, which the recency guard must not read as a
+    // session writing (see [`SelfRemovals`]).
+    if let (Some(removals), Some(session_dir), Some(parent)) =
+        (ctx.removals, &session_of_target, target.parent())
+    {
+        removals.note_removal(session_dir, parent);
+    }
     match tree::remove_reviewed_counted(target, &verdict.snapshot, ctx.cancel) {
         Ok(removed) => Ok(removed),
         // Nothing was unlinked: an ordinary refusal. Something was: the bytes

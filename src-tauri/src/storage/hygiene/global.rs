@@ -399,6 +399,13 @@ pub struct CleanerInventory {
     /// and not judged either. Internal to the run path like `incomplete_repos`.
     #[serde(skip)]
     pub shed_repos: u32,
+    /// Agent scratch folders a check could not be run for (a failure that may
+    /// clear: a process table that could not be read, a time budget, an I/O
+    /// error). Counted apart from `shed_repos`: it is not the host shedding
+    /// work under load, and each folder's reason is in the kept list. Internal
+    /// to the run path.
+    #[serde(skip)]
+    pub unchecked_folders: u32,
     /// Every enabled reclaim scope's pass ran over every discovered
     /// repository. A pass cut short by the inventory budget, a cancellation
     /// or a worktree listing that failed leaves it false, and such an
@@ -502,6 +509,12 @@ pub struct CleanerState {
     /// The saved reclaim scopes include at least one, and a person has
     /// previewed exactly this set since it last changed: runs use them.
     pub scopes_previewed: bool,
+    /// Why a scheduled run that is due is not starting: the governor's cause,
+    /// as the end of a sentence ("the kernel reports memory pressure"). In
+    /// memory only, never saved, and only while the schedule is enabled, due
+    /// and idle: it drops the moment the run starts or is no longer due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_wait: Option<String>,
 }
 
 #[cfg(test)]
@@ -515,6 +528,9 @@ pub struct Cleaner {
     active: AtomicBool,
     scanning: AtomicBool,
     current: Mutex<Option<(String, String)>>,
+    /// The reason the due scheduled run is waiting, set by the scheduler tick;
+    /// read (and filtered by "enabled, due, idle") by [`Cleaner::state`].
+    scheduled_wait: Mutex<Option<String>>,
     #[cfg(test)]
     activity_override: Option<ActivityCheck>,
     /// Replaces the repository-state check, so a test can make the host shed
@@ -581,6 +597,7 @@ impl Cleaner {
             active: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
             current: Mutex::new(None),
+            scheduled_wait: Mutex::new(None),
             #[cfg(test)]
             activity_override: None,
             #[cfg(test)]
@@ -787,14 +804,16 @@ impl Cleaner {
     /// the new next run time when it moved.
     fn bring_forward_for_disk(
         &self,
-        disk_only: bool,
+        remedy_due: bool,
         now: u64,
     ) -> Result<Option<u64>, CommandError> {
         self.expire_disk_forward(now)?;
-        // `disk_only` is `crate::sysload::shed_is_disk_only()`, which owns the
-        // definition. The same answer admits the cleaner's own read-only
-        // checks, so a run brought forward is a run that can look.
-        if !disk_only {
+        // `remedy_due` is `crate::sysload::disk_remedy_due()`, which owns the
+        // definition (the disk alone is the reason the host sheds, or free
+        // disk is below the Severe floor whatever else is pressed). The same
+        // answer admits the cleaner's own read-only checks, so a run brought
+        // forward is a run that can look.
+        if !remedy_due {
             return Ok(None);
         }
         self.update(|saved| {
@@ -962,6 +981,14 @@ impl Cleaner {
                 .config
                 .scopes
                 .agent_lapsed(saved.previewed_at, super::now());
+        let scheduled_wait = self
+            .scheduled_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|_| {
+                saved.config.enabled && !running && super::now() >= saved.config.next_run_at
+            });
         Ok(CleanerState {
             config: saved.config,
             history: saved.history,
@@ -971,7 +998,57 @@ impl Cleaner {
             background_error: saved.background_error,
             agent_rules: devmap_query::hygiene::AGENT_RULES.into(),
             scopes_previewed,
+            scheduled_wait,
         })
+    }
+    /// What one tick of the in-app scheduler does. `wait` is the governor's
+    /// reason to hold a due run back (`None`: start it) and `remedy_due` its
+    /// answer to "the disk remedy is due" (`disk_remedy_due`). Kept apart from the loop so a
+    /// test can drive it without a governor.
+    pub(super) fn clock_tick(self: &Arc<Self>, wait: Option<String>, remedy_due: bool, now: u64) {
+        let set = |reason: Option<String>| {
+            *self
+                .scheduled_wait
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
+        };
+        match self.state() {
+            Ok(state)
+                if state.config.enabled && !state.running && now < state.config.next_run_at =>
+            {
+                set(None);
+                WAITING_LOGGED.store(false, Ordering::Relaxed);
+                // Not due. A full disk makes it due: the host is shedding
+                // work because of it, and this run frees what the saved
+                // scopes allow.
+                match self.bring_forward_for_disk(remedy_due, now) {
+                    Ok(Some(_)) => log::info!("Cleaner schedule brought forward: the disk is the reason the host is shedding work"),
+                    Ok(None) => {}
+                    Err(e) => log::warn!("Cleaner could not be brought forward for the disk: {e}", e = e.message()),
+                }
+            }
+            Ok(state)
+                if state.config.enabled && !state.running && now >= state.config.next_run_at =>
+            {
+                if let Some(reason) = wait {
+                    // Stays due: the next tick asks again. The panel reads
+                    // the reason from the state; one log line when it starts
+                    // waiting, not one every 30 seconds.
+                    set(Some(reason));
+                    if !WAITING_LOGGED.swap(true, Ordering::Relaxed) {
+                        log::info!("Scheduled cleaner is waiting: the host is shedding background work for a reason other than the disk");
+                    }
+                } else {
+                    set(None);
+                    WAITING_LOGGED.store(false, Ordering::Relaxed);
+                    if let Err(e) = self.start(true, state.config.revision, now) {
+                        log::warn!("Scheduled cleaner could not start: {e}", e = e.message());
+                    }
+                }
+            }
+            Ok(_) => set(None),
+            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}", e = e.message()),
+        }
     }
     pub fn save(&self, config: CleanerConfig) -> Result<CleanerState, CommandError> {
         if config.enabled && config.run_when_closed && !super::background::supported() {
@@ -1138,9 +1215,15 @@ impl Cleaner {
                 Ok(())
             })?;
         } else if config.scopes.any() {
+            // "When the host is less busy" only when load was the reason.
+            let advice = if inventory.shed_repos > 0 {
+                "Inspect again when the host is less busy."
+            } else {
+                "What could not be read or checked is named in the issues and the kept list; inspect again once that is resolved."
+            };
             push_issue(
                 &mut inventory.issues,
-                "This inspection did not finish every enabled reclaim scope, so it does not count as their preview and no run uses them yet. Inspect again when the host is less busy.".into(),
+                format!("This inspection did not finish every enabled reclaim scope, so it does not count as their preview and no run uses them yet. {advice}"),
             );
         }
         // After the approval is settled and outside every scope: this only adds
@@ -1182,6 +1265,7 @@ impl Cleaner {
             long_lived: vec![],
             incomplete_repos: BTreeSet::new(),
             shed_repos: 0,
+            unchecked_folders: 0,
             // Repositories discovery never reached were not shown either.
             scopes_complete: !found.partial,
         };
@@ -1802,13 +1886,24 @@ impl Cleaner {
         // Refusing globally left 20 consecutive scheduled runs reclaiming 0
         // bytes: two repositories that were never trusted and a traversal
         // budget on six large ones held a 57-repository workspace hostage.
-        run.unexamined = inventory.shed_repos;
+        run.unexamined = inventory
+            .shed_repos
+            .saturating_add(inventory.unchecked_folders);
         if inventory.shed_repos > 0 {
             push_issue(
                 &mut run.issues,
                 format!(
                     "{} repositor(ies) could not be scanned: the host was shedding work under load, so nothing in them was judged",
                     inventory.shed_repos
+                ),
+            );
+        }
+        if inventory.unchecked_folders > 0 {
+            push_issue(
+                &mut run.issues,
+                format!(
+                    "{} agent scratch folder(s) could not be checked and were kept; each reason is in the preview's kept list",
+                    inventory.unchecked_folders
                 ),
             );
         }
@@ -1844,6 +1939,11 @@ impl Cleaner {
         }
         let started = Instant::now();
         let mut attempted = 0u64;
+        // What this run itself removes from a session folder: its parent's
+        // time changes with each removal and must not read as a session
+        // writing, or one folder per session would be freed per retention
+        // period.
+        let own_removals = super::agent::SelfRemovals::default();
         // `max_targets` limits removals attempted, not rows written. Counting
         // every refused row against it let 14 refused candidates and 6 dirty
         // repositories fill a 20-target run that then removed nothing, run
@@ -1974,6 +2074,7 @@ impl Cleaner {
                         cancel: &self.cancel,
                         deadline: Instant::now() + Duration::from_secs(60),
                         target_budget: super::agent::CARGO_TARGET_BUDGET,
+                        removals: Some(&own_removals),
                     };
                     let freed = match super::agent::remove_judged(&candidate, &ctx, remaining) {
                         Ok(freed) => freed,
@@ -2168,6 +2269,7 @@ impl AgentPass<'_> {
             cancel: &cleaner.cancel,
             deadline: started + (AGENT_SCAN_BUDGET - self.spent),
             target_budget: super::agent::CARGO_TARGET_BUDGET,
+            removals: None,
         };
         let out = f(&ctx);
         self.spent += started.elapsed();
@@ -2274,12 +2376,7 @@ fn status_in(root: &Path, under: Option<&str>) -> Result<Vec<u8>, CommandError> 
 fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandError> {
     let tasks = crate::tasks::view(repo);
     if !tasks.error.is_empty() {
-        // A check that could not run: recorded as unexamined, not as a rule
-        // that kept the folder.
-        return Err(CommandError::typed(
-            IpcErrorKind::DeferredUnderLoad,
-            format!("Task activity could not be checked: {}", tasks.error),
-        ));
+        return Err(format!("Task activity could not be checked: {}", tasks.error).into());
     }
     let applies = |lease: &crate::tasks::TaskLease| match branch {
         None => true,
@@ -2322,12 +2419,10 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
         Ok(pids) if pids.is_empty() => {}
         Ok(pids) => return Err(format!("{} process(es) use this worktree", pids.len()).into()),
         Err(e) => {
-            return Err(CommandError::typed(
-                IpcErrorKind::DeferredUnderLoad,
-                format!(
-                    "Whether a process works in this worktree could not be read, so it was left alone: {e}"
-                ),
-            ))
+            return Err(format!(
+            "Whether a process works in this worktree could not be read, so it was left alone: {e}"
+        )
+            .into())
         }
     }
     if !status_in(&root, None)?.is_empty() {
@@ -2339,12 +2434,7 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
     let main = listed_worktrees(worktree)?
         .into_iter()
         .find(|info| info.is_main)
-        .ok_or_else(|| {
-            CommandError::typed(
-                IpcErrorKind::DeferredUnderLoad,
-                "The main checkout of this worktree could not be found",
-            )
-        })?;
+        .ok_or("The main checkout of this worktree could not be found")?;
     leases_clear(&main.path, Some(branch))
 }
 
@@ -2408,13 +2498,29 @@ static WAITING_LOGGED: AtomicBool = AtomicBool::new(false);
 /// entries per target and holds a snapshot of them, and its git checks are shed
 /// under load, so starting it while the host is short of memory, swap, CPU or
 /// anything else only adds load and then deletes nothing. It waits while the
-/// host sheds background work for a reason other than the disk; with the disk
-/// the only reason it runs, because the run is what relieves it. Only the
+/// host sheds background work for a reason other than the disk; when the disk
+/// remedy is due (`disk_remedy_due`: the disk is the only reason, or free disk
+/// is below the Severe floor whatever else is pressed) it runs, because the run
+/// is what relieves it. Low disk at Elevated, or the fill projection alone,
+/// with memory pressed, still waits. Only the
 /// in-app scheduler asks: a person's own preview or run is never deferred, and
 /// the headless run has no governor in its process (`shed()` is then not
 /// shedding), so it never waits.
-pub(super) fn scheduled_run_waits() -> bool {
-    crate::sysload::shed().background && !crate::sysload::shed_is_disk_only()
+/// The reason a due run is held back, as the governor names it (the end of a
+/// sentence), or `None` when the run may start.
+pub(super) fn scheduled_wait_reason() -> Option<String> {
+    crate::engine::process::background_deferral_cause().map(str::to_string)
+}
+
+/// One tick of the in-app scheduler, with the governor's answers read here:
+/// the loop calls this and nothing else, so a test of it is a test of what the
+/// loop does.
+pub(super) fn scheduler_tick(cleaner: &Arc<Cleaner>, now: u64) {
+    cleaner.clock_tick(
+        scheduled_wait_reason(),
+        crate::sysload::disk_remedy_due(),
+        now,
+    );
 }
 
 pub fn start_scheduler() -> Result<(), CommandError> {
@@ -2425,38 +2531,7 @@ pub fn start_scheduler() -> Result<(), CommandError> {
     crate::supervisor::spawn_loop(
         "gitpulse-cleaner-clock",
         Duration::from_secs(30),
-        move || match cleaner.state() {
-            Ok(state) if state.config.enabled && !state.running && super::now() < state.config.next_run_at => {
-                // Not due. A full disk makes it due: the host is shedding
-                // work because of it, and this run frees what the saved
-                // scopes allow.
-                match cleaner.bring_forward_for_disk(crate::sysload::shed_is_disk_only(), super::now()) {
-                    Ok(Some(_)) => log::info!("Cleaner schedule brought forward: the disk is the reason the host is shedding work"),
-                    Ok(None) => {}
-                    Err(e) => log::warn!("Cleaner could not be brought forward for the disk: {e}", e = e.message()),
-                }
-            }
-            Ok(state)
-                if state.config.enabled
-                    && !state.running
-                    && super::now() >= state.config.next_run_at =>
-            {
-                if scheduled_run_waits() {
-                    // Stays due: the next tick asks again. One line when it
-                    // starts waiting, not one every 30 seconds.
-                    if !WAITING_LOGGED.swap(true, Ordering::Relaxed) {
-                        log::info!("Scheduled cleaner is waiting: the host is shedding background work for a reason other than the disk");
-                    }
-                } else {
-                    WAITING_LOGGED.store(false, Ordering::Relaxed);
-                    if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
-                        log::warn!("Scheduled cleaner could not start: {e}", e = e.message());
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}", e = e.message()),
-        },
+        move || scheduler_tick(&cleaner, super::now()),
     )
     .map_err(|e| {
         SCHEDULER_STARTED.store(false, Ordering::SeqCst);

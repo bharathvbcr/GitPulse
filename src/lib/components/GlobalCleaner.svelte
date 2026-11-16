@@ -6,7 +6,7 @@
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState, CloneBudget, ReclaimScopes } from "../storage/hygiene/globalTypes";
   import { anyScopeOn, cloneBudgetOf, scopeLabel, scopesOf } from "../storage/hygiene/reclaimConfig";
-  import { cleanupAllowed, coverageNotice, itemStatusLabel, runRowsSummary } from "../storage/hygiene/globalEligibility";
+  import { cleanupAllowed, coverageNotice, itemStatusLabel, runRowsSummary, scheduledWaitNotice } from "../storage/hygiene/globalEligibility";
   import { humanBytes } from "../storage/format";
   import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -44,6 +44,7 @@
   const scopes = $derived(draft ? scopesOf(draft) : null);
   const budget = $derived(draft ? cloneBudgetOf(draft) : null);
   /** The saved policy turns a scope on, but nobody has inspected it yet: no run uses it. */
+  const scheduleWait = $derived(cleaner ? scheduledWaitNotice(cleaner) : null);
   const scopesAwaitPreview = $derived(cleaner ? anyScopeOn(scopesOf(cleaner.config)) && !cleaner.scopes_previewed : false);
   /** A saved value outside the presets stays selectable instead of silently reading as the first option. */
   const withCurrent = (choices: number[], current: number) => (choices.includes(current) ? choices : [...choices, current].sort((a, b) => a - b));
@@ -156,6 +157,7 @@
     {#if scopes && budget}
     <div class="gp-card p-3 space-y-2" aria-label="Reclaim more">
       <strong>Reclaim more (off by default)</strong>
+      {#if scheduleWait}<p role="status" class="gp-notice" data-tone="warn" data-testid="scheduled-wait">{scheduleWait}</p>{/if}
       {#if scopesAwaitPreview}<p role="status" class="gp-notice" data-tone="warn">No run, scheduled or manual, uses these scopes until you inspect saved roots with this exact set. Saving a change to them clears that.</p>{/if}
       <label class="flex items-center gap-2"><Checkbox ariaLabel="Reclaim build caches in idle linked worktrees" checked={scopes.worktree_caches} onchange={(next) => setScope("worktree_caches", next)} />Reclaim build caches in idle linked worktrees</label>
       <p class="text-textMuted">Deletes regenerable build caches (<span class="font-mono">target</span>, <span class="font-mono">.turbo</span>) inside linked worktrees that no process is using, whose tree is clean and whose cache has been untouched for the idle period below. The worktree and its source stay.</p>
@@ -216,7 +218,7 @@
     {/if}
     {#if cleaner.history.length}
       <details open><summary class="font-semibold cursor-pointer">Recent cleanup runs ({cleaner.history.length})</summary>
-        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {runRowsSummary(run)}</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {itemStatusLabel(item.status)}</p><p>{item.message}</p><p class="text-textMuted">Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}</p></div>{/each}</div>{/each}</div>
+        <div class="max-h-72 overflow-y-auto space-y-3 mt-2">{#each cleaner.history as run (run.id)}<div class="gp-card p-3 space-y-1"><strong>{run.status.replaceAll("_", " ")} · {run.trigger}</strong><p class="text-textMuted">{new Date(run.started_at*1000).toLocaleString()} · {run.repositories} repositories · {runRowsSummary(run)}</p>{#each run.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}{#each run.items as item}<div class="pt-2"><p class="font-mono break-all">{item.repo_path}/{item.path} · {itemStatusLabel(item.status)}</p><p>{item.message}</p><p class="text-textMuted" data-testid="item-sizes">{#if item.status === "partially_removed"}Was {humanBytes(item.bytes_before)} · the rest was left in place; its size was not measured{:else}Before {humanBytes(item.bytes_before)} · After {item.bytes_after === null ? "unavailable" : humanBytes(item.bytes_after)}{/if}</p></div>{/each}</div>{/each}</div>
       </details>
     {/if}
     <details><summary class="cursor-pointer">DevCouncil agent hygiene rules</summary><p class="mt-2 whitespace-pre-wrap text-textMuted">{cleaner.agent_rules}</p></details>

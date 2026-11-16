@@ -121,6 +121,7 @@ fn run<T>(
         cancel: &cancel,
         deadline: Instant::now() + Duration::from_secs(60),
         target_budget: CARGO_TARGET_BUDGET,
+        removals: None,
     })
 }
 
@@ -849,7 +850,11 @@ fn a_git_question_that_could_not_run_is_unexamined_not_an_answer() {
     assert!(!scan.complete);
     let mut inventory = empty_inventory();
     scan.absorb_into(&mut inventory);
-    assert_eq!(inventory.shed_repos, 1, "the run counts it as unexamined");
+    assert_eq!(
+        (inventory.shed_repos, inventory.unchecked_folders),
+        (0, 1),
+        "the run counts it as a folder that could not be checked, not as load"
+    );
     assert!(!inventory.scopes_complete);
     assert!(inventory
         .issues
@@ -898,9 +903,10 @@ fn the_cleaners_git_checks_are_answered_under_a_full_disk_only_with_relief() {
             super::super::global::listed_worktrees(repo.to_str().unwrap()).is_ok(),
         )
     };
-    // The injected governor has no history, so the real accessor answers
-    // false: the host is shed, the cleaner's helpers get no relief.
-    let (ignored, tracked, listed) = asks();
+    // Free space this low reads Severe, which the real accessor treats as
+    // the remedy being due, so the shed leg forces the answer to false: the
+    // host is shed and the cleaner's helpers get no relief.
+    let (ignored, tracked, listed) = crate::engine::process::with_disk_only_answer(false, asks);
     assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
     assert!(matches!(tracked, GitAnswer::Unknown(_)), "{tracked:?}");
     assert!(!listed, "shed when the governor does not say disk-only");
@@ -953,9 +959,21 @@ fn the_cleaners_git_checks_are_answered_under_a_full_disk_only_with_relief() {
     ));
     assert!(!crate::sysload::shed_is_disk_only());
     let (ignored, _, listed) = asks();
+    assert_eq!(
+        ignored,
+        GitAnswer::Yes,
+        "memory Severe beside a disk under the Severe floor: the remedy is due, admitted"
+    );
+    assert!(listed);
+    drop(_memory);
+    // Low disk only Elevated (24 GiB) with memory Severe: not due, shed.
+    let mut elevated = disk_input(Level::Critical);
+    elevated.readings.free_disk = Reading::Value(24 << 30);
+    let _elevated = crate::sysload::inject_governor_with_history(std::iter::repeat_n(elevated, 10));
+    let (ignored, _, listed) = asks();
     assert!(
         matches!(ignored, GitAnswer::Unknown(_)),
-        "memory Severe beside the disk: the helpers are shed ({ignored:?})"
+        "memory Severe beside an Elevated disk: the helpers are shed ({ignored:?})"
     );
     assert!(!listed);
 }
@@ -972,6 +990,7 @@ fn empty_inventory() -> super::super::global::CleanerInventory {
         long_lived: vec![],
         incomplete_repos: BTreeSet::new(),
         shed_repos: 0,
+        unchecked_folders: 0,
         scopes_complete: true,
     }
 }
@@ -1031,6 +1050,7 @@ fn a_scan_past_its_deadline_is_incomplete_and_says_so() {
         cancel: &cancel,
         deadline: Instant::now(),
         target_budget: CARGO_TARGET_BUDGET,
+        removals: None,
     };
     let scan = scan_sessions(&root, UID, &ctx, false);
     assert!(scan.candidates.is_empty());
@@ -1079,6 +1099,7 @@ fn a_target_too_large_to_verify_says_so() {
             entries: 10,
             seconds: 30,
         },
+        removals: None,
     };
     let scan = scan_sessions(&root, UID, &ctx, false);
     assert!(scan.candidates.is_empty());
@@ -1455,6 +1476,122 @@ fn marked_targets(parent: &Path, count: usize) {
     }
 }
 
+/// The rule for a failed read, once: permission denied on a folder is an answer
+/// about it (kept, listed, the scan stays complete, so the scopes stay
+/// approvable); any other failure may clear and is a could-not-look (the scan
+/// incomplete).
+#[cfg(unix)]
+#[test]
+fn a_folder_gitpulse_may_not_read_is_kept_and_the_scan_stays_complete() {
+    let (_temp, root) = temp_root();
+    let sealed = root.join("a/b/c");
+    fs::create_dir_all(&sealed).unwrap();
+    let _mode = Mode::set(&sealed, 0o000);
+    let scan = run(&nobody(), &idle, |ctx| {
+        let mut scan = Scan {
+            complete: true,
+            ..Scan::default()
+        };
+        let found = find_targets(&root, &mut scan, SCOPE_REPOSITORY, ctx);
+        assert!(found.is_empty());
+        scan
+    });
+    assert!(scan.complete, "{:?}", scan.issues);
+    assert_eq!(scan.unexamined, 0, "{:?}", scan.kept);
+    let item = scan
+        .kept
+        .iter()
+        .find(|k| k.path.ends_with("a/b/c"))
+        .unwrap_or_else(|| panic!("listed as kept: {:?}", scan.kept));
+    assert!(item.reason.contains("may not read"), "{item:?}");
+    assert!(!item.reason.starts_with(COULD_NOT_CHECK), "{item:?}");
+}
+
+#[test]
+fn only_a_failure_that_may_clear_makes_the_scan_incomplete() {
+    let (_temp, root) = temp_root();
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let busy = std::io::Error::from(std::io::ErrorKind::Other);
+    assert!(matches!(read_failure("x", &denied), Refusal::Denied(_)));
+    assert!(matches!(read_failure("x", &busy), Refusal::Unexamined(_)));
+    let mut scan = Scan {
+        complete: true,
+        ..Scan::default()
+    };
+    scan.unreadable_io(&root, SCOPE_REPOSITORY, "it could not be listed", &denied);
+    assert!(scan.complete && scan.unexamined == 0);
+    scan.unreadable_io(&root, SCOPE_REPOSITORY, "it could not be listed", &busy);
+    assert!(!scan.complete && scan.unexamined == 1, "{:?}", scan.kept);
+}
+
+/// A folder over its listing bound is an answer about that folder, not an
+/// unfinished scan.
+#[cfg(unix)]
+#[test]
+fn a_target_top_level_over_its_bound_is_kept_not_unexamined() {
+    let (_temp, root) = temp_root();
+    let target = root.join("target-x");
+    cargo_target(&target, 30);
+    for n in 0..=TOP_LEVEL_LISTING_BOUND {
+        fs::write(target.join(format!("f{n}")), "").unwrap();
+    }
+    let refusal = foreign_top_level(&target, 0).unwrap_err();
+    assert!(
+        matches!(&refusal, Refusal::Denied(why) if why.contains("more than")),
+        "{refusal:?}"
+    );
+}
+
+/// A directory counts as a profile only by what Cargo writes: `deps` and
+/// `.fingerprint` real directories, `.cargo-lock` a regular file, never a
+/// symlink or a plain file standing in.
+#[cfg(unix)]
+#[test]
+fn a_profile_needs_real_directories_and_a_real_lock_file() {
+    let (_temp, root) = temp_root();
+    let target = root.join("target-x");
+    cargo_target(&target, 30);
+    let layout = |name: &str, build: &dyn Fn(&Path)| {
+        let dir = target.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        build(&dir);
+        foreign_top_level(&target, 0).unwrap()
+    };
+    // Plain files named like the directories do not make a profile.
+    assert_eq!(
+        layout("fake1", &|d| {
+            fs::write(d.join("deps"), "").unwrap();
+            fs::write(d.join(".fingerprint"), "").unwrap();
+        })
+        .as_deref(),
+        Some("fake1")
+    );
+    // Symlinks named like them do not either.
+    assert_eq!(
+        layout("fake2", &|d| {
+            std::os::unix::fs::symlink("/", d.join("deps")).unwrap();
+            std::os::unix::fs::symlink("/etc/hosts", d.join(".cargo-lock")).unwrap();
+        })
+        .as_deref(),
+        Some("fake1"),
+        "the first foreign name in order is reported; fake2 is foreign too"
+    );
+    fs::remove_dir_all(target.join("fake1")).unwrap();
+    assert_eq!(
+        foreign_top_level(&target, 0).unwrap().as_deref(),
+        Some("fake2")
+    );
+    fs::remove_dir_all(target.join("fake2")).unwrap();
+    // The real thing is accepted.
+    assert_eq!(
+        layout("release", &|d| {
+            fs::create_dir_all(d.join("deps")).unwrap();
+            fs::write(d.join(".cargo-lock"), "").unwrap();
+        }),
+        None
+    );
+}
+
 /// A scan root that cannot be listed at all is unexamined, not an empty root:
 /// nothing in it was looked at.
 #[cfg(unix)]
@@ -1489,14 +1626,14 @@ fn a_wrapper_that_cannot_be_listed_or_holds_too_many_is_said_so_and_a_symlink_is
         scan_sessions(&root, UID, ctx, false)
     });
     assert!(scan.candidates.is_empty());
-    assert_eq!(scan.unexamined, 1, "{:?}", scan.kept);
-    assert!(!scan.complete);
+    assert_eq!(scan.unexamined, 0, "{:?}", scan.kept);
+    assert!(scan.complete, "a lasting refusal leaves the scan complete");
     assert!(
-        scan.issues
+        scan.kept
             .iter()
-            .any(|i| i.contains("target-sealed") && i.contains("could not be examined")),
+            .any(|k| k.path.contains("target-sealed") && k.reason.contains("may not read it")),
         "{:?}",
-        scan.issues
+        scan.kept
     );
     drop(_mode);
     fs::remove_dir(&sealed).unwrap();
@@ -1596,6 +1733,7 @@ fn a_session_folder_whose_age_cannot_be_read_or_trusted_is_not_quiet() {
         cancel: &cancel,
         deadline: Instant::now() + Duration::from_secs(60),
         target_budget: CARGO_TARGET_BUDGET,
+        removals: None,
     };
     assert!(session_quiet(&session, &ctx).unwrap() >= 29);
     // Unreadable: a tasks folder that cannot be listed.
@@ -1604,7 +1742,7 @@ fn a_session_folder_whose_age_cannot_be_read_or_trusted_is_not_quiet() {
     {
         let _mode = Mode::set(&tasks, 0o000);
         let refusal = session_quiet(&session, &ctx).unwrap_err();
-        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     }
     // Cut by the bound: more entries than the listing reads.
     for n in 0..=SESSION_LISTING_BOUND {
@@ -1613,7 +1751,7 @@ fn a_session_folder_whose_age_cannot_be_read_or_trusted_is_not_quiet() {
     quiet_sessions(&root, 30);
     let refusal = session_quiet(&session, &ctx).unwrap_err();
     assert!(
-        matches!(&refusal, Refusal::Unexamined(why) if why.contains("more than")),
+        matches!(&refusal, Refusal::Denied(why) if why.contains("more than")),
         "{refusal:?}"
     );
     fs::remove_dir_all(&tasks).unwrap();
@@ -1717,13 +1855,13 @@ fn the_layout_rule_names_what_it_could_not_read() {
         let _mode = Mode::set(&target.join("triple/odd"), 0o000);
         // Inspecting `odd` itself (is_profile) fails: it is x-less.
         let refusal = foreign_top_level(&target, 0).unwrap_err();
-        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     }
     // A top level that cannot be listed.
     {
         let _mode = Mode::set(&target, 0o000);
         let refusal = foreign_top_level(&target, 0).unwrap_err();
-        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     }
     // A nested target that cannot be read.
     let nested = target.join("llvm-cov-target");
@@ -1731,27 +1869,127 @@ fn the_layout_rule_names_what_it_could_not_read() {
     {
         let _mode = Mode::set(&nested, 0o000);
         let refusal = foreign_top_level(&target, 0).unwrap_err();
-        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     }
     // A nested target whose folder reads but whose marker file does not: the
     // folder was not judged, so it is neither accepted nor called foreign.
     {
         let _mode = Mode::set(&nested.join("CACHEDIR.TAG"), 0o000);
         let refusal = foreign_top_level(&target, 0).unwrap_err();
-        assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     }
 }
 
-/// An unreadable marker is no evidence either way.
+/// The recency guard ignores the time change of exactly the directories this
+/// run removed an entry from, and nothing else: a file a live session writes
+/// afterwards (in `scratchpad/`, in `tasks/` or inside a wrapper) still keeps
+/// the folder, and a modification time that predates the first removal is not
+/// excused.
+#[test]
+fn the_runs_own_removal_is_ignored_only_where_it_happened() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let session = pad.parent().unwrap().to_path_buf();
+    let wrapper = pad.join("target-wrap");
+    fs::create_dir_all(&wrapper).unwrap();
+    fs::create_dir_all(session.join("tasks")).unwrap();
+    quiet_sessions(&root, 30);
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let removals = SelfRemovals::default();
+    fn with_removals<'a>(
+        live: &'a LiveSessions,
+        cancel: &'a AtomicBool,
+        removals: Option<&'a SelfRemovals>,
+    ) -> Context<'a> {
+        Context {
+            now: now(),
+            retention_days: 7,
+            live,
+            use_of: &idle,
+            cancel,
+            deadline: Instant::now() + Duration::from_secs(60),
+            target_budget: CARGO_TARGET_BUDGET,
+            removals,
+        }
+    }
+    macro_rules! ctx {
+        ($removals:expr) => {
+            with_removals(&live, &cancel, $removals)
+        };
+    }
+    // What an unlink does to the parent: its modification time moves.
+    let unlink_in = |parent: &Path| {
+        let name = parent.join(".gone");
+        fs::write(&name, "").unwrap();
+        fs::remove_file(&name).unwrap();
+    };
+    let kept = |why: Result<u64, Refusal>| matches!(why, Err(Refusal::Kept(_)));
+
+    // Before: a quiet session, 29+ days.
+    assert!(session_quiet(&session, &ctx!(Some(&removals))).unwrap() >= 29);
+
+    // The run removed a target from `scratchpad/`.
+    removals.note_removal(&session, &pad);
+    unlink_in(&pad);
+    assert!(
+        kept(session_quiet(&session, &ctx!(None))),
+        "without the record the parent's new time keeps the folder"
+    );
+    assert!(
+        session_quiet(&session, &ctx!(Some(&removals))).is_ok(),
+        "with it, the run's own unlink is not a session writing"
+    );
+
+    // A file a live session writes into `scratchpad/` afterwards keeps it.
+    let written = pad.join("notes.txt");
+    fs::write(&written, "x").unwrap();
+    assert!(kept(session_quiet(&session, &ctx!(Some(&removals)))));
+    fs::remove_file(&written).unwrap();
+    assert!(session_quiet(&session, &ctx!(Some(&removals))).is_ok());
+
+    // So does one in `tasks/`, which is never excused.
+    let task = session.join("tasks/t.json");
+    fs::write(&task, "x").unwrap();
+    assert!(kept(session_quiet(&session, &ctx!(Some(&removals)))));
+    fs::remove_file(&task).unwrap();
+    unlink_in(&session.join("tasks"));
+    assert!(
+        kept(session_quiet(&session, &ctx!(Some(&removals)))),
+        "a time change in tasks/ is never the run's doing"
+    );
+    quiet_sessions(&root, 30);
+    // Same under a wrapper: removed a child of it, then a session writes in it.
+    removals.note_removal(&session, &wrapper);
+    unlink_in(&wrapper);
+    assert!(session_quiet(&session, &ctx!(Some(&removals))).is_ok());
+    let inside = wrapper.join("late.log");
+    fs::write(&inside, "x").unwrap();
+    assert!(
+        kept(session_quiet(&session, &ctx!(Some(&removals)))),
+        "a file written inside the wrapper after the removal is seen"
+    );
+    fs::remove_file(&inside).unwrap();
+    quiet_sessions(&root, 30);
+    // Another session folder is not covered by this one's record.
+    let other = scratchpad(&root, "session-0002-bbbbbbbb");
+    let other_session = other.parent().unwrap().to_path_buf();
+    quiet_sessions(&root, 30);
+    unlink_in(&other);
+    assert!(kept(session_quiet(&other_session, &ctx!(Some(&removals)))));
+}
+
+/// A marker GitPulse may not read is no evidence either way: the folder is
+/// kept with that reason (a lasting property, so the scan stays complete).
 #[cfg(unix)]
 #[test]
-fn an_unreadable_marker_is_unexamined_not_no_markers() {
+fn an_unreadable_marker_is_kept_not_no_markers() {
     let (_temp, root) = temp_root();
     let target = root.join("target-x");
     cargo_target(&target, 30);
     let _mode = Mode::set(&target.join("CACHEDIR.TAG"), 0o000);
     let refusal = cargo_evidence(&target).unwrap_err();
-    assert!(matches!(refusal, Refusal::Unexamined(_)), "{refusal:?}");
+    assert!(matches!(refusal, Refusal::Denied(_)), "{refusal:?}");
     drop(_mode);
     fs::remove_file(target.join("CACHEDIR.TAG")).unwrap();
     assert!(
@@ -1760,12 +1998,24 @@ fn an_unreadable_marker_is_unexamined_not_no_markers() {
     );
 }
 
-/// A folder this scan cannot look at (an error other than "not found") is
-/// unexamined with an issue line and an incomplete scan, in every scope; absent
-/// is just absent.
+/// A scan that was refused permission to read something and nothing else: no
+/// folder counted as unexamined, the scan complete, and a kept row for it.
+fn denied_and_complete(scan: &Scan) -> bool {
+    scan.unexamined == 0
+        && scan.complete
+        && scan
+            .kept
+            .iter()
+            .any(|k| k.reason.contains("may not read it"))
+}
+
+/// A folder this scan may not read (permission denied, a lasting property) is
+/// kept with that reason and leaves the scan complete, in every scope; absent
+/// is just absent. The transient failures that stay unexamined are covered by
+/// `only_a_failure_that_may_clear_makes_the_scan_incomplete`.
 #[cfg(unix)]
 #[test]
-fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
+fn a_folder_that_cannot_be_inspected_is_kept_in_every_scan() {
     // Sessions: the scope root listable, a project folder not inspectable.
     let (_temp, root) = temp_root();
     let pad = scratchpad(&root, OLD);
@@ -1774,14 +2024,7 @@ fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
     let scan = run(&nobody(), &idle, |ctx| {
         super::scan_sessions(&root, UID, ctx, false)
     });
-    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
-    assert!(
-        scan.issues
-            .iter()
-            .any(|i| i.contains("could not be examined")),
-        "{:?}",
-        scan.issues
-    );
+    assert!(denied_and_complete(&scan), "{:?}", scan.kept);
     drop(_scope);
     let _ = pad;
     // Repository scratch.
@@ -1790,7 +2033,7 @@ fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
     fs::create_dir_all(&repo).unwrap();
     let _repo = Mode::set(&repo, 0o444);
     let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
-    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    assert!(denied_and_complete(&scan), "{:?}", scan.kept);
     drop(_repo);
     // `.claude` targets.
     let (_temp3, root3) = temp_root();
@@ -1800,7 +2043,7 @@ fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
     let scan = run(&nobody(), &idle, |ctx| {
         scan_claude_targets(std::slice::from_ref(&checkout), ctx, false)
     });
-    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    assert!(denied_and_complete(&scan), "{:?}", scan.kept);
     drop(_checkout);
     // Absent is absent: no scratch, no `.claude`, nothing unexamined.
     let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
@@ -1813,7 +2056,7 @@ fn a_folder_that_cannot_be_inspected_is_unexamined_in_every_scan() {
     let scan = run(&nobody(), &idle, |ctx| {
         super::scan_sessions(&root4, UID, ctx, false)
     });
-    assert!(scan.unexamined >= 1 && !scan.complete, "{:?}", scan.kept);
+    assert!(denied_and_complete(&scan), "{:?}", scan.kept);
 }
 
 /// The judgement's own could-not-look cases: a path component that cannot be
@@ -1838,6 +2081,7 @@ fn a_judgement_that_could_not_look_or_ran_out_of_time_is_unexamined() {
         cancel: &cancel,
         deadline: Instant::now() + Duration::from_secs(60),
         target_budget: budget,
+        removals: None,
     };
     let session = pad.parent().unwrap().to_path_buf();
     let id = OLD;
@@ -1876,8 +2120,8 @@ fn a_judgement_that_could_not_look_or_ran_out_of_time_is_unexamined() {
     let _pad = Mode::set(&pad, 0o444);
     let unreadable = judged(&context(CARGO_TARGET_BUDGET)).unwrap();
     assert!(
-        matches!(unreadable, Refusal::Unexamined(_)),
-        "{unreadable:?}"
+        matches!(unreadable, Refusal::Denied(_)),
+        "a folder GitPulse may not read is a kept answer: {unreadable:?}"
     );
 }
 
@@ -1915,6 +2159,7 @@ fn a_removal_stopped_part_way_reports_the_bytes_it_removed() {
         cancel: &cancel,
         deadline: Instant::now() + Duration::from_secs(60),
         target_budget: CARGO_TARGET_BUDGET,
+        removals: None,
     };
     let failure = remove_judged(&candidate, &ctx, u64::MAX).unwrap_err();
     let Refusal::PartlyRemoved { why, bytes } = &failure else {

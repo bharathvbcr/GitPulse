@@ -243,6 +243,67 @@ fn a_disabled_or_future_schedule_cannot_start_or_mutate_history() {
         .is_err());
     assert!(!cleaner.active.load(std::sync::atomic::Ordering::SeqCst));
 }
+/// A due scheduled run held back for the host says so in the status the panel
+/// reads: the reason while it waits, nothing once the run starts, the schedule
+/// is no longer due, or it is disabled. In memory only.
+#[cfg(unix)]
+#[test]
+fn a_waiting_scheduled_run_says_why_and_stops_saying_it_when_it_stops_waiting() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, root) = fixture();
+    let now = crate::storage::hygiene::now();
+    let mut c = config(&cleaner, &root);
+    c.enabled = true;
+    c.next_run_at = now;
+    cleaner.save(c).unwrap();
+    let reason = "the kernel reports memory pressure";
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    let waiting = cleaner.state().unwrap();
+    assert_eq!(waiting.scheduled_wait.as_deref(), Some(reason));
+    assert!(waiting.history.is_empty(), "nothing started");
+    // Not persisted: a second handle on the same directory does not see it.
+    assert_eq!(
+        Cleaner::new(cleaner.dir.clone())
+            .state()
+            .unwrap()
+            .scheduled_wait,
+        None
+    );
+
+    // No longer due (the person moved the schedule): it is not "due and waiting".
+    let mut later = cleaner.state().unwrap().config;
+    later.next_run_at = now + 3600;
+    cleaner.save(later).unwrap();
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    // Due again and waiting, then disabled.
+    let mut due = cleaner.state().unwrap().config;
+    due.next_run_at = now;
+    cleaner.save(due).unwrap();
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert!(cleaner.state().unwrap().scheduled_wait.is_some());
+    let mut off = cleaner.state().unwrap().config;
+    off.enabled = false;
+    cleaner.save(off).unwrap();
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    // Due and waiting, then the host clears: the run starts and the reason goes.
+    let mut on = cleaner.state().unwrap().config;
+    on.enabled = true;
+    on.next_run_at = now;
+    cleaner.save(on).unwrap();
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert!(cleaner.state().unwrap().scheduled_wait.is_some());
+    cleaner.clock_tick(None, false, now);
+    let started = wait(&cleaner);
+    assert_eq!(started.scheduled_wait, None);
+    assert_eq!(started.history.len(), 1, "the run started: {started:?}");
+}
+
 #[cfg(not(unix))]
 #[test]
 fn enabled_schedules_are_refused_on_this_platform() {
@@ -2496,10 +2557,12 @@ fn a_process_naming_a_worktree_refuses_the_worktree_veto() {
     );
 }
 
-/// A task store that cannot be read is a lease check that could not run: the
-/// refusal is the typed "never judged" kind, not a rule that kept the folder.
+/// A task store that cannot be read refuses the worktree-cache scope with a
+/// plain error (row "skipped"), as it always has: a corrupt store does not
+/// clear on its own, so it must not look like the host shedding work (backoff
+/// sleeps, a bring-forward, the retry counter).
 #[test]
-fn an_unreadable_task_store_is_an_unexamined_lease_check() {
+fn an_unreadable_task_store_is_a_plain_refusal_not_a_deferral() {
     let (_temp, _cleaner, code) = fixture();
     let worktree = repo(&code, "lane");
     // Ignored, so the worktree reads clean and the lease check is reached.
@@ -2512,14 +2575,14 @@ fn an_unreadable_task_store_is_an_unexamined_lease_check() {
     .unwrap();
     let path = worktree.to_str().unwrap();
     let leases = super::leases_clear(path, None).expect_err("the store cannot be read");
-    assert!(super::shed_under_load(&leases), "{}", leases.message());
+    assert!(!super::shed_under_load(&leases), "{}", leases.message());
     assert!(
         leases.message().contains("could not be checked"),
         "{}",
         leases.message()
     );
     let quiet = super::quiet_worktree(path, None).expect_err("the store cannot be read");
-    assert!(super::shed_under_load(&quiet), "{}", quiet.message());
+    assert!(!super::shed_under_load(&quiet), "{}", quiet.message());
 }
 
 /// A full or filling disk makes an enabled schedule due, once per gap. Any
@@ -2540,12 +2603,13 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
         .unwrap();
     let now = super::current_time();
     let next = |c: &Cleaner| c.state().unwrap().config.next_run_at;
-    // The argument is `shed_is_disk_only()`: false for any other cause, for a
-    // disk shed with something else not clear, and with no governor.
+    // The argument is `disk_remedy_due()`: false for any other cause, for a
+    // disk shed Elevated or by projection with something else pressed, and
+    // with no governor.
     assert_eq!(cleaner.bring_forward_for_disk(false, now).unwrap(), None);
-    assert_eq!(next(&cleaner), later, "not disk-only");
+    assert_eq!(next(&cleaner), later, "remedy not due");
     assert!(
-        !crate::sysload::shed_is_disk_only(),
+        !crate::sysload::disk_remedy_due(),
         "this process has no governor, so the scheduler's own call is false"
     );
     let before = cleaner.state().unwrap().config.revision;
@@ -2945,7 +3009,8 @@ fn probe_the_real_machine_with_production_wiring() {
         Some(Path::new(&real_home)),
     );
     eprintln!("PROBE config dirs: {:?} error={:?}", dirs.dirs, dirs.error);
-    std::env::set_var(
+    let serial = crate::test_support::env::env_serial();
+    let _env = crate::test_support::env::bind_env(&serial).set(
         "GITPULSE_CLAUDE_CONFIG_DIRS",
         std::env::join_paths(&dirs.dirs).unwrap(),
     );
@@ -3570,6 +3635,193 @@ fn two_session_cleaner(cap: u64) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::p
     (temp, cleaner, targets)
 }
 
+/// One finished session whose scratchpad holds the given marked targets (paths
+/// relative to the scratchpad; `wrap/t0` is a child of a wrapper folder), a
+/// cleaner with the agent scope on and previewed, and the scripted process
+/// table. Returns the targets in the order given.
+fn one_session_cleaner(
+    layout: &[&str],
+) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    one_session_cleaner_with(layout, |_| {})
+}
+
+/// [`one_session_cleaner`], with `shape` run on each target after it is built
+/// and before the scratchpad is aged and previewed.
+fn one_session_cleaner_with(
+    layout: &[&str],
+    shape: impl Fn(&std::path::Path),
+) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    use std::sync::atomic::Ordering;
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let temp_root = base.join("faketmp");
+    let uid = super::super::agent::current_uid();
+    let pad = temp_root.join(format!(
+        "claude-{uid}/proj/session-0001-aaaaaaaa/scratchpad"
+    ));
+    let mut targets = Vec::new();
+    for relative in layout {
+        let target = pad.join(relative);
+        old_cargo_target(&target);
+        shape(&target);
+        targets.push(target);
+    }
+    quiet_session_folder(&pad);
+    let mut service = Cleaner::new(base.join("one-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: scripted_use,
+        temp_root,
+    });
+    service.long_lived_machine = Some((base.join("home"), vec![]));
+    let cleaner = Arc::new(service);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .filter(|c| c.scope == "agent-session-scratch")
+            .count(),
+        layout.len(),
+        "{preview:?}"
+    );
+    (temp, cleaner, targets)
+}
+
+/// Removing one target changes its parent folder's modification time. The
+/// recency guard is judged again for every candidate at delete time, so without
+/// the run knowing what it removed itself, the second target of the same
+/// finished session would be refused as "too recent" for a whole retention
+/// period: one folder freed per session per retention period.
+#[test]
+fn a_finished_session_with_two_targets_is_cleared_in_one_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "two-targets-run");
+    let done = run.items.iter().filter(|i| i.status == "completed").count();
+    assert_eq!(done, 2, "{:?}", run.items);
+    assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
+}
+
+/// A removal that stops part way (something changed in the target, which is
+/// what a live build looks like) leaves the target itself with a new time. That
+/// is not the run's doing in the sense the guard excuses: the folder shows life,
+/// so the session's other target is kept for this retention period and says so.
+#[test]
+fn a_partly_removed_target_keeps_its_sibling_this_period() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    USE_CALLS.store(0, Ordering::SeqCst);
+    // Calls 1 and 2 are the run's own inspection, 3 the first delete-time
+    // judgement and 4 the re-check right before its first unlink.
+    TOUCH_AT_CALL.store(4, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "partial-sibling-run");
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    let row = |name: &str| {
+        run.items
+            .iter()
+            .find(|i| i.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name}: {:?}", run.items))
+    };
+    assert_eq!(
+        row("target-a").status,
+        "partially_removed",
+        "{:?}",
+        run.items
+    );
+    let sibling = row("target-b");
+    assert_eq!(sibling.status, "skipped", "{sibling:?}");
+    assert!(sibling.message.contains("too recent"), "{sibling:?}");
+    assert!(targets[1].join("debug/app.o").exists());
+}
+
+/// Cargo hard-links heavily: an uplifted `debug/foo` beside its `debug/deps`
+/// copy, an `incremental` object beside the `build` one. A real target must
+/// end `completed`, not stop at the first pair as `partially_removed`.
+#[cfg(unix)]
+#[test]
+fn a_target_shaped_like_a_real_cargo_target_with_hard_links_is_completed() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let shape = |target: &std::path::Path| {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let set = |p: &std::path::Path| {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        for dir in ["debug/deps", "debug/incremental/crate-1", "debug/build/out"] {
+            fs::create_dir_all(target.join(dir)).unwrap();
+        }
+        fs::write(target.join("debug/deps/foo-1234"), vec![b'f'; 2000]).unwrap();
+        fs::hard_link(target.join("debug/deps/foo-1234"), target.join("debug/foo")).unwrap();
+        fs::write(
+            target.join("debug/incremental/crate-1/x.o"),
+            vec![b'o'; 3000],
+        )
+        .unwrap();
+        fs::hard_link(
+            target.join("debug/incremental/crate-1/x.o"),
+            target.join("debug/build/out/x.o"),
+        )
+        .unwrap();
+        for path in [
+            "debug/deps/foo-1234",
+            "debug/foo",
+            "debug/incremental/crate-1/x.o",
+            "debug/build/out/x.o",
+            "debug/deps",
+            "debug/incremental/crate-1",
+            "debug/incremental",
+            "debug/build/out",
+            "debug/build",
+            "debug",
+        ] {
+            set(&target.join(path));
+        }
+    };
+    let (_temp, cleaner, targets) = one_session_cleaner_with(&["target-a"], shape);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "hard-link-run");
+    let row = run
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("target-a"))
+        .unwrap_or_else(|| panic!("{:?}", run.items));
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert!(!targets[0].exists());
+    // 4096 (app.o) + 2000 + 3000 + 45 (the marker files): each file once,
+    // however many names it had.
+    assert!(
+        row.message.contains("9141 bytes"),
+        "files counted once: {}",
+        row.message
+    );
+}
+
+/// The same, one level down: the wrapper folder is itself a top-level entry of
+/// `scratchpad/`, and removing a child changes the wrapper's time.
+#[test]
+fn a_wrapper_with_two_children_is_cleared_in_one_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-wrap/t0", "target-wrap/t1"]);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "wrapper-run");
+    let done = run.items.iter().filter(|i| i.status == "completed").count();
+    assert_eq!(done, 2, "{:?}", run.items);
+    assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
+}
+
 /// A removal that stops at 90% leaves its bytes gone, and they count: the run
 /// charges them, records the row as partly removed (not skipped), and the next
 /// candidate meets what is left of the cap. Charging only completed removals let
@@ -3621,6 +3873,80 @@ fn a_partly_removed_candidate_is_charged_and_the_next_one_meets_the_cap() {
     assert_eq!(run.status, "completed_with_skips");
 }
 
+/// One folder GitPulse may not read is an answer about that folder: it is kept
+/// and listed, and the agent scope can still be previewed and approved. It used
+/// to clear the one shared "complete" flag, which approves no scope at all.
+#[cfg(unix)]
+#[test]
+fn a_folder_gitpulse_may_not_read_does_not_stop_the_scopes_being_approved() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a"]);
+    let claude_dir = targets[0]
+        .ancestors()
+        .nth(4)
+        .expect("<claude-uid>/<project>/<session>/scratchpad/<target>")
+        .to_path_buf();
+    let sealed = claude_dir.join("sealed-project");
+    fs::create_dir_all(&sealed).unwrap();
+    let _held = deny(&sealed);
+    let inventory = cleaner.inventory().unwrap();
+    assert!(inventory.scopes_complete, "{:?}", inventory.issues);
+    assert_eq!(inventory.unchecked_folders, 0);
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "the preview counts: {:?}",
+        inventory.issues
+    );
+    let item = inventory
+        .kept
+        .iter()
+        .find(|k| k.path.ends_with("sealed-project"))
+        .unwrap_or_else(|| panic!("listed as kept: {:?}", inventory.kept));
+    assert!(item.reason.contains("may not read"), "{item:?}");
+}
+
+/// A folder a check could not run for (the process table unreadable) is not
+/// "the host was shedding work under load" and is not advice to wait for the
+/// host to be less busy; the run says what it is.
+#[test]
+fn folders_that_could_not_be_checked_are_not_reported_as_host_load() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    // The first candidate is read, every later reading fails.
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(2, Ordering::SeqCst);
+    let inventory = cleaner.inventory().unwrap();
+    assert!(!inventory.scopes_complete);
+    assert!(
+        inventory
+            .issues
+            .iter()
+            .all(|i| !i.contains("less busy") && !i.contains("under load")),
+        "{:?}",
+        inventory.issues
+    );
+    USE_CALLS.store(0, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "unchecked-run");
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    assert!(run.unexamined >= 1, "{run:?}");
+    assert!(
+        run.issues
+            .iter()
+            .any(|i| i.contains("agent scratch folder(s) could not be checked")),
+        "{:?}",
+        run.issues
+    );
+    assert!(
+        run.issues
+            .iter()
+            .all(|i| !i.contains("shedding work under load")),
+        "{:?}",
+        run.issues
+    );
+}
+
 /// A check that could not run at delete time is an unexamined row, counted, and
 /// nothing is removed: the process table unreadable after a good preview.
 #[test]
@@ -3670,28 +3996,131 @@ fn a_due_scheduled_run_waits_for_every_pressure_but_the_disk() {
         ..GovernorInput::test_pressure(Level::Normal)
     };
     assert!(
-        !super::scheduled_run_waits(),
+        !super::scheduled_wait_reason().is_some(),
         "no governor in this thread: it runs"
     );
     {
         let _memory = history(GovernorInput::test_pressure(Level::Critical));
         assert!(crate::sysload::shed().background, "the fixture sheds");
-        assert!(super::scheduled_run_waits(), "memory Severe: it waits");
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "memory Severe: it waits"
+        );
     }
     {
         let _disk = history(low_disk());
         assert!(crate::sysload::shed().background);
-        assert!(!super::scheduled_run_waits(), "the disk alone: it runs");
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "the disk alone: it runs"
+        );
     }
     {
+        // A nearly full disk brings memory pressure with it: below the Severe
+        // floor the clean proceeds whatever else is pressed.
         let mut both = low_disk();
         both.level = Some(Level::Critical);
         let _both = history(both);
-        assert!(super::scheduled_run_waits(), "disk and memory: it waits");
+        assert!(crate::sysload::shed().background);
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "disk below the Severe floor and memory pressed: it runs"
+        );
+    }
+    {
+        // Low disk Elevated (24 GiB, between the floors) is not enough.
+        let mut elevated = low_disk();
+        elevated.readings.free_disk = Reading::Value(24 << 30);
+        elevated.level = Some(Level::Critical);
+        let _elevated = history(elevated);
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "disk Elevated and memory pressed: it waits"
+        );
+    }
+    {
+        // The fill projection alone, with space well above the floor.
+        let mut filling = GovernorInput::test_pressure(Level::Critical);
+        filling.readings.free_disk = Reading::Value(40 << 30);
+        filling.readings.disk_fill_sustained = Reading::Value(10 << 30);
+        let _filling = history(filling);
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "a fill projection alone with memory pressed: it waits"
+        );
     }
     {
         let _clear = history(GovernorInput::test_pressure(Level::Normal));
-        assert!(!super::scheduled_run_waits(), "nothing shed: it runs");
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "nothing shed: it runs"
+        );
+    }
+}
+
+/// What the scheduler loop does with a due schedule, through the one function
+/// it calls and the real governor accessors: nothing starts while the host
+/// sheds for a reason the run does not relieve (and the state says why), a run
+/// starts when nothing is shed or the disk remedy is due, and a schedule that
+/// is not due starts nothing.
+#[cfg(unix)]
+#[test]
+fn the_scheduler_loop_holds_a_due_run_back_only_when_the_remedy_is_not_due() {
+    use crate::sysload::{inject_governor_with_history, GovernorInput, Level, Reading};
+    let _serial = crate::storage::hygiene::tests::serial();
+    let due = |cleaner: &Arc<Cleaner>, root: &std::path::Path| {
+        let now = crate::storage::hygiene::now();
+        let mut c = config(cleaner, root);
+        c.enabled = true;
+        c.next_run_at = now;
+        cleaner.save(c).unwrap();
+        now
+    };
+    let history =
+        |input: GovernorInput| inject_governor_with_history(std::iter::repeat_n(input, 10));
+    // Memory Severe with plenty of disk: a due run waits and says why.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        super::scheduler_tick(&cleaner, now);
+        let state = cleaner.state().unwrap();
+        assert!(state.scheduled_wait.is_some(), "{state:?}");
+        assert!(state.history.is_empty(), "nothing started");
+    }
+    // The same pressure with free disk below the Severe floor: it starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let mut input = GovernorInput::test_pressure(Level::Critical);
+        input.readings.free_disk = Reading::Value(8 << 30);
+        let _both = history(input);
+        super::scheduler_tick(&cleaner, now);
+        let state = wait(&cleaner);
+        assert_eq!(state.scheduled_wait, None);
+        assert_eq!(state.history.len(), 1, "the run started: {state:?}");
+    }
+    // Nothing shed: it starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let _clear = history(GovernorInput::test_pressure(Level::Normal));
+        super::scheduler_tick(&cleaner, now);
+        let state = wait(&cleaner);
+        assert_eq!(state.history.len(), 1, "{state:?}");
+    }
+    // Not due, with memory Severe: nothing waits and nothing starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let mut later = cleaner.state().unwrap().config;
+        later.next_run_at = now + 3600;
+        cleaner.save(later).unwrap();
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        super::scheduler_tick(&cleaner, now);
+        let state = cleaner.state().unwrap();
+        assert_eq!(state.scheduled_wait, None);
+        assert!(state.history.is_empty());
     }
 }
 

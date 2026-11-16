@@ -1859,12 +1859,6 @@ pub(crate) struct ProcessUse {
     /// process cannot be inspected without privilege and is only counted.
     pub mine: bool,
     pub cwd: Option<PathBuf>,
-    /// The kernel ANSWERED, and the answer is that the working directory no
-    /// longer has a path (it was removed while the process stayed in it). That
-    /// is a known state, unlike `cwd == None` without it, which is a lookup that
-    /// failed: a process whose directory is gone cannot be inside any folder
-    /// that exists.
-    pub cwd_gone: bool,
     pub exe: Option<String>,
     pub argv: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
@@ -2107,13 +2101,12 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
             out.users.push((process.pid, kind));
         } else if !process.mine {
             out.other_users += 1;
-        } else if process.argv.is_none()
-            || process.env.is_none()
-            || (process.cwd.is_none() && !process.cwd_gone)
-        {
-            // A working directory whose lookup failed is as unproven as an
-            // argument list the OS would not show. One the kernel answered for
-            // with "no path any more" is a known state and is not counted here.
+        } else if process.argv.is_none() || process.env.is_none() || process.cwd.is_none() {
+            // A working directory the OS would not show is as unproven as an
+            // argument list it would not show, whatever the reason: no path is
+            // not "inside nothing". (macOS keeps answering with the old path
+            // for a directory removed under a process, so that case reads as a
+            // user of that path; a failed lookup is what lands here.)
             out.unreadable.push(process.pid);
         }
     }
@@ -2444,32 +2437,9 @@ mod os {
         Ok(())
     }
 
-    /// What the kernel said about a process's working directory.
-    #[derive(Debug, PartialEq, Eq)]
-    pub(crate) enum CwdReading {
-        /// Its path.
-        Path(PathBuf),
-        /// The kernel answered, and there is no path (an empty or non-absolute
-        /// one): the directory was removed under the process.
-        NoPath,
-        /// The lookup itself failed (no such process, no permission, a short or
-        /// unterminated answer). Unproven.
-        Failed,
-    }
-
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
-        match cwd_reading(pid) {
-            CwdReading::Path(path) => Some(path),
-            CwdReading::NoPath | CwdReading::Failed => None,
-        }
-    }
-
-    pub(crate) fn cwd_reading(pid: i32) -> CwdReading {
         use std::ffi::CStr;
         use std::os::unix::ffi::OsStrExt;
-        let Ok(size_arg) = i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()) else {
-            return CwdReading::Failed;
-        };
         let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
         let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         // SAFETY: the buffer is exactly one `proc_vnodepathinfo`, and it is
@@ -2480,11 +2450,11 @@ mod os {
                 libc::PROC_PIDVNODEPATHINFO,
                 0,
                 info.as_mut_ptr().cast(),
-                size_arg,
+                i32::try_from(size).ok()?,
             )
         };
         if usize::try_from(written).ok() != Some(size) {
-            return CwdReading::Failed;
+            return None;
         }
         // SAFETY: fully initialised, established above.
         let info = unsafe { info.assume_init() };
@@ -2493,13 +2463,11 @@ mod os {
         let raw: &[libc::c_char] = info.pvi_cdir.vip_path.as_flattened();
         // SAFETY: c_char and u8 share size and alignment.
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast(), raw.len()) };
-        let Ok(path) = CStr::from_bytes_until_nul(bytes).map(CStr::to_bytes) else {
-            return CwdReading::Failed;
-        };
+        let path = CStr::from_bytes_until_nul(bytes).ok()?.to_bytes();
         if path.first() != Some(&b'/') {
-            return CwdReading::NoPath;
+            return None;
         }
-        CwdReading::Path(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
     }
 
     /// `struct proc_fileinfo` from <sys/proc_info.h>.
@@ -2895,7 +2863,6 @@ mod os {
         owner: u32,
         me: u32,
         cwd: Option<std::path::PathBuf>,
-        cwd_gone: bool,
     ) -> Option<super::ProcessUse> {
         let mine = if owner == UNKNOWN_OWNER {
             true
@@ -2908,7 +2875,6 @@ mod os {
             pid,
             mine,
             cwd,
-            cwd_gone,
             ..Default::default()
         })
     }
@@ -2922,16 +2888,11 @@ mod os {
         if first.zombie {
             return None;
         }
-        let reading = cwd_reading(pid);
-        let cwd_gone = reading == CwdReading::NoPath;
-        let cwd = match reading {
-            CwdReading::Path(path) => Some(path),
-            CwdReading::NoPath | CwdReading::Failed => None,
-        };
+        let cwd = cwd(pid);
         // The OS would not even say who owns it (a failed lookup that was not
         // "no such process"): it may be the user's, so it is unproven, never
         // counted as another user's and never dropped.
-        if let Some(row) = use_without_arguments(pid, first.uid, uid(), cwd.clone(), cwd_gone) {
+        if let Some(row) = use_without_arguments(pid, first.uid, uid(), cwd.clone()) {
             return Some(row);
         }
         if buf.is_empty() {
@@ -2942,7 +2903,6 @@ mod os {
                 pid,
                 mine: true,
                 cwd,
-                cwd_gone,
                 exe: Some(exe),
                 argv: Some(argv),
                 env: Some(env),
@@ -2957,7 +2917,6 @@ mod os {
                     pid,
                     mine: true,
                     cwd,
-                    cwd_gone,
                     exe: Some(exe),
                     argv: Some(argv),
                     env: Some(env),
@@ -2968,7 +2927,6 @@ mod os {
                         pid,
                         mine: true,
                         cwd,
-                        cwd_gone,
                         ..Default::default()
                     }),
             },
@@ -3490,10 +3448,6 @@ mod os {
             pid,
             mine: true,
             cwd,
-            // `/proc/<pid>/cwd` read back as a path that is no directory (a
-            // removed one reads "<old path> (deleted)"): the kernel answered.
-            cwd_gone: std::fs::read_link(format!("/proc/{pid}/cwd"))
-                .is_ok_and(|path| path.is_absolute() && !path.is_dir()),
             exe: exe_path(pid),
             argv,
             env,
@@ -3773,7 +3727,6 @@ pub(crate) mod tests {
             pid,
             mine: true,
             cwd: Some(PathBuf::from(cwd)),
-            cwd_gone: false,
             exe: Some(exe.into()),
             argv: Some(argv.iter().map(|a| (*a).into()).collect()),
             env: Some(env.iter().map(|e| (*e).into()).collect()),
@@ -4067,7 +4020,6 @@ pub(crate) mod tests {
             pid: 7,
             mine: true,
             cwd: None,
-            cwd_gone: false,
             exe: Some("/bin/tool".into()),
             argv: Some(vec!["t".into()]),
             env: Some(vec![]),
@@ -4083,10 +4035,12 @@ pub(crate) mod tests {
     }
 
     /// What the kernel says about a process whose working directory was removed
-    /// under it, read from a child this test owns.
+    /// under it, read from a child this test owns: the old path, so the
+    /// process still counts as a user of it. A failed lookup reads as no path,
+    /// which is unproven.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_removed_working_directory_is_a_known_state_and_a_failed_lookup_is_not() {
+    fn a_removed_working_directory_still_reports_its_old_path_and_a_failed_lookup_is_unproven() {
         use crate::procguard::LockedSpawn;
         let temp = tempfile::tempdir().unwrap();
         let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
@@ -4099,32 +4053,28 @@ pub(crate) mod tests {
             .spawn_locked()
             .expect("spawn");
         let pid = i32::try_from(child.id()).unwrap();
-        let inside = (0..200).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            os::cwd_reading(pid) == os::CwdReading::Path(dir.clone())
-        });
+        let inside =
+            crate::test_support::env::wait_until(std::time::Duration::from_secs(2), || {
+                os::cwd(pid).as_deref() == Some(dir.as_path())
+            });
         std::fs::remove_dir(&dir).unwrap();
-        let removed = os::cwd_reading(pid);
+        let removed = os::cwd(pid);
         let mut buf = Vec::new();
         let row = os::read_use(pid, &mut buf);
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(inside, "the child never showed its directory");
         // Measured here (macOS, `proc_pidinfo(PROC_PIDVNODEPATHINFO)`): the
-        // kernel keeps answering with the removed directory's old path, so a
-        // shell left in a deleted worktree is a process with a KNOWN working
-        // directory, not an unreadable one.
-        assert_eq!(removed, os::CwdReading::Path(dir.clone()), "{removed:?}");
+        // kernel keeps answering with the removed directory's old path, so the
+        // process is still a user of that path.
+        assert_eq!(removed.as_deref(), Some(dir.as_path()), "{removed:?}");
         let row = row.expect("alive when read");
         assert_eq!(row.cwd.as_deref(), Some(dir.as_path()), "{row:?}");
-        assert!(!row.cwd_gone);
         let reading = dir_use_in(&base, std::slice::from_ref(&row), 1);
         assert!(reading.unreadable.is_empty(), "{reading:?}");
-        // The kernel's old path is still under the folder, so it reads as a
-        // user of that folder: known, and conservative.
         assert_eq!(reading.users.len(), 1, "{reading:?}");
-        // A lookup that failed (no such process) is a different state.
-        assert_eq!(os::cwd_reading(i32::MAX - 7), os::CwdReading::Failed);
+        // A lookup that failed (no such process) reads as no path at all.
+        assert_eq!(os::cwd(i32::MAX - 7), None);
     }
 
     /// A process whose owner the OS would not name is filed as this user's
@@ -4136,42 +4086,16 @@ pub(crate) mod tests {
     fn an_unnamed_owner_is_unproven_and_another_users_process_is_not() {
         let dir = Path::new("/work/x");
         let me = 501;
-        let unknown = os::use_without_arguments(9, os::UNKNOWN_OWNER, me, None, false)
+        let unknown = os::use_without_arguments(9, os::UNKNOWN_OWNER, me, None)
             .expect("an unnamed owner has a row");
         assert!(unknown.mine && unknown.argv.is_none() && unknown.env.is_none());
         let reading = dir_use_in(dir, std::slice::from_ref(&unknown), 1);
         assert_eq!(reading.unreadable, vec![9], "{reading:?}");
-        let other = os::use_without_arguments(10, 0, me, None, false)
-            .expect("another user's process has a row");
+        let other =
+            os::use_without_arguments(10, 0, me, None).expect("another user's process has a row");
         assert!(!other.mine);
         assert!(dir_use_in(dir, std::slice::from_ref(&other), 1).provably_unused());
-        assert!(os::use_without_arguments(11, me, me, None, false).is_none());
-    }
-
-    /// The two states apart, whatever an OS answers: a kernel that says "no
-    /// path any more" is known (it cannot be inside an existing folder); a
-    /// lookup that failed is unproven.
-    #[test]
-    fn a_working_directory_without_a_path_is_known_and_a_failed_lookup_is_not() {
-        let dir = Path::new("/work/x");
-        let gone = ProcessUse {
-            pid: 7,
-            mine: true,
-            cwd: None,
-            cwd_gone: true,
-            exe: Some("/bin/tool".into()),
-            argv: Some(vec!["t".into()]),
-            env: Some(vec![]),
-        };
-        let known = dir_use_in(dir, std::slice::from_ref(&gone), 1);
-        assert!(known.provably_unused(), "{known:?}");
-        let failed = ProcessUse {
-            cwd_gone: false,
-            ..gone
-        };
-        let unproven = dir_use_in(dir, &[failed], 1);
-        assert_eq!(unproven.unreadable, vec![7]);
-        assert!(!unproven.provably_unused());
+        assert!(os::use_without_arguments(11, me, me, None).is_none());
     }
 
     #[test]
