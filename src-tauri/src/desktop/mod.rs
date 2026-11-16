@@ -1454,12 +1454,15 @@ mod tests {
         assert_eq!(*confirmations.lock().unwrap(), 1);
     }
 
+    /// The main-thread dispatches a test captured instead of running them.
+    type JobQueue = std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
     /// A stalled main thread must not collect one closure per update: ten
     /// updates queue exactly one, and the newest state is the one applied.
     #[test]
     fn menu_updates_behind_a_stalled_main_thread_queue_one_closure_and_apply_the_newest() {
         let slot = std::sync::Arc::new(MenuStateSlot::default());
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let applied: std::sync::Arc<Mutex<Vec<MenuState>>> = Default::default();
         let mut receivers = Vec::new();
         for index in 0..10 {
@@ -1499,7 +1502,7 @@ mod tests {
     #[test]
     fn a_menu_apply_failure_reaches_every_waiting_caller_and_frees_the_slot() {
         let slot = std::sync::Arc::new(MenuStateSlot::default());
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let submit = |slot: &std::sync::Arc<MenuStateSlot>| {
             let queue = std::sync::Arc::clone(&queue);
             MenuStateSlot::submit(
@@ -1543,7 +1546,7 @@ mod tests {
             std::sync::Arc::new(|_| Ok(())),
         );
         assert_eq!(refused.err(), Some("event loop closed".to_string()));
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let sink = std::sync::Arc::clone(&queue);
         MenuStateSlot::submit(
             &slot,
