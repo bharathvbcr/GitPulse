@@ -44,6 +44,17 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 This removes a local quarantine attribute; it does not verify or notarize the app.
 Open GitPulse from Applications, Finder, or Spotlight.
 
+To let Claude Code or Codex use GitPulse's MCP tools and hooks, open
+**Settings → Agents → Connect your agent** once GitPulse runs from
+Applications. The `gitpulse-mcp` and `gitpulse-hook` binaries ship inside
+`GitPulse.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
+registers the server through each agent's own CLI, after showing you the plan.
+Because the links point into the app, they follow the app when you update it.
+Connecting is refused while macOS runs the app from a temporary App
+Translocation location (opened straight from the DMG or Downloads); move it to
+Applications first. `bun run mcp:install` is only for building these binaries
+from a source checkout.
+
 #### Signing local builds
 
 On macOS, `bun run tauri build` signs with a team identity when your login
@@ -190,9 +201,10 @@ store (dc-store) migrates one way: a profile migrated to a newer schema cannot b
 read back by a host built against an older one. (The dc-store vendored in this
 tree is store schema 11 with workbench schema 17.) GitPulse, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
-schema, before any of them opens it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
-(`bun run mcp:install`); a binary built against an older schema refuses the
-migrated profile. The release notes in the CHANGELOG record each schema change.
+schema, before any of them opens it. A connected app install updates the
+`gitpulse-mcp` and `gitpulse-hook` it links along with the app; a source build
+must reinstall them (`bun run mcp:install`). A binary built against an older
+schema refuses the migrated profile. The release notes in the CHANGELOG record each schema change.
 After updating, `bun run check:schema-parity` asks each installed reader which
 schemas it reads, including the app's bundled server, and names any that were
 left behind.

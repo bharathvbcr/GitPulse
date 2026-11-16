@@ -67,14 +67,29 @@ loaded-page filtering, multi-selection, archive, and run boundaries.
 
 ## 5. Add optional capabilities when you need them
 
+GitPulse works without any of these. A view that needs one stays open and says
+what is missing, with a **Set up** (or **Build index**) button in place.
+
+- **Connect your agent:** **Settings → Agents → Connect your agent** (also on the
+  first-run card and the setup wizard's last step) links the `gitpulse-mcp` and
+  `gitpulse-hook` that ship inside the app into `~/.local/bin` and registers the
+  server with Claude Code and Codex through their own `mcp add`. It shows the
+  plan first and changes nothing until you apply it; anything already set up
+  differently is left alone and reported. **Copy setup prompt** gives your agent
+  the same steps to carry out instead. No source checkout or Rust toolchain is
+  needed.
 - **GitHub:** install and authenticate `gh` for pull requests, issues, and Actions.
-- **Code Map:** use **Help → Set Up Optional Tools** for DevMap, the default module.
+- **Code Map:** use **Help → Set Up Optional Tools** for DevMap, the default
+  module. There is no prebuilt DevMap this version can read yet, so the wizard
+  builds it from source, which needs a Rust toolchain.
 - **AI assistance:** configure a local model server for built-in assistance;
   supported Mac builds also offer Apple Intelligence for task drafting and, for
   commit messages, to phrase a subject the app has already classified. With no
   model at all, a commit message is still written from the staged change.
-- **Agents and policy:** configure Manvi and the provider you intend to use.
-  Explicit agent sessions have their own permissions and network behavior.
+- **Agents and policy:** set up Manvi from the same wizard (a checksummed
+  prebuilt on macOS and Linux) and configure the provider you intend to use.
+  Without Manvi, Git actions run unchecked and say so. Explicit agent sessions
+  have their own permissions and network behavior.
 
 Ordinary terminal sessions are separate from built-in AI suggestions. The
 [terminal guide](TERMINAL.md) explains session persistence and recovery.
