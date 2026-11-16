@@ -47,7 +47,10 @@ fn the_probe_is_admitted_while_the_verdict_sheds_everything_else() {
     let probe = with_background_processes(|| {
         super::gate::with_exec_probe(|| gate.acquire_until(far(), &|| false))
     });
-    assert!(probe.is_ok(), "the probe must not be shed by its own verdict");
+    assert!(
+        probe.is_ok(),
+        "the probe must not be shed by its own verdict"
+    );
     drop(probe);
     assert!(
         matches!(background(), Some(Refusal::Pressure { .. })),
@@ -68,7 +71,10 @@ fn the_probe_is_admitted_while_the_verdict_sheds_everything_else() {
 fn a_trivial_child_is_timed_through_the_runner_even_under_pressure() {
     use super::{time_exec_probe, ExecProbeRun};
     let _pressed = inject_governor(GovernorInput::test_pressure(Level::Critical));
-    match time_exec_probe(std::path::Path::new("/usr/bin/true"), Duration::from_secs(30)) {
+    match time_exec_probe(
+        std::path::Path::new("/usr/bin/true"),
+        Duration::from_secs(30),
+    ) {
         ExecProbeRun::Ran(took) => assert!(took < Duration::from_secs(30), "{took:?}"),
         other => panic!("expected a timing, got {other:?}"),
     }
@@ -136,9 +142,9 @@ fn slow_start_up_defers_background_spawns_by_name_and_admits_reactive_ones() {
     );
     let message = refusal_message("git status", refusal);
     assert!(
-        message.message().contains(
-            "background work is shed while process start-up is slow (median 1.4 s)"
-        ),
+        message
+            .message()
+            .contains("background work is shed while process start-up is slow (median 1.4 s)"),
         "{}",
         message.message()
     );
@@ -152,7 +158,9 @@ fn slow_start_up_defers_background_spawns_by_name_and_admits_reactive_ones() {
         "reactive reads are admitted"
     );
     assert!(
-        with_admission(Admission::Interactive, || gate.acquire_until(far(), &|| false)).is_ok(),
+        with_admission(Admission::Interactive, || gate
+            .acquire_until(far(), &|| false))
+        .is_ok(),
         "a click is admitted"
     );
 }

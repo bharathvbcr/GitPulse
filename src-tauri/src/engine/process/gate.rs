@@ -149,7 +149,10 @@ pub(crate) fn refusal_message_at(
             let measured = match cause {
                 crate::sysload::Binding::ExecLatency => crate::sysload::exec_latency()
                     .map(|latency| {
-                        format!(" (median {})", crate::sysload::format_latency(latency.median_ms))
+                        format!(
+                            " (median {})",
+                            crate::sysload::format_latency(latency.median_ms)
+                        )
                     })
                     .unwrap_or_default(),
                 _ => String::new(),

@@ -536,7 +536,12 @@ pub(crate) enum ExecProbeRun {
 /// a person is waiting on, and a background-band child is throttled by design.
 /// The wait for a slot is not part of the time.
 pub(crate) fn time_exec_probe(program: &Path, deadline: Duration) -> ExecProbeRun {
-    let mut cmd = Command::new(program);
+    let Some(program) = program.to_str() else {
+        return ExecProbeRun::Failed;
+    };
+    // The seam's own constructor: the same scrubbed environment as every other
+    // captured child, so the probe times what a git read would pay.
+    let mut cmd = build_capture_command(program, &[], None, &[], None, None);
     let mut options = RunOptions::new(deadline);
     options.qos = Some(QosTier::Standard);
     let admitted = Cell::new(None);

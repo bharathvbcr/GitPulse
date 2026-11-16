@@ -122,9 +122,7 @@ impl Window {
     /// Records one probe that finished at `at`.
     pub fn push(&mut self, at: Instant, outcome: Outcome) {
         let sample = match outcome {
-            Outcome::Sample(took) => {
-                Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX))
-            }
+            Outcome::Sample(took) => Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX)),
             Outcome::Failed => None,
         };
         if self.outcomes.len() == WINDOW {
@@ -216,11 +214,6 @@ pub struct ExecProbe {
 }
 
 impl ExecProbe {
-    /// The reading now, for the sampler to put on the governor's input.
-    pub fn reading(&self) -> Reading<ExecLatency> {
-        reading_of(&self.window)
-    }
-
     /// A handle that reads the window without owning the thread.
     pub fn reader(&self) -> impl Fn() -> Reading<ExecLatency> + Send + 'static {
         let window = self.window.clone();

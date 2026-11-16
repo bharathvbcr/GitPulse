@@ -135,12 +135,18 @@ fn the_latch_sets_at_the_enter_line_and_clears_only_below_the_exit_line() {
     }
     let held = value(window.reading(at));
     assert_eq!(held.median_ms, EXIT_MS);
-    assert!(held.slow, "{EXIT_MS} ms is not below the exit line: {held:?}");
+    assert!(
+        held.slow,
+        "{EXIT_MS} ms is not below the exit line: {held:?}"
+    );
     for _ in 0..WINDOW {
         window.push(at, ms(EXIT_MS - 1));
         at += CADENCE;
     }
-    assert!(!value(window.reading(at)).slow, "below the exit line clears");
+    assert!(
+        !value(window.reading(at)).slow,
+        "below the exit line clears"
+    );
 }
 
 #[test]
@@ -150,7 +156,14 @@ fn a_median_hovering_at_the_line_does_not_flap() {
     let mut transitions = 0;
     let mut last = false;
     for i in 0..60u64 {
-        window.push(at, ms(if i % 2 == 0 { ENTER_MS - 20 } else { ENTER_MS + 20 }));
+        window.push(
+            at,
+            ms(if i % 2 == 0 {
+                ENTER_MS - 20
+            } else {
+                ENTER_MS + 20
+            }),
+        );
         at += CADENCE;
         if let Reading::Value(latency) = window.reading(at) {
             if latency.slow != last {
@@ -179,7 +192,9 @@ fn probe_once_records_what_the_injected_probe_returns() {
     let clock = Instant::now();
     let mut results = vec![ms(40), Outcome::Failed, ms(60), ms(80)].into_iter();
     for _ in 0..4 {
-        probe_once(&window, &|| clock, &mut || results.next().expect("four probes"));
+        probe_once(&window, &|| clock, &mut || {
+            results.next().expect("four probes")
+        });
     }
     let latency = value(window.lock().unwrap().reading(clock));
     assert_eq!(latency.n, 3, "the failed probe is not a sample");
