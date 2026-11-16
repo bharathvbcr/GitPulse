@@ -10,6 +10,8 @@ struct FakeRunner {
     calls: RefCell<Vec<Call>>,
     /// Answers `get` calls: (agent program, success, output).
     get: RefCell<Vec<(String, bool, String)>>,
+    /// Answers `claude plugin list --json`: (success, output). No plugins by default.
+    plugins: RefCell<(bool, String)>,
     add_ok: bool,
 }
 
@@ -22,8 +24,13 @@ impl FakeRunner {
                     .map(|(p, s, o)| (p.to_string(), s, o.to_string()))
                     .collect(),
             ),
+            plugins: RefCell::new((true, "[]".to_string())),
             add_ok: true,
         }
+    }
+    fn with_plugins(self, success: bool, output: &str) -> Self {
+        *self.plugins.borrow_mut() = (success, output.to_string());
+        self
     }
     fn adds(&self) -> Vec<Call> {
         self.calls
@@ -40,6 +47,10 @@ impl CliRunner for FakeRunner {
         self.calls
             .borrow_mut()
             .push((program.to_string(), args.to_vec()));
+        if args.first().map(String::as_str) == Some("plugin") {
+            let (success, output) = self.plugins.borrow().clone();
+            return Ok(CliRun { success, output });
+        }
         if args.get(1).map(String::as_str) == Some("get") {
             let answers = self.get.borrow();
             return match answers.iter().find(|(p, _, _)| p == program) {
@@ -92,6 +103,7 @@ fn env<'a>(
 ) -> ConnectEnv<'a> {
     ConnectEnv {
         home: fx.home.clone(),
+        cargo_bin: fx.home.join(".cargo/bin"),
         mcp: Ok(fx.bundle.join("gitpulse-mcp")),
         hook: Ok(fx.bundle.join("gitpulse-hook")),
         find_tool: find,
@@ -400,4 +412,190 @@ fn link_details_say_what_depends_on_path() {
         "{}",
         done.detail
     );
+}
+
+/// `claude plugin list --json` with GitPulse's plugin installed, in the shape
+/// Claude Code 2026 prints (only the fields read here matter).
+fn gitpulse_plugin(enabled: bool) -> String {
+    format!(
+        r#"[{{"id":"gitpulse@gitpulse","version":"1.4.0","scope":"user","enabled":{enabled},
+            "mcpServers":{{"gitpulse":{{"type":"stdio","command":"gitpulse-mcp","args":[]}}}}}},
+           {{"id":"other@market","enabled":true,"mcpServers":{{"other":{{"command":"x"}}}}}}]"#
+    )
+}
+
+fn only_claude(n: &str) -> Option<String> {
+    (n == "claude").then(|| "/fake/bin/claude".to_string())
+}
+
+#[test]
+fn a_server_the_gitpulse_plugin_provides_is_not_registered_a_second_time() {
+    let fx = fixture();
+    let runner = FakeRunner::new(vec![("/fake/bin/claude", false, NOT_FOUND)])
+        .with_plugins(true, &gitpulse_plugin(true));
+    let out = apply(&env(&fx, &runner, &only_claude));
+    let reg = action(&out.plan, "register:claude");
+    assert_eq!(reg.state, ConnectActionState::Done, "{}", reg.detail);
+    assert!(reg.detail.contains("gitpulse@gitpulse"), "{}", reg.detail);
+    assert!(reg.detail.contains("PATH"), "{}", reg.detail);
+    assert!(runner.adds().is_empty(), "no duplicate user-scope server");
+}
+
+#[test]
+fn a_disabled_plugin_does_not_count_as_providing_the_server() {
+    let fx = fixture();
+    let runner = FakeRunner::new(vec![("/fake/bin/claude", false, NOT_FOUND)])
+        .with_plugins(true, &gitpulse_plugin(false));
+    let plan = build_plan(&env(&fx, &runner, &only_claude));
+    assert_eq!(
+        action(&plan, "register:claude").state,
+        ConnectActionState::Todo
+    );
+}
+
+#[test]
+fn a_plugin_check_that_could_not_run_blocks_the_registration() {
+    let fx = fixture();
+    for (success, output) in [
+        (false, "error: unknown command 'plugin'"),
+        (true, "not json"),
+    ] {
+        let runner = FakeRunner::new(vec![("/fake/bin/claude", false, NOT_FOUND)])
+            .with_plugins(success, output);
+        let out = apply(&env(&fx, &runner, &only_claude));
+        let reg = action(&out.plan, "register:claude");
+        assert_eq!(reg.state, ConnectActionState::Blocked, "{output}");
+        assert!(reg.detail.contains("plugin"), "{}", reg.detail);
+        assert!(runner.adds().is_empty());
+    }
+}
+
+#[test]
+fn plugin_and_registration_together_are_reported_as_two_servers() {
+    let fx = fixture();
+    let runner = FakeRunner::new(vec![(
+        "/fake/bin/claude",
+        true,
+        "gitpulse:\n  Scope: User config (available in all your projects)\n  Command: /old/gitpulse-mcp\n",
+    )])
+    .with_plugins(true, &gitpulse_plugin(true));
+    let plan = build_plan(&env(&fx, &runner, &only_claude));
+    let reg = action(&plan, "register:claude");
+    assert_eq!(reg.state, ConnectActionState::Blocked);
+    assert!(reg.detail.contains("two"), "{}", reg.detail);
+    assert_eq!(reg.commands, ["claude mcp remove gitpulse -s user"]);
+}
+
+#[test]
+fn a_different_registration_shows_the_commands_that_switch_it() {
+    let fx = fixture();
+    let mcp = fx
+        .bundle
+        .join("gitpulse-mcp")
+        .to_string_lossy()
+        .into_owned();
+    let codex_json = r#"{"name":"gitpulse","transport":{"type":"stdio","command":"/Users/me/.cargo/bin/gitpulse-mcp","args":[]}}"#;
+    let runner = FakeRunner::new(vec![
+        (
+            "/fake/bin/claude",
+            true,
+            "gitpulse:\n  Scope: Local config (private to you in this project)\n  Command: gitpulse-mcp\n",
+        ),
+        ("/fake/bin/codex", true, codex_json),
+    ]);
+    let out = apply(&env(&fx, &runner, &both));
+    let claude = action(&out.plan, "register:claude");
+    assert_eq!(claude.state, ConnectActionState::Blocked);
+    assert_eq!(
+        claude.commands,
+        [
+            "claude mcp remove gitpulse -s local".to_string(),
+            format!("claude mcp add --scope user gitpulse -- {mcp}"),
+        ]
+    );
+    let codex = action(&out.plan, "register:codex");
+    assert_eq!(codex.state, ConnectActionState::Blocked);
+    assert!(codex.detail.contains("/Users/me/.cargo/bin/gitpulse-mcp"));
+    assert_eq!(
+        codex.commands,
+        [
+            "codex mcp remove gitpulse".to_string(),
+            format!("codex mcp add gitpulse -- {mcp}"),
+        ]
+    );
+    assert!(runner.adds().is_empty(), "switching is the user's to run");
+    assert!(
+        !runner
+            .calls
+            .borrow()
+            .iter()
+            .any(|(_, a)| a.get(1).map(String::as_str) == Some("remove")),
+        "Connect never removes a registration"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_pointing_elsewhere_shows_the_command_that_repoints_it() {
+    let fx = fixture();
+    let bin = fx.home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        "/Volumes/GitPulse/GitPulse.app/Contents/MacOS/gitpulse-hook",
+        bin.join("gitpulse-hook"),
+    )
+    .unwrap();
+    let runner = FakeRunner::new(vec![]);
+    let plan = build_plan(&env(&fx, &runner, &none));
+    let hook = action(&plan, "link:gitpulse-hook");
+    assert_eq!(hook.state, ConnectActionState::Blocked);
+    assert_eq!(
+        hook.commands,
+        [format!(
+            "ln -sfn {} {}",
+            fx.bundle.join("gitpulse-hook").display(),
+            bin.join("gitpulse-hook").display()
+        )]
+    );
+    assert!(action(&plan, "link:gitpulse-mcp").commands.is_empty());
+}
+
+#[test]
+fn an_older_cargo_install_copy_is_named_beside_the_link() {
+    let fx = fixture();
+    let cargo_bin = fx.home.join(".cargo/bin");
+    std::fs::create_dir_all(&cargo_bin).unwrap();
+    std::fs::write(cargo_bin.join("gitpulse-hook"), b"old").unwrap();
+    let runner = FakeRunner::new(vec![]);
+    let plan = build_plan(&env(&fx, &runner, &none));
+    let hook = action(&plan, "link:gitpulse-hook");
+    assert_eq!(
+        hook.state,
+        ConnectActionState::Todo,
+        "the copy does not block the link"
+    );
+    assert!(
+        hook.detail
+            .contains(&cargo_bin.join("gitpulse-hook").display().to_string()),
+        "{}",
+        hook.detail
+    );
+    assert!(
+        hook.detail.contains("bun run mcp:install"),
+        "{}",
+        hook.detail
+    );
+    assert_eq!(hook.commands, ["cargo uninstall gitpulse"]);
+    let mcp = action(&plan, "link:gitpulse-mcp");
+    assert!(mcp.commands.is_empty(), "no copy of gitpulse-mcp there");
+}
+
+#[test]
+fn the_claude_registration_says_which_profile_it_writes() {
+    let fx = fixture();
+    let runner = FakeRunner::new(vec![("/fake/bin/claude", false, NOT_FOUND)]);
+    let plan = build_plan(&env(&fx, &runner, &only_claude));
+    let reg = action(&plan, "register:claude");
+    assert!(reg.detail.contains("CLAUDE_CONFIG_DIR"), "{}", reg.detail);
+    assert!(reg.detail.contains("Copy setup prompt"), "{}", reg.detail);
 }

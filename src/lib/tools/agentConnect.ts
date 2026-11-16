@@ -21,6 +21,11 @@ export interface ConnectAction {
   target: string;
   state: ConnectActionState;
   detail: string;
+  /**
+   * Lines the user can run themselves for what Connect leaves alone: switch a
+   * registration or a link, remove an older copy. Connect never runs them.
+   */
+  commands: string[];
 }
 
 export interface AgentCommand {
@@ -132,7 +137,11 @@ export function buildSetupPrompt(plan: ConnectPlan, windows = false): string {
     `   ln -s ${sh(plan.mcp_path)} ~/.local/bin/gitpulse-mcp`,
   );
   if (plan.hook_path) lines.push(`   ln -s ${sh(plan.hook_path)} ~/.local/bin/gitpulse-hook`);
-  lines.push("2. Register the server with each agent CLI I have installed, using the agent's own command (do not edit its config files by hand):");
+  lines.push(
+    "2. Register the server with each agent CLI I have installed, using the agent's own command (do not edit its config files by hand). Check first, and register only what is missing:",
+    "   - Claude Code: run `claude plugin list --json`. If an enabled plugin lists a gitpulse server under mcpServers (GitPulse's plugin), skip Claude Code: the plugin already provides the server, and a second registration would duplicate every tool.",
+    "   - Run `<agent> mcp get gitpulse`. If gitpulse is already registered with a different command (for example an older `cargo install` copy in ~/.cargo/bin), stop and ask me before replacing it. To replace it: `claude mcp remove gitpulse -s <the scope it shows>` or `codex mcp remove gitpulse`, then the line below.",
+  );
   for (const command of plan.agent_commands) {
     lines.push(`   ${command.label}: ${command.add}`);
   }
@@ -140,16 +149,18 @@ export function buildSetupPrompt(plan: ConnectPlan, windows = false): string {
   for (const command of plan.agent_commands) {
     lines.push(`   ${command.label}: ${command.verify}`);
   }
-  lines.push("   The server is named gitpulse. Tell me which agents you registered it with.");
+  lines.push("   The server is named gitpulse. Tell me which agents you registered it with, and which you skipped and why.");
   lines.push(
-    "4. Check that ~/.local/bin is on my shell's PATH (echo $PATH). The registration above uses the full path, so the MCP server works either way, but GitPulse's Claude Code hooks call gitpulse-hook by name. If it is missing, tell me which shell profile line would add it; do not edit my profile yourself.",
+    "4. Check that ~/.local/bin is on my shell's PATH (echo $PATH). The registration above uses the full path, so the MCP server works either way, but GitPulse's Claude Code plugin and hooks call gitpulse-mcp and gitpulse-hook by name. If it is missing, tell me which shell profile line would add it; do not edit my profile yourself.",
+    "5. Check for older copies: if ~/.cargo/bin/gitpulse-mcp or ~/.cargo/bin/gitpulse-hook exists, it is from an earlier source install and may come before ~/.local/bin on PATH. Tell me; `cargo uninstall gitpulse` removes them, but ask me first (I may build GitPulse from source on purpose).",
   );
 
   lines.push(
     "",
-    "Optional, only if I say yes: GitPulse's Claude Code plugin adds its hooks (collision guard, command gate) and skills. Install it with Claude Code's own plugin commands:",
+    "Optional, only if I say yes: GitPulse's Claude Code plugin adds its hooks (collision guard, command gate) and skills, and provides the gitpulse server itself. Install it with Claude Code's own plugin commands:",
     `   ${CLAUDE_PLUGIN_MARKETPLACE_ADD}`,
     `   ${CLAUDE_PLUGIN_INSTALL}`,
+    "   If you registered gitpulse with Claude Code in step 2, remove that registration afterwards (`claude mcp remove gitpulse -s user`) so there is one server, not two.",
   );
   const devmap = buildDevcouncilInstallCommand({ preset: "devmap", sourceCheckout: null, windows });
   if (devmap.runnable && devmap.command) {

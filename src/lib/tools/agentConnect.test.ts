@@ -32,6 +32,7 @@ function action(over: Partial<ConnectAction>): ConnectAction {
     target: "/Users/me/.local/bin/gitpulse-mcp",
     state: "todo",
     detail: "",
+    commands: [],
     ...over,
   };
 }
@@ -124,6 +125,28 @@ describe("setup prompt", () => {
     const text = buildSetupPrompt(plan());
     expect(text).toContain("~/.local/bin is on my shell's PATH");
     expect(text).toContain("do not edit my profile yourself");
+  });
+
+  it("has the agent use the plugin or a registration, never both", () => {
+    const text = buildSetupPrompt(plan());
+    expect(text).toContain("claude plugin list --json");
+    expect(text).toContain("skip Claude Code");
+    expect(text).toContain("claude mcp remove gitpulse -s user");
+    expect(text).toContain("one server, not two");
+  });
+
+  it("asks before replacing an existing registration and names the remove commands", () => {
+    const text = buildSetupPrompt(plan());
+    expect(text).toContain("stop and ask me before replacing it");
+    expect(text).toContain("codex mcp remove gitpulse");
+    expect(text).toContain("claude mcp remove gitpulse -s <the scope it shows>");
+  });
+
+  it("points out older cargo copies that can shadow the links, and asks before removing them", () => {
+    const text = buildSetupPrompt(plan());
+    expect(text).toContain("~/.cargo/bin/gitpulse-hook");
+    expect(text).toContain("cargo uninstall gitpulse");
+    expect(text).toContain("ask me first");
   });
 
   it("says the code map needs Rust", () => {

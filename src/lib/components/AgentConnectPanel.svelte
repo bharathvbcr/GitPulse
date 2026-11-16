@@ -33,6 +33,7 @@
   let applying = $state(false);
   let error = $state<string | null>(null);
   let copyNote = $state<string | null>(null);
+  let commandsNote = $state<{ id: string; text: string } | null>(null);
   let loaded = $state(false);
 
   function failure(verb: string, object: string, cause: unknown): string {
@@ -83,6 +84,13 @@
     copyNote = (await copyText(buildSetupPrompt(plan, windows)))
       ? "Copied. Paste it into Claude Code or Codex."
       : "Couldn't copy. Try again.";
+  }
+
+  async function copyCommands(id: string, commands: string[]) {
+    commandsNote = {
+      id,
+      text: (await copyText(commands.join("\n"))) ? "Copied. Run it in a terminal, then Rescan." : "Couldn't copy. Try again.",
+    };
   }
 
   function resultFor(id: string): ConnectResult | undefined {
@@ -137,6 +145,24 @@
             </span>
             <span class="text-textMuted block font-mono break-all opacity-80">{action.target}</span>
             <span class="text-textMuted block">{action.detail}</span>
+            {#if action.commands.length > 0}
+              <!-- Lines for the user to run; Connect never runs them. -->
+              <span class="mt-1 flex items-start gap-1.5" data-testid="connect-commands">
+                <code class="text-textPrimary block min-w-0 flex-1 font-mono break-all whitespace-pre-wrap">{action.commands.join("\n")}</code>
+                <button
+                  type="button"
+                  class="gp-btn shrink-0 inline-flex items-center gap-1"
+                  data-size="sm"
+                  onclick={() => void copyCommands(action.id, action.commands)}
+                >
+                  <Clipboard size={10} />
+                  Copy
+                </button>
+              </span>
+              {#if commandsNote?.id === action.id}
+                <span class="text-textMuted block" role="status">{commandsNote.text}</span>
+              {/if}
+            {/if}
             {#if result}
               <span class={result.ok ? "text-ok block" : "text-warn block"} data-testid="connect-result">{result.message}</span>
             {/if}

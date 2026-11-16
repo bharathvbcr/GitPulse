@@ -60,6 +60,9 @@ pub struct ConnectAction {
     pub target: String,
     pub state: ConnectActionState,
     pub detail: String,
+    /// Lines the user can run themselves for what Connect leaves alone (switch
+    /// a registration or a link, remove an older copy). Never run by Connect.
+    pub commands: Vec<String>,
 }
 
 /// The agent's own CLI lines, for the paste-into-your-agent prompt. Built here
@@ -147,6 +150,9 @@ impl CliRunner for BoundedCliRunner {
 /// Everything the plan reads from the machine, injectable for tests.
 pub struct ConnectEnv<'a> {
     pub home: PathBuf,
+    /// Where `cargo install` (so `bun run mcp:install`) puts binaries, to name
+    /// an older copy that can shadow the link on PATH.
+    pub cargo_bin: PathBuf,
     pub mcp: Result<PathBuf, String>,
     pub hook: Result<PathBuf, String>,
     pub find_tool: &'a dyn Fn(&str) -> Option<String>,
@@ -194,20 +200,39 @@ impl Agent {
     }
 }
 
+impl Agent {
+    /// The agent's own line that removes the registration, for the user to run.
+    fn remove_line(self, scope: Option<&str>) -> String {
+        let mut line = format!("{} mcp remove {SERVER_NAME}", self.key());
+        if let (Agent::Claude, Some(scope)) = (self, scope) {
+            line.push_str(" -s ");
+            line.push_str(scope);
+        }
+        line
+    }
+}
+
+/// Connect writes to the profile `claude` reads with no `CLAUDE_CONFIG_DIR`
+/// set (a GUI app inherits none), which may not be the one a session uses.
+const CLAUDE_PROFILE_NOTE: &str = "Connect runs `claude` with its default profile; if you start \
+     Claude Code with CLAUDE_CONFIG_DIR, use Copy setup prompt from that session instead.";
+
+fn shell_quote(arg: &str) -> String {
+    if arg
+        .chars()
+        .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+    {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    } else {
+        arg.to_string()
+    }
+}
+
 fn shell_words(program: &str, args: &[String]) -> String {
     let mut line = program.to_string();
     for arg in args {
         line.push(' ');
-        if arg
-            .chars()
-            .any(|c| c.is_whitespace() || c == '\'' || c == '"')
-        {
-            line.push('\'');
-            line.push_str(&arg.replace('\'', "'\\''"));
-            line.push('\'');
-        } else {
-            line.push_str(arg);
-        }
+        line.push_str(&shell_quote(arg));
     }
     line
 }
@@ -246,8 +271,25 @@ fn same_file(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// What a link at `dest` to `source` is now, without touching anything.
-fn inspect_link(dest: &Path, source: &Path) -> (ConnectActionState, String) {
+/// What a link at `dest` to `source` is now, without touching anything, plus
+/// the line that would repoint a link Connect leaves alone.
+fn inspect_link(dest: &Path, source: &Path) -> (ConnectActionState, String, Vec<String>) {
+    let (state, detail) = inspect_link_state(dest, source);
+    let repoint = state == ConnectActionState::Blocked
+        && std::fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink());
+    let commands = if repoint {
+        vec![format!(
+            "ln -sfn {} {}",
+            shell_quote(&source.to_string_lossy()),
+            shell_quote(&dest.to_string_lossy())
+        )]
+    } else {
+        Vec::new()
+    };
+    (state, detail, commands)
+}
+
+fn inspect_link_state(dest: &Path, source: &Path) -> (ConnectActionState, String) {
     if let Some(dir) = dest.parent() {
         if dir.exists() && !dir.is_dir() {
             return (
@@ -291,9 +333,85 @@ fn inspect_link(dest: &Path, source: &Path) -> (ConnectActionState, String) {
 
 enum Registration {
     Absent,
-    Current,
-    Different(String),
+    /// Registered with this app's command; `scope` as for `Different`.
+    Current {
+        scope: Option<&'static str>,
+    },
+    /// Registered with another command; `scope` is Claude Code's, when shown.
+    Different {
+        command: String,
+        scope: Option<&'static str>,
+    },
     Unknown(String),
+}
+
+/// The scope out of `claude mcp get`'s text (`Scope: User config (…)`), as
+/// `claude mcp remove -s` spells it.
+fn claude_scope(output: &str) -> Option<&'static str> {
+    let word = output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Scope:"))?
+        .split_whitespace()
+        .next()?
+        .to_ascii_lowercase();
+    match word.as_str() {
+        "user" => Some("user"),
+        "local" => Some("local"),
+        "project" => Some("project"),
+        _ => None,
+    }
+}
+
+/// Whether an enabled Claude Code plugin already provides the server.
+enum PluginServer {
+    None,
+    /// The providing plugin's id, e.g. `gitpulse@gitpulse`.
+    Provided(String),
+    Unknown(String),
+}
+
+/// Reads `claude plugin list --json` (no server is started, unlike
+/// `claude mcp list`). A plugin counts when it is enabled and serves a server
+/// named `gitpulse` or one whose command is `gitpulse-mcp`.
+fn claude_plugin_server(program: &str, runner: &dyn CliRunner) -> PluginServer {
+    let args: Vec<String> = vec!["plugin".into(), "list".into(), "--json".into()];
+    let run = match runner.run(program, &args) {
+        Ok(run) => run,
+        Err(e) => return PluginServer::Unknown(cap(&e)),
+    };
+    if !run.success {
+        return PluginServer::Unknown(cap(&run.output));
+    }
+    let Ok(serde_json::Value::Array(plugins)) = serde_json::from_str(run.output.trim()) else {
+        return PluginServer::Unknown("its plugin list was not readable".into());
+    };
+    let serves_gitpulse = |servers: &serde_json::Map<String, serde_json::Value>| {
+        servers.iter().any(|(name, server)| {
+            name == SERVER_NAME
+                || server
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .and_then(|c| Path::new(c).file_name())
+                    .is_some_and(|f| f == "gitpulse-mcp")
+        })
+    };
+    plugins
+        .iter()
+        .find(|p| {
+            p.get("enabled").and_then(|e| e.as_bool()) == Some(true)
+                && p.get("mcpServers")
+                    .and_then(|m| m.as_object())
+                    .is_some_and(serves_gitpulse)
+        })
+        .map(|p| {
+            PluginServer::Provided(
+                p.get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("a GitPulse plugin")
+                    .to_string(),
+            )
+        })
+        .unwrap_or(PluginServer::None)
 }
 
 /// The registered command out of `claude mcp get`'s text (`Command: <path>`).
@@ -337,10 +455,22 @@ fn registration(
         Agent::Claude => claude_command(&run.output),
         Agent::Codex => codex_command(&run.output),
     };
+    let scope = match agent {
+        Agent::Claude => claude_scope(&run.output),
+        Agent::Codex => None,
+    };
     match registered {
-        Some(found) if same_file(Path::new(&found), Path::new(command)) => Registration::Current,
-        Some(found) => Registration::Different(found),
-        None => Registration::Different("a command GitPulse could not read".into()),
+        Some(found) if same_file(Path::new(&found), Path::new(command)) => {
+            Registration::Current { scope }
+        }
+        Some(found) => Registration::Different {
+            command: found,
+            scope,
+        },
+        None => Registration::Different {
+            command: "a command GitPulse could not read".into(),
+            scope,
+        },
     }
 }
 
@@ -389,7 +519,17 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
             Ok(source) => {
                 plan.available = true;
                 *slot = source.to_string_lossy().into_owned();
-                let (state, detail) = inspect_link(&dest, source);
+                let (state, mut detail, mut commands) = inspect_link(&dest, source);
+                let older = env.cargo_bin.join(name);
+                if std::fs::symlink_metadata(&older).is_ok() && !same_file(&older, source) {
+                    detail.push_str(&format!(
+                        " Also found {}, an older copy from `bun run mcp:install`; whichever \
+                         directory comes first on PATH wins. If you use this app's copy, remove \
+                         it with `cargo uninstall gitpulse`.",
+                        older.display()
+                    ));
+                    commands.push("cargo uninstall gitpulse".into());
+                }
                 plan.actions.push(ConnectAction {
                     id: format!("link:{name}"),
                     kind: ConnectActionKind::Link,
@@ -398,6 +538,7 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                     target: dest.to_string_lossy().into_owned(),
                     state,
                     detail,
+                    commands,
                 });
             }
             Err(e) => notes.push(format!("{name}: {e}")),
@@ -423,38 +564,89 @@ pub fn build_plan(env: &ConnectEnv) -> ConnectPlan {
                 continue;
             };
             plan.agents_found.push(agent.key().to_string());
-            let (state, detail) = match registration(agent, &program, env.runner, &command) {
-                Registration::Absent => (
-                    ConnectActionState::Todo,
-                    format!(
-                        "Registers {SERVER_NAME} through {}'s own CLI.",
-                        agent.label()
-                    ),
+            let add_line = shell_words(agent.key(), &agent.add_args(&command));
+            let registered = registration(agent, &program, env.runner, &command);
+            let plugin = match agent {
+                Agent::Claude => claude_plugin_server(&program, env.runner),
+                Agent::Codex => PluginServer::None,
+            };
+            let label = agent.label();
+            let (state, mut detail, commands) = match (registered, plugin) {
+                (Registration::Unknown(why), _) => (
+                    ConnectActionState::Blocked,
+                    format!("Could not check {label}'s registry: {why}"),
+                    Vec::new(),
                 ),
-                Registration::Current => (
+                // Registering anyway could add a second gitpulse server beside
+                // the plugin's; not knowing is not "no plugin".
+                (_, PluginServer::Unknown(why)) => (
+                    ConnectActionState::Blocked,
+                    format!(
+                        "Could not check whether GitPulse's {label} plugin already provides the \
+                         server ({why}), so nothing is registered, to avoid a second {SERVER_NAME} \
+                         server. If the plugin is not installed, run the line below yourself."
+                    ),
+                    vec![add_line.clone()],
+                ),
+                (Registration::Absent, PluginServer::Provided(id)) => (
                     ConnectActionState::Done,
-                    format!("Already registered with {}.", agent.label()),
+                    format!(
+                        "Provided by the {id} plugin, which starts gitpulse-mcp by name, so it \
+                         needs ~/.local/bin (the link above) on your shell's PATH. Not registered \
+                         a second time."
+                    ),
+                    Vec::new(),
                 ),
-                Registration::Different(found) => (
+                (
+                    Registration::Current { scope } | Registration::Different { scope, .. },
+                    PluginServer::Provided(id),
+                ) => (
                     ConnectActionState::Blocked,
                     format!(
-                        "Left alone: {SERVER_NAME} is already registered with {} as `{found}`.",
-                        agent.label()
+                        "{label} has two {SERVER_NAME} servers: the {id} plugin's and a \
+                             `{SERVER_NAME}` registration. Keep one; to keep the plugin's, remove \
+                             the registration."
                     ),
+                    vec![agent.remove_line(scope)],
                 ),
-                Registration::Unknown(why) => (
+                (Registration::Absent, PluginServer::None) => (
+                    ConnectActionState::Todo,
+                    format!("Registers {SERVER_NAME} through {label}'s own CLI."),
+                    Vec::new(),
+                ),
+                (Registration::Current { .. }, PluginServer::None) => (
+                    ConnectActionState::Done,
+                    format!("Already registered with {label}."),
+                    Vec::new(),
+                ),
+                (
+                    Registration::Different {
+                        command: found,
+                        scope,
+                    },
+                    PluginServer::None,
+                ) => (
                     ConnectActionState::Blocked,
-                    format!("Could not check {}'s registry: {why}", agent.label()),
+                    format!(
+                        "Left alone: {SERVER_NAME} is already registered with {label} as \
+                         `{found}`. To use this app's copy instead, run the lines below."
+                    ),
+                    vec![agent.remove_line(scope), add_line.clone()],
                 ),
             };
+            if matches!(agent, Agent::Claude) {
+                detail.push(' ');
+                detail.push_str(CLAUDE_PROFILE_NOTE);
+            }
             plan.actions.push(ConnectAction {
                 id: format!("register:{}", agent.key()),
                 kind: ConnectActionKind::Register,
                 agent: Some(agent.key().to_string()),
                 title: format!("Register with {}", agent.label()),
-                target: shell_words(agent.key(), &agent.add_args(&command)),
+                target: add_line,
                 state,
                 detail,
+                commands,
             });
         }
     }
@@ -585,8 +777,14 @@ fn with_real_env<T>(f: impl FnOnce(&ConnectEnv) -> T) -> T {
         Err::<PathBuf, String>("connecting an agent is not available on this platform yet".into()),
     );
     let find = |name: &str| process::find_external_tool(name);
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".cargo"))
+        .join("bin");
     let env = ConnectEnv {
         home,
+        cargo_bin,
         mcp,
         hook,
         find_tool: &find,
