@@ -552,12 +552,12 @@ fn apply_register(env: &ConnectEnv, action: &ConnectAction) -> Result<(), String
 
 /// The plan for this machine and this running app.
 pub fn plan_for_this_app() -> ConnectPlan {
-    with_real_env(|env| build_plan(env))
+    with_real_env(build_plan)
 }
 
 /// Applies the plan for this machine and this running app.
 pub fn apply_for_this_app() -> ConnectOutcome {
-    with_real_env(|env| apply(env))
+    with_real_env(apply)
 }
 
 fn with_real_env<T>(f: impl FnOnce(&ConnectEnv) -> T) -> T {
