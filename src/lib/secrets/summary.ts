@@ -11,6 +11,48 @@ import { plural } from "../format";
 import { SCAN_FRESH_MS, isScanStale } from "../runtime/autoScan";
 import type { SecretFinding, SecretLocation, SecretsReport } from "./types";
 
+/** `ENGINE_KINGFISHER` in the backend: the opt-in deep scan's engine name. */
+export const KINGFISHER_ENGINE = "kingfisher";
+
+/** The report came from Kingfisher's deep scan, not the in-process scanner. */
+export function isDeepScan(report: SecretsReport): boolean {
+  return report.engine === KINGFISHER_ENGINE;
+}
+
+/** The scanner named for a header: Kingfisher with its version, or the engine's own name. */
+export function engineLabel(report: SecretsReport): string {
+  if (isDeepScan(report)) {
+    return report.kingfisher_version ? `Kingfisher ${report.kingfisher_version}` : "Kingfisher";
+  }
+  return report.engine || "unknown engine";
+}
+
+/**
+ * The deep scan is offered beside a result the in-process scanner produced,
+ * and only where Kingfisher is installed to run it.
+ */
+export function offersDeepScan(report: SecretsReport): boolean {
+  return !isDeepScan(report) && report.kingfisher_present;
+}
+
+/** Skipped inputs named in a note before it says how many more there are. */
+const SKIPPED_SHOWN = 5;
+
+/**
+ * The inputs the in-process scan did not read, by name and reason; null when
+ * it read everything. A scan that skipped anything is partial, never clean.
+ */
+export function skippedNote(report: SecretsReport): string | null {
+  if (report.skipped_total === 0) return null;
+  const shown = report.skipped
+    .slice(0, SKIPPED_SHOWN)
+    .map((skip) => `${skip.path} (${skip.reason})`)
+    .join(", ");
+  const more = report.skipped_total - Math.min(report.skipped.length, SKIPPED_SHOWN);
+  const tail = more > 0 ? `${shown ? ", and " : ""}${more.toLocaleString("en-US")} more` : "";
+  return `${plural(report.skipped_total, "input")} not read: ${shown}${tail}.`;
+}
+
 /** Most actionable first; matches the backend's sort. */
 export const LOCATION_ORDER: readonly SecretLocation[] = [
   "git_metadata",
@@ -143,8 +185,9 @@ export function verdict(report: SecretsReport): Verdict {
       return {
         tone: "ok",
         title: "No secrets reported",
-        detail:
-          "Kingfisher read every file in scope and reported nothing at medium confidence or above.",
+        detail: isDeepScan(report)
+          ? "Kingfisher read every file in scope and reported nothing at medium confidence or above."
+          : `${engineLabel(report)} read every file in scope and matched no credential shape.`,
       };
     }
     const partial = report.completeness === "partial";
@@ -154,7 +197,9 @@ export function verdict(report: SecretsReport): Verdict {
         ? "No findings, but the scan was partial"
         : "No findings, completeness unverified",
       detail: partial
-        ? "Kingfisher couldn't read some files (permissions, or files that changed mid-scan). This is not a clean result."
+        ? skippedNote(report)
+          ? `${skippedNote(report)} This is not a clean result.`
+          : "Kingfisher couldn't read some files (permissions, or files that changed mid-scan). This is not a clean result."
         : "This Kingfisher did not report whether it read every file. This is not a clean result.",
     };
   }
@@ -169,7 +214,12 @@ export function verdict(report: SecretsReport): Verdict {
 function findingsDetail(report: SecretsReport): string {
   const parts: string[] = [];
   if (report.completeness === "partial") {
-    parts.push("Some files couldn't be read, so this list is a floor.");
+    const skipped = skippedNote(report);
+    parts.push(
+      skipped
+        ? `${skipped} This list is a floor.`
+        : "Some files couldn't be read, so this list is a floor.",
+    );
   } else if (report.completeness === "unverified") {
     parts.push("Kingfisher did not report whether it read every file.");
   }
@@ -193,23 +243,38 @@ export function capNote(report: SecretsReport): string | null {
 }
 
 /**
- * What "every file in scope" means. Each line is a behaviour measured on
- * Kingfisher 2.7.0 with GitPulse's argv, not a paraphrase of its docs.
+ * What "every file in scope" means. For Kingfisher each line is a behaviour
+ * measured on Kingfisher 2.7.0 with GitPulse's argv, not a paraphrase of its
+ * docs; for the in-process scanner each is a property of its own reader.
  */
 export function scopeNotes(report: SecretsReport): string[] {
-  const notes = [
-    "Working tree only: commit history is not scanned.",
-    "Values are matched locally and never validated against a provider.",
-    "Symbolic links are not followed, and Kingfisher skips some directories itself (node_modules).",
-    "Inline kingfisher:ignore comments are honored.",
-  ];
-  if (report.max_file_size_mb > 0) {
+  const notes = isDeepScan(report)
+    ? [
+        "Working tree only: commit history is not scanned.",
+        "Values are matched locally and never validated against a provider.",
+        "Symbolic links are not followed, and Kingfisher skips some directories itself (node_modules).",
+        "Inline kingfisher:ignore comments are honored.",
+      ]
+    : [
+        "Working tree only: commit history is not scanned.",
+        "Reads every tracked file and every untracked file git does not ignore. Ignored files (build output, local .env files) are not read; the deep scan reads those.",
+        "Values are matched locally and never validated against a provider.",
+        "Symbolic links are not followed.",
+        "Recognises far fewer credential shapes than Kingfisher (recall is measured in docs/PERFORMANCE.md), so a clean result here is weaker than a clean deep scan.",
+      ];
+  if (isDeepScan(report) && report.max_file_size_mb > 0) {
     notes.push(`Files over ${report.max_file_size_mb} MB are skipped without being reported.`);
+  } else if (!isDeepScan(report) && report.max_file_size_mb > 0) {
+    notes.push(
+      `Files over ${report.max_file_size_mb} MB, or past the scan's byte or time budget, are listed as not read.`,
+    );
   }
   if (report.nested_repos_scanned) {
     notes.push("Nested repositories and submodules inside this tree are scanned too.");
   }
-  const left = excludedNote(report.excluded_paths);
+  const skipped = skippedNote(report);
+  if (skipped) notes.push(skipped);
+  const left = excludedNote(report.excluded_paths, isDeepScan(report));
   if (left) notes.push(left);
   return notes;
 }
@@ -223,11 +288,14 @@ const EXCLUDED_SHOWN = 10;
  * A finding there is a copy of one the scan can see, or is scanned when that
  * worktree is the repository open; the note keeps the narrower scope visible.
  */
-function excludedNote(paths: readonly string[]): string | null {
+function excludedNote(paths: readonly string[], deep: boolean): string | null {
   if (paths.length === 0) return null;
   const shown = paths.slice(0, EXCLUDED_SHOWN).join(", ");
   const more = paths.length - EXCLUDED_SHOWN;
   const tail = more > 0 ? `, and ${more.toLocaleString("en-US")} more` : "";
+  if (!deep) {
+    return `Not scanned: nested repositories and submodules, which belong to another index (${shown}${tail}).`;
+  }
   return `Not scanned: ignored build output, dependency and scratch trees, and this repository's other worktrees inside it (${shown}${tail}).`;
 }
 

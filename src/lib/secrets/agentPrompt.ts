@@ -1,5 +1,5 @@
 import { AGENT_CONTEXT_CLIP_NOTE, boundAgentPrompt, safeBlock, safeText } from "../terminal/agentPromptText";
-import { LOCATION_COPY, capNote, groupSizes, verdict } from "./summary";
+import { LOCATION_COPY, capNote, engineLabel, groupSizes, isDeepScan, verdict } from "./summary";
 import type { SecretsReport } from "./types";
 
 /**
@@ -22,7 +22,7 @@ export function formatSecretsScanSnapshot(report: SecretsReport): string {
     `Verdict: ${safeText(headline.title)}`,
     ...(headline.detail ? [safeText(headline.detail)] : []),
     `Completeness: ${safeText(report.completeness)}`,
-    ...(report.kingfisher_version ? [`Kingfisher: ${safeText(report.kingfisher_version)}`] : []),
+    ...(report.engine ? [`Engine: ${safeText(engineLabel(report))}`] : []),
   ];
   const cap = capNote(report);
   if (cap) lines.push(cap);
@@ -59,10 +59,10 @@ export function formatSecretsAgentPrompt(repoPath: string, report: SecretsReport
     "Find and remediate committed or exposed secrets in this repository without revealing them.",
     "",
     report
-      ? "GitPulse Health attached the Kingfisher secrets scan it is showing, below. It lists rule, path, line and location only; it may be stale, partial or capped exactly as its verdict says, so it is a starting list, not the whole answer."
+      ? `GitPulse Health attached the ${isDeepScan(report) ? "Kingfisher" : "in-process"} secrets scan it is showing, below. It lists rule, path, line and location only; it may be stale, partial or capped exactly as its verdict says, so it is a starting list, not the whole answer.`
       : "GitPulse Health did not attach a secrets scan. Nothing was measured for this prompt; the absence of findings here is not evidence that the repository is free of secrets.",
     "",
-    "1. Confirm the checkout below and read AGENTS.md / CLAUDE.md. Measure first: run a read-only secret scanner the repository already uses (GitPulse uses Kingfisher) and record whether it read every input. A partial or failed scan is not a clean result.",
+    "1. Confirm the checkout below and read AGENTS.md / CLAUDE.md. Measure first: run a read-only secret scanner the repository already uses (GitPulse's own scan is in-process, and Kingfisher is its deeper, opt-in scan) and record whether it read every input. A partial or failed scan is not a clean result.",
     "2. Report each finding by rule, path, line and location (tracked, untracked, ignored, nested repository or Git history) only. Never print, echo, log, paste or commit a secret value, and do not quote the matched line.",
     "3. For each real finding, move the credential out of source into the environment or the project's existing secret store, reference it from configuration, and add an ignore rule for local files that should never be committed. List the credentials that must be rotated at their provider; anything that reached Git history needs rotation, which you cannot do from here.",
     "4. Do not rewrite Git history, force-push, or disable the scanner or its rules to hide a finding. Ask before adding dependencies. Do not delete source files, uncommitted work, environments or host-wide caches.",

@@ -5,13 +5,16 @@ import {
   LOCATION_ORDER,
   capNote,
   distinctSecrets,
+  engineLabel,
   filterFindings,
   groupSizes,
   isStale,
   isSuperseded,
   locationLabel,
   locationChips,
+  offersDeepScan,
   scopeNotes,
+  skippedNote,
   scanFailureCopy,
   shouldCache,
   STALE_AFTER_MS,
@@ -38,6 +41,9 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
     max_file_size_mb: 256,
     scanned_at_ms: 1_000_000,
     duration_ms: 10,
+    engine: "kingfisher",
+    skipped_total: 0,
+    skipped: [],
     ...overrides,
   };
 }
@@ -329,5 +335,76 @@ describe("parseSecretsReport", () => {
     expect(parseSecretsReport({ ...report(), kingfisher_version_rejected: true })
       .kingfisher_version_rejected).toBe(true);
     expect(parseSecretsReport(report()).kingfisher_version_rejected).toBe(false);
+  });
+});
+
+const IN_HOUSE = "dc-redact 0.2.5 (devcouncil@b9b2314d)";
+
+/** What the in-process scanner returns: no version, no confidence, no groups. */
+function inHouse(overrides: Partial<SecretsReport> = {}): SecretsReport {
+  return report({
+    engine: IN_HOUSE,
+    kingfisher_present: false,
+    kingfisher_version: null,
+    nested_repos_scanned: false,
+    max_file_size_mb: 32,
+    ...overrides,
+  });
+}
+
+describe("the in-process engine", () => {
+  it("is named in the header, and Kingfisher keeps its version", () => {
+    expect(engineLabel(inHouse())).toBe(IN_HOUSE);
+    expect(engineLabel(report({ engine: "kingfisher" }))).toBe("Kingfisher 2.7.0");
+    expect(engineLabel(report({ engine: "" }))).toBe("unknown engine");
+  });
+
+  it("offers the deep scan only beside an in-process result, and only when Kingfisher is installed", () => {
+    expect(offersDeepScan(inHouse({ kingfisher_present: true }))).toBe(true);
+    expect(offersDeepScan(inHouse({ kingfisher_present: false }))).toBe(false);
+    expect(offersDeepScan(report({ engine: "kingfisher", kingfisher_present: true }))).toBe(false);
+  });
+
+  it("says clean for a complete empty scan, in the engine's own words", () => {
+    const v = verdict(inHouse());
+    expect(v.tone).toBe("ok");
+    expect(v.detail).toContain(IN_HOUSE);
+    expect(v.detail).not.toContain("Kingfisher");
+  });
+
+  it("never calls a scan with skipped inputs clean, and names them", () => {
+    const skipped = [{ path: "big.bin", reason: "larger than the scan reads", bytes: 40_000_000 }];
+    const partial = inHouse({ completeness: "partial", skipped_total: 3, skipped });
+    const v = verdict(partial);
+    expect(v.tone).toBe("warn");
+    expect(v.title).toContain("partial");
+    expect(v.detail).toContain("3 inputs not read: big.bin (larger than the scan reads), and 2 more.");
+    expect(v.detail).toContain("not a clean result");
+    expect(skippedNote(partial)).toContain("big.bin");
+    expect(skippedNote(inHouse())).toBeNull();
+  });
+
+  it("states the narrower scope instead of Kingfisher's", () => {
+    const notes = scopeNotes(inHouse({ excluded_paths: ["vendor/inner/"] })).join("\n");
+    expect(notes).toContain("Ignored files");
+    expect(notes).toContain("far fewer credential shapes");
+    expect(notes).toContain("nested repositories and submodules");
+    expect(notes).not.toContain("skipped without being reported");
+    expect(notes).not.toContain("kingfisher:ignore");
+  });
+
+  it("parses a report that lists skips as partial even if it declared complete", () => {
+    const parsed = parseSecretsReport({
+      ok: true,
+      engine: IN_HOUSE,
+      completeness: "complete",
+      findings: [],
+      skipped_total: 1,
+      skipped: [{ path: "a", reason: "could not be read", bytes: null }],
+    });
+    expect(parsed.completeness).toBe("partial");
+    expect(parsed.engine).toBe(IN_HOUSE);
+    expect(parsed.skipped).toEqual([{ path: "a", reason: "could not be read", bytes: null }]);
+    expect(verdict(parsed).tone).toBe("warn");
   });
 });

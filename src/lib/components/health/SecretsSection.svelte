@@ -12,7 +12,7 @@
   const secretsCache = createRepoPanelCache<SecretsReport>();
 
   /**
-   * The Kingfisher scan in flight for each repository.
+   * The scan in flight for each repository, in-process or deep.
    *
    * Module-level, not per instance. Health renders this section from more
    * than one branch (the local scan loading, failed, or loaded), so a
@@ -22,9 +22,14 @@
    */
   const inflightScans = createScanJoin<SecretsReport>();
 
-  function scanRepository(repoPath: string): Promise<SecretsReport> {
-    return inflightScans.run(repoPath, () =>
-      invoke<unknown>("cmd_scan_secrets", { repoPath }).then((payload) => {
+  // A deep scan is a different request from the in-process one, so it is
+  // joined under its own key: a click on "Deep scan" must not attach itself
+  // to a scan of the other kind already running.
+  const DEEP_KEY = "\0deep";
+
+  function scanRepository(repoPath: string, deep: boolean): Promise<SecretsReport> {
+    return inflightScans.run(deep ? repoPath + DEEP_KEY : repoPath, () =>
+      invoke<unknown>("cmd_scan_secrets", deep ? { repoPath, deep: true } : { repoPath }).then((payload) => {
         const next = parseSecretsReport(payload);
         if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
         return next;
@@ -64,8 +69,10 @@
     filterFindings,
     findingKey,
     groupSizes,
+    engineLabel,
     isStale,
     isSuperseded,
+    offersDeepScan,
     locationChips,
     locationLabel,
     scopeNotes,
@@ -91,9 +98,11 @@
   /**
    * Working-tree secrets, as a section of Health.
    *
-   * Kingfisher findings located against Git: tracked, untracked, ignored,
-   * nested repository. No secret value is ever read or shown — a finding is a
-   * rule, a path and a line.
+   * Findings located against Git: tracked, untracked, ignored, nested
+   * repository. The in-process scanner answers; Kingfisher is the opt-in deep
+   * scan, offered once a result is on screen and Kingfisher is installed. No
+   * secret value is ever read or shown — a finding is a rule, a path and a
+   * line.
    *
    * The scan is this section's own, independent of the dependency scan above
    * it: a failed npm audit says nothing about secrets, so the section renders
@@ -119,6 +128,8 @@
   } = $props();
 
   let loading = $state(false);
+  /** The scan in flight is the deep one, so its own button carries the spinner. */
+  let deepRunning = $state(false);
   let errorMsg = $state<string | null>(null);
   let filter = $state<LocationFilter>("all");
   let expanded = $state(false);
@@ -184,7 +195,7 @@
     pending = false;
   }
 
-  async function scan(path?: string) {
+  async function scan(path?: string, deep = false) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     stopPending();
@@ -192,11 +203,12 @@
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
+    deepRunning = deep;
     errorMsg = null;
     held = null;
     const failureKey = `secrets:${repoPath}`;
     try {
-      const next = await scanRepository(repoPath);
+      const next = await scanRepository(repoPath, deep);
       if (!next.ok) recordFailure(scanFailureCopy(next));
       // Per repository, not per pane: it must be recorded even when this pane
       // was left before the scan returned. A scan a newer one replaced is
@@ -218,7 +230,10 @@
     } finally {
       // A cancelled scan must still release the spinner when nothing newer
       // has taken over; otherwise a closed-then-reopened path spins forever.
-      if (inflight === guard) loading = false;
+      if (inflight === guard) {
+        loading = false;
+        deepRunning = false;
+      }
     }
   }
 
@@ -360,7 +375,7 @@
         <span class="text-meta text-textMuted" data-testid="secrets-meta">
           {#if !report.ok}<span class="text-warn">Unavailable</span>{/if}
           {#if scannedAgo}{report.ok ? "" : "· "}scanned {scannedAgo}{/if}
-          {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
+          <span data-testid="secrets-engine" title="The scanner that produced this result">· {engineLabel(report)}</span>
           {#if report.kingfisher_version_rejected}<span
               class="text-warn"
               title="The scan output named a version that was refused as unsafe to display.">
@@ -380,6 +395,24 @@
           Fix with agent
         </button>
       {/if}
+      {#if report && offersDeepScan(report) && $repoStore.currentPath}
+        <button
+          type="button"
+          class="gp-btn"
+          data-size="sm"
+          data-testid="secrets-deep-scan"
+          title="Run Kingfisher over the whole working tree, ignored files included. Slower, and starts a separate program."
+          onclick={() => scan(undefined, true)}
+          disabled={loading}
+        >
+          {#if loading && deepRunning}
+            <LoaderCircle size={13} class="animate-spin" />
+            Deep scanning…
+          {:else}
+            Deep scan with Kingfisher
+          {/if}
+        </button>
+      {/if}
       <button
         type="button"
         class="gp-btn"
@@ -388,7 +421,7 @@
         disabled={loading || !$repoStore.currentPath}
         aria-label="Rescan secrets"
       >
-        {#if loading}
+        {#if loading && !deepRunning}
           <LoaderCircle size={13} class="animate-spin" />
           {report ? "Rescanning…" : "Scanning…"}
         {:else}
@@ -403,11 +436,11 @@
     <p class="text-meta text-textMuted" data-testid="secrets-backoff">{describeBackoff(held)}</p>
   {/if}
   {#if !$repoStore.currentPath}
-    <p class="text-textMuted">No repository open. Open one to scan its working tree with Kingfisher.</p>
+    <p class="text-textMuted">No repository open. Open one to scan its working tree.</p>
   {:else if pending && !report && !loading}
     <p class="text-textMuted">The working-tree scan starts once you stay on this page. Rescan starts it now.</p>
   {:else if loading && !report}
-    <!-- A full Kingfisher scan outlasts a second, so the wait is a skeleton;
+    <!-- A full-tree scan can outlast a second, so the wait is a skeleton;
          the spinner lives only inside the busy Rescan button above. -->
     <div class="space-y-2">
       <p class="text-textMuted">Scanning working tree…</p>
@@ -543,12 +576,12 @@
       <EmptyState
         icon={ShieldCheck}
         title="Nothing to rotate"
-        hint="No secret matched in the files Kingfisher could read. The scope below says what that covers."
+        hint="No secret matched in the files the scan could read. The scope below says what that covers."
         compact
       />
     {/if}
 
-    {#if report.kingfisher_present}
+    {#if report.ok || report.kingfisher_present}
       <details class="text-meta text-textMuted px-0.5" data-testid="secrets-scope">
         <summary class="cursor-pointer select-none">What this scan covers</summary>
         <ul class="mt-1.5 space-y-0.5 list-disc pl-4">

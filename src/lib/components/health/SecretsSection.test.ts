@@ -78,6 +78,21 @@ describe("SecretsSection", () => {
     expect(source).toContain("total: report.findings_total");
   });
 
+  it("names the engine and offers Kingfisher only as a secondary deep scan", () => {
+    // The default scan sends no `deep` argument; the deep scan sends it
+    // explicitly, and is offered through the tested `offersDeepScan` rule.
+    expect(source).toContain('invoke<unknown>("cmd_scan_secrets", deep ? { repoPath, deep: true } : { repoPath })');
+    expect(source).toContain("offersDeepScan(report)");
+    expect(source).toContain("Deep scan with Kingfisher");
+    expect(source).toContain("onclick={() => scan(undefined, true)}");
+    expect(source).toContain('data-testid="secrets-engine"');
+    expect(source).toContain("{engineLabel(report)}");
+    // A deep scan never attaches itself to an in-process scan already running.
+    expect(source).toContain("deep ? repoPath + DEEP_KEY : repoPath");
+    // The automatic scan is still the primary one.
+    expect(source).toContain("run: () => void scan(path)");
+  });
+
   it("is a Health section, between the GitHub alerts and the issues", () => {
     expect(source).toContain('<HealthSection id="secrets"');
     const at = HEALTH_SECTION_IDS.indexOf("secrets");

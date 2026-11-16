@@ -1,7 +1,7 @@
 /**
- * Mirror of `src-tauri/src/secrets/parse.rs` — `SecretsReport` and
- * `SecretFinding`, checked field-for-field by `check:types` (CONTRACTS row
- * "secrets").
+ * Mirror of `src-tauri/src/secrets/parse.rs` — `SecretsReport`,
+ * `SecretFinding` and `SecretSkip`, checked field-for-field by `check:types`
+ * (CONTRACTS row "secrets").
  */
 
 import { redactDiagnosticText } from "../diagnostics/diagnostics";
@@ -16,7 +16,10 @@ export type SecretLocation =
   | "outside"
   | "unknown";
 
-/** Whether Kingfisher said it read every input. */
+/**
+ * Whether the scan read every input: Kingfisher's own audit for its deep
+ * scan, the in-process scanner's account of what it skipped otherwise.
+ */
 export type ScanCompleteness = "complete" | "partial" | "unverified";
 
 export interface SecretFinding {
@@ -33,8 +36,21 @@ export interface SecretFinding {
   secret_group: number;
 }
 
+/** One input the in-process scan did not read; a hole, never a clean file. */
+export interface SecretSkip {
+  path: string;
+  /** Why, as a sentence. */
+  reason: string;
+  bytes: number | null;
+}
+
 export interface SecretsReport {
   ok: boolean;
+  /**
+   * The scanner that produced this report: the in-process engine's name and
+   * version, or `kingfisher` for the opt-in deep scan.
+   */
+  engine: string;
   error?: string | null;
   /**
    * Copyable facts about a failed run. Never Kingfisher stdout or stderr.
@@ -61,10 +77,15 @@ export interface SecretsReport {
   max_file_size_mb: number;
   scanned_at_ms: number;
   duration_ms: number;
+  /** Inputs not read, all counted; `skipped` lists the first of them. */
+  skipped_total: number;
+  skipped: SecretSkip[];
 }
 
 /** `report::MAX_EXCLUSIONS` in the backend. */
 const MAX_EXCLUDED_PATHS = 256;
+/** `leak_scan::MAX_REPORTED_SKIPS` in the backend. */
+const MAX_SKIPPED = 200;
 
 const LOCATIONS: ReadonlySet<string> = new Set<SecretLocation>([
   "git_metadata",
@@ -139,14 +160,33 @@ export function parseSecretsReport(value: unknown): SecretsReport {
       secret_group: count(f.secret_group),
     });
   }
-  const completeness =
+  const skipped: SecretSkip[] = [];
+  if (Array.isArray(raw.skipped)) {
+    for (const item of raw.skipped.slice(0, MAX_SKIPPED)) {
+      const k = item && typeof item === "object" ? (item as Record<string, unknown>) : null;
+      if (!k || typeof k.path !== "string" || !k.path) continue;
+      skipped.push({
+        path: k.path.slice(0, 4_096),
+        reason: boundedText(k.reason, 200) ?? "was not read",
+        bytes: typeof k.bytes === "number" && Number.isFinite(k.bytes) && k.bytes >= 0 ? k.bytes : null,
+      });
+    }
+  }
+  const declared =
     typeof raw.completeness === "string" && COMPLETENESS.has(raw.completeness)
       ? (raw.completeness as ScanCompleteness)
       : "unverified";
+  // Fail closed: a report that lists unread inputs is not a complete scan,
+  // whatever it declared.
+  const completeness =
+    declared === "complete" && (skipped.length > 0 || count(raw.skipped_total) > 0)
+      ? "partial"
+      : declared;
   return {
     // A report that claims success with no findings array is not a scan
     // that found nothing; it is a payload this build cannot read.
     ok: raw.ok === true && findingsOk,
+    engine: boundedText(raw.engine, 128) ?? "",
     error:
       typeof raw.error === "string"
         ? boundedText(raw.error, 4_000)
@@ -174,5 +214,7 @@ export function parseSecretsReport(value: unknown): SecretsReport {
     max_file_size_mb: count(raw.max_file_size_mb),
     scanned_at_ms: count(raw.scanned_at_ms),
     duration_ms: count(raw.duration_ms),
+    skipped_total: Math.max(count(raw.skipped_total), skipped.length),
+    skipped,
   };
 }

@@ -234,7 +234,7 @@ export const CONTRACTS = Object.freeze([
   // The Secrets panel. `completeness` and `findings_unreadable` are what keep
   // a partial or lossy scan from rendering as clean; a rename on either side
   // would read as `undefined`, which the parser maps to "unverified" / 0.
-  { label: "secrets", rustPath: rust("secrets", "parse.rs"), tsPath: ts("secrets", "types.ts"), structs: ["SecretsReport", "SecretFinding"] },
+  { label: "secrets", rustPath: rust("secrets", "parse.rs"), tsPath: ts("secrets", "types.ts"), structs: ["SecretsReport", "SecretFinding", "SecretSkip"] },
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },

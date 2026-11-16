@@ -462,7 +462,7 @@ describe("the verdict stays total and stays honest", () => {
     kingfisher_version_rejected: false, nested_repos_scanned: true, excluded_paths: [],
     completeness: "complete",
     findings: [], findings_total: 0, findings_unreadable: 0, findings_truncated: false,
-    git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1,
+    git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1, engine: "kingfisher", skipped_total: 0, skipped: [],
   };
 
   it("never throws on hostile strings in any text-bearing field", () => {

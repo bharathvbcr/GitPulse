@@ -35,6 +35,9 @@ function cleanSecrets(overrides: Partial<SecretsReport> = {}): SecretsReport {
     max_file_size_mb: 256,
     scanned_at_ms: 1_000_000,
     duration_ms: 10,
+    engine: "kingfisher",
+    skipped_total: 0,
+    skipped: [],
     ...overrides,
   };
 }
