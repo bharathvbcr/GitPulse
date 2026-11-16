@@ -7723,6 +7723,7 @@ mod tests {
             stderr: err.as_bytes().to_vec(),
             success: code == 0,
             status_code: code,
+            signal: None,
             incomplete: None,
             stderr_incomplete: None,
             cancelled,
