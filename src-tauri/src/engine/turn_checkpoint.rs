@@ -1471,6 +1471,7 @@ pub fn diff_turn_checkpoint(
 /// git process runs, no ref is written and no ledger row is appended (the row
 /// needs the repository's address, which reads Git). Otherwise every attempt
 /// writes one ledger row naming its outcome; the reply carries the same result.
+#[cfg(target_os = "macos")]
 pub fn serve_turn_checkpoint(
     request: &crate::desktop::instance::Request,
 ) -> Result<serde_json::Value, String> {
@@ -1480,6 +1481,7 @@ pub fn serve_turn_checkpoint(
 }
 
 /// [`serve_turn_checkpoint`] with where the setting is read from passed in.
+#[cfg(target_os = "macos")]
 pub(crate) fn serve_turn_checkpoint_with(
     request: &crate::desktop::instance::Request,
     enabled: &dyn Fn() -> bool,

@@ -5033,6 +5033,7 @@ impl GitWriter {
     /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
     /// logged like any other failure (under the request's id), which is also
     /// what settles the hook's "unknown" row for the same write.
+    #[cfg(target_os = "macos")]
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
         not_after_send: Instant,
@@ -9927,6 +9928,7 @@ mod bound_to_checked_state {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
         let (_dir, repo) = repo_with_unprunable_expired_snapshot();
@@ -9982,7 +9984,8 @@ mod adv_tests;
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
 
-#[cfg(test)]
+// Every case builds a `desktop::instance::Request`, which exists on macOS only.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "git_writer_op_deadline_tests.rs"]
 mod op_deadline_tests;
 

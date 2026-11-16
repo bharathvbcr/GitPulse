@@ -1012,6 +1012,8 @@ fn gitpulse_state_nested_repos_and_symlinked_ignores_are_counted_not_captured() 
 
 // ── the app handler and the mailbox ──────────────────────────────────────────
 
+// The handler and its requests exist on macOS only (`desktop::instance`).
+#[cfg(target_os = "macos")]
 fn request(root: &Path, event: &str) -> crate::desktop::instance::Request {
     crate::desktop::instance::Request::RecordTurnCheckpoint {
         id: "turn-test-1".into(),
@@ -1024,10 +1026,12 @@ fn request(root: &Path, event: &str) -> crate::desktop::instance::Request {
 
 /// The handler with the setting on, without reading the developer's real
 /// `tools.json`.
+#[cfg(target_os = "macos")]
 fn serve_on(request: &crate::desktop::instance::Request) -> Result<serde_json::Value, String> {
     serve_turn_checkpoint_with(request, &|| true)
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_app_refuses_to_capture_when_the_setting_is_off() {
     let dir = init();
@@ -1070,6 +1074,7 @@ fn the_app_refuses_to_capture_when_the_setting_is_off() {
     assert_eq!(reply["outcome"], "captured", "{reply}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn every_attempt_that_reaches_the_app_leaves_one_ledger_row_with_its_outcome() {
     let dir = init();
@@ -1126,6 +1131,7 @@ fn every_attempt_that_reaches_the_app_leaves_one_ledger_row_with_its_outcome() {
         .contains("unborn"));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn an_unknown_event_is_refused_by_the_handler() {
     let dir = init();
