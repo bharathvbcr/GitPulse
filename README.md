@@ -105,7 +105,7 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   frequent actions close. Background windows stop their timers instead of polling.
 
 The [feature reference](docs/FEATURES.md) describes each surface and its limits.
-The [changelog](CHANGELOG.md) records release changes; [open qualification](docs/QUALIFICATION.md)
+The [changelog](CHANGELOG.md) records release changes; [open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md)
 tracks remaining platform, provider, and performance checks.
 
 ![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)

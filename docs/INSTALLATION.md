@@ -23,7 +23,7 @@ workflow has been tested on that platform.
 > produced and covered by the automated suites, but are not exercised against a
 > running app by a person. Some features are deliberately macOS-only — desktop
 > notifications among them — and others are simply untried elsewhere.
-> [Platform coverage](QUALIFICATION.md#platform-coverage) lists which is which.
+> [Platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) lists which is which.
 
 Git must be installed and available to the app. For native build dependencies,
 see [Contributing](../CONTRIBUTING.md).

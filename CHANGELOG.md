@@ -2825,7 +2825,7 @@ forked, and a test suite whose verdict depended on how busy the machine was.
   first launch should be the reversible one, and the managed lane stays a
   deliberate choice. An existing remembered preference is untouched.
 - **Platform coverage is written down.** [Platform
-  coverage](docs/QUALIFICATION.md#platform-coverage) separates what is *known
+  coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) separates what is *known
   absent* off macOS — desktop notifications for activity and agent sessions, the
   agent hook socket, the menu-bar status item — from what is merely *unverified*
   there, such as managed runs. macOS is the platform GitPulse is developed and

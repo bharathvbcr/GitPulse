@@ -19,19 +19,32 @@
  * Compatibility": "Cursor supports both Claude Code's nested
  * `hookSpecificOutput` response format and the older flat response format."
  */
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const qualification = readFileSync(
-  new URL("../docs/QUALIFICATION.md", import.meta.url),
-  "utf8",
-);
+const QUALIFICATION_PATH = "docs/QUALIFICATION.md";
+const qualificationUrl = new URL(`../${QUALIFICATION_PATH}`, import.meta.url);
+const hasQualification = existsSync(fileURLToPath(qualificationUrl));
+
+const qualification = hasQualification ? readFileSync(qualificationUrl, "utf8") : "";
 const start = qualification.indexOf("### Plugin hooks per agent host");
 const end = qualification.indexOf("### Native PTY", start);
 const section = qualification.slice(start, end);
 const found = start > 0 && end > start;
 
-describe("absence claims in the Cursor rows of docs/QUALIFICATION.md", () => {
+it(`${QUALIFICATION_PATH} may be absent only while git ignores it`, () => {
+  if (hasQualification) return;
+  const ignored = spawnSync("git", ["check-ignore", "-q", "--", QUALIFICATION_PATH], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    timeout: 5_000,
+  });
+  expect(ignored.error, "git check-ignore could not run").toBeUndefined();
+  expect(ignored.status, `${QUALIFICATION_PATH} is missing and not ignored`).toBe(0);
+});
+
+describe.skipIf(!hasQualification)("absence claims in the Cursor rows of docs/QUALIFICATION.md", () => {
   it("finds its section (a missing one must fail every test, not pass them)", () => {
     expect(found).toBe(true);
   });

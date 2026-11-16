@@ -121,7 +121,7 @@ must still pass on their respective operating systems.
 > Linux build regularly, so a change that only breaks there will not be caught
 > by a person — only by whatever assertion happens to cover it. If you are
 > touching anything platform-shaped, read
-> [platform coverage](docs/QUALIFICATION.md#platform-coverage) first: it
+> [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) first: it
 > separates what is *known absent* off macOS from what is merely *unverified*,
 > and those need different treatment. Write the other platform's behaviour as a
 > `cfg` arm you can compile here rather than relying on a build nobody runs —
@@ -224,7 +224,7 @@ flowchart TD
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
-For the DevMap watcher/diagnostics boundary, run `bun run test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `bun run test:browser` and `bun run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [docs/QUALIFICATION.md](docs/QUALIFICATION.md); the dated DevMap verification ledger is [DEVMAP_AUDIT.md at commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md).
+For the DevMap watcher/diagnostics boundary, run `bun run test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `bun run test:browser` and `bun run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [QUALIFICATION.md at commit 90362c2e](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md); the dated DevMap verification ledger is [DEVMAP_AUDIT.md at commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md).
 
 ### Contracts enforced by tests rather than scripts
 

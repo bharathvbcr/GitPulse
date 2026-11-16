@@ -72,7 +72,7 @@ Four properties are deliberate:
 
 Where the transport does not exist (Windows has no Unix socket), `notify` reports `unsupported` once per invocation at info and exits 0, before it looks for a configuration directory, so an unset `APPDATA` is not a warning. That is a third outcome, not a delivery and not a failure; the bridge is not offered on Windows (ft-959d4d26).
 
-Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#platform-coverage).
+Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage).
 
 The command gate runs without a bound task scope, so it reaches the hard rungs (force-push, destructive commands) and not the scope rungs. That is a smaller gate than the desktop app's, and a real one.
 
@@ -90,7 +90,7 @@ In a checkout bound to a task, both hooks judge writes against the task's plan. 
 One canonical package: [`plugins/gitpulse/`](https://github.com/bharathvbcr/GitPulse/tree/main/plugins/gitpulse)
 
 - Codex: `.codex-plugin/plugin.json` + `.mcp.json`
-- Cursor: `.cursor-plugin/plugin.json` (identity and logo only; no hooks entry, because Cursor's documented plugin `hooks/hooks.json` is a different format from ours and the fields ours rely on are undocumented there: [plugin hooks per agent host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#plugin-hooks-per-agent-host))
+- Cursor: `.cursor-plugin/plugin.json` (identity and logo only; no hooks entry, because Cursor's documented plugin `hooks/hooks.json` is a different format from ours and the fields ours rely on are undocumented there: [plugin hooks per agent host](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#plugin-hooks-per-agent-host))
 - Claude Code compatibility files
 - Agent Plugins 1.0 manifests
 - Shared `skills/`

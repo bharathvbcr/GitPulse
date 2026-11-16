@@ -481,7 +481,7 @@ Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
 delivery to the provider are separate states. Terminal handoffs do not produce
 those structured callbacks. Full crash recovery remains a qualification gap; see
-the [implementation contract](AGENTIC_WORKSPACES_PLAN.md) and
+the [implementation contract](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md) and
 [architecture](ARCHITECTURE.md#agentic-workbench-implemented-core-broader-qualification-in-progress).
 
 ### Reviewing an attempt before it is merged
@@ -493,7 +493,7 @@ on, merging or cherry-picking an attempt's branch — from the panels, the
 attempt's **Merge** button or the GitPulse terminal — is refused until someone
 approves exactly that range, or records a merge without review and says why.
 A commit after the approval needs a new one. See
-[AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md).
+[AGENT_OUTPUT_REVIEW.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENT_OUTPUT_REVIEW.md).
 
 ### Providers with a managed lane
 
@@ -554,7 +554,7 @@ project context are unaffected; only settings files are scoped.
 > [!NOTE]
 > Managed runs are verified on macOS only. Neither adapter uses a Unix-specific
 > API, but both end-to-end tests are `#[cfg(unix)]`, so Windows is untried
-> rather than known-good. See [platform coverage](QUALIFICATION.md#platform-coverage).
+> rather than known-good. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage).
 
 ## Keyboard controls
 

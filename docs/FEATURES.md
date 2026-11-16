@@ -4,7 +4,7 @@
 
 This is the detailed feature reference. Start with the guides above for a first
 session; use the sections below for controls, prerequisites, and limits.
-[Open qualification](QUALIFICATION.md) tracks verification that remains outstanding.
+[Open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md) tracks verification that remains outstanding.
 
 ## Find a workflow
 
