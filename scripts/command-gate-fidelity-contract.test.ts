@@ -46,7 +46,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_rename_branch: "GitWriter::rename_branch_argv builds the line the gate judges and rename_branch runs; commands/parity_tests.rs asserts judged == spawned",
   cmd_create_tag: "GitWriter::create_tag_argv builds the line the gate judges and create_tag runs; commands/parity_tests.rs asserts judged == spawned",
   cmd_delete_tag: "GitWriter::delete_tag_argv builds the line the gate judges and delete_tag runs; commands/parity_tests.rs asserts judged == spawned",
-  cmd_publish_release: "create_tag_argv and push_tag_argv build the two lines the gate judges, and create_tag and push_tag run them; commands/parity_tests.rs asserts judged == spawned",
+  cmd_publish_release: "create_tag_argv and push_tag_argv build the two lines the gate judges, and create_tag and push_tag_with_policy run them; commands/parity_tests.rs asserts judged == spawned",
   cmd_checkout_detached: "GitWriter::checkout_detached_argv builds the line the gate judges, and checkout_detached runs that same function's argv",
   cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",

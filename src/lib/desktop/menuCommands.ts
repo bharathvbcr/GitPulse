@@ -82,7 +82,9 @@ export function createMenuCommands(deps: MenuCommandDeps = defaultMenuCommandDep
   async function outcome(work: () => Promise<MutationOutcome>, success: string) {
     const result = await work();
     if (result.ok) deps.success(success);
-    else if (result.error) deps.error(result.error);
+    // A failure already surfaced (the session's error toast, or the secret
+    // scan's refusal with its "Push anyway") is not said a second time.
+    else if (result.error && !result.surfaced) deps.error(result.error);
   }
   const mutation = (id: string, work: () => Promise<MutationOutcome>, success: string) => () => run(id, () => outcome(work, success));
   const operate = (action: OperationAction) => () => run(`operation-${action}`, async (state) => {

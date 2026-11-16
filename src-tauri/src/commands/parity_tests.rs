@@ -320,6 +320,7 @@ fn every_judged_writer_runs_the_line_its_command_judged() {
         repo.clone(),
         "v1.0.0".into(),
         "Release v1.0.0".into(),
+        None,
     ));
     result.expect("publish release");
     // The tag, then the push: both are judged before either runs.
@@ -375,6 +376,7 @@ fn a_blocked_ref_command_starts_no_mutating_child() {
         repo.clone(),
         "v2.0.0".into(),
         "Release v2.0.0".into(),
+        None,
     ));
     assert_blocked(result);
     seen.assert_nothing_mutated("publish release");

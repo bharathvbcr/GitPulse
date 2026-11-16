@@ -33,6 +33,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 /// keeps [`DEFAULT_TIMEOUT`].
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Stream budget a run may declare when its observer drains stdout
+/// ([`ProcessObserver::drains_stdout`]): the bytes are dropped as they are
+/// seen, so [`MAX_OUTPUT_BYTES`]' reason — what a buffered read costs to
+/// hold — does not apply, but the stream is still bounded, and every byte
+/// still counts against the declared cap.
+pub const MAX_DRAINED_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -1132,13 +1138,16 @@ fn run_admitted_inner(
         )
         .into());
     }
-    if stdout_cap > MAX_OUTPUT_BYTES
-        || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
+    let stdout_limit = if observer.drains_stdout() {
+        MAX_DRAINED_OUTPUT_BYTES
+    } else {
+        MAX_OUTPUT_BYTES
+    };
+    if stdout_cap > stdout_limit || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
     {
-        return Err(format!(
-            "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
-        )
-        .into());
+        return Err(
+            format!("{label} input/output budget exceeds the {stdout_limit} byte limit").into(),
+        );
     }
     let queue_deadline = gate.clock.now() + timeout;
     if stdin_bytes.is_some() {
