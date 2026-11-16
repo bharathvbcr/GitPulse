@@ -896,20 +896,27 @@ impl Thresholds {
                     Tier::Severe => this.disk_guard.fill.severe_within_min,
                     _ => this.disk_guard.fill.elevated_within_min,
                 };
+                // What a recovered reading is held for: a Severe the fill rule
+                // caused is kept for its release hold, anything else until it
+                // stays clear.
+                let held_for = match held {
+                    Tier::Severe => format!(
+                        "held for {} minutes after the fill rate last read severe",
+                        super::governor::FILL_SEVERE_RELEASE.as_secs() / 60
+                    ),
+                    _ => "held until it stays clear".to_string(),
+                };
                 let Some(fill) = this.fill_projection(readings).ok().flatten() else {
-                    return Some(
-                        "free disk space is no longer falling fast enough to project, held until it stays clear"
-                            .to_string(),
-                    );
+                    return Some(format!(
+                        "free disk space is no longer falling fast enough to project, {held_for}"
+                    ));
                 };
                 let (free, floor) = (fill.free_bytes as f64 / GIB, fill.floor_bytes as f64 / GIB);
                 let rate = fill.rate_bytes_per_min as f64 / GIB;
                 let verdict = if fill.eta_min < horizon {
                     format!("inside the {horizon:.0} minute horizon")
                 } else {
-                    format!(
-                        "now outside the {horizon:.0} minute horizon, held until it stays clear"
-                    )
+                    format!("now outside the {horizon:.0} minute horizon, {held_for}")
                 };
                 format!(
                     "free disk space is {free:.1} GiB and falling by {rate:.1} GiB a minute, about {:.0} minutes until the {floor:.0} GiB floor, {verdict}",

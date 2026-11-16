@@ -401,11 +401,12 @@ fn availability(input: &Input) -> Availability {
 /// One sample's tier and the resource that put it there: the highest tier any
 /// input reaches, and on equal tiers the first of memory pressure, compressor
 /// thrash, compressor segments, swap, low disk, thermal, CPU load, battery.
-fn sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
+fn sample(input: &Input) -> Option<Sample> {
     if !matches!(availability(input), Availability::Governing) {
         return None;
     }
     let mut best = (Tier::Clear, None);
+    let mut fill = Tier::Clear;
     let mut consider = |tier: Tier, binding: Binding| {
         if tier > best.0 {
             best = (tier, Some(binding));
@@ -421,9 +422,25 @@ fn sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
         consider(Tier::Elevated, Binding::MemoryPressure);
     }
     for c in input.thresholds.assess(&input.readings).contributions {
+        if c.binding == Binding::DiskFilling {
+            fill = fill.max(c.tier);
+        }
         consider(c.tier, c.binding);
     }
-    Some(best)
+    Some(Sample {
+        tier: best.0,
+        binding: best.1,
+        fill,
+    })
+}
+
+/// What one sample read: the tier and the resource that put it there, and,
+/// whichever of them won, the tier the fill rule itself read. The release hold
+/// follows that reading, not whichever cause the binding happens to name.
+struct Sample {
+    tier: Tier,
+    binding: Option<Binding>,
+    fill: Tier,
 }
 
 fn level_words(level: Option<Level>) -> String {
@@ -595,6 +612,13 @@ pub struct Governor {
     /// The highest tier, and its binding, of the current run below the held
     /// one: what the run leaves to.
     down: (Tier, Option<Binding>),
+    /// Consecutive counted ticks the fill rule has read Severe.
+    fill_run: u32,
+    /// Counted ticks since the fill rule last read Severe, once it read it for
+    /// [`ENTER_SAMPLES`] in a row (so a blip under another cause's Severe arms
+    /// nothing): the fill hold. Leaving Severe waits for it to reach
+    /// [`FILL_SEVERE_RELEASE_SAMPLES`], whichever cause the held tier names.
+    fill_since: Option<u32>,
     last: Option<(Instant, Input)>,
     refusing_since: Option<Instant>,
     noticed: bool,
@@ -610,6 +634,8 @@ impl Default for Governor {
             up: (Tier::Severe, None),
             down_streak: 0,
             down: (Tier::Clear, None),
+            fill_run: 0,
+            fill_since: None,
             last: None,
             refusing_since: None,
             noticed: false,
@@ -632,9 +658,9 @@ impl Governor {
     /// history. `now` is when the sample was taken.
     pub fn instant(now: Instant, input: Input) -> Self {
         let mut governor = Self::default();
-        if let Some((tier, binding)) = sample(&input) {
-            governor.held = tier;
-            governor.binding = binding;
+        if let Some(read) = sample(&input) {
+            governor.held = read.tier;
+            governor.binding = read.binding;
         }
         governor.last = Some((now, input));
         governor
@@ -665,8 +691,13 @@ impl Governor {
                 self.binding = None;
                 self.up_streak = 0;
                 self.down_streak = 0;
+                self.fill_run = 0;
+                self.fill_since = None;
             }
-            Some((tier, binding)) if counts => self.count(tier, binding),
+            Some(read) if counts => {
+                self.count_fill(read.fill);
+                self.count(read.tier, read.binding);
+            }
             Some(_) => {}
         }
         self.last = Some((now, input));
@@ -686,6 +717,28 @@ impl Governor {
             verdict,
             notice_raised,
         }
+    }
+
+    /// The fill hold's clock: armed by [`ENTER_SAMPLES`] consecutive Severe
+    /// readings of the fill rule, restarted by each one after that, and
+    /// advanced by every counted tick it reads lower.
+    fn count_fill(&mut self, fill: Tier) {
+        if fill == Tier::Severe {
+            self.fill_run += 1;
+            if self.fill_run >= ENTER_SAMPLES || self.fill_since.is_some() {
+                self.fill_since = Some(0);
+            }
+        } else {
+            self.fill_run = 0;
+            self.fill_since = self.fill_since.map(|ticks| ticks.saturating_add(1));
+        }
+    }
+
+    /// Whether the fill hold lets Severe go: it was never armed, or the fill
+    /// rule has read lower for [`FILL_SEVERE_RELEASE_SAMPLES`] counted ticks.
+    fn fill_hold_released(&self) -> bool {
+        self.fill_since
+            .is_none_or(|ticks| ticks >= FILL_SEVERE_RELEASE_SAMPLES)
     }
 
     fn count(&mut self, tier: Tier, binding: Option<Binding>) {
@@ -711,15 +764,14 @@ impl Governor {
                     self.down = (tier, binding);
                 }
                 self.down_streak += 1;
-                // Only a Severe the fill rule holds is kept longer: the cause
-                // is the binding the held tier carries.
-                let exit =
-                    if self.held == Tier::Severe && self.binding == Some(Binding::DiskFilling) {
-                        FILL_SEVERE_RELEASE_SAMPLES
-                    } else {
-                        EXIT_SAMPLES
-                    };
-                if self.down_streak >= exit {
+                // Severe is left on both clocks: the ordinary down streak, and,
+                // when the fill rule armed its hold, the hold's own. The hold
+                // follows the fill rule's reading, not the held binding.
+                let released = self.held != Tier::Severe || self.fill_hold_released();
+                if self.down_streak >= EXIT_SAMPLES && released {
+                    if self.held == Tier::Severe {
+                        self.fill_since = None;
+                    }
                     (self.held, self.binding) = self.down;
                     self.down_streak = 0;
                 }
@@ -760,12 +812,25 @@ impl Governor {
             Some((at, input)) => {
                 let aged = input.aged(now.saturating_duration_since(*at));
                 // An input the ageing made ungovernable holds no tier.
-                let held = if sample(&aged).is_some() {
+                let read = sample(&aged);
+                let held = if read.is_some() {
                     self.held
                 } else {
                     Tier::Clear
                 };
-                decide(&aged, held, self.binding)
+                // A Severe kept only by the fill hold (every current reading
+                // is lower) names the fill rule, whatever cause entered it.
+                let binding = match &read {
+                    Some(read)
+                        if held == Tier::Severe
+                            && read.tier < Tier::Severe
+                            && self.fill_since.is_some() =>
+                    {
+                        Some(Binding::DiskFilling)
+                    }
+                    _ => self.binding,
+                };
+                decide(&aged, held, binding)
             }
         }
     }

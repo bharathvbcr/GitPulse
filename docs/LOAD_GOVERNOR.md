@@ -775,9 +775,17 @@ always acceptable:
 **Leaving a fill-caused Severe.** A Severe the fill rule caused is left only
 after the fill rule has read below Severe for 180 s without a break
 (`FILL_SEVERE_RELEASE`, 90 ticks), not the five ticks every other exit takes;
-the level, memory and CPU exits are unchanged. Causes are told apart by the
-binding the governor already holds while it is Severe: held Severe with the
-`disk_filling` binding gets the long release, anything else the short one. So
+the level, memory and CPU exits are unchanged. The hold follows the fill rule's
+own reading, whichever cause the held binding names: the governor counts the
+ticks since the fill rule last read Severe (armed once it read Severe for the
+three ticks entering a tier takes, so a one-tick blip under another cause's
+Severe arms nothing), and Severe is left only when both the ordinary five
+ticks and that count have run out. When memory pressure, swap or the disk level
+is Severe at the same time as the fill, the hold still applies; while it alone
+keeps Severe (every current reading lower) the verdict names the fill rule and
+says it is held after the reading recovered, not that a threshold is crossed.
+The count is forgotten when the sensor goes unavailable and does not advance on
+a re-read snapshot. So
 a build that writes in lumps with pauses of up to 240 s is held at Severe from
 the first bind until free space reaches the floor, where the level rule takes
 over, rather than admitting launches in each pause. The cost is a linger: a
@@ -845,8 +853,10 @@ and with `host_load.govern_launches` off they advise and never refuse.
 **Not covered, by name.** `cd /elsewhere && cargo build` writes to
 `/elsewhere`, which the hook cannot know without evaluating the shell; only
 the `cwd` it was given and the literal build directories above are read.
-`sudo`, `xargs`, `env --chdir`, cargo aliases, a build directory from a shell
-variable or a `~` (`--target-dir ~/x`, `--target-dir=~/x`, `CARGO_TARGET_DIR=$HOME/x`),
+`sudo`, `xargs`, `env --chdir`, cargo aliases, a build directory the line names
+through a variable or `~` (`--target-dir ~/x`, `--target-dir=~/x`,
+`CARGO_TARGET_DIR=$HOME/x`), which is dropped and the line is then judged on
+the `cwd` alone,
 `export CARGO_TARGET_DIR=/x; cargo build`, a `CARGO_TARGET_DIR` already set in
 the session, `build.target-dir` in `.cargo/config.toml`, `RUSTFLAGS` exported
 earlier in the line, `CARGO_ENCODED_RUSTFLAGS`, and `eval "$(cargo llvm-cov show-env ...)"; cargo test` are not

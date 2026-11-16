@@ -539,6 +539,301 @@ fn a_lone_burst_binds_severe_at_half_the_headroom_cold_and_all_of_it_warm() {
     }
 }
 
+/// Another resource that reads Severe over a window of seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Other {
+    MemoryCritical,
+    SwapSevere,
+}
+
+/// One tick of a replay with another cause overlapping the fill.
+#[derive(Debug, Clone)]
+struct Tick {
+    second: u64,
+    free: f64,
+    tier: Tier,
+    binding: Option<Binding>,
+    /// What the fill rule itself read, whichever cause the governor named.
+    fill: Tier,
+}
+
+fn fill_tier(input: &Input) -> Tier {
+    input
+        .thresholds
+        .assess(&input.readings)
+        .contributions
+        .iter()
+        .filter(|c| c.binding == Binding::DiskFilling)
+        .map(|c| c.tier)
+        .max()
+        .unwrap_or(Tier::Clear)
+}
+
+/// [`drive_until`] with `other` read Severe from second `from` up to `to`.
+fn drive_with(
+    free: impl Fn(u64) -> f64,
+    stop_at: f64,
+    other: Option<(Other, u64, u64)>,
+) -> Vec<Tick> {
+    let mut replay = Replay::new();
+    let memory = replay.input.readings.memsize.value().expect("memory size");
+    let mut ticks = Vec::new();
+    for i in 0..7_200u64 {
+        let second = i * 2;
+        let at = free(second);
+        if at <= stop_at {
+            break;
+        }
+        let active = |kind: Other| {
+            other.is_some_and(|(k, from, to)| k == kind && (from..to).contains(&second))
+        };
+        replay.input.level = Some(if active(Other::MemoryCritical) {
+            Level::Critical
+        } else {
+            Level::Normal
+        });
+        replay.input.readings.swap_used = Reading::Value(if active(Other::SwapSevere) {
+            memory / 10 * 9
+        } else {
+            0
+        });
+        let seen = replay.tick_gib(at);
+        ticks.push(Tick {
+            second,
+            free: at,
+            tier: seen.verdict.tier,
+            binding: seen.verdict.binding,
+            fill: fill_tier(&replay.input),
+        });
+    }
+    ticks
+}
+
+/// Seconds below Severe after the first Severe.
+fn seconds_outside_severe(ticks: &[Tick]) -> Vec<u64> {
+    let first = ticks.iter().position(|t| t.tier == Tier::Severe);
+    first.map_or(Vec::new(), |first| {
+        ticks[first..]
+            .iter()
+            .filter(|t| t.tier != Tier::Severe)
+            .map(|t| t.second)
+            .collect()
+    })
+}
+
+#[test]
+fn the_fill_hold_follows_the_fill_rule_whichever_cause_is_named() {
+    // 5 GiB every 80 s from 150 GiB: the fill rule reads Severe in stretches
+    // with pauses between them. Memory pressure critical, or swap Severe,
+    // overlaps the first stretch and eases during a pause in which the fill
+    // rule reads lower: the held binding is then not the fill rule, and the
+    // hold must still keep Severe until the floor.
+    let pattern = || lumps(150.0, 5.0, 1, 80, 30);
+    let baseline = drive_with(pattern(), 16.0, None);
+    let first = baseline
+        .iter()
+        .find(|t| t.tier == Tier::Severe)
+        .expect("the fill rule alone reaches Severe")
+        .second;
+    let pause = baseline
+        .windows(7)
+        .find(|w| {
+            w[0].second > first + 20
+                && w.iter()
+                    .all(|t| t.fill < Tier::Severe && t.tier == Tier::Severe)
+        })
+        .expect("the fill rule reads lower for 12 s inside the held Severe")[0]
+        .second;
+    assert_eq!(seconds_outside_severe(&baseline), Vec::<u64>::new());
+    for (other, binding) in [
+        (Other::MemoryCritical, Binding::MemoryPressure),
+        (Other::SwapSevere, Binding::Swap),
+    ] {
+        let ticks = drive_with(pattern(), 16.0, Some((other, first - 30, pause)));
+        assert!(
+            ticks
+                .iter()
+                .any(|t| t.tier == Tier::Severe && t.binding == Some(binding)),
+            "{other:?} must be the held cause for part of the run"
+        );
+        assert_eq!(
+            seconds_outside_severe(&ticks),
+            Vec::<u64>::new(),
+            "{other:?}: launches were admitted in the middle of the fill"
+        );
+        // Free space stayed above the 16 GiB floor throughout, so the level
+        // rule was never the reason.
+        assert!(ticks.iter().all(|t| t.free > 16.0), "{other:?}");
+        eprintln!("{other:?} eased at {pause} s: held Severe through the pauses");
+    }
+}
+
+/// A governor fed directly: free space is 40 GiB, and the fill rule reads
+/// Severe (10 GiB a minute, under four minutes to the floor) or nothing.
+struct Direct {
+    governor: Governor,
+    input: Input,
+    now: Instant,
+}
+
+impl Direct {
+    fn new() -> Self {
+        let mut input = Input::test_pressure(Level::Normal);
+        input.readings.free_disk = Reading::Value(40 << 30);
+        Self {
+            governor: Governor::default(),
+            input,
+            now: Instant::now(),
+        }
+    }
+
+    fn set(&mut self, memory_critical: bool, fill_severe: bool) {
+        self.input.level = Some(if memory_critical {
+            Level::Critical
+        } else {
+            Level::Normal
+        });
+        self.input.readings.disk_fill_sustained =
+            Reading::Value(if fill_severe { 10 << 30 } else { 0 });
+    }
+
+    /// One counted tick.
+    fn tick(&mut self, memory_critical: bool, fill_severe: bool) -> GovernorVerdict {
+        self.set(memory_critical, fill_severe);
+        self.now += Duration::from_millis(TICK_MS);
+        self.governor.observe(self.now, self.input.clone()).verdict
+    }
+
+    /// A tick that read the same snapshot again: nothing is counted.
+    fn repeat(&mut self, memory_critical: bool, fill_severe: bool) -> GovernorVerdict {
+        self.set(memory_critical, fill_severe);
+        self.now += Duration::from_millis(TICK_MS);
+        self.governor
+            .observe_repeat(self.now, self.input.clone())
+            .verdict
+    }
+
+    /// Memory critical for ten ticks, then `fill_ticks` ticks with the fill
+    /// rule Severe too. The last of those is the fill rule's last Severe.
+    fn memory_severe_then_fill(&mut self, fill_ticks: u32) {
+        for _ in 0..10 {
+            self.tick(true, false);
+        }
+        assert_eq!(self.governor.held, Tier::Severe);
+        assert_eq!(self.governor.binding, Some(Binding::MemoryPressure));
+        for _ in 0..fill_ticks {
+            self.tick(true, true);
+        }
+    }
+}
+
+#[test]
+fn a_fill_blip_of_one_or_two_ticks_under_a_memory_held_severe_arms_no_hold() {
+    for blip in [1, 2] {
+        let mut d = Direct::new();
+        d.memory_severe_then_fill(blip);
+        for _ in 0..3 {
+            d.tick(true, false);
+        }
+        // Memory eases and the fill rule reads nothing.
+        for eased in 1..=EXIT_SAMPLES {
+            let v = d.tick(false, false);
+            let severe = v.tier == Tier::Severe;
+            assert_eq!(
+                severe,
+                eased < EXIT_SAMPLES,
+                "a {blip}-tick blip, {eased} ticks after memory eased: {v:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_fill_hold_armed_under_a_memory_held_severe_is_left_exactly_at_the_release_samples() {
+    for gap in [1u32, 5, 20] {
+        let mut d = Direct::new();
+        d.memory_severe_then_fill(5);
+        // `last` is the fill rule's last Severe reading; memory stays critical
+        // for `gap` more ticks, then eases.
+        let mut left = None;
+        for after in 1..=FILL_SEVERE_RELEASE_SAMPLES + 5 {
+            let v = d.tick(after <= gap, false);
+            let severe = v.tier == Tier::Severe;
+            if !severe && left.is_none() {
+                left = Some(after);
+            }
+            if after > gap && severe {
+                assert_eq!(
+                    v.binding,
+                    Some(Binding::DiskFilling),
+                    "gap {gap}, {after} ticks after the fill rule's last Severe: {v:?}"
+                );
+                assert!(
+                    v.message
+                        .contains("held for 3 minutes after the fill rate last read severe"),
+                    "{}",
+                    v.message
+                );
+                assert!(!v.admit);
+            }
+            if after <= gap {
+                assert_eq!(v.binding, Some(Binding::MemoryPressure), "{v:?}");
+            }
+        }
+        assert_eq!(
+            left,
+            Some(FILL_SEVERE_RELEASE_SAMPLES),
+            "gap {gap}: Severe is left that many counted ticks after the fill rule's last Severe"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_snapshot_neither_arms_nor_advances_the_fill_hold() {
+    // Repeats of a fill-Severe reading under memory-held Severe arm nothing.
+    let mut d = Direct::new();
+    d.memory_severe_then_fill(0);
+    for _ in 0..20 {
+        d.repeat(true, true);
+    }
+    for eased in 1..=EXIT_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier == Tier::Severe, eased < EXIT_SAMPLES, "{v:?}");
+    }
+    // Repeats after the fill rule's last Severe do not run the hold's clock.
+    let mut d = Direct::new();
+    d.memory_severe_then_fill(5);
+    for _ in 1..FILL_SEVERE_RELEASE_SAMPLES {
+        assert_eq!(d.tick(false, false).tier, Tier::Severe);
+    }
+    for _ in 0..50 {
+        assert_eq!(d.repeat(false, false).tier, Tier::Severe);
+    }
+    assert_ne!(d.tick(false, false).tier, Tier::Severe);
+}
+
+#[test]
+fn a_sensor_that_goes_unavailable_mid_hold_carries_no_hold_back() {
+    let mut d = Direct::new();
+    d.memory_severe_then_fill(5);
+    d.tick(false, false);
+    d.input.state = SensorState::Dead;
+    let gone = d.tick(false, false);
+    assert_eq!(gone.tier, Tier::Clear, "{gone:?}");
+    d.input.state = SensorState::Fresh;
+    // Back and calm: no Severe is held over.
+    assert_eq!(d.tick(false, false).tier, Tier::Clear);
+    // A later memory Severe is left in the ordinary EXIT_SAMPLES.
+    for _ in 0..6 {
+        d.tick(true, false);
+    }
+    assert_eq!(d.governor.held, Tier::Severe);
+    for eased in 1..=EXIT_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier == Tier::Severe, eased < EXIT_SAMPLES, "{v:?}");
+    }
+}
+
 #[test]
 fn a_burst_of_a_minute_or_less_never_refuses_when_it_leaves_42_gib_or_more() {
     for (from, size, dur) in [(54.0, 12.0, 30), (62.0, 20.0, 60), (50.0, 8.0, 30)] {
