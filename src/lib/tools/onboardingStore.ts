@@ -108,6 +108,25 @@ export async function refreshToolsStatus(): Promise<ToolsStatus | null> {
   }
 }
 
+let toolsStatusFirstRead: Promise<ToolsStatus | null> | null = null;
+
+/**
+ * The tools status for a surface that only needs it to exist: one read for
+ * every caller, attempted once. A failed read is not retried from here (its
+ * error is in `loadError`); `refreshToolsStatus` is what asks again.
+ */
+export function ensureToolsStatus(): Promise<ToolsStatus | null> {
+  const known = get(status);
+  if (known) return Promise.resolve(known);
+  toolsStatusFirstRead ??= refreshToolsStatus();
+  return toolsStatusFirstRead;
+}
+
+/** Test seam: forget the once-only first read. */
+export function resetEnsureToolsStatus(): void {
+  toolsStatusFirstRead = null;
+}
+
 export async function refreshToolConfig(): Promise<ToolConfigView | null> {
   try {
     const next = await getToolConfig();

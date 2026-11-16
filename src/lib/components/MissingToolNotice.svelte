@@ -24,10 +24,11 @@
   import {
     buildGraphIndex,
     classifyGraphGap,
-    readGraphReading,
+    forgetGraphReading,
+    readGraphReadingShared,
     type GraphReading,
   } from "../tools/graphGap";
-  import { onboardingStore, openSetupWizard, refreshToolsStatus } from "../tools/onboardingStore";
+  import { ensureToolsStatus, onboardingStore, openSetupWizard } from "../tools/onboardingStore";
 
   let {
     repoPath,
@@ -80,7 +81,7 @@
   const reasonTitle = $derived(tooltipWalkIncomplete([reason]) ?? undefined);
 
   async function probe(repo: string) {
-    const result = await readGraphReading(repo);
+    const result = await readGraphReadingShared(repo);
     if (repo === repoPath) probed = { repo, reading: result };
   }
 
@@ -89,8 +90,11 @@
     if (repo && graph === null) void probe(repo);
   });
 
+  // Whether the CLI is installed only decides between the two remedies, so it
+  // is read only when the graph is actually unavailable, and once for every
+  // notice (a failed read is not retried from here).
   $effect(() => {
-    if ($toolsStatus === null) void refreshToolsStatus();
+    if (reading === "unavailable" && $toolsStatus === null) void ensureToolsStatus();
   });
 
   async function setup() {
@@ -110,6 +114,7 @@
         buildError = result.error;
         return;
       }
+      forgetGraphReading(repo);
       if (graph === null) await probe(repo);
       onBuilt?.();
     } finally {

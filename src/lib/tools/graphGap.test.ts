@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DevmapBuildOutcome } from "../codeintel/types";
-import { buildGraphIndex, classifyGraphGap, readGraphReading } from "./graphGap";
+import {
+  buildGraphIndex,
+  classifyGraphGap,
+  forgetGraphReading,
+  GRAPH_READING_TTL_MS,
+  readGraphReading,
+  readGraphReadingShared,
+} from "./graphGap";
 
 describe("classifyGraphGap", () => {
   it("offers Setup when the graph is missing and the CLI is not installed", () => {
@@ -66,5 +73,40 @@ describe("buildGraphIndex", () => {
       throw new Error("spawn refused");
     });
     expect(result).toEqual({ ok: false, error: "spawn refused" });
+  });
+});
+
+describe("readGraphReadingShared", () => {
+  it("gives every notice for one repository the same read within the TTL", async () => {
+    forgetGraphReading();
+    const read = vi.fn(async () => ({ available: false }));
+    let t = 1_000;
+    const now = () => t;
+    const first = await Promise.all([1, 2, 3].map(() => readGraphReadingShared("/r", read, now)));
+    expect(first).toEqual(["unavailable", "unavailable", "unavailable"]);
+    t += GRAPH_READING_TTL_MS - 1;
+    await readGraphReadingShared("/r", read, now);
+    expect(read).toHaveBeenCalledTimes(1);
+    t += 1;
+    await readGraphReadingShared("/r", read, now);
+    expect(read).toHaveBeenCalledTimes(2);
+    await readGraphReadingShared("/other", read, now);
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not keep a read that could not run, and forgets on request", async () => {
+    forgetGraphReading();
+    const failing = vi.fn(async () => {
+      throw new Error("down");
+    });
+    expect(await readGraphReadingShared("/r", failing)).toBe("unknown");
+    await Promise.resolve();
+    expect(await readGraphReadingShared("/r", failing)).toBe("unknown");
+    expect(failing).toHaveBeenCalledTimes(2);
+    const ok = vi.fn(async () => ({ available: false }));
+    await readGraphReadingShared("/r", ok);
+    forgetGraphReading("/r");
+    await readGraphReadingShared("/r", ok);
+    expect(ok).toHaveBeenCalledTimes(2);
   });
 });
