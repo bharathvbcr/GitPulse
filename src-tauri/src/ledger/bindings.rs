@@ -2302,6 +2302,126 @@ mod family_cost_tests {
         assert_eq!(sibling_opens(), opens, "a warm read reopened a sibling");
     }
 
+    fn hash_objects(spawned: &[Vec<String>]) -> usize {
+        spawned
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "hash-object"))
+            .count()
+    }
+
+    /// `git hash-object --stdin` asked directly, the authority a key must equal.
+    fn real_key(repo: &str, source: &str) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let mut child = command
+            .args(["hash-object", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("git hash-object");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("output");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    /// Siblings that keep writing are imported again on every pass (their
+    /// stamp moved), and each pass used to spawn a `git hash-object` per
+    /// sibling to re-derive a key it had already derived. Once a sibling has
+    /// been imported, a later pass in the same process spawns none.
+    #[test]
+    fn a_second_consolidation_pass_over_moved_siblings_spawns_no_hash_object() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        let (first, spawned) = spawned_by(&repo, || repository_address(&repo));
+        first.expect("first pass");
+        assert_eq!(hash_objects(&spawned), 3, "one key per never-seen sibling");
+
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        let (second, spawned) = spawned_by(&repo, || repository_address(&repo));
+        let second = second.expect("second pass");
+        let rows = crate::ledger::tail(&second.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 6, "the moved siblings were not imported again");
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a second pass spawned git to re-key a known sibling: {spawned:?}"
+        );
+    }
+
+    /// A hook is a process of its own with no memo to warm, so the keys must
+    /// come from what the anchor persisted. After the first pass, a process
+    /// that starts empty spawns no `git hash-object` for any sibling, whether
+    /// it consolidates them or only asks whether one is unconsolidated.
+    #[test]
+    fn a_cold_process_takes_the_sibling_keys_from_the_persisted_rows() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        repository_address(&repo).expect("first pass");
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        crate::ledger::tests_support::forget_family_keys();
+
+        let (address, spawned) = spawned_by(&repo, || repository_address(&repo));
+        let address = address.expect("cold pass");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a cold consolidation re-keyed a persisted sibling: {spawned:?}"
+        );
+
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        crate::ledger::tests_support::forget_family_keys();
+        let members: Vec<std::path::PathBuf> = siblings
+            .iter()
+            .map(|(_, worktree)| std::path::PathBuf::from(worktree))
+            .collect();
+        let (pending, spawned) = spawned_by(&repo, || {
+            crate::ledger::unconsolidated_legacy_ledger(&address.anchor, &members)
+        });
+        pending.expect("cold readonly check");
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a cold readonly check re-keyed a persisted sibling: {spawned:?}"
+        );
+    }
+
+    /// The key is what Git's own `hash-object --stdin` returns: persisted rows
+    /// are keyed by it, so no path to a key may disagree with it.
+    #[test]
+    fn a_sibling_key_is_the_object_id_git_gives_the_path() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(2);
+        repository_address(&repo).expect("first pass");
+        let anchor = std::path::Path::new(&repo);
+        for (_, worktree) in &siblings {
+            let want = real_key(&repo, worktree);
+            let hashed = crate::ledger::tests_support::hashed_key(anchor, worktree);
+            assert_eq!(hashed, want, "a freshly hashed key differs from git's");
+            let stored = crate::ledger::tests_support::stored_key(&repo, worktree);
+            assert_eq!(
+                stored.as_deref(),
+                Some(want.as_str()),
+                "a persisted key differs from git's"
+            );
+        }
+    }
+
     /// Gating consolidation on change must not turn into never consolidating:
     /// a row a sibling writes after a warm read is imported by the next one.
     #[test]
