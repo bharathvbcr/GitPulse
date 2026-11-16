@@ -142,6 +142,10 @@
       };
 
       const deadSymbols = () => {
+        // The real backend refuses the dead-symbol query when there is no graph.
+        if (mode === "unrun") {
+          return { source_freshness: { fresh: null, reason: "no graph" }, available: false, reason: "no code graph has been built here", items: [], total: 0, shown: 0, truncated: false };
+        }
         if (mode === "empty") {
           return { source_freshness: { fresh: true, generation_id: 12 }, available: true, reason: null, items: [], total: 0, shown: 0, truncated: false, rungs: { deterministic: 0, high: 0, speculative: 0, filtered_out: 0 } };
         }
@@ -582,7 +586,16 @@
             has(root, "did not run")
               && !has(root, "Every scan completed with no findings"));
           check("a missing code graph is named as missing", () =>
-            has(section("code-graph"), "No code map for this repository"));
+            has(section("code-graph"), "This repository has no code map yet.")
+              || has(section("code-graph"), "The code map tool is not installed."));
+          // The notice is the fix and not only the diagnosis: it carries the
+          // one button that matches the cause (the fixture reports no tools
+          // status, so the CLI is not known to be absent and Build is offered).
+          check("a missing code graph offers Build index or Set up", () =>
+            [...section("code-graph").querySelectorAll("button")]
+              .some(b => ["Build index", "Set up code map"].includes(b.textContent.trim())));
+          check("a missing code graph's notice is mounted on the dead-code card too", () =>
+            section("dead-code").querySelector('[data-testid="missing-tool-notice"]') !== null);
 
           // ---- Stress: failure and recovery ----------------------------------
           mode = "failed";

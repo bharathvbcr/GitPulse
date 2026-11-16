@@ -152,3 +152,14 @@ describe("the list is one of Graph's lists", () => {
     expect(details).toContain("suspectsQuery.seedSince($currentRepoPath, commitId)");
   });
 });
+
+describe("SuspectsList missing-code-map notice", () => {
+  it("mounts the shared notice in the refused state, keeping the honest text for other causes", () => {
+    const refused = list.slice(list.indexOf("{#if !answer.available}"), list.indexOf("{:else if suspects.length === 0}"));
+    expect(refused).toContain("<MissingToolNotice");
+    expect(refused).toContain('feature="ranked suspects"');
+    expect(refused).toContain("not the same as no suspects");
+    // The raw reason is a tooltip on the notice, not a bare paragraph here.
+    expect(refused).not.toContain('<p class="gp-notice');
+  });
+});
