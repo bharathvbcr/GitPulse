@@ -1,6 +1,7 @@
 <script lang="ts">
   import { AlertTriangle, LoaderCircle, Rocket, Tag } from "@lucide/svelte";
   import { describeFailure } from "../ui/copy/describeFailure";
+  import { ipcErrorKind } from "../ipc/invoke";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { verdictLabel } from "../stores/harnessStore";
   import { toastStore } from "../stores/toastStore";
@@ -39,6 +40,8 @@
   /** Once the person types a message, the tag no longer rewrites it. */
   let messageEdited = $state(false);
   let error = $state<string | null>(null);
+  /** The error is the secret scan refusing the tag's push, which a person may publish past. */
+  let secretScanBlocked = $state(false);
 
   const repoTags = $derived($repoStore.tags);
   const suggestion = $derived(releaseTagSuggestion(repoTags.map((tag) => tag.name)));
@@ -67,6 +70,7 @@
       tagEdited = false;
       messageEdited = false;
       error = null;
+      secretScanBlocked = false;
     });
   });
 
@@ -82,14 +86,20 @@
     if (!messageEdited) releaseMessage = `Release ${value.trim()}`;
   }
 
-  async function publishRelease() {
+  /**
+   * `allowSecrets` only from the "Publish anyway" button under a
+   * `secret_scan_blocked` refusal: the person has read what the scan found
+   * (or could not read) in the commits the tag sends, and publishes past it.
+   */
+  async function publishRelease(allowSecrets = false) {
     if (!canPush) return;
     const repo = $repoStore.currentPath;
     const tag = releaseTag.trim();
     publishing = true;
     error = null;
+    secretScanBlocked = false;
     try {
-      const outcome = await repoStore.publishRelease(tag, releaseMessage.trim() || `Release ${tag}`);
+      const outcome = await repoStore.publishRelease(tag, releaseMessage.trim() || `Release ${tag}`, allowSecrets);
       if ($repoStore.currentPath !== repo) {
         // The push ran in the repository it was asked for; the reader moved on.
         // A pushed tag is not undone by switching tabs, so say what happened
@@ -100,6 +110,7 @@
       }
       if (!outcome.ok) {
         error = outcome.error ?? "Couldn't publish the release.";
+        secretScanBlocked = ipcErrorKind(outcome.cause) === "secret_scan_blocked";
         return;
       }
       releaseConfirmed = false;
@@ -178,12 +189,25 @@
         />
       </div>
       {#if error}
-        <div class="gp-notice" data-tone="danger" role="alert">
+        <div class="gp-notice" data-tone="danger" role="alert" data-secret-scan-blocked={secretScanBlocked || undefined}>
           <AlertTriangle size={14} class="shrink-0" style="color: var(--gp-notice-ink)" />
-          <span class="min-w-0 flex-1">{error}</span>
+          <span class="min-w-0 flex-1 {secretScanBlocked ? 'whitespace-pre-wrap font-mono text-micro' : ''}">{error}</span>
         </div>
+        {#if secretScanBlocked}
+          <button
+            type="button"
+            class="gp-btn w-full justify-center"
+            data-size="sm"
+            data-variant="danger"
+            title="Push the tag without the secret scan's approval. Anything credential-shaped in the commits it sends becomes public history."
+            onclick={() => void publishRelease(true)}
+            disabled={!canPush}
+          >
+            Publish anyway
+          </button>
+        {/if}
       {/if}
-      <button type="button" class="gp-btn w-full justify-center" data-variant="primary" onclick={publishRelease} disabled={!canPush}>
+      <button type="button" class="gp-btn w-full justify-center" data-variant="primary" onclick={() => void publishRelease()} disabled={!canPush}>
         {#if publishing}<LoaderCircle size={14} class="animate-spin" />{:else}<Rocket size={14} />{/if} Push release tag
       </button>
     </div>

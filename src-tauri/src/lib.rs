@@ -36,6 +36,7 @@ pub mod ingest;
 pub mod insights;
 pub mod ipc_error;
 pub mod lappi;
+pub mod leak_scan;
 pub mod ledger;
 pub mod limits;
 #[cfg(unix)]

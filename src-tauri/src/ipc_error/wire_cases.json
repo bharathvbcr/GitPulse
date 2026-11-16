@@ -36,5 +36,18 @@
   {
     "kind": "read_cancelled",
     "message": "git read cancelled: its caller is gone"
+  },
+  {
+    "kind": "secret_scan_blocked",
+    "message": "Commit blocked by the secret scan. Nothing was committed.\n1 added line looks like a credential:\n  github personal access token at src/a.rs:3\nA credential committed to history stays there after the file is fixed: remove it from the staged changes.",
+    "detail": {
+      "gate": "commit",
+      "engine": "dc-redact 0.2.5 (devcouncil@b9b2314d)",
+      "hits": [{ "rule": "github personal access token", "path": "src/a.rs", "line": 3 }],
+      "hits_total": 1,
+      "skipped": [],
+      "skipped_total": 0,
+      "failure": null
+    }
   }
 ]
