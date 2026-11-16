@@ -3737,6 +3737,8 @@ pub(crate) mod tests {
         }
     }
 
+    // Creating the link needs a privilege on Windows.
+    #[cfg(unix)]
     #[test]
     fn repository_roots_are_canonical_so_spellings_of_one_checkout_agree() {
         let tmp = tempfile::tempdir().unwrap();
