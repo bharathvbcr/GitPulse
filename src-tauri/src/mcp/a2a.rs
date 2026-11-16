@@ -22,9 +22,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
-#[cfg(target_os = "macos")]
-use std::time::UNIX_EPOCH;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Environment variable overriding `gitpulse-mcp`'s per-request call budget.
 pub const CALL_BUDGET_ENV: &str = "GITPULSE_MCP_CALL_TIMEOUT_MS";
