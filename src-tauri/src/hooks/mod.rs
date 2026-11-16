@@ -11905,19 +11905,29 @@ done
         #[test]
         fn gitpulse_hook_binary_emits_json_object_under_antigravity_env_on_empty_payload() {
             use crate::procguard::LockedSpawn;
-            let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("debug")
-                .join("gitpulse-hook");
+            // Beside this test binary (`<target>/<profile>/deps/…`), not under
+            // CARGO_MANIFEST_DIR/target: with CARGO_TARGET_DIR elsewhere that
+            // path never exists, and the build below lands in the real one.
+            let profile_dir = std::env::current_exe()
+                .expect("test binary path")
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("test binary sits in <target>/<profile>/deps")
+                .to_path_buf();
+            let bin = profile_dir.join(format!("gitpulse-hook{}", std::env::consts::EXE_SUFFIX));
             if !bin.exists() {
+                let mut args = vec![
+                    "build",
+                    "--manifest-path",
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+                    "--bin",
+                    "gitpulse-hook",
+                ];
+                if profile_dir.file_name().is_some_and(|n| n == "release") {
+                    args.push("--release");
+                }
                 let status = std::process::Command::new("cargo")
-                    .args([
-                        "build",
-                        "--manifest-path",
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-                        "--bin",
-                        "gitpulse-hook",
-                    ])
+                    .args(args)
                     .status_locked()
                     .expect("build gitpulse-hook");
                 assert!(status.success());
