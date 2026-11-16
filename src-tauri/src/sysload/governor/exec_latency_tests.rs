@@ -49,7 +49,9 @@ fn slow_start_up_sheds_background_work_and_leaves_reactive_work_and_launches() {
     assert!(verdict.admit, "launches are not refused for slow start-up");
     assert_eq!(verdict.shed.cause, Some(Binding::ExecLatency));
     assert!(
-        verdict.message.contains("starting a process takes a median 1.4 s"),
+        verdict
+            .message
+            .contains("starting a process takes a median 1.4 s"),
         "{}",
         verdict.message
     );
@@ -94,7 +96,10 @@ fn the_tier_is_entered_after_three_slow_ticks_and_left_after_five_quick_ones() {
     let mut readings = vec![slow(900); ENTER_SAMPLES as usize];
     readings.extend(vec![quick(); EXIT_SAMPLES as usize - 1]);
     let (held, now) = counted(readings.clone());
-    assert!(held.verdict(now).shed.background, "four quick ticks hold it");
+    assert!(
+        held.verdict(now).shed.background,
+        "four quick ticks hold it"
+    );
     readings.push(quick());
     let (left, now) = counted(readings);
     assert!(!left.verdict(now).shed.background, "five leave");
@@ -115,7 +120,11 @@ fn a_median_hovering_at_the_line_does_not_flap_the_verdict() {
     let mut now = Instant::now();
     let (mut shedding, mut transitions) = (false, 0);
     for probe in 0..40u64 {
-        let ms = if probe % 2 == 0 { ENTER_MS - 20 } else { ENTER_MS + 20 };
+        let ms = if probe % 2 == 0 {
+            ENTER_MS - 20
+        } else {
+            ENTER_MS + 20
+        };
         window.push(at, Outcome::Sample(Duration::from_millis(ms)));
         at += CADENCE;
         for _ in 0..ticks_per_probe {
@@ -138,10 +147,33 @@ fn a_median_hovering_at_the_line_does_not_flap_the_verdict() {
 fn the_binding_is_published_to_older_readers_as_cpu_load_and_read_back_exactly() {
     assert_eq!(Binding::ExecLatency.wire(), Binding::CpuLoad);
     let (base, detail) = Binding::wire_codes(Some(Binding::ExecLatency));
-    assert_eq!(Binding::of_wire(base, detail), Some(Some(Binding::ExecLatency)));
+    assert_eq!(
+        Binding::of_wire(base, detail),
+        Some(Some(Binding::ExecLatency))
+    );
     assert_eq!(
         Binding::of_wire(base, 0),
         Some(Some(Binding::CpuLoad)),
         "a reader without the detail byte sees the binding it knows"
     );
+}
+
+/// What Health and a diagnostics export read: the report carries the median and
+/// count next to the verdict, and says nothing was read as `null`, so the
+/// frontend can say unknown rather than draw a number.
+#[test]
+fn the_report_serializes_the_start_up_time_beside_the_verdict() {
+    let (governor, now) = counted(vec![slow(1_360); ENTER_SAMPLES as usize]);
+    let json = serde_json::to_value(governor.report(now)).unwrap();
+    assert_eq!(
+        json["exec_latency"],
+        serde_json::json!({ "median_ms": 1360, "n": 9, "slow": true }),
+        "{json}"
+    );
+    assert_eq!(json["verdict"]["binding"], "exec_latency");
+
+    let (unread, now) = counted(vec![Reading::Unavailable(Why::Failed); 3]);
+    let json = serde_json::to_value(unread.report(now)).unwrap();
+    assert!(json["exec_latency"].is_null(), "unknown is null: {json}");
+    assert!(serde_json::to_value(GovernorReport::ungoverned()).unwrap()["exec_latency"].is_null());
 }

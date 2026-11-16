@@ -991,6 +991,11 @@ impl Governor {
         });
         GovernorReport {
             verdict,
+            exec_latency: self
+                .last
+                .as_ref()
+                .filter(|(_, input)| input.state.governs())
+                .and_then(|(_, input)| input.readings.exec_latency.value()),
             disk_fill,
             refusing_for_s: refusing_for.map(|d| d.as_secs()),
             notice: self.noticed && refusing,
@@ -1008,6 +1013,10 @@ impl Governor {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GovernorReport {
     pub verdict: GovernorVerdict,
+    /// How long a trivial child last took to start, beside the memory
+    /// pressure the verdict reports. `None` when this process runs no probe or
+    /// the probe has no reading: unknown, never fast.
+    pub exec_latency: Option<super::exec_probe::ExecLatency>,
     /// Where the disk is heading, while the fill-rate rule is on and the
     /// projection is at least elevated: its rate and the minutes it leaves
     /// before the severe floor. Shown even when the rule's mode keeps it from
@@ -1031,6 +1040,7 @@ impl GovernorReport {
     fn ungoverned() -> Self {
         Self {
             disk_fill: None,
+            exec_latency: None,
             verdict: GovernorVerdict {
                 admit: true,
                 shed: Shed::default(),

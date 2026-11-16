@@ -15,6 +15,7 @@ import {
   bindingLabel,
   describeReading,
   diskFillLine,
+  execLatencyLine,
   fillRateLabel,
   fillRateLine,
   formatAge,
@@ -443,5 +444,25 @@ describe("fastestWriter", () => {
       "Writing fastest: Claude session 11 in an unknown directory, at least 6.00 MB/s",
     );
     expect(fastestWriter([launched], false)?.session.run_id).toBe("r1");
+  });
+});
+
+describe("execLatencyLine", () => {
+  const report = (exec_latency?: GovernorReport["exec_latency"]): GovernorReport =>
+    ({ exec_latency }) as GovernorReport;
+
+  it("names the median and sample count, and says when background work is shed", () => {
+    expect(execLatencyLine(report({ median_ms: 1360, n: 12, slow: true }))).toBe(
+      "Process start-up time: median 1.4 s over 12 probes (slow: background work is shed).",
+    );
+    expect(execLatencyLine(report({ median_ms: 8, n: 1, slow: false }))).toBe(
+      "Process start-up time: median 8 ms over 1 probe.",
+    );
+  });
+
+  it("says unknown, never fast, when there is no reading", () => {
+    for (const value of [null, undefined]) {
+      expect(execLatencyLine(report(value))).toContain("unknown");
+    }
   });
 });
