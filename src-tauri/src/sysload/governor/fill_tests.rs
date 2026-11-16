@@ -1025,6 +1025,54 @@ fn a_repeated_snapshot_does_not_advance_the_only_disk_count() {
 }
 
 #[test]
+fn a_fill_held_severe_in_a_pause_is_disk_only_for_the_whole_hold_and_not_after() {
+    // The fill rule alone: Severe for five ticks, then a pause in which every
+    // disk input reads below Elevated but Severe is held.
+    let mut d = Direct::new();
+    for _ in 0..5 {
+        d.tick(false, true);
+    }
+    for after in 1..FILL_SEVERE_RELEASE_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier, Tier::Severe, "{after} ticks into the pause: {v:?}");
+        assert!(d.disk_only(), "{after} ticks into the pause");
+    }
+    // The hold lapses, Severe is left, nothing is shed: not disk only.
+    let v = d.tick(false, false);
+    assert_ne!(v.tier, Tier::Severe, "{v:?}");
+    assert!(!v.shed.background && !v.shed.reactive);
+    assert!(!d.disk_only());
+
+    // The hold under a Severe memory entered, once memory has eased and the
+    // others have read Clear for EXIT_SAMPLES ticks.
+    let mut d = Direct::new();
+    d.memory_severe_then_fill(5);
+    for after in 1..FILL_SEVERE_RELEASE_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier, Tier::Severe, "{after} ticks after memory eased");
+        assert_eq!(d.disk_only(), after >= EXIT_SAMPLES, "{after} ticks");
+    }
+}
+
+#[test]
+fn cpu_elevated_arriving_mid_hold_makes_a_fill_held_severe_not_disk_only() {
+    let mut d = Direct::new();
+    for _ in 0..5 {
+        d.tick(false, true);
+    }
+    for _ in 0..20 {
+        d.tick(false, false);
+    }
+    assert!(d.disk_only());
+    cpu_load(&mut d, 4.0);
+    for after in 21..FILL_SEVERE_RELEASE_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier, Tier::Severe, "{after}");
+        assert!(!d.disk_only(), "{after} ticks into the hold, CPU Elevated");
+    }
+}
+
+#[test]
 fn a_burst_of_a_minute_or_less_never_refuses_when_it_leaves_42_gib_or_more() {
     for (from, size, dur) in [(54.0, 12.0, 30), (62.0, 20.0, 60), (50.0, 8.0, 30)] {
         let out = refused_after_a_write(from, size, dur, 630);

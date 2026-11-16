@@ -793,11 +793,16 @@ fill-Severe blip hours later arms nothing: arming again takes three in a row.
 a caller that may do disk-freeing work while the disk is the whole problem and
 must keep shedding when anything else is pressed too (`shed_cause()` is one
 binding picked by priority, so it says disk for a disk Severe with CPU Severe
-or thermal Critical beside it). True only when the host is shedding, a disk
-input (low disk, disk filling) reads Elevated or above now, and every other
-input (memory level normal, no compressor thrash, no other contribution above
-Clear, none unreadable) has read Clear for five counted ticks in a row; the
-count is reset when the run is forgotten and does not advance on a re-read
+or thermal Critical beside it). True only when the host is shedding, every
+other input (memory level normal, no compressor thrash, no other contribution
+above Clear, none unreadable) has read Clear for five counted ticks in a row
+and reads Clear now, and the disk is what is shedding: a disk input (low disk,
+disk filling) reads Elevated or above now, or the fill hold is armed and has
+not lapsed, or the held binding is still low disk or disk filling. The last
+two matter in a pause of a lumpy fill, where the disk inputs read lower but
+Severe is held: nothing but the disk is wrong then, so the cleaner's checks
+are admitted. Once the hold lapses and Severe is left nothing is shed and the
+answer is false. The count is reset when the run is forgotten and does not advance on a re-read
 snapshot. Any doubt is false: a process with no governor of its own (the
 headless cleaner run, the MCP server, a hook), a governor built from one
 sample (`Governor::instant`), an unavailable or stale-old sensor. The

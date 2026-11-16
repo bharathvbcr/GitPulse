@@ -882,10 +882,15 @@ impl Governor {
     /// [`EXIT_SAMPLES`] consecutive counted ticks have read every input other
     /// than low disk and disk filling Clear (memory level normal, no
     /// compressor thrash, no other contribution above Clear, none unreadable);
-    /// the last reading still has every one of those inputs Clear; and a disk
-    /// input reads at least Elevated now. A governor with no history (one from
-    /// [`Governor::instant`]) has counted nothing and answers false, as does
-    /// one whose sensor is unavailable.
+    /// the last reading still has every one of those inputs Clear; and the
+    /// disk is what is shedding: a disk input reads at least Elevated now, or
+    /// the fill hold is armed and not lapsed, or the held binding is low disk
+    /// or disk filling (a tier the hysteresis still holds after the reading
+    /// recovered). In those last two the disk is the only thing wrong, so
+    /// there is no doubt to resolve conservatively. A governor with no history
+    /// (one from [`Governor::instant`]) has counted nothing and answers
+    /// false, as does one whose sensor is unavailable, and one that sheds
+    /// nothing (a hold lapsed and Severe left).
     pub fn disk_only(&self, now: Instant) -> bool {
         let Some((at, input)) = &self.last else {
             return false;
@@ -894,8 +899,10 @@ impl Governor {
         if !(shed.background || shed.reactive) || self.others_clear_run < EXIT_SAMPLES {
             return false;
         }
+        let held_for_disk = !self.fill_hold_released()
+            || matches!(self.binding, Some(Binding::LowDisk | Binding::DiskFilling));
         sample(&input.aged(now.saturating_duration_since(*at)))
-            .is_some_and(|read| read.others_clear && read.disk >= Tier::Elevated)
+            .is_some_and(|read| read.others_clear && (read.disk >= Tier::Elevated || held_for_disk))
     }
 
     /// A person said "Admit anyway": launches pass for [`OVERRIDE_WINDOW`].
@@ -1381,9 +1388,11 @@ pub fn shed_cause() -> Option<Binding> {
 /// problem and must keep shedding when anything else is also pressed.
 /// [`shed_cause`] is one binding picked by priority, so it says "disk" for a
 /// disk Severe that has CPU Severe or thermal Critical beside it; this does
-/// not. True only when the host is shedding, a disk input reads Elevated or
-/// above, and every other input has read Clear for [`EXIT_SAMPLES`] counted
-/// ticks. False on any doubt: no governor in this process (the headless
+/// not. True only when the host is shedding, every other input has read Clear
+/// for [`EXIT_SAMPLES`] counted ticks (and reads Clear now), and the disk is
+/// what is shedding: a disk input reads Elevated or above now, or the fill
+/// hold keeps Severe after the fill reading recovered, or the held binding is
+/// still low disk or disk filling. False on any doubt: no governor in this process (the headless
 /// run, the MCP server, a hook), a governor with no history, an unavailable
 /// or stale sensor, an unreadable input. One short lock, no IO.
 pub fn shed_is_disk_only() -> bool {
