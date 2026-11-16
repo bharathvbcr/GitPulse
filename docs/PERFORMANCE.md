@@ -3168,23 +3168,28 @@ The run takes about 15 s after the build.
 **Old-table column.** Swap the older table in, run the command above, then restore:
 
 ```bash
-git checkout b07f2d9b -- src-tauri/vendored/dc-redact
+git checkout 7583a7b0 -- src-tauri/vendored/dc-redact
 ```
 
 ```bash
 git checkout HEAD -- src-tauri/vendored/dc-redact
 ```
 
-`ENGINE` is a constant and reads `devcouncil@cbd51369` in both runs. To tell the runs apart, use the report header's table fingerprint, an FNV-1a of the vendored source: `1c12c06020db8cec` for the old table, `8d1f4ea6dc4a1dc0` for cbd51369.
+- **Which commit holds the old table:** `7583a7b0`. Its `lib.rs` is byte-identical to `b07f2d9b`, the commit this was first measured from, which now survives only in backup refs after a history rewrite.
+- **Telling runs apart:** the report header's detector line comes from `ENGINE`, a constant, so it names the current table even in an old-table run. Use the table fingerprint, an FNV-1a of the vendored source:
+  - `1c12c06020db8cec`: the old table;
+  - `8d1f4ea6dc4a1dc0`: `cbd51369`;
+  - `c7355cc99cbb070d`: `b9b2314d`, the current table.
+- **`cbd51369` is no longer on the branch.** Its vendor commit carried plaintext test credentials and was folded away. Its column below is kept as measured.
 
 ### Measured (kingfisher 2.16.0, betterleaks 1.10.1, salt 0)
 
 Kingfisher lists 454 visible rules (368 high, 86 medium), plus 47 helper rules it never reports on their own.
 
-| confidence | plants | Kingfisher | Betterleaks | dc-redact, old table (`b07f2d9b`) | dc-redact, DevCouncil `cbd51369` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| high | 316 | 316/316 | 306/316 | 42/316 | **49/316** |
-| medium | 76 | 76/76 | 58/76 | 9/76 | **10/76** |
+| confidence | plants | Kingfisher | Betterleaks | dc-redact, old table (`b07f2d9b`) | dc-redact, DevCouncil `cbd51369` | dc-redact, DevCouncil `b9b2314d` (current) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| high | 316 | 316/316 | 306/316 | 42/316 | 49/316 | **60/316** |
+| medium | 76 | 76/76 | 58/76 | 9/76 | 10/76 | **10/76** |
 
 **Spread over five corpora (salts 0–4, same build):**
 
@@ -3192,12 +3197,19 @@ Kingfisher lists 454 visible rules (368 high, 86 medium), plus 47 helper rules i
 | --- | --- | --- |
 | old | 42, 40, 42, 44, 41 | 9, 10, 10, 10, 10 |
 | `cbd51369` | 49, 47, 48, 50, 48 | 10, 11, 11, 11, 11 |
+| `b9b2314d` | 60, 58, 59, 61, 59 | 10, 11, 11, 11, 11 |
 
-The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the five corpora.
+- **`cbd51369` over the old table:** gains 6 to 7 high plants and 1 medium plant on every one of the five corpora.
+- **`b9b2314d` over `cbd51369`:** gains exactly 11 high plants on every corpus, and the same medium. The 11 are the formats this measurement listed as missing for vendors dc-redact already named:
+  - AWS Bedrock long- and short-lived keys;
+  - Gemini;
+  - GitLab incoming-mail token, runner registration token and session cookie;
+  - four Slack formats;
+  - `stripe-access-token`.
 
 **Rules measured beside their helper rules** (not part of the table above; all are high confidence):
 
-| salt | plants | Kingfisher | Betterleaks | dc-redact, either table |
+| salt | plants | Kingfisher | Betterleaks | dc-redact, any of the three tables |
 | --- | ---: | ---: | ---: | ---: |
 | 0 | 30 | 30/30 | 30/30 | 0/30 |
 | 1 | 31 | 31/31 | 30/31 | 0/31 |
@@ -3206,17 +3218,17 @@ The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the fi
 | 4 | 30 | 30/30 | 30/30 | 0/30 |
 
 - **What these rules are:** client secrets, API secrets and tokens whose id, URL or account name is a separate helper match. Examples: Alibaba, Azure storage account key, PayPal, MongoDB Atlas, PlanetScale, Snowflake, Supabase, Auth0, Salesforce.
-- **dc-redact finds none of them** on any salt, on either table.
+- **dc-redact finds none of them** on any salt, on any of the three tables.
 - **Where line attribution mattered:**
   - On salts 3 and 4, dc-redact flagged a Polymarket helper line (the helper is itself a secret), not the `polymarket-api-key` plant.
   - On salts 1 to 3, Betterleaks reported a Tableau helper line, not the token.
   - Neither is credited.
 - **Every measured rule, salt 0:**
 
-  | confidence | plants | Betterleaks | dc-redact |
-  | --- | ---: | ---: | ---: |
-  | high | 346 | 336 | 49 |
-  | medium | 76 | 58 | 10 |
+  | confidence | plants | Betterleaks | dc-redact, `cbd51369` | dc-redact, `b9b2314d` |
+  | --- | ---: | ---: | ---: | ---: |
+  | high | 346 | 336 | 49 | 60 |
+  | medium | 76 | 58 | 10 | 10 |
 
 **Against the lost 2026-11-14 corpus (41/308 high, 14/75 medium):**
 - **High reproduces:** 42/316 on the old table is 13.3%, the same as 41/308.
@@ -3226,7 +3238,7 @@ The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the fi
   - But it gives 83 plants, not 75, and Betterleaks 65, not the earlier 62.
   - The extra medium hits are high-confidence Betterleaks rules whose bytes Kingfisher hands to a medium Veles rule (npm, DigitalOcean, OpenRouter).
   - So the earlier corpus probably counted sibling-claimed plants under medium. That is inferred, not established, since the generator is lost.
-  - On cbd51369 the reconstruction gives 15/83.
+  - On `cbd51369` and on `b9b2314d` the reconstruction gives 15/83.
 
 **Rules without a confirmed plant: 32 (22 high, 10 medium), down from 62 before helper rules were planted.** None of them is measured. The ranked list in the report shows them per vendor in a "not measured" column, so a vendor is never read as covered because its rules went unplanted. Each rule's reason is in the report:
 
@@ -3249,19 +3261,21 @@ Each of the three helpers that could not be sampled has a `\b` beside a lazy gap
 - This is inferred from the patterns; the sampler does not report why a draw failed.
 - Teaching `plant_sampler.rs` to keep such a gap non-empty would let these rules be tried properly.
 
-### Where dc-redact misses (current table)
+### Where dc-redact misses (current table, `b9b2314d`)
 
 - **Length artefacts:** 8 misses are found once the secret is at a realistic length, for example Slack bot and app tokens whose minimum-length plant is under dc-redact's floor. The report labels these and keeps them out of the ranking.
-- **Real misses:** 355 rules, grouped by vendor. That is 325 measured alone, plus the 30 measured beside their helpers.
+- **Real misses:** 344 rules, grouped by vendor.
+  - That is 314 measured alone, plus the 30 measured beside their helpers.
+  - On `cbd51369` it was 355; `b9b2314d` closed 11.
 
 | tier | vendors missed | rules missed |
 | --- | ---: | ---: |
-| cloud | 22 | 36 |
-| CI, source and packages | 39 | 65 |
-| payments and finance | 31 | 44 |
+| cloud | 20 | 33 |
+| CI, source and packages | 38 | 62 |
+| payments and finance | 30 | 43 |
 | AI providers | 32 | 38 |
 | databases and data | 21 | 31 |
-| messaging and email | 21 | 31 |
+| messaging and email | 20 | 27 |
 | observability and on-call | 11 | 20 |
 | identity and secret managers | 8 | 9 |
 | generic and context | 3 | 4 |
@@ -3270,12 +3284,9 @@ Each of the three helpers that could not be sampled has a `\b` beside a lazy gap
 Each tier is ranked by how common the credential is (the order of `VENDORS` in `recall_tests.rs`).
 
 **Formats missing for vendors dc-redact already names:**
-- AWS Bedrock API keys, long- and short-lived;
-- the Gemini API key format (`gcp-gemini-api`);
-- three GitLab formats: incoming-mail token, runner registration token, session cookie;
-- Stripe `stripe-access-token`;
-- four Slack formats: legacy token, legacy workspace token, session cookie, session token;
 - OpenRouter's Veles form, `sk-or-v<n>-` with a free body. dc-redact only has `v1` with a 64-hex body.
+- The other ten on this list for `cbd51369` (Bedrock, Gemini, GitLab, Slack and Stripe formats) are found by `b9b2314d`.
+- **Heuristic error:** "persona" matches inside dc-redact's "digitalocean personal access token", so the report says dc-redact names Persona. It does not.
 
 **Vendors with no shape at all, first in each tier:**
 - **Cloud:** Azure (Teams webhook, storage account key), Alibaba (2), Cloudflare (4), Heroku (2), Vercel (6), Netlify, Fly.io, IBM Cloud, Exoscale.
