@@ -200,6 +200,28 @@
       // The Manvi model card's credential answer: an object in the wire shape,
       // or "throw" for a backend that could not answer.
       window.__gpClaudeStatus = { key_saved: false, account: null, account_error: null };
+      // "Connect your agent": cmd_agent_connect_plan / _apply as agent_connect.rs
+      // answers. `__gpConnect.applies` counts writes, so a click that skipped the
+      // confirmation shows up as a count, not as a guess.
+      const linkAction = (id, title, target, state) => ({ id, kind: "link", agent: null, title, target, state, detail: state === "done" ? "Already linked." : "Link into ~/.local/bin.", commands: [] });
+      const codexCommands = ["codex mcp remove gitpulse", "codex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"];
+      const connectPlan = (linkState) => ({
+        available: true, reason: "",
+        mcp_path: "/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+        hook_path: "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook",
+        agents_found: ["claude", "codex"],
+        agent_commands: [
+          { agent: "claude", label: "Claude Code", add: "claude mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp", verify: "claude mcp get gitpulse" },
+          { agent: "codex", label: "Codex", add: codexCommands[1], verify: "codex mcp get gitpulse" },
+        ],
+        actions: [
+          linkAction("link:gitpulse-mcp", "Link gitpulse-mcp", "~/.local/bin/gitpulse-mcp", linkState),
+          linkAction("link:gitpulse-hook", "Link gitpulse-hook", "~/.local/bin/gitpulse-hook", linkState),
+          { id: "register:claude", kind: "register", agent: "claude", title: "Register with Claude Code", target: "claude plugin list --json", state: "done", detail: "The gitpulse@gitpulse plugin already provides the server.", commands: [] },
+          { id: "register:codex", kind: "register", agent: "codex", title: "Register with Codex", target: "codex mcp add gitpulse", state: "blocked", detail: "gitpulse is registered with a different command.", commands: codexCommands },
+        ],
+      });
+      window.__gpConnect = { applies: 0, plans: 0, linked: false };
       localStorage.removeItem("gitpulse_ai_model");
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
@@ -239,6 +261,21 @@
             }
             agentDefaults = next;
             return agentView();
+          }
+          if (cmd === "cmd_agent_connect_plan") {
+            window.__gpConnect.plans++;
+            return connectPlan(window.__gpConnect.linked ? "done" : "todo");
+          }
+          if (cmd === "cmd_agent_connect_apply") {
+            window.__gpConnect.applies++;
+            window.__gpConnect.linked = true;
+            return {
+              results: [
+                { id: "link:gitpulse-mcp", ok: true, message: "Linked gitpulse-mcp." },
+                { id: "link:gitpulse-hook", ok: true, message: "Linked gitpulse-hook." },
+              ],
+              plan: connectPlan("done"),
+            };
           }
           if (cmd === "cmd_mcp_info") return mcpInfo;
           if (cmd === "cmd_devcouncil_suite_status") return suiteReport;
@@ -389,6 +426,54 @@
           check("External CLIs renders exactly once", externalHeadings.length === 1);
           check("the model card lists the resolved local endpoint", document.getElementById("manvi-section-model").textContent.includes("llama3.2:3b"));
           check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1);
+
+
+          // Connect your agent: rendered and clicked, through the app's own confirm dialog.
+          const connect = () => document.querySelector('[data-testid="agent-connect"]');
+          const connectText = () => (connect()?.textContent ?? "").replace(/\s+/g, " ");
+          const btn = (scope, label) => [...scope.querySelectorAll("button")].find((b) => b.textContent.trim() === label);
+          const prompt = () => document.querySelector('[role="dialog"][aria-label="Connect your agent?"]');
+          const clipboardWrites = [];
+          Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { clipboardWrites.push(text); } } });
+          check("Connect your agent renders its plan summary", await until(() => connectText().includes("2 changes to make")));
+          check("every planned action gets a row", connect().querySelectorAll('[data-testid="connect-action"]').length === 4);
+          const rows = [...connect().querySelectorAll('[data-testid="connect-action"]')];
+          const codexRow = rows.find((r) => r.textContent.includes("Register with Codex"));
+          const claudeRow = rows.find((r) => r.textContent.includes("Register with Claude Code"));
+          check("a done registration names the plugin that provides it", claudeRow.textContent.includes("gitpulse@gitpulse") && !claudeRow.querySelector('[data-testid="connect-commands"]'));
+          const codexCommandBlock = codexRow.querySelector('[data-testid="connect-commands"]');
+          check("a blocked registration shows both commands", codexCommandBlock && codexCommandBlock.textContent.includes("codex mcp remove gitpulse") && codexCommandBlock.textContent.includes("codex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"));
+          check("the commands block has a Copy button", Boolean(btn(codexCommandBlock, "Copy")));
+          btn(codexCommandBlock, "Copy").click();
+          check("Copy puts the commands on the clipboard, one per line", await until(() => clipboardWrites.at(-1) === "codex mcp remove gitpulse\ncodex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"));
+          check("nothing is applied before Connect is pressed", window.__gpConnect.applies === 0 && !prompt());
+          const connectButton = () => btn(connect(), "Connect");
+          check("Connect is offered while changes are pending", connectButton() && !connectButton().disabled);
+          connectButton().click();
+          check("Connect opens the app's confirm dialog", await until(() => prompt()));
+          check("the dialog lists both link targets", prompt().textContent.includes("~/.local/bin/gitpulse-mcp") && prompt().textContent.includes("~/.local/bin/gitpulse-hook"));
+          check("the dialog does not list work that is already done or blocked", !prompt().textContent.includes("Register with Codex"));
+          check("opening the dialog applies nothing", window.__gpConnect.applies === 0);
+          btn(prompt(), "Cancel").click();
+          check("Cancel closes the dialog", await until(() => !prompt()));
+          await wait(100);
+          check("Cancel applies nothing and the changes stay pending", window.__gpConnect.applies === 0 && connectText().includes("2 changes to make") && !connect().querySelector('[data-testid="connect-result"]'));
+          connectButton().click();
+          await until(() => prompt());
+          btn(prompt(), "Connect").click();
+          check("confirming applies exactly once", await until(() => window.__gpConnect.applies === 1));
+          await wait(150);
+          check("the apply was not repeated", window.__gpConnect.applies === 1);
+          check("after apply the summary stops offering changes", await until(() => !connectText().includes("changes to make") && connectText().includes("Nothing to change; some items were left alone")));
+          check("after apply Connect is disabled", connectButton().disabled);
+          const resultNodes = [...connect().querySelectorAll('[data-testid="connect-result"]')].map((n) => n.textContent);
+          check("each applied action shows its result", resultNodes.length === 2 && resultNodes.includes("Linked gitpulse-mcp.") && resultNodes.includes("Linked gitpulse-hook."));
+          btn(connect(), "Copy setup prompt").click();
+          check("Copy setup prompt writes the mcp path and the plugin check", await until(() => {
+            const text = clipboardWrites.at(-1) ?? "";
+            return text.includes("/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp") && text.includes("claude plugin list --json");
+          }));
+          check("copying the prompt confirms in the panel", await until(() => connectText().includes("Copied. Paste it into Claude Code or Codex.")));
 
           // Scan and pick.
           const scanButton = [...document.querySelectorAll("#manvi-section-model button")].find((b) => b.textContent.includes("Scan local servers"));
