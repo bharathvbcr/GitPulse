@@ -19,7 +19,7 @@ import { terminalLaunchRequests } from "../src/lib/terminal/launchRequests";
 import { PROVIDER_LABELS } from "../src/lib/workbench/taskHandoff";
 import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
-import { hostLoadStatusFixture, previousBootFixture } from "./hostLoadFixture.ts";
+import { hostLoadStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
 import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
@@ -479,6 +479,34 @@ export async function runHostLoadChecks(ctx) {
     // And back to none: the block goes.
     await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
     check("returning to no previous boot removes the block", () => !previous());
+
+    // Which session is writing to disk fastest. The rate is a floor and names
+    // a session, never a folder.
+    const fastest = () => root.querySelector('[data-testid="host-load-fastest-writer"]');
+    const rate = v => ({ status: "value", value: v });
+    const notYet = { status: "unavailable", value: "not_yet" };
+    const withProcs = (rates, truncated = false) =>
+      ({ ...hostLoadStatusFixture(), previous_boot: null, problems: [], procs: procViewFixture(rates, truncated) });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)]));
+    check("the session writing fastest is named with its pid, folder and a floor", () =>
+      !!fastest() && /^Writing fastest: Claude session 1202 in \/Users\/fixture\/code\/beta, at least 8\d(\.\d)? MB\/s$/.test(flat(fastest())));
+    check("the line says it is about a session, not a folder, and that the rate is a floor", () =>
+      has(card(), "not the folder that grew") && has(card(), "so the rate is a floor"));
+    check("each session row shows its own write rate as a floor", () => {
+      const rows = [...card().querySelectorAll("tbody tr")].filter(tr => /120[123]/.test(tr.textContent));
+      return rows.length === 3 && rows.filter(tr => tr.textContent.includes("at least")).length === 3 && !/NaN|undefined/.test(card().textContent);
+    });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)], true));
+    check("on a truncated session list the claim is only about the sessions shown", () =>
+      flat(fastest()).startsWith("Writing fastest of the sessions shown: Claude session 1202"));
+    await show(withProcs([rate(0), rate(0), rate(90 * 2 ** 20)]));
+    check("a session whose folder is unknown says so", () =>
+      has(fastest(), "Claude session 1203 in an unknown directory"));
+    await show(withProcs([notYet, notYet, notYet]));
+    check("with no baseline yet there is no fastest-writer line and no invented rate", () =>
+      !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
+    await show(withProcs([rate(0), rate(4096), rate(0)]));
+    check("when nobody writes above the threshold no session is named", () => !fastest());
   } finally {
     knobs.hostLoad = null;
   }

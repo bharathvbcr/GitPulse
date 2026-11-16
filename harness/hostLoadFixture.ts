@@ -1,4 +1,4 @@
-import type { HostLoadSettings, HostLoadStatus, PreviousBoot, Reading, TracePeaks, TraceRecord } from "../src/lib/stores/hostLoadStore";
+import type { HostLoadSettings, HostLoadStatus, PreviousBoot, ProcView, Reading, TracePeaks, TraceRecord } from "../src/lib/stores/hostLoadStore";
 
 /**
  * What `cmd_host_load_status` returns on a calm Mac where another GitPulse
@@ -153,6 +153,65 @@ function traceRecordFixture(i: number): TraceRecord {
  * peaks are written out, not derived, so the page shows a number a person can
  * look up in this file.
  */
+/**
+ * `HostLoadStatus.procs` as the process scan answers it on the writer: three
+ * Claude sessions (one started by GitPulse, two observed), each with a disk
+ * write rate in bytes per second. `rates` is one reading per session, in pid
+ * order, so a scenario can say "no baseline yet" or "nobody is writing".
+ */
+export function procViewFixture(rates: [Reading<number>, Reading<number>, Reading<number>], truncated = false): ProcView {
+  const value = <T>(v: T): Reading<T> => ({ status: "value", value: v });
+  const session = (pid: number, cwd: string | null, tree: string | null, rate: Reading<number>) => ({
+    kind: "claude" as const,
+    pid,
+    start_us: 1_760_000_000_000_000 + pid,
+    cwd,
+    tree,
+    run_id: null,
+    parent_pid: null,
+    footprint: value(600 << 20),
+    write_rate: rate,
+    members: 3,
+    unreadable_members: 0,
+  });
+  return {
+    ok: true,
+    error: null,
+    processes: 640,
+    other_users: 0,
+    unreadable: 0,
+    claude: { launched: 1, observed: 2 },
+    codex: { launched: 0, observed: 0 },
+    other: { launched: 0, observed: 0 },
+    sessions: [
+      session(1201, "/Users/fixture/code/alpha", "session:term-1", rates[0]),
+      session(1202, "/Users/fixture/code/beta", null, rates[1]),
+      session(1203, null, null, rates[2]),
+    ],
+    sessions_truncated: truncated,
+    trees: [],
+    launched_footprint: value(600 << 20),
+    observed_footprint: value(1_200 << 20),
+    foreign_top: [],
+    largest_foreign: value(0),
+    launched_write_rate: rates[0],
+    max_tree_write_rate: rates[0],
+    memguard: {
+      present: false,
+      pid: null,
+      start_us: null,
+      exec: null,
+      flags: [],
+      log_path: { status: "unavailable", value: "unsupported" },
+      heartbeat_age_s: { status: "unavailable", value: "unsupported" },
+      heartbeat_interval_s: null,
+      warn: false,
+      warnings: [],
+    },
+    orphans: [],
+  };
+}
+
 export function previousBootFixture(dropped: number): PreviousBoot {
   const peaks: TracePeaks = {
     records: 3,
