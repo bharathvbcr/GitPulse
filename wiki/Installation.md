@@ -9,5 +9,7 @@ and building from source.
 Use the selected release's assets and notes for availability and signing status.
 A version in a repository checkout is not proof of a published release.
 
+After installing the app, connect Claude Code or Codex from **Settings → Agents → Connect your agent**; see [[MCP and Agents]]. `bun run mcp:install` is only for a source checkout. DevMap (code map) currently builds from source and needs a Rust toolchain; Manvi builds from source with Go.
+
 After installation, continue with [[Getting Started]]. For developer prerequisites,
 see [[Development]].

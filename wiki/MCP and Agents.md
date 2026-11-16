@@ -6,20 +6,42 @@ It exposes GitPulse-owned surfaces (worktrees, ledger, collisions) and selected 
 
 Protocol: [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) (`server/discover`, per-request `_meta`, cacheable `tools/list`). Legacy `initialize` (2024-11-05 / 2025-11-25) still works.
 
-## Install the server
+## Connect an agent (app install)
 
-From a GitPulse checkout:
+Open **Settings → Agents → Connect your agent**. It is also the setup wizard's last step and the first-run card. It shows a plan first and changes nothing until you confirm. On confirm it:
+
+- symlinks the app's bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin`, never overwriting a file or a link that points elsewhere;
+- registers the server with Claude Code (`claude mcp add --scope user gitpulse -- <full path>`) and Codex (`codex mcp add gitpulse -- <full path>`) through their own CLIs.
+
+An existing different registration or link is left alone. The plan shows the commands to switch it yourself (remove, then add). No source checkout or Rust toolchain is needed.
+
+**Plugin or direct registration, not both.** If the GitPulse Claude Code plugin is installed, it already provides the `gitpulse` server and the hooks, so Connect marks the Claude Code registration as done instead of adding a second one. The plugin starts `gitpulse-mcp` and `gitpulse-hook` by bare name, so `~/.local/bin` must be on the `PATH` of the shell Claude Code starts from. Connect does not install the plugin or the hooks:
+
+```sh
+claude plugin marketplace add bharathvbcr/GitPulse
+claude plugin install gitpulse@gitpulse
+```
+
+**Copy setup prompt** (same panel) gives your agent the same steps to run itself. Use it if you run Claude Code with a non-default `CLAUDE_CONFIG_DIR`, because Connect runs the `claude` CLI with its default profile.
+
+The hook is the binary that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal.
+
+### Settings copy buttons
+
+The packaged app also carries `plugins/gitpulse/` in `Contents/Resources/plugin`. The Agents card in Settings resolves `gitpulse-mcp` and `gitpulse-hook` beside the app, says `not reachable` for a hook binary it cannot find, and warns when either is not on `PATH`. Its `.codex-plugin/plugin.json`, `.mcp.json` and `hooks.json` buttons copy the manifests with those absolute paths filled in, for a client you wire by hand instead of using Connect. In the copied `hooks.json` the collision guard and command gate refuse the call when the binary is missing, and session start says the hooks are off.
+
+### Upgrading from `bun run mcp:install`
+
+`bun run mcp:install` is for a source checkout only: it `cargo install`s the binaries into `~/.cargo/bin` and records the source digest `bun run mcp:doctor` compares against. If you ran it before and now use the app, `~/.cargo/bin/gitpulse-mcp` and `gitpulse-hook` may shadow the app's copies on `PATH`, and an existing registration may point at the cargo copy. Connect leaves those alone and shows them. To switch to the app's copies, run `cargo uninstall gitpulse` and the remove/add commands the plan shows. If you develop GitPulse from source, keep the cargo copies, re-run `bun run mcp:install` after pulling, and use `bun run mcp:doctor`, which reports each binary separately as **absent**, **unresponsive**, **stale** or **matching** and exits non-zero if either is missing.
+
+### Install from a source checkout
 
 ```sh
 bun run mcp:install
 bun run mcp:doctor
 ```
 
-`mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. `mcp:doctor` reports each separately, distinguishing **absent**, **unresponsive**, and **stale** from **matching**. A missing binary must not look like a current one.
-
-Both are required, and the hook is the one that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal. `mcp:doctor` exits non-zero if either is missing.
-
-The packaged app copies `plugins/gitpulse/` into `Contents/Resources/plugin`. Settings resolves `gitpulse-mcp` and `gitpulse-hook` beside the app, says `not reachable` for a hook binary it cannot find, warns when either is not on `PATH`, and copies `.mcp.json` and `hooks.json` with the resolved absolute paths. A released app puts neither on `PATH`, which is why those copies, not the bare names in the plugin's own manifests, are what to install there. In the copied `hooks.json` the collision guard and command gate refuse the call when the binary is missing, and session start says the hooks are off.
+`mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. Both are required.
 
 Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
