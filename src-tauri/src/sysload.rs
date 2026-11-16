@@ -39,6 +39,7 @@
 
 mod disk;
 mod diskrate;
+mod exec_probe;
 mod governor;
 mod probe;
 pub(crate) mod procscan;

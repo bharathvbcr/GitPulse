@@ -540,6 +540,11 @@ pub struct Readings {
     /// The sustained rate Severe decides on: one burst cannot fake it and a
     /// pause cannot hide it (`diskrate`).
     pub disk_fill_sustained: Reading<u64>,
+    /// How long a trivial child takes to start (`exec_probe`): the app's
+    /// sampler measures it in its own process, so it is not part of a host
+    /// sample and rides on the governor's input only. Unsupported wherever no
+    /// probe runs (a reader process, a platform with no trivial program).
+    pub exec_latency: Reading<super::exec_probe::ExecLatency>,
 }
 
 impl Readings {
@@ -555,6 +560,7 @@ impl Readings {
             segments: host.compressor_segments,
             disk_fill: Reading::default(),
             disk_fill_sustained: Reading::default(),
+            exec_latency: Reading::default(),
         }
     }
 
@@ -581,6 +587,11 @@ impl Readings {
             }),
             disk_fill: Reading::Value(0),
             disk_fill_sustained: Reading::Value(0),
+            exec_latency: Reading::Value(super::exec_probe::ExecLatency {
+                median_ms: 5,
+                n: 9,
+                slow: false,
+            }),
         }
     }
 

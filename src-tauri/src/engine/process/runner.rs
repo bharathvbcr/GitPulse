@@ -7,7 +7,8 @@ use super::env::{
 };
 use super::gate::{
     current_admission, is_deferred_under_load, is_slot_wait_timeout, refusal_message_at,
-    spawn_gate, strip_code_prefix, with_admission, Admission, Refusal, SpawnGate, TIMEOUT_MARKER,
+    spawn_gate, strip_code_prefix, with_admission, with_exec_probe, Admission, Refusal, SpawnGate,
+    TIMEOUT_MARKER,
 };
 #[cfg(test)]
 use super::gate::{refusal_message, spawn_log};
@@ -507,6 +508,60 @@ fn is_runner_timeout_shape(body: &str) -> bool {
         .take_while(|b| b.is_ascii_digit() || *b == b'.')
         .count();
     plain_label && digits > 0 && after[digits..].starts_with('s')
+}
+
+/// What [`time_exec_probe`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecProbeRun {
+    /// The child was admitted, ran and exited zero; this long from admission
+    /// to reaped.
+    Ran(Duration),
+    /// The child started and was still running at its deadline. The slowest
+    /// outcome there is, so a caller reads it as a sample of the deadline.
+    DeadlineHit,
+    /// No timing: the gate refused it or no slot came free, it failed to
+    /// spawn, or it exited non-zero.
+    Failed,
+}
+
+/// Starts `program` (a child that does nothing) and times it from the moment
+/// the spawn gate admits it to the moment the runner has reaped it, for
+/// `sysload::exec_probe`.
+///
+/// It runs through the same funnel as every other child (`run_admitted`), so
+/// it is bounded by `deadline`, counted in the gate report as `exec probe`, and
+/// held to the concurrency limit as a `Background` spawn; it is exempt from
+/// the rate bucket and the load verdict ([`with_exec_probe`] says why). It runs
+/// at standard QoS whatever its class: the signal stands for the reactive reads
+/// a person is waiting on, and a background-band child is throttled by design.
+/// The wait for a slot is not part of the time.
+pub(crate) fn time_exec_probe(program: &Path, deadline: Duration) -> ExecProbeRun {
+    let mut cmd = Command::new(program);
+    let mut options = RunOptions::new(deadline);
+    options.qos = Some(QosTier::Standard);
+    let admitted = Cell::new(None);
+    let result = with_admission(Admission::Background, || {
+        with_exec_probe(|| {
+            run_admitted(
+                &mut cmd,
+                "exec probe",
+                options,
+                None,
+                1024,
+                &mut (),
+                spawn_gate(),
+                &|| admitted.set(Some(Instant::now())),
+            )
+        })
+    });
+    match result {
+        Ok(run) if run.success && run.incomplete.is_none() => admitted
+            .get()
+            .map_or(ExecProbeRun::Failed, |at| ExecProbeRun::Ran(at.elapsed())),
+        Ok(_) => ExecProbeRun::Failed,
+        Err(error) if is_run_timeout(error.message()) => ExecProbeRun::DeadlineHit,
+        Err(_) => ExecProbeRun::Failed,
+    }
 }
 
 /// True when `err` is a child that started and ran past its deadline: not a
