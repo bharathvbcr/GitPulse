@@ -74,9 +74,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+// Only the macOS handler resolves a request's cwd to its repository root.
+#[cfg(target_os = "macos")]
+use crate::engine::git_cli::find_git_root;
 use crate::engine::git_cli::{
-    find_git_root, git_captured, git_captured_with_stdin, git_text_capped, git_with_index,
-    validate_repo,
+    git_captured, git_captured_with_stdin, git_text_capped, git_with_index, validate_repo,
 };
 use crate::engine::git_writer::{
     absent_oid_for_len, validate_oid, validate_ref_name, SNAPSHOT_IDENTITY_ARGS,

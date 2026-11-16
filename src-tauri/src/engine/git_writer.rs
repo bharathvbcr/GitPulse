@@ -4466,7 +4466,7 @@ fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
     let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
     op_snapshot_test_failures()
@@ -4494,7 +4494,9 @@ pub(crate) struct AskerDeadline {
 }
 
 impl AskerDeadline {
-    /// `budget` from `start`, on the real clock.
+    /// `budget` from `start`, on the real clock. Only the macOS op-record
+    /// handler builds one.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(start: Instant, budget: Duration) -> Self {
         Self {
             expires_at: start + budget,
@@ -4502,7 +4504,7 @@ impl AskerDeadline {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
         Self { expires_at, now }
     }
@@ -4529,7 +4531,9 @@ pub(crate) const OP_DEADLINE_PASSED: &str =
 
 impl GitWriter {
     /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
-    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]). Only the macOS
+    /// op-record handler calls it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn record_op_snapshot(
         repo_path: &str,
         command: &str,

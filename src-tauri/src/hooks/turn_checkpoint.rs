@@ -33,7 +33,8 @@ pub(super) enum Outcome {
     /// The setting is off (or unreadable): nothing was attempted.
     Disabled,
     /// The app answered: `captured`, `unchanged`, `coalesced`, `skipped` or
-    /// `failed`, with its reason.
+    /// `failed`, with its reason. Built only where the app-side recorder exists.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Answered {
         outcome: String,
         reason: Option<String>,
