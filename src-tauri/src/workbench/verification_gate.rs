@@ -153,15 +153,16 @@ pub(crate) const CURRENT_HEAD_SOURCE: &str = "verification_gate.current_head";
 /// HEAD of the worktree a verification was taken in, as it is now.
 pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // The driver asks this of every held card every sweep, and the board asks
-    // it per card on every refresh. HEAD is a function of HEAD and the ref it
-    // names, which a symref may place in any namespace (`refs/remotes/...`), so
-    // the whole ref store is stamped, as for the verification base. An
-    // unchanged worktree is answered from the ref cache by file stats, with no
-    // process.
+    // it per card on every refresh. HEAD is a function of HEAD and the one ref
+    // it names (plus packed-refs), so only those files are stamped: stamping the
+    // whole ref store made every ref move anywhere in the repository, by any
+    // of the agents sharing it, a miss and a process. Anything the narrow stamp
+    // cannot name exactly (a symref to a symref, reftable) falls back to the
+    // whole-store stamp inside `git_text_head`. An unchanged worktree is
+    // answered from the ref cache by file stats, with no process.
     crate::engine::process::with_spawn_source(CURRENT_HEAD_SOURCE, || {
-        crate::engine::ref_cache::git_text(
+        crate::engine::ref_cache::git_text_head(
             Path::new(worktree),
-            &[crate::engine::ref_cache::ALL_REFS],
             &["rev-parse", "--verify", "HEAD^{commit}"],
         )
     })
