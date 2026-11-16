@@ -1788,6 +1788,7 @@ fn a_command_of_unknown_target_from_another_session_makes_a_proved_one_ambiguous
     assert_eq!(got.session_id, None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_command_aimed_at_another_checkout_stays_a_candidate_since_text_cannot_prove_it_elsewhere() {
     let t = tree();
@@ -2126,6 +2127,7 @@ fn an_unknown_git_verb_never_links_and_makes_another_sessions_link_ambiguous() {
     assert_eq!(alone.basis, basis::COMMAND_TARGET_UNKNOWN);
 }
 
+#[cfg(unix)]
 #[test]
 fn only_verbs_known_to_make_no_commit_are_read_only() {
     let t = tree();
@@ -2178,6 +2180,7 @@ fn only_verbs_known_to_make_no_commit_are_read_only() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn how_many_commits_a_command_makes_is_a_single_commit_unless_the_words_say_a_run() {
     let t = tree();
