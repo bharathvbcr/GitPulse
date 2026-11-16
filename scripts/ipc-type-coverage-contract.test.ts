@@ -83,6 +83,8 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["CodeintelFileSymbols", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelLayeredImpact", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelNeighbors", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["ConnectOutcome", { reason: "mirrored in src/lib/tools/agentConnect.ts; covered by agentConnect.test.ts" }],
+  ["ConnectPlan", { reason: "mirrored in src/lib/tools/agentConnect.ts; covered by agentConnect.test.ts" }],
   ["DeadbranchBackupInfo", { reason: "deadbranch backup list; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchCleanResult", { reason: "deadbranch prune outcome; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchRestoreResult", { reason: "deadbranch restore outcome; mirrored in src/lib/branches/types.ts" }],

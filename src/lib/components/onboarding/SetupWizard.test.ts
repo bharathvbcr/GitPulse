@@ -22,6 +22,24 @@ describe("SetupWizard DevCouncil install", () => {
   });
 });
 
+describe("SetupWizard with no repository open", () => {
+  // The Console runs through cmd_terminal_run, which validates a repository
+  // path, so there is no terminal to run in. The button is not rendered (it
+  // used to be a disabled control with its reason in a tooltip), the reason is
+  // said on the page, and Copy command keeps working.
+  it("renders Run in terminal only when a repository is open, and says why otherwise", () => {
+    expect(source).toMatch(/\{#if repoPath\}\s*<button[\s\S]*?Run in terminal[\s\S]*?\{\/if\}/);
+    expect(source).not.toMatch(/disabled=\{!repoPath/);
+    expect(source).toContain('data-testid="no-repo-terminal-note"');
+    expect(source).toContain("{#if !repoPath}");
+  });
+
+  it("keeps Copy command independent of the repository", () => {
+    const copy = source.slice(source.indexOf("Copy command") - 400, source.indexOf("Copy command"));
+    expect(copy).not.toContain("repoPath");
+  });
+});
+
 describe("SetupWizard dialog accessibility", () => {
   it("traps focus, closes on Escape, and restores focus through the shared action", () => {
     expect(source).toContain('import { trapFocus } from "../../ui/focusTrap"');

@@ -16,6 +16,7 @@ export const EN = {
   "setup.step.preflight": "Check",
   "setup.step.install": "Install",
   "setup.step.verify": "Verify",
+  "setup.step.connect": "Connect agent",
   "setup.step.done": "Done",
   "setup.checking": "Checking prerequisites…",
   "setup.complete": "Setup complete for this session.",
