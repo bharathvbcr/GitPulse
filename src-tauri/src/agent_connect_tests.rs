@@ -382,3 +382,22 @@ fn translocated_bundle_is_refused_with_a_move_instruction() {
     assert!(!fx.home.join(".local").exists());
     assert!(runner.adds().is_empty());
 }
+
+#[test]
+fn link_details_say_what_depends_on_path() {
+    let fx = fixture();
+    let runner = FakeRunner::new(vec![]);
+    let e = env(&fx, &runner, &none);
+    let before = build_plan(&e);
+    assert!(action(&before, "link:gitpulse-hook")
+        .detail
+        .contains("must be on your shell's PATH"));
+    let after = apply(&e).plan;
+    let done = action(&after, "link:gitpulse-hook");
+    assert_eq!(done.state, ConnectActionState::Done);
+    assert!(
+        done.detail.contains("must be on your shell's PATH"),
+        "{}",
+        done.detail
+    );
+}

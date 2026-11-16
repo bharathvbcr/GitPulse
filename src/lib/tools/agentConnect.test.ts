@@ -9,6 +9,8 @@ vi.mock("../ipc/invoke", () => ({ invoke: (...args: unknown[]) => invoke(...args
 import {
   applyAgentConnect,
   buildSetupPrompt,
+  CLAUDE_PLUGIN_INSTALL,
+  CLAUDE_PLUGIN_MARKETPLACE_ADD,
   canConnect,
   connectConfirmText,
   connectSummary,
@@ -101,6 +103,31 @@ describe("setup prompt", () => {
     expect(text).not.toContain("mcp:install");
     expect(text).not.toContain("cargo build");
     expect(text).toContain("reinstall GitPulse");
+  });
+
+  it("always offers Manvi through the button that exists, even when no DevMap command is runnable", () => {
+    for (const windows of [false, true]) {
+      const text = buildSetupPrompt(plan(), windows);
+      expect(text).toContain("Settings > Agents > Manvi policy > Set up Manvi");
+      expect(text).not.toContain("Run setup");
+    }
+  });
+
+  it("offers the Claude Code plugin for hooks through Claude's own plugin commands", () => {
+    const text = buildSetupPrompt(plan());
+    expect(text).toContain(CLAUDE_PLUGIN_MARKETPLACE_ADD);
+    expect(text).toContain(CLAUDE_PLUGIN_INSTALL);
+    expect(CLAUDE_PLUGIN_INSTALL).toBe("claude plugin install gitpulse@gitpulse");
+  });
+
+  it("asks the agent to check ~/.local/bin is on PATH without editing the profile", () => {
+    const text = buildSetupPrompt(plan());
+    expect(text).toContain("~/.local/bin is on my shell's PATH");
+    expect(text).toContain("do not edit my profile yourself");
+  });
+
+  it("says the code map needs Rust", () => {
+    expect(buildSetupPrompt(plan())).toContain("Rust toolchain (cargo)");
   });
 
   it("quotes a path with a quote or space in the link command", () => {

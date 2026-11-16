@@ -67,17 +67,20 @@ loaded-page filtering, multi-selection, archive, and run boundaries.
 
 ## 5. Add optional capabilities when you need them
 
-GitPulse works without any of these. A view that needs one stays open and says
-what is missing, with a **Set up** (or **Build index**) button in place.
+GitPulse works without any of these. The code-map views (Health, Suspects, diff
+impact and palette symbol search) stay open without DevMap and say what is
+missing, with a **Set up code map** or **Build index** button in place; the
+Manvi card and status pill do the same for Manvi.
 
 - **Connect your agent:** **Settings → Agents → Connect your agent** (also on the
   first-run card and the setup wizard's last step) links the `gitpulse-mcp` and
   `gitpulse-hook` that ship inside the app into `~/.local/bin` and registers the
-  server with Claude Code and Codex through their own `mcp add`. It shows the
-  plan first and changes nothing until you apply it; anything already set up
-  differently is left alone and reported. **Copy setup prompt** gives your agent
-  the same steps to carry out instead. No source checkout or Rust toolchain is
-  needed.
+  MCP server with Claude Code and Codex through their own `mcp add`. It shows
+  the plan first and changes nothing until you apply it; anything already set
+  up differently is left alone and reported. **Copy setup prompt** gives your
+  agent the same steps to carry out instead, plus the optional Claude Code
+  plugin that adds GitPulse's hooks and skills. No source checkout or Rust
+  toolchain is needed.
 - **GitHub:** install and authenticate `gh` for pull requests, issues, and Actions.
 - **Code Map:** use **Help → Set Up Optional Tools** for DevMap, the default
   module. There is no prebuilt DevMap this version can read yet, so the wizard
@@ -86,8 +89,9 @@ what is missing, with a **Set up** (or **Build index**) button in place.
   supported Mac builds also offer Apple Intelligence for task drafting and, for
   commit messages, to phrase a subject the app has already classified. With no
   model at all, a commit message is still written from the staged change.
-- **Agents and policy:** set up Manvi from the same wizard (a checksummed
-  prebuilt on macOS and Linux) and configure the provider you intend to use.
+- **Agents and policy:** set up Manvi from the same wizard (it builds from
+  source, which needs a Go toolchain; no published Manvi release reads this
+  version's task store yet) and configure the provider you intend to use.
   Without Manvi, Git actions run unchecked and say so. Explicit agent sessions
   have their own permissions and network behavior.
 

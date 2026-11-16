@@ -146,53 +146,23 @@ pub struct PinnedRelease {
 
 /// The prebuilts GitPulse will install.
 ///
-/// A SHA-256 is only worth pinning for an artifact that was actually
-/// downloaded, checked against its release's published sums, and run. Each
-/// entry below was: Manvi v0.0.5 publishes raw binaries plus `SHA256SUMS`;
-/// all four digests equal that file, and the darwin-arm64 binary was started.
+/// A SHA-256 is only worth pinning for an artifact that was downloaded,
+/// checked against its release's published sums, run, and found compatible
+/// with what this build reads. The unpacker handles every format the sibling
+/// projects publish (`devmap-cli-<target>.tar.xz`, Manvi's raw binaries), but
+/// no published release is compatible yet, so the table is empty:
 ///
-/// There is no devmap entry on purpose. The unpacker handles the formats
-/// DevCouncil publishes (`devmap-cli-<target>.tar.xz`), but its latest
-/// published release, v0.2.3, writes store schema 22 and this build's reader
-/// requires at least schema 29 (`MIN_READER_SCHEMA_VERSION`), so it would
-/// install a binary GitPulse then refuses. Pin devmap once a DevCouncil
-/// release that writes the current schema is published, downloaded and
-/// checked; until then the rung is unavailable for it and the pinned source
-/// installs are used.
-pub const PINNED_RELEASES: &[PinnedRelease] = &[
-    PinnedRelease {
-        tool: "manvi",
-        version: "v0.0.5",
-        target: "aarch64-apple-darwin",
-        asset_name: "manvi-v0.0.5-darwin-arm64",
-        format: AssetFormat::Raw,
-        sha256: "71b54c227e2401bbcf6e7148ff62bd6576851ffb1fdb4e773d372785615a3ccb",
-    },
-    PinnedRelease {
-        tool: "manvi",
-        version: "v0.0.5",
-        target: "x86_64-apple-darwin",
-        asset_name: "manvi-v0.0.5-darwin-amd64",
-        format: AssetFormat::Raw,
-        sha256: "9737d717f5d00a992251c18bd55859c06853b82a408201982dda6c9808c4ced8",
-    },
-    PinnedRelease {
-        tool: "manvi",
-        version: "v0.0.5",
-        target: "x86_64-unknown-linux-gnu",
-        asset_name: "manvi-v0.0.5-linux-amd64",
-        format: AssetFormat::Raw,
-        sha256: "c3c2d51c8f936d9c4eb24d5aa037e9425cdbc72353771291550fa8650dfa0232",
-    },
-    PinnedRelease {
-        tool: "manvi",
-        version: "v0.0.5",
-        target: "aarch64-unknown-linux-gnu",
-        asset_name: "manvi-v0.0.5-linux-arm64",
-        format: AssetFormat::Raw,
-        sha256: "21967498b08d42b5117d44dd4502dc2ee47011137e3bb48d6a54cf218b24ef4f",
-    },
-];
+/// - devmap: the latest release, v0.2.3, writes store schema 22 and this
+///   reader requires at least 29 (`MIN_READER_SCHEMA_VERSION`).
+/// - Manvi: the latest release, v0.0.5, was built against DevCouncil
+///   `97741aec`, whose dc-store is schema 9 with no workbench schema; this
+///   build's profile is dc-store 11 / workbench 17, and the profile migrates
+///   one way, so that Manvi would be a stale reader of the shared task store.
+///
+/// Pin a tool once a release that reads the current schemas is published,
+/// downloaded and checked; until then the rung reports itself unavailable and
+/// the pinned source installs are used.
+pub const PINNED_RELEASES: &[PinnedRelease] = &[];
 
 /// The pin for `tool` on `target`, if the table has one.
 fn pinned_for<'a>(
@@ -1103,36 +1073,23 @@ mod tests {
         assert!(!dest.exists());
     }
 
-    /// Real network: downloads the pinned Manvi asset for this platform through
-    /// the release rung into a relocated tools.json, then starts it. Run with
-    /// `cargo test --lib prebuilt_manvi_installs_end_to_end -- --ignored`.
-    #[cfg(unix)]
+    /// Manvi v0.0.5 links dc-store schema 9 (DevCouncil `97741aec`); this
+    /// build's task store is newer and migrates one way. Until a Manvi release
+    /// that links the current dc-store is pinned, the table must not install a
+    /// stale reader of the shared profile.
     #[test]
-    #[ignore = "downloads from github.com"]
-    fn prebuilt_manvi_installs_end_to_end() {
-        let _lock = crate::harness::sidecar::test_serial();
-        let serial = crate::test_support::env::env_serial();
-        let dir = tempfile::TempDir::new().unwrap();
-        let cfg = dir.path().join("tools.json");
-        let _env = crate::test_support::env::bind_env(&serial)
-            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg)
-            .invalidating(crate::tool_config::invalidate_cache);
-        let dest = install_prebuilt(ExternalTool::Manvi).expect("install the pinned manvi");
-        assert!(dest.starts_with(dir.path()), "{dest:?} escaped {dir:?}");
-        let mut cmd = Command::new(&dest);
-        cmd.arg("version");
-        let out = process::run_bounded_capped(
-            cmd,
-            "manvi version",
-            Duration::from_secs(10),
-            None,
-            64 * 1024,
-        )
-        .expect("run manvi");
-        let text = String::from_utf8_lossy(&out.stdout);
-        println!("{} -> {text}", dest.display());
-        assert!(out.success);
-        assert!(text.contains("v0.0.5"), "{text}");
+    fn no_manvi_pin_ships_while_the_published_release_links_an_older_dc_store() {
+        const PUBLISHED_MANVI_DC_STORE_SCHEMA: u32 = 9;
+        const {
+            assert!(
+                PUBLISHED_MANVI_DC_STORE_SCHEMA < dc_store::SCHEMA_VERSION,
+                "the published Manvi now links the current dc-store: pin it and delete this test"
+            );
+        }
+        assert!(
+            PINNED_RELEASES.iter().all(|pin| pin.tool != "manvi"),
+            "a manvi pin ships a stale reader of the shared task store"
+        );
     }
 
     #[test]

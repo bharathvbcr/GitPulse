@@ -89,6 +89,15 @@ export function connectConfirmText(plan: ConnectPlan): string {
   return lines.join("\n");
 }
 
+/**
+ * Claude Code's plugin commands for GitPulse's marketplace
+ * (`.claude-plugin/marketplace.json` at the public repository's root, plugin
+ * `gitpulse`). Syntax from `claude plugin marketplace add --help` and
+ * `claude plugin install --help`: `<source>` and `<plugin>@<marketplace>`.
+ */
+export const CLAUDE_PLUGIN_MARKETPLACE_ADD = "claude plugin marketplace add bharathvbcr/GitPulse";
+export const CLAUDE_PLUGIN_INSTALL = "claude plugin install gitpulse@gitpulse";
+
 function sh(text: string): string {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
@@ -132,15 +141,25 @@ export function buildSetupPrompt(plan: ConnectPlan, windows = false): string {
     lines.push(`   ${command.label}: ${command.verify}`);
   }
   lines.push("   The server is named gitpulse. Tell me which agents you registered it with.");
+  lines.push(
+    "4. Check that ~/.local/bin is on my shell's PATH (echo $PATH). The registration above uses the full path, so the MCP server works either way, but GitPulse's Claude Code hooks call gitpulse-hook by name. If it is missing, tell me which shell profile line would add it; do not edit my profile yourself.",
+  );
 
+  lines.push(
+    "",
+    "Optional, only if I say yes: GitPulse's Claude Code plugin adds its hooks (collision guard, command gate) and skills. Install it with Claude Code's own plugin commands:",
+    `   ${CLAUDE_PLUGIN_MARKETPLACE_ADD}`,
+    `   ${CLAUDE_PLUGIN_INSTALL}`,
+  );
   const devmap = buildDevcouncilInstallCommand({ preset: "devmap", sourceCheckout: null, windows });
   if (devmap.runnable && devmap.command) {
     lines.push(
-      "",
-      "Optional, only if I say yes: install DevCouncil's code map, which GitPulse's Map view uses. It needs a Rust toolchain (cargo):",
+      "Optional, only if I say yes: install DevCouncil's code map, which GitPulse's Map, Health, Suspects and impact views use. It needs a Rust toolchain (cargo):",
       `   ${devmap.command}`,
-      "Optional, only if I say yes: Manvi (policy checks) is installed from GitPulse itself: Settings > Agents > Run setup.",
     );
   }
+  lines.push(
+    "Optional, only if I say yes: Manvi (policy checks before commits, pushes and other Git actions) is set up from GitPulse itself: Settings > Agents > Manvi policy > Set up Manvi. Building it needs a Go toolchain.",
+  );
   return lines.join("\n");
 }

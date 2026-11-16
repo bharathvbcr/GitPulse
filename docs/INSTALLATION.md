@@ -44,12 +44,16 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 This removes a local quarantine attribute; it does not verify or notarize the app.
 Open GitPulse from Applications, Finder, or Spotlight.
 
-To let Claude Code or Codex use GitPulse's MCP tools and hooks, open
+To let Claude Code or Codex use GitPulse's MCP tools, open
 **Settings → Agents → Connect your agent** once GitPulse runs from
 Applications. The `gitpulse-mcp` and `gitpulse-hook` binaries ship inside
 `GitPulse.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
-registers the server through each agent's own CLI, after showing you the plan.
-Because the links point into the app, they follow the app when you update it.
+registers the MCP server through each agent's own CLI, after showing you the
+plan. Because the links point into the app, they follow the app when you update
+it. Connecting does not install GitPulse's Claude Code plugin, which is what
+wires its hooks; **Copy setup prompt** includes the plugin's install commands,
+and its hooks find `gitpulse-hook` only when `~/.local/bin` is on your shell's
+`PATH`.
 Connecting is refused while macOS runs the app from a temporary App
 Translocation location (opened straight from the DMG or Downloads); move it to
 Applications first. `bun run mcp:install` is only for building these binaries

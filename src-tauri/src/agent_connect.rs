@@ -222,6 +222,12 @@ fn cap(text: &str) -> String {
     cut
 }
 
+/// Why a link can be in place and still not be found. The app cannot read the
+/// PATH of the shell an agent starts from (a GUI app's own PATH differs), so
+/// it says what depends on it instead of guessing.
+const PATH_NOTE: &str = "The MCP registration uses the full path and works either way; \
+     Claude Code hooks call gitpulse-hook by name, so ~/.local/bin must be on your shell's PATH.";
+
 /// Whether `path` lies inside a macOS App Translocation mount.
 fn is_translocated(path: &Path) -> bool {
     path.components()
@@ -253,7 +259,7 @@ fn inspect_link(dest: &Path, source: &Path) -> (ConnectActionState, String) {
     match std::fs::symlink_metadata(dest) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             ConnectActionState::Todo,
-            format!("Creates a link to {}", source.display()),
+            format!("Creates a link to {}. {PATH_NOTE}", source.display()),
         ),
         Err(e) => (
             ConnectActionState::Blocked,
@@ -262,7 +268,7 @@ fn inspect_link(dest: &Path, source: &Path) -> (ConnectActionState, String) {
         Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(dest) {
             Ok(target) if same_file(&target, source) => (
                 ConnectActionState::Done,
-                "Already linked to this app.".into(),
+                format!("Already linked to this app. {PATH_NOTE}"),
             ),
             Ok(target) => (
                 ConnectActionState::Blocked,
