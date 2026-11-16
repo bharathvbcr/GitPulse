@@ -128,6 +128,9 @@ impl CliRunner for BoundedCliRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<CliRun, String> {
         let mut cmd = Command::new(program);
         cmd.args(args);
+        // Run outside any repository, so a project-scoped `.mcp.json` in the
+        // app's working directory cannot change what `mcp get` reports.
+        cmd.current_dir(std::env::temp_dir());
         let run = process::run_bounded_capped(cmd, program, CLI_DEADLINE, None, CLI_OUTPUT_CAP)
             .map_err(|e| e.message().to_string())?
             .require_complete(program)
