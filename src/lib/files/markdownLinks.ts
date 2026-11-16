@@ -15,6 +15,7 @@
  */
 
 import { isOpenableUrl, MAX_URL_LENGTH, resolveRepoFile } from "../terminal/links";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** Prefix every rendered id carries in the app's document. */
 export const MARKDOWN_ID_PREFIX = "gp-md-";
@@ -206,7 +207,7 @@ export function handleMarkdownClick(event: MouseEvent, context: MarkdownClickCon
     }
     case "external":
       void context.openExternal(action.url).catch((error: unknown) => {
-        context.report(`Couldn't open ${action.url}. ${error instanceof Error ? error.message : String(error)}`);
+        context.report(`Couldn't open ${action.url}. ${describeError(error, "markdown")}`);
       });
       return;
     case "file":

@@ -414,7 +414,7 @@ fn parse_pattern(pattern: &str) -> Option<BoundPattern> {
     }
     let (binds_r, names) = match spec.strip_prefix("r:") {
         Some(names) => (true, names),
-        None => (false, spec.strip_prefix(':').unwrap_or(spec)),
+        None => (false, spec.trim_prefix(':')),
     };
     let relationships: Vec<String> = names
         .split('|')

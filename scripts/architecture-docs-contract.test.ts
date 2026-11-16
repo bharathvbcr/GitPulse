@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { readCommandsSource } from "./commands-source";
+import { DEFAULT_LIB_RS, parseRegisteredHandlers } from "./check-ipc-contract.mjs";
 
 /**
  * The architecture docs listed "Tokio" beside "Rayon" as though both were
@@ -143,5 +144,38 @@ describe("architecture documentation contract", () => {
     expect(targets.length, "no in-repository links found to check").toBeGreaterThan(0);
     const missing = targets.filter((relative) => !existsSync(new URL(relative, root)));
     expect(missing).toEqual([]);
+  });
+
+  it("keeps inline <code> repository paths in architecture docs pointing at real paths", () => {
+    const root = new URL("../", import.meta.url);
+    const moduleIntegration = readFileSync(new URL("docs/MODULE_INTEGRATION.md", root), "utf8");
+    const missing: string[] = [];
+    for (const [name, source] of [
+      ["docs/ARCHITECTURE.md", architecture],
+      ["docs/MODULE_INTEGRATION.md", moduleIntegration],
+    ] as const) {
+      for (const match of source.matchAll(
+        /<code>((?:src-tauri|src|contracts|scripts|docs)\/[^<*]+)<\/code>/g,
+      )) {
+        if (!existsSync(new URL(match[1], root))) {
+          missing.push(`${name}: ${match[1]}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it("keeps MODULE_INTEGRATION handler count aligned with registered IPC handlers", () => {
+    const moduleIntegration = readFileSync(
+      new URL("../docs/MODULE_INTEGRATION.md", import.meta.url),
+      "utf8",
+    );
+    const { handlers, errors } = parseRegisteredHandlers(readFileSync(DEFAULT_LIB_RS, "utf8"));
+    expect(errors.length, "lib.rs registry must parse cleanly").toBe(0);
+    const claims = [...moduleIntegration.matchAll(/(\d[\d,]*)\s+Handlers\b/gi)];
+    expect(claims.length, "MODULE_INTEGRATION.md must state a handler count").toBeGreaterThan(0);
+    for (const match of claims) {
+      expect(Number(match[1].replace(/,/g, ""))).toBe(handlers.size);
+    }
   });
 });

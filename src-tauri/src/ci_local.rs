@@ -22,7 +22,8 @@
 //! claim about a tree that was never tested.
 
 use crate::analyzer::deps::npm_program;
-use crate::engine::git_cli::{capture_command, git_text, validate_repo, CapturedOutput};
+use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::process::{capture_command, CapturedOutput};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -621,7 +622,7 @@ const NPM_CI_ENV: &[(&str, &str)] = &[
 fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
     let mut combined = stdout.to_vec();
     combined.extend_from_slice(stderr);
-    crate::engine::git_cli::byte_tail(&combined, OUTPUT_TAIL_BYTES)
+    crate::engine::process::byte_tail(&combined, OUTPUT_TAIL_BYTES)
         .lines()
         .collect::<Vec<_>>()
         .join("\n")

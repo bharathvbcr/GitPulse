@@ -46,7 +46,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Wall-clock ceiling for the tag listing.
 ///
-/// Deliberately *not* [`crate::engine::git_cli::NETWORK_TIMEOUT`] (30 min):
+/// Deliberately *not* [`crate::engine::process::NETWORK_TIMEOUT`] (30 min):
 /// that budget exists for multi-gigabyte clones and fetches. A version check
 /// transfers a few kilobytes of ref names, and one that has not answered in
 /// twenty seconds has failed as far as the user is concerned.
@@ -156,7 +156,7 @@ pub fn parse_version(text: &str) -> Option<Version> {
 /// this check has no way to ask.
 pub fn parse_release_tag(tag: &str) -> Option<Version> {
     let trimmed = tag.trim();
-    let bare = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let bare = trimmed.trim_prefix('v');
     if bare.contains('-') || bare.contains('+') {
         return None;
     }
@@ -194,7 +194,7 @@ pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, Str
         let Some(tag) = refname.trim().strip_prefix("refs/tags/") else {
             continue;
         };
-        let tag = tag.strip_suffix("^{}").unwrap_or(tag);
+        let tag = tag.trim_suffix("^{}");
         let Some(version) = parse_release_tag(tag) else {
             continue;
         };
@@ -434,7 +434,7 @@ fn tip_fingerprint(ls_remote_output: &str, current_version: &str) -> String {
             let Some(tag) = refname.trim().strip_prefix("refs/tags/") else {
                 return false;
             };
-            let tag = tag.strip_suffix("^{}").unwrap_or(tag);
+            let tag = tag.trim_suffix("^{}");
             match (parse_release_tag(tag), current) {
                 (Some(version), Some(current)) => version > current,
                 (Some(_), None) => true,

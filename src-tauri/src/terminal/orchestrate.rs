@@ -153,6 +153,7 @@ impl<R: tauri::Runtime> OrchestrateUiSink for AppOrchestrateUiSink<R> {
         std::sync::Arc::new(crate::terminal::AppEvents::new(
             &self.app,
             state.incidents.clone(),
+            state.session_ledger.clone(),
         ))
     }
 }
@@ -1027,9 +1028,7 @@ fn build_agent_child_args(
 
 #[cfg(unix)]
 fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str) {
-    let Some(host) = &state.host else {
-        return;
-    };
+    let host = &state.host;
     let (dims, seen_bytes) = {
         let inner = state.orchestration.lock();
         let Some(rec) = inner.sessions.get(child_session_id) else {

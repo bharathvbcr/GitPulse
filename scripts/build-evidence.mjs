@@ -7,7 +7,56 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** A source-map reference written as the comment bundlers append to an output. */
 const SOURCE_MAP_REFERENCE = /(?:\/\/|\/\*)[#@]\s*sourceMappingURL=/;
-const SCANNED_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".css"]);
+export const SOURCE_MAP_SCANNED_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".css"]);
+
+/**
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+export function isSourceMapPath(filePath) {
+  return /\.map$/i.test(filePath);
+}
+
+/**
+ * @param {string} filePath
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasSourceMapComment(filePath, text) {
+  return SOURCE_MAP_SCANNED_EXTENSIONS.has(path.extname(filePath).toLowerCase())
+    && SOURCE_MAP_REFERENCE.test(text);
+}
+
+/**
+ * Detects a Source Map v3 JSON payload even when its filename/extension was
+ * stripped (for example WiX `PathFile_I<hex>` CAB entries inside `.msi`).
+ *
+ * @param {Buffer} data
+ * @returns {boolean}
+ */
+export function isSourceMapDocument(data) {
+  if (data.length < 2 || data.length > 64 * 1024 * 1024) return false;
+  let offset = data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf ? 3 : 0;
+  while (
+    offset < data.length
+    && (data[offset] === 0x20 || data[offset] === 0x09 || data[offset] === 0x0a || data[offset] === 0x0d)
+  ) {
+    offset += 1;
+  }
+  if (offset >= data.length || data[offset] !== 0x7b) return false;
+  try {
+    const parsed = JSON.parse(data.toString("utf8", offset));
+    return Boolean(
+      parsed
+      && typeof parsed === "object"
+      && !Array.isArray(parsed)
+      && parsed.version === 3
+      && ((typeof parsed.mappings === "string" && Array.isArray(parsed.sources)) || Array.isArray(parsed.sections)),
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Every file under `dir` that would hand a reader the app's sources: a `.map`
@@ -31,10 +80,10 @@ export function shippedSourceMaps(dir) {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const full = path.join(current, entry.name);
       const relative = path.relative(dir, full).split(path.sep).join("/");
-      if (entry.name.endsWith(".map")) found.push(relative);
+      if (isSourceMapPath(entry.name)) found.push(relative);
       else if (entry.isDirectory()) walk(full);
-      else if (entry.isFile() && SCANNED_EXTENSIONS.has(path.extname(entry.name))
-        && SOURCE_MAP_REFERENCE.test(readFileSync(full, "utf8"))) found.push(relative);
+      else if (entry.isFile() && SOURCE_MAP_SCANNED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+        && hasSourceMapComment(entry.name, readFileSync(full, "utf8"))) found.push(relative);
     }
   };
   walk(dir);

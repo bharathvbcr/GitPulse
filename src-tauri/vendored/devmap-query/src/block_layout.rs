@@ -344,10 +344,10 @@ mod tests {
         };
         json!({
             "content_fingerprint": "c2:0123456789012345678901234567890123456789",
-            "dead_code": (0..dead).map(|i| json!({"id": format!("d{i}")})).collect::<Vec<_>>(),
-            "edges": (0..edges).map(edge).collect::<Vec<_>>(),
+            "dead_code": Vec::from_fn(dead, |i| json!({"id": format!("d{i}")})),
+            "edges": Vec::from_fn(edges, edge),
             "meta": {"counts": [1, 2, 3], "text": "x, y]"},
-            "nodes": (0..nodes).map(node).collect::<Vec<_>>(),
+            "nodes": Vec::from_fn(nodes, node),
             "schema_version": 2,
         })
     }

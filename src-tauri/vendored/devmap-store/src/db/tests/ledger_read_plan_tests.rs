@@ -46,7 +46,7 @@ fn ledger(skip: usize) -> Vec<UnresolvedReference> {
         for sym in 0..4 {
             for callee in ["hub", "ghost", "other"] {
                 n += 1;
-                if skip != 0 && n % skip == 0 {
+                if skip != 0 && n.is_multiple_of(skip) {
                     continue;
                 }
                 rows.push(UnresolvedReference {
@@ -58,7 +58,7 @@ fn ledger(skip: usize) -> Vec<UnresolvedReference> {
                         reason: format!("reason_{n}"),
                     },
                     class: classes[n % classes.len()].clone(),
-                    receiver: if n % 2 == 0 {
+                    receiver: if n.is_multiple_of(2) {
                         None
                     } else {
                         Some(format!("recv_{n}"))
@@ -225,7 +225,8 @@ fn every_keyed_read_returns_what_the_statement_it_replaced_returned() {
     // (what the public read keys on, the column the old statement named,
     // whether the public read filters to the unattributed classes)
     type Read = fn(&Store, u32, &[String], usize) -> Result<Option<UnresolvedSitesByName>>;
-    let reads: [(&str, LedgerKey, &str, bool, &[String], Read); 4] = [
+    type ReadCase<'a> = (&'a str, LedgerKey, &'a str, bool, &'a [String], Read);
+    let reads: [ReadCase; 4] = [
         (
             "unresolved_sites_naming",
             LedgerKey::Callee,

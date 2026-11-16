@@ -27,8 +27,8 @@ describe("boardDrag", () => {
   });
 
   it("moves a focused card to the neighbouring column", () => {
-    expect(neighborStatus("inbox", 1)).toBe("backlog");
-    expect(neighborStatus("inbox", -1)).toBeNull();
+    expect(neighborStatus("backlog", 1)).toBe("ready");
+    expect(neighborStatus("backlog", -1)).toBeNull();
     expect(neighborStatus("done", 1)).toBeNull();
     expect(neighborStatus("review", -1)).toBe("in_progress");
   });

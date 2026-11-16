@@ -13,8 +13,9 @@
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::git_cli::{git_text, validate_repo, with_spawn_source};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::REFS_TAG_CAP;
+use crate::engine::process::with_spawn_source;
 use crate::graph::ref_scope::{self, HiddenHistory, RefScope};
 
 /// What a ref is, so the UI can style and order them.
@@ -178,12 +179,12 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
     // A detached HEAD makes this exit 1, which is an answer: no current
     // branch. A refusal is not, and used to render the graph with no HEAD
     // branch label at all, so it fails the listing with its own cause.
-    let failures = crate::engine::git_cli::process_failures();
+    let failures = crate::engine::process::process_failures();
     let current_branch = crate::engine::git_reader::head_branch_cached(&repo)
         .unwrap_or_default()
         .unwrap_or_default();
-    if crate::engine::git_cli::process_failures() != failures {
-        return Err(crate::engine::git_cli::last_process_failure()
+    if crate::engine::process::process_failures() != failures {
+        return Err(crate::engine::process::last_process_failure()
             .unwrap_or_else(|| "the current-branch lookup produced no answer".into()));
     }
 
@@ -477,7 +478,7 @@ mod tests {
     fn a_refused_current_branch_lookup_fails_the_listing() {
         let dir = init_repo();
         let path = dir.path().to_str().unwrap();
-        let refused = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let refused = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             list_ref_decorations(path, RefScope::Named)
         });
         let error = refused.expect_err("no current branch was learned");

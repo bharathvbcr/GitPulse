@@ -3,7 +3,7 @@ import { fuzzyMatch } from "../branches/groupBranches";
 import { isRecord } from "../record";
 import { MAX_QUERY_LENGTH } from "./modes";
 
-export { MAX_QUERY_LENGTH, PALETTE_MODES, parsePaletteQuery, type PaletteMode } from "./modes";
+export { MAX_QUERY_LENGTH, PALETTE_MODES, modeLandsOnRepositoryPage, parsePaletteQuery, type PaletteMode } from "./modes";
 
 export interface PaletteItem {
   id: string;
@@ -97,7 +97,7 @@ export function rankItems<T extends Pick<PaletteItem, "id" | "label" | "descript
 
 export function actionFailure(result: unknown): string | null {
   if (isRecord(result) && result.ok === false) {
-    return typeof result.error === "string" && result.error ? result.error : "The action was cancelled or did not complete.";
+    return typeof result.error === "string" && result.error ? result.error : "The action was canceled or didn't complete.";
   }
   return null;
 }

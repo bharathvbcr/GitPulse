@@ -264,6 +264,39 @@ fn unknown_or_out_of_range_values_are_errors_not_guesses() {
     );
 }
 
+#[test]
+fn the_board_has_five_statuses_and_no_inbox() {
+    assert_eq!(
+        STATUSES,
+        ["backlog", "ready", "in_progress", "review", "done"]
+    );
+}
+
+#[test]
+fn a_retired_inbox_is_read_as_backlog() {
+    for spelling in ["inbox", "Inbox", " INBOX "] {
+        assert_eq!(
+            normalize_status(spelling).as_deref(),
+            Ok("backlog"),
+            "{spelling:?}"
+        );
+    }
+    assert_eq!(current_status("inbox"), "backlog");
+    assert_eq!(current_status("backlog"), "backlog");
+    assert_eq!(current_status("done"), "done");
+    let error = normalize_status("outbox").unwrap_err();
+    assert!(
+        error.contains("backlog") && !error.contains("inbox"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_brief_on_disk_that_says_status_inbox_is_a_backlog_brief() {
+    let brief = parse_brief("---\ntitle: Old\nstatus: inbox\n---\n").unwrap();
+    assert_eq!(brief.status.as_deref(), Some("backlog"));
+}
+
 // Pre-fix `\n----- not end` closed the frontmatter.
 #[test]
 fn only_a_bare_dash_line_closes_frontmatter() {

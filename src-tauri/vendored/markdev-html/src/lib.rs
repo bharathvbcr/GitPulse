@@ -2676,7 +2676,7 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
-    let mut rest = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let mut rest = text.trim_prefix('\u{FEFF}');
     loop {
         rest = rest.trim_start();
         if let Some(after) = rest.strip_prefix("<?") {

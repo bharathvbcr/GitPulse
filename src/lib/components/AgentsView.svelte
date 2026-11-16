@@ -19,6 +19,7 @@
   import { get } from "svelte/store";
   import { Bot, ChevronDown, LayoutList, ChevronRight, CircleAlert, FolderOpen, Inbox, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
   import AgentInbox from "./AgentInbox.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import { tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -316,18 +317,11 @@
   role="region"
   aria-label="Agents"
 >
-  <!-- The same header as Tasks (gp-surface-header): title and what it counts on
+  <!-- The same header as every page (PageHeader): title and what it counts on
        the left; the view switch and actions on the right, where Tasks keeps
        Board/List. -->
-  <header class="gp-surface-header">
-    <div class="flex items-center gap-2.5 min-w-0 flex-1">
-      <Bot size={16} class="text-accent shrink-0" />
-      <div class="min-w-0">
-        <h1 class="gp-surface-title">Agents</h1>
-        <p class="text-meta text-textMuted truncate" data-testid="agents-headline" title={headline}>{headline}</p>
-      </div>
-    </div>
-    <div class="flex items-center gap-1.5 shrink-0">
+  <PageHeader title="Agents" level={1} description={headline} descriptionTestId="agents-headline">
+    {#snippet actions()}
       <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Agents view">
         <button
           type="button"
@@ -375,8 +369,8 @@
         >
           <X size={14} />
         </button>
-    </div>
-  </header>
+    {/snippet}
+  </PageHeader>
 
   <!-- Filters and columns act on the plane's table, so they live with it: the
        Inbox has neither, and showing them there offered controls that did
@@ -493,9 +487,9 @@
       </section>
     {/if}
 
-  <div class="flex-1 min-h-0 min-w-0 overflow-auto">
+  <div class="gp-page">
     {#if visible.length === 0}
-      <div class="px-4 py-6 max-w-xl" data-testid="agents-empty">
+      <div class="gp-page-body" data-testid="agents-empty">
         {#if scopeLabel && plane.rows.length > 0 && scoped.length === 0}
           <EmptyState compact icon={Bot} title="No agent work in {scopeLabel}" hint="No agent checkouts, terminals or task runs here. Other repositories have {plural(plane.rows.length, "row", "rows")}; clear the scope to see them." />
         {:else if plane.rows.length > 0}

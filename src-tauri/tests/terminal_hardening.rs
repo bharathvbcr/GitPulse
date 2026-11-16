@@ -40,7 +40,7 @@ impl Drop for TerminalCleanup {
 fn repo() -> tempfile::TempDir {
     // The 100-session test opens sessions faster than the production spawn
     // rate allows, and what it measures is lifetime, not that rate.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])

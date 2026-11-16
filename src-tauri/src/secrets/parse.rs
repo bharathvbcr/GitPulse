@@ -99,6 +99,10 @@ pub struct SecretsReport {
     /// Kingfisher defaults nested-repo scanning on, and its CLI flag cannot
     /// take `false` (no `ArgAction::Set`). Always true for our invocation.
     pub nested_repos_scanned: bool,
+    /// Repo-relative directories, each ending in `/`, that the scan left out:
+    /// wholly ignored build-output, dependency and scratch trees, and linked
+    /// worktrees of this repository nested inside it. Empty when nothing was.
+    pub excluded_paths: Vec<String>,
     pub completeness: ScanCompleteness,
     /// Sorted most-actionable first, at most [`super::MAX_FINDINGS`] rows.
     pub findings: Vec<SecretFinding>,
@@ -132,6 +136,7 @@ impl SecretsReport {
             kingfisher_version: version,
             kingfisher_version_rejected: false,
             nested_repos_scanned: true,
+            excluded_paths: Vec::new(),
             completeness: ScanCompleteness::Unverified,
             findings: Vec::new(),
             findings_total: 0,
@@ -259,10 +264,7 @@ pub(crate) fn parse_kingfisher_json(
 /// the same release; the header prints "Kingfisher <version>" itself.
 pub(super) fn clean_version(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    let bare = trimmed
-        .strip_prefix("kingfisher ")
-        .unwrap_or(trimmed)
-        .trim();
+    let bare = trimmed.trim_prefix("kingfisher ").trim();
     if bare.is_empty() || bare.chars().any(char::is_control) {
         return None;
     }

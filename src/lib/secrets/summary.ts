@@ -8,6 +8,7 @@
  * always says by how much.
  */
 import { plural } from "../format";
+import { SCAN_FRESH_MS, isScanStale } from "../runtime/autoScan";
 import type { SecretFinding, SecretLocation, SecretsReport } from "./types";
 
 /** Most actionable first; matches the backend's sort. */
@@ -208,11 +209,30 @@ export function scopeNotes(report: SecretsReport): string[] {
   if (report.nested_repos_scanned) {
     notes.push("Nested repositories and submodules inside this tree are scanned too.");
   }
+  const left = excludedNote(report.excluded_paths);
+  if (left) notes.push(left);
   return notes;
 }
 
+/** Trees named in the note before it says how many more there are. */
+const EXCLUDED_SHOWN = 10;
+
+/**
+ * The trees the scan left out, by name: ignored build output, dependency and
+ * scratch directories, and this repository's own worktrees nested inside it.
+ * A finding there is a copy of one the scan can see, or is scanned when that
+ * worktree is the repository open; the note keeps the narrower scope visible.
+ */
+function excludedNote(paths: readonly string[]): string | null {
+  if (paths.length === 0) return null;
+  const shown = paths.slice(0, EXCLUDED_SHOWN).join(", ");
+  const more = paths.length - EXCLUDED_SHOWN;
+  const tail = more > 0 ? `, and ${more.toLocaleString("en-US")} more` : "";
+  return `Not scanned: ignored build output, dependency and scratch trees, and this repository's other worktrees inside it (${shown}${tail}).`;
+}
+
 /** A cached report older than this is refreshed when the panel reopens. */
-export const STALE_AFTER_MS = 5 * 60_000;
+export const STALE_AFTER_MS = SCAN_FRESH_MS;
 
 /**
  * The text behind Copy error. Kingfisher's own output is not part of it.
@@ -226,7 +246,18 @@ export function scanFailureCopy(report?: SecretsReport | null): string {
 }
 
 export function isStale(report: SecretsReport, nowMs: number): boolean {
-  return report.scanned_at_ms <= 0 || nowMs - report.scanned_at_ms >= STALE_AFTER_MS;
+  return isScanStale(report.scanned_at_ms, nowMs);
+}
+
+/** The backend's wording for a scan a newer one replaced (`SUPERSEDED` in secrets/run.rs). */
+export const SUPERSEDED_ERROR = "superseded by a newer secrets scan";
+
+/**
+ * A scan that was replaced, not one that failed: nothing is wrong with the
+ * repository or the scanner, so it earns no back-off.
+ */
+export function isSuperseded(report: SecretsReport): boolean {
+  return !report.ok && report.error === SUPERSEDED_ERROR;
 }
 
 /**

@@ -29,8 +29,11 @@
   const REPO = "/test/repository";
   const SHA = "0123456789abcdef0123456789abcdef01234567";
 
-  const cliPresent = { present: true, program: "firebase", version: "15.25.1", reason: null };
-  const listingAvailable = { available: true, checked: true, reason: null };
+  // Base fixtures carry the full wire shape the backend sends today, so a
+  // check passes because the panel reads the payload — not because it is
+  // defensive about fields a stale fixture leaves out.
+  const cliPresent = { present: true, program: "firebase", version: "15.25.1", reason: null, failure: null, attempt: null };
+  const listingAvailable = { available: true, checked: true, reason: null, attempt: null };
   const status = (over = {}) => ({
     configured: true,
     projects: [
@@ -58,7 +61,8 @@
     available: true, checked: true, cli_present: true,
     project_id: "acme-prod", backend_id: "web",
     rollouts: [rollout("succeeded")],
-    truncated: false, unreachable: [], walk_incomplete: null, error: null, ...over,
+    truncated: false, unreachable: [], walk_incomplete: null, error: null,
+    failure: null, attempts: [], account: null, ...over,
   });
   const backendListing = (over = {}) => ({
     available: true, checked: true, cli_present: true,
@@ -67,12 +71,13 @@
       { id: "web", location: "us-central1", uri: "https://web--acme.web.app" },
       { id: "admin", location: "europe-west4", uri: null },
     ],
-    truncated: false, unreachable: [], walk_incomplete: null, error: null, ...over,
+    truncated: false, unreachable: [], walk_incomplete: null, error: null,
+    failure: null, attempts: [], account: null, ...over,
   });
 
   const createOutcome = (over = {}) => ({
     project_id: "acme-prod", backend_id: "web", git_commit: SHA,
-    created: true, unconfirmed: null, ...over,
+    created: true, unconfirmed: null, error: null, failure: null, attempts: [], account: null, ...over,
   });
 
   /** What the mocked backend answers next; each scenario swaps these. */
@@ -520,6 +525,179 @@
         () => rolloutCalls() === afterUnchecked);
       check("and it says it could not read rather than showing an empty deploy history",
         () => !flat().includes("has never deployed"));
+
+      // --- a failure says what kind it is, and its diagnostics can be copied --
+      // The 2.0 beta's report: the CLI probe ran from `/`, firebase-tools could
+      // not create firebase-debug.log there, and the panel showed one line —
+      // "Unable to obtain permissions" — with no way to copy it or learn that
+      // it was not about Google Cloud at all.
+      const clipboardWrites = [];
+      let clipboardRefuses = false;
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async value => {
+          if (clipboardRefuses) throw new Error("clipboard denied");
+          clipboardWrites.push(value);
+        } },
+      });
+      const realExecCommand = document.execCommand;
+      const PLANTED = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+      const startupAttempt = {
+        argv: ["firebase", "--version"], cwd: "/private/var/folders/x/T", started_at_ms: Date.UTC(2026, 10, 14, 9, 0, 0),
+        duration_ms: 812, exit_code: 1, stdout_tail: "",
+        stderr_tail: "Error: Unable to obtain permissions for firebase-debug.log\n    at findAvailableLogFile (lib/logger.js:148:11)",
+        spawn_error: null,
+      };
+      statusReply = status({
+        cli: { present: false, program: "firebase", version: null,
+          reason: "Error: Unable to obtain permissions for firebase-debug.log",
+          failure: { kind: "cli_startup", title: "The Firebase CLI could not start",
+            next_step: "It could not create its debug log (firebase-debug.log) in the folder it was started from. This is a local file-system problem, not a Google Cloud permission.",
+            permission: null, role: null, api: null },
+          attempt: startupAttempt },
+        rollout_listing: { available: false, checked: false,
+          reason: "The Firebase CLI could not be run, so what it supports is unknown.", attempt: null },
+      });
+      await remount();
+      const copyButton = () => button("Copy diagnostics");
+      check("a CLI that crashed at startup is named as that, not as a permission",
+        () => flat().includes("The Firebase CLI could not start") && flat().includes("not a Google Cloud permission"));
+      check("its state is labelled", () => flat().includes("CLI couldn't start"));
+      check("it is never labelled a missing permission", () => !flat().includes("Missing permission"));
+      check("the failure notice carries its kind for styling and tests",
+        () => root()?.querySelector('[data-failure-kind="cli_startup"]') !== null);
+      check("the CLI's own words stay one disclosure away",
+        () => flat().includes("What the CLI said") && text().includes("Unable to obtain permissions"));
+      check("diagnostics can be copied even when no action is offered",
+        () => Boolean(copyButton()) && !backendsButton() && !checkButton());
+      copyButton()?.click();
+      await settle();
+      const copied = clipboardWrites.at(-1) ?? "";
+      check("one click copies once", () => clipboardWrites.length === 1);
+      check("the copy names the classified state and its next step",
+        () => copied.includes("CLI couldn't start") && copied.includes("not a Google Cloud permission"));
+      check("the copy carries the command, its folder, exit and output",
+        () => copied.includes("$ firebase --version") && copied.includes("cwd: /private/var/folders/x/T")
+          && copied.includes("exit 1") && copied.includes("firebase-debug.log"));
+      check("the copy is timestamped", () => /Generated: \d{4}-\d{2}-\d{2}T/.test(copied)
+        && copied.includes("started 2026-11-14T09:00:00.000Z"));
+      check("the copy names the repository and the GitPulse version",
+        () => copied.includes(`Repository: ${REPO}`) && /GitPulse: \S+/.test(copied));
+      check("the copy says it was copied", () => flat().includes("Copied"));
+      const details = [...root().querySelectorAll("details")].find(d => d.querySelector("summary")?.textContent.trim() === "Diagnostics");
+      const shownText = details?.querySelector("pre")?.textContent ?? "";
+      check("the debug view shows the same report that was copied",
+        () => shownText.length > 0 && copied.replace(/^Generated: .*\n/m, "") === shownText);
+
+      // A listing refused by IAM: the permission and the account are named.
+      statusReply = status();
+      backendsReply = { policy: null, output: {
+        ...backendListing({ backends: [] }), available: false, checked: false,
+        error: `HTTP Error: 403, Permission 'firebaseapphosting.backends.list' denied ${PLANTED}`,
+        failure: { kind: "missing_permission",
+          title: "Missing permission firebaseapphosting.backends.list on acme-prod",
+          next_step: "Ask a project owner to grant your account a role that includes firebaseapphosting.backends.list.",
+          permission: "firebaseapphosting.backends.list", role: null, api: null },
+        attempts: [{ ...startupAttempt, argv: ["firebase", "apphosting:backends:list", "--project", "acme-prod", "--non-interactive", "--json"],
+          cwd: REPO, stderr_tail: "", stdout_tail: '{"status":"error","error":"HTTP Error: 403"}' }],
+        account: { checked: true, email: "ada@example.com", reason: null },
+      } };
+      await remount();
+      await selectProject("default");
+      await runBackends();
+      check("a refused listing names the missing permission",
+        () => root()?.querySelector('[data-failure-kind="missing_permission"]') !== null
+          && flat().includes("Permission firebaseapphosting.backends.list"));
+      check("and the account the CLI used", () => flat().includes("Firebase CLI account: ada@example.com"));
+      check("and still says the listing did not run", () => text().includes("Backend listing did not run"));
+      const writesBefore = clipboardWrites.length;
+      copyButton()?.click();
+      await settle();
+      const copiedListing = clipboardWrites.at(-1) ?? "";
+      check("the listing's copy names project, account, permission and command",
+        () => clipboardWrites.length === writesBefore + 1
+          && copiedListing.includes("Project: default → acme-prod")
+          && copiedListing.includes("Signed-in account: ada@example.com")
+          && copiedListing.includes("Permission: firebaseapphosting.backends.list")
+          && copiedListing.includes("$ firebase apphosting:backends:list --project acme-prod"));
+      check("a credential in an error never reaches the clipboard", () => !copiedListing.includes(PLANTED));
+      check("nor the debug view", () => {
+        const view = [...root().querySelectorAll("details")]
+          .find(d => d.querySelector("summary")?.textContent.trim() === "Diagnostics")?.querySelector("pre")?.textContent ?? "";
+        return view.includes("Permission: firebaseapphosting.backends.list") && !view.includes(PLANTED);
+      });
+
+      // A deploy the CLI refused comes back as an outcome with a reason, and
+      // must never read as a started rollout.
+      statusReply = status();
+      backendsReply = { policy: null, output: backendListing() };
+      createReply = { policy: null, output: createOutcome({
+        created: false,
+        error: "HTTP Error: 403, The caller does not have permission",
+        failure: { kind: "missing_permission",
+          title: "The signed-in account lacks a permission on acme-prod",
+          next_step: "Ask a project owner to grant your account a role with access to Firebase App Hosting.",
+          permission: null, role: null, api: null },
+        attempts: [{ ...startupAttempt, argv: ["firebase", "apphosting:rollouts:create", "web", "--git-commit", SHA],
+          cwd: REPO, stderr_tail: "HTTP Error: 403" }],
+        account: { checked: true, email: "ada@example.com", reason: null },
+      }) };
+      await remount();
+      await selectProject("default");
+      await runBackends();
+      await setSelect(selects()[1], "web");
+      await typeSha(SHA);
+      reviewButton()?.click();
+      await settle();
+      deployButton()?.click();
+      await settle();
+      check("a refused deploy reads as not created, with its classified reason",
+        () => flat().includes("Rollout was not created: The signed-in account lacks a permission")
+          && root()?.querySelector('[data-failure-kind="missing_permission"]') !== null);
+      check("a refused deploy never reads as started", () => !flat().includes("Rollout started"));
+      check("a refused deploy disarms, so a retry is a deliberate second click", () => !deployButton());
+      copyButton()?.click();
+      await settle();
+      const copiedDeploy = clipboardWrites.at(-1) ?? "";
+      check("the refused deploy's command and reason are in the copy",
+        () => copiedDeploy.includes("$ firebase apphosting:rollouts:create web --git-commit")
+          && copiedDeploy.includes("Deploy: Missing permission"));
+      // A deploy whose CLI never reported an outcome may have started: it is
+      // neither a refusal nor a success, and "try again" would deploy twice.
+      createReply = { policy: null, output: createOutcome({
+        created: false,
+        unconfirmed: "The rollout may have started before the CLI lost track of it. Check the backend's rollouts in the Firebase console before deploying again — creating a rollout twice deploys twice.",
+        error: "firebase timed out after 60s",
+        failure: { kind: "network", title: "The Firebase CLI did not report whether the rollout started",
+          next_step: "The rollout may have started before the CLI lost track of it. Check the backend's rollouts in the Firebase console before deploying again — creating a rollout twice deploys twice.",
+          permission: null, role: null, api: null },
+        attempts: [{ ...startupAttempt, argv: ["firebase", "apphosting:rollouts:create", "web", "--git-commit", SHA],
+          cwd: REPO, exit_code: null, stderr_tail: "", spawn_error: "firebase timed out after 60s" }],
+        account: null,
+      }) };
+      await typeSha(SHA);
+      reviewButton()?.click();
+      await settle();
+      deployButton()?.click();
+      await settle();
+      check("a deploy with no reported outcome reads as unknown, not as refused",
+        () => flat().includes("Rollout outcome unknown") && !flat().includes("Rollout was not created"));
+      check("and says to check the console before deploying again",
+        () => flat().includes("before deploying again"));
+      check("and never as started", () => !flat().includes("Rollout started"));
+      createReply = { policy: null, output: createOutcome() };
+
+      // A copy that did not happen must not look like one that did.
+      clipboardRefuses = true;
+      document.execCommand = () => false;
+      await remount();
+      copyButton()?.click();
+      await settle();
+      check("a refused copy says so instead of claiming success",
+        () => flat().includes("Couldn't copy") && !flat().includes("Copied"));
+      clipboardRefuses = false;
+      document.execCommand = realExecCommand;
+      backendsReply = { policy: null, output: backendListing() };
 
       check("no unconfigured command was invoked", () => unexpected.length === 0);
       check("no runtime errors", () => errors.length === 0);

@@ -36,7 +36,7 @@ function hits(rule: number, name: string, as?: string): Violation[] {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** rule -> [positive count, svelte negative file exists] */
-const SVELTE_RULES: Record<number, number> = { 1: 6, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 12, 16: 3 };
+const SVELTE_RULES: Record<number, number> = { 1: 6, 2: 5, 3: 7, 4: 6, 5: 3, 6: 4, 7: 5, 8: 4, 9: 6, 10: 6, 11: 4, 12: 5, 13: 5, 14: 12, 16: 3, 19: 5 };
 
 describe("design-lint rules: one positive and one negative fixture each", () => {
   for (const [rule, expected] of Object.entries(SVELTE_RULES)) {
@@ -396,12 +396,48 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
 });
 
 describe("design-lint registry", () => {
-  it("has one entry per rule 1-18, rule 14 being the single banned-terms entry", () => {
-    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+  it("has one entry per rule 1-19, rule 14 being the single banned-terms entry", () => {
+    expect(RULES.map((r) => r.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
     for (const r of RULES) expect(Boolean(r.run) !== Boolean(r.runRepo), `rule ${r.id} has exactly one of run and runRepo`).toBe(true);
     expect(new Set(RULES.map((r) => r.name)).size).toBe(RULES.length);
     for (const r of RULES) expect(r.summary).not.toBe("");
     expect(RULES.filter((r) => r.id === 14).map((r) => r.name)).toEqual(["banned-ui-terms"]);
+  });
+});
+
+describe("design-lint rule 19: page width cap", () => {
+  const rule19 = (src: string, file = "src/lib/components/NewPanel.svelte") => lintSource(file, src).filter((v) => v.rule === 19);
+
+  it("catches a cap added to a page that renders PageHeader", () => {
+    const found = rule19('<PageHeader title="New" />\n<div class="gp-notice max-w-2xl">x</div>');
+    expect(found).toHaveLength(1);
+    expect(found[0].message).toContain("max-w-2xl");
+    expect(found[0].line).toBe(2);
+  });
+
+  it("catches a cap on a page that wears gp-page or PageBody, in a file the lint was never told about", () => {
+    expect(rule19('<PageBody><section class="gp-card max-w-4xl">x</section></PageBody>')).toHaveLength(1);
+    expect(rule19('<div class="gp-page"><div class="max-w-[32rem]">x</div></div>')).toHaveLength(1);
+  });
+
+  it("still reads a migrated page that went back to a bare div", () => {
+    const named = "src/lib/components/StoragePanel.svelte";
+    expect(rule19('<div class="p-4"><div class="max-w-4xl">x</div></div>', named)).toHaveLength(1);
+  });
+
+  it("leaves a component that is not a page alone", () => {
+    expect(rule19('<div class="max-w-md">a tooltip or a dialog</div>', "src/lib/components/Tooltip.svelte")).toEqual([]);
+  });
+
+  it("accepts the opt-out only with a reason, on the same element", () => {
+    const page = (attr: string) => `<PageHeader title="x" />\n<select class="max-w-40" ${attr}></select>`;
+    expect(rule19(page('data-width-cap="one select"'))).toEqual([]);
+    expect(rule19(page('data-width-cap=""'))).toHaveLength(1);
+    expect(rule19(`${page('data-width-cap="one select"')}\n<p class="max-w-xl">other element</p>`)).toHaveLength(1);
+  });
+
+  it("does not treat a share of the parent, full or none as a cap", () => {
+    expect(rule19('<PageHeader title="x" /><span class="max-w-full max-w-[40%] max-w-none max-w-[var(--w)]"></span>')).toEqual([]);
   });
 });
 

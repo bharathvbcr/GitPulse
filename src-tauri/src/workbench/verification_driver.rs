@@ -36,7 +36,10 @@
 //! - A host that is shutting down stops the sweep without writing.
 
 use super::intake::{self, HELD_MARKER};
-use super::verification_gate::{self as gate, Gate, Record, EVIDENCE_TYPE, STATE_COULD_NOT_RUN};
+use super::store_probe::FileId;
+use super::verification_gate::{
+    self as gate, Gate, Memo, Record, EVIDENCE_TYPE, STATE_COULD_NOT_RUN,
+};
 use super::{query, WorkbenchError, WorkbenchState};
 use crate::ipc_error::CommandError;
 use dc_store::Store;
@@ -107,6 +110,11 @@ pub(crate) trait Backend {
     fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError>;
     fn now(&self) -> Instant;
     fn cancelled(&self) -> bool;
+    /// The verdicts this backend's reads share. The host's one, unless a test
+    /// gives its backend a memo of its own.
+    fn memo(&self) -> &Memo {
+        Memo::shared()
+    }
 }
 
 /// A verification this process started or adopted.
@@ -316,7 +324,7 @@ impl Driver {
         // batch fail, each card is read alone, so one card's unreadable
         // record stays that card's.
         let ids: Vec<String> = held.iter().map(|(_, _, id)| id.clone()).collect();
-        let batch = gate::latest_many(store, &ids);
+        let batch = backend.memo().latest_many(store, &ids);
         let mut seen = HashSet::new();
         for (card, target, id) in &held {
             if backend.cancelled() {
@@ -324,7 +332,7 @@ impl Driver {
             }
             let latest = match &batch {
                 Ok(found) => Ok(found.get(id).cloned()),
-                Err(_) => gate::latest(store, id),
+                Err(_) => backend.memo().latest(store, id),
             };
             let key = (id.clone(), target.head.clone());
             seen.insert(key.clone());
@@ -397,6 +405,7 @@ impl Driver {
             }
             Step::Promote => {
                 let outcome = gate::check(
+                    backend.memo(),
                     store,
                     id,
                     &repository_identity(store, card).unwrap_or_default(),
@@ -520,7 +529,10 @@ pub(crate) fn status(
     backend: &dyn Backend,
     id: &str,
 ) -> Result<Value, WorkbenchError> {
-    let record = gate::latest(store, id).map_err(|m| WorkbenchError::new("store_error", m))?;
+    let record = backend
+        .memo()
+        .latest(store, id)
+        .map_err(|m| WorkbenchError::new("store_error", m))?;
     Ok(describe(record, backend, &mut HashMap::new(), true))
 }
 
@@ -545,8 +557,10 @@ pub(crate) fn status_batch(
     }
     let mut heads = HashMap::new();
     let mut items = serde_json::Map::new();
-    let mut records =
-        gate::latest_many(store, ids).map_err(|m| WorkbenchError::new("store_error", m))?;
+    let mut records = backend
+        .memo()
+        .latest_many(store, ids)
+        .map_err(|m| WorkbenchError::new("store_error", m))?;
     for id in ids {
         if let Some(record) = records.remove(id) {
             items.insert(
@@ -728,7 +742,7 @@ pub(crate) fn run_at(
     }
     let spec = format!("{head}^");
     let parent = base_from_parent_read(
-        crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+        crate::engine::process::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
             crate::engine::git_cli::git_text(
                 Path::new(&local.path),
                 &["rev-parse", "--verify", "--end-of-options", &spec],
@@ -801,7 +815,7 @@ pub(crate) fn judge_candidate_with(
         if backend.cancelled() {
             return Err("Verification stopped because GitPulse closed.".into());
         }
-        match gate::latest(store, task_id) {
+        match backend.memo().latest(store, task_id) {
             Err(why) => return Err(why),
             Ok(Some(record)) if verdict_covers(&record, candidate) => {
                 let scratch_text = scratch
@@ -886,8 +900,8 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
 /// deferred it under load, or the child never got a process slot. The command
 /// did not run, so the error is not an answer about the repository.
 pub(crate) fn git_question_unasked(err: &str) -> bool {
-    crate::engine::git_cli::is_deferred_under_load(err)
-        || crate::engine::git_cli::is_slot_wait_timeout(err)
+    crate::engine::process::is_deferred_under_load(err)
+        || crate::engine::process::is_slot_wait_timeout(err)
 }
 
 /// What the driver writes before a head read's error in a `could_not_run`
@@ -902,7 +916,7 @@ const HEAD_UNREADABLE: &str = "the worktree's head could not be read: ";
 /// The matcher itself is not loosened: text that merely quotes a refusal, or
 /// a path that carries one, is still not a deferral.
 pub(crate) fn stored_question_unasked(line: &str) -> bool {
-    git_question_unasked(line.strip_prefix(HEAD_UNREADABLE).unwrap_or(line))
+    git_question_unasked(line.trim_prefix(HEAD_UNREADABLE))
 }
 
 const NO_PARENT: &str = "the claimed commit is on the default branch and has no parent, so there is no earlier revision to diff against";
@@ -960,7 +974,7 @@ pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, C
         &[crate::engine::ref_cache::ALL_REFS],
         &["verification-base", head],
         || {
-            crate::engine::git_cli::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
+            crate::engine::process::with_spawn_source(VERIFICATION_BASE_SOURCE, || {
                 verification_base_uncached(worktree, head)
             })
             .map(|base| (base, true))
@@ -1037,6 +1051,32 @@ impl Backend for HostBackend {
     }
 }
 
+/// The driver's own connection to the profile at `path`, kept for as long as
+/// the file there is the file it opened.
+///
+/// A profile replaced on disk (restored, or a new file moved over it) leaves a
+/// long-lived connection reading the old file, and a verdict read through it
+/// would be an answer about a store that is gone. The file's identity is
+/// checked on every call, which is one `stat`.
+pub(crate) fn driver_store(
+    path: Option<std::path::PathBuf>,
+    held: &mut Option<(Store, FileId)>,
+) -> Option<&Store> {
+    let current = path.as_deref().and_then(FileId::at);
+    if held.as_ref().is_some_and(|(_, opened)| {
+        current
+            .as_ref()
+            .is_none_or(|current| opened.replaced_by(current))
+    }) {
+        *held = None;
+    }
+    if held.is_none() {
+        let identity = current?;
+        *held = Store::open(path?).ok().map(|store| (store, identity));
+    }
+    held.as_ref().map(|(store, _)| store)
+}
+
 /// Start the driver thread. A thread that fails to start costs automatic
 /// verification only: the Verify action still works.
 pub(crate) fn install(host: WorkbenchState) {
@@ -1045,16 +1085,9 @@ pub(crate) fn install(host: WorkbenchState) {
         let mut driver = Driver::default();
         // Its own connection: a sweep waits on the sidecar, and the
         // board's reads must not queue behind that.
-        let mut store: Option<Store> = None;
+        let mut own: Option<(Store, FileId)> = None;
         while host.check_open().is_ok() {
-            if store.is_none() {
-                store = host
-                    .profile_path()
-                    .ok()
-                    .filter(|path| path.exists())
-                    .and_then(|path| Store::open(&path).ok());
-            }
-            if let Some(open) = &store {
+            if let Some(open) = driver_store(host.profile_path().ok(), &mut own) {
                 let report = driver.sweep(open, &backend);
                 if report != Report::default() {
                     log::info!(target: "workbench", "verification driver: {report:?}");

@@ -660,7 +660,7 @@ pub fn parse_changes(raw: &[u8], patch: &str) -> Result<ChangeSet, ChangeRefusal
 fn side(rest: &str) -> Side {
     // Git ends a header's name with a TAB when the name holds a space, so a
     // name that itself ends in a space survives; only that one TAB is shed.
-    let rest = rest.strip_suffix('\t').unwrap_or(rest);
+    let rest = rest.trim_suffix('\t');
     if rest == "/dev/null" {
         return Ok(None);
     }

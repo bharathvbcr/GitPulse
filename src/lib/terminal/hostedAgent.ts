@@ -1,5 +1,6 @@
 import { isPermissionMode, type PermissionMode } from "./agentDefaults";
 import type { TerminalExitPayload } from "./runResult";
+import type { TerminalResume } from "./sessionLedger";
 import { isSessionId } from "./tabs";
 
 /**
@@ -14,7 +15,7 @@ import { isSessionId } from "./tabs";
 export type AgentProvider = "claude" | "agy";
 
 /** Flags that already say which conversation a launch is. */
-const SESSION_FLAGS = new Set(["--resume", "-r", "--session-id", "--continue", "-c", "--conversation"]);
+const SESSION_FLAGS = new Set(["--resume", "-r", "--session-id", "--continue", "-c", "--conversation", "--fork", "--fork-session"]);
 
 /** Where the prompt starts: after `--` every argument is text, whatever it looks like. */
 function flagEnd(args: readonly string[]): number {
@@ -65,14 +66,9 @@ export function carriesSession(args: readonly string[]): boolean {
 }
 
 /**
- * The arguments for an agent launch and the conversation id it will have.
- *
- * A launch that already names a conversation keeps its arguments exactly as
- * they are, and the id is the one it names when that is a session id. A fresh
- * Claude launch gets `--session-id <fresh id>` in front so the CLI uses the id
- * GitPulse recorded; Antigravity's `--conversation` is resume-only (passing a
- * fresh UUID emits `warning: conversation "<id>" not found`), so fresh `agy`
- * launches keep their arguments unchanged until resumed with `--conversation`.
+ * Assigns or extracts the conversation id for an agent launch (`S2-07`: never
+ * constructs `--session-id` / `--resume` / `--conversation` flags here; the
+ * Rust backend `terminal_command` is the single argv owner).
  */
 export function withSessionId(
   args: readonly string[] | undefined,
@@ -88,7 +84,7 @@ export function withSessionId(
     return { args: [...given], sessionId: null };
   }
   const sessionId = newId().toLowerCase();
-  return { args: ["--session-id", sessionId, ...given], sessionId };
+  return { args: [...given], sessionId };
 }
 
 /** One hosted agent conversation, as it is kept between app runs. */
@@ -109,47 +105,83 @@ export interface HostedAgent {
   endedSignal: string | null;
   /** Live artifact directory reported by Antigravity `SessionStart`, when present. */
   artifactDir?: string | null;
+  /** Source session UUID when this hosted record was started with `--fork-session`. */
+  forkedFrom?: string | null;
 }
 
 export type HostedClaude = HostedAgent;
 
 export const AGY_CONTINUE_SENTINEL = "__agy_continue__";
 
-function workspaceDirForRecord(record: { repoPath: string; startDir: string | null }): string {
-  const base = record.repoPath.replace(/[\\/]+$/, "");
-  const sub = record.startDir?.replace(/^[\\/]+|[\\/]+$/g, "") ?? "";
-  if (!base) return sub;
-  return sub ? `${base}/${sub}` : base;
+/** Spawn plan decided by `conversationForStart` without frontend CLI flags. */
+export interface ConversationSpawnPlan {
+  args: string[] | undefined;
+  sessionId: string | null;
+  resume: TerminalResume | null;
 }
 
 /**
  * The conversation an agent tab's next process runs, decided where the
- * process starts and recorded only when the start makes one.
+ * process starts and recorded only when the start makes one. Returns a typed
+ * `resume` payload for `cmd_terminal_spawn` rather than constructing CLI flags
+ * in the webview (`S2-07`).
  */
 export function conversationForStart(
   store: Pick<ReturnType<typeof createHostedAgentStore>, "begin" | "byTerminal">,
   start: {
     attach: string | null;
     resumeId: string | null;
+    fork?: boolean;
     args: string[] | undefined;
     record: Omit<HostedAgent, "sessionId" | "terminalId" | "endedSignal" | "provider"> & { provider?: AgentProvider };
     newId?: () => string;
     provider?: AgentProvider;
   },
-): { args: string[] | undefined; sessionId: string | null } {
-  if (start.attach) return { args: start.args, sessionId: store.byTerminal(start.attach)?.sessionId ?? null };
+): ConversationSpawnPlan {
+  if (start.attach) {
+    return { args: start.args, sessionId: store.byTerminal(start.attach)?.sessionId ?? null, resume: null };
+  }
   const provider = start.provider ?? start.record.provider ?? "claude";
-  const workspaceDir = workspaceDirForRecord(start.record);
-  const resumeArgs = start.resumeId
-    ? (provider === "agy"
-        ? (start.resumeId === AGY_CONTINUE_SENTINEL
-            ? ["--continue", ...(workspaceDir ? ["--add-dir", workspaceDir] : [])]
-            : ["--conversation", start.resumeId])
-        : ["--resume", start.resumeId])
-    : start.args;
-  const hosted = withSessionId(resumeArgs, start.newId, provider);
+  if (start.fork) {
+    if (provider !== "claude" || !start.resumeId || !isSessionId(start.resumeId)) {
+      throw new Error("Forking a session requires Claude Code with a valid session UUID.");
+    }
+    const sourceId = start.resumeId.toLowerCase();
+    let forkId = (start.newId ?? (() => crypto.randomUUID()))().toLowerCase();
+    if (forkId === sourceId && !start.newId) {
+      forkId = crypto.randomUUID().toLowerCase();
+    }
+    if (!isSessionId(forkId) || forkId === sourceId) {
+      throw new Error("Forked session id must be a fresh UUID distinct from the source session.");
+    }
+    store.begin({ ...start.record, provider: "claude", sessionId: forkId, forkedFrom: sourceId });
+    return {
+      args: start.args,
+      sessionId: forkId,
+      resume: { session_id: sourceId, fork: true },
+    };
+  }
+  if (start.resumeId) {
+    const sessionId =
+      start.resumeId === AGY_CONTINUE_SENTINEL
+        ? null
+        : isSessionId(start.resumeId)
+          ? start.resumeId.toLowerCase()
+          : null;
+    if (sessionId) store.begin({ ...start.record, provider, sessionId });
+    return {
+      args: start.args,
+      sessionId,
+      resume: { session_id: start.resumeId, fork: false },
+    };
+  }
+  const hosted = withSessionId(start.args, start.newId, provider);
   if (hosted.sessionId) store.begin({ ...start.record, provider, sessionId: hosted.sessionId });
-  return hosted;
+  return {
+    args: start.args === undefined ? undefined : hosted.args,
+    sessionId: hosted.sessionId,
+    resume: null,
+  };
 }
 
 /** The most conversations kept; the oldest go first. */
@@ -186,6 +218,7 @@ export function readHostedAgent(raw: unknown): HostedAgent | null {
     startedAt: r.startedAt,
     endedSignal: text(r.endedSignal, 128),
     artifactDir: text(r.artifactDir, 4096),
+    forkedFrom: typeof r.forkedFrom === "string" && isSessionId(r.forkedFrom) ? r.forkedFrom.toLowerCase() : null,
   };
 }
 
@@ -232,6 +265,7 @@ export function createHostedAgentStore(storage: HostedStorage | null) {
         terminalId: null,
         endedSignal: null,
         artifactDir: record.artifactDir ?? null,
+        forkedFrom: record.forkedFrom ?? null,
       });
       persist();
     },
@@ -278,6 +312,7 @@ export function createHostedAgentStore(storage: HostedStorage | null) {
         startedAt: existing?.startedAt ?? (typeof meta.startedAt === "number" && Number.isFinite(meta.startedAt) ? meta.startedAt : Date.now()),
         endedSignal: null,
         artifactDir: text(meta.artifactDir, 4096) ?? existing?.artifactDir ?? null,
+        forkedFrom: existing?.forkedFrom ?? null,
       };
       records.set(sessionId, next);
       persist();

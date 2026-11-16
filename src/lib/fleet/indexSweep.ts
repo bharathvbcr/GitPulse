@@ -23,6 +23,7 @@
 
 import { buildDevmap, initializeDevcouncil } from "../codeintel/client";
 import { buildFailureReason, type DevmapBuildOutcome, type InitReport } from "../codeintel/types";
+import { describeError } from "../ui/copy/describeFailure";
 
 export interface IndexTarget {
   path: string;
@@ -145,7 +146,7 @@ export async function runIndexSweep(
         path: target.path,
         label: target.label,
         status: "failed",
-        reason: error instanceof Error ? error.message : String(error),
+        reason: describeError(error, "fleet"),
       });
     }
     options.onProgress?.(outcomes.length, total, target);

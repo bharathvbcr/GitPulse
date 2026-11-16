@@ -138,7 +138,7 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
         tone: "warn",
         label: "unrecognised",
         detail:
-          `this build does not recognise the verdict ${JSON.stringify(f.verification.verdict)}, ` +
+          `this build does not recognize the verdict ${JSON.stringify(f.verification.verdict)}, ` +
           "so it is not read as a pass",
       };
     }

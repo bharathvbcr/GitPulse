@@ -6,6 +6,7 @@ import { render } from "svelte/server";
 import { get } from "svelte/store";
 import PageSearch from "./PageSearch.svelte";
 import { repoStore } from "../stores/repoStore";
+import { interfaceStore } from "../stores/interfaceStore";
 import { activeSectionFor } from "../views/viewRegistry";
 import {
   pageScope,
@@ -122,10 +123,43 @@ describe("PageSearch", () => {
     }
   });
 
+  it("is the repository palette under Fleet, Agents and Tasks, whatever page was last active, and names the repository", async () => {
+    // A provider registered for the last active page must not take the field
+    // while that page is hidden behind a host-wide surface.
+    const dispose = registerPageSearch(currentScope(), findProvider("needle"));
+    await repoStore.openRepo("/repo/named-here", { allowBroken: true, activate: true });
+    try {
+      for (const surface of ["fleet", "agents", "tasks"] as const) {
+        interfaceStore.setGlobalSurface(surface);
+        const { body } = render(PageSearch);
+        expect(body).toContain('data-page-search="palette"');
+        expect(body).not.toContain('aria-label="Next match"');
+        expect(body).toContain("Search named-here: commands, / files, @ branches, # commits");
+        expect(body).toContain('aria-label="Search named-here"');
+        expect(body).not.toContain("this repository");
+      }
+    } finally {
+      interfaceStore.setGlobalSurface("repository");
+      await repoStore.closeActiveTab();
+      dispose();
+    }
+  });
+
   it("takes focus from the shared event, not from a key listener of its own", () => {
     // App owns ⌘F and decides when the field may take it (fieldOwnsFindChord).
     expect(source).toContain("FOCUS_PAGE_SEARCH_EVENT");
     expect(source).not.toContain('addEventListener("keydown"');
+  });
+
+  it("takes focus from the Suspects event only when that page is hidden behind a surface", () => {
+    expect(source).toContain("FOCUS_SUSPECTS_SYMPTOM_EVENT");
+    expect(source).toMatch(/if \(!onRepository\) take\(\);/);
+  });
+
+  it("chooses its text from its own measured width, not the window's", () => {
+    expect(source).toContain("createResizeObservation");
+    expect(source).toContain("paletteFieldCopy({ subject, width: pillWidth })");
+    expect(source).not.toMatch(/window\.innerWidth|matchMedia/);
   });
 
   it("keeps the palette out of the entry chunk", () => {

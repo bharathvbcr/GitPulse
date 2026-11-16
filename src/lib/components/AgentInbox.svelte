@@ -1079,7 +1079,7 @@
   <!-- Split Pane: Threads & Detail -->
   <div class="inbox-body">
     <!-- Thread List Pane -->
-    <aside class="threads-pane" aria-label="Conversation threads">
+    <aside class="threads-pane gp-float-card" aria-label="Conversation threads">
       {#if filteredThreads.length > 0 && selectedKeys.size === 0}
         <div class="threads-pane-tools">
           <button
@@ -1142,8 +1142,9 @@
                         <FileCode class="w-3 h-3" /> Review
                       </span>
                     {/if}
-                    <span class="agent-name" title="Sender agent">
-                      <Bot class="w-2.5 h-2.5" /> {thread.from_agent}
+                    <span class="agent-name" title="Sender agent: {thread.from_agent}">
+                      <Bot class="w-2.5 h-2.5 shrink-0" />
+                      <span class="agent-name-text">{thread.from_agent}</span>
                     </span>
                     {#if isMobileOriginated(thread.from_agent)}
                       <span class="gp-chip" data-tone="accent" data-kind="label" data-testid="mobile-origin-badge" title="Sent from Graft Mobile on phone">
@@ -1157,10 +1158,10 @@
                   </span>
                 </div>
 
-                <h4 class="thread-title">{thread.title}</h4>
+                <h4 class="thread-title" title={thread.title}>{thread.title}</h4>
 
                 <div class="thread-footer">
-                  <span class="thread-slug font-mono">{thread.thread_key}</span>
+                  <span class="thread-slug font-mono" title={thread.thread_key}>{thread.thread_key}</span>
                   <span class="thread-time" title={new Date(thread.updated_at_ms).toLocaleString()}>
                     {formatRelativeTime(thread.updated_at_ms)}
                   </span>
@@ -1755,7 +1756,6 @@
     width: 320px;
     flex-shrink: 0;
     overflow-y: auto;
-    background: rgb(var(--c-bg) / 0.35);
   }
 
   .threads-list {
@@ -1767,9 +1767,13 @@
     gap: 6px;
   }
 
-  /* A thread is a multi-line row: tone on rest, accent on hover and selection. */
+  /* A thread is a multi-line row: tone on rest, accent on hover and selection.
+     It shares its row with the selection toggle, so it takes the space that is
+     left (flex: 1) and may shrink below its one-line title (min-width: 0);
+     `width: 100%` plus the toggle pushed it past the column's clip. */
   .thread-card {
-    width: 100%;
+    flex: 1 1 0;
+    min-width: 0;
     text-align: left;
     background: var(--mac-fill-bg, rgb(var(--c-bg)));
     border-radius: var(--gp-r-md);
@@ -1799,19 +1803,35 @@
     gap: 6px;
   }
 
+  /* The status chip keeps its size; the meta side gives way. */
+  .thread-card-header > .gp-chip {
+    flex-shrink: 0;
+  }
+
   .thread-meta {
     display: flex;
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
+    min-width: 0;
   }
 
+  /* A sender is often a bare session uuid: one line, cut with an ellipsis. */
   .agent-name {
     display: inline-flex;
     align-items: center;
     gap: 3px;
+    min-width: 0;
+    max-width: 100%;
     font-size:var(--text-meta);
     color: rgb(var(--c-text-muted));
+  }
+
+  .agent-name-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .thread-title {
@@ -1828,8 +1848,21 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     font-size:var(--text-micro);
     color: rgb(var(--c-text-muted));
+  }
+
+  .thread-slug {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .thread-time {
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   /* Detail Pane */
@@ -1851,10 +1884,16 @@
     background: rgb(var(--c-bg) / 0.35);
   }
 
+  .detail-header-main {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
   .detail-title {
     margin: 0 0 6px 0;
     font-size:var(--text-base);
     font-weight: 600;
+    overflow-wrap: anywhere;
   }
 
   .detail-tags {
@@ -1868,7 +1907,10 @@
   .agent-route {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 4px;
+    min-width: 0;
+    overflow-wrap: anywhere;
     color: rgb(var(--c-text-muted));
   }
 
@@ -2016,6 +2058,7 @@
   .message-header {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     font-size:var(--text-meta);
     margin-bottom: 4px;
@@ -2032,10 +2075,15 @@
     color: rgb(var(--c-text-muted));
   }
 
+  /* Agent notes carry long paths and ids with no spaces: they break anywhere
+     rather than widen the pane, and a line stops at a readable measure instead
+     of running the full width of a wide window. */
   .message-text {
     margin: 0;
+    max-width: 110ch;
     font-size:var(--text-xs);
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
     line-height: 1.4;
   }
 

@@ -516,14 +516,10 @@ fn live() {}
                 symbol.qualified_name.clone_from(&canonical);
             }
         }
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                super::super::budget::WALK_DEADLINE.with(|slot| slot.set(None));
-                super::super::budget::WALK_OVERRAN.with(|slot| slot.set(false));
-            }
-        }
-        let _clear = Clear;
+        let _clear = std::mem::DropGuard::new((), |()| {
+            super::super::budget::WALK_DEADLINE.with(|slot| slot.set(None));
+            super::super::budget::WALK_OVERRAN.with(|slot| slot.set(false));
+        });
         super::super::budget::WALK_DEADLINE.with(|slot| slot.set(Some(std::time::Instant::now())));
         assert!(!super::split_rust_cfg_copies(&mut extraction));
         let names = host_names(&extraction);

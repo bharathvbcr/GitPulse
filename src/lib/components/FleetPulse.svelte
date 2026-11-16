@@ -27,6 +27,8 @@
   import { describePulseCoverage, TREND_DAYS } from "../fleet/pulse";
   import { foldFleetLanguages } from "../fleet/languages";
   import { COMMIT_WINDOWS, DEFAULT_COMMIT_WINDOW } from "../fleet/types";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import FleetSparkline from "./FleetSparkline.svelte";
   import FleetLanguageBar from "./FleetLanguageBar.svelte";
 
@@ -57,6 +59,10 @@
     loading?: boolean;
   } = $props();
 
+  /** Which callout lists the reader expanded; each opens on LIST_PREVIEW_ROWS rows. */
+  let busiestExpanded = $state(false);
+  let dormantExpanded = $state(false);
+
   const coverage = $derived(describePulseCoverage(pulse));
   const languageStats = $derived(foldFleetLanguages(languages.stats));
 
@@ -83,8 +89,8 @@
 </script>
 
 <section
-  class="shrink-0 px-4 py-2.5"
-  aria-label="Fleet Pulse"
+  class="@container shrink-0 px-4 py-2.5"
+  aria-label="Fleet pulse"
   data-testid="fleet-pulse"
 >
   <div class="flex items-center gap-2">
@@ -97,7 +103,7 @@
     >
       {#if open}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
       <Activity size={12} class="text-accent" />
-      <span class="text-meta font-semibold">Fleet Pulse</span>
+      <span class="text-meta font-semibold">Fleet pulse</span>
     </button>
 
     {#if pulse.counted > 0}
@@ -158,7 +164,7 @@
         {coverage || "No commit history has been read yet."}
       </p>
     {:else}
-      <div class="mt-2 grid gap-3 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+      <div class="mt-2 grid gap-3 @4xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <!-- The chart, and the one sentence that qualifies it. -->
         <div class="gp-card rounded-lg px-3 py-2 flex flex-col gap-1.5 min-w-0">
           <div class="flex items-baseline gap-2 flex-wrap">
@@ -195,7 +201,7 @@
           <span class="gp-label">Movers</span>
           {#if pulse.busiest.length > 0}
             <ul class="flex flex-col gap-0.5">
-              {#each pulse.busiest as repo (repo.path)}
+              {#each previewSlice(pulse.busiest, busiestExpanded, LIST_PREVIEW_ROWS) as repo (repo.path)}
                 <li>
                   <button
                     type="button"
@@ -210,6 +216,7 @@
                 </li>
               {/each}
             </ul>
+            <ListPreviewToggle total={pulse.busiest.length} noun="repositories" bind:expanded={busiestExpanded} />
           {:else}
             <p class="text-meta text-textMuted">Nothing committed in the window.</p>
           {/if}
@@ -225,7 +232,7 @@
                 Quiet for {pulse.windowDays}d
               </span>
               <ul class="flex flex-col gap-0.5">
-                {#each pulse.dormant as repo (repo.path)}
+                {#each previewSlice(pulse.dormant, dormantExpanded, LIST_PREVIEW_ROWS) as repo (repo.path)}
                   <li class="flex items-center gap-1">
                     <button
                       type="button"
@@ -249,6 +256,7 @@
                   </li>
                 {/each}
               </ul>
+              <ListPreviewToggle total={pulse.dormant.length} noun="repositories" bind:expanded={dormantExpanded} />
             </div>
           {/if}
         </div>

@@ -185,7 +185,7 @@
   /* The one button (design language §9). With no `data-variant` it is the
      secondary pill, exactly what it has always been; `data-variant` picks
      primary | secondary | ghost | danger | success and `data-size` picks
-     sm (24px, also the unmarked height) | md (28px). The `gp-btn-primary/-success/-danger` classes below
+     sm (24px, also the unmarked height) | md (28px). The `gp-btn-primary/-danger` classes below
      stay as working aliases until Wave 2 migrates their call sites and empties
      them. Only colors and the press transform animate. */
   @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border bg-surface px-3 py-0 text-xs font-medium text-textPrimary shadow-xs;
@@ -225,7 +225,7 @@
   }
 
   &[data-variant="primary"] {
-    @apply border-transparent font-semibold text-white;
+    @apply border-transparent font-semibold text-onAccent;
     background-image: var(--brand-gradient);
     box-shadow: var(--shadow-glow);
     &:hover {
@@ -282,7 +282,7 @@
 
 @utility gp-btn-primary {
   /* Pill button (primary): brand gradient with a soft halo. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white;
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-onAccent;
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-fast);
   transition-timing-function: var(--gp-ease-effect);
@@ -303,7 +303,7 @@
 
 @utility gp-btn-danger {
   /* Pill button (destructive): same geometry as primary, rose ramp. */
-  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white;
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-onDanger;
   transition-property: color, background-color, border-color, transform;
   transition-duration: var(--gp-dur-fast);
   transition-timing-function: var(--gp-ease-effect);
@@ -524,6 +524,17 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   }
 }
 
+/* The end cue when it names the section below ("Worktrees ⌄"): the same
+   chip as the chevron, widened to carry the word, and kept inside the 2rem
+   band (h-6) so it never sits on a row. */
+@utility gp-scroll-cue-pill {
+  @apply pointer-events-auto inline-flex h-6 max-w-[calc(100%-1.5rem)] cursor-pointer items-center gap-1 rounded-full border border-edge bg-surface/90 pr-2 pl-2.5 text-micro font-medium text-textMuted;
+  box-shadow: var(--shadow-bubble-lift);
+  &:hover {
+    @apply bg-surfaceHover text-textPrimary;
+  }
+}
+
 @utility gp-menu {
   /* Floating menu / popover. */
   @apply overflow-hidden rounded-xl border border-edgeStrong bg-surface p-1;
@@ -585,13 +596,6 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   @apply inline-flex select-none items-center gap-0.5 rounded-full border border-edge bg-background/70 p-0.5;
 }
 
-@utility gp-surface-header {
-  /* The top bar of a full-pane surface (Tasks, Agents): title on the left,
-     the surface's switches and actions on the right, one height and no rule for
-     every surface so moving between them does not shift the chrome. */
-  @apply flex shrink-0 flex-wrap items-center justify-between gap-3 px-3.5 py-2.5;
-}
-
 @utility gp-surface-title {
   @apply m-0 text-base font-semibold text-textPrimary;
 }
@@ -637,6 +641,81 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   }
 }
 
+/* ---- Page layout (design language section 7a) ----------------------------
+   A page's content is fluid: it fills its pane, and what changes with the pane
+   is spacing and column count, never a fixed cap. The pane is measured with a
+   CONTAINER query on `gp-page`, not the window: the same page sits in a narrow
+   split and a full-width tab and must lay out for the width it was given.
+   Steps (the pane's own inline size): compact below 40rem, regular from 40rem,
+   wide from 72rem. A container cannot query itself, so the container
+   (`gp-page`) and the padded column inside it (`gp-page-body`) are two
+   elements; `PageBody.svelte` renders both. */
+@utility gp-page {
+  /* The page's scroll area and its width container. */
+  container: gp-page / inline-size;
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  overflow: auto;
+  /* Breathing room before the status bar when scrolled to the end: the page
+     scroller owns it, so every page ends the same way. At least the widest
+     section gap (`--gp-space-6`). */
+  padding-block-end: var(--gp-space-6);
+}
+
+@utility gp-page-body {
+  /* The padded column of sections. Padding and the gap between sections step
+     up with the container; `--gp-pad` (density) is the compact floor. */
+  --gp-page-pad: var(--gp-pad);
+  --gp-page-gap: var(--gp-pad);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: var(--gp-page-pad) var(--gp-page-pad) 0;
+  gap: var(--gp-page-gap);
+  @container gp-page (min-width: 40rem) {
+    --gp-page-pad: var(--gp-space-4);
+    --gp-page-gap: var(--gp-space-5);
+  }
+  @container gp-page (min-width: 72rem) {
+    --gp-page-pad: var(--gp-space-6);
+    --gp-page-gap: var(--gp-space-6);
+  }
+}
+
+@utility gp-page-section {
+  /* A section, notice or card: the full width of the page body, never capped.
+     Its own children are spaced one step tighter than the sections are. */
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  gap: var(--gp-space-2);
+}
+
+@utility gp-page-grid {
+  /* Cards that sit side by side as the pane allows: one column when narrow, one
+     more each time the pane has room for another `--gp-page-col` (default 18rem on :root;
+     set it on the element for smaller tiles). Needs no breakpoint: auto-fit
+     measures the grid's own width, and drops the tracks no card fills so a
+     short list still spans the pane. For a FIXED set of tiles that should be 2
+     or 4 across, use `grid-cols-2 @2xl:grid-cols-4` instead. */
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: var(--gp-space-3);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--gp-page-col)), 1fr));
+  align-items: start;
+}
+
+@utility gp-prose {
+  /* The one place a page keeps a measure: long running text (an explanation of
+     several sentences) is unreadable at pane width. 72ch. Never a card, a
+     notice, a table or a list of controls. */
+  max-inline-size: 72ch;
+}
+
 @utility gp-label {
   /* A section label: sentence case, `text-meta` medium, muted. Replaces the
      uppercase + tracking labels, so the casing is decided here once. */
@@ -651,7 +730,7 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
      animates transform only, through `@keyframes gp-slide`. Both reduced-motion
      lists below stop it; the bar then rests at the start of the track, which
      still reads as "working" without moving. */
-  animation: gp-slide calc(var(--gp-dur-emphasis) * 2.5) ease-in-out infinite;
+  animation: gp-slide calc(var(--gp-dur-emphasis) * 2.5) var(--gp-ease-effect) infinite;
 }
 
 @utility gp-notice {
@@ -792,6 +871,11 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
   &[data-active='true'] {
     @apply bg-surface font-semibold text-accent;
     box-shadow: var(--shadow-bubble);
+  }
+  /* Compact: inside a field or a narrow rail, where the control is secondary
+     to the text beside it. Same 24px target, metadata type, tighter padding. */
+  [data-size='sm'] > & {
+    @apply px-2 text-meta;
   }
 }
 
@@ -1168,6 +1252,9 @@ html[data-transparency~="reduced"] .gp-scroll-diffuse {
     --gp-header-h: 32px;
     --gp-pad: 12px;
     --gp-density: 1;
+    /* Narrowest card a `gp-page-grid` track may be (design language 7a). An
+       element overrides it for smaller tiles: `[--gp-page-col:14rem]`. */
+    --gp-page-col: 18rem;
 
     /* Settings -> Appearance inputs (ui/appearance/apply.ts writes these inline
        on <html>). The values here are the shipped look, so unset and default
@@ -1500,6 +1587,9 @@ html.macos {
   /* `--gp-float-blur` is the Settings input; 0 also stamps
      `html[data-float-blur="off"]`, because `blur(0)` is not `none`. */
   --mac-glass-blur-float: var(--gp-float-blur, 34px);
+  /* The wallpaper input. `none` until ui/appearance/apply.ts writes a
+     `url("…")` inline; drawn only by the body rule below the shell. */
+  --gp-backdrop: none;
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
   /* An inset area inside a panel -- a diff preview, a code block, an
@@ -1585,6 +1675,22 @@ html.macos .gp-shell {
     radial-gradient(70% 68% at 98% 6%, rgb(var(--mac-hue-c) / calc(0.42 * var(--mac-hue-gain))), rgb(var(--mac-hue-c) / 0) 100%),
     radial-gradient(74% 70% at 88% 100%, rgb(var(--mac-hue-b) / calc(0.38 * var(--mac-hue-gain))), rgb(var(--mac-hue-b) / 0) 100%),
     radial-gradient(64% 62% at 6% 96%, rgb(var(--mac-hue-d) / calc(0.3 * var(--mac-hue-gain))), rgb(var(--mac-hue-d) / 0) 100%);
+}
+
+/* The wallpaper (Settings → Appearance → Wallpaper). It is painted on `body`,
+   BENEATH the shell veil above, so it stands where the desktop would: the
+   material model already proves the stack over a pure white and a pure black
+   desktop, the extremes of any picture, and that proof covers a wallpaper
+   only from down here. Painted on the shell itself it would sit above the
+   veil (an image layer paints over the element's own background colour) and
+   the proof would no longer hold. `--gp-backdrop` is the input written
+   inline by ui/appearance/apply.ts; this rule is the only place it is drawn.
+   Static: one composited image, no animation, no filter. */
+html.macos[data-backdrop] body {
+  background-image: var(--gp-backdrop);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
@@ -1782,11 +1888,23 @@ html.macos .gp-welcome {
   background-color: transparent;
 }
 
-/* The repository strip paints 12px labels on glass. The shared chrome fill
-   is 40% so the hue field shows through, which drops muted text below AA;
-   this row is denser so an open tab remains a plate rather than a ghost. */
+/* The title row and the view bar paint no fill: they are drawn straight on
+   the window's ground, the shell, and the sidebar and workspace float on that
+   same ground as cards. A fill of their own made the chrome a band across the
+   top of every page. The shell's veil (c-bg at 0.55 dark, 0.62 light) is
+   denser than the workspace plate (0.46 / 0.6), so the 12px labels keep at
+   least the contrast the page's own text has; the shared 40% chrome fill,
+   which let the hue field through, would not. */
 html.macos .gp-glass.gp-repo-tabs {
-  background-color: rgb(var(--c-surface) / 0.78);
+  background-color: transparent;
+}
+
+/* The status bar is the same chrome at the foot of the window: it paints no
+   band of its own and sits on the shell's ground like the two top rows. It has
+   its own class so the harnesses and contract tests that mean the top rows
+   (`gp-repo-tabs`) do not match it. */
+html.macos .gp-glass.gp-status-bar {
+  background-color: transparent;
 }
 
 html.macos .gp-welcome-card {
@@ -1795,14 +1913,14 @@ html.macos .gp-welcome-card {
   border-radius: var(--gp-r-xl);
 }
 
-/* The sidebar and the workspace are two rounded cards that fill the space
-   between the tab strip and the status bar, with no gutter around or
-   between them; any band of the shell's hue there read as wasted space. The
-   gutter stays a token so both panes keep moving together. The rounded
-   corners leave a tiny wedge of shell hue where they meet the straight bars,
-   which is accepted. */
+/* The sidebar and the workspace are two rounded cards floating on the
+   window's own ground, the same ground the title row and view bar are drawn
+   on (they paint no fill of their own). The gutter is what makes them float:
+   with none, each card's top edge met the chrome as a line across the window.
+   It is kept small, since a wide band of shell hue reads as wasted space, and
+   it stays a token so both panes move together. */
 html.macos {
-  --gp-pane-gutter: 0px;
+  --gp-pane-gutter: 6px;
   --gp-pane-radius: 14px;
 }
 
@@ -1866,16 +1984,38 @@ html.light .gp-sidebar[data-sidebar-panel] {
   --gp-sidebar-cue-ramp: 0.5rem;
 }
 
+/* Per edge, the cleared band is the cue band only where that scroller draws
+   its own chevron. ScrollCue sets `--gp-cue-clear-start`/`-end` to 0px on an
+   edge whose chevron gave way to an enclosing one (the branch list's bottom,
+   right above the body's cue): nothing is drawn there, so that edge only
+   ramps and no band of rows is hidden for nothing. */
+.gp-sidebar [data-gp-fade] {
+  --gp-clear-start: var(--gp-cue-clear-start, var(--gp-sidebar-cue-band));
+  --gp-clear-end: var(--gp-cue-clear-end, var(--gp-sidebar-cue-band));
+}
+
 .gp-sidebar [data-gp-fade="y-start"] {
-  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-clear-start), #000 calc(var(--gp-clear-start) + var(--gp-sidebar-cue-ramp)));
 }
 
 .gp-sidebar [data-gp-fade="y-end"] {
-  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)));
+  --gp-fade-mask: linear-gradient(to top, transparent var(--gp-clear-end), #000 calc(var(--gp-clear-end) + var(--gp-sidebar-cue-ramp)));
 }
 
 .gp-sidebar [data-gp-fade="y-both"] {
-  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-sidebar-cue-band), #000 calc(var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-sidebar-cue-band) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-sidebar-cue-band)));
+  --gp-fade-mask: linear-gradient(to bottom, transparent var(--gp-clear-start), #000 calc(var(--gp-clear-start) + var(--gp-sidebar-cue-ramp)), #000 calc(100% - var(--gp-clear-end) - var(--gp-sidebar-cue-ramp)), transparent calc(100% - var(--gp-clear-end)));
+}
+
+/* The branch list fills the sidebar body except for a strip at the bottom:
+   the body's cue band and ramp, less the body's 0.75rem (p-3) padding. While
+   worktrees and changes wait below, the body fades that strip out and draws
+   its "Worktrees" cue there. A list that ran into it had its last row (the
+   Tags header) erased by the body's fade even when scrolled to its end. The
+   floor keeps a short window from squeezing the list to nothing; the body
+   scrolls instead. */
+.gp-sidebar-branches {
+  height: calc(100% - (var(--gp-sidebar-cue-band) + var(--gp-sidebar-cue-ramp) - 0.75rem));
+  min-height: 18rem;
 }
 
 html.macos :is(.gp-menu, .gp-card.shadow-float) {
@@ -1999,6 +2139,13 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     background-image: none;
   }
 
+  /* The wallpaper too: a picture behind solid surfaces is the half-finished
+     state these preferences exist to avoid. Same selector as the rule that
+     draws it, and later, so it wins. */
+  html.macos[data-backdrop] body {
+    background-image: none;
+  }
+
   /* The window itself stays transparent -- that is fixed at build time -- so
      the only way to honour the preference is for the page to paint over it. */
   html.macos,
@@ -2036,7 +2183,11 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   }
 
   html.macos .gp-glass.gp-repo-tabs {
-    background-color: rgb(var(--c-surface));
+    background-color: rgb(var(--c-bg));
+  }
+
+  html.macos .gp-glass.gp-status-bar {
+    background-color: rgb(var(--c-bg));
   }
 
   html.macos :is(.gp-scrim, .backdrop-blur-sm) {
@@ -2064,6 +2215,10 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
    selector, so the rules are written twice, and mac-material-contract.test.ts
    pins the two lists equal rule for rule: add a surface to both or neither. */
 html.macos[data-transparency="reduced"] .gp-shell {
+  background-image: none;
+}
+
+html.macos[data-transparency="reduced"][data-backdrop] body {
   background-image: none;
 }
 
@@ -2097,7 +2252,11 @@ html.macos[data-transparency="reduced"] :is([class~="shadow-float"], [class~="sh
 }
 
 html.macos[data-transparency="reduced"] .gp-glass.gp-repo-tabs {
-  background-color: rgb(var(--c-surface));
+  background-color: rgb(var(--c-bg));
+}
+
+html.macos[data-transparency="reduced"] .gp-glass.gp-status-bar {
+  background-color: rgb(var(--c-bg));
 }
 
 html.macos[data-transparency="reduced"] :is(.gp-scrim, .backdrop-blur-sm) {
@@ -2112,23 +2271,21 @@ html.macos[data-transparency="reduced"] .gp-liquid-selection {
   border-color: rgb(var(--c-accent));
 }
 
-/* The title row and the view bar under it are one band of chrome. Each is a
-   glass slab on its own, so where they met the upper one drew its bottom
-   shade and drop shadow and the lower one its top sheen: a seam across the
-   window. Joined, the pair keeps only the band's outer edges, and both drop
-   their diagonal sheen (two gradients each sized to its own row cannot meet
-   without a step). The fill is the same token on both, so nothing marks the
-   join. Placed after every glass and reduced-transparency rule so it wins in
-   all of them. */
-html.macos .gp-glass.gp-repo-tabs:has(+ .gp-glass.gp-repo-tabs) {
+/* The title row and the view bar under it are one band of chrome, and that
+   band is the same ground as the page below it. A glass slab draws a sheen,
+   a bottom shade and a drop shadow; across the top of the window those read
+   as a separator between the chrome and every page. So neither row draws
+   any of them: no diagonal sheen, no edge, no shadow. With the plate fill
+   above, nothing marks where the chrome ends and the page begins. Placed
+   after every glass and reduced-transparency rule so it wins in all of them. */
+html.macos .gp-glass.gp-repo-tabs {
   background-image: none;
-  box-shadow: inset 0 1px 0 var(--mac-glass-sheen);
+  box-shadow: none;
 }
-html.macos .gp-glass.gp-repo-tabs + .gp-glass.gp-repo-tabs {
+
+html.macos .gp-glass.gp-status-bar {
   background-image: none;
-  box-shadow:
-    inset 0 -1px 0 var(--mac-glass-shade),
-    var(--shadow-card-drop);
+  box-shadow: none;
 }
 
 .overflow-auto,
@@ -2184,6 +2341,21 @@ html[data-fullscreen] .gp-traffic-inset {
 
 .gp-pane {
   contain: layout paint;
+}
+
+/* A side panel inside a page drawn as its own card, floating on the page the
+   way the sidebar and workspace float on the window: the pane gutter around
+   it, the pane radius, a soft edge and the card shadow. It clips its children
+   to the rounded edge, so a header band inside it needs no corners of its
+   own. Use it on the column's host; it stretches with its flex row, so it
+   takes no `h-full` (with the margin that would overflow). */
+@utility gp-float-card {
+  margin: var(--gp-pane-gutter, 6px);
+  border: 1px solid rgb(var(--c-border) / 0.65);
+  border-radius: var(--gp-r-pane);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  min-height: 0;
 }
 
 /* Landing cue for a deep link: the section a header chip pointed at wears a
@@ -2377,7 +2549,7 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
   }
 
   html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-out"] {
-    animation: gp-dock-slide-out var(--gp-dock-exit-ms, 70ms) var(--gp-ease-exit) both;
+    animation: gp-dock-slide-out var(--gp-dock-exit-ms, var(--gp-dur-instant)) var(--gp-ease-exit) both;
   }
 }
 
@@ -2386,7 +2558,7 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation-duration: var(--gp-dur-base);
-  animation-timing-function: ease;
+  animation-timing-function: var(--gp-ease-effect);
 }
 
 /* Written out rather than grouped with `:is()`: these are pseudo-elements on

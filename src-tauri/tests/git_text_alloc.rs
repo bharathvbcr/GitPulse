@@ -13,8 +13,8 @@
 
 use gitpulse_lib::engine::git_cli::{
     git_bytes_capped, git_text, git_text_capped, git_text_partial, git_text_with_timeout,
-    MAX_OUTPUT_BYTES,
 };
+use gitpulse_lib::engine::process::MAX_OUTPUT_BYTES;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::time::Duration;

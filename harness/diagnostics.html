@@ -318,7 +318,12 @@
       fixture.cmd_devmap_status = () => quietStatus;
     }
     await click("Docs");
-    check("250 repeated broken links show the honest 200-row cap",target.querySelectorAll("li").length===200 && target.textContent.includes("250"),target.textContent.slice(-150));
+    // The page previews five rows of the 200 it holds; the cap the producer applied (200 of 250) stays stated beside them.
+    check("250 repeated broken links open as five rows and still state the 200-of-250 cap",target.querySelectorAll("li").length===5 && target.textContent.includes("Showing 200 of 250 broken links"),target.textContent.slice(-150));
+    await click("Show all 200 broken links");
+    check("expanding the broken links shows all 200 rows the cap allows",target.querySelectorAll("li").length===200 && target.textContent.includes("Showing 200 of 250 broken links"),target.textContent.slice(-150));
+    await click("Show fewer");
+    check("Show fewer returns the broken links to five rows",target.querySelectorAll("li").length===5);
     const priorLoads=calls.get("cmd_devmap_repo_map");
     for(let i=0;i<200;i++){repoStore.setError(null);await tick();}
     check("200 store emissions do not reload the map",calls.get("cmd_devmap_repo_map")===priorLoads);
@@ -416,6 +421,16 @@
       target.textContent.slice(0,300));
     await click("Show all");
     check("Show all lists the entries the filter hid",target.textContent.includes("Harness filtered warning")&&!target.textContent.includes("hidden by this filter"));
+    diagnostics.clear();
+    // Interleaved repeats of two failures fold into two group cards, not five.
+    for (const message of ["Group canary A","Group canary B","Group canary A","Group canary B","Group canary A"]) diagnostics.error("group-canary",message);
+    host.show("blame");await settle();host.show("diagnostics");await settle();
+    const groupCount = text => target.textContent.split(text).length-1;
+    check("interleaved repeats render as one card per failure with a count",groupCount("Group canary A")===1&&groupCount("Group canary B")===1&&target.textContent.includes("×3")&&target.textContent.includes("×2"),target.textContent.slice(0,400));
+    const disclosure=()=>[...target.querySelectorAll("button[aria-expanded]")].find(b=>b.textContent.includes("×3"));
+    check("a grouped card is a closed disclosure listing no occurrences yet",disclosure()?.getAttribute("aria-expanded")==="false"&&!target.querySelector('[aria-label="Occurrences"]'));
+    disclosure()?.click();await settle();
+    check("opening the disclosure lists each recorded run",disclosure()?.getAttribute("aria-expanded")==="true"&&target.querySelectorAll('[aria-label="Occurrences"] li').length>=1);
     diagnostics.clear();
     await settle();
     check("an empty ring still says nothing was recorded",target.textContent.includes("No frontend diagnostics recorded"));

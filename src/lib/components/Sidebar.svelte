@@ -94,6 +94,7 @@
     Search,
   } from "@lucide/svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import { prefersReducedMotion } from "../motion/easing";
   import { onDestroy, tick, untrack } from "svelte";
   import { motionExitMs, motionMs } from "../motion/tokens";
   import { slideDocked } from "../sidebar/dockedSlide";
@@ -239,6 +240,75 @@
   /** Set on pointerup after a real drag; dblclick inside the window is ignored. */
   let lastDragEndAt = 0;
   let bodyScroller: HTMLDivElement | undefined = $state();
+
+  /* --- What waits below the branch list --------------------------------------
+   * The branch list fills the body, so the worktrees and the change lists
+   * under it start off-screen with nothing saying they exist. The body's end
+   * cue names the first of them still below the fold, and choosing it brings
+   * that section's heading to the top, clear of the top fade.
+   */
+  let worktreesSection: HTMLDivElement | undefined = $state();
+  let changesSection: HTMLDivElement | undefined = $state();
+  let sectionBelow = $state<{ label: string; el: HTMLElement } | null>(null);
+
+  /** The body's cue band plus its ramp, in px: the strip a fade hides. */
+  function cueReservePx(el: HTMLElement): number {
+    const cs = getComputedStyle(el);
+    const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    const band = parseFloat(cs.getPropertyValue("--gp-sidebar-cue-band")) || 2;
+    const ramp = parseFloat(cs.getPropertyValue("--gp-sidebar-cue-ramp")) || 0.5;
+    return (band + ramp) * rem;
+  }
+
+  function measureSectionBelow() {
+    const scroller = bodyScroller;
+    if (!scroller) {
+      sectionBelow = null;
+      return;
+    }
+    const visibleEnd = scroller.getBoundingClientRect().bottom - cueReservePx(scroller);
+    const sections: [string, HTMLElement | undefined][] = [
+      ["Worktrees", worktreesSection],
+      ["Changes", changesSection],
+    ];
+    const next = sections.find(([, el]) => el && el.getBoundingClientRect().top >= visibleEnd);
+    const found = next ? { label: next[0], el: next[1] as HTMLElement } : null;
+    if (found?.label !== sectionBelow?.label || found?.el !== sectionBelow?.el) sectionBelow = found;
+  }
+
+  $effect(() => {
+    const scroller = bodyScroller;
+    const watched = [worktreesSection, changesSection].filter((el): el is HTMLDivElement => !!el);
+    if (!scroller) return;
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        measureSectionBelow();
+      });
+    };
+    // Sections move when anything above them changes height (the branch list
+    // loading, a worktree row appearing), so their own sizes are watched too.
+    const ro = new ResizeObserver(schedule);
+    ro.observe(scroller);
+    for (const el of watched) ro.observe(el);
+    scroller.addEventListener("scroll", schedule, { passive: true });
+    schedule();
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      ro.disconnect();
+      scroller.removeEventListener("scroll", schedule);
+    };
+  });
+
+  function revealSectionBelow() {
+    const scroller = bodyScroller;
+    const el = sectionBelow?.el;
+    if (!scroller || !el) return;
+    const top = scroller.scrollTop + el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - cueReservePx(scroller);
+    scroller.scrollTo({ top: Math.max(0, top), behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  }
 
   /* --- Repository switch -----------------------------------------------------
    * The sidebar is mounted once per window, so a tab switch re-points the store
@@ -387,7 +457,7 @@
 {#snippet expanded()}
     <!-- Repository header. Opening another repository is the title bar's
          "Open" (decision D3, HEADER_SPEC §9): the sidebar no longer repeats it. -->
-    <div class="p-3 flex items-center justify-between bg-surfaceHover/30 gap-1">
+    <div class="p-3 flex items-center justify-between gap-1">
       <div class="flex items-center gap-2 truncate">
         <FolderGit2 size={15} class="text-accent shrink-0" />
         <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No repository"}>
@@ -570,12 +640,16 @@
            extend, so it costs no space on a repository that is already fine. -->
       <TrustExtensionBanner />
 
-      <BranchList />
+      <div class="gp-sidebar-branches">
+        <BranchList />
+      </div>
 
-      <WorktreesPanel />
+      <div bind:this={worktreesSection}>
+        <WorktreesPanel />
+      </div>
 
       <!-- Shared file filter -->
-      <div class="relative">
+      <div bind:this={changesSection} class="relative">
         <Search
           size={13}
           class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none"
@@ -754,7 +828,7 @@
         {/if}
       </div>
     </div>
-    <ScrollCue target={bodyScroller} axis="y" />
+    <ScrollCue target={bodyScroller} axis="y" endLabel={sectionBelow?.label} onEnd={sectionBelow ? revealSectionBelow : undefined} />
     </div>
 
     <CommitComposer />

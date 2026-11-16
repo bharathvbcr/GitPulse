@@ -21,10 +21,10 @@ use crate::analyzer::cargo_supply::{
 };
 use crate::analyzer::language::LanguageDetector;
 use crate::deadline::{ScanDeadline, AUDIT_TIMEOUT};
-use crate::engine::git_cli::{
-    capture_command_scrubbed, capture_command_with_env, classify_tool_probe, git_text,
-    is_timed_out, resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo,
-    CapturedOutput, PathSource, ToolProbe,
+use crate::engine::git_cli::{git_text, sandbox_join, sandbox_join_canonical, validate_repo};
+use crate::engine::process::{
+    capture_command_scrubbed, capture_command_with_env, classify_tool_probe, is_timed_out,
+    resolve_spawn_program_in, CapturedOutput, PathSource, ToolProbe,
 };
 #[allow(unused_imports)]
 use crate::ipc_error::CommandError;
@@ -2100,10 +2100,7 @@ fn auditable_config_path(repo: &Path, locks: &[String]) -> Option<String> {
 }
 
 fn repo_relative(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    path.trim_prefix(repo).to_string_lossy().replace('\\', "/")
 }
 
 /// Audits pinned requirements files with `pip-audit --no-deps`.
@@ -2566,7 +2563,7 @@ pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>,
 /// zero findings, even on exit 0: these scanners always emit at least `[]` or
 /// a config message, so emptiness is itself a failed run.
 fn scanner_stdout(
-    out: Result<crate::engine::git_cli::CapturedOutput, CommandError>,
+    out: Result<crate::engine::process::CapturedOutput, CommandError>,
     issues: &mut Vec<HealthIssue>,
     code: &str,
     program: &str,
@@ -2885,7 +2882,7 @@ fn user_registry(userconfig: &Path) -> Option<String> {
 /// with no `=` is a key set to true; `;` and `#` start a comment line and
 /// `[section]` headers carry no key.
 fn parse_npmrc(text: &str) -> Vec<(String, String)> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_prefix('\u{feff}');
     text.split(['\r', '\n'])
         .map(str::trim)
         .filter(|line| {
@@ -2906,7 +2903,7 @@ fn parse_npmrc(text: &str) -> Vec<(String, String)> {
                     break;
                 }
             }
-            let key = key.strip_suffix("[]").unwrap_or(key);
+            let key = key.trim_suffix("[]");
             (
                 key.trim().to_ascii_lowercase(),
                 value.trim().trim_matches(['"', '\'']).to_string(),
@@ -6742,7 +6739,7 @@ mod tests {
 
     // -- scanner failure surfacing ---------------------------------------------
 
-    use crate::engine::git_cli::{found_but_failed_detail, CapturedOutput};
+    use crate::engine::process::{found_but_failed_detail, CapturedOutput};
 
     fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {
         CapturedOutput {
@@ -6889,7 +6886,7 @@ mod tests {
     /// through the production spawn path so fallback-dir resolution (GUI
     /// launches, ~/go/bin, …) is honored exactly as in the app.
     fn unrunnable(program: &str) -> bool {
-        crate::engine::git_cli::capture_command(
+        crate::engine::process::capture_command(
             program,
             &["--version"],
             None,
@@ -8425,7 +8422,7 @@ mod tests {
 #[cfg(test)]
 mod fail_closed_tests {
     use super::*;
-    use crate::engine::git_cli::CapturedOutput;
+    use crate::engine::process::CapturedOutput;
 
     fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {
         CapturedOutput {
@@ -9036,7 +9033,7 @@ mod fail_closed_tests {
     #[test]
     fn a_load_deferral_is_not_a_deadline_cut_but_a_slot_wait_timeout_is() {
         let deferred = "npm deferred under load after 0.000s: background work is shed";
-        assert!(crate::engine::git_cli::is_deferred_under_load(deferred));
+        assert!(crate::engine::process::is_deferred_under_load(deferred));
         let clock = ScanClock::new(crate::deadline::ScanDeadline::after(Duration::from_secs(
             60,
         )));
@@ -9047,7 +9044,7 @@ mod fail_closed_tests {
             clock.state().not_run
         );
         let slot = "npm timed out after 1.000s waiting for a process slot";
-        assert!(crate::engine::git_cli::is_slot_wait_timeout(slot));
+        assert!(crate::engine::process::is_slot_wait_timeout(slot));
         clock.note_finished::<()>(&Err(slot.into()), "npm audit", true);
         assert_eq!(clock.state().not_run.len(), 1);
     }

@@ -1676,7 +1676,7 @@ pub(super) fn go_filename_is_constrained(path: &str) -> bool {
     let Some(stem) = file.strip_suffix(".go") else {
         return false;
     };
-    let stem = stem.strip_suffix("_test").unwrap_or(stem);
+    let stem = stem.trim_suffix("_test");
     let mut parts = stem.split('_').rev();
     let Some(last) = parts.next() else {
         return false;

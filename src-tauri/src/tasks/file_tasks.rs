@@ -66,7 +66,21 @@ pub const MAX_OWNER_BYTES: usize = 300;
 pub const MAX_KIND_BYTES: usize = 64;
 
 /// The statuses the board has columns for.
-pub const STATUSES: [&str; 6] = ["inbox", "backlog", "ready", "in_progress", "review", "done"];
+pub const STATUSES: [&str; 5] = ["backlog", "ready", "in_progress", "review", "done"];
+/// Names a status once had, and the column each is read as. `inbox` was merged
+/// into `backlog`; a brief on disk, an older agent's call or a store row may
+/// still say it. [`current_status`] is the one place that reads it: nothing is
+/// written, shown or advertised under the old name. The TypeScript twin is
+/// `LEGACY_STATUSES` in `src/lib/workbench/vocabulary.ts`.
+const LEGACY_STATUSES: [(&str, &str); 1] = [("inbox", "backlog")];
+
+/// The column a normalised status is read as: itself, or what a retired name became.
+pub fn current_status(status: &str) -> &str {
+    LEGACY_STATUSES
+        .iter()
+        .find(|(old, _)| *old == status)
+        .map_or(status, |(_, current)| current)
+}
 /// The severities the board accepts. `none` is the absence of one.
 pub const SEVERITIES: [&str; 4] = ["low", "medium", "high", "critical"];
 
@@ -182,11 +196,13 @@ pub fn validate_title(raw: &str) -> Result<String, String> {
     Ok(title.into())
 }
 
-/// Normalise a status (`In Progress`, `in-progress` → `in_progress`).
+/// Normalise a status (`In Progress`, `in-progress` → `in_progress`). A
+/// retired name reads as the column it became (`inbox` → `backlog`).
 pub fn normalize_status(raw: &str) -> Result<String, String> {
-    let status = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    if STATUSES.contains(&status.as_str()) {
-        Ok(status)
+    let folded = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    let status = current_status(&folded);
+    if STATUSES.contains(&status) {
+        Ok(status.to_owned())
     } else {
         Err(format!(
             "unknown status {raw:?}; expected one of {}",
@@ -222,7 +238,7 @@ pub fn parse_priority(raw: &str) -> Result<u8, String> {
         [b @ b'0'..=b'3'] => Some(b - b'0'),
         _ => None,
     };
-    let parsed = digit(lower.strip_prefix('p').unwrap_or(&lower))
+    let parsed = digit(lower.trim_prefix('p'))
         .or_else(|| priority_name(&lower))
         .or_else(|| {
             let (number, rest) = lower.split_once(" (")?;
@@ -477,8 +493,7 @@ fn list(
 /// Parse a brief from file content.
 pub fn parse_brief(content: &str) -> Result<TaskBrief, String> {
     let text = content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
+        .trim_prefix('\u{feff}')
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     if text.contains('\0') {

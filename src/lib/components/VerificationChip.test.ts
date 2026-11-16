@@ -94,9 +94,13 @@ describe("the task sheet's Post verify result action", () => {
     expect(out).toMatch(/<button[^>]*data-testid="task-verify-post"[^>]*disabled/);
     expect(out).toContain("Post verify result");
     expect(out).toContain('data-testid="task-verify-post-note"');
+    expect(out).toMatch(/<button[^>]*id="task-verify-opt-in"[^>]*role="switch"[^>]*disabled/);
+    expect(out).not.toContain('id="task-verify-comment"');
   });
   it("stays disabled with no repository open", () => {
     const out = render(TaskVerification, { props: { taskId: "t", revision: 1 } }).body;
     expect(out).toMatch(/<button[^>]*data-testid="task-verify-post"[^>]*disabled/);
+    expect(out).not.toContain('id="task-verify-opt-in"');
+    expect(out).not.toContain('id="task-verify-comment"');
   });
 });

@@ -90,7 +90,7 @@ describe("quick add under hostile input", () => {
     for (const input of HOSTILE) {
       const parsed = parseQuickAdd(input, { repositories: [{ id: "r1", name: "GitPulse" }] });
       const draft = quickAddDraft(parsed, {
-        status: "inbox",
+        status: "backlog",
         kind: "feature",
         repositoryIds: ["r1"],
         primaryRepositoryId: "r1",

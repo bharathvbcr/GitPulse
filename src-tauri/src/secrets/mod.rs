@@ -42,7 +42,88 @@ mod tests {
             duration_ms: 2,
             nested_repos_scanned: true,
             max_file_size_mb: MAX_FILE_SIZE_MB,
+            excluded_paths: Vec::new(),
         }
+    }
+
+    fn ignored(entries: &[&str]) -> GitView {
+        GitView {
+            tracked: Default::default(),
+            ignored: entries.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn exclusions_are_bulk_ignored_trees_and_nested_worktrees_only() {
+        let root = Path::new("/repo");
+        let view = ignored(&[
+            "src-tauri/target/",
+            "node_modules/",
+            "tmp/",
+            // Inside `tmp/`, which already covers it.
+            "tmp/target/",
+            // Ignored, but not bulk: a `.env` file and a config directory a
+            // person wrote are exactly what the scan is for.
+            ".env",
+            "secrets/",
+            // A file named like a bulk directory is not one.
+            "target",
+            // A name that merely starts like one.
+            "targets/",
+        ]);
+        let worktrees = [
+            Path::new("/repo/.claude/worktrees/lane").to_path_buf(),
+            // Inside an excluded tree already.
+            Path::new("/repo/tmp/rel").to_path_buf(),
+            // Outside the scan root: nothing to leave out.
+            Path::new("/elsewhere/lane").to_path_buf(),
+            Path::new("/repo-other/lane").to_path_buf(),
+        ];
+        assert_eq!(
+            report::scan_exclusions(root, Some(&view), &worktrees),
+            vec![
+                ".claude/worktrees/lane/",
+                "node_modules/",
+                "src-tauri/target/",
+                "tmp/",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_the_ignore_listing_only_worktrees_are_left_out() {
+        let worktrees = [Path::new("/repo/lanes/a").to_path_buf()];
+        assert_eq!(
+            report::scan_exclusions(Path::new("/repo"), None, &worktrees),
+            vec!["lanes/a/"]
+        );
+    }
+
+    #[test]
+    fn exclusions_are_bounded() {
+        let entries: Vec<String> = (0..report::MAX_EXCLUSIONS + 10)
+            .map(|i| format!("p{i:04}/target/"))
+            .collect();
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let kept = report::scan_exclusions(Path::new("/repo"), Some(&ignored(&refs)), &[]);
+        assert_eq!(kept.len(), report::MAX_EXCLUSIONS);
+    }
+
+    #[test]
+    fn argv_names_each_excluded_tree_once() {
+        let argv = build_scan_argv(
+            "/tmp/repo",
+            &[
+                Path::new("/tmp/repo/target").to_path_buf(),
+                Path::new("/tmp/repo/tmp").to_path_buf(),
+            ],
+        );
+        let excludes: Vec<&str> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--exclude")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(excludes, ["/tmp/repo/target", "/tmp/repo/tmp"]);
     }
 
     fn envelope(text: &str) -> parse::Envelope {
@@ -120,7 +201,7 @@ mod tests {
 
     #[test]
     fn argv_forces_safe_scan_contract() {
-        let argv = build_scan_argv("/tmp/repo");
+        let argv = build_scan_argv("/tmp/repo", &[]);
         assert_eq!(argv[0], "--no-update-check");
         assert_eq!(argv[1], "scan");
         assert_eq!(argv[2], "/tmp/repo");
@@ -314,7 +395,7 @@ mod tests {
         let deadline = std::time::Duration::from_secs(7);
         let reason = |err: &str| run::runner_failure_reason(err, deadline);
         // The gate's own formatter, not a transcription of it.
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         assert_eq!(
             reason(refusal_message("kingfisher", Refusal::TimedOut { deadline }).message()),
             "kingfisher could not start: no process slot became free in time"

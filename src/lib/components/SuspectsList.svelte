@@ -7,8 +7,9 @@
    * `views/historyList.ts`). The commit graph and HEAD moves read the history
    * forwards; this one reads it backwards, from a misbehaving symbol to the
    * commits that touched what it reaches. The question sits in History's
-   * context bar (`SuspectsQueryBar`) and the answer in `suspectsQuery`, so it
-   * survives switching lists and the other lists can mark what it ranked.
+   * list's own header strip (`SuspectsQueryBar`, always visible) and the answer
+   * in `suspectsQuery`, so it survives switching lists and the other lists can
+   * mark what it ranked. The view bar's search field stays the only search box.
    *
    * A click selects the commit in place, through the same path as the other
    * two lists, and pins it: the details pane stays on it even when a graph
@@ -45,6 +46,7 @@
   import { boundedJoin, tooltipWalkIncomplete } from "../codeintel/walkIncomplete";
   import { formatRelativeTime, formatDate, shortHash } from "../format";
   import EmptyState from "./EmptyState.svelte";
+  import SuspectsQueryBar from "./SuspectsQueryBar.svelte";
 
   const repoPath = $derived($currentRepoPath);
   // Another repository's answer is not this one's: the store drops it on a
@@ -60,6 +62,12 @@
   }
 </script>
 
+<div class="flex min-h-0 flex-1 flex-col">
+<!-- The question's own strip, outside the scroller so it stays in reach before
+     a question is asked and after results are shown. -->
+<div class="flex shrink-0 items-center px-3 pt-2 font-sans">
+  <SuspectsQueryBar />
+</div>
 <div class="flex-1 min-h-0 overflow-auto px-3 py-2 font-sans" aria-label="Regression suspects">
   <div class="flex flex-col gap-2">
     {#if $suspectsQuery.error}
@@ -81,7 +89,7 @@
           icon={Bug}
           title="Which commit broke it?"
           hint={repoPath
-            ? "Name the misbehaving symbol and the last ref it was well at, above. The call graph is walked out from the symptom and the lines it reaches are blamed, so the commits here are ranked by what they touched — not by how recent they are. Any commit's details offer “Find suspects since this commit”."
+            ? "Name the misbehaving symbol and the last ref it was well at in the form above, then rank suspects. The call graph is walked out from the symptom and the lines it reaches are blamed, so the commits here are ranked by what they touched — not by how recent they are. Any commit's details offer “Find suspects since this commit”."
             : "Open a repository to run this query."}
         />
       {/if}
@@ -233,4 +241,5 @@
       {/if}
     {/if}
   </div>
+</div>
 </div>

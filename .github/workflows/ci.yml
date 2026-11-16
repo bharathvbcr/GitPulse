@@ -115,6 +115,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test
 
+      # Run due-date, quick-add, pulse, and commit-cadence suites across
+      # non-UTC DST zones (TZ=America/New_York, TZ=Pacific/Auckland,
+      # TZ=Asia/Kolkata) so local-time gap/overlap handling is verified.
+      - name: Frontend Timezone & DST Tests (Vitest)
+        if: ${{ !cancelled() }}
+        run: bun run test:tz
+
       - name: Svelte Browser Regressions (Chrome)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: bun run test:browser:all

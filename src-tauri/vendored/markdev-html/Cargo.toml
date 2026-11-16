@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Safe HTML rendering of MarkDev's Markdown dialect: browser-ready export, vault sites, and embeddable fragments"
 license = "MIT"
+rust-version = "1.100"
 
 [features]
 default = ["mathml"]

@@ -81,7 +81,11 @@ export function duePartsOf(dueAt: number | null | undefined): { day: DueDay; tim
  *
  * An unreadable or empty clock falls back to the same hour a bare `due:friday`
  * means, so picking a day and never touching the time matches what typing the
- * day would have done.
+ * day would have done. Rejects out-of-month dates (`2026-02-31`) and
+ * nonexistent local times inside a DST spring-forward gap (where `Date` would
+ * silently advance `getHours()`/`getMinutes()`, e.g. `2026-03-08 02:30` in
+ * `America/New_York`) by returning `null`. Ambiguous fall-back overlap times
+ * preserve the chosen local hour/minute and round-trip through `duePartsOf`.
  */
 export function composeDue(day: DueDay, time: unknown): number | null {
   if (!Number.isSafeInteger(day.year) || !Number.isSafeInteger(day.month) || !Number.isSafeInteger(day.day)) return null;
@@ -97,8 +101,17 @@ export function composeDue(day: DueDay, time: unknown): number | null {
   }
   const date = new Date(day.year, day.month, day.day, hour, minute, 0, 0);
   if (!Number.isFinite(date.getTime())) return null;
-  // Reject a day the constructor would roll forward (2026-02-31 → March).
-  if (date.getFullYear() !== day.year || date.getMonth() !== day.month || date.getDate() !== day.day) return null;
+  // Reject a day the constructor would roll forward (2026-02-31 → March) or a
+  // nonexistent local clock inside a DST spring-forward gap (02:30 → 03:30).
+  if (
+    date.getFullYear() !== day.year ||
+    date.getMonth() !== day.month ||
+    date.getDate() !== day.day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute
+  ) {
+    return null;
+  }
   const seconds = Math.floor(date.getTime() / 1000);
   return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : null;
 }

@@ -1,10 +1,11 @@
 use crate::analyzer::deps::severity_rank;
-use crate::engine::git_cli::{
-    capture_command, classify_tool_probe, git_text, run_command_in, validate_repo, CapturedOutput,
-    ToolProbe,
+use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::process::{
+    capture_command, classify_tool_probe, run_command_in, CapturedOutput, RunError, ToolProbe,
 };
 use crate::ipc_error::CommandError;
 pub mod actions;
+pub mod avatars;
 pub mod outcome;
 pub mod pr_worktree;
 use outcome::RunOutcome;
@@ -101,6 +102,17 @@ pub struct IssueInfo {
     pub labels: Vec<String>,
     pub updated_at: String,
     pub author: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueDetail {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -430,7 +442,7 @@ pub fn parse_github_remote_url(url: &str) -> Option<GitHubRepoRef> {
     for (scheme, strip_port) in SCHEMES {
         if lower.starts_with(scheme) {
             let remainder = trim_git_suffix(trimmed[scheme.len()..].trim().trim_end_matches('/'));
-            let remainder = remainder.strip_prefix("git@").unwrap_or(remainder);
+            let remainder = remainder.trim_prefix("git@");
             return split_owner_repo(remainder, strip_port);
         }
     }
@@ -536,18 +548,18 @@ static GH_PROBES: crate::tool_capability::BinaryProbeCache<ToolProbe> =
 /// What `gh --version` says about the GitHub CLI. No working directory, so a
 /// not-found can only mean the program (see [`is_spawn_not_found`]).
 ///
-/// [`is_spawn_not_found`]: crate::engine::git_cli::is_spawn_not_found
+/// [`is_spawn_not_found`]: crate::engine::process::is_spawn_not_found
 pub(crate) fn probe_gh_cli() -> ToolProbe {
     // Every GitHub call asks this first — the live run poll included — and the
     // answer changes only when the `gh` binary does, so it is kept per binary.
     // Only a `Present` answer is kept: a shed or failed probe is asked again.
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let path = crate::engine::git_cli::extended_child_path(
+    let path = crate::engine::process::extended_child_path(
         std::env::var_os("PATH").as_deref(),
         home.as_deref(),
     );
     let program =
-        crate::engine::git_cli::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
+        crate::engine::process::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
     GH_PROBES.get_or_probe(&program, || {
         let probe = classify_tool_probe(
             "gh",
@@ -855,7 +867,7 @@ fn bounded_error(message: String) -> String {
     if message.len() <= MAX_GH_ERROR_BYTES {
         return message;
     }
-    crate::engine::git_cli::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
+    crate::engine::process::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
 }
 
 fn run_gh(
@@ -931,6 +943,175 @@ fn parse_issue_list(stdout: &[u8], display_limit: usize) -> Result<(Vec<IssueInf
         })
         .collect();
     Ok((issues, truncated))
+}
+
+const OUTBOX_MARKER_PREFIX: &str = "<!-- gitpulse-outbox-idempotency: ";
+const OUTBOX_MARKER_SUFFIX: &str = " -->";
+
+/// HTML comment appended when creating an issue via the durable outbox so
+/// crash recovery can relocate an already-created issue by idempotency key.
+pub fn outbox_marker(idempotency_key: &str) -> String {
+    format!(
+        "{OUTBOX_MARKER_PREFIX}{}{OUTBOX_MARKER_SUFFIX}",
+        idempotency_key.trim()
+    )
+}
+
+/// Removes trailing outbox idempotency markers from an issue body so
+/// `work_issue_sync` snapshots compare cleanly against the task's description.
+pub fn strip_outbox_marker(body: &str) -> String {
+    let mut current = body;
+    loop {
+        let trimmed_end = current.trim_end_matches(&[' ', '\t', '\r', '\n'][..]);
+        let Some(start) = trimmed_end.rfind(OUTBOX_MARKER_PREFIX) else {
+            break;
+        };
+        if !trimmed_end.ends_with(OUTBOX_MARKER_SUFFIX) {
+            break;
+        }
+        let inner = &trimmed_end
+            [start + OUTBOX_MARKER_PREFIX.len()..trimmed_end.len() - OUTBOX_MARKER_SUFFIX.len()];
+        if inner.contains("-->") || inner.contains('\n') || inner.contains('\r') {
+            break;
+        }
+        current = trimmed_end[..start].trim_end_matches(&[' ', '\t', '\r', '\n'][..]);
+    }
+    current.to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct GhIssueDetail {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: String,
+    state: String,
+    url: String,
+    #[serde(default)]
+    labels: Vec<GhLabel>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+}
+
+fn issue_view_leading_args(number: &str) -> Vec<&str> {
+    vec![
+        "issue",
+        "view",
+        number,
+        "--json",
+        "number,title,body,state,url,labels,updatedAt",
+    ]
+}
+
+fn issue_search_leading_args(search: &str) -> Vec<&str> {
+    vec![
+        "issue",
+        "list",
+        "--state",
+        "all",
+        "--search",
+        search,
+        "--limit",
+        "5",
+        "--json",
+        "number,title,body,state,url,labels,updatedAt",
+    ]
+}
+
+fn issue_detail_from_gh(issue: GhIssueDetail) -> Result<IssueDetail, String> {
+    let state = match issue.state.trim().to_ascii_lowercase().as_str() {
+        "open" => "open".to_string(),
+        "closed" => "closed".to_string(),
+        other => return Err(format!("GitHub returned unexpected issue state: {other}")),
+    };
+    Ok(IssueDetail {
+        number: issue.number,
+        title: issue.title,
+        body: issue.body,
+        state,
+        url: issue.url,
+        labels: issue
+            .labels
+            .into_iter()
+            .map(|label| label.name.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .collect(),
+        updated_at: issue.updated_at,
+    })
+}
+
+pub fn parse_issue_view(stdout: &[u8]) -> Result<IssueDetail, String> {
+    let issue: GhIssueDetail = serde_json::from_slice(stdout)
+        .map_err(|error| format!("GitHub returned invalid issue detail: {error}"))?;
+    issue_detail_from_gh(issue)
+}
+
+pub fn parse_issue_search(stdout: &[u8]) -> Result<Vec<IssueDetail>, String> {
+    let issues: Vec<GhIssueDetail> = serde_json::from_slice(stdout)
+        .map_err(|error| format!("GitHub returned invalid issue search data: {error}"))?;
+    issues.into_iter().map(issue_detail_from_gh).collect()
+}
+
+pub fn view_issue(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    number: u64,
+) -> Result<IssueDetail, CommandError> {
+    if number == 0 {
+        return Err("Invalid issue number".into());
+    }
+    let repo = validate_repo(repo_path)?;
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason.into());
+    }
+    let number = number.to_string();
+    let stdout = run_gh(
+        remote,
+        &issue_view_leading_args(&number),
+        Duration::from_secs(45),
+        Some(&repo),
+    )?;
+    parse_issue_view(&stdout).map_err(CommandError::from)
+}
+
+pub fn find_issue_by_marker(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    idempotency_key: &str,
+) -> Result<Option<IssueDetail>, CommandError> {
+    validate_outbox_idempotency_key(idempotency_key).map_err(CommandError::from)?;
+    let repo = validate_repo(repo_path)?;
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason.into());
+    }
+    let marker = outbox_marker(idempotency_key);
+    let query = format!("\"{marker}\" in:body");
+    let stdout = run_gh(
+        remote,
+        &issue_search_leading_args(&query),
+        Duration::from_secs(45),
+        Some(&repo),
+    )?;
+    let candidates = parse_issue_search(&stdout).map_err(CommandError::from)?;
+    Ok(candidates
+        .into_iter()
+        .find(|issue| issue.body.contains(&marker)))
+}
+
+fn validate_outbox_idempotency_key(key: &str) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err("Outbox idempotency key must be 1 to 128 characters".into());
+    }
+    if trimmed.contains("-->")
+        || trimmed.contains('"')
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
+    {
+        return Err("Outbox idempotency key contains unsupported characters".into());
+    }
+    Ok(())
 }
 
 /// Display cap for the open-PR list. One extra row is fetched so a capped
@@ -1528,6 +1709,35 @@ fn capture_gh_api(
 ) -> Result<CapturedOutput, CommandError> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
     args.extend(api_host_flags(remote));
+    capture_gh_args(&args, timeout)
+}
+
+/// Argv of a read-only `gh api graphql` call for this remote. Variables go in
+/// as `-f` (raw strings), never `-F`, which reads `@file` and guesses types.
+pub(crate) fn gh_graphql_args(remote: &GitHubRepoRef, query: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["api".to_string(), "graphql".to_string()];
+    for (key, value) in [
+        ("owner", remote.owner.as_str()),
+        ("name", remote.name.as_str()),
+        ("query", query),
+    ] {
+        args.push("-f".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.extend(api_host_flags(remote));
+    args
+}
+
+/// Runs one read-only `gh api graphql` call pinned to this remote's host.
+fn capture_gh_graphql(
+    remote: &GitHubRepoRef,
+    query: &str,
+    timeout: Duration,
+) -> Result<CapturedOutput, CommandError> {
+    capture_gh_args(&gh_graphql_args(remote, query), timeout)
+}
+
+fn capture_gh_args(args: &[String], timeout: Duration) -> Result<CapturedOutput, CommandError> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     capture_command("gh", &refs, None, timeout, &[])
 }
@@ -2029,6 +2239,33 @@ fn validate_gh_body(subject: &str, body: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_issue_label(label: &str) -> Result<Option<String>, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Ok(None);
+    }
+    // A leading '-' makes the label option-shaped: interpolated as
+    // `gh issue create … --label <label>`, some CLI parsers read
+    // "-inbox" (or worse, "-oProxyCommand=…") as flags rather than as
+    // the label's value. Labels are names on GitHub anyway — none begin
+    // with '-' — so refuse instead of hoping every parser quotes well.
+    if label.starts_with('-') {
+        return Err(format!("Issue label '{label}' must not start with '-'"));
+    }
+    if label.chars().count() > 128 {
+        return Err("Issue label exceeds the 128 character limit".into());
+    }
+    if label
+        .chars()
+        .any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
+    {
+        return Err(format!(
+            "Issue label '{label}' must not contain control or bidirectional override characters"
+        ));
+    }
+    Ok(Some(label.to_string()))
+}
+
 pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Result<(), String> {
     validate_gh_title("Issue", title)?;
     validate_gh_body("Issue", body)?;
@@ -2036,29 +2273,7 @@ pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Res
         return Err("At most 10 issue labels may be supplied".into());
     }
     for label in labels {
-        let label = label.trim();
-        if label.is_empty() {
-            continue;
-        }
-        // A leading '-' makes the label option-shaped: interpolated as
-        // `gh issue create … --label <label>`, some CLI parsers read
-        // "-inbox" (or worse, "-oProxyCommand=…") as flags rather than as
-        // the label's value. Labels are names on GitHub anyway — none begin
-        // with '-' — so refuse instead of hoping every parser quotes well.
-        if label.starts_with('-') {
-            return Err(format!("Issue label '{label}' must not start with '-'"));
-        }
-        if label.chars().count() > 128 {
-            return Err("Issue label exceeds the 128 character limit".into());
-        }
-        if label
-            .chars()
-            .any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
-        {
-            return Err(format!(
-                "Issue label '{label}' must not contain control or bidirectional override characters"
-            ));
-        }
+        validate_issue_label(label)?;
     }
     Ok(())
 }
@@ -2110,6 +2325,410 @@ pub fn create_issue(
     let stdout = run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo))
         .map_err(|e| e.wrap(|e| bounded_error(e.to_string())))?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhMutationOutcome {
+    Applied(IssueDetail),
+    DefinitiveFailure { message: String, retryable: bool },
+    Uncertain { message: String },
+}
+
+fn parse_issue_number_from_url(output: &str) -> Option<u64> {
+    for token in output.split_whitespace().rev() {
+        let trimmed = token.trim_end_matches(&['/', '.', ','][..]);
+        if let Some((_, tail)) = trimmed.rsplit_once("/issues/") {
+            if let Ok(number) = tail.parse::<u64>() {
+                if number > 0 {
+                    return Some(number);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn classify_gh_mutation_error(err: &CommandError) -> GhMutationOutcome {
+    let message = bounded_error(err.message().to_string());
+    if err.origin() == Some(crate::ipc_error::IpcErrorKind::DeferredUnderLoad) {
+        return GhMutationOutcome::DefinitiveFailure {
+            message,
+            retryable: true,
+        };
+    }
+    match RunError::classify(err.message()) {
+        RunError::Timeout => GhMutationOutcome::Uncertain { message },
+        RunError::Deferred | RunError::SlotWaitTimeout => GhMutationOutcome::DefinitiveFailure {
+            message,
+            retryable: true,
+        },
+        RunError::SpawnNotFound | RunError::SpawnFailed => GhMutationOutcome::DefinitiveFailure {
+            message,
+            retryable: false,
+        },
+        RunError::Other => {
+            let unavailable = classify_github_unavailable(true, true, Some(err.message()));
+            match unavailable {
+                GithubUnavailableReason::RateLimited => GhMutationOutcome::DefinitiveFailure {
+                    message,
+                    retryable: true,
+                },
+                GithubUnavailableReason::Forbidden
+                | GithubUnavailableReason::ProductDisabled
+                | GithubUnavailableReason::NotGithubRemote
+                | GithubUnavailableReason::CliMissing => GhMutationOutcome::DefinitiveFailure {
+                    message,
+                    retryable: false,
+                },
+                GithubUnavailableReason::Transport | GithubUnavailableReason::Unknown => {
+                    let lower = err.message().to_ascii_lowercase();
+                    let status = http_status_from_gh_text(err.message());
+                    if status == Some(429)
+                        || is_rate_limit_message(err.message())
+                        || lower.contains("secondary rate")
+                    {
+                        return GhMutationOutcome::DefinitiveFailure {
+                            message,
+                            retryable: true,
+                        };
+                    }
+                    if matches!(status, Some(400 | 401 | 403 | 404 | 422))
+                        || lower.contains("validation failed")
+                        || lower.contains("not found")
+                        || lower.contains("could not resolve")
+                        || lower.contains("unknown label")
+                        || lower.contains("must not ")
+                        || lower.contains("exceeds the ")
+                    {
+                        return GhMutationOutcome::DefinitiveFailure {
+                            message,
+                            retryable: false,
+                        };
+                    }
+                    GhMutationOutcome::Uncertain { message }
+                }
+            }
+        }
+    }
+}
+
+pub fn issue_edit_argv(
+    remote: &GitHubRepoRef,
+    number: u64,
+    title: Option<&str>,
+    body: Option<&str>,
+    add_labels: &[String],
+    remove_labels: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "gh".to_string(),
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+    ];
+    if let Some(title) = title {
+        args.push("--title".to_string());
+        args.push(title.trim().to_string());
+    }
+    if let Some(body) = body {
+        args.push("--body".to_string());
+        args.push(body.to_string());
+    }
+    for label in add_labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        args.push("--add-label".to_string());
+        args.push(label.to_string());
+    }
+    for label in remove_labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+    {
+        args.push("--remove-label".to_string());
+        args.push(label.to_string());
+    }
+    args.extend(gh_repo_flags(remote));
+    args
+}
+
+pub fn issue_state_argv(remote: &GitHubRepoRef, number: u64, state: &str) -> Option<Vec<String>> {
+    let sub = match state {
+        "closed" => "close",
+        "open" => "reopen",
+        _ => return None,
+    };
+    let mut args = vec![
+        "gh".to_string(),
+        "issue".to_string(),
+        sub.to_string(),
+        number.to_string(),
+    ];
+    args.extend(gh_repo_flags(remote));
+    Some(args)
+}
+
+/// What an outbox create or update writes to an issue, borrowed from the
+/// outbox entry's payload. One value carries the four fields from the entry
+/// through the transport to `gh`, so they cannot be passed out of order.
+#[derive(Debug, Clone, Copy)]
+pub struct IssueContent<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub state: &'a str,
+    pub labels: &'a [String],
+}
+
+pub fn execute_outbox_create_issue(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    content: IssueContent<'_>,
+    idempotency_key: &str,
+) -> GhMutationOutcome {
+    let IssueContent {
+        title,
+        body,
+        state,
+        labels,
+    } = content;
+    if !matches!(state, "open" | "closed") {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: format!("Issue state must be open or closed (got {state})"),
+            retryable: false,
+        };
+    }
+    if let Err(err) = validate_outbox_idempotency_key(idempotency_key) {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: err,
+            retryable: false,
+        };
+    }
+    let marker = outbox_marker(idempotency_key);
+    let marked_body = if body.is_empty() {
+        marker.clone()
+    } else {
+        format!("{body}\n\n{marker}")
+    };
+    if let Err(err) = validate_issue_payload(title, &marked_body, labels) {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: err,
+            retryable: false,
+        };
+    }
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            return GhMutationOutcome::DefinitiveFailure {
+                message: err.into_message(),
+                retryable: false,
+            }
+        }
+    };
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: reason,
+            retryable: false,
+        };
+    }
+
+    let created = match create_issue(repo_path, remote, title, &marked_body, labels) {
+        Ok(out) => out,
+        Err(err) => return classify_gh_mutation_error(&err),
+    };
+    let number = match parse_issue_number_from_url(&created) {
+        Some(n) => n,
+        None => match find_issue_by_marker(repo_path, remote, idempotency_key) {
+            Ok(Some(found)) => found.number,
+            _ => {
+                return GhMutationOutcome::Uncertain {
+                    message: format!(
+                        "gh issue create did not report an issue URL and marker lookup was inconclusive: {}",
+                        bounded_error(created)
+                    ),
+                }
+            }
+        },
+    };
+    if state == "closed" {
+        if let Some(close_args) = issue_state_argv(remote, number, "closed") {
+            let refs: Vec<&str> = close_args.iter().skip(1).map(String::as_str).collect();
+            if let Err(err) = run_command_in("gh", &refs, Duration::from_secs(45), Some(&repo)) {
+                return GhMutationOutcome::Uncertain {
+                    message: format!(
+                        "Issue #{number} was created, but closing it failed: {}",
+                        bounded_error(err.message().to_string())
+                    ),
+                };
+            }
+        }
+    }
+    match view_issue(repo_path, remote, number) {
+        Ok(detail) => GhMutationOutcome::Applied(detail),
+        Err(err) => GhMutationOutcome::Uncertain {
+            message: format!(
+                "Issue #{number} was created, but reading its final state failed: {}",
+                bounded_error(err.message().to_string())
+            ),
+        },
+    }
+}
+
+pub fn execute_outbox_update_issue(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    number: u64,
+    fields: &[String],
+    content: IssueContent<'_>,
+    current_remote: Option<&IssueDetail>,
+) -> GhMutationOutcome {
+    let IssueContent {
+        title,
+        body,
+        state,
+        labels,
+    } = content;
+    if number == 0 {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: "Invalid issue number".into(),
+            retryable: false,
+        };
+    }
+    let want_title = fields.iter().any(|f| f == "title");
+    let want_body = fields.iter().any(|f| f == "body");
+    let want_state = fields.iter().any(|f| f == "state");
+    let want_labels = fields.iter().any(|f| f == "labels");
+    if want_title {
+        if let Err(err) = validate_gh_title("Issue", title) {
+            return GhMutationOutcome::DefinitiveFailure {
+                message: err,
+                retryable: false,
+            };
+        }
+    }
+    if want_body {
+        if let Err(err) = validate_gh_body("Issue", body) {
+            return GhMutationOutcome::DefinitiveFailure {
+                message: err,
+                retryable: false,
+            };
+        }
+    }
+    if want_state && !matches!(state, "open" | "closed") {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: format!("Issue state must be open or closed (got {state})"),
+            retryable: false,
+        };
+    }
+    let mut normalized_labels = Vec::new();
+    if want_labels {
+        if labels.len() > 10 {
+            return GhMutationOutcome::DefinitiveFailure {
+                message: "At most 10 issue labels may be supplied".into(),
+                retryable: false,
+            };
+        }
+        for raw in labels {
+            match validate_issue_label(raw) {
+                Ok(Some(clean)) => {
+                    if !normalized_labels.contains(&clean) {
+                        normalized_labels.push(clean);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return GhMutationOutcome::DefinitiveFailure {
+                        message: err,
+                        retryable: false,
+                    }
+                }
+            }
+        }
+    }
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            return GhMutationOutcome::DefinitiveFailure {
+                message: err.into_message(),
+                retryable: false,
+            }
+        }
+    };
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return GhMutationOutcome::DefinitiveFailure {
+            message: reason,
+            retryable: false,
+        };
+    }
+
+    let fetched_remote = if (want_labels || want_state) && current_remote.is_none() {
+        match view_issue(repo_path, remote, number) {
+            Ok(detail) => Some(detail),
+            Err(err) => return classify_gh_mutation_error(&err),
+        }
+    } else {
+        None
+    };
+    let remote_detail = current_remote.or(fetched_remote.as_ref());
+
+    let (add_labels, remove_labels) = if want_labels {
+        let existing = remote_detail
+            .map(|detail| detail.labels.clone())
+            .unwrap_or_default();
+        let add: Vec<String> = normalized_labels
+            .iter()
+            .filter(|label| !existing.contains(label))
+            .cloned()
+            .collect();
+        let remove: Vec<String> = existing
+            .into_iter()
+            .filter(|label| !normalized_labels.contains(label))
+            .collect();
+        (add, remove)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    if want_title || want_body || !add_labels.is_empty() || !remove_labels.is_empty() {
+        let edit_args = issue_edit_argv(
+            remote,
+            number,
+            want_title.then_some(title),
+            want_body.then_some(body),
+            &add_labels,
+            &remove_labels,
+        );
+        let refs: Vec<&str> = edit_args.iter().skip(1).map(String::as_str).collect();
+        if let Err(err) = run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)) {
+            return classify_gh_mutation_error(&err);
+        }
+    }
+
+    if want_state {
+        let needs_state_change = remote_detail
+            .map(|detail| detail.state != state)
+            .unwrap_or(true);
+        if needs_state_change {
+            if let Some(state_args) = issue_state_argv(remote, number, state) {
+                let refs: Vec<&str> = state_args.iter().skip(1).map(String::as_str).collect();
+                if let Err(err) = run_command_in("gh", &refs, Duration::from_secs(45), Some(&repo))
+                {
+                    return classify_gh_mutation_error(&err);
+                }
+            }
+        }
+    }
+
+    match view_issue(repo_path, remote, number) {
+        Ok(detail) => GhMutationOutcome::Applied(detail),
+        Err(err) => GhMutationOutcome::Uncertain {
+            message: format!(
+                "Issue #{number} update ran, but reading its final state failed: {}",
+                bounded_error(err.message().to_string())
+            ),
+        },
+    }
 }
 
 /// One pull request in detail, from `gh pr view`: what a reader needs before
@@ -2989,7 +3608,7 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         // Only `gh --version` is refused; the remote is still read.
         let (runs, context, dependabot, scanning, workflows) =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || {
+            crate::engine::process::with_forced_spawn_failure_of("--version", || {
                 (
                     load_workflow_runs_report(path),
                     load_github_context(path),
@@ -4862,7 +5481,7 @@ mod tests {
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         GH_PROBES.clear();
         let probes = || {
-            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (_, labels) = crate::engine::process::spawn_labels_during(|| {
                 for _ in 0..5 {
                     assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
                 }
@@ -4897,7 +5516,7 @@ mod tests {
         // Another test's probe, as it would leave the cache.
         assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
         let refused =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", probe_gh_cli);
+            crate::engine::process::with_forced_spawn_failure_of("--version", probe_gh_cli);
         assert!(
             matches!(refused, ToolProbe::NotRun(_)),
             "a refused `gh --version` was answered from the cache: {refused:?}"
@@ -5283,5 +5902,242 @@ mod non_ascii_tail_tests {
             let _ = parse_github_remote_url(&url);
             let _ = pick_github_remote(&format!("origin\t{url} (fetch)\n{tail}"));
         }
+    }
+
+    #[test]
+    fn parse_issue_view_normalizes_state_and_preserves_fields() {
+        let json = br#"{
+            "number": 42,
+            "title": "Sync queue",
+            "body": "Body text\n\n<!-- gitpulse-outbox-idempotency: key-1 -->",
+            "state": "OPEN",
+            "url": "https://github.com/acme/repo/issues/42",
+            "labels": [{"name": "bug"}, {"name": "  "}, {"name": "ui"}],
+            "updatedAt": "2026-11-14T00:00:00Z"
+        }"#;
+        let detail = parse_issue_view(json).expect("issue view parses");
+        assert_eq!(detail.number, 42);
+        assert_eq!(detail.state, "open");
+        assert_eq!(detail.labels, vec!["bug", "ui"]);
+        assert_eq!(strip_outbox_marker(&detail.body), "Body text");
+        assert!(outbox_marker("key-1").contains("gitpulse-outbox-idempotency: key-1"));
+    }
+
+    #[test]
+    fn issue_edit_and_state_argv_render_flags_safely() {
+        let remote = GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "repo".into(),
+        };
+        let args = issue_edit_argv(
+            &remote,
+            19,
+            Some("  Updated  "),
+            Some("New body"),
+            &["p1".into()],
+            &["old".into()],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "gh",
+                "issue",
+                "edit",
+                "19",
+                "--title",
+                "Updated",
+                "--body",
+                "New body",
+                "--add-label",
+                "p1",
+                "--remove-label",
+                "old",
+                "--repo",
+                "acme/repo",
+            ]
+        );
+        assert_eq!(
+            issue_state_argv(&remote, 19, "closed").unwrap(),
+            vec!["gh", "issue", "close", "19", "--repo", "acme/repo"]
+        );
+        assert_eq!(
+            issue_state_argv(&remote, 19, "open").unwrap(),
+            vec!["gh", "issue", "reopen", "19", "--repo", "acme/repo"]
+        );
+        assert!(issue_state_argv(&remote, 19, "invalid").is_none());
+    }
+
+    #[test]
+    fn outbox_issue_executors_validate_inputs_before_spawning() {
+        let remote = GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "repo".into(),
+        };
+        assert_eq!(
+            parse_issue_number_from_url("creating...\nhttps://github.com/acme/repo/issues/314\n"),
+            Some(314)
+        );
+        let bad_state = execute_outbox_create_issue(
+            "/nonexistent",
+            &remote,
+            IssueContent {
+                title: "Title",
+                body: "Body",
+                state: "bogus",
+                labels: &[],
+            },
+            "k1",
+        );
+        assert!(matches!(
+            bad_state,
+            GhMutationOutcome::DefinitiveFailure {
+                retryable: false,
+                ..
+            }
+        ));
+        let bad_label = execute_outbox_update_issue(
+            "/nonexistent",
+            &remote,
+            12,
+            &["labels".into()],
+            IssueContent {
+                title: "Title",
+                body: "Body",
+                state: "open",
+                labels: &["-evil".into()],
+            },
+            None,
+        );
+        assert!(matches!(
+            bad_label,
+            GhMutationOutcome::DefinitiveFailure {
+                retryable: false,
+                ..
+            }
+        ));
+        let timeout_err = CommandError::plain("gh issue create timed out after 90s");
+        assert!(matches!(
+            classify_gh_mutation_error(&timeout_err),
+            GhMutationOutcome::Uncertain { .. }
+        ));
+        let rate_err = CommandError::plain("HTTP 429 API rate limit exceeded");
+        assert!(matches!(
+            classify_gh_mutation_error(&rate_err),
+            GhMutationOutcome::DefinitiveFailure {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_issue_by_marker_and_update_use_view_and_edit() {
+        use std::os::unix::fs::PermissionsExt;
+        let serial = crate::harness::sidecar::test_serial();
+        let fixture = tempfile::TempDir::new().unwrap();
+        let log = fixture.path().join("gh.log");
+        let marker = outbox_marker("idem-99");
+        let issue_json = serde_json::json!({
+            "number": 77,
+            "title": "From outbox",
+            "body": format!("Details\n\n{marker}"),
+            "state": "OPEN",
+            "url": "https://github.com/acme/repo/issues/77",
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-11-14T00:00:00Z"
+        });
+        let issue_list_json = serde_json::json!([issue_json]).to_string();
+        let issue_view_json = serde_json::json!({
+            "number": 77,
+            "title": "Renamed",
+            "body": "Updated body",
+            "state": "CLOSED",
+            "url": "https://github.com/acme/repo/issues/77",
+            "labels": [{"name": "ops"}],
+            "updatedAt": "2026-11-14T00:05:00Z"
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{log}'\n\
+             case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac\n\
+             case \"$1 $2\" in\n\
+               \"issue list\") printf '%s' '{list}'; exit 0;;\n\
+               \"issue view\") printf '%s' '{view}'; exit 0;;\n\
+               \"issue edit\"|\"issue close\"|\"issue reopen\") exit 0;;\n\
+             esac\n\
+             exit 1\n",
+            log = log.display(),
+            list = issue_list_json.replace('\'', "'\\''"),
+            view = issue_view_json.replace('\'', "'\\''"),
+        );
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = crate::test_support::git_repo();
+        let remote = GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "repo".into(),
+        };
+
+        let found = find_issue_by_marker(repo.path().to_str().unwrap(), &remote, "idem-99")
+            .unwrap()
+            .expect("marker match");
+        assert_eq!(found.number, 77);
+        assert_eq!(strip_outbox_marker(&found.body), "Details");
+
+        let current = IssueDetail {
+            number: 77,
+            title: "From outbox".into(),
+            body: "Details".into(),
+            state: "open".into(),
+            url: "https://github.com/acme/repo/issues/77".into(),
+            labels: vec!["bug".into()],
+            updated_at: "2026-11-14T00:00:00Z".into(),
+        };
+        let outcome = execute_outbox_update_issue(
+            repo.path().to_str().unwrap(),
+            &remote,
+            77,
+            &[
+                "title".into(),
+                "body".into(),
+                "state".into(),
+                "labels".into(),
+            ],
+            IssueContent {
+                title: "Renamed",
+                body: "Updated body",
+                state: "closed",
+                labels: &["ops".into()],
+            },
+            Some(&current),
+        );
+        match outcome {
+            GhMutationOutcome::Applied(updated) => {
+                assert_eq!(updated.state, "closed");
+                assert_eq!(updated.labels, vec!["ops"]);
+            }
+            other => panic!("expected Applied outcome, got {other:?}"),
+        }
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged
+            .lines()
+            .any(|l| l.starts_with("issue list --state all --search")));
+        assert!(logged.lines().any(|l| l.contains("issue edit 77")
+            && l.contains("--add-label ops")
+            && l.contains("--remove-label bug")));
+        assert!(logged
+            .lines()
+            .any(|l| l.starts_with("issue close 77 --repo acme/repo")));
     }
 }

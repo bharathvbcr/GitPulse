@@ -1156,7 +1156,7 @@ fn signal_spec(spec: &str) -> Option<bool> {
         return Some(spec.bytes().all(|b| b == b'0'));
     }
     let upper = spec.to_ascii_uppercase();
-    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let name = upper.trim_prefix("SIG");
     (SIGNALS.contains(&name) && name != "EXIT").then_some(false)
 }
 
@@ -1536,7 +1536,7 @@ fn var_refs(src: &str) -> Vec<String> {
     while i < chars.len() {
         match chars[i] {
             '\'' => {
-                single = !single;
+                single.toggle();
                 i += 1;
             }
             '\\' => i += 2,
@@ -3469,7 +3469,7 @@ fn gnu_options(
 fn procps_signal(spec: &str) -> Option<bool> {
     const SIGRTMIN: u64 = 34;
     let upper = spec.to_ascii_uppercase();
-    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let name = upper.trim_prefix("SIG");
     if matches!(name, "EXIT" | "NULL") {
         return Some(true);
     }
@@ -3483,7 +3483,7 @@ fn procps_signal(spec: &str) -> Option<bool> {
     let digits = digits.trim_start();
     let (negative, digits) = match digits.strip_prefix('-') {
         Some(rest) => (true, rest),
-        None => (false, digits.strip_prefix('+').unwrap_or(digits)),
+        None => (false, digits.trim_prefix('+')),
     };
     if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;

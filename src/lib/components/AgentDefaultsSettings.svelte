@@ -87,7 +87,7 @@
 </script>
 
 <div data-setting="agent-defaults">
-  <div class="text-textMuted text-micro mb-1.5">Agent launch defaults</div>
+  <h3 class="gp-label mb-1.5">Agent launch defaults</h3>
   <p class="text-textMuted text-micro leading-snug mb-2">
     How much a coding agent may do when you start it from a terminal tab. Applies to new
     sessions; a task handed to an agent keeps the permission mode chosen for that task.

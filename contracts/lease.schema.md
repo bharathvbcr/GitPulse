@@ -235,7 +235,7 @@ parts (an empty array is "nothing to propose") and optional `rationale` and
 `fields` (the parts to apply) and, when `split_into` is selected, `split_ids`:
 one new, never-used task identifier per proposed split. It adds and never
 removes: criteria are appended, `duplicate_of` links are merged into the
-task's `links`, and each split becomes a new `inbox` task in the same
+task's `links`, and each split becomes a new `backlog` task in the same
 repositories carrying a `parent` link to the refined task. The task changes in
 one revisioned update (`applied_task_revision`), a stale task revision is
 `revision_conflict`, a changed field the proposal was drafted from is

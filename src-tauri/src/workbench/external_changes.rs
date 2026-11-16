@@ -30,6 +30,7 @@
 #[doc(hidden)]
 pub mod bench_seam;
 
+use super::store_probe::{ChangeProbe, FileId};
 use super::WorkbenchState;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,7 +317,7 @@ impl Env for Live {
 /// One read-only observer of the profile's commit counter.
 #[derive(Default)]
 pub(crate) struct Watcher {
-    connection: Option<(rusqlite::Connection, Option<(u64, u64)>)>,
+    connection: Option<ChangeProbe>,
     last: Option<i64>,
     /// What the files looked like when `last` was read, and when that was.
     seen: Option<(Fingerprint, SystemTime)>,
@@ -377,17 +378,16 @@ impl Watcher {
             }
             Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
         };
-        let identity = file_identity(&meta);
+        let identity = FileId::of_metadata(&meta);
         let replaced = self
             .connection
             .as_ref()
-            .is_some_and(|(_, held)| held.is_some() && *held != identity);
+            .is_some_and(|probe| probe.opened_as().replaced_by(&identity));
         if replaced {
             self.connection = None;
         }
         if self.connection.is_none() {
-            let connection = open(path)?;
-            self.connection = Some((connection, identity));
+            self.connection = Some(open(path)?);
             self.last = None;
             self.seen = None;
         }
@@ -397,14 +397,14 @@ impl Watcher {
                 return Ok(false);
             }
         }
-        let (connection, _) = self.connection.as_ref().expect("connection just ensured");
+        let probe = self.connection.as_ref().expect("connection just ensured");
         self.reads += 1;
-        let version: i64 = match connection.query_row("PRAGMA data_version", [], |row| row.get(0)) {
+        let version = match probe.data_version() {
             Ok(version) => version,
             Err(error) => {
                 self.connection = None;
                 self.seen = None;
-                return Err(format!("cannot read the profile's change counter: {error}"));
+                return Err(error);
             }
         };
         let changed = replaced || self.last.is_some_and(|last| last != version);
@@ -421,30 +421,14 @@ fn wal_of(path: &Path) -> std::path::PathBuf {
     name.into()
 }
 
-fn open(path: &Path) -> Result<rusqlite::Connection, String> {
+fn open(path: &Path) -> Result<ChangeProbe, String> {
     use rusqlite::OpenFlags;
     // No SQLITE_OPEN_CREATE: launching the app must not create a profile.
-    let connection = rusqlite::Connection::open_with_flags(
+    ChangeProbe::open(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        Duration::from_millis(250),
     )
-    .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    connection
-        .busy_timeout(Duration::from_millis(250))
-        .map_err(|e| format!("cannot configure the change watcher: {e}"))?;
-    Ok(connection)
-}
-
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    // Windows cannot delete a database another connection holds open.
-    None
 }
 
 #[cfg(test)]

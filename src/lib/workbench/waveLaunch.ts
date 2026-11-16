@@ -33,6 +33,7 @@
 import { MergeTeardownFailure } from "../branches/mergeTeardown";
 import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
 import { formatError } from "../ui/formatError";
+import type { ReadinessCheck } from "./readiness";
 
 export const DEFAULT_WAVE_SIZE = 3;
 export const MAX_WAVE_SIZE = 5;
@@ -160,6 +161,8 @@ export interface WaveDeps {
    * collision; `unreadable` and `partial` say what the claim store could not give.
    */
   heldPaths?(signal: AbortSignal): Promise<HeldRead>;
+  /** DAG dependency readiness by task id (`items.readiness`). Fail-closed when provided. */
+  readiness?(ids: readonly string[], signal: AbortSignal): Promise<ReadonlyMap<string, ReadinessCheck>>;
   now(): number;
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   id(): string;
@@ -237,7 +240,7 @@ export interface BatchPlan {
  * reason to leave it out. Whether a claim from another run or batch should hold
  * a candidate back is an owner decision, and until it is made nothing does.
  */
-export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions(), held: readonly Held[] = []): BatchPlan {
+export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<string, readonly string[]>, n: number, excluded: ReadonlySet<string>, options: PathIdentityOptions = hostOptions(), held: readonly Held[] = [], readiness?: ReadonlyMap<string, ReadinessCheck>): BatchPlan {
   const chosen: Candidate[] = [], skipped: BatchPlan["skipped"] = [], notices: BatchPlan["notices"] = [];
   // A scope with any entry that cannot be read is an unknown scope, which runs alone.
   const known = (id: string) => {
@@ -247,6 +250,19 @@ export function planBatch(candidates: readonly Candidate[], scopes: ReadonlyMap<
   for (const candidate of candidates) {
     if (chosen.length >= n) break;
     if (excluded.has(candidate.id) || chosen.some((c) => c.id === candidate.id)) continue;
+    if (readiness) {
+      const check = readiness.get(candidate.id);
+      if (!check || !check.ok) {
+        const detail = check ? check.error : "no readiness entry returned";
+        skipped.push({ id: candidate.id, title: candidate.title, reason: `readiness couldn't be checked (${detail})` });
+        continue;
+      }
+      if (!check.readiness.ready) {
+        const blockers = check.readiness.blocked_by.map((b) => `"${b.title || b.id}" (${b.id})`).join(", ");
+        skipped.push({ id: candidate.id, title: candidate.title, reason: blockers ? `blocked by ${blockers}` : "blocked by open task dependencies" });
+        continue;
+      }
+    }
     const mine = known(candidate.id);
     const clash = chosen.find((other) => {
       const theirs = known(other.id);
@@ -388,9 +404,11 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     const excluded = new Set(record.attempted);
     const open = ranked.filter((c) => !excluded.has(c.id));
     if (open.length === 0) { await save({ state: "done", note: "No further task is ready to start." }); return false; }
-    const scopes = await deps.scopes(open.map((c) => c.id), abort.signal);
+    const openIds = open.map((c) => c.id);
+    const scopes = await deps.scopes(openIds, abort.signal);
+    const readiness = deps.readiness ? await deps.readiness(openIds, abort.signal) : undefined;
     const claimed = deps.heldPaths ? await deps.heldPaths(abort.signal) : { held: [] };
-    const plan = planBatch(open, scopes, record.n, excluded, hostOptions(), claimed.held);
+    const plan = planBatch(open, scopes, record.n, excluded, hostOptions(), claimed.held, readiness);
     const members = plan.chosen.map((c) => member(c, deps));
     const base = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
     const extras = [
@@ -399,6 +417,10 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       claimed.partial ? `File claims were read in part (${claimed.partial}).` : "",
     ].filter(Boolean).join(" ");
     const note = extras ? (base ? `${base.trimEnd()} ${extras}` : extras) : base;
+    if (plan.chosen.length === 0) {
+      await save({ state: "done", note: note || "No further task is ready to start." });
+      return false;
+    }
     await save({
       batch: record.batch + 1, batchesLeft: record.batchesLeft - 1, members, note,
       attempted: [...record.attempted, ...members.map((m) => m.taskId)].slice(-MAX_ATTEMPTED),

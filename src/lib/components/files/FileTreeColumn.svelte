@@ -17,8 +17,11 @@
   let {
     children,
     reserve = FILE_TREE_MIN_WIDTH,
+    class: className = "",
   }: {
     children: Snippet;
+    /** Classes for the column's host; the caller decides whether it floats. */
+    class?: string;
     /**
      * Pixels the rest of this row must keep. Explorer passes the editor
      * minimum (and the dashboard, when it is open); Blame renders in that
@@ -132,7 +135,7 @@
 <div
   {@attach watchRow}
   data-file-tree-column
-  class="relative h-full shrink-0 overflow-hidden"
+  class="relative shrink-0 overflow-hidden {className}"
   style="width: {displayed}px; min-width: {FILE_TREE_MIN_WIDTH}px; max-width: 50%"
 >
   {@render children()}

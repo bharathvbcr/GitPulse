@@ -90,7 +90,6 @@
   await settle();
 
   const pane = () => $("#pane");
-  const row = () => $("#row");
   const sidebar = () => $("aside.gp-sidebar");
   const panel = () => $("[data-sidebar-panel]");
   const rail = () => $("[data-sidebar-rail-slot]");
@@ -207,6 +206,9 @@
       return sidebar().getAnimations().length === 0 && layout.length === 0;
     });
     check("the pane reflowed wider and the list still draws full rows", () => width(pane()) > startWidth && full());
+    // The workspace beside the 44 px rail, gutters included: an open overlay
+    // panel must leave it exactly this wide.
+    const railPaneWidth = width(pane());
     clickBtn('button[aria-label="Expand sidebar"]');
     await tick();
     const expand = await traceToggle();
@@ -223,7 +225,7 @@
     check("the mode toggle persists overlay", () => get(panelModes).sidebar === "overlay");
     check("overlay keeps a 44 px rail in the column and floats the panel", () => !!rail() && Math.round(width(rail())) === 44 && !!panel());
     const overlayPaneWidth = width(pane());
-    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - (width(row()) - 44)) < 2);
+    check("the workspace does not reflow for an open overlay panel", () => Math.abs(overlayPaneWidth - railPaneWidth) < 2);
     check("the panel floats over the workspace and wins the hit test", () => {
       const p = panel().getBoundingClientRect();
       const hit = document.elementFromPoint(p.left + p.width / 2, p.top + p.height / 2);
@@ -443,7 +445,8 @@
     const list = () => panel().querySelector(".will-change-scroll.overflow-y-auto");
     const remPx = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
     const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
-    const downCue = (scroller) => [...scroller.parentElement.children].map((c) => c !== scroller && c.querySelector('button[aria-label="Scroll down"]')).find(Boolean) || null;
+    // `^=`: the body's cue names what it scrolls to ("Scroll down to Worktrees").
+    const downCue = (scroller) => [...scroller.parentElement.children].map((c) => c !== scroller && c.querySelector('button[aria-label^="Scroll down"]')).find(Boolean) || null;
     check("the sidebar body overflows the shell", () => body().scrollHeight > body().clientHeight + 100);
     check("the branch list scrolls inside it", () => !!list() && list().scrollHeight > list().clientHeight + 20);
     body().scrollTop = 0;
@@ -454,16 +457,50 @@
       // Where the resolved mask stops being fully transparent, in px from the
       // edge; a transparent stop with no length (the generic fade) clears 0.
       const clear = parseFloat(/(?:transparent|rgba\(0, ?0, ?0, ?0\))\s+(-?\d+(?:\.\d+)?)px/.exec(maskOf(scroller))?.[1] ?? "0");
-      check(`the ${name}'s fade clears the cue band entirely (${Math.round(clear)} px of ${Math.round(band)} px)`, () => Number.isFinite(clear) && clear >= band - 0.5);
-      // The list yields its chevron to the body's while their edges touch, so a
-      // chevron is judged only where it is drawn.
+      // A scroller clears the band only where its own chevron is drawn. The
+      // list yields its chevron to the body's cue just below it, and there it
+      // only ramps: a cleared band with no chevron in it hid list rows for
+      // nothing.
       const btn = downCue(scroller);
       if (btn) {
+        check(`the ${name}'s fade clears the cue band entirely (${Math.round(clear)} px of ${Math.round(band)} px)`, () => Number.isFinite(clear) && clear >= band - 0.5);
         const depth = scroller.getBoundingClientRect().bottom - btn.getBoundingClientRect().top;
         check(`and the ${name}'s chevron sits wholly inside it (${Math.round(depth)} px)`, () => depth <= clear + 0.5);
+      } else {
+        check(`the ${name} draws no chevron of its own, so its fade only ramps (${Math.round(clear)} px cleared)`, () => Number.isFinite(clear) && clear < 0.5);
       }
     }
-    check("at least one bottom chevron is drawn", () => $$('[data-sidebar-panel] button[aria-label="Scroll down"]').length >= 1);
+    check("at least one bottom chevron is drawn", () => $$('[data-sidebar-panel] button[aria-label^="Scroll down"]').length >= 1);
+    // The branch list ends above the body's cue band and ramp, so the body's
+    // fade never erases list rows. Scrolled to its end with the body at rest,
+    // the list's last row (the Tags header, in a repository with tags) used to
+    // sit inside that band, invisible until the whole sidebar was scrolled.
+    {
+      const cs = getComputedStyle(body());
+      const reserve = (parseFloat(cs.getPropertyValue("--gp-sidebar-cue-band")) + parseFloat(cs.getPropertyValue("--gp-sidebar-cue-ramp"))) * remPx();
+      list().scrollTop = list().scrollHeight;
+      await wait(200);
+      await settle();
+      const rows = [...list().querySelectorAll(".gp-cv-row")];
+      const lastBottom = Math.max(...rows.map((r) => r.getBoundingClientRect().bottom));
+      const fadeTop = body().getBoundingClientRect().bottom - reserve;
+      check(`at the list's end its last row is clear of the body's fade (${Math.round(fadeTop - lastBottom)} px)`, () => body().getAttribute("data-gp-fade") === "y-end" && rows.length > 0 && lastBottom <= fadeTop + 0.5);
+      list().scrollTop = 0;
+      await settle();
+    }
+    // What is below the branch list is named, not left to a bare chevron.
+    {
+      const cue = downCue(body());
+      check(`the body's bottom cue names the worktrees below the branch list (${cue?.getAttribute("aria-label")})`, () => !!cue && /Worktrees/.test(cue.textContent) && /Worktrees/.test(cue.getAttribute("aria-label") ?? ""));
+      cue?.click();
+      await wait(700);
+      await settle();
+      const heading = [...panel().querySelectorAll(".gp-label")].find((l) => /^Worktrees/.test(l.textContent.trim()));
+      const box = body().getBoundingClientRect(), at = heading?.getBoundingClientRect();
+      check("choosing it brings the Worktrees heading into view", () => !!at && at.top >= box.top - 0.5 && at.bottom <= box.bottom + 0.5 && body().scrollTop > 0);
+      body().scrollTop = 0;
+      await settle();
+    }
     list().scrollTop = list().scrollHeight;
     body().scrollTop = body().scrollHeight;
     await wait(300);

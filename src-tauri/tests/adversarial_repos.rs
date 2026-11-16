@@ -29,7 +29,7 @@ use tempfile::TempDir;
 /// defers a `GitReader` call mid-test ("local bucket: 0 token(s)"). The switch
 /// is order-independent and idempotent, like the other integration suites'.
 fn unmetered_spawns() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
 }
 
 fn git_in(dir: &Path, args: &[&str]) {

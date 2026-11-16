@@ -9,7 +9,7 @@
   import {
     CORNER_STYLES,
     FLOAT_BLUR_MAX,
-    MATERIAL_FLOOR,
+    appearanceMaterialFloor,
     appearanceNotes,
     resolveAccent,
     type FieldLevel,
@@ -23,6 +23,8 @@
   import SettingSegment from "./SettingSegment.svelte";
   import Slider from "./Slider.svelte";
   import ThemeFileSettings from "./ThemeFileSettings.svelte";
+  import ThemeGallery from "./ThemeGallery.svelte";
+  import WallpaperSettings from "./WallpaperSettings.svelte";
 
   /**
    * Settings -> Appearance, in the seven groups of the design language (§11):
@@ -223,7 +225,8 @@
   );
 
   // --- material ---------------------------------------------------------------
-  const floor = $derived(MATERIAL_FLOOR[theme]);
+  // Measured over the palette in force: an applied theme or preset has its own floor.
+  const floor = $derived($appearanceMaterialFloor);
   const intensity = $derived(Math.max(prefs.materialIntensity[theme], floor));
   const transparencyChoice = $derived(prefs.reduceTransparency ? "reduced" : "auto");
 </script>
@@ -285,9 +288,9 @@
         {/if}
 {/snippet}
 
-<div class="flex flex-col gap-5" data-appearance-settings>
+<div class="flex flex-col gap-4" data-appearance-settings>
   <!-- Theme -->
-  <section class="flex flex-col gap-3" hidden={!any(["theme", "theme-file"])} data-group="theme">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["theme", "theme-gallery", "theme-file"])} data-group="theme">
     <h3 class="gp-label">Theme</h3>
     <div data-setting="theme" hidden={!shown("theme")}>
       <SettingSegment
@@ -297,13 +300,16 @@
         onselect={onTheme}
       />
     </div>
+    <div data-setting="theme-gallery" hidden={!shown("theme-gallery")}>
+      <ThemeGallery />
+    </div>
     <div data-setting="theme-file" hidden={!shown("theme-file")}>
       <ThemeFileSettings />
     </div>
   </section>
 
   <!-- Colors -->
-  <section class="flex flex-col gap-3" hidden={!any(["accent"])} data-group="colors">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["accent"])} data-group="colors">
     <h3 class="gp-label">Colors</h3>
     <div data-setting="accent" hidden={!shown("accent")} class="flex flex-col gap-2">
       <!-- `group` + `aria-pressed`, not `radiogroup` + `radio`, matching every
@@ -403,7 +409,7 @@
   </section>
 
   <!-- Type -->
-  <section class="flex flex-col gap-3" hidden={!any(["ui-scale", "font-ui", "font-mono"])} data-group="type">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["ui-scale", "font-ui", "font-mono"])} data-group="type">
     <h3 class="gp-label">Type</h3>
     <div data-setting="ui-scale" hidden={!shown("ui-scale")} class="flex flex-col gap-1.5">
       <Slider
@@ -463,7 +469,7 @@
   </section>
 
   <!-- Shape -->
-  <section class="flex flex-col gap-3" hidden={!any(["corner-style"])} data-group="shape">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["corner-style"])} data-group="shape">
     <h3 class="gp-label">Shape</h3>
     <div data-setting="corner-style" hidden={!shown("corner-style")} class="flex flex-col gap-1.5">
       <SettingSegment
@@ -481,9 +487,9 @@
 
   <!-- Material -->
   <section
-    class="flex flex-col gap-3"
+    class="gp-card p-4 flex flex-col gap-3"
     hidden={nativeMaterial
-      ? !any(["material-intensity", "float-blur", "background-field", "transparency", "native-glass"])
+      ? !any(["material-intensity", "float-blur", "background-field", "wallpaper", "transparency", "native-glass"])
       : filtering}
     data-group="material"
   >
@@ -557,6 +563,10 @@
       </p>
     </div>
 
+    <div data-setting="wallpaper" hidden={!shown("wallpaper")}>
+      <WallpaperSettings />
+    </div>
+
     <div data-setting="transparency" hidden={!shown("transparency")} class="flex flex-col gap-1.5">
       <div class="text-meta font-medium text-textPrimary">Transparency</div>
       <SettingSegment
@@ -584,7 +594,7 @@
   </section>
 
   <!-- Motion -->
-  <section class="flex flex-col gap-3" hidden={!any(["motion", "high-refresh"])} data-group="motion">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["motion", "high-refresh"])} data-group="motion">
     <h3 class="gp-label">Motion</h3>
     <div data-setting="motion" hidden={!shown("motion")}>
       <SettingToggle
@@ -612,7 +622,7 @@
   </section>
 
   <!-- Density -->
-  <section class="flex flex-col gap-3" hidden={!any(["density"])} data-group="density">
+  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["density"])} data-group="density">
     <h3 class="gp-label">Density</h3>
     <div data-setting="density" hidden={!shown("density")} class="flex flex-col gap-1.5">
       <SettingSegment
@@ -630,7 +640,7 @@
 
   <!-- Terminal -->
   <section
-    class="flex flex-col gap-3"
+    class="gp-card p-4 flex flex-col gap-3"
     hidden={!any([
       "terminal-screen-reader",
       "terminal-gpu",
@@ -724,7 +734,7 @@
 
   <!-- Interface -->
   <section
-    class="flex flex-col gap-3"
+    class="gp-card p-4 flex flex-col gap-3"
     hidden={!any(["timestamps", "branch-rows", "coach-marks", "walkthrough-replay"])}
     data-group="interface"
   >

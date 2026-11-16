@@ -174,7 +174,7 @@ export async function deleteTasks(
   run: (attempt: DeleteAttempt) => Promise<void>,
   options: { newID: () => string; limit?: number; cancelled?: () => boolean; timeout?: number },
 ): Promise<DeleteBatchResult> {
-  return writeEach(tasks, run, { ...options, settled: deleteAlreadyGone, timeoutMessage: "Delete timed out. Retry to confirm its result." });
+  return writeEach(tasks, run, { ...options, settled: deleteAlreadyGone, timeoutMessage: "Delete timed out. Try again to confirm its result." });
 }
 
 /**
@@ -195,7 +195,7 @@ export async function restoreTasks(
   return writeEach(tasks, run, {
     ...options,
     settled: (error) => classifyDeleteError(error).code === "invalid_state",
-    timeoutMessage: "Restore timed out. Retry to confirm its result.",
+    timeoutMessage: "Restore timed out. Try again to confirm its result.",
   });
 }
 
@@ -225,7 +225,7 @@ async function writeEach(
       return attempt ? { task, attempt } : null;
     })
     .filter((row): row is { task: DeletableTask; attempt: DeleteAttempt } => row !== null);
-  const exec = (attempt: DeleteAttempt) => bounded(run(attempt), deleteTimeout(options.timeout), options.timeoutMessage ?? "Delete timed out. Retry to confirm its result.");
+  const exec = (attempt: DeleteAttempt) => bounded(run(attempt), deleteTimeout(options.timeout), options.timeoutMessage ?? "Delete timed out. Try again to confirm its result.");
 
   const serial = await runBoundedSerial(attempts, async (row) => {
     try {

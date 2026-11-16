@@ -5,6 +5,7 @@
   import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { isPromptOpen } from "../stores/modalStore";
   import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
@@ -19,7 +20,7 @@
   import { scrollEdgeFade } from "../ui/scrollEdgeFade";
   import { openSetupWizard } from "../tools/onboardingStore";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
-  import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
+  import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, modeLandsOnRepositoryPage, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
   import { emptySearch, scheduleSearch, workspaceRoot } from "../palette/search";
 
   /**
@@ -176,9 +177,14 @@
   function close() { handingOff = false; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
   function closeForHandoff() { handingOff = true; if (dropdown) dropdown.onclose(); else dialogOpen = false; }
 
+  /** A file, branch, commit or symbol lives on the repository page: bring it back from Fleet, Agents or Tasks. */
+  function showRepositoryPage() { interfaceStore.setGlobalSurface("repository"); }
+
   async function run(index: number) {
     const command = filteredCommands[index];
     if (!command || command.disabledReason || pendingAction) return;
+    // The mode the result was listed under; typing during the action may change it.
+    const lands = modeLandsOnRepositoryPage(mode);
     const epoch = openEpoch;
     pendingAction = command.id;
     actionError = null;
@@ -190,6 +196,7 @@
         if (isOpen && openEpoch === epoch) actionError = failure;
         return;
       }
+      if (lands) showRepositoryPage();
       if (!command.keepOpen) history = recordFrecency(history, command.id, storage());
       if (!command.keepOpen && openEpoch === epoch) close();
     } catch (error) {
@@ -312,7 +319,7 @@
         <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>
         {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { closeForHandoff(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
       {/if}
-      {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
+      {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { showRepositoryPage(); repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
     </div>
   {/if}
   <div bind:this={listEl} id={listboxId} class="palette-results scroll-py-8" use:scrollEdgeFade role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>

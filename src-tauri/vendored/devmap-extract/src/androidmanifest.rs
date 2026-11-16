@@ -177,7 +177,7 @@ fn end_of(rest: &str, close: &str, what: &str) -> Result<usize, String> {
 /// `.` for the module's namespace. A build placeholder (`${applicationId}`) is
 /// not a class and is refused.
 fn is_class_name(name: &str) -> bool {
-    let body = name.strip_prefix('.').unwrap_or(name);
+    let body = name.trim_prefix('.');
     !body.is_empty()
         && body.split('.').all(|part| {
             !part.is_empty()

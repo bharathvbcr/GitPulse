@@ -7,7 +7,7 @@ const answer = (over: Partial<TaskSuggestions> = {}): TaskSuggestions => ({
   generated_at: 1, candidates: 3,
   suggestions: [
     { rank: 1, id: "a", title: "Fix the crash", status: "ready", priority: 0, score: 130, reason: "urgent priority; overdue by 3 days", signals: [] },
-    { rank: 2, id: "b", title: "Tidy docs", status: "inbox", priority: 3, score: 4, reason: "no urgency signal; ranked by tie-break", signals: [] },
+    { rank: 2, id: "b", title: "Tidy docs", status: "backlog", priority: 3, score: 4, reason: "no urgency signal; ranked by tie-break", signals: [] },
   ],
   blocked: [], excluded: { in_progress: 0, review: 0, duplicate: 0, blocked: 0, unread: 0, filtered: 0 },
   board: { scanned: 3, complete: true, unhydrated: 0 }, verification: { checked: 2, unchecked: 0, failed: 0 },

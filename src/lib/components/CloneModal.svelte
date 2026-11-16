@@ -125,7 +125,7 @@
       <div class="p-4 gp-section-edge flex items-center justify-between">
         <h2 id="clone-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <Download size={16} class="text-accent" />
-          <span>Clone Git Repository</span>
+          <span>Clone Git repository</span>
         </h2>
       </div>
 
@@ -148,7 +148,7 @@
         </div>
 
         <div>
-          <label for="clone-dest" class="block text-textMuted text-meta mb-1.5">Destination Directory</label>
+          <label for="clone-dest" class="block text-textMuted text-meta mb-1.5">Destination directory</label>
           <div class="flex items-center gap-2">
             <input
               id="clone-dest"

@@ -209,7 +209,7 @@
       {#if lastOutcome.ok}
         Installed {lastOutcome.tool} at {lastOutcome.binary}
       {:else if lastOutcome.cancelled}
-        Install cancelled.
+        Install canceled.
       {:else}
         {lastOutcome.reason ?? (lastOutcome.stderr || "Install failed")}
       {/if}

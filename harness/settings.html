@@ -197,6 +197,9 @@
         scanned: 4, capabilities: true,
       };
       window.__gpScan = "ok";
+      // The Manvi model card's credential answer: an object in the wire shape,
+      // or "throw" for a backend that could not answer.
+      window.__gpClaudeStatus = { key_saved: false, account: null, account_error: null };
       localStorage.removeItem("gitpulse_ai_model");
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
@@ -258,7 +261,10 @@
             if (window.__gpScan === "throw") throw "the sweep could not start";
             return scanResult;
           }
-          if (cmd === "cmd_claude_key_status") return false;
+          if (cmd === "cmd_claude_key_status") {
+            if (window.__gpClaudeStatus === "throw") throw "the Keychain could not be read";
+            return window.__gpClaudeStatus;
+          }
           // Lappi reloads each time the Agents panel becomes active, so a null
           // answer here crashes the modal on the second visit.
           if (cmd === "cmd_host_load_settings") return { enabled: true, govern_launches: true };
@@ -396,6 +402,37 @@
           scanButton.click();
           check("a failed sweep says it is not a list of what is running", await until(() => document.getElementById("manvi-section-model").textContent.includes("This is not a list of what is running.")));
           window.__gpScan = "ok";
+
+          // The Claude credential: GitPulse's own key unless ~/.anthropic-accounts
+          // names an account, whose workspace it shows and whose key it never reads.
+          // The "Manvi's model" card sits beside the Local model servers section.
+          const claudeCard = () =>
+            [...document.querySelectorAll("section")].find((el) => el.querySelector("h3")?.textContent.trim() === "Manvi's model");
+          const modelText = () => (claudeCard()?.textContent ?? "").replace(/\s+/g, " ");
+          const keyInput = () => claudeCard()?.querySelector('input[type="password"]') ?? null;
+          check("with no registry the card offers to save a key", await until(() => keyInput() && !modelText().includes("~/.anthropic-accounts exists")));
+          const remountWith = async (status) => {
+            window.__gpClaudeStatus = status;
+            await open(false);
+            await open(true);
+            tab("agents").click();
+            await wait(120);
+          };
+          await remountWith({
+            key_saved: true,
+            account: { name: "main", workspace: "wrkspc_01Harness", source: "default" },
+            account_error: null,
+          });
+          check("a registry account is named with its workspace", await until(() => modelText().includes("Using Anthropic account main") && modelText().includes("wrkspc_01Harness")));
+          check("a registry account hides the key field", !keyInput());
+          check("a key saved beside a registry account is called unused and removable", Boolean(document.querySelector('[data-testid="manvi-claude-unused-key"] button')));
+          await remountWith({ key_saved: false, account: null, account_error: "`anthropic-account` is not on PATH" });
+          check("an unreadable registry is an error, not a missing key", await until(() => document.querySelector('[data-testid="manvi-claude-account-error"]')?.textContent.includes("not on PATH")));
+          check("an unreadable registry offers no key field to fall back on", !keyInput());
+          await remountWith("throw");
+          check("a failed read shows the failure", await until(() => modelText().includes("Keychain could not be read")));
+          check("a failed read claims neither a missing key nor a missing registry", !modelText().includes("No Claude API key saved") && !keyInput());
+          await remountWith({ key_saved: false, account: null, account_error: null });
 
           // Search finds the new rows by the words a reader would use.
           await typeSearch("model servers");

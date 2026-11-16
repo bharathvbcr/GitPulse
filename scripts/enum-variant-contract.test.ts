@@ -20,6 +20,10 @@ import { describe, expect, it } from "vitest";
  * compiling: the union still lists a valid string, the comparison just stops
  * matching anything, and a branch silently becomes dead. No type error, no
  * test failure, no crash.
+ *
+ * Both directions count: an enum Rust only deserializes (a command argument
+ * the frontend sends) drifts as quietly as one it only serializes, and fails
+ * at the command boundary instead of in a branch.
  */
 const RUST_ROOT = fileURLToPath(new URL("../src-tauri/src/", import.meta.url));
 const TS_ROOT = fileURLToPath(new URL("../src/", import.meta.url));
@@ -40,12 +44,24 @@ const NO_TS_MIRROR = new Map<string, string>([
     "`gitpulse_landed` is an MCP read tool: its `via` reaches agents over MCP and has no frontend consumer",
   ],
   [
+    "WorktreeLayout",
+    "`gitpulse_worktree_create` takes `layout` as an MCP string parsed by WorktreeLayout::parse; no IPC command carries it and the frontend never sees it",
+  ],
+  [
     "LandedReason",
     "`gitpulse_landed` is an MCP read tool: its `reason` code reaches agents over MCP and has no frontend consumer",
   ],
   [
     "LandedAtSource",
     "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
+  ],
+  [
+    "TurnEvent",
+    "engine::turn_checkpoint wire type: the hook sends it as `event` inside `desktop::instance::Request::RecordTurnCheckpoint` over the profile's unix socket to the running owner, and `gitpulse_turn_checkpoints` returns it to agents over MCP; it has no frontend consumer (capture, list and diff only, no UI)",
+  ],
+  [
+    "CaptureOutcome",
+    "engine::turn_checkpoint wire type: the app answers the hook's `Request::RecordTurnCheckpoint` with it and `gitpulse_turn_checkpoints` returns it to agents over MCP; no frontend consumer reads it (no turn checkpoint UI)",
   ],
   [
     "PrWorktreeRefusalCode",
@@ -103,6 +119,20 @@ const NO_TS_MIRROR = new Map<string, string>([
   [
     "CampaignViolation",
     "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`gitpulse_campaign_audit`) and by the gitpulse-worktree CLI; no Tauri command returns them and the frontend has no consumer",
+  ],
+  // Argument-only enums found when this check began reading `Deserialize`
+  // enums. Each is a known gap, named rather than fixed here.
+  [
+    "BrowserGo",
+    "argument to `cmd_browser_go`; the frontend spells it `HistoryStep` in src/lib/browser/browserSession.ts, a different name, so this check cannot pair them (renaming one side would bring it under the check)",
+  ],
+  [
+    "ExitAnswer",
+    "argument to `cmd_exit_request_answer`; App.svelte sends the literals `\"seen\"` and `\"cancel\"` inline with no named type (App.test.ts pins `answer: \"seen\"`)",
+  ],
+  [
+    "ScanDepth",
+    "argument to `cmd_list_worktrees`; callers pass `\"listing\"`, `\"dirty\"` or `\"full\"` inline with no named type",
   ],
 ]);
 
@@ -169,7 +199,8 @@ function rustEnums(root = RUST_ROOT): Map<string, RustEnum> {
   for (const file of walk(root, [".rs"])) {
     const source = readFileSync(file, "utf8");
     for (const match of source.matchAll(/((?:#\[[^\]]*\]\s*)*)pub enum (\w+)\s*\{/g)) {
-      if (!match[1].includes("Serialize")) continue;
+      // `Deserialize` does not contain `Serialize` (capital S), so both are named.
+      if (!/\b(?:Serialize|Deserialize)\b/.test(match[1])) continue;
       const rule = /rename_all\s*=\s*"([^"]+)"/.exec(match[1])?.[1];
       const tag = /\btag\s*=\s*"([^"]+)"/.exec(match[1])?.[1];
       const body = balanced(source, match.index ?? 0);
@@ -431,6 +462,15 @@ describe("a const-tuple mirror is compared like any other union", () => {
     expect(renamed).toEqual([
       "IpcErrorKind: Rust sends deferred; TS does not accept them",
       "IpcErrorKind: TS accepts deferred_under_load; Rust never sends them",
+    ]);
+  });
+
+  it("compares an enum Rust only deserializes (a command argument) too", () => {
+    const argument = RUST.replace("#[derive(Serialize)]", "#[derive(Clone, Copy, Deserialize)]");
+    expect(drift(argument, tuple(["unclassified", "deferred_under_load", "stale_stash"]))).toEqual([]);
+    expect(drift(argument, tuple(["unclassified", "deferred_under_load", "stale_stashes"]))).toEqual([
+      "IpcErrorKind: Rust sends stale_stash; TS does not accept them",
+      "IpcErrorKind: TS accepts stale_stashes; Rust never sends them",
     ]);
   });
 

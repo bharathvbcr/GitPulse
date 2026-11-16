@@ -137,9 +137,9 @@
           button("Cancel").click();
           await until(() => cancels.length === 1);
           check("Cancel reaches the backend with the search's own token", () => cancels[0] === heldToken);
-          await until(() => summary()?.textContent.includes("cancelled"));
+          await until(() => summary()?.textContent.includes("canceled"));
           check("the cancelled partial answer still lands, marked cancelled", () =>
-            summary().textContent.includes("partial: the search was cancelled") && matches().length === 1);
+            summary().textContent.includes("partial: the search was canceled") && matches().length === 1);
           check("and Search comes back", () => !!button("Search"));
 
           // --- a newer search retires the older one ---------------------------

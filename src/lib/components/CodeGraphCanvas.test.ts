@@ -54,6 +54,8 @@ describe("CodeGraphCanvas interaction cost and recovery", () => {
   it("lays out in a fixed content space, so a resize never re-lays out", () => {
     expect(source).toContain("buildCodeGraphModel(payload, CODE_GRAPH_LAYOUT_WIDTH, CODE_GRAPH_LAYOUT_HEIGHT)");
     expect(source).not.toMatch(/buildCodeGraphModel\(payload,\s*width,\s*height\)/);
+    expect(source).toContain('from "../codeintel/codeMap"');
+    expect(source).not.toContain("vendored/");
   });
 
   it("hit-tests hover at most once per frame, from the newest pointer position", () => {
@@ -66,12 +68,23 @@ describe("CodeGraphCanvas interaction cost and recovery", () => {
     expect(source).toContain("hoverScheduler.cancel()");
   });
 
-  it("drops the cached context on loss and repaints on restore", () => {
+  it("cancels queued hover hit-testing when the pointer leaves or state resets", () => {
+    expect(source).toContain("onpointerleave={onPointerLeave}");
+    const leave = functionBody("onPointerLeave");
+    expect(leave).toContain("hoverScheduler.cancel()");
+    expect(leave).toContain("hoveredId = null");
+    expect(functionBody("setGlobe")).toContain("hoverScheduler.cancel()");
+    expect(functionBody("filtersChanged")).toContain("hoverScheduler.cancel()");
+  });
+
+  it("drops the cached context on loss, repaints on restore, and watches devicePixelRatio", () => {
     expect(source).toContain('canvas?.addEventListener("contextlost", onContextLost)');
     expect(source).toContain('canvas?.addEventListener("contextrestored", onContextRestored)');
     expect(source).toContain('canvas?.removeEventListener("contextlost", onContextLost)');
     expect(source).toMatch(/function onContextLost\(event: Event\) \{\s*event\.preventDefault\(\);\s*gpuCtx = null;\s*schedulePaint\(\);/);
     expect(source).toMatch(/function onContextRestored\(\) \{\s*gpuCtx = null;\s*schedulePaint\(\);/);
+    expect(source).toContain("watchDevicePixelRatio(");
+    expect(source).toContain("detachDpr()");
   });
 });
 
@@ -148,6 +161,54 @@ describe("buildCodeGraphModel layout space", () => {
     const fixed = graph.buildCodeGraphModel(payload, graph.CODE_GRAPH_LAYOUT_WIDTH, graph.CODE_GRAPH_LAYOUT_HEIGHT);
     expect(graph.buildCodeGraphModel(payload).nodes.map((n) => [n.x, n.y])).toEqual(fixed.nodes.map((n) => [n.x, n.y]));
   });
+
+  it("counts layoutNodes, buildCodeGraphModel, and hitTestCodeGraph passes through the codeMap probe seam", async () => {
+    const graph = await import("../codeintel/codeMap");
+    const payload = { nodes: [{ id: "a", name: "a" }, { id: "b", name: "b" }], links: [{ source: "a", target: "b" }] };
+    const layoutsBefore = graph.codeGraphLayoutCount();
+    graph.buildCodeGraphModel(payload);
+    graph.buildCodeGraphModel(payload, graph.CODE_GRAPH_LAYOUT_WIDTH, graph.CODE_GRAPH_LAYOUT_HEIGHT);
+    expect(graph.codeGraphLayoutCount() - layoutsBefore).toBe(2);
+
+    const laidOut = graph.layoutNodes([{ id: "a", name: "a" }], 800, 560);
+    expect(laidOut).toHaveLength(1);
+    expect(graph.codeGraphLayoutCount() - layoutsBefore).toBe(3);
+
+    const model = graph.buildCodeGraphModel({ nodes: [{ id: "a", name: "a", x: 100, y: 100 }], links: [] });
+    const hitsBefore = graph.codeGraphHitTestCount();
+    const hit = graph.hitTestCodeGraph(model, 100, 100, 0, 0, 1);
+    const miss = graph.hitTestCodeGraph(model, 0, 0, 0, 0, 1);
+    expect(hit?.kind).toBe("node");
+    expect(hit?.id).toBe("a");
+    expect(miss).toBeNull();
+    expect(graph.codeGraphHitTestCount() - hitsBefore).toBe(2);
+
+    expect(graph.getCodeGraphColor({ id: "a", name: "a", path: "a.ts" })).toBeTruthy();
+    expect(graph.getCodeGraphColor({ id: "a", name: "a", path: "a.ts" }, true)).toBeTruthy();
+    const noop = () => {};
+    const stubCtx = {
+      save: noop, restore: noop, clearRect: noop, fillRect: noop,
+      beginPath: noop, moveTo: noop, lineTo: noop, arc: noop,
+      fill: noop, stroke: noop, fillText: noop, translate: noop, scale: noop,
+    } as unknown as CanvasRenderingContext2D;
+    let customColorCalls = 0;
+    graph.paintCodeGraph(stubCtx, {
+      model,
+      widthCss: 200,
+      heightCss: 200,
+      panX: 0,
+      panY: 0,
+      scale: 1,
+      selectedId: null,
+      hoveredId: null,
+      theme: graph.DEFAULT_CODE_GRAPH_THEME,
+      colorFor: () => {
+        customColorCalls += 1;
+        return "rgb(1, 2, 3)";
+      },
+    });
+    expect(customColorCalls).toBeGreaterThan(0);
+  });
 });
 
 describe("CodeGraphCanvas globe, focus and design-rule pins", () => {
@@ -195,5 +256,19 @@ describe("CodeGraphCanvas globe, focus and design-rule pins", () => {
     expect(source).toContain("node.label");
     expect(source).toContain("nodePathText(row.node)");
     expect(source).toContain("focusNode(row.node.id)");
+  });
+});
+
+describe("CodeGraphCanvas About hint", () => {
+  it("shows a focusable info hint carrying the view description, and none without one", async () => {
+    const { render } = await import("svelte/server");
+    const { default: CodeGraphCanvas } = await import("./CodeGraphCanvas.svelte");
+    const about = "Each dot is a file; a line means one file imports another.";
+    const withHint = render(CodeGraphCanvas, { props: { load: null, about } }).body;
+    const tag = withHint.match(/<button\b[^>]*data-testid="code-graph-about"[^>]*>/)?.[0] ?? "";
+    expect(tag).toContain(`title="${about}"`);
+    expect(tag).toContain('type="button"');
+    expect(tag).toContain(`aria-label="About this view: ${about}"`);
+    expect(render(CodeGraphCanvas, { props: { load: null } }).body).not.toContain("code-graph-about");
   });
 });

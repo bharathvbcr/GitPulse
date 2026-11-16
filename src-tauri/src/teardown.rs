@@ -69,6 +69,13 @@ fn close_terminals_within(terminals: &TerminalSessions, deadline: Duration) {
         log::info!(target: "terminal", "quitting with every terminal left running in the terminal host");
         return;
     }
+    // Durable ledger contract (S2-03): persist AppQuit synchronously BEFORE
+    // SIGHUP stops any child PTYs so reader-thread exit delivery never
+    // overwrites AppQuit as ExitedSignal or ExitedClean.
+    let marked = terminals.mark_app_quit_sessions();
+    if marked > 0 {
+        log::info!(target: "terminal", "recorded app_quit for {marked} running session(s) before terminal shutdown");
+    }
     stop_terminals(terminals, deadline);
     // Nothing is left to hold the connection for; the next launch must not
     // find a host still talking to an app that is leaving.

@@ -72,8 +72,9 @@ describe("HarnessBadge destinations", () => {
     // The model picker now acts in place; only repository navigation chips
     // retain section destinations.
     // Markup order: the verdict snippet is declared ahead of the Manvi menu,
-    // whose "Open Manvi policy" item owns the harness destination.
-    expect(chipTargets).toEqual(["activity", "harness"]);
+    // whose cloud section's "Change Manvi's model" item owns the model
+    // destination and whose "Open Manvi policy" item owns the harness one.
+    expect(chipTargets).toEqual(["activity", "model", "harness"]);
     expect(new Set(chipTargets).size).toBe(chipTargets.length);
     for (const target of chipTargets) {
       expect(MANVI_FOCUS_IDS).toContain(target);
@@ -89,7 +90,7 @@ describe("HarnessBadge destinations", () => {
 
   it("tells each chip's tooltip where the click lands", () => {
     // Guarded, so an empty match list cannot pass this as if it had checked.
-    expect(chipTargets.length).toBe(2);
+    expect(chipTargets.length).toBe(3);
     for (const target of chipTargets) {
       expect(source).toContain(`manviFocusHint("${target}")`);
     }
@@ -194,6 +195,28 @@ describe("HarnessBadge chip", () => {
     const body = renderState({ ai: ready, preferred: null }, false);
     expect(body).toContain('class="font-medium max-[1099px]:sr-only"');
     expect(body).toMatch(/class="hidden[^"]*min-\[1440px\]:inline"[^>]*>Automatic · chat</);
+  });
+
+  it("compact is the shield alone: no label, no model face, the same name, and a downward menu", () => {
+    const state = writable({
+      ...get(harnessStore),
+      harness: harnessStatus({ available: true }),
+      ai: ready,
+      preferred: null,
+    });
+    vi.spyOn(harnessStore, "subscribe").mockImplementation(state.subscribe);
+    const full = render(HarnessBadge, { props: { open: false } }).body;
+    const compact = render(HarnessBadge, { props: { variant: "compact", open: false } }).body;
+    expect(full).toContain('data-variant="full"');
+    expect(full).toContain("min-[1440px]:inline");
+    expect(compact).toContain('data-variant="compact"');
+    expect(compact).not.toContain("min-[1440px]:inline");
+    expect(compact).not.toContain("max-[1099px]:sr-only");
+    expect(compact).toContain('<span class="sr-only">Manvi</span>');
+    // Same accessible name and tooltip as the full pill.
+    expect(chipTag(compact)).toContain('aria-label="Manvi, policy checks connected"');
+    expect(chipTag(compact)).toContain(chipTag(full).match(/title="[^"]*"/)?.[0] ?? "no title");
+    expect(source).toContain('place: variant === "full" ? ("above" as const) : ("below" as const)');
   });
 
   it("keeps the live model status rendered while the menu is closed", () => {
@@ -365,9 +388,11 @@ describe("HarnessBadge model options", () => {
       join(dirname(fileURLToPath(import.meta.url)), "../../App.svelte"),
       "utf8",
     );
-    expect(app).toMatch(/\{#if \$interfaceStore\.showHarnessBadges\}\s*<HarnessBadge \/>/);
+    expect(app).toMatch(
+      /\{#if \$interfaceStore\.showHarnessBadges && !manviInStatusBar\}\s*<HarnessBadge variant="compact" \/>/,
+    );
     const ungated = app.replace(
-      /\{#if \$interfaceStore\.showHarnessBadges\}[\s\S]*?\{\/if\}/,
+      /\{#if \$interfaceStore\.showHarnessBadges && !manviInStatusBar\}[\s\S]*?\{\/if\}/,
       "",
     );
     expect(ungated).not.toMatch(/<HarnessBadge(?:\s|\/>)/);
@@ -377,7 +402,7 @@ describe("HarnessBadge model options", () => {
     expect(body).not.toContain("MANVI");
     expect(body).not.toContain("data-manvi-face");
     expect(body).not.toContain('aria-label="Local model"');
-    expect(body).not.toContain('data-testid="manvi-titlebar-status"');
+    expect(body).not.toContain('data-testid="manvi-status"');
   });
 
   it("distinguishes discovery in progress from an empty or failed result", () => {
@@ -387,5 +412,43 @@ describe("HarnessBadge model options", () => {
     expect(failed).toContain("Model request failed");
     expect(failed).toContain("No local models available");
     expect(failed).not.toContain("Looking for local models…");
+  });
+});
+
+describe("HarnessBadge cloud mode", () => {
+  const empty: AiStatus = { ...ready, endpoints: [], ready: false, selected: null };
+  const cloud = { manviClaude: { model: "claude-sonnet-5-5" } };
+
+  it("shows Cloud on the pill instead of local discovery when Manvi is on Claude", () => {
+    const body = renderState({ ai: empty, ...cloud }, false);
+    const chip = body.slice(body.indexOf("data-manvi-chip"), body.indexOf("</button>", body.indexOf("data-manvi-chip")));
+    expect(chip).toContain("data-manvi-cloud");
+    expect(chip).toContain("Cloud");
+    expect(chip).toContain("Sonnet 5.5");
+    expect(chip).not.toContain("No models");
+    // An empty local sweep is not Manvi's problem on cloud, and the credential
+    // has not been read during a server render, so no alert is raised.
+    expect(chip).not.toContain("text-danger");
+    expect(chipTag(body)).toContain("Manvi uses cloud: claude-sonnet-5-5");
+  });
+
+  it("keeps the local face on the pill when Manvi is on a local model", () => {
+    const body = renderState({ ai: empty, manviClaude: null }, false);
+    expect(body).not.toContain("data-manvi-cloud");
+    expect(body).toContain("No models");
+  });
+
+  it("puts Manvi's cloud model first in the menu and labels the local picker for GitPulse AI", () => {
+    const body = renderState({ ai: empty, ...cloud }, true);
+    const menu = body.slice(body.indexOf("data-manvi-menu"));
+    expect(menu).toContain("data-manvi-cloud-row");
+    expect(menu).toContain("Cloud · claude-sonnet-5-5");
+    const cloudAt = menu.search(/Manvi(?:'|&#39;|&apos;)s model</);
+    const localAt = menu.indexOf("Local model · GitPulse AI");
+    expect(cloudAt).toBeGreaterThan(-1);
+    expect(localAt).toBeGreaterThan(cloudAt);
+    // The local picker keeps describing local discovery, never "Cloud".
+    expect(menu).toMatch(/data-manvi-face="No models"/);
+    expect(menu).toMatch(/Change Manvi(?:'|&#39;|&apos;)s model/);
   });
 });

@@ -8,7 +8,7 @@ let next = 0;
 function card(over: Partial<TaskCard> = {}): TaskCard {
   next++;
   return {
-    id: `t${next}`, revision: 1, updated_at: 1, title: "Untitled", kind: "task", status: "inbox",
+    id: `t${next}`, revision: 1, updated_at: 1, title: "Untitled", kind: "task", status: "backlog",
     priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: ["r1"],
     primary_repository_id: "r1", home_workspace_id: null, position: next, archived: false, completed_at: null,
     ...over,

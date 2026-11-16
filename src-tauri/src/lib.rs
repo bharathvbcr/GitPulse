@@ -285,6 +285,13 @@ pub fn run() {
                     "host" => "by the terminal host and survive a quit",
                     _ => "in the app",
                 });
+                if terminals.backend() != "host" {
+                    let lost = terminals.reconcile_session_ledger();
+                    if lost > 0 {
+                        log::info!(target: "terminal", "marked {lost} previously running terminal session(s) as lost on launch");
+                    }
+                }
+                let ledger_app = app.handle().clone();
                 if let Err(error) = supervisor::spawn_once(
                     "task-run-reconcile",
                     "task run reconcile",
@@ -296,6 +303,9 @@ pub fn run() {
                         // cannot be reached answers every run as held.
                         if let Err(error) = terminals.connect_host() {
                             log::error!(target: "terminal", "the terminal host could not be reached at startup; its runs are left alone: {error}");
+                        }
+                        if terminals.backend() == "host" && terminals.reconcile_session_ledger() > 0 {
+                            terminals.session_ledger().emit_view(&ledger_app);
                         }
                         match state.reconcile_stale_runs() {
                         Ok(0) => {}
@@ -449,6 +459,7 @@ pub fn run() {
             cmd_clone_repo,
             cmd_conflict_snapshot,
             cmd_save_conflict,
+            cmd_save_export,
             cmd_preview_conflict,
             cmd_detect_language,
             cmd_count_loc,
@@ -521,6 +532,7 @@ pub fn run() {
             cmd_github_context,
             cmd_github_runs,
             cmd_github_dependabot_alerts,
+            cmd_github_author_avatars,
             cmd_github_code_scanning_alerts,
             cmd_github_create_issue,
             cmd_github_checkout_pr,
@@ -562,6 +574,8 @@ pub fn run() {
             cmd_create_tag,
             cmd_delete_tag,
             cmd_publish_release,
+            cmd_list_op_snapshots,
+            cmd_undo_op_snapshot,
             cmd_harness_status,
             cmd_harness_reconnect,
             cmd_claude_key_status,
@@ -580,7 +594,6 @@ pub fn run() {
             cmd_terminal_write,
             cmd_terminal_deliver_peer,
             cmd_terminal_ack,
-            cmd_terminal_export,
             cmd_terminal_save_clipboard_image,
             cmd_terminal_clipboard_files,
             cmd_terminal_read_agent_artifact,
@@ -588,6 +601,9 @@ pub fn run() {
             cmd_terminal_kill,
             cmd_terminal_incidents,
             cmd_terminal_conversations,
+            cmd_terminal_session_ledger,
+            cmd_terminal_session_ledger_dismiss,
+            cmd_terminal_session_ledger_reopen_check,
             cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_listening_ports,

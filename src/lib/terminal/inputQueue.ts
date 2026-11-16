@@ -1,3 +1,5 @@
+import { describeError } from "../ui/copy/describeFailure";
+
 /** Ordered user input. Never retry a write: it may have been partially accepted. */
 const MAX_INPUT_BYTES = 1024 * 1024;
 const CHUNK_BYTES = 16 * 1024;
@@ -171,7 +173,7 @@ export const INPUT_SLOW_NOTICE = "Terminal is responding slowly; typing is queue
  *
  * The frontend bounds, with the ratio over the worst case above:
  *   KILL_HARD_MS      30 s  about 3x the ~10 s kill. A timeout keeps the slot and
- *                           the process id ("Close failed; use Sessions to retry").
+ *                           the process id ("Close failed; use Sessions to try again").
  *   KILL_SOFT_MS       6 s  past the 4.75 s a close takes with nothing slow in the
  *                           way, so the notice means "the host", not "the grace".
  *   CONTEXT_READ_MS    5 s  4x the measured read. A user is waiting on the answer
@@ -244,7 +246,7 @@ export function createTerminalInput(
               // All that is known is that nothing answered. The session may be fine;
               // the write may still land, so nothing after it can safely be sent.
               ? `Input to this terminal stopped: no answer from the terminal backend for ${Math.round(error.ms / 1000)} s; the host may be overloaded. The session may still be running, but its input cannot be resumed in order; restart to type again.`
-              : `Input delivery failed; restart before typing again. ${String(error)}`,
+              : `Input delivery failed; restart before typing again. ${describeError(error, "terminal")}`,
             true,
           );
         } else {
@@ -254,7 +256,7 @@ export function createTerminalInput(
           // next thing the user types goes through.
           queue.length = 0;
           bytes = 0;
-          onError(`Some input was not delivered and was dropped. ${String(error)}`, false);
+          onError(`Some input was not delivered and was dropped. ${describeError(error, "terminal")}`, false);
         }
       }
     } finally {

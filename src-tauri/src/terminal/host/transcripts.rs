@@ -1568,7 +1568,7 @@ fn key_marker(lower: &str, tag: &str) -> Option<(usize, usize)> {
         let line = &lower[start..line_end];
         if let Some(k) = line.find(KEY) {
             let after = &line[k + KEY.len()..];
-            let after = after.strip_prefix(" block").unwrap_or(after);
+            let after = after.trim_prefix(" block");
             if after.starts_with("-----") {
                 return Some((start, line_end - after.len() + "-----".len()));
             }

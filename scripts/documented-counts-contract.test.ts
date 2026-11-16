@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { parseRegisteredHandlers, DEFAULT_LIB_RS } from "./check-ipc-contract.mjs";
 import * as checkCoverageTypes from "./check-coverage-types.mjs";
 import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
+import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../src/lib/workbench/vocabulary";
 
 /**
  * README, CONTRIBUTING and ARCHITECTURE state precise counts — 136 IPC
@@ -481,5 +482,16 @@ describe("cross-boundary caps", () => {
     const watcher = read("src-tauri/src/watcher/mod.rs");
     const rustCap = Number(/pub const MAX_WATCHES:\s*usize\s*=\s*(\d+)/.exec(watcher)![1]);
     expect(Number(tsCap![1])).toBeGreaterThan(rustCap);
+  });
+
+  it("keeps the renderer's live-run bounds equal to dc-store's", () => {
+    const runs = read("src-tauri/vendored/dc-store/src/workbench/runs.rs");
+    const defaultMatch = /^pub const DEFAULT_ACTIVE_RUNS: i64 = (\d+);$/m.exec(runs);
+    expect(defaultMatch, "DEFAULT_ACTIVE_RUNS must be findable in runs.rs").toBeTruthy();
+    const ceilingMatch = /^pub const MAX_ACTIVE_RUNS_CEILING: i64 = (\d+);$/m.exec(runs);
+    expect(ceilingMatch, "MAX_ACTIVE_RUNS_CEILING must be findable in runs.rs").toBeTruthy();
+
+    expect(DEFAULT_LIVE_RUNS).toBe(Number(defaultMatch![1]));
+    expect(MAX_LIVE_RUNS).toBe(Number(ceilingMatch![1]));
   });
 });

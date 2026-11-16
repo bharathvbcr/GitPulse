@@ -121,7 +121,20 @@ export function chromeVictim(chrome, profile, platform, self, readProcess) {
  */
 const WATCHDOG = `
 const runner = Number(process.argv[1]), chrome = Number(process.argv[2]), profile = process.argv[3];
-const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const alive = pid => {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === "linux") {
+      try {
+        const status = require("node:fs").readFileSync("/proc/" + pid + "/status", "utf8");
+        if (/^State:\\s*Z/m.test(status)) return false;
+      } catch {}
+    }
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+};
 const readProcess = pid => {
   try {
     const out = require("node:child_process").execFileSync("ps", ["-o", "pgid=,command=", "-p", String(pid)], { encoding: "utf8" }).trim();
@@ -134,7 +147,14 @@ const tick = setInterval(() => {
   if (alive(runner)) { if (!alive(chrome)) process.exit(0); return; }
   clearInterval(tick);
   const victim = chromeVictim(chrome, profile, process.platform, process.pid, readProcess);
-  if (victim !== null) { try { process.kill(victim, "SIGKILL"); } catch {} }
+  if (victim !== null) {
+    try { process.kill(victim, "SIGKILL"); } catch {}
+  } else if (alive(chrome)) {
+    const info = readProcess(chrome);
+    if (info && info.command.includes(profile)) {
+      try { process.kill(chrome, "SIGKILL"); } catch {}
+    }
+  }
   try { require("node:fs").rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); } catch {}
   process.exit(0);
 }, 200);

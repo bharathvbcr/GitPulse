@@ -193,7 +193,7 @@ describe("array operations on $repoStore", () => {
     "lib/components/FleetView.svelte": 1,
     "lib/components/GitHubPanel.svelte": 2,
     "lib/components/RepoPanel.svelte": 1,
-    "lib/components/RepoTabBar.svelte": 12,
+    "lib/components/RepoTabBar.svelte": 11,
     "lib/components/StatusBar.svelte": 3,
     "lib/components/TaskAgentPanel.svelte": 1,
     "lib/components/TaskBoard.svelte": 1,

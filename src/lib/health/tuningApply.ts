@@ -22,6 +22,7 @@ import type {
   TuningPlan,
 } from "../storage/types";
 import type { Guarded } from "../stores/harnessStore";
+import { describeError } from "../ui/copy/describeFailure";
 
 /**
  * Whether the Storage panel offers the apply button: at least one change clears
@@ -62,7 +63,7 @@ export function runnableArgv(plan: TuningPlan): string[][] {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return describeError(error, "tuning");
 }
 
 export function createTuningApplyFlow(options: {

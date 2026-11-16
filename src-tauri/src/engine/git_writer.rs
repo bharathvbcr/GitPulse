@@ -1,16 +1,20 @@
 use crate::engine::git_cli::{
-    git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
-    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, is_transient_git_lock_error,
-    resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
-    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+    git_captured, git_captured_with_stdin, git_global_observed, git_text, git_text_network,
+    git_with_stdin, git_with_timeout, is_transient_git_lock_error, resolve_git_common_dir,
+    sandbox_join, validate_repo,
 };
 use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
+use crate::engine::process::{
+    is_deferred_under_load, is_slot_wait_timeout, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+};
 use crate::ipc_error::CommandError;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -1191,19 +1195,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
-        let run = git_captured(repo, &["config", "--get", name])?;
-        match run.status_code {
-            0 => Ok(
-                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
-                    .filter(|value| !value.is_empty()),
-            ),
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read {name} from git config (exit {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )
-            .into()),
-        }
+        Ok(config_get_exact(repo, name)?.filter(|value| !value.is_empty()))
     }
 
     /// The identity a commit in `repo` would be recorded under, resolved as
@@ -1617,7 +1609,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             ],
             &input,
         )
-        .map(crate::engine::git_cli::text_from_bytes)
+        .map(crate::engine::process::text_from_bytes)
     }
 
     /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
@@ -2478,15 +2470,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
             }
             // A deadline is a finished run that git did not: its message is
             // the same sentence a timeout error carries.
-            Ok(crate::engine::git_cli::BoundedRun {
-                incomplete: Some(crate::engine::git_cli::Incomplete::Deadline { message, .. }),
+            Ok(crate::engine::process::BoundedRun {
+                incomplete: Some(crate::engine::process::Incomplete::Deadline { message, .. }),
                 ..
             }) => (Err(with_lock(message).into()), "timed_out"),
             Ok(run) if run.success => (Ok(finished(false, started)), "written"),
             Ok(run) => (
                 Err(with_lock(format!(
                     "git commit-graph write failed: {}",
-                    crate::engine::git_cli::byte_tail(&run.stderr, 400).trim()
+                    crate::engine::process::byte_tail(&run.stderr, 400).trim()
                 ))
                 .into()),
                 "failed",
@@ -2495,12 +2487,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
             // spawned, and the person's stop is the answer, not a failure.
             Err(error)
                 if stop.load(std::sync::atomic::Ordering::SeqCst)
-                    && !crate::engine::git_cli::is_timed_out(error.message()) =>
+                    && !crate::engine::process::is_timed_out(error.message()) =>
             {
                 (Ok(finished(true, started)), "cancelled")
             }
             Err(error) => {
-                let journal = if crate::engine::git_cli::is_timed_out(error.message()) {
+                let journal = if crate::engine::process::is_timed_out(error.message()) {
                     "timed_out"
                 } else {
                     "failed"
@@ -3235,7 +3227,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     )
                 )) {
             Some(
-                super::git_cli::canonicalize_plain(source_path)
+                super::process::canonicalize_plain(source_path)
                     .map_err(|error| format!("Cannot resolve local clone source: {error}"))?,
             )
         } else {
@@ -3452,7 +3444,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
             dest.display()
         )
     })?;
-    let parent_canonical = crate::engine::git_cli::canonicalize_plain(parent).map_err(|e| {
+    let parent_canonical = crate::engine::process::canonicalize_plain(parent).map_err(|e| {
         format!(
             "Cannot resolve clone destination parent '{}': {}",
             parent.display(),
@@ -3469,7 +3461,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
                 )
                 .into());
             }
-            let actual = crate::engine::git_cli::canonicalize_plain(dest).map_err(|e| {
+            let actual = crate::engine::process::canonicalize_plain(dest).map_err(|e| {
                 format!(
                     "Cannot resolve clone destination '{}': {}",
                     dest.display(),
@@ -3738,25 +3730,86 @@ pub(crate) fn summarize_git_failure(raw: &str) -> String {
 
 const PUSH_DETACHED: &str = "Cannot push: HEAD is detached. Check out a branch, then push.";
 const PUSH_NO_REMOTES: &str = "This repository has no remotes. Add a remote before pushing.";
+const PUSH_UPSTREAM_UNKNOWN: &str = "Cannot push: the upstream could not be determined";
 
-fn branch_has_upstream(repo: &Path) -> bool {
-    git_text(
-        repo,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .map(|text| !text.trim().is_empty())
-    .unwrap_or(false)
+/// What a read of one git config key reported, before any caller decides what
+/// absence means.
+///
+/// `git config --get` exits 1 for a key that is unset, and also for a key git
+/// refuses as invalid; the second prints to stderr, so exit 1 with output on
+/// stderr is a failed read, not an absent key. Every other non-zero exit, a
+/// stream cut short, and a cancelled run are failed reads too. The value is
+/// returned as git printed it, trimmed: an empty value is `Some("")`, which is
+/// not the same answer as `None`.
+fn config_get_outcome(name: &str, run: BoundedRun) -> Result<Option<String>, CommandError> {
+    let run = run.require_complete("git config")?;
+    if run.cancelled {
+        return Err(format!("Reading {name} from git config was cancelled").into());
+    }
+    match run.status_code {
+        0 => Ok(Some(
+            String::from_utf8_lossy(&run.stdout).trim().to_string(),
+        )),
+        1 if String::from_utf8_lossy(&run.stderr).trim().is_empty() => Ok(None),
+        code => Err(format!(
+            "Could not read {name} from git config (exit {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into()),
+    }
 }
 
-fn current_branch_name(repo: &Path) -> Result<String, CommandError> {
-    crate::engine::git_reader::head_branch(repo)?
-        .ok_or_else(|| PUSH_DETACHED.to_string())
-        .map_err(CommandError::from)
+fn config_get_exact(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
+    config_get_outcome(name, git_captured(repo, &["config", "--get", name])?)
+}
+
+/// Whether a branch publishes somewhere by its own configuration.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchUpstream {
+    /// `branch.<name>.remote` and `branch.<name>.merge` are both set. Git, not
+    /// GitPulse, decides what a bare `git push` does with them, whether or not
+    /// the tracking ref exists yet and whether or not the remote still does.
+    Configured,
+    /// Neither key is set: git read the configuration and found no upstream.
+    Unconfigured,
+}
+
+/// Reads a branch's upstream from its configuration. `Err` is the third answer,
+/// "could not be determined": a failed read, or a configuration that sets only
+/// part of an upstream (one key, or an empty value). Neither may be planned as
+/// an unpublished branch, because `-u <default remote> <branch>` would send the
+/// branch to a remote it was not configured for and rewrite its upstream.
+fn branch_upstream(repo: &Path, branch: &str) -> Result<BranchUpstream, CommandError> {
+    let read = |key: &str| {
+        let name = format!("branch.{branch}.{key}");
+        config_get_exact(repo, &name).map_err(|err| {
+            CommandError::from(format!(
+                "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: {}",
+                err.message()
+            ))
+        })
+    };
+    let remote = read("remote")?;
+    let merge = read("merge")?;
+    let set = |value: &Option<String>| value.as_deref().is_some_and(|text| !text.trim().is_empty());
+    match (&remote, &merge) {
+        (None, None) => Ok(BranchUpstream::Unconfigured),
+        _ if set(&remote) && set(&merge) => Ok(BranchUpstream::Configured),
+        _ => Err(format!(
+            "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: its upstream is only partly configured \
+             (branch.{branch}.remote and branch.{branch}.merge must both be set, or both \
+             removed). Fix the configuration or name the remote to push to."
+        )
+        .into()),
+    }
+}
+
+/// The branch HEAD is on; `None` when HEAD is detached. The name is not
+/// validated for argv here: a branch that is only read for its configuration
+/// is never put on a command line, and the callers that do put it there
+/// validate it themselves.
+fn read_head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
+    crate::engine::git_reader::head_branch_name(repo)
 }
 
 /// Remote to publish an unpublished branch to when the caller did not name one.
@@ -3770,10 +3823,9 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, CommandError> {
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
     }
-    if let Ok(configured) = git_text(repo, &["config", "--get", "checkout.defaultRemote"]) {
-        let name = configured.trim();
-        if remotes.iter().any(|remote| remote == name) {
-            return Ok(name.to_string());
+    if let Some(configured) = config_get_exact(repo, "checkout.defaultRemote")? {
+        if remotes.contains(&configured) {
+            return Ok(configured);
         }
     }
     if remotes.iter().any(|remote| remote == "origin") {
@@ -3805,7 +3857,8 @@ const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"
 fn require_force_if_includes(
     preflight: &crate::engine::git_cli::GitPreflight,
 ) -> Result<(), CommandError> {
-    use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
+    use crate::engine::git_cli::{supports, GitPreflightStatus};
+    use crate::engine::process::is_deferred_under_load;
     if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
         return Ok(());
     }
@@ -3839,9 +3892,7 @@ fn require_force_if_includes(
         .message
         .as_deref()
         .unwrap_or("no version was reported");
-    let detail = detail
-        .strip_prefix("Git could not be checked yet: ")
-        .unwrap_or(detail);
+    let detail = detail.trim_prefix("Git could not be checked yet: ");
     if is_deferred_under_load(detail) {
         return Err(detail.to_string().into());
     }
@@ -3878,8 +3929,8 @@ fn plan_push_argv(
     }
     match (remote, branch) {
         (None, None) => {
-            if !branch_has_upstream(repo) {
-                let branch = current_branch_name(repo)?;
+            let branch = read_head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())?;
+            if branch_upstream(repo, &branch)? == BranchUpstream::Unconfigured {
                 let remote = unpublished_push_remote(repo)?;
                 validate_ref_name(&remote)?;
                 validate_push_branch(&branch)?;
@@ -3919,15 +3970,13 @@ fn plan_push_argv(
 /// branch's own `branch.<name>.remote` when it names a configured remote,
 /// else the same choice an unpublished branch makes.
 fn implicit_push_remote(repo: &Path) -> Result<String, CommandError> {
-    if let Ok(branch) = current_branch_name(repo) {
+    // Detached HEAD is an answer (no branch, so no branch remote); a HEAD or
+    // config read that failed is not, and must not fall through to a default.
+    if let Some(branch) = read_head_branch(repo)? {
         let key = format!("branch.{branch}.remote");
-        if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
-            let name = configured.trim();
-            if crate::engine::remotes::list_names(repo)?
-                .iter()
-                .any(|remote| remote == name)
-            {
-                return Ok(name.to_string());
+        if let Some(configured) = config_get_exact(repo, &key)? {
+            if crate::engine::remotes::list_names(repo)?.contains(&configured) {
+                return Ok(configured);
             }
         }
     }
@@ -4043,6 +4092,1004 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
         return Err("Invalid revision".into());
     }
     Ok(())
+}
+
+// ── Agent git operation log (`refs/gitpulse/ops/*`) & CAS undo ─────────────────
+//
+// Security-Impact Statement (`refs/gitpulse/ops/*`):
+// - Namespace & authority: snapshots are stored solely under `refs/gitpulse/ops/<n>`
+//   by the desktop app process inside `GitWriter` (under `repo_mutation_lock`),
+//   never by external hook scripts; `hooks/` stays strictly decide-only and only
+//   sends `Request::RecordGitOp` over the UID-authenticated single-instance unix
+//   socket mailbox. Failed or unreachable snapshot attempts write an
+//   `"unsnapshotted"` ledger row and emit a visible notice rather than failing open
+//   in silence.
+// - Command & secret handling: command text recorded in snapshot commit metadata is
+//   passed through `crate::ledger::redact::text` before writing commit objects so
+//   tokens/credentials embedded in shell commands do not persist in git history.
+// - Working-tree & ref integrity on Undo: every ref restore runs under
+//   `harness::guard` (`cmd_undo_op_snapshot`), checks `repo_op::detect` to refuse
+//   parked multi-step states, refuses dirty working trees unless `confirm_dirty` is
+//   explicitly set after UI review, and executes atomic `git update-ref --stdin -z`
+//   with explicit expected old OIDs (CAS), refusing and naming any moved ref.
+// - Config hygiene: snapshot creation uses inline `-c` flags only (`user.name`,
+//   `user.email`, `commit.gpgsign=false`) and cap/expiry eviction deletes refs via
+//   `git update-ref -d` without ever modifying `.git/config`.
+
+/// Identity flags for objects GitPulse writes on its own behalf (op-log
+/// snapshots, turn checkpoints): inline `-c`, never `.git/config`.
+pub(crate) const SNAPSHOT_IDENTITY_ARGS: [&str; 6] = [
+    "-c",
+    "user.name=GitPulse",
+    "-c",
+    "user.email=gitpulse@local",
+    "-c",
+    "commit.gpgsign=false",
+];
+
+/// Ref prefix under which pre-op agent snapshots are stored.
+pub const OP_REF_PREFIX: &str = "refs/gitpulse/ops/";
+/// Maximum number of retained snapshots per repository before oldest are evicted.
+pub const MAX_OPS: usize = 50;
+/// Snapshot retention window in seconds before automatic expiry pruning (7 days).
+pub const OP_EXPIRY_SECS: u64 = 7 * 24 * 3600;
+const OP_SNAPSHOT_VERSION: u32 = 1;
+const OP_SNAPSHOT_PARENT_CAP: usize = 64;
+const OP_MAX_LIST_LIMIT: usize = 200;
+
+/// One recorded ref in an agent operation snapshot alongside its current live target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpRefEntry {
+    pub refname: String,
+    pub oid: String,
+    pub current_oid: Option<String>,
+}
+
+/// Summary of one pre-op snapshot commit stored under `refs/gitpulse/ops/<seq>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpSnapshotSummary {
+    pub seq: u64,
+    pub op_ref: String,
+    pub snapshot_oid: String,
+    pub created_at: i64,
+    pub command: String,
+    pub head_ref: Option<String>,
+    pub head_oid: Option<String>,
+    pub stash_oid: Option<String>,
+    pub refs: Vec<OpRefEntry>,
+}
+
+/// Bounded list of agent operation snapshots, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpSnapshotList {
+    pub entries: Vec<OpSnapshotSummary>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+/// Caller's reviewed expectation for a single ref during CAS undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoExpectation {
+    pub refname: String,
+    pub expected_oid: Option<String>,
+}
+
+/// Reviewed plan to restore every ref recorded in snapshot `seq` via CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoPlan {
+    pub seq: u64,
+    pub expected_refs: Vec<OpUndoExpectation>,
+    pub confirm_dirty: bool,
+}
+
+/// Result of restoring snapshot `seq` via atomic CAS `update-ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpUndoOutcome {
+    pub seq: u64,
+    pub op_ref: String,
+    pub restored_refs: usize,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpSnapshotRefRecord {
+    refname: String,
+    oid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpSnapshotPayload {
+    v: u32,
+    seq: u64,
+    created_at: i64,
+    command: String,
+    head_ref: Option<String>,
+    head_oid: Option<String>,
+    stash_oid: Option<String>,
+    refs: Vec<OpSnapshotRefRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRefRow {
+    refname: String,
+    oid: String,
+    commit_oid: Option<String>,
+}
+
+pub(crate) fn absent_oid_for_len(oid_len: usize) -> &'static str {
+    if oid_len == 64 {
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    } else {
+        "0000000000000000000000000000000000000000"
+    }
+}
+
+fn repo_absent_oid(
+    repo: &Path,
+    head_oid: Option<&str>,
+    refs: &[LiveRefRow],
+) -> Result<&'static str, CommandError> {
+    if let Some(oid) = head_oid.or_else(|| refs.first().map(|r| r.oid.as_str())) {
+        return Ok(absent_oid_for_len(oid.len()));
+    }
+    let fmt = git_text(repo, &["rev-parse", "--show-object-format"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    Ok(absent_oid_for_len(if fmt == "sha256" { 64 } else { 40 }))
+}
+
+fn read_head_oid(repo: &Path) -> Result<Option<String>, CommandError> {
+    let run = git_captured(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    if !run.success {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    validate_oid(&oid)?;
+    Ok(Some(oid))
+}
+
+fn read_head_symbolic_ref(repo: &Path) -> Result<Option<String>, CommandError> {
+    let run = git_captured(repo, &["symbolic-ref", "-q", "HEAD"])?;
+    if !run.success {
+        return Ok(None);
+    }
+    let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if name.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
+}
+
+fn read_heads_and_tags(repo: &Path) -> Result<Vec<LiveRefRow>, CommandError> {
+    let raw = git_text(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\0').collect();
+        if parts.len() < 3 {
+            return Err("Unexpected for-each-ref record while reading refs".into());
+        }
+        let refname = parts[0];
+        let oid = parts[1];
+        let obj_type = parts[2];
+        let peeled_oid = parts.get(3).copied().unwrap_or("");
+        let peeled_type = parts.get(4).copied().unwrap_or("");
+        validate_ref_name(refname)?;
+        validate_oid(oid)?;
+        let commit_oid = if obj_type == "commit" {
+            Some(oid.to_string())
+        } else if obj_type == "tag" && peeled_type == "commit" && is_full_oid(peeled_oid) {
+            Some(peeled_oid.to_string())
+        } else {
+            None
+        };
+        rows.push(LiveRefRow {
+            refname: refname.to_string(),
+            oid: oid.to_string(),
+            commit_oid,
+        });
+    }
+    Ok(rows)
+}
+
+/// Returns `true` when the working tree or index holds user changes that an
+/// op-log undo could overwrite. Ignores only untracked `.devcouncil/` entries
+/// created by GitPulse's own SQLite ledger/workbench state in repositories
+/// whose `.gitignore` does not yet cover `.devcouncil/`.
+fn working_tree_has_user_changes(repo: &Path) -> Result<bool, CommandError> {
+    let raw = git_text(repo, &["status", "--porcelain=v1", "-z"])?;
+    for entry in raw.split('\0') {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = &entry[3..];
+        if status == "??" && (path == ".devcouncil" || path.starts_with(".devcouncil/")) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn list_op_ref_tips(repo: &Path) -> Result<Vec<(u64, String, String)>, CommandError> {
+    let raw = git_text(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            OP_REF_PREFIX,
+        ],
+    )?;
+    let mut tips = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((refname, oid)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some(suffix) = refname.strip_prefix(OP_REF_PREFIX) else {
+            continue;
+        };
+        let Ok(seq) = suffix.parse::<u64>() else {
+            continue;
+        };
+        if validate_oid(oid).is_err() {
+            continue;
+        }
+        tips.push((seq, refname.to_string(), oid.to_string()));
+    }
+    tips.sort_by_key(|(seq, _, _)| *seq);
+    Ok(tips)
+}
+
+fn read_op_payload(
+    repo: &Path,
+    seq: u64,
+    op_ref: &str,
+    snapshot_oid: &str,
+) -> Result<OpSnapshotPayload, CommandError> {
+    let raw = git_text(repo, &["cat-file", "commit", snapshot_oid])?;
+    let (_, body) = raw
+        .split_once("\n\n")
+        .ok_or_else(|| format!("Snapshot {op_ref} ({snapshot_oid}) has no commit message body"))?;
+    let trimmed = body.trim();
+    let payload: OpSnapshotPayload = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Snapshot {op_ref} ({snapshot_oid}) payload is invalid JSON: {e}"))?;
+    if payload.seq != seq {
+        return Err(format!(
+            "Snapshot {op_ref} sequence mismatch: payload carries {}, ref carries {seq}",
+            payload.seq
+        )
+        .into());
+    }
+    Ok(payload)
+}
+
+fn resolve_snapshot_tree_oid(repo: &Path, head_oid: Option<&str>) -> Result<String, CommandError> {
+    if head_oid.is_some() {
+        let tree = git_text(repo, &["rev-parse", "--verify", "HEAD^{tree}"])?;
+        let trimmed = tree.trim();
+        validate_oid(trimmed)?;
+        return Ok(trimmed.to_string());
+    }
+    let out = git_with_stdin(repo, &["mktree"], b"")?;
+    let tree = String::from_utf8_lossy(&out).trim().to_string();
+    validate_oid(&tree)?;
+    Ok(tree)
+}
+
+fn prune_op_snapshots_locked(
+    repo: &Path,
+    now_secs: i64,
+    max_ops: usize,
+    expiry_secs: u64,
+    keep_seq: Option<u64>,
+) -> Result<usize, CommandError> {
+    let tips = list_op_ref_tips(repo)?;
+    let mut survivors: Vec<(u64, String, String)> = Vec::new();
+    let mut removed = 0usize;
+
+    for (seq, op_ref, snapshot_oid) in tips {
+        let is_kept = keep_seq == Some(seq) && max_ops > 0;
+        let expired = if is_kept {
+            false
+        } else {
+            match read_op_payload(repo, seq, &op_ref, &snapshot_oid) {
+                Ok(payload) => {
+                    now_secs > payload.created_at
+                        && (now_secs - payload.created_at) as u64 > expiry_secs
+                }
+                // Corrupt/unparseable op ref is cleaned up on prune only when expired isn't known? Keep readable-only expiry, avoid silent data loss unless unreadable? Wait: don't delete valid newer refs on transient read errors; only delete verified expired ones.
+                Err(_) => false,
+            }
+        };
+        if expired {
+            let run = git_captured(repo, &["update-ref", "-d", &op_ref, &snapshot_oid])?;
+            if !run.success {
+                return Err(format!(
+                    "Failed to prune expired snapshot {op_ref}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+            removed += 1;
+        } else {
+            survivors.push((seq, op_ref, snapshot_oid));
+        }
+    }
+
+    if survivors.len() > max_ops {
+        let mut excess = survivors.len() - max_ops;
+        for (seq, op_ref, snapshot_oid) in survivors {
+            if excess == 0 {
+                break;
+            }
+            if keep_seq == Some(seq) && max_ops > 0 {
+                continue;
+            }
+            let run = git_captured(repo, &["update-ref", "-d", &op_ref, &snapshot_oid])?;
+            if !run.success {
+                return Err(format!(
+                    "Failed to evict oldest snapshot {op_ref}: {}",
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+            removed += 1;
+            excess -= 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+#[cfg(test)]
+fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
+    static FAILURES: OnceLock<Mutex<Vec<(PathBuf, String)>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
+    let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
+    op_snapshot_test_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((canon, reason.to_string()));
+}
+
+#[cfg(test)]
+fn take_injected_op_snapshot_failure(repo: &Path) -> Option<String> {
+    let mut guard = op_snapshot_test_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pos = guard.iter().position(|(p, _)| p == repo)?;
+    Some(guard.remove(pos).1)
+}
+
+/// The moment an op snapshot's asker stops waiting, read from a clock that a
+/// test can script. The asker lets its git write run at that moment, so state
+/// captured at or after it may already include the write.
+#[derive(Clone, Copy)]
+pub(crate) struct AskerDeadline {
+    expires_at: Instant,
+    now: fn() -> Instant,
+}
+
+impl AskerDeadline {
+    /// `budget` from `start`, on the real clock.
+    pub(crate) fn new(start: Instant, budget: Duration) -> Self {
+        Self {
+            expires_at: start + budget,
+            now: Instant::now,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
+        Self { expires_at, now }
+    }
+
+    /// The instant itself counts as passed: the asker's read deadline fires at
+    /// exactly the budget, so an answer at that instant is already unwanted.
+    fn has_passed(&self) -> bool {
+        (self.now)() >= self.expires_at
+    }
+}
+
+/// What an op snapshot's asker told the app: the request's id, which ties every
+/// ledger row for one write together, and the deadline it will stop waiting at.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OpAsk<'a> {
+    pub(crate) request_id: Option<&'a str>,
+    pub(crate) deadline: Option<AskerDeadline>,
+}
+
+/// The failure an app answers when the asker's deadline passed before the state
+/// to snapshot was captured. No ref and no snapshotted row exist for it.
+pub(crate) const OP_DEADLINE_PASSED: &str =
+    "the asker's op-snapshot deadline passed before the repository state was captured; no snapshot was recorded";
+
+impl GitWriter {
+    /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
+    pub(crate) fn record_op_snapshot(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        ask: &OpAsk<'_>,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        Self::record_op_snapshot_with_limits_asked(
+            repo_path,
+            command,
+            session_id,
+            task_id,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+            ask,
+        )
+    }
+
+    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits,
+    /// for a caller with no asker waiting on it.
+    pub fn record_op_snapshot_with_limits(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        now_ms: u64,
+        max_ops: usize,
+        expiry_secs: u64,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        Self::record_op_snapshot_with_limits_asked(
+            repo_path,
+            command,
+            session_id,
+            task_id,
+            now_ms,
+            max_ops,
+            expiry_secs,
+            &OpAsk::default(),
+        )
+    }
+
+    /// The snapshot itself, for an asker that may have stopped waiting.
+    ///
+    /// The rule: a snapshot is a true pre-op state only if its state was
+    /// captured before the asker's deadline, because at the deadline the asker
+    /// lets its git write run. So the deadline is checked before the lock, after
+    /// the lock is acquired, and again once the state has been read and
+    /// immediately before the ref is written. A pass at any of them writes no
+    /// ref and no snapshotted row and answers [`OP_DEADLINE_PASSED`]. A ref
+    /// whose state was captured in time is a valid pre-op snapshot even if its
+    /// write finishes a moment past the deadline, and is kept as a normal one;
+    /// there are no late-marked refs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_op_snapshot_with_limits_asked(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        now_ms: u64,
+        max_ops: usize,
+        expiry_secs: u64,
+        ask: &OpAsk<'_>,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        let deadline_passed = || ask.deadline.is_some_and(|deadline| deadline.has_passed());
+        if command.trim().is_empty() {
+            return Err("Operation command must not be empty".into());
+        }
+        let repo = validate_repo(repo_path)?;
+        #[cfg(test)]
+        if let Some(reason) = take_injected_op_snapshot_failure(&repo) {
+            return Err(reason.into());
+        }
+        // Cheap early refusal: no lock to wait for, no state to read.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lock may have been held by another write for as long as it took
+        // for the asker to give up.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
+
+        let head_ref = read_head_symbolic_ref(&repo)?;
+        let head_oid = read_head_oid(&repo)?;
+        let live_refs = read_heads_and_tags(&repo)?;
+        let stash_oid = crate::engine::stash::stash_create_in(&repo)?;
+        let tree_oid = resolve_snapshot_tree_oid(&repo, head_oid.as_deref())?;
+        let absent_oid = repo_absent_oid(&repo, head_oid.as_deref(), &live_refs)?;
+
+        let existing_tips = list_op_ref_tips(&repo)?;
+        let next_seq = existing_tips
+            .last()
+            .map(|(seq, _, _)| seq.saturating_add(1))
+            .unwrap_or(1);
+        let op_ref = format!("{OP_REF_PREFIX}{next_seq}");
+        let created_at = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
+        let redacted_command = crate::ledger::redact::text(command);
+
+        let payload = OpSnapshotPayload {
+            v: OP_SNAPSHOT_VERSION,
+            seq: next_seq,
+            created_at,
+            command: redacted_command.clone(),
+            head_ref: head_ref.clone(),
+            head_oid: head_oid.clone(),
+            stash_oid: stash_oid.clone(),
+            refs: live_refs
+                .iter()
+                .map(|r| OpSnapshotRefRecord {
+                    refname: r.refname.clone(),
+                    oid: r.oid.clone(),
+                })
+                .collect(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("Failed to serialize op snapshot payload: {e}"))?;
+
+        let mut parents: Vec<String> = Vec::new();
+        let mut seen_parents: HashSet<String> = HashSet::new();
+        for oid in head_oid
+            .iter()
+            .chain(stash_oid.iter())
+            .chain(live_refs.iter().filter_map(|r| r.commit_oid.as_ref()))
+        {
+            if parents.len() >= OP_SNAPSHOT_PARENT_CAP {
+                break;
+            }
+            if seen_parents.insert(oid.clone()) {
+                parents.push(oid.clone());
+            }
+        }
+
+        let mut args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .chain(["commit-tree".to_string(), tree_oid])
+            .collect();
+        for p in &parents {
+            args.push("-p".into());
+            args.push(p.clone());
+        }
+        args.push("-F".into());
+        args.push("-".into());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let commit_run = git_captured_with_stdin(&repo, &arg_refs, &payload_bytes)?;
+        if !commit_run.success {
+            return Err(format!(
+                "Failed to write op snapshot commit object: {}",
+                String::from_utf8_lossy(&commit_run.stderr).trim()
+            )
+            .into());
+        }
+        let snapshot_oid = String::from_utf8_lossy(&commit_run.stdout)
+            .trim()
+            .to_string();
+        validate_oid(&snapshot_oid)?;
+
+        // The state was read above. If the asker has stopped waiting, its write
+        // may already have changed the repository, so what was read is not a
+        // pre-op state: leave the commit object unreferenced (git gc collects
+        // it) and write no ref.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
+        let ref_run = git_captured(&repo, &["update-ref", &op_ref, &snapshot_oid, absent_oid])?;
+        if !ref_run.success {
+            return Err(format!(
+                "Failed to record snapshot ref {op_ref}: {}",
+                String::from_utf8_lossy(&ref_run.stderr).trim()
+            )
+            .into());
+        }
+
+        let keep = if max_ops > 0 { Some(next_seq) } else { None };
+        // The ref is durable now, so the snapshot exists whatever retention
+        // does next: a failed prune is reported on the snapshot's own ledger
+        // row, never as a failed snapshot.
+        let prune_error =
+            match prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep) {
+                Ok(_) => None,
+                Err(err) => {
+                    log::warn!(
+                        "op snapshot {op_ref} was recorded but retention pruning failed: {}",
+                        err.message()
+                    );
+                    Some(err.message().to_string())
+                }
+            };
+
+        crate::ledger::record_op_snapshot_event(
+            repo_path,
+            &redacted_command,
+            session_id,
+            task_id,
+            head_oid.as_deref(),
+            &op_ref,
+            next_seq,
+            stash_oid.as_deref(),
+            live_refs.len(),
+            prune_error.as_deref(),
+            ask.request_id,
+            now_ms,
+        );
+
+        let refs = live_refs
+            .into_iter()
+            .map(|r| OpRefEntry {
+                refname: r.refname,
+                oid: r.oid.clone(),
+                current_oid: Some(r.oid),
+            })
+            .collect();
+
+        Ok(OpSnapshotSummary {
+            seq: next_seq,
+            op_ref,
+            snapshot_oid,
+            created_at,
+            command: redacted_command,
+            head_ref,
+            head_oid,
+            stash_oid,
+            refs,
+        })
+    }
+
+    /// Evicts expired or over-cap snapshots under `refs/gitpulse/ops/*` without
+    /// modifying `.git/config`.
+    pub fn prune_op_snapshots(
+        repo_path: &str,
+        now_secs: i64,
+        max_ops: usize,
+        expiry_secs: u64,
+    ) -> Result<usize, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_op_snapshots_locked(&repo, now_secs, max_ops, expiry_secs, None)
+    }
+
+    /// Lists recorded snapshots under `refs/gitpulse/ops/*` newest first,
+    /// populating each recorded ref's live `current_oid`.
+    pub fn list_op_snapshots(
+        repo_path: &str,
+        limit: usize,
+    ) -> Result<OpSnapshotList, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let live_refs = read_heads_and_tags(&repo)?;
+        let live_map: HashMap<String, String> =
+            live_refs.into_iter().map(|r| (r.refname, r.oid)).collect();
+        let mut tips = list_op_ref_tips(&repo)?;
+        tips.reverse();
+
+        let cap = limit.clamp(1, OP_MAX_LIST_LIMIT);
+        let mut parsed = Vec::new();
+        for (seq, op_ref, snapshot_oid) in tips {
+            let Ok(payload) = read_op_payload(&repo, seq, &op_ref, &snapshot_oid) else {
+                continue;
+            };
+            let refs = payload
+                .refs
+                .into_iter()
+                .map(|r| {
+                    let current_oid = live_map.get(&r.refname).cloned();
+                    OpRefEntry {
+                        refname: r.refname,
+                        oid: r.oid,
+                        current_oid,
+                    }
+                })
+                .collect();
+            parsed.push(OpSnapshotSummary {
+                seq,
+                op_ref,
+                snapshot_oid,
+                created_at: payload.created_at,
+                command: payload.command,
+                head_ref: payload.head_ref,
+                head_oid: payload.head_oid,
+                stash_oid: payload.stash_oid,
+                refs,
+            });
+        }
+        let total = parsed.len();
+        let truncated = total > cap;
+        parsed.truncate(cap);
+        Ok(OpSnapshotList {
+            entries: parsed,
+            total,
+            truncated,
+        })
+    }
+
+    /// Builds an [`OpUndoPlan`] for snapshot `seq` from the current live refs.
+    pub fn prepare_op_undo(repo_path: &str, seq: u64) -> Result<OpUndoPlan, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let op_ref = format!("{OP_REF_PREFIX}{seq}");
+        let tips = list_op_ref_tips(&repo)?;
+        let (_, _, snapshot_oid) = tips
+            .into_iter()
+            .find(|(s, _, _)| *s == seq)
+            .ok_or_else(|| format!("Op snapshot {op_ref} does not exist"))?;
+        let payload = read_op_payload(&repo, seq, &op_ref, &snapshot_oid)?;
+        let live_refs: HashMap<String, String> = read_heads_and_tags(&repo)?
+            .into_iter()
+            .map(|r| (r.refname, r.oid))
+            .collect();
+        let expected_refs = payload
+            .refs
+            .into_iter()
+            .map(|r| OpUndoExpectation {
+                expected_oid: live_refs.get(&r.refname).cloned(),
+                refname: r.refname,
+            })
+            .collect();
+        Ok(OpUndoPlan {
+            seq,
+            expected_refs,
+            confirm_dirty: false,
+        })
+    }
+
+    /// Restores every ref recorded by snapshot `plan.seq` through atomic CAS
+    /// `git update-ref --stdin -z`. Refuses before touching any ref if a
+    /// multi-step operation is parked, the working tree is dirty without
+    /// `confirm_dirty`, or any expected ref moved since review (naming every
+    /// moved ref). Appends a `git.op.undo` ledger row with `before_ref`/`after_ref`.
+    pub(crate) fn undo_op_snapshot_with_gate(
+        repo_path: &str,
+        plan: &OpUndoPlan,
+        gate: crate::engine::worktree::GitWriteGate<'_>,
+    ) -> Result<OpUndoOutcome, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        let lock = repo_mutation_lock(&repo);
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(parked) = crate::engine::repo_op::detect(&repo)? {
+            return Err(format!(
+                "Cannot undo op snapshot while a {} is in progress. Finish or abort it first.",
+                parked.kind.label()
+            )
+            .into());
+        }
+
+        let op_ref = format!("{OP_REF_PREFIX}{}", plan.seq);
+        let tips = list_op_ref_tips(&repo)?;
+        let (_, _, snapshot_oid) = tips
+            .into_iter()
+            .find(|(s, _, _)| *s == plan.seq)
+            .ok_or_else(|| format!("Op snapshot {op_ref} does not exist"))?;
+        let payload = read_op_payload(&repo, plan.seq, &op_ref, &snapshot_oid)?;
+
+        let head_before = read_head_oid(&repo)?;
+        let head_sym_before = read_head_symbolic_ref(&repo)?;
+        let live_rows = read_heads_and_tags(&repo)?;
+        let absent_oid = repo_absent_oid(&repo, head_before.as_deref(), &live_rows)?;
+        let live_map: HashMap<String, String> =
+            live_rows.into_iter().map(|r| (r.refname, r.oid)).collect();
+
+        let mut expected_map: HashMap<&str, Option<&str>> =
+            HashMap::with_capacity(plan.expected_refs.len());
+        for exp in &plan.expected_refs {
+            validate_ref_name(&exp.refname)?;
+            if let Some(oid) = &exp.expected_oid {
+                validate_oid(oid)?;
+            }
+            if expected_map
+                .insert(exp.refname.as_str(), exp.expected_oid.as_deref())
+                .is_some()
+            {
+                return Err(format!(
+                    "Undo plan contains duplicate expectation for {}",
+                    exp.refname
+                )
+                .into());
+            }
+        }
+
+        for recorded in &payload.refs {
+            validate_ref_name(&recorded.refname)?;
+            validate_oid(&recorded.oid)?;
+            if !expected_map.contains_key(recorded.refname.as_str()) {
+                return Err(format!(
+                    "Undo plan omits recorded ref {} from snapshot {}",
+                    recorded.refname, plan.seq
+                )
+                .into());
+            }
+        }
+
+        let mut moved_refs = Vec::new();
+        for exp in &plan.expected_refs {
+            let live_oid = live_map.get(&exp.refname).map(String::as_str);
+            if live_oid != exp.expected_oid.as_deref() {
+                moved_refs.push(exp.refname.clone());
+            }
+        }
+        if !moved_refs.is_empty() {
+            return Err(format!(
+                "Cannot undo op snapshot {}: ref moved since review ({}). Refresh snapshots and review again.",
+                plan.seq,
+                moved_refs.join(", ")
+            )
+            .into());
+        }
+
+        if !plan.confirm_dirty && working_tree_has_user_changes(&repo)? {
+            return Err(
+                "Working tree has uncommitted changes; confirm dirty-worktree overwrite before undoing this op."
+                    .into(),
+            );
+        }
+
+        if !payload.refs.is_empty() {
+            gate(&["git", "update-ref", "--stdin"])?;
+            let mut batch = Vec::new();
+            batch.extend_from_slice(b"start\0");
+            for recorded in &payload.refs {
+                let old_oid = live_map
+                    .get(&recorded.refname)
+                    .map(String::as_str)
+                    .unwrap_or(absent_oid);
+                batch.extend_from_slice(b"update ");
+                batch.extend_from_slice(recorded.refname.as_bytes());
+                batch.push(0);
+                batch.extend_from_slice(recorded.oid.as_bytes());
+                batch.push(0);
+                batch.extend_from_slice(old_oid.as_bytes());
+                batch.push(0);
+            }
+            batch.extend_from_slice(b"prepare\0commit\0");
+
+            let run = git_captured_with_stdin(&repo, &["update-ref", "--stdin", "-z"], &batch)?;
+            if !run.success {
+                return Err(format!(
+                    "Atomic CAS update-ref failed for snapshot {}: {}",
+                    plan.seq,
+                    String::from_utf8_lossy(&run.stderr).trim()
+                )
+                .into());
+            }
+        }
+
+        let mut head_target_changed = false;
+        if let Some(sym) = &payload.head_ref {
+            validate_ref_name(sym)?;
+            if head_sym_before.as_deref() != Some(sym.as_str()) {
+                git_text(&repo, &["symbolic-ref", "HEAD", sym])?;
+                head_target_changed = true;
+            }
+        } else if let Some(detached_oid) = &payload.head_oid {
+            validate_oid(detached_oid)?;
+            if head_sym_before.is_some() || head_before.as_deref() != Some(detached_oid.as_str()) {
+                git_text(&repo, &["update-ref", "--no-deref", "HEAD", detached_oid])?;
+                head_target_changed = true;
+            }
+        }
+
+        let head_after = read_head_oid(&repo)?;
+        if (head_before != head_after || head_target_changed) && head_after.is_some() {
+            git_text(&repo, &["read-tree", "--reset", "-u", "HEAD"])?;
+        }
+
+        crate::ledger::record_op_undo_event(
+            repo_path,
+            plan.seq,
+            &op_ref,
+            head_before.as_deref(),
+            head_after.as_deref(),
+            payload.refs.len(),
+            crate::ledger::ids::now_millis(),
+        );
+
+        Ok(OpUndoOutcome {
+            seq: plan.seq,
+            op_ref,
+            restored_refs: payload.refs.len(),
+            head_before,
+            head_after,
+        })
+    }
+
+    /// Handles [`crate::desktop::instance::Request::RecordGitOp`] inside the
+    /// primary desktop process. Snapshot failures append `"unsnapshotted"` to
+    /// the ledger and return `snapshotted: false` so the hook never stays silent.
+    ///
+    /// `not_after_send` is an instant no later than the asker's send (the
+    /// mailbox takes it before greeting the asker). The asker waits a full
+    /// [`crate::desktop::instance::OP_RECORD_DEADLINE`] after its send, so the
+    /// same budget counted from this instant ends no later than the asker's
+    /// wait does: app start <= asker's send, asker waits >= budget after send,
+    /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
+    /// logged like any other failure (under the request's id), which is also
+    /// what settles the hook's "unknown" row for the same write.
+    pub fn serve_op_record(
+        request: &crate::desktop::instance::Request,
+        not_after_send: Instant,
+    ) -> Result<serde_json::Value, String> {
+        let crate::desktop::instance::Request::RecordGitOp {
+            id,
+            cwd,
+            command,
+            session_id,
+            task_id,
+        } = request
+        else {
+            return Err("not an op-record request".into());
+        };
+        let root = crate::engine::git_cli::find_git_root(Path::new(cwd))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.clone());
+        let ask = OpAsk {
+            request_id: Some(id.as_str()),
+            deadline: Some(AskerDeadline::new(
+                not_after_send,
+                crate::desktop::instance::OP_RECORD_DEADLINE,
+            )),
+        };
+        match Self::record_op_snapshot(
+            &root,
+            command,
+            session_id.as_deref(),
+            task_id.as_deref(),
+            &ask,
+        ) {
+            Ok(summary) => Ok(serde_json::json!({
+                "snapshotted": true,
+                "seq": summary.seq,
+                "op_ref": summary.op_ref,
+            })),
+            Err(err) => {
+                let head_before = validate_repo(&root)
+                    .ok()
+                    .and_then(|canon| read_head_oid(&canon).ok().flatten());
+                crate::ledger::record_unsnapshotted_git_op(
+                    &root,
+                    command,
+                    session_id.as_deref(),
+                    task_id.as_deref(),
+                    head_before.as_deref(),
+                    err.message(),
+                    Some(id.as_str()),
+                    crate::ledger::ids::now_millis(),
+                );
+                Ok(serde_json::json!({
+                    "snapshotted": false,
+                    "error": err.message(),
+                }))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6359,7 +7406,7 @@ mod tests {
             // Spawns of fetch/pull/push fail loudly here, so an Err that names
             // the target and is not a spawn failure proves git never ran it.
             let forced = |arg: &str, body: &dyn Fn() -> Result<String, CommandError>| {
-                crate::engine::git_cli::with_forced_spawn_failure_of(arg, body)
+                crate::engine::process::with_forced_spawn_failure_of(arg, body)
             };
             let results: Vec<(&str, Result<String, CommandError>)> = vec![
                 (
@@ -6475,6 +7522,283 @@ mod tests {
         let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
             .unwrap_err();
         assert!(err.contains("victim.git"), "{err}", err = err.message());
+    }
+
+    /// A repository with `origin` (the default remote) and `team`, neither
+    /// fetched, on `main`. The bare repositories are returned so they outlive
+    /// the test body.
+    fn two_remote_repo() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let origin = init_bare();
+        let team = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "team", team.path().to_str().unwrap()],
+        );
+        (repo, origin, team)
+    }
+
+    const FORCE_PAIR: [&str; 2] = ["--force-with-lease", "--force-if-includes"];
+
+    fn plan_plain_and_forced(repo: &tempfile::TempDir) -> [Result<Vec<String>, CommandError>; 2] {
+        [false, true].map(|force| GitWriter::plan_push(&repo_path(repo), None, None, force))
+    }
+
+    #[test]
+    fn a_configured_upstream_whose_tracking_ref_is_missing_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        // Configured, never fetched: `@{upstream}` cannot resolve, the
+        // configuration still names `team` as the destination.
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        let mut expected = vec!["push".to_string()];
+        expected.extend(FORCE_PAIR.map(String::from));
+        assert_eq!(forced.unwrap(), expected);
+    }
+
+    #[test]
+    fn an_upstream_naming_a_remote_that_no_longer_exists_is_never_replaced_by_the_default() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "gone"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        for planned in plan_plain_and_forced(&repo) {
+            let argv = planned.unwrap();
+            assert!(!argv.iter().any(|arg| arg == "-u"), "{argv:?}");
+            assert!(!argv.iter().any(|arg| arg == "origin"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_local_upstream_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["branch", "base"]);
+        git_in(repo.path(), &["config", "branch.main.remote", "."]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/base"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_branch_with_no_upstream_still_plans_set_upstream_to_the_default_remote() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+        assert_eq!(
+            forced.unwrap(),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "main"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_healthy_upstream_on_a_non_default_remote_is_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["push", "-q", "-u", "team", "main"]);
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        assert!(!forced.unwrap().iter().any(|arg| arg == "-u"));
+    }
+
+    #[test]
+    fn a_half_configured_upstream_is_refused_and_never_replaced_by_the_default_remote() {
+        // (remote, merge) as configured; `None` leaves the key unset.
+        let cases: [(Option<&str>, Option<&str>); 8] = [
+            (Some("team"), None),
+            (None, Some("refs/heads/main")),
+            (Some(""), Some("refs/heads/main")),
+            (Some("team"), Some("")),
+            (Some("  "), Some("refs/heads/main")),
+            (Some("team"), Some("  ")),
+            (Some(""), Some("")),
+            (Some(""), None),
+        ];
+        for (remote, merge) in cases {
+            let (repo, _origin, _team) = two_remote_repo();
+            if let Some(remote) = remote {
+                git_in(repo.path(), &["config", "branch.main.remote", remote]);
+            }
+            if let Some(merge) = merge {
+                git_in(repo.path(), &["config", "branch.main.merge", merge]);
+            }
+            for planned in plan_plain_and_forced(&repo) {
+                let err = planned.unwrap_err();
+                assert!(
+                    err.contains("upstream"),
+                    "{remote:?}/{merge:?}: {err}",
+                    err = err.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_name_with_slashes_plans_by_its_own_upstream_configuration() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "-b", "feat/x/y"]);
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "feat/x/y"]);
+        git_in(repo.path(), &["config", "branch.feat/x/y.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.feat/x/y.merge", "refs/heads/feat/x/y"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_flag_shaped_configuration_value_never_reaches_the_planned_argv() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "--mirror"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        // A default-remote setting that names no configured remote is not a
+        // destination; the unpublished path still resolves `origin`.
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(
+            repo.path(),
+            &["config", "checkout.defaultRemote", "--mirror"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+    }
+
+    #[test]
+    fn a_detached_head_keeps_the_detached_refusal_whatever_the_branch_configuration_says() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(
+                err.contains("HEAD is detached"),
+                "{err}",
+                err = err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_configuration_plans_nothing() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let config = repo.path().join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[branch \"main\"]\n\tremote = team\n\tmerge = refs/heads/main\n[bad\n");
+        std::fs::write(&config, text).unwrap();
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(!err.message().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_config_read_separates_unset_from_empty_from_failed() {
+        let run = |code: i32, out: &str, err: &str, cancelled: bool| BoundedRun {
+            stdout: out.as_bytes().to_vec(),
+            stderr: err.as_bytes().to_vec(),
+            success: code == 0,
+            status_code: code,
+            signal: None,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled,
+        };
+        let key = "branch.main.remote";
+        assert_eq!(
+            config_get_outcome(key, run(0, "team\n", "", false)).unwrap(),
+            Some("team".into())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(0, "\n", "", false)).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(1, "", "", false)).unwrap(),
+            None
+        );
+        for failed in [
+            run(1, "", "error: invalid key: branch.main.re mote\n", false),
+            run(128, "", "fatal: bad config line 3\n", false),
+            run(139, "", "", false),
+            run(0, "team\n", "", true),
+        ] {
+            assert!(config_get_outcome(key, failed).is_err());
+        }
+    }
+
+    #[test]
+    fn an_upstream_read_that_cannot_run_is_undetermined_not_unconfigured() {
+        let missing = tempfile::TempDir::new().unwrap();
+        let err = branch_upstream(&missing.path().join("absent"), "main").unwrap_err();
+        assert!(
+            err.contains(PUSH_UPSTREAM_UNKNOWN),
+            "{err}",
+            err = err.message()
+        );
+        let (repo, _origin, _team) = two_remote_repo();
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Unconfigured
+        );
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let err = branch_upstream(repo.path(), "main").unwrap_err();
+        assert!(
+            err.contains("partly configured"),
+            "{err}",
+            err = err.message()
+        );
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Configured
+        );
+    }
+
+    #[test]
+    fn a_branch_named_alone_resolves_the_remote_its_own_configuration_names() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "team", "feat"]);
+        git_in(repo.path(), &["config", "--unset", "branch.main.remote"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "feat"]);
+    }
+
+    #[test]
+    fn a_branch_named_alone_from_a_detached_head_still_plans() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("main"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "main"]);
     }
 
     #[test]
@@ -6900,7 +8224,7 @@ mod tests {
 
     /// Every `git config --get` child recorded for `repo` so far.
     fn config_get_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--get")
@@ -6946,7 +8270,7 @@ mod tests {
 
     /// Every `git config --list` child recorded for `repo` so far.
     fn config_list_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--list")
@@ -7764,7 +9088,7 @@ mod tests {
                 .count()
         };
 
-        let (staged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (staged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()))
         });
         assert_eq!(staged_result.expect("stage").1, 300);
@@ -7775,7 +9099,7 @@ mod tests {
         );
         assert_eq!(staged(&dir), 300);
 
-        let (unstaged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (unstaged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Unstage, |_| Ok(()))
         });
         assert_eq!(unstaged_result.expect("unstage").1, 300);
@@ -7816,7 +9140,7 @@ mod tests {
             for file in &files {
                 std::fs::write(dir.path().join(file), "x\n").unwrap();
             }
-            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
                 GitWriter::stage_files_attributed(&path, &files)
             });
             assert_eq!(outcomes.len(), count);
@@ -7839,7 +9163,7 @@ mod tests {
         for gone in [3usize, 17, 39] {
             std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         for (index, outcome) in outcomes.iter().enumerate() {
@@ -7869,7 +9193,7 @@ mod tests {
         let dir = init_repo_with_commit();
         let path = repo_path(&dir);
         let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_err));
@@ -7935,7 +9259,7 @@ mod tests {
         for file in &files {
             std::fs::write(dir.path().join(file), "x\n").unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
@@ -7958,7 +9282,7 @@ mod tests {
         }
         let lock = dir.path().join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         std::fs::remove_file(&lock).unwrap();
@@ -8231,7 +9555,7 @@ mod bound_to_checked_state {
         commit_file(p, "b.txt");
         let c3 = commit_file(p, "c.txt");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_rebase_sequence(
                 p.to_str().unwrap(),
                 &c1,
@@ -8263,7 +9587,7 @@ mod bound_to_checked_state {
         commit_file(p, "m.txt");
         let main_tip = rev(p, "main");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_restack(p, "feature", "main", &main_tip)
         });
 
@@ -8318,6 +9642,336 @@ mod bound_to_checked_state {
         assert_eq!(ours.name.as_deref(), Some("Env Name"));
         assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
+
+    #[test]
+    fn op_log_undo_restores_refs_atomically_via_cas_refuses_moved_ref_and_logs_before_after_refs() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+
+        std::fs::write(p.join("f.txt"), "base\n").unwrap();
+        git_in(p, &["add", "--", "f.txt"]);
+        git_in(p, &["commit", "-q", "-m", "base"]);
+        let main_before = rev(p, "refs/heads/main");
+
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(p.join("feature.txt"), "feat-1\n").unwrap();
+        git_in(p, &["add", "--", "feature.txt"]);
+        git_in(p, &["commit", "-q", "-m", "feat-1"]);
+        let feature_before = rev(p, "refs/heads/feature");
+        git_in(p, &["tag", "v0.1.0", "refs/heads/main"]);
+
+        let repo_canon = p.canonicalize().unwrap();
+        let repo_str = repo_canon.to_str().unwrap();
+
+        let snap = GitWriter::record_op_snapshot_with_limits(
+            repo_str,
+            "git rebase main",
+            Some("sess-1"),
+            None,
+            1_700_000_010_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("snapshot must succeed");
+        assert_eq!(snap.seq, 1);
+        assert_eq!(snap.op_ref, "refs/gitpulse/ops/1");
+        assert_eq!(snap.refs.len(), 3);
+
+        // Simulate an agent git write moving both feature and tag after snapshot.
+        std::fs::write(p.join("feature.txt"), "feat-rewritten\n").unwrap();
+        git_in(p, &["add", "--", "feature.txt"]);
+        git_in(p, &["commit", "-q", "--amend", "-m", "feat-rewritten"]);
+        let feature_after_agent = rev(p, "refs/heads/feature");
+        assert_ne!(feature_after_agent, feature_before);
+        git_in(p, &["tag", "-f", "v0.1.0", "refs/heads/feature"]);
+
+        // Review undo while clean -> move a ref externally before confirming -> must refuse & name moved ref!
+        let stale_plan = GitWriter::prepare_op_undo(repo_str, 1).expect("prepare_op_undo");
+        std::fs::write(p.join("extra.txt"), "extra\n").unwrap();
+        git_in(p, &["add", "--", "extra.txt"]);
+        git_in(p, &["commit", "-q", "-m", "extra move after review"]);
+        let feature_externally_moved = rev(p, "refs/heads/feature");
+        let moved_err =
+            GitWriter::undo_op_snapshot_with_gate(repo_str, &stale_plan, &mut |_| Ok(()))
+                .expect_err("moved ref after review must be refused by CAS");
+        assert!(
+            moved_err.message().contains("refs/heads/feature"),
+            "refusal must name moved ref: {}",
+            moved_err.message()
+        );
+        // Atomic refusal: tag v0.1.0 must NOT have moved back either.
+        assert_eq!(rev(p, "refs/tags/v0.1.0"), feature_after_agent);
+        assert_eq!(rev(p, "refs/heads/feature"), feature_externally_moved);
+
+        // Dirty working tree (both untracked user files and tracked edits) must refuse unless confirm_dirty is true.
+        let mut plan = GitWriter::prepare_op_undo(repo_str, 1).expect("re-prepare");
+        std::fs::write(p.join("untracked.txt"), "untracked-user-file\n").unwrap();
+        let untracked_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect_err("untracked user file must require confirm_dirty");
+        assert!(
+            untracked_err
+                .message()
+                .to_lowercase()
+                .contains("uncommitted")
+                || untracked_err.message().to_lowercase().contains("dirty"),
+            "expected dirty confirmation error for untracked user file, got: {}",
+            untracked_err.message()
+        );
+        std::fs::remove_file(p.join("untracked.txt")).unwrap();
+
+        std::fs::write(p.join("feature.txt"), "dirty-edit\n").unwrap();
+        let dirty_err = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect_err("dirty tree must require confirm_dirty");
+        assert!(
+            dirty_err.message().to_lowercase().contains("uncommitted")
+                || dirty_err.message().to_lowercase().contains("dirty"),
+            "expected dirty confirmation error, got: {}",
+            dirty_err.message()
+        );
+
+        // With confirm_dirty = true, CAS restores every recorded ref and logs before_ref/after_ref.
+        plan.confirm_dirty = true;
+        let outcome = GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect("confirmed undo must succeed");
+        assert_eq!(outcome.seq, 1);
+        assert_eq!(outcome.op_ref, "refs/gitpulse/ops/1");
+        assert_eq!(outcome.restored_refs, 3);
+        assert_eq!(
+            outcome.head_before.as_deref(),
+            Some(feature_externally_moved.as_str())
+        );
+        assert_eq!(outcome.head_after.as_deref(), Some(feature_before.as_str()));
+        assert_eq!(rev(p, "refs/heads/main"), main_before);
+        assert_eq!(rev(p, "refs/heads/feature"), feature_before);
+        assert_eq!(rev(p, "refs/tags/v0.1.0"), main_before);
+        assert_eq!(
+            std::fs::read_to_string(p.join("feature.txt")).unwrap(),
+            "feat-1\n"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            repo_str,
+            &crate::ledger::EventQuery {
+                action: Some(crate::ledger::OP_UNDO_ACTION.to_string()),
+                descending: true,
+                limit: 5,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query undo row")
+        .expect("ledger exists");
+        assert_eq!(page.events.len(), 1);
+        let row = &page.events[0];
+        assert_eq!(
+            row.before_ref.as_deref(),
+            Some(feature_externally_moved.as_str())
+        );
+        assert_eq!(row.after_ref.as_deref(), Some(feature_before.as_str()));
+        let detail = row.detail_json.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("\"occurred_at\""),
+            "detail missing occurred_at: {detail}"
+        );
+        assert!(
+            detail.contains("\"kind\":\"undo\""),
+            "detail missing kind: {detail}"
+        );
+    }
+
+    #[test]
+    fn op_log_evicts_oldest_over_cap_expires_old_and_never_writes_git_config() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+
+        let config_path = p.join(".git").join("config");
+        let config_before = std::fs::read(&config_path).expect("read .git/config");
+        let repo_canon = p.canonicalize().unwrap();
+        let repo_str = repo_canon.to_str().unwrap();
+
+        // Write 5 snapshots with cap = 3 -> only ops 3, 4, 5 survive (oldest 1, 2 evicted).
+        for idx in 1..=5_u64 {
+            GitWriter::record_op_snapshot_with_limits(
+                repo_str,
+                &format!("git commit --allow-empty -m op-{idx}"),
+                None,
+                None,
+                (1_700_000_000 + idx * 10) * 1000,
+                3,
+                3600,
+            )
+            .expect("record bounded snapshot");
+        }
+        let listed = GitWriter::list_op_snapshots(repo_str, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![5, 4, 3], "oldest ops over cap must be evicted");
+
+        // Advance time beyond expiry and add op 6 -> ops 3..5 expire and are pruned cleanly.
+        let future_ms = (1_700_000_050 + 3600 + 60) * 1000;
+        let fresh = GitWriter::record_op_snapshot_with_limits(
+            repo_str,
+            "git rebase main",
+            None,
+            None,
+            future_ms,
+            MAX_OPS,
+            3600,
+        )
+        .expect("record fresh snapshot");
+        assert_eq!(fresh.seq, 6);
+
+        let after_expiry = GitWriter::list_op_snapshots(repo_str, 50).expect("list after expiry");
+        let after_seqs: Vec<u64> = after_expiry.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(after_seqs, vec![6], "expired snapshots must be pruned");
+
+        // Verify .git/config bytes were never touched by snapshot creation, eviction, or expiry.
+        let config_after = std::fs::read(&config_path).expect("read .git/config after prune");
+        assert_eq!(
+            config_after, config_before,
+            "pruning must write no .git/config"
+        );
+    }
+
+    /// A repository holding an expired snapshot 1 whose ref cannot be deleted:
+    /// a leftover `refs/gitpulse/ops/1.lock` makes `git update-ref -d` fail for
+    /// real, the way a concurrent or crashed git does. The next snapshot's
+    /// prune must evict snapshot 1, so it fails after the new ref is written.
+    fn repo_with_unprunable_expired_snapshot() -> (tempfile::TempDir, String) {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+        let repo = p.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git commit --allow-empty -m old",
+            None,
+            None,
+            1_700_000_000_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("record the old snapshot");
+        std::fs::write(p.join(".git/refs/gitpulse/ops/1.lock"), b"").expect("plant ref lock");
+        (dir, repo)
+    }
+
+    #[test]
+    fn a_prune_failure_after_the_snapshot_ref_is_written_still_reports_the_snapshot() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+
+        let summary = GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git rebase main",
+            None,
+            None,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("the snapshot exists once its ref is written, so the call succeeds");
+        assert_eq!(summary.seq, 2);
+        assert_eq!(summary.op_ref, "refs/gitpulse/ops/2");
+        let listed = GitWriter::list_op_snapshots(&repo, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 1],
+            "the new ref exists; the locked one stayed"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        let row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("refs/gitpulse/ops/2"))
+            .expect("the snapshot's own ledger row is written");
+        let detail = row.detail_json.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("\"prune_error\"") && detail.contains("refs/gitpulse/ops/1"),
+            "the row must carry the prune failure: {detail}"
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "an existing snapshot must not be logged as unsnapshotted"
+        );
+    }
+
+    #[test]
+    fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+        let request = crate::desktop::instance::Request::RecordGitOp {
+            id: "op-1".to_string(),
+            cwd: repo.clone(),
+            command: "git reset --hard HEAD".to_string(),
+            session_id: None,
+            task_id: None,
+        };
+
+        let answer = GitWriter::serve_op_record(&request, Instant::now()).expect("served");
+        assert_eq!(answer["snapshotted"], true, "answer: {answer}");
+        assert_eq!(answer["seq"], 2);
+        assert_eq!(answer["op_ref"], "refs/gitpulse/ops/2");
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "no unsnapshotted row for a snapshot that exists"
+        );
+        assert!(
+            page.events.iter().any(|row| {
+                row.object.as_deref() == Some("refs/gitpulse/ops/2")
+                    && row
+                        .detail_json
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("\"prune_error\"")
+            }),
+            "the prune failure is recorded on the snapshot's row"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8327,6 +9981,10 @@ mod adv_tests;
 #[cfg(test)]
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
+
+#[cfg(test)]
+#[path = "git_writer_op_deadline_tests.rs"]
+mod op_deadline_tests;
 
 #[cfg(test)]
 #[path = "git_writer_commit_graph_tests.rs"]

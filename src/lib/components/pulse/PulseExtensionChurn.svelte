@@ -26,7 +26,7 @@
         <span class="gp-chip ml-auto" data-tone="neutral">Top {shown.length} of {extensions.length}</span>
       {/if}
     </div>
-    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+    <div class="grid grid-cols-1 @xl:grid-cols-2 gap-2">
       {#each shown as ext (ext.extension)}
         {@const churn = ext.additions + ext.deletions}
         {@const width = maxChurn > 0 ? Math.round((churn / maxChurn) * 100) : 0}

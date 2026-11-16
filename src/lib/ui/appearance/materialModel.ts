@@ -79,6 +79,71 @@ export const SHIPPED_STACK: Readonly<Record<Appearance, MaterialStack>> = {
   },
 };
 
+/**
+ * Everything the measurement reads that a palette decides: the layer stack, the
+ * colour the shell veil is painted in (`--c-bg`), and the two inks. The shipped
+ * palette is the stylesheet's; an applied theme (an import or a built-in
+ * preset) brings its own derived ladder and field, and its floor is measured
+ * over that rather than assumed from the shipped one.
+ */
+export interface Palette {
+  readonly stack: MaterialStack;
+  readonly shell: Rgb;
+  readonly text: Rgb;
+  readonly textMuted: Rgb;
+}
+
+export function shippedPalette(appearance: Appearance): Palette {
+  return {
+    stack: SHIPPED_STACK[appearance],
+    shell: L[appearance].bg,
+    text: L[appearance].text,
+    textMuted: L[appearance].textMuted,
+  };
+}
+
+/** The `--c-*` triplets a derived palette carries that the stack reads. */
+export interface PaletteTokens {
+  readonly "--c-bg": string;
+  readonly "--c-surface": string;
+  readonly "--c-surface-hover": string;
+  readonly "--c-text": string;
+  readonly "--c-text-muted": string;
+}
+
+function triplet(value: string): Rgb {
+  const [r, g, b] = value.trim().split(/\s+/).map(Number);
+  return [r, g, b];
+}
+
+/**
+ * The stack a derived palette draws, with the shipped alphas. Light mode's plate
+ * stays white because app.css spells `--mac-plate-fill` as white there, not as
+ * `--c-bg`; every other layer follows the palette.
+ */
+export function derivedPalette(
+  appearance: Appearance,
+  tokens: PaletteTokens,
+  field: { readonly blobs: readonly Rgb[]; readonly gain: number },
+): Palette {
+  const shipped = SHIPPED_STACK[appearance];
+  const bg = triplet(tokens["--c-bg"]);
+  return {
+    stack: {
+      ...shipped,
+      plate: { color: appearance === "dark" ? bg : shipped.plate.color, alpha: shipped.plate.alpha },
+      surface: { color: triplet(tokens["--c-surface"]), alpha: shipped.surface.alpha },
+      hover: { color: triplet(tokens["--c-surface-hover"]), alpha: shipped.hover.alpha },
+      fillBg: { color: bg, alpha: shipped.fillBg.alpha },
+      blobs: field.blobs,
+      gain: field.gain,
+    },
+    shell: bg,
+    text: triplet(tokens["--c-text"]),
+    textMuted: triplet(tokens["--c-text-muted"]),
+  };
+}
+
 export type Desktop = "white" | "black";
 const DESKTOPS: Readonly<Record<Desktop, Rgb>> = {
   white: [255, 255, 255],
@@ -115,11 +180,11 @@ export interface Ground {
  * desktop, under each blob and under none. Nested panels only add coverage, so
  * one panel on the plate is the thinnest stack that exists.
  */
-export function grounds(appearance: Appearance, t: number): Ground[] {
-  const stack = SHIPPED_STACK[appearance];
+export function grounds(appearance: Appearance, t: number, palette: Palette = shippedPalette(appearance)): Ground[] {
+  const { stack } = palette;
   const out: Ground[] = [];
   for (const desktop of Object.keys(DESKTOPS) as Desktop[]) {
-    const shell = over(L[appearance].bg, stack.veil, DESKTOPS[desktop]);
+    const shell = over(palette.shell, stack.veil, DESKTOPS[desktop]);
     const choices: (number | "none")[] = ["none", ...stack.blobs.map((_, index) => index)];
     for (const blob of choices) {
       const field =
@@ -150,9 +215,14 @@ export interface Worst {
 }
 
 /** The lowest contrast of `ink` over every ground at intensity `t`. */
-export function worstContrast(appearance: Appearance, t: number, ink: Rgb): Worst {
+export function worstContrast(
+  appearance: Appearance,
+  t: number,
+  ink: Rgb,
+  palette: Palette = shippedPalette(appearance),
+): Worst {
   let worst: Worst | null = null;
-  for (const ground of grounds(appearance, t)) {
+  for (const ground of grounds(appearance, t, palette)) {
     const ratio = contrastRatio(ink, ground.color);
     if (worst === null || ratio < worst.ratio) worst = { ratio, ground };
   }
@@ -178,11 +248,14 @@ export interface FloorMeasurement {
   readonly atFloor: { readonly text: Worst; readonly textMuted: Worst };
 }
 
-export function measureFloor(appearance: Appearance): FloorMeasurement {
-  const ink = inks(appearance);
+export function measureFloor(
+  appearance: Appearance,
+  palette: Palette = shippedPalette(appearance),
+): FloorMeasurement {
+  const ink = { text: palette.text, textMuted: palette.textMuted };
   const at = (t: number) => ({
-    text: worstContrast(appearance, t, ink.text),
-    textMuted: worstContrast(appearance, t, ink.textMuted),
+    text: worstContrast(appearance, t, ink.text, palette),
+    textMuted: worstContrast(appearance, t, ink.textMuted, palette),
   });
   const passes = (t: number) => {
     const worst = at(t);

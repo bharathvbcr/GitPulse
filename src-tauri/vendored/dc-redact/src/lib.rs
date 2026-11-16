@@ -22,15 +22,45 @@ struct SecretPattern {
     prefix: &'static str,
     /// Minimum length of the whole token, including the prefix.
     min_len: usize,
-    /// Whether everything after the prefix must be letters and digits.
-    ///
-    /// It exists for the short, ambiguous prefixes. `sk-` occurs inside
-    /// ordinary English and ordinary identifiers — `task-`, `disk-`, `risk-`
-    /// all contain it — and a length floor alone would turn a long enough
-    /// kebab-case name into a reported credential. The vendors whose keys are
-    /// a flat alphanumeric body can say so, and then the shape does the work
-    /// the prefix cannot.
-    alphanumeric_body: bool,
+    /// Which characters everything after the prefix must be written in.
+    body: Body,
+}
+
+/// The characters a key's body is written in, after its prefix.
+///
+/// It exists for the short, ambiguous prefixes. `sk-` occurs inside ordinary
+/// English and ordinary identifiers — `task-`, `disk-`, `risk-` all contain it
+/// — and a length floor alone would turn a long enough kebab-case name into a
+/// reported credential. The vendors whose keys are a narrower alphabet than a
+/// token run can say so, and then the shape does the work the prefix cannot.
+#[derive(Clone, Copy)]
+enum Body {
+    /// Any key character ([`is_key_char`]).
+    Any,
+    /// Letters and digits only.
+    Alphanumeric,
+    /// Upper-case letters and digits only: how AWS writes every key id. For
+    /// a prefix as short as `A3T`, the case is what keeps the start of a
+    /// mixed-case base64 run from reading as a key.
+    UpperAlphanumeric,
+    /// Letters, digits, `-` and `_`: the URL-safe base64 alphabet without
+    /// padding. A `/` or a `.` in the run means a path or a URL, not a key.
+    UrlSafe,
+}
+
+impl Body {
+    fn admits(self, body: &str) -> bool {
+        match self {
+            Body::Any => true,
+            Body::Alphanumeric => body.bytes().all(|b| b.is_ascii_alphanumeric()),
+            Body::UpperAlphanumeric => body
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
+            Body::UrlSafe => body
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        }
+    }
 }
 
 impl SecretPattern {
@@ -65,11 +95,7 @@ impl SecretPattern {
                     // A period closing a sentence is not part of the key.
                     let end = start + content[start..token_end].trim_end_matches('.').len();
                     let token = &content[start..end];
-                    if token.len() < self.min_len
-                        || (self.alphanumeric_body
-                            && !token[self.prefix.len()..]
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric()))
+                    if token.len() < self.min_len || !self.body.admits(&token[self.prefix.len()..])
                     {
                         return None;
                     }
@@ -167,37 +193,37 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "anthropic api key",
         prefix: "sk-ant-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "openai project api key",
         prefix: "sk-proj-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe live key",
         prefix: "sk_live_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe test key",
         prefix: "sk_test_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe restricted test key",
         prefix: "rk_test_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "stripe restricted live key",
         prefix: "rk_live_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // OpenAI admin keys: the Admin API Keys reference's create example returns
     // a value beginning `sk-admin-`
@@ -208,7 +234,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openai admin api key",
         prefix: "sk-admin-",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // OpenRouter: `sk-or-v1-` plus 64 hex characters, 73 in all. The format is
     // read off the key examples on
@@ -218,7 +244,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openrouter api key",
         prefix: "sk-or-v1-",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Last of the `sk` family, because it is a prefix of the ones above and the
     // scan stops at its first match. The floor is high — a legacy OpenAI key is
@@ -228,7 +254,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "openai api key",
         prefix: "sk-",
         min_len: 45,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     // Stripe endpoint signing secret: "a signing secret beginning with
     // `whsec_`" (https://docs.stripe.com/webhooks). No length is stated.
@@ -236,167 +262,249 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "stripe webhook signing secret",
         prefix: "whsec_",
         min_len: 24,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "xai api key",
         prefix: "xai-",
         min_len: 20,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "google api key",
         prefix: "AIza",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
+    },
+    // Google OAuth 2.0 access token. Google's Compute Engine guide prints one
+    // as `ya29.AHES6ZRN3-…` (59 characters) and its IAM downscoping guide as
+    // `ya29.dr.AbCDeFg-…`, so the body carries dots and is left open; the
+    // prefix is Google's alone:
+    // https://docs.cloud.google.com/compute/docs/access/authenticate-workloads
+    // https://docs.cloud.google.com/iam/docs/create-downscoped-short-lived-credentials
+    // Google states no alphabet, only that an access token is at most 2048
+    // bytes (https://developers.google.com/identity/protocols/oauth2), so a
+    // narrower body would risk refusing a real token and passing it whole.
+    SecretPattern {
+        name: "google oauth access token",
+        prefix: "ya29.",
+        min_len: 30,
+        body: Body::Any,
+    },
+    // Google OAuth 2.0 refresh token, printed as `1//xEoDL4iW3cxlI7yDbSRFYNG01k…`
+    // (46 characters) in https://developers.google.com/identity/protocols/oauth2/native-app.
+    // `1//` is also a URL's or a path's `…1//…` and Python's floor division,
+    // so the body must be URL-safe (no `/` or `.`) and the floor sits above a
+    // `1//`-prefixed UUID.
+    SecretPattern {
+        name: "google oauth refresh token",
+        prefix: "1//",
+        min_len: 40,
+        body: Body::UrlSafe,
+    },
+    // Google OAuth 2.0 client secret: `GOCSPX-` and a URL-safe body. Google
+    // publishes the prefix only by example and states no length: its codelab
+    // shows `"client_secret": "GOCSPX-abcd1234-…"`, a 26-character body, in
+    // https://codelabs.developers.google.com/generate_creatives_google_ads.
+    // Secret scanners expect a 28-character body, 35 characters in all
+    // (GitLab's secret-detection rule is `GOCSPX-[a-zA-Z0-9_-]{28}`). The floor
+    // of 30, a 23-character body, sits under both, and the body is left open,
+    // because a real secret refused by either check is a secret passed whole.
+    SecretPattern {
+        name: "google oauth client secret",
+        prefix: "GOCSPX-",
+        min_len: 30,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github personal access token",
         prefix: "ghp_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github oauth token",
         prefix: "gho_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github app server token",
         prefix: "ghs_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github app user token",
         prefix: "ghu_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github refresh token",
         prefix: "ghr_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "github pat",
         prefix: "github_pat_",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab personal access token",
         prefix: "glpat-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // GitLab token prefixes, from the table at
-    // https://docs.gitlab.com/security/tokens/ . The page states no length or
-    // character set, so the floor is the one `glpat-` already uses.
+    // https://docs.gitlab.com/security/tokens/ , which states no length or
+    // character set. GitLab's own secret-detection rules do
+    // (gitlab-org/security-products/secret-detection/secret-detection-rules,
+    // rules/mit/gitlab/gitlab.toml): every classic token is its prefix and a
+    // 20-character body of `[0-9a-zA-Z_-]`, and the routable, partitioned and
+    // versioned forms are longer. So a floor is the prefix plus 20 at most:
+    // `gldt-`, `glrt-` and `glft-` tokens are 25 characters, and the floor of
+    // 26 they shared with `glpat-` passed every one of them whole. `glwt-` is
+    // listed there only in its routable form (45 or more); its floor is still
+    // prefix plus 20, because a floor above a real token is a token passed,
+    // and one below it costs nothing for a prefix this distinctive. No floor
+    // is raised to a family's longer documented body: that would trade recall
+    // for nothing measured.
     SecretPattern {
         name: "gitlab deploy token",
         prefix: "gldt-",
-        min_len: 26,
-        alphanumeric_body: false,
+        min_len: 25,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab runner authentication token",
         prefix: "glrt-",
-        min_len: 26,
-        alphanumeric_body: false,
+        min_len: 25,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab runner registration-created token",
         prefix: "glrtr-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab oauth application secret",
         prefix: "gloas-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab ci job token",
         prefix: "glcbt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab trigger token",
         prefix: "glptt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab feed token",
         prefix: "glft-",
-        min_len: 26,
-        alphanumeric_body: false,
+        min_len: 25,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab incoming mail token",
         prefix: "glimt-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab agent for kubernetes token",
         prefix: "glagent-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab workspace token",
         prefix: "glwt-",
-        min_len: 26,
-        alphanumeric_body: false,
+        min_len: 25,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab scim token",
         prefix: "glsoat-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "gitlab feature flags client token",
         prefix: "glffct-",
         min_len: 26,
-        alphanumeric_body: false,
+        body: Body::Any,
+    },
+    // Slack token rotation: an app that opts in gets access tokens
+    // `xoxe.xoxp-…`, `xoxe.xoxb-…` and `xoxe.xapp-…` and refresh tokens
+    // `xoxe-1-…` (https://docs.slack.dev/authentication/using-token-rotation;
+    // https://docs.slack.dev/authentication/tokens names `xoxe.xapp-`). No
+    // length is stated, so the floor is the other Slack tokens'. The rotated
+    // forms come before `xoxp-`, `xoxb-` and `xapp-`: a `.` is a token
+    // boundary, and the inner prefix would otherwise name the token.
+    SecretPattern {
+        name: "slack rotated user token",
+        prefix: "xoxe.xoxp-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack rotated bot token",
+        prefix: "xoxe.xoxb-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack rotated app-level token",
+        prefix: "xoxe.xapp-",
+        min_len: 30,
+        body: Body::Any,
+    },
+    SecretPattern {
+        name: "slack refresh token",
+        prefix: "xoxe-",
+        min_len: 30,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack bot token",
         prefix: "xoxb-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack user token",
         prefix: "xoxp-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack workspace token",
         prefix: "xoxa-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "slack app-level token",
         prefix: "xapp-",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // The URL is the credential: whoever has it can post to the channel.
     SecretPattern {
         name: "slack incoming webhook",
         prefix: "https://hooks.slack.com/services/",
         min_len: 60,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // `SG.` + 22 + `.` + 43. The floor is the whole shape, so `SG.` in prose
     // never reaches it.
@@ -404,37 +512,37 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "sendgrid api key",
         prefix: "SG.",
         min_len: 69,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "shopify access token",
         prefix: "shpat_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify custom app token",
         prefix: "shpca_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify private app token",
         prefix: "shppa_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "shopify shared secret",
         prefix: "shpss_",
         min_len: 38,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     SecretPattern {
         name: "aws access key id",
         prefix: "AKIA",
         min_len: 20,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
     },
     // Temporary credentials, and no less dangerous for it: an ASIA key plus its
     // session token is the same access as a long-lived one for as long as it
@@ -443,19 +551,61 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "aws temporary access key id",
         prefix: "ASIA",
         min_len: 20,
-        alphanumeric_body: true,
+        body: Body::Alphanumeric,
+    },
+    // The other credential ids in AWS's unique-ID prefix table
+    // (https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html#identifiers-prefixes):
+    // `ABIA`, an AWS STS service bearer token, and `ACCA`, a context-specific
+    // credential. Like `AKIA` they are 20 characters.
+    SecretPattern {
+        name: "aws sts service bearer token id",
+        prefix: "ABIA",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
+    },
+    SecretPattern {
+        name: "aws context-specific credential id",
+        prefix: "ACCA",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
+    },
+    // `A3T` and one more character: an access key id prefix that secret
+    // scanners match beside `AKIA` (gitleaks' and Betterleaks'
+    // `A3T[A-Z0-9]`). AWS's prefix table does not list it, so this is a
+    // scanner convention, not a documented format. Three characters is a
+    // short prefix, so the body must be upper case and digits, as every AWS
+    // key id is, and a mixed-case base64 run that starts `A3T` is refused.
+    SecretPattern {
+        name: "aws access key id",
+        prefix: "A3T",
+        min_len: 20,
+        body: Body::UpperAlphanumeric,
     },
     SecretPattern {
         name: "huggingface token",
         prefix: "hf_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
+    // HuggingFace organisation API token, deprecated but still in old
+    // organisations' hands: `huggingface_hub`'s login refuses a token that
+    // `startswith("api_org")` (src/huggingface_hub/_login.py). HuggingFace
+    // documents no length; scanners give the body as 34 letters, 42 in all.
+    // The body is letters and digits, so an `api_org_…` identifier is not one.
+    SecretPattern {
+        name: "huggingface organization token",
+        prefix: "api_org_",
+        min_len: 40,
+        body: Body::Alphanumeric,
+    },
+    // npm: `npm_` and 36 letters and digits, 40 in all. With any key
+    // character admitted, every `fn npm_…()` test name was a token. The floor
+    // stays where it was, below the real length.
     SecretPattern {
         name: "npm access token",
         prefix: "npm_",
         min_len: 36,
-        alphanumeric_body: false,
+        body: Body::Alphanumeric,
     },
     // PyPI API token: `pypi-` and a base64 macaroon; the secret-reporting
     // docs give the pattern as `pypi-[A-Za-z0-9-_]{85,}`, 90 bytes with the
@@ -464,7 +614,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "pypi api token",
         prefix: "pypi-",
         min_len: 90,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // DigitalOcean: `dop_v1_` personal access token, `doo_v1_` OAuth access
     // token, `dor_v1_` OAuth refresh token
@@ -475,19 +625,19 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "digitalocean personal access token",
         prefix: "dop_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "digitalocean oauth access token",
         prefix: "doo_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "digitalocean oauth refresh token",
         prefix: "dor_v1_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Replicate: "40-character strings that always start with `r8_`"
     // (https://replicate.com/docs/topics/security/api-tokens).
@@ -495,7 +645,7 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "replicate api token",
         prefix: "r8_",
         min_len: 40,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Linear: personal API keys `lin_api_` and OAuth tokens `lin_oauth_`, from
     // the changelog entry that introduced the prefixes so GitHub could scan for
@@ -504,13 +654,13 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "linear api key",
         prefix: "lin_api_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "linear oauth token",
         prefix: "lin_oauth_",
         min_len: 32,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     // Notion: new Public API tokens begin `ntn_` in place of `secret_` since
     // 2024-09-25 (https://developers.notion.com/page/changelog). Notion advises
@@ -521,13 +671,13 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "notion api token",
         prefix: "ntn_",
         min_len: 30,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
     SecretPattern {
         name: "private key block",
         prefix: "-----BEGIN",
         min_len: 20,
-        alphanumeric_body: false,
+        body: Body::Any,
     },
 ];
 
@@ -788,6 +938,9 @@ fn assignment_spans(line: &str) -> Vec<std::ops::Range<usize>> {
         if !names_a_credential(key) {
             continue;
         }
+        if b == b':' && value_from == i + 1 && annotates_a_type(line, i) {
+            continue;
+        }
         if let Some(span) = literal_after(line, value_from, &mut ends) {
             spans.push(span);
         }
@@ -807,7 +960,7 @@ fn declared_name(line: &str, sep: usize) -> Option<&str> {
     let key_start = line[..sep].trim_end().len() - key.len();
     let head = line[..key_start].trim_end();
     let head = head.trim_end_matches(['&', '*', '[', ']']).trim_end();
-    let head = head.strip_suffix(':').unwrap_or(head).trim_end();
+    let head = head.trim_suffix(':').trim_end();
     key_before(line, head.len()).or(Some(key))
 }
 
@@ -1101,9 +1254,30 @@ fn is_literal_secret(value: &str, quoted: bool) -> bool {
             .rsplit('.')
             .next()
             .is_some_and(|last| reads_as_words(last, 1));
-    // An expression rather than a literal: a call, an index, a member access.
+    // An increment or decrement of a bare name: `++latest`, `--remaining`.
+    // Only those two: a password may start with one `!`, `-`, `+` or `*`
+    // (`!Welcomeback`), and a single operator says too little to excuse it.
+    // The operand is letters and `_` alone — no digit — as a name is.
+    let operand = value
+        .strip_prefix("++")
+        .or_else(|| value.strip_prefix("--"))
+        .unwrap_or(value);
+    let operated_name = operand.len() < value.len()
+        && !operand.is_empty()
+        && operand
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'_');
+    // An expression rather than a literal: a call, an index, a member access
+    // or path (`Duration::ZERO`), a block or object literal or format slot
+    // (`{scrubbed}`, which the unquoted value's end at `}` cuts to
+    // `{scrubbed`), an operator applied.
     let expression = !quoted
-        && (value.contains(['(', '[']) || value.contains('.') && !has_digit || qualified_name);
+        && (value.contains(['(', '['])
+            || value.starts_with('{')
+            || value.contains("::")
+            || value.contains('.') && !has_digit
+            || qualified_name
+            || operated_name);
     let plain_word = value.bytes().all(|b| b.is_ascii_lowercase()) && value.len() < 12;
     value.chars().count() >= MIN_LITERAL_LEN
         && !value.contains(char::is_whitespace)
@@ -1185,7 +1359,15 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             .any(|&(_, w)| matches!(w, "machine" | "login" | "default"));
     let next_word_at = |i: usize| words.get(i + 1).map(|&(at, _)| at);
     for (i, &(at, word)) in words.iter().enumerate() {
-        let program = word.rsplit('/').next().unwrap_or(word);
+        // The client's name, with what is glued to its front taken off: a
+        // directory, and the `=`, `(`, backtick or quote that a command
+        // recorded as `command=curl`, run as `$(curl …)` or written inside a
+        // string literal puts there. Reading only a bare `curl` passed the
+        // password after every one of those.
+        let program = word
+            .rsplit(['/', '=', '(', '`', '"', '\''])
+            .next()
+            .unwrap_or(word);
         if ATTACHED.contains(&program) || matches!(program, "sshpass" | "curl") {
             client = Some(program);
             continue;
@@ -1254,7 +1436,18 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             .chars()
             .filter(|c| !matches!(c, '"' | '\'') && !c.is_whitespace())
             .collect();
-        if is_literal_secret(&value, quoted) {
+        // A command read inside a backtick or a `$(…)` ends at the closer,
+        // which a value glued to it — ``…`curl -u user:password`, …`` in
+        // prose — would otherwise carry into its judging, hiding the generic
+        // word it is. Only the judging drops it; the redaction keeps the word
+        // whole, and a value with no closer is judged as written.
+        let unclosed = value.trim_end_matches([',', ';', '.', ':']);
+        let judged = if unclosed.ends_with(['`', ')']) {
+            unclosed.trim_end_matches(['`', ')'])
+        } else {
+            value.as_str()
+        };
+        if is_literal_secret(judged, quoted) {
             spans.push(start..end);
         }
     }
@@ -1298,12 +1491,73 @@ fn is_placeholder(value: &str) -> bool {
         .is_some_and(|open| value[open..].contains('>'));
     value.starts_with('$')
         || slot
+        || has_brace_slot(value)
         || ["${", "{{", "$(", "%("].iter().any(|t| value.contains(t))
         || WORDS.iter().any(|w| lowered.contains(w))
         || value
             .chars()
             .all(|c| c == value.chars().next().unwrap_or(c))
         || value.contains('…')
+}
+
+/// Whether `value` holds a single-brace template slot — `{}`, `{token}`,
+/// `{pw:?}`, `{0}` — the interpolation of a Rust or Python format string,
+/// which a program fills in. Like the angle-bracket slot, it needs its closing
+/// brace, and its inside must read as a name or a format spec: braces around
+/// anything else are characters of a literal. One pass, so a value of
+/// unclosed braces costs no more than its length.
+fn has_brace_slot(value: &str) -> bool {
+    let mut open = false;
+    for b in value.bytes() {
+        match b {
+            b'{' => open = true,
+            b'}' if open => return true,
+            _ if open
+                && !(b.is_ascii_alphanumeric()
+                    || matches!(b, b'_' | b'.' | b':' | b'?' | b'#')) =>
+            {
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the `:` at `colon` opens a type annotation rather than a value:
+/// `MIN_TOKEN_INTERVAL: Duration = …`, `let token: String = …`, a parameter
+/// `token_delay: Duration)`, a field `password: Password,`. The name before
+/// the colon is a credential's; what follows it is a type, and reading that
+/// type as the literal assigned flagged `Duration` as a token.
+///
+/// A type followed by `=` is annotated whatever it looks like. One followed by
+/// `)`, `,`, `;` or `{` is only when it reads as a capitalised name of words,
+/// because a YAML flow mapping writes a password the same way.
+fn annotates_a_type(line: &str, colon: usize) -> bool {
+    /// Longest type read. A type is short; the bound keeps a line of `:`s
+    /// from being rescanned to its end at every one of them.
+    const MAX_TYPE_LEN: usize = 128;
+    let rest = line[colon + 1..].trim_start();
+    let scan = &rest.as_bytes()[..rest.len().min(MAX_TYPE_LEN + 1)];
+    let len = scan
+        .iter()
+        .position(|&b| {
+            !(b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b':' | b'<' | b'>' | b'&' | b'[' | b']' | b'*'))
+        })
+        .unwrap_or(scan.len());
+    if len == 0 || len > MAX_TYPE_LEN {
+        return false;
+    }
+    let ty = &rest[..len];
+    let after = rest[len..].trim_start();
+    // Spaced: `QWxhZGRpbg=`, a base64 value's own padding, is glued to it.
+    let spaced = after.len() < rest.len() - len;
+    let assigned = spaced && after.starts_with('=') && !after[1..].starts_with(['=', '>']);
+    let named_type = after.starts_with([')', ',', ';', '{'])
+        && ty.starts_with(|c: char| c.is_ascii_uppercase())
+        && reads_as_words(ty, 1);
+    assigned || named_type
 }
 
 /// A credential found on a line: which shape it has, and the token rendered
@@ -1349,8 +1603,8 @@ pub fn redact_secrets(text: &str) -> String {
     // `contains_secret` and left in place here.
     let mut out = String::with_capacity(text.len());
     for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = segment.trim_suffix('\n');
+        let line = line.trim_suffix('\r');
         out.push_str(&redact_line(line));
         out.push_str(&segment[line.len()..]);
     }
@@ -1487,6 +1741,55 @@ mod redaction_tests {
         assert!(!contains_secret("cargo build --release"));
         assert_ne!(redact_secrets(key), key);
         assert_eq!(redact_secrets("cargo build"), "cargo build");
+    }
+
+    /// Google's OAuth tokens, in the shapes Google's own documentation prints
+    /// them, with `FAKE` bodies of the same length and alphabet. A CLI that
+    /// talks to Google — `gcloud`, `firebase` — can echo one in an error or a
+    /// debug line, and with no JSON key beside it nothing named it a
+    /// credential.
+    #[test]
+    fn google_oauth_tokens_are_found_and_redacted() {
+        let access = concat!(
+            "ya",
+            "29.FAKE6fakeT-okenNotReal0123_abcDEF_ghIJ01k85nHq39HE3C2LTrFAKE"
+        );
+        let downscoped = concat!("ya", "29.dr.FAKEfak-123456789abcdefghijKLMNOP");
+        let refresh = concat!("1/", "/FAKEfakeRefreshTokenNotReal01k-259FAKEfake");
+        for (token, name) in [
+            (access, "google oauth access token"),
+            (downscoped, "google oauth access token"),
+            (refresh, "google oauth refresh token"),
+        ] {
+            for line in [
+                token.to_string(),
+                format!("Authorization: Bearer {token}"),
+                format!("refresh={token}; next"),
+                format!("token ({token})."),
+            ] {
+                assert_eq!(find_secret(&line).map(|m| m.name), Some(name), "{line}");
+                let out = redact_secrets(&line);
+                assert!(!out.contains(token), "{out}");
+            }
+        }
+    }
+
+    /// `1//` is a short prefix, and a path or URL contains it: the refresh
+    /// token's body is letters, digits, `-` and `_`, so a run with a `/` or a
+    /// `.` in it is not one, and neither is anything under the floor.
+    #[test]
+    fn a_double_slash_path_is_not_a_google_refresh_token() {
+        for ordinary in [
+            "curl http://127.0.0.1//api/v1/projects/scholarlm/backends/list?page=2",
+            "gs://bucket-1//some/long/object/key/that/keeps/going/for/a/while",
+            "x = n1//2 + 1//3",
+            "print(total // 1//len(items_in_the_very_long_named_collection))",
+            concat!("id 1/", "/0f8fad5b-d9cb-469f-a165-70867728950e"),
+            "file:///Users/me/1//Library/Application Support/Something/Longer",
+        ] {
+            assert_eq!(find_secret(ordinary), None, "{ordinary}");
+            assert_eq!(redact_secrets(ordinary), ordinary, "{ordinary}");
+        }
     }
 
     /// Each context detector on the literal it exists for, and on the
@@ -1927,7 +2230,11 @@ mod redaction_tests {
     /// ledger writer, where a stalled scan is a stalled commit.
     #[test]
     fn every_detector_scans_its_worst_line_in_linear_time() {
-        let shapes: [(&str, &str); 12] = [
+        let shapes: [(&str, &str); 16] = [
+            ("type annotation", "fn f(token: Duration) "),
+            ("brace slots", "https://u:{a"),
+            ("glued client", "x=curl -u a:Xk29LmQp3Zw "),
+            ("prefix operator", "token=++latest "),
             ("jwt dots", "eyJ."),
             ("jwt dashes", "-eyJ"),
             ("url userinfo", "a://"),
@@ -2073,6 +2380,283 @@ mod redaction_tests {
         }
         // Agreement on lines with no JWT in them would prove nothing.
         assert!(hits >= 1_000, "only {hits} generated lines held a JWT");
+    }
+
+    /// `prefix` and `body` joined at run time, so no source line of this file
+    /// is itself a vendor token.
+    fn token(prefix: &[&str], body: &str) -> String {
+        let mut t = prefix.concat();
+        t.push_str(body);
+        t
+    }
+
+    /// GitLab's own secret-detection rules give every classic token a
+    /// 20-character body, so `gldt-`, `glft-` and `glrt-` tokens are 25
+    /// characters long. The table's floor of 26 passed each of them whole.
+    #[test]
+    fn gitlab_tokens_with_a_twenty_character_body_are_found() {
+        const BODY: &str = "Xk29LmQp3ZwR7tY1uV5n";
+        for (prefix, name) in [
+            (["gl", "dt-"], "gitlab deploy token"),
+            (["gl", "ft-"], "gitlab feed token"),
+            (["gl", "rt-"], "gitlab runner authentication token"),
+            (["gl", "wt-"], "gitlab workspace token"),
+            (["gl", "pat-"], "gitlab personal access token"),
+        ] {
+            let t = token(&prefix, BODY);
+            assert_eq!(find_secret(&t).map(|m| m.name), Some(name), "{name}");
+            let line = format!("export TOKEN={t}");
+            assert!(!redact_secrets(&line).contains(BODY), "{name}");
+            // One character short of GitLab's shortest body is not a token.
+            assert_eq!(find_secret(&t[..t.len() - 1]), None, "{name}");
+        }
+        // The partitioned runner token carries `t1_`..`t3_` before its body.
+        let t = token(&["gl", "rt-", "t3_"], BODY);
+        assert_eq!(
+            find_secret(&t).map(|m| m.name),
+            Some("gitlab runner authentication token")
+        );
+    }
+
+    /// Slack's token rotation issues refresh tokens `xoxe-1-…` and rotated
+    /// access tokens `xoxe.xoxp-…`, `xoxe.xoxb-…` and `xoxe.xapp-…`. A refresh
+    /// token passed whole; a rotated token was named by the `xoxp-` inside it.
+    #[test]
+    fn slack_rotation_tokens_are_found_and_named() {
+        const BODY: &str = "1-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0";
+        for (prefix, name, shown) in [
+            (["xo", "xe-"].as_slice(), "slack refresh token", "xoxe-"),
+            (
+                ["xo", "xe.xo", "xp-"].as_slice(),
+                "slack rotated user token",
+                "xoxe.xoxp-",
+            ),
+            (
+                ["xo", "xe.xo", "xb-"].as_slice(),
+                "slack rotated bot token",
+                "xoxe.xoxb-",
+            ),
+            (
+                ["xo", "xe.xa", "pp-"].as_slice(),
+                "slack rotated app-level token",
+                "xoxe.xapp-",
+            ),
+        ] {
+            let t = token(prefix, BODY);
+            let line = format!("refresh_token={t}");
+            let found = find_secret(&line).expect(name);
+            assert_eq!(found.name, name);
+            assert!(found.redacted.starts_with(shown), "{}", found.redacted);
+            assert!(!redact_secrets(&line).contains(&BODY[10..]), "{name}");
+        }
+    }
+
+    /// AWS's unique-ID prefixes for an STS service bearer token (`ABIA`) and
+    /// a context-specific credential (`ACCA`), and the `A3T` key-id prefix
+    /// secret scanners carry, beside `AKIA` and `ASIA`.
+    #[test]
+    fn aws_bearer_context_and_a3t_key_ids_are_found() {
+        const BODY: &str = "Q3EGRTWQKYZXN7M2";
+        for (prefix, name) in [
+            (["AB", "IA"].as_slice(), "aws sts service bearer token id"),
+            (
+                ["AC", "CA"].as_slice(),
+                "aws context-specific credential id",
+            ),
+            (["A3", "TX"].as_slice(), "aws access key id"),
+            (["A3", "T7"].as_slice(), "aws access key id"),
+        ] {
+            let t = token(prefix, BODY);
+            assert_eq!(t.len(), 20);
+            assert_eq!(
+                find_secret(&format!("id: {t}")).map(|m| m.name),
+                Some(name),
+                "{t}"
+            );
+        }
+        // The body is upper-case letters and digits, as AWS writes every
+        // key id: a mixed-case run that starts `A3T` is base64, not a key.
+        for line in [
+            token(&["A3", "T"], "xq9vB2mL7pZ4kR8sT1u"),
+            token(&["AB", "IA"], "q3egrtwqkyzxn7m2"),
+            token(&["ac", "ca"], BODY),
+        ] {
+            assert_eq!(find_secret(&line), None, "{line}");
+        }
+    }
+
+    /// HuggingFace organisation tokens begin `api_org_`; `huggingface_hub`'s
+    /// own login refuses a token with that prefix. The body is letters, so an
+    /// identifier that starts the same way is not one.
+    #[test]
+    fn huggingface_organisation_tokens_are_found() {
+        let t = token(&["api_", "org_"], "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh");
+        assert_eq!(
+            find_secret(&format!("HF_TOKEN={t}")).map(|m| m.name),
+            Some("huggingface organization token")
+        );
+        for line in [
+            "fn api_org_settings_handler_for_the_tenant_admin_page() {",
+            "let x = api_org_membership_lookup_table_v2.get(id);",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+    }
+
+    /// `curl -u user:password` was already a detected shape, but only when
+    /// the word was `curl` itself. A command recorded as `command=curl …`, a
+    /// command substitution `$(curl …)`, or one inside a string literal hid
+    /// the client's name, and the password after it passed.
+    #[test]
+    fn a_client_name_glued_to_punctuation_is_still_the_client() {
+        for line in [
+            "command=curl --user alice:Xk29LmQp3Zw https://example.test",
+            "out=$(curl -u alice:Xk29LmQp3Zw https://example.test)",
+            r#"run("curl -u alice:Xk29LmQp3Zw https://example.test")"#,
+            r#"let cmd = "curl --user alice:Xk29LmQp3Zw";"#,
+            "`curl -u alice:Xk29LmQp3Zw https://example.test`",
+            r#"sh -c "mysql -u root -pS3cretRootPw appdb""#,
+            "cmd=sshpass -p Tr0ub4dor3x ssh deploy@host",
+        ] {
+            assert_eq!(
+                find_secret(line).map(|m| m.name),
+                Some("password on a command line"),
+                "{line}"
+            );
+            let out = redact_secrets(line);
+            assert!(!out.contains("Xk29LmQp3Zw"), "{line} -> {out}");
+            assert!(!out.contains("S3cretRootPw"), "{line} -> {out}");
+            assert!(!out.contains("Tr0ub4dor3x"), "{line} -> {out}");
+            assert_eq!(redact_secrets(&out), out, "not idempotent: {out}");
+        }
+        // The same rules as every other client: a reference, a prompt, a
+        // value under the length floor and a placeholder are not passwords.
+        for line in [
+            r#"command=curl -u "$USER:$PASS" https://example.test"#,
+            "command=curl -u alice https://example.test",
+            "command=curl -u alice:opaque https://example.test",
+            "out=$(curl -u alice:${TOKEN} https://example.test)",
+            "command=curl -u alice:<your-password> https://example.test",
+            "mode=curl-like retry -u 5",
+            // This crate's own doc comment: the backtick ends the command.
+            "///   - `curl -u user:password`, `--user user:password`, `-uuser:password`",
+            "see `$(curl -u user:password)` and `mysql -ppassword`;",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Shell punctuation inside a value is a character of the password:
+        // a `.netrc` is not shell, and the rest is not the end of a command
+        // until whitespace. Each is found and redacted whole.
+        for (line, tail) in [
+            ("machine m login l password Ab1&2345678x", "2345678x"),
+            ("sshpass -p Tr0ub4dor&3xample ssh host", "3xample"),
+            ("mysql -u root -pS3cr3t;Pw99 db", "Pw99"),
+            ("docker login -p Xk29Lm|Qp3Zw registry", "Qp3Zw"),
+            ("psql --password Xk29Lm<Qp3Zw -h db", "Qp3Zw"),
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+            assert!(!redact_secrets(line).contains(tail), "{line}");
+        }
+    }
+
+    /// Real npm tokens are `npm_` and 36 letters and digits. With any key
+    /// character admitted, a test function named `npm_…` was a token.
+    #[test]
+    fn an_npm_prefixed_identifier_is_not_an_npm_token() {
+        for line in [
+            "fn npm_scan_package_manifest_handles_scoped_names() {",
+            "fn npm_scan_child_sees_no_tokens_and_a_pinned_config() {",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        let t = token(&["np", "m_"], "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        assert_eq!(
+            find_secret(&format!("//registry.npmjs.org/:_authToken={t}")).map(|m| m.name),
+            Some("npm access token")
+        );
+    }
+
+    /// A type annotation names a type, not a value: `MIN_TOKEN_INTERVAL:
+    /// Duration =` read `Duration` as the literal assigned to a token.
+    #[test]
+    fn a_type_annotation_is_not_a_credential_value() {
+        for line in [
+            "const MIN_TOKEN_INTERVAL: Duration = Duration::from_millis(1);",
+            "let token_ttl_floor: Duration = Duration::ZERO;",
+            "fn wait(token_delay: Duration) {",
+            "    password: Password,",
+            "pub fn new(secret: Zeroizing, other: u8) -> Self {",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // A typed declaration with a literal still assigns one, a YAML value
+        // that is a capitalised word is still a value, and so is a base64
+        // value whose padding `=` is glued to it.
+        for line in [
+            r#"const ADMIN_PASSWORD: &str = "Wint3r!sComing2026";"#,
+            r#"let token: String = "a7Hk29LmQp3ZxW8vRt5N".into();"#,
+            "password: Monkeyshines",
+            "token: QWxhZGRpbjpvcGVuIHNlc2FtZQ=",
+        ] {
+            assert_eq!(
+                find_secret(line).map(|m| m.name),
+                Some("credential assigned to a named key"),
+                "{line}"
+            );
+        }
+    }
+
+    /// A prefix operator applied to a name is an expression: `const token =
+    /// ++latest;` assigns a counter, not a password.
+    #[test]
+    fn a_prefix_operator_on_a_name_is_an_expression() {
+        for line in [
+            "const token = ++latest;",
+            "let token = --remaining;",
+            "token = !isStale",
+            "auth = &mutableConfig;",
+            "secret = *borrowedSecret",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Leading punctuation in a literal password is still a password, a
+        // letters-only one included: only `++` and `--` make an expression.
+        for line in [
+            "DB_PASSWORD=!Welcomeback",
+            "sshpass -p !Welcomeback ssh h",
+            "token=+Correcthorse",
+            "password=!Xk29LmQp3Z",
+            "token = -A1b2C3d4E5f6",
+            "secret: +Zq81mNy2x7",
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+        }
+    }
+
+    /// A single-brace template — Rust's and Python's `{}`, `{name}`,
+    /// `{name:?}` — stands in for a value the program supplies, as `${…}` and
+    /// `<…>` already did. In a URL's userinfo and after a credential-named key
+    /// it was reported as the credential itself.
+    #[test]
+    fn a_brace_template_is_a_placeholder() {
+        for line in [
+            r#""leaked bearer token: {scrubbed}""#,
+            r#"format!("password={password}")"#,
+            r#"let url = format!("https://x:{token}@example.com/r");"#,
+            r#"write!(f, "https://user:{}@host/path", self.user)"#,
+            r#"f"https://{user}:{password}@db.internal:5432/app""#,
+            r#"format!("https://user:{pw:?}@host")"#,
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // Braces that do not form a slot are characters of the literal.
+        for line in [
+            "postgres://app:s3cr}t{Passw0rd@db:5432/app",
+            "postgres://app:{s3cr3t-Passw0rd!}@db:5432/app",
+            r#"password = "Xq9{vB2mL7pZ4""#,
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+        }
     }
 
     /// The table's own invariant: a key is longer than its prefix, so the

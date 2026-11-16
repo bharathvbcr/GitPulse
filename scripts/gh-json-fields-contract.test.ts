@@ -38,6 +38,8 @@ const GH_FIELDS: Record<string, string[]> = {
 /** Each listing: where its argv is built, and the struct that parses the reply. */
 const LISTINGS = [
   { subcommand: "issue", fn: "list_issues", source: "github/mod.rs", struct: "GhIssue" },
+  { subcommand: "issue", fn: "issue_view_leading_args", source: "github/mod.rs", struct: "GhIssueDetail" },
+  { subcommand: "issue", fn: "issue_search_leading_args", source: "github/mod.rs", struct: "GhIssueDetail" },
   { subcommand: "run", fn: "list_workflow_runs", source: "github/mod.rs", struct: "GhWorkflowRun" },
   {
     subcommand: "workflow",

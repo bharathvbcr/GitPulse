@@ -443,21 +443,20 @@ describe("Part 3: TaskBoard Search Query Mutations & Multi-Column Page Invariant
   // Model a TaskBoard state across 6 columns
   class SimulatedTaskBoard {
     columns: Record<TaskStatus, { loadedCards: SimulatedCard[]; total: number }> = {
-      inbox: { loadedCards: [], total: 12 },
       ready: { loadedCards: [], total: 1 },
       in_progress: { loadedCards: [], total: 2 },
       review: { loadedCards: [], total: 196 },
       done: { loadedCards: [], total: 24 },
-      backlog: { loadedCards: [], total: 20 },
+      // The former inbox (12) and backlog (20) are one column.
+      backlog: { loadedCards: [], total: 32 },
     };
 
     allCards: Record<TaskStatus, SimulatedCard[]> = {
-      inbox: generateCards("inbox", 12),
       ready: generateCards("ready", 1),
       in_progress: generateCards("in_progress", 2),
       review: generateCards("review", 196),
       done: generateCards("done", 24),
-      backlog: generateCards("backlog", 20),
+      backlog: generateCards("backlog", 32),
     };
 
     pageSize = 30;
@@ -522,8 +521,8 @@ describe("Part 3: TaskBoard Search Query Mutations & Multi-Column Page Invariant
       // Invariant: Other columns maintain their loaded pages
       expect(reloadedPages.done).toBe(1);
       expect(board.columns.done.loadedCards.length).toBe(24);
-      expect(reloadedPages.inbox).toBe(1);
-      expect(board.columns.inbox.loadedCards.length).toBe(12);
+      expect(reloadedPages.backlog).toBe(1);
+      expect(board.columns.backlog.loadedCards.length).toBe(board.pageSize);
     }
   });
 

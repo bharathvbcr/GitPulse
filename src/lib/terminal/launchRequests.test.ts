@@ -9,24 +9,25 @@ afterEach(() => vi.useRealTimers());
 describe("resumeArgs", () => {
   const ID = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
 
-  it("is the plain resume with no prompt, exactly as before", () => {
-    expect(resumeArgs(ID)).toEqual(["--resume", ID]);
-    expect(resumeArgs(ID, undefined, "agy")).toEqual(["--conversation", ID]);
+  it("returns empty prompt args with no prompt, leaving --resume / --conversation to the Rust owner", () => {
+    expect(resumeArgs(ID)).toEqual([]);
+    expect(resumeArgs(ID, undefined, "agy")).toEqual([]);
+    expect(resumeArgs("__agy_continue__", undefined, "agy")).toEqual([]);
   });
 
   it("puts the prompt after `--` for Claude Code and `--prompt-interactive` for Antigravity, so no flag or shell word in it is read as one", () => {
-    // The real CLI form: `claude [options] [prompt]` (`claude --help`), and the
-    // `--` separator this repository already uses for every initial prompt;
-    // Antigravity uses `--conversation <id> --prompt-interactive <prompt>`.
+    // Prompt delivery only; typed `resume: { session_id, fork }` carries the
+    // conversation id so the Rust backend owns `--resume` / `--conversation`.
     for (const text of ["fix it", "--settings {}", "-p", "$(touch /tmp/x) `id` ; rm -rf ~", "multi\nline\ttext ✓"]) {
-      expect(resumeArgs(ID, text)).toEqual(["--resume", ID, "--", text]);
-      expect(resumeArgs(ID, text, "agy")).toEqual(["--conversation", ID, "--prompt-interactive", text]);
+      expect(resumeArgs(ID, text)).toEqual(["--", text]);
+      expect(resumeArgs(ID, text, "agy")).toEqual(["--prompt-interactive", text]);
     }
   });
 
   it("refuses what the initial-prompt path refuses, and a session id that is not one", () => {
     for (const bad of ["", "  \n", "a\0b", "x".repeat(16001)]) expect(() => resumeArgs(ID, bad)).toThrow();
     for (const id of ["", "../etc", "6f1c2a7e", `${ID}x`]) expect(() => resumeArgs(id, "hi")).toThrow();
+    expect(() => resumeArgs("__agy_continue__", "hi", "claude")).toThrow();
     expect(() => resumeArgs("--settings")).toThrow();
   });
 });
@@ -168,6 +169,34 @@ it("enqueues repository-contained file split requests and rejects traversal path
   const pending = requests.requestFile("/repo", "./src/lib/tabs.ts", 25, 3);
   const claimed = requests.take("/repo");
   expect(claimed).toMatchObject({ launcher: "file", filePath: "src/lib/tabs.ts", line: 25, column: 3 });
+  claimed?.complete();
+  await expect(pending).resolves.toBeUndefined();
+});
+
+it("validates fork resume options fail-closed and delivers resume and custom name on take", async () => {
+  const requests = createTerminalLaunchRequests();
+  const ID = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  await expect(
+    requests.request("/repo", "agy", undefined, undefined, { resume: { sessionId: ID, mode: "edit", fork: true } }),
+  ).rejects.toThrow("Claude Code");
+  await expect(
+    requests.request("/repo", "claude", undefined, undefined, { resume: { sessionId: "__agy_continue__", mode: null, fork: true } }),
+  ).rejects.toThrow("Claude Code");
+  await expect(
+    requests.request("/repo", "codex", undefined, undefined, { resume: { sessionId: ID, mode: null, fork: false } }),
+  ).rejects.toThrow("Claude Code or Antigravity");
+
+  const pending = requests.request("/repo-fork", "claude", undefined, undefined, {
+    resume: { sessionId: ID, mode: "edit", fork: true },
+    name: "  lane-1 (forked)  ",
+  });
+  const claimed = requests.take("/repo-fork");
+  expect(claimed).toMatchObject({
+    repoPath: "/repo-fork",
+    launcher: "claude",
+    resume: { sessionId: ID, mode: "edit", fork: true },
+    name: "lane-1 (forked)",
+  });
   claimed?.complete();
   await expect(pending).resolves.toBeUndefined();
 });

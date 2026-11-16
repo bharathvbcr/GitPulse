@@ -311,20 +311,22 @@ describe("what answers a request", () => {
     expect(get(activity).get("term-1")?.title).toBe("build ok");
   });
 
-  it("counts a bell as asking and a finished agent as not", () => {
+  it("leaves a bell and a finished agent out of asksForReader by default", () => {
     expect([..."needs-you error signalled finished".split(" "), null].map((kind) => asksForReader(kind as never)))
-      .toEqual([true, true, true, false, false]);
+      .toEqual([true, true, false, false, false]);
   });
 
   describe("the bell setting", () => {
-    afterEach(() => setSignalledAsksForReader(true));
+    afterEach(() => setSignalledAsksForReader(false));
 
-    it("with the bell setting off, signalled is not an ask; needs-you/error still are", () => {
-      setSignalledAsksForReader(false);
-      expect([..."needs-you error signalled finished".split(" "), null].map((kind) => asksForReader(kind as never)))
-        .toEqual([true, true, false, false, false]);
+    it("with the bell setting on, signalled is an ask; off drops signalled while needs-you/error stay", () => {
       setSignalledAsksForReader(true);
-      expect(asksForReader("signalled")).toBe(true);
+      expect([..."needs-you error signalled finished".split(" "), null].map((kind) => asksForReader(kind as never)))
+        .toEqual([true, true, true, false, false]);
+      setSignalledAsksForReader(false);
+      expect(asksForReader("signalled")).toBe(false);
+      expect(asksForReader("needs-you")).toBe(true);
+      expect(asksForReader("error")).toBe(true);
     });
   });
 

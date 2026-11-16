@@ -22,13 +22,11 @@ Uncommitted counts that could not be scanned show nothing rather than `0`. A ver
 
 ## Code (`⌥⌘1` / `Ctrl+Shift+1`)
 
-Explorer and Blame are two lenses on one **file** (selection survives the switch). **Search** scans file contents across the working tree or revisions. **Map** is the structural navigator — DevMap repo map, code/doc graph, and tracked-markdown search — not a third reading of the open file. Sections: `⌥1` / `⌥2` / `⌥3` / `⌥4`.
+**Explorer** (with inline **Blame** and **Search** toggles) and **Map** share the Code view. Explorer, Blame and Search work over files and text; **Map** is the structural navigator — DevMap repo map, code/doc graph, and tracked-markdown search. Sections: `⌥1` / `⌥2`.
 
 | Section | Purpose |
 | --- | --- |
-| **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), virtualized code viewer with proportional row-height zoom scaling (70%–160%), responsive header scroll cues (`ScrollCue`), boundary-aware tooltips, in-file search, go-to-line, inline edit, MarkDev bidirectional scrolling preview / image / hex previews. Status bar language mix toggle (LOC vs percentage). Commit composer shows pre-commit blast radius from `devmap preview`, drafts structured commit briefs from the patch, and supports on-device Apple Intelligence phrasing fallback. |
-| **Blame** | Per-line author, age, commit and coverage gutter with SWR caching, with consecutive lines of one commit read as a block. A **code-age timeline** above it shows what share of the file was last changed in each period, a **legend** carrying each age band's share filters on it, and an **age rail** down the right edge maps where in the file each age lives (click or drag to navigate; it maps the list actually drawn, so a filter re-maps it). Column, chip and band are one selection model: each selects exactly what it counted. Uncommitted lines render as `uncommitted`, not as a link to a fake commit, and — with clock-skewed and undated lines — ride beside the axis as their own labelled shares rather than being left out of the total. Coverage unavailable is marked separately from uncovered. |
-| **Search** | Fast repository-wide text search across the working tree or an explicit Git revision using `git grep`. Respects `.gitignore` rules across tracked and untracked files. A search that is cancelled, timed out, capped, or truncated explicitly declares its status and reason. Case-sensitive and regex modes with line match jumping. |
+| **Explorer** | File tree with live Git status, dual-backend highlighting (MarkDev tree-sitter for six languages; regex for the rest), virtualized code viewer with proportional row-height zoom scaling (70%–160%), responsive header scroll cues (`ScrollCue`), boundary-aware tooltips, in-file search, go-to-line, inline edit, MarkDev bidirectional scrolling preview / image / hex previews, toggled **Blame** gutter (line authorship, code-age timeline/rail, and coverage gutter), and toggled repository-wide **Search** (`git grep` with honest cancellation/cap status). Status bar language mix toggle (LOC vs percentage). Commit composer shows pre-commit blast radius from `devmap preview`, drafts structured commit briefs from the patch, and supports on-device Apple Intelligence phrasing fallback. |
 | **Map** | Subsystems / entry points from the `repo_map` resolved by `devmap paths --json` (default `.devmap/repo_map.json`, legacy `.devcouncil` supported), code and doc graph canvas, docs search and broken links, cross-repo link candidates, and zero-copy worktree graph sharing (`base_store_ref.json` -> anchor `devmap.sqlite` + `overlay.json` Blake3/CAS delta overlays). Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
 
 The graph filters include **Hide notes & Markdown**, off by default. It hides
@@ -51,14 +49,13 @@ Lenses on one **commit** and regression history.
 
 ## Insights (`⌥⌘3` / `Ctrl+Shift+3`)
 
-Five on-demand scans of **this repository**. Each must say when it was capped rather than presenting a floor as a total.
+Four on-demand scans of **this repository**. Each must say when it was capped rather than presenting a floor as a total.
 
 | Section | Purpose |
 | --- | --- |
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
 | **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
-| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, pinned advisory table columns, and Dependabot/code scanning via `gh` when a repository opens. Critical and high findings warn. |
-| **Secrets** | Kingfisher scanner for exposed credentials and tokens in the working tree. Each finding shows where it sits in Git (tracked, untracked, ignored, `.git` metadata, nested repo) and which rows share a value; secret values and context are dropped; stdout is unlogged; partial or incomplete scans are never shown as clean. |
+| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, pinned advisory table columns, Dependabot and code scanning via `gh` when a repository opens, and the **Kingfisher Secrets Scanner** (showing Git location and shared-value rows while dropping secret values and context, never reporting partial/incomplete scans as clean). Critical and high findings warn. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
 ![Coverage scanner](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-coverage.png)

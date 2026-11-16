@@ -7,7 +7,8 @@
 //! the same resolved binary every other call does and says, in one sentence
 //! a user can act on, what is wrong.
 
-use super::{classify_tool_probe, git_command, run_bounded, CapturedOutput, ToolProbe};
+use super::git_command;
+use crate::engine::process::{classify_tool_probe, run_bounded, CapturedOutput, ToolProbe};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -61,6 +62,17 @@ pub struct GitPreflight {
 
 /// `2.39.3` from `git version 2.39.3 (Apple Git-146)` or
 /// `git version 2.45.1.windows.1`. Missing minor or patch read as zero.
+///
+/// Kept local instead of delegating to `dc_proc::GitVersion::parse` because
+/// GitPulse's preflight contract diverges on three fail-closed/compatibility
+/// cases (and `gitpulse` does not link `dc-proc` directly):
+/// - overflowing numeric patch components fail closed (`None`) here rather than
+///   saturating to `0` (`unwrap_or(0)` in `dc-proc`);
+/// - pre-release tags such as `git version 2.45.1-rc1` split on `-` so
+///   `2.45.1` satisfies `MIN_CLONE_GIT_VERSION`, whereas `dc-proc` parses patch
+///   `0` (`2.45.0`) and rejects it;
+/// - major-only `git version 3` parses as `(3, 0, 0)` here, whereas `dc-proc`
+///   requires `major.minor`.
 pub(crate) fn parse_git_version(line: &str) -> Option<(u32, u32, u32)> {
     let rest = line.trim().strip_prefix("git version ")?;
     let mut parts = rest

@@ -12,7 +12,8 @@
 pub mod components;
 pub mod release;
 
-use crate::engine::git_cli::{self, BoundedRun};
+use crate::engine::git_cli;
+use crate::engine::process::{self, BoundedRun};
 use crate::ipc_error::CommandError;
 use crate::ipc_error::IpcErrorKind;
 use crate::tool_capability;
@@ -557,7 +558,7 @@ pub(crate) fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
         }
     }
     let run =
-        git_cli::run_bounded_capped(cmd, tool.as_str(), Duration::from_secs(5), None, 64 * 1024)
+        process::run_bounded_capped(cmd, tool.as_str(), Duration::from_secs(5), None, 64 * 1024)
             .ok()?
             .require_complete(tool.as_str())
             .ok()?;
@@ -692,14 +693,14 @@ fn assess_ladder_with(tool: ExternalTool, probe: ReleaseProbe) -> LadderAssessme
 
     // Rung 3 — toolchain remote
     let (toolchain_ok, toolchain_block) = match tool {
-        ExternalTool::Devmap => match git_cli::find_external_tool("cargo") {
+        ExternalTool::Devmap => match process::find_external_tool("cargo") {
             Some(_) => (true, None),
             None => (
                 false,
                 Some("cargo is not installed (needed for cargo install --git)".into()),
             ),
         },
-        ExternalTool::Manvi => match git_cli::find_external_tool("go") {
+        ExternalTool::Manvi => match process::find_external_tool("go") {
             Some(_) => (true, None),
             None => (
                 false,
@@ -726,8 +727,8 @@ fn assess_ladder_with(tool: ExternalTool, probe: ReleaseProbe) -> LadderAssessme
         .as_ref()
         .and_then(|root| install_target(tool, root).ok());
     let installer_ok = match tool {
-        ExternalTool::Devmap => git_cli::find_external_tool("cargo").is_some(),
-        ExternalTool::Manvi => git_cli::find_external_tool("go").is_some(),
+        ExternalTool::Devmap => process::find_external_tool("cargo").is_some(),
+        ExternalTool::Manvi => process::find_external_tool("go").is_some(),
     };
     let (local_ok, local_block) = match (&target, installer_ok) {
         (Some(_), true) => (true, None),
@@ -998,15 +999,15 @@ struct InstallProgress {
     lines: [Vec<u8>; 2],
 }
 
-impl git_cli::ProcessObserver for InstallProgress {
+impl process::ProcessObserver for InstallProgress {
     fn cancelled(&self) -> bool {
         cancelled()
     }
 
-    fn output(&mut self, stream: git_cli::OutputStream, bytes: &[u8]) {
+    fn output(&mut self, stream: process::OutputStream, bytes: &[u8]) {
         let index = match stream {
-            git_cli::OutputStream::Stdout => 0,
-            git_cli::OutputStream::Stderr => 1,
+            process::OutputStream::Stdout => 0,
+            process::OutputStream::Stderr => 1,
         };
         let line = &mut self.lines[index];
         for &byte in bytes {
@@ -1031,7 +1032,7 @@ fn run_cancellable_install(
         rung,
         lines: [Vec::new(), Vec::new()],
     };
-    let result = git_cli::run_observed(
+    let result = process::run_observed(
         cmd,
         label,
         INSTALL_DEADLINE,
@@ -1338,7 +1339,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
     }
     let mut cmd = match tool {
         ExternalTool::Devmap => {
-            let cargo = match git_cli::find_external_tool("cargo") {
+            let cargo = match process::find_external_tool("cargo") {
                 Some(c) => c,
                 None => {
                     return InstallOutcome {
@@ -1365,7 +1366,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             cmd
         }
         ExternalTool::Manvi => {
-            let go = match git_cli::find_external_tool("go") {
+            let go = match process::find_external_tool("go") {
                 Some(g) => g,
                 None => {
                     return InstallOutcome {
@@ -1453,7 +1454,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             exit_code: None,
             stdout: String::new(),
             stderr: err.message().to_string(),
-            timed_out: git_cli::is_run_timeout(err.message()),
+            timed_out: process::is_run_timeout(err.message()),
             cancelled: cancelled(),
             reason_kind: reason_kind_of(&err),
             reason: Some(err.into_message()),
@@ -1566,7 +1567,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
 
     let mut cmd = match tool {
         ExternalTool::Devmap => {
-            let cargo = match git_cli::find_external_tool("cargo") {
+            let cargo = match process::find_external_tool("cargo") {
                 Some(c) => c,
                 None => {
                     return InstallOutcome {
@@ -1599,7 +1600,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             cmd
         }
         ExternalTool::Manvi => {
-            let go = match git_cli::find_external_tool("go") {
+            let go = match process::find_external_tool("go") {
                 Some(g) => g,
                 None => {
                     return InstallOutcome {
@@ -1657,7 +1658,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             reason_kind: None,
         },
         InstallRun::Failed(err) => {
-            let was_timeout = git_cli::is_run_timeout(err.message());
+            let was_timeout = process::is_run_timeout(err.message());
             // The source module may itself be a nested checkout. The approval
             // flow must name the same repository that process admission checks.
             let source = if crate::repository_trust::refused(err.message()) {
@@ -1726,11 +1727,11 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
     let mut requirements = Vec::new();
     match tool {
         ExternalTool::Devmap => {
-            let cargo = git_cli::find_external_tool("cargo");
+            let cargo = process::find_external_tool("cargo");
             let ver = cargo.as_ref().and_then(|p| {
                 let mut cmd = Command::new(p);
                 cmd.arg("--version");
-                git_cli::run_bounded_capped(cmd, "cargo", Duration::from_secs(5), None, 8 * 1024)
+                process::run_bounded_capped(cmd, "cargo", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
                     .and_then(|run| run.require_complete("cargo").ok())
                     .filter(|run| run.success)
@@ -1746,9 +1747,9 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
                     .is_none()
                     .then(|| "needed for cargo install / --git".into()),
             });
-            let cc = git_cli::find_external_tool("cc")
-                .or_else(|| git_cli::find_external_tool("clang"))
-                .or_else(|| git_cli::find_external_tool("gcc"));
+            let cc = process::find_external_tool("cc")
+                .or_else(|| process::find_external_tool("clang"))
+                .or_else(|| process::find_external_tool("gcc"));
             requirements.push(PreflightRequirement {
                 name: "c_compiler".into(),
                 found: cc.is_some(),
@@ -1762,11 +1763,11 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
             });
         }
         ExternalTool::Manvi => {
-            let go = git_cli::find_external_tool("go");
+            let go = process::find_external_tool("go");
             let ver = go.as_ref().and_then(|p| {
                 let mut cmd = Command::new(p);
                 cmd.arg("version");
-                git_cli::run_bounded_capped(cmd, "go", Duration::from_secs(5), None, 8 * 1024)
+                process::run_bounded_capped(cmd, "go", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
                     .and_then(|run| run.require_complete("go").ok())
                     .filter(|run| run.success)
@@ -1790,7 +1791,7 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
             });
         }
     }
-    let curl = git_cli::find_external_tool("curl");
+    let curl = process::find_external_tool("curl");
     requirements.push(PreflightRequirement {
         name: "curl".into(),
         found: curl.is_some(),
@@ -1901,7 +1902,7 @@ fn verify_devmap() -> VerifyReport {
     // Prefer `devmap doctor --json` over scraping `--version` prose.
     let mut cmd = Command::new(&binary);
     cmd.args(["doctor", "--json"]);
-    if let Ok(run) = git_cli::run_bounded_capped(
+    if let Ok(run) = process::run_bounded_capped(
         cmd,
         "devmap doctor",
         Duration::from_secs(10),
@@ -1945,7 +1946,7 @@ fn verify_devmap() -> VerifyReport {
 
     let mut cmd = Command::new(&binary);
     cmd.arg("--version");
-    let run = match git_cli::run_bounded_capped(
+    let run = match process::run_bounded_capped(
         cmd,
         "devmap --version",
         Duration::from_secs(5),

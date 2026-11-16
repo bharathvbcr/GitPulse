@@ -124,3 +124,16 @@ export function unwiredExclusionSummary(meta: RepoMapUnwiredMeta): string[] {
   );
   return phrases;
 }
+
+/**
+ * The words for a `liveness_meta.unavailable` key.
+ *
+ * The producer keys its "could not be answered" notes by snake_case list name
+ * (`unreachable_files`); the panel shows plain words, never the identifier.
+ * An unknown key is spelled out rather than dropped, so a new analysis the
+ * producer starts reporting still reaches the reader.
+ */
+export function unavailableAnalysisLabel(key: string): string {
+  const words = key.replace(/[_-]+/g, " ").trim();
+  return words === "" ? "an analysis" : words;
+}

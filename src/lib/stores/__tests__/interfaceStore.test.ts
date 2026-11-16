@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { get } from "svelte/store";
-import { interfaceStore } from "../interfaceStore";
+import {
+  BELL_ASKS_FOR_READER_REV,
+  interfaceStore,
+  migrateBellAsksForReader,
+} from "../interfaceStore";
 import { memoryStorage } from "../../repos/persist";
 import { asksForReader } from "../../terminal/sessionActivity";
 
@@ -136,6 +140,14 @@ describe("interfaceStore", () => {
     interfaceStore.setShowGraphAvatars(false);
     interfaceStore.reset();
     expect(get(interfaceStore).showGraphAvatars).toBe(true);
+  });
+
+  it("shows GitHub profile pictures by default and persists the opt-out", () => {
+    expect(get(interfaceStore).showGithubAvatars).toBe(true);
+    interfaceStore.setShowGithubAvatars(false);
+    expect(get(interfaceStore).showGithubAvatars).toBe(false);
+    interfaceStore.reset();
+    expect(get(interfaceStore).showGithubAvatars).toBe(true);
   });
 
   it("customizes graph width without changing the other interface prefs", () => {
@@ -368,30 +380,46 @@ describe("interfaceStore", () => {
     }
   });
 
-  it("counts a terminal bell as waiting by default, and the setter drives asksForReader", () => {
-    expect(get(interfaceStore).bellAsksForReader).toBe(true);
-    expect(asksForReader("signalled")).toBe(true);
+  it("leaves a terminal bell opt-in by default, and the setter drives asksForReader", () => {
+    expect(get(interfaceStore).bellAsksForReader).toBe(false);
+    expect(get(interfaceStore).bellAsksForReaderRev).toBe(BELL_ASKS_FOR_READER_REV);
+    expect(asksForReader("signalled")).toBe(false);
+    expect(asksForReader("needs-you")).toBe(true);
+    expect(asksForReader("error")).toBe(true);
     try {
+      interfaceStore.setBellAsksForReader(true);
+      expect(get(interfaceStore).bellAsksForReader).toBe(true);
+      expect(asksForReader("signalled")).toBe(true);
       interfaceStore.setBellAsksForReader(false);
       expect(get(interfaceStore).bellAsksForReader).toBe(false);
       expect(asksForReader("signalled")).toBe(false);
-      expect(asksForReader("needs-you")).toBe(true);
       interfaceStore.setBellAsksForReader(true);
-      expect(asksForReader("signalled")).toBe(true);
-      interfaceStore.setBellAsksForReader(false);
       interfaceStore.reset();
-      expect(get(interfaceStore).bellAsksForReader).toBe(true);
-      expect(asksForReader("signalled")).toBe(true);
+      expect(get(interfaceStore).bellAsksForReader).toBe(false);
+      expect(get(interfaceStore).bellAsksForReaderRev).toBe(BELL_ASKS_FOR_READER_REV);
+      expect(asksForReader("signalled")).toBe(false);
     } finally {
       interfaceStore.reset();
     }
   });
 
-  it("reads the stored bell setting at load: false round-trips, anything else is on", async () => {
+  it("reconciles migrateBellAsksForReader against the opt-in revision", () => {
+    for (const rev of [undefined, 0, "1", Number.NaN, -1, null]) {
+      expect(migrateBellAsksForReader(true, rev), `rev: ${String(rev)}`).toBe(false);
+    }
+    expect(migrateBellAsksForReader(true, BELL_ASKS_FOR_READER_REV)).toBe(true);
+    expect(migrateBellAsksForReader(true, BELL_ASKS_FOR_READER_REV + 1)).toBe(true);
+    for (const bad of [false, "true", 1, "yes", "no", 0, {}, [], null, undefined]) {
+      expect(migrateBellAsksForReader(bad, undefined), `bad@undef: ${JSON.stringify(bad)}`).toBe(false);
+      expect(migrateBellAsksForReader(bad, BELL_ASKS_FOR_READER_REV), `bad@cur: ${JSON.stringify(bad)}`).toBe(false);
+    }
+  });
+
+  it("reconciles pre-revision stored true once at load and preserves deliberate opt-ins", async () => {
     const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
-    const load = async (stored: unknown) => {
+    const load = async (stored: Record<string, unknown>) => {
       const storage = memoryStorage({
-        gitpulse_interface_prefs: JSON.stringify({ bellAsksForReader: stored }),
+        gitpulse_interface_prefs: JSON.stringify(stored),
       });
       Object.defineProperty(globalThis, "window", {
         value: { localStorage: storage },
@@ -403,14 +431,48 @@ describe("interfaceStore", () => {
       const activity = await import("../../terminal/sessionActivity");
       // The flag must already be set when the store is created, before any
       // subscriber or setter runs.
-      return [get(fresh.interfaceStore).bellAsksForReader, activity.asksForReader("signalled")];
+      return {
+        pref: get(fresh.interfaceStore).bellAsksForReader,
+        asks: activity.asksForReader("signalled"),
+        store: fresh.interfaceStore,
+        storage,
+      };
     };
     try {
-      expect(await load(false)).toEqual([false, false]);
-      expect(await load(true)).toEqual([true, true]);
-      expect(await load(undefined)).toEqual([true, true]);
-      expect(await load("no")).toEqual([true, true]);
-      expect(await load(0)).toEqual([true, true]);
+      // Old default persisted without the opt-in revision moves to false once.
+      const preRev = await load({ bellAsksForReader: true });
+      expect([preRev.pref, preRev.asks]).toEqual([false, false]);
+
+      // Turning the opt-in on writes BELL_ASKS_FOR_READER_REV and survives reload.
+      preRev.store.setBellAsksForReader(true);
+      preRev.store.flush();
+      expect(JSON.parse(preRev.storage.getItem("gitpulse_interface_prefs") ?? "{}")).toMatchObject({
+        bellAsksForReader: true,
+        bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
+      });
+
+      const optedIn = await load({
+        bellAsksForReader: true,
+        bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
+      });
+      expect([optedIn.pref, optedIn.asks]).toEqual([true, true]);
+
+      const optedOut = await load({
+        bellAsksForReader: false,
+        bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
+      });
+      expect([optedOut.pref, optedOut.asks]).toEqual([false, false]);
+
+      for (const stored of [
+        {},
+        { bellAsksForReader: "true", bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV },
+        { bellAsksForReader: 1, bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV },
+        { bellAsksForReader: "no" },
+        { bellAsksForReader: 0 },
+      ]) {
+        const res = await load(stored);
+        expect([res.pref, res.asks], JSON.stringify(stored)).toEqual([false, false]);
+      }
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");
@@ -926,6 +988,32 @@ it("reads stored terminal scrollback clamped, and ignores a corrupt one", async 
   }
 });
 
+it("persists the commit pane height clamped on set, and validates it on read", async () => {
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ commitPaneHeight: 99_999 }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    const first = (await import("../interfaceStore")).interfaceStore;
+    expect(get(first).commitPaneHeight).toBe(1600);
+    first.setCommitPaneHeight(10);
+    expect(get(first).commitPaneHeight).toBe(140);
+    first.setCommitPaneHeight(Number.NaN);
+    expect(get(first).commitPaneHeight).toBe(256);
+    first.setCommitPaneHeight(320.4);
+    first.flush();
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).commitPaneHeight).toBe(320);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ commitPaneHeight: "tall" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).commitPaneHeight).toBe(256);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("reloads terminal preferences and rejects corrupt stored values", async () => {
   const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
   const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalFontSize: 20, terminalLauncher: "manvi" }) });
@@ -974,19 +1062,19 @@ describe("tasks board view preferences", () => {
 
   it("hides columns one at a time and brings them all back in one action", () => {
     interfaceStore.toggleTaskColumn("done");
-    interfaceStore.toggleTaskColumn("inbox");
-    expect(get(interfaceStore).taskHiddenColumns).toEqual(["inbox", "done"]);
-    interfaceStore.toggleTaskColumn("inbox");
+    interfaceStore.toggleTaskColumn("backlog");
+    expect(get(interfaceStore).taskHiddenColumns).toEqual(["backlog", "done"]);
+    interfaceStore.toggleTaskColumn("backlog");
     expect(get(interfaceStore).taskHiddenColumns).toEqual(["done"]);
     interfaceStore.showAllTaskColumns();
     expect(get(interfaceStore).taskHiddenColumns).toEqual([]);
   });
 
   it("refuses the toggle that would leave the board with no columns", () => {
-    for (const status of ["inbox", "backlog", "ready", "in_progress", "review"] as const) {
+    for (const status of ["backlog", "ready", "in_progress", "review"] as const) {
       interfaceStore.toggleTaskColumn(status);
     }
-    const five = ["inbox", "backlog", "ready", "in_progress", "review"];
+    const five = ["backlog", "ready", "in_progress", "review"];
     expect(get(interfaceStore).taskHiddenColumns).toEqual(five);
     // Refused, and nothing else disturbed. This asserted `[]` before, which is
     // the storage repair leaking into a click: the reader unchecks one column
@@ -1093,6 +1181,27 @@ describe("tasks board view preferences", () => {
       storage.setItem("gitpulse_interface_prefs", JSON.stringify({ taskHiddenRepositories: "repo-0" }));
       vi.resetModules();
       expect(get((await import("../interfaceStore")).interfaceStore).taskHiddenRepositories).toEqual([]);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("loads stored board preferences that name the retired inbox column", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ taskHiddenColumns: ["inbox", "done"] }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      expect(get(reloaded).taskHiddenColumns).toEqual(["done"]);
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");

@@ -66,7 +66,7 @@ pub(crate) fn strip_prefix_operators(text: &str) -> &str {
             .strip_prefix('&')
             .or_else(|| rest.strip_prefix('*'))
             .or_else(|| rest.strip_prefix('!'))
-            .map(|after| after.strip_prefix("mut ").unwrap_or(after))
+            .map(|after| after.trim_prefix("mut "))
             .map(str::trim_start)
             .filter(|next| !next.is_empty())
         else {

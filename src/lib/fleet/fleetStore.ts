@@ -198,8 +198,10 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
       await runOne(family, repoPath);
       update((s) => ({ ...s, scanning: null, progress: null }));
     } catch (err: unknown) {
-      const reason = formatError(err);
+      // Logged first: it marks a runtime fault as recorded, so formatting it
+      // for the screen below does not add a second Diagnostics entry.
       reportPanelError("fleet", err);
+      const reason = formatError(err);
       update((s) => ({
         ...s,
         scanning: null,

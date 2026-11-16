@@ -9,7 +9,7 @@
 //! which does exactly what the engine used to; in `gitpulse-ptyd` it is a frame
 //! to whichever app is connected (`host::server`).
 
-use super::incident;
+use super::{incident, session_ledger};
 use super::{TerminalExitPayload, TerminalLossPayload};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -47,13 +47,19 @@ pub trait SessionEvents: Send + Sync {
 pub struct AppEvents<R: tauri::Runtime> {
     app: AppHandle<R>,
     incidents: Arc<incident::Recorder>,
+    session_ledger: Arc<session_ledger::SessionLedger>,
 }
 
 impl<R: tauri::Runtime> AppEvents<R> {
-    pub fn new(app: &AppHandle<R>, incidents: Arc<incident::Recorder>) -> Self {
+    pub fn new(
+        app: &AppHandle<R>,
+        incidents: Arc<incident::Recorder>,
+        session_ledger: Arc<session_ledger::SessionLedger>,
+    ) -> Self {
         Self {
             app: app.clone(),
             incidents,
+            session_ledger,
         }
     }
 }
@@ -74,6 +80,14 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
     }
 
     fn exit(&self, ended: SessionEnded) {
+        if self.session_ledger.record_exit(
+            &ended.payload.id,
+            ended.ended_by_gitpulse,
+            ended.payload.exit_code,
+            Some(ended.payload.signal.as_str()).filter(|s| !s.is_empty()),
+        ) {
+            self.session_ledger.emit_view(&self.app);
+        }
         incident::report_exit(
             &self.incidents,
             &self.app,

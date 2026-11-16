@@ -17,8 +17,8 @@ use super::proto::{
 use super::receipts::Receipts;
 use super::transcripts::{ArmError, Limits, Transcripts};
 use crate::terminal::{
-    self as engine, OutputSink, Place, SessionEnded, SessionEvents, TerminalLossPayload,
-    TerminalSessions, TranscriptRead,
+    engine, Engine, OutputSink, Place, SessionEnded, SessionEvents, TerminalLossPayload,
+    TranscriptRead,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long a write to the app may block before the app is taken to be gone.
@@ -37,6 +37,13 @@ use std::time::{Duration, Instant};
 pub const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a new connection has to introduce itself.
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
+/// How long `introduce` / `Retire` waits for a connection whose peer has
+/// already hung up to finish its `disconnected` cleanup.
+const DEPARTING_SETTLE: Duration = Duration::from_secs(2);
+/// Brief grace when a second `Hello` arrives before EOF is visible (e.g. a
+/// final fire-and-forget frame queued ahead of FIN). Wakes immediately via
+/// `Condvar` when the departing connection ends.
+const HANDOFF_GRACE: Duration = Duration::from_millis(250);
 /// How often the accept loop looks up to check whether it should exit.
 const ACCEPT_WAIT: Duration = Duration::from_millis(250);
 /// The default for how long a host with no app and no sessions waits before it
@@ -120,24 +127,79 @@ impl Conn {
     }
 }
 
+#[derive(Default)]
+struct LinkState {
+    current: Option<Arc<Conn>>,
+    /// True while a departing connection is running `detach_all` and releasing
+    /// holds, so a successor never attaches views before the departing cleanup
+    /// finishes.
+    disconnecting: bool,
+}
+
 /// Whichever app is connected now.
 #[derive(Default)]
 struct Link {
-    current: Mutex<Option<Arc<Conn>>>,
+    state: Mutex<LinkState>,
+    changed: Condvar,
 }
 
 impl Link {
     fn current(&self) -> Option<Arc<Conn>> {
-        self.current
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .current
             .clone()
+    }
+
+    fn is_idle(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.current.is_none() && !state.disconnecting
     }
 
     fn send(&self, header: &HostFrame, payload: &[u8]) -> Result<(), String> {
         self.current()
             .ok_or_else(|| "no GitPulse app is connected".to_string())?
             .send(header, payload)
+    }
+
+    /// Waits out a connection that is already disconnecting or whose peer has
+    /// hung up (`local_socket::peer_hung_up_silently`), plus a brief
+    /// `HANDOFF_GRACE` in case final bytes precede FIN.
+    fn wait_for_departing(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let grace_deadline = Instant::now() + HANDOFF_GRACE;
+        while !state.disconnecting {
+            let Some(prev) = state.current.as_ref() else {
+                return state;
+            };
+            if prev.is_closed() || crate::local_socket::peer_hung_up_silently(&prev.control) {
+                prev.close();
+                break;
+            }
+            let left = grace_deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return state;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        let settle_deadline = Instant::now() + DEPARTING_SETTLE;
+        while state.disconnecting || state.current.as_ref().is_some_and(|c| c.is_closed()) {
+            let left = settle_deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state
     }
 }
 
@@ -201,7 +263,7 @@ impl SessionEvents for HostEvents {
 }
 
 struct Host {
-    engine: TerminalSessions,
+    engine: Engine,
     link: Arc<Link>,
     receipts: Arc<Receipts>,
     /// Each session's saved output, or why the store could not be opened: a
@@ -460,22 +522,34 @@ impl Host {
     /// view, exactly as a page reload would, and keeps running.
     fn disconnected(&self, conn: &Arc<Conn>) {
         conn.close();
-        let mut current = self
-            .link
-            .current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
-            *current = None;
-            drop(current);
-            let detached = engine::detach_all(&self.engine);
-            let holds =
-                std::mem::take(&mut *self.holds.lock().unwrap_or_else(PoisonError::into_inner));
-            for (_, hold) in holds {
-                hold.release();
+        {
+            let mut state = self
+                .link
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !state.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
+                return;
             }
-            log::info!(target: "terminal_host", "the app disconnected; {detached} session(s) left running");
+            state.current = None;
+            state.disconnecting = true;
+            self.link.changed.notify_all();
         }
+        struct Finish<'a>(&'a Link);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.disconnecting = false;
+                self.0.changed.notify_all();
+            }
+        }
+        let _finish = Finish(&self.link);
+        let detached = engine::detach_all(&self.engine);
+        let holds = std::mem::take(&mut *self.holds.lock().unwrap_or_else(PoisonError::into_inner));
+        for (_, hold) in holds {
+            hold.release();
+        }
+        log::info!(target: "terminal_host", "the app disconnected; {detached} session(s) left running");
     }
 }
 
@@ -517,6 +591,13 @@ fn serve_connection(host: Arc<Host>, stream: UnixStream) {
         conn.close();
         return;
     }
+    struct ActiveConn<'a>(&'a Host, &'a Arc<Conn>);
+    impl Drop for ActiveConn<'_> {
+        fn drop(&mut self) {
+            self.0.disconnected(self.1);
+        }
+    }
+    let _active = ActiveConn(&host, &conn);
     loop {
         let frame = match proto::read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
@@ -536,7 +617,6 @@ fn serve_connection(host: Arc<Host>, stream: UnixStream) {
             }
         }
     }
-    host.disconnected(&conn);
 }
 
 /// The first frame: `hello` (become the connected app) or `retire`.
@@ -552,13 +632,9 @@ fn introduce(host: &Arc<Host>, conn: &Arc<Conn>, reader: &mut BufReader<UnixStre
     };
     match request {
         Request::Hello { protocol, build } => {
-            let mut current = host
-                .link
-                .current
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if current.as_ref().is_some_and(|c| !c.is_closed()) {
-                drop(current);
+            let mut state = host.link.wait_for_departing();
+            if state.disconnecting || state.current.is_some() {
+                drop(state);
                 conn.reply(
                     id,
                     Err("Another GitPulse window is connected to this terminal host.".into()),
@@ -581,12 +657,15 @@ fn introduce(host: &Arc<Host>, conn: &Arc<Conn>, reader: &mut BufReader<UnixStre
             if build != crate::updates::CURRENT_VERSION {
                 log::info!(target: "terminal_host", "app build {build} connected to host build {}", crate::updates::CURRENT_VERSION);
             }
-            *current = Some(conn.clone());
+            state.current = Some(conn.clone());
+            host.link.changed.notify_all();
             true
         }
         Request::Retire => {
+            let state = host.link.wait_for_departing();
             let sessions = host.session_count();
-            let connected = host.link.current().is_some_and(|c| !c.is_closed());
+            let connected = state.disconnecting || state.current.is_some();
+            drop(state);
             let retired = sessions == 0 && !connected;
             if retired {
                 host.retire.store(true, Ordering::Release);
@@ -623,6 +702,15 @@ fn prepare(stream: &UnixStream) -> std::io::Result<()> {
 /// Runs the host until it is idle long enough, retired, or signalled. Returns
 /// the process exit code.
 pub fn serve(config: ServeConfig) -> i32 {
+    serve_with(config, Engine::default(), true)
+}
+
+#[cfg(test)]
+pub(in crate::terminal) fn serve_for_unit_test(config: ServeConfig, engine: Engine) -> i32 {
+    serve_with(config, engine, false)
+}
+
+fn serve_with(config: ServeConfig, engine: Engine, install_shutdown_hook: bool) -> i32 {
     if let Err(error) = crate::local_socket::private_dir(&config.dir) {
         eprintln!("gitpulse-ptyd: {error}");
         return exit_code::FAILED;
@@ -674,14 +762,14 @@ pub fn serve(config: ServeConfig) -> i32 {
         }
     };
     let host = Arc::new(Host {
-        engine: TerminalSessions::default(),
+        engine,
         link: Arc::default(),
         receipts,
         transcripts,
         holds: Mutex::default(),
         retire: AtomicBool::new(false),
     });
-    {
+    if install_shutdown_hook {
         let host = host.clone();
         crate::procguard::set_shutdown_hook(move || {
             log::info!(target: "terminal_host", "signalled: stopping every session");
@@ -705,7 +793,7 @@ pub fn serve(config: ServeConfig) -> i32 {
             log::info!(target: "terminal_host", "retired by a newer app");
             break exit_code::IDLE;
         }
-        let idle = host.link.current().is_none() && host.session_count() == 0;
+        let idle = host.link.is_idle() && host.session_count() == 0;
         match (idle, idle_since) {
             (false, _) => idle_since = None,
             (true, None) => idle_since = Some(Instant::now()),

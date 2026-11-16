@@ -538,7 +538,7 @@ fn a_listing_older_than_a_recorded_exit_does_not_bring_the_session_back() {
     assert!(app.host.knows("term-live"));
 
     fake.end("term-live");
-    let proxies = || app.sessions.host.as_ref().unwrap().known_sessions();
+    let proxies = || app.sessions.host.known_sessions();
     until("the exit recorded", Duration::from_secs(10), || {
         proxies() == 0
     });
@@ -647,7 +647,7 @@ fn a_spawn_the_host_never_answers_is_vouched_for_only_briefly() {
     app.sessions.connect_host().unwrap();
     fake.shared.hang_spawn.store(true, Ordering::Release);
 
-    let host = app.sessions.host.clone().unwrap();
+    let host = app.sessions.host.clone();
     let spawner = std::thread::spawn(move || {
         host.spawn(
             Arc::new(NullEvents),
@@ -684,7 +684,7 @@ fn an_exit_that_overtakes_the_spawn_reply_is_not_vouched_for() {
     app.sessions.connect_host().unwrap();
     fake.shared.hang_spawn.store(true, Ordering::Release);
 
-    let host = app.sessions.host.clone().unwrap();
+    let host = app.sessions.host.clone();
     let spawner = std::thread::spawn(move || {
         host.spawn(
             Arc::new(NullEvents),
@@ -869,7 +869,7 @@ fn a_hundred_threads_ask_while_the_host_churns_and_a_session_ends() {
     std::thread::sleep(Duration::from_millis(500));
     fake.forget("term-live");
     fake.end("term-live");
-    let proxies = || app.sessions.host.as_ref().unwrap().known_sessions();
+    let proxies = || app.sessions.host.known_sessions();
     until("the exit recorded", Duration::from_secs(10), || {
         proxies() == 1
     });
@@ -933,7 +933,7 @@ fn an_output_flood_does_not_stall_the_check() {
 const ALWAYS: usize = usize::MAX / 2;
 
 fn the_client(app: &Fixture) -> HostClient {
-    app.sessions.host.clone().unwrap()
+    app.sessions.host.clone()
 }
 
 /// A spawn the host answers while the adoption's list is still on its way, as

@@ -17,6 +17,8 @@
  */
 
 import { IDLE_OPERATION, type OperationState } from "./operation";
+import { disambiguateLabels, displayName } from "./paths";
+import type { RepoSession } from "./storeTypes";
 import { WATCH_UNKNOWN, type WatchState } from "./watchState";
 import type { RepoWipInput } from "./wipSummary";
 
@@ -113,4 +115,94 @@ export function toWipInput(facts: RepoFacts): RepoWipInput {
     loadFailed: facts.loadFailed || facts.stashFailed,
     hydrated: facts.hydrated,
   };
+}
+
+/**
+ * Open paths that may receive background work. A session with
+ * `trustRequired`, or one whose checkout is `missing`, is omitted, and it is
+ * not used as the active key. A missing checkout used to stay in: every
+ * workspace sync re-tried it and re-reported it, once per activation.
+ */
+export function pathsTrustedForBackground(
+  tabs: readonly { path: string; trustRequired?: boolean; missing?: boolean; parked?: boolean }[],
+  activePath: string | null,
+): { activeKey: string | null; retainedKeys: string[]; liveKeys: string[] } {
+  const retainedKeys: string[] = [];
+  const liveKeys: string[] = [];
+  let activeBlocked = false;
+  for (const tab of tabs) {
+    if (tab.trustRequired || tab.missing) {
+      if (tab.path === activePath) activeBlocked = true;
+      continue;
+    }
+    retainedKeys.push(tab.path);
+    // Parked: open but not watched (repos/watchPool.ts). The active tab is
+    // never parked, so this cannot drop the repository being looked at.
+    if (!tab.parked || tab.path === activePath) liveKeys.push(tab.path);
+  }
+  return {
+    activeKey: activePath && !activeBlocked ? activePath : null,
+    retainedKeys,
+    liveKeys,
+  };
+}
+
+/**
+ * Per-repository live facts, one record per open tab.
+ *
+ * `unpushedCommits` comes from the current branch's ahead count; a session
+ * that has not hydrated reports zero, and `hydrated: false` is what tells
+ * every consumer to treat that zero as unknown rather than as "nothing to
+ * push". The same rule governs every other count here.
+ *
+ * This is the single extraction from session state. The work-in-progress
+ * summary and the Fleet grid both narrow from it instead of walking
+ * `internal.sessions` themselves.
+ */
+export function collectRepoFacts(
+  tabs: readonly { id: string; path: string }[],
+  sessions: Readonly<Record<string, RepoSession | undefined>>,
+): RepoFacts[] {
+  const labels = disambiguateLabels(tabs.map((tab) => tab.path));
+  return tabs.map((tab) => {
+    const session = sessions[tab.id];
+    const statuses = session?.statuses ?? [];
+    const current = session?.branches.find(
+      (branch) => branch.is_current || branch.name === session?.currentBranch,
+    );
+    let additions = 0;
+    let deletions = 0;
+    let churnPartial = false;
+    for (const file of statuses) {
+      additions += file.additions;
+      deletions += file.deletions;
+      // Rust omits the key entirely while empty, so this is absent on the
+      // overwhelming majority of rows. Where it is present, the sums above
+      // are floors and must be rendered as such.
+      if (file.warnings && file.warnings.length > 0) churnPartial = true;
+    }
+    return {
+      path: tab.path,
+      label: labels.get(tab.path) ?? displayName(tab.path),
+      branch: session?.currentBranch ?? null,
+      isBare: Boolean(session?.isBare),
+      changedFiles: statuses.length,
+      conflictedFiles: statuses.filter((file) => file.is_conflicted).length,
+      stagedFiles: statuses.filter((file) => file.is_staged).length,
+      additions,
+      deletions,
+      churnPartial,
+      unpushedCommits: current?.ahead_count ?? 0,
+      behindCommits: current?.behind_count ?? 0,
+      // An unreadable stash list must not read as an empty one; consumers
+      // treat a failed probe as unknown through `stashFailed`/`loadFailed`.
+      stashEntries: session?.stashEntries.length ?? 0,
+      stashFailed: Boolean(session?.stashFailed || session?.stashTruncated),
+      operation: session?.operation ?? IDLE_OPERATION,
+      watch: session?.watch ?? WATCH_UNKNOWN,
+      loadFailed: Boolean(session?.error),
+      loadError: session?.error ?? null,
+      hydrated: Boolean(session?.hasHydrated),
+    };
+  });
 }

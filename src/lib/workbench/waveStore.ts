@@ -145,7 +145,7 @@ export interface ActiveWave { record: WaveRecord | null; complete: boolean }
 export async function findActiveWave(api: WaveTaskApi): Promise<ActiveWave> {
   let complete = true;
   const found = new Map<string, WaveRecord>();
-  for (const status of ["in_progress", "ready", "backlog", "inbox", "review"] as const) {
+  for (const status of ["in_progress", "ready", "backlog", "review"] as const) {
     let cursor: string | undefined;
     for (let page = 0; page < DISCOVERY_PAGES; page += 1) {
       const result = await api.listCards(status, cursor);

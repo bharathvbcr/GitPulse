@@ -20,11 +20,13 @@
 //! check that could not run (unreadable store, unreadable head, unparseable
 //! record) is a hold that says so, never a quiet pass.
 
+pub(crate) mod memo;
+pub(crate) use memo::Memo;
+
 use super::intake::resolve;
 use super::WorkbenchError;
 use crate::ipc_error::CommandError;
 use dc_store::Store;
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -74,6 +76,43 @@ pub(crate) struct Record {
     pub critic_summary: String,
 }
 
+impl Record {
+    /// Bytes of heap this record holds, for the memo's budget: the text of each
+    /// field and of each criterion, finding and degraded line, and their
+    /// headers.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        const STRING: usize = std::mem::size_of::<String>();
+        let fields = [
+            &self.request_id,
+            &self.item_id,
+            &self.state,
+            &self.outcome,
+            &self.worktree,
+            &self.head,
+            &self.critic_summary,
+        ]
+        .iter()
+        .map(|text| text.len())
+        .sum::<usize>();
+        let criteria: usize = self
+            .criteria
+            .iter()
+            .map(|criterion| {
+                std::mem::size_of::<Criterion>()
+                    + criterion.text.len()
+                    + criterion.status.len()
+                    + criterion
+                        .findings
+                        .iter()
+                        .map(|finding| STRING + finding.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let degraded: usize = self.degraded.iter().map(|line| STRING + line.len()).sum();
+        std::mem::size_of::<Self>() + fields + criteria + degraded
+    }
+}
+
 /// What the gate decided for a claim of `done`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Gate {
@@ -84,35 +123,6 @@ pub(crate) enum Gate {
     Held(String),
 }
 
-/// The newest verification record for `item_id`, `None` when the item has
-/// never been verified.
-///
-/// Evidence rows are append-only and the newest row for a request is its
-/// current state, so the newest row of this type decides. An unparseable row
-/// is an error rather than a skip: skipping it would let an older `passed`
-/// row stand in for a newer verdict nobody could read.
-///
-/// One row is asked for, newest first, so the walk stops at the card's newest
-/// verification. It used to read a page of the card's whole history (up to
-/// 10,001 rows, each decoded) to use the first one, and called a verdict
-/// behind a page of other evidence "too long to establish". A card never
-/// verified still walks the whole table (`evidence` has no index on
-/// `task_id`); ask [`latest_many`] for more than one card.
-pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, String> {
-    store
-        .connection()
-        .query_row(
-            "SELECT data_json FROM evidence WHERE task_id = ?1 AND type = ?2
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![item_id, EVIDENCE_TYPE],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| format!("the verification evidence could not be read: {e}"))?
-        .map(|data| parse_record(&data))
-        .transpose()
-}
-
 fn parse_record(data: &str) -> Result<Record, String> {
     serde_json::from_str(data).map_err(|e| {
         format!(
@@ -121,50 +131,14 @@ fn parse_record(data: &str) -> Result<Record, String> {
     })
 }
 
-/// [`latest`] for many tasks at once: each task's newest verification record,
-/// absent for a task that has none.
-///
-/// The board asks this for every card it shows, on every refresh, and the
-/// driver for every held card on every sweep. `evidence` has no index on
-/// `task_id` (dc-store's schema), so [`latest`] per card was one walk of the
-/// whole table per card: 4 s for 60 cards on an 82k-row profile, holding a
-/// storage slot throughout. This is one walk for them all.
-pub(crate) fn latest_many(
-    store: &Store,
-    item_ids: &[String],
-) -> Result<std::collections::HashMap<String, Record>, String> {
-    let mut found = std::collections::HashMap::new();
-    if item_ids.is_empty() {
-        return Ok(found);
-    }
-    let unreadable =
-        |e: rusqlite::Error| format!("the verification evidence could not be read: {e}");
-    let ids = serde_json::to_string(item_ids).map_err(|e| e.to_string())?;
-    let mut statement = store
-        .connection()
-        .prepare(
-            "SELECT e.task_id, e.data_json FROM evidence e
-             JOIN (SELECT MAX(id) AS id FROM evidence
-                   WHERE type = ?1 AND task_id IN (SELECT value FROM json_each(?2))
-                   GROUP BY task_id) newest ON newest.id = e.id",
-        )
-        .map_err(unreadable)?;
-    let rows = statement
-        .query_map(rusqlite::params![EVIDENCE_TYPE, ids], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(unreadable)?;
-    for row in rows {
-        let (task, data) = row.map_err(unreadable)?;
-        found.insert(task, parse_record(&data)?);
-    }
-    Ok(found)
-}
-
 /// The gate for a claim of `done` on `item_id`, a task of the repository whose
-/// identity is `repository_identity`.
-pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> Gate {
-    match latest(store, item_id) {
+/// identity is `repository_identity`, judged on the newest record `memo` holds
+/// for it ([`Memo::latest`]: the one reader, a single newest-first walk held
+/// while the store has not changed). The caller names the memo: a caller that
+/// carries a backend asks the backend's, so a test can give each run its own,
+/// and one with none asks [`Memo::shared`].
+pub(crate) fn check(memo: &Memo, store: &Store, item_id: &str, repository_identity: &str) -> Gate {
+    match memo.latest(store, item_id) {
         Err(reason) => Gate::Held(reason),
         Ok(None) => Gate::Held(
             "no verification record exists for this task: Manvi's work.verify.task has not judged it".into(),
@@ -184,7 +158,7 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // the whole ref store is stamped, as for the verification base. An
     // unchanged worktree is answered from the ref cache by file stats, with no
     // process.
-    crate::engine::git_cli::with_spawn_source(CURRENT_HEAD_SOURCE, || {
+    crate::engine::process::with_spawn_source(CURRENT_HEAD_SOURCE, || {
         crate::engine::ref_cache::git_text(
             Path::new(worktree),
             &[crate::engine::ref_cache::ALL_REFS],

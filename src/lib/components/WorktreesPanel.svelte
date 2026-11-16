@@ -11,6 +11,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
+  import { describeError } from "../ui/copy/describeFailure";
   import Checkbox from "./Checkbox.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { worktreeSetupNotices, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
@@ -35,6 +36,7 @@
     Eraser,
     AlertTriangle,
     GitMerge,
+    GitFork,
     Globe,
     RefreshCw,
   } from "@lucide/svelte";
@@ -49,6 +51,9 @@
   import { MERGE_MODES } from "../branches/mergeSelection";
   import { runStateLabel } from "../workbench/taskHandoff";
   import { openTaskForRun } from "../workbench/taskOpen";
+  import { hostedClaude, resolveClaudeForkSource, resolveTranscriptAnswer } from "../terminal/hostedClaude";
+  import { checkTranscripts } from "../terminal/transcripts";
+  import { terminalLaunchRequests } from "../terminal/launchRequests";
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
@@ -142,6 +147,10 @@
    */
   let removeTarget: MutationTarget | null = null;
   let mergeTarget: MutationTarget | null = null;
+  let forkConfirmPath = $state<string | null>(null);
+  let forkingPath = $state<string | null>(null);
+  let forkTarget: MutationTarget | null = null;
+  let forkTimer: ReturnType<typeof setTimeout> | null = null;
   /** Rows with a lock or unlock in flight: a second click waits for the first, whose answer decides which one it is. */
   const locking = new Set<string>();
   let mergeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -184,6 +193,11 @@
       mergeTimer = null;
       mergeConfirmPath = null;
       mergingPath = null;
+      forkTarget = null;
+      if (forkTimer !== null) clearTimeout(forkTimer);
+      forkTimer = null;
+      forkConfirmPath = null;
+      forkingPath = null;
     };
   });
 
@@ -227,6 +241,11 @@
       hooksPreview = null;
       hooksError = null;
       hooksBusy = false;
+      forkTarget = null;
+      if (forkTimer !== null) clearTimeout(forkTimer);
+      forkTimer = null;
+      forkConfirmPath = null;
+      forkingPath = null;
     },
   );
 
@@ -509,7 +528,7 @@
     try {
       trusted = await repoStore.trustRepo(targetPath);
     } catch (cause) {
-      return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't remove the worktree", epoch);
+      return showFailure({ ok: false, cause, error: describeError(cause, "worktrees") }, "Couldn't remove the worktree", epoch);
     }
     if (!trusted) return;
     // The trust prompt can sit open while the reader goes elsewhere: the
@@ -535,6 +554,122 @@
 
   function open(wt: WorktreeInfo) {
     void repoStore.openRepo(wt.path);
+  }
+
+  async function forkLane(wt: WorktreeInfo) {
+    if (forkingPath === wt.path) return;
+    if (forkConfirmPath !== wt.path) {
+      const armed = repoStore.captureTarget();
+      if (!armed) return;
+      forkTarget = armed;
+      forkConfirmPath = wt.path;
+      if (forkTimer !== null) clearTimeout(forkTimer);
+      forkTimer = setTimeout(() => {
+        forkTimer = null;
+        if (forkConfirmPath === wt.path) {
+          forkConfirmPath = null;
+          forkTarget = null;
+        }
+      }, 4000);
+      return;
+    }
+    forkConfirmPath = null;
+    if (forkTimer !== null) {
+      clearTimeout(forkTimer);
+      forkTimer = null;
+    }
+    const target = forkTarget;
+    forkTarget = null;
+    if (!target) return;
+    const epoch = tabScope.epoch;
+    forkingPath = wt.path;
+    error = null;
+    try {
+      let trusted: string | null;
+      try {
+        trusted = await repoStore.trustRepo(wt.path);
+      } catch (cause) {
+        return showFailure({ ok: false, cause, error: describeError(cause, "worktrees") }, "Couldn't fork the worktree", epoch);
+      }
+      if (!trusted) return;
+      if (!repoStore.targetIsActive(target)) {
+        toastStore.error("Couldn't fork the worktree. The repository changed while it was waiting; nothing was run.");
+        return;
+      }
+      const outcome = await repoStore.addWorktree(
+        {
+          targetPath: "",
+          newBranch: null,
+          startPoint: null,
+          detach: false,
+          cowCaches,
+          runHooks,
+          seedDevmap,
+          zeroCopyDevmap,
+          forkFrom: wt.path,
+        },
+        target,
+        true,
+      );
+      if (!outcome.ok || !outcome.output) {
+        return showFailure(outcome, "Couldn't fork the worktree", epoch);
+      }
+      const created = outcome.output;
+      for (const notice of worktreeSetupNotices(created, "create")) toastStore.warning(notice);
+      if (tabScope.isCurrent(epoch)) await load();
+      try {
+        const forkTrusted = await repoStore.trustRepo(created.path);
+        if (!forkTrusted) return;
+      } catch (cause) {
+        toastStore.warning(`Fork created at ${created.path}, but trust check failed: ${describeError(cause, "worktrees")}`);
+        return;
+      }
+      const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
+      const { sessionId: sourceSessionId, mode: resumeMode } = resolveClaudeForkSource(
+        hostedClaude,
+        wt.path,
+        created.source_session_id,
+        pathOpts,
+      );
+
+      let readyPath: string | null = null;
+      const opened = await repoStore.openRepo(created.path, {
+        activate: true,
+        onReady: (path) => {
+          readyPath = path;
+        },
+      });
+      const activeForkPath = opened ? (readyPath ?? created.path) : null;
+      if (!activeForkPath) {
+        toastStore.warning(`Forked worktree at ${created.path}, but its repository tab couldn't open.`);
+        return;
+      }
+      if (!sourceSessionId) {
+        toastStore.success(`Forked ${wt.name} into ${created.path}`);
+        return;
+      }
+      const answers = await checkTranscripts([sourceSessionId]);
+      const answer = answers.get(sourceSessionId) ?? {
+        state: "unknown" as const,
+        reason: "GitPulse did not get an answer for it.",
+      };
+      const checked = resolveTranscriptAnswer(hostedClaude, sourceSessionId, "claude", answer);
+      if (!checked.offer) {
+        toastStore.warning(checked.note ?? "Forked worktree, but the source Claude transcript could not be verified.");
+        return;
+      }
+      repoStore.setTerminalOpen(true);
+      try {
+        await terminalLaunchRequests.request(activeForkPath, "claude", undefined, undefined, {
+          resume: { sessionId: checked.offer, mode: resumeMode, fork: true },
+          name: `${wt.name} (forked)`,
+        });
+      } catch (launchCause) {
+        toastStore.warning(`Forked worktree opened, but Claude session fork didn't launch: ${describeError(launchCause, "terminal")}`);
+      }
+    } finally {
+      if (tabScope.isCurrent(epoch)) forkingPath = null;
+    }
   }
 
   /**
@@ -587,7 +722,7 @@
       try {
         trusted = await repoStore.trustRepo(wt.path);
       } catch (cause) {
-        return showFailure({ ok: false, cause, error: String(cause) }, "Couldn't merge the worktree", epoch);
+        return showFailure({ ok: false, cause, error: describeError(cause, "worktrees") }, "Couldn't merge the worktree", epoch);
       }
       if (!trusted) return;
       // The trust prompt can sit open while the reader goes elsewhere. The
@@ -869,6 +1004,16 @@
             >
               <ExternalLink size={11} />
             </button>
+            <button
+              onclick={() => void forkLane(wt)}
+              disabled={forkingPath === wt.path}
+              title={forkingPath === wt.path ? "Forking…" : forkConfirmPath === wt.path ? "Click Fork once more to create forked worktree" : "Fork this worktree and its Claude session"}
+              aria-label="Fork {wt.name}"
+              data-testid="worktree-fork"
+              class="p-0.5 rounded-full {forkingPath === wt.path ? 'opacity-50 cursor-not-allowed' : forkConfirmPath === wt.path ? 'text-accent' : 'hover:bg-surfaceHover hover:text-accent'}"
+            >
+              <GitFork size={11} class={forkingPath === wt.path ? "animate-pulse" : ""} />
+            </button>
             {#if !wt.is_main}
               <!-- The armed confirm is said once, inline under the row; the
                    button keeps one stable name so it is not described twice. -->
@@ -1049,6 +1194,12 @@
                 holdMergeConfirm(wt.path);
               }}
             />
+          {/if}
+
+          {#if forkConfirmPath === wt.path}
+            <div class="text-micro font-semibold text-accent pt-0.5" role="status" data-testid="worktree-fork-confirm">
+              Fork {wt.branch ?? wt.name} (HEAD, uncommitted changes, and saved Claude conversation) into a new worktree? Click Fork once more to run.
+            </div>
           {/if}
 
           {#if aiSummaries[wt.path]}

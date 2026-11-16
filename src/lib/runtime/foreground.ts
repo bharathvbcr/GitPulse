@@ -77,16 +77,25 @@ export function readHiddenDocument(): boolean {
  * shown, or when this process has no DOM; otherwise on the first
  * `visibilitychange` that shows it. Work that only matters to someone looking
  * waits here instead of spending the spawn budget on a minimised window.
+ *
+ * Aborting `signal` removes the listener and resolves too, so a caller that
+ * gave up does not leave one registered for the life of the page; it checks
+ * its own cancellation after the await.
  */
-export function whenDocumentShown(): Promise<void> {
-  if (typeof document === "undefined" || !readHiddenDocument()) return Promise.resolve();
+export function whenDocumentShown(signal?: AbortSignal): Promise<void> {
+  if (typeof document === "undefined" || !readHiddenDocument() || signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const onChange = () => {
-      if (readHiddenDocument()) return;
+    const done = () => {
       document.removeEventListener("visibilitychange", onChange);
+      signal?.removeEventListener("abort", done);
       resolve();
     };
+    const onChange = () => {
+      if (readHiddenDocument()) return;
+      done();
+    };
     document.addEventListener("visibilitychange", onChange);
+    signal?.addEventListener("abort", done);
   });
 }
 
@@ -146,5 +155,30 @@ export function bindForegroundChanges(
     removeForegroundListener("visibilitychange", onChange);
     removeForegroundListener("focus", onChange);
     removeForegroundListener("blur", onChange);
+  };
+}
+
+export interface ForegroundBinding {
+  bind(): void;
+  unbind(): void;
+}
+
+/**
+ * Idempotent document/window foreground subscription owner so modules do not
+ * duplicate `let unbind = null; bind(); unbind();` listener pairs.
+ */
+export function createForegroundBinding(onChange: () => void): ForegroundBinding {
+  let release: (() => void) | null = null;
+  return {
+    bind() {
+      if (release !== null || typeof document === "undefined") return;
+      release = bindForegroundChanges(document, typeof window === "undefined" ? null : window, onChange);
+    },
+    unbind() {
+      if (release === null) return;
+      const fn = release;
+      release = null;
+      fn();
+    },
   };
 }

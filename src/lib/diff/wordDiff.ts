@@ -460,6 +460,11 @@ export function isImagePath(path: string | null | undefined): boolean {
 /**
  * Annotates an entire diff in one pass. Only for small diffs: large ones must
  * go through `parseUnifiedDiff` plus per-window `annotateRange` calls.
+ *
+ * Kept intentionally as a test-only export: `wordDiff.test.ts` uses this as
+ * its whole-diff reference oracle (`parseUnifiedDiff` + `annotateRange` across
+ * `[0, length)`) to verify that windowed and incremental annotation produces
+ * identical spans and line attributes.
  */
 export function annotateUnifiedDiff(raw: string): AnnotatedDiffLine[] {
   const parsed = parseUnifiedDiff(raw);

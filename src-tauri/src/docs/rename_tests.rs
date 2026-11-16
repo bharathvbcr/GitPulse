@@ -1076,7 +1076,7 @@ fn a_hub_rename_stages_in_a_bounded_number_of_git_processes() {
     for notes in [3, 60, 300] {
         let dir = hub_repo(notes);
         let path = dir.path().to_str().unwrap();
-        let (outcome, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcome, labels) = crate::engine::process::spawn_labels_during(|| {
             rename_doc(path, "docs/Roadmap.md", "plans/Roadmap.md", |_| Ok(()))
         });
         let outcome = outcome.expect("rename");

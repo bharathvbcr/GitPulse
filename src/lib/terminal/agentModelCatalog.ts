@@ -16,6 +16,7 @@ import { writable, type Readable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { isModelId } from "./agentDefaults";
 import type { LauncherKind } from "./tabs";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** Mirrors `agent_models::AgentModelOption`. */
 export interface AgentModelOption {
@@ -120,7 +121,7 @@ export function loadAgentModels(launcher: LauncherKind, refresh = false): Promis
       if (catalog.error) return { status: "failed", message: catalog.error, previous };
       return { status: "ready", catalog };
     })
-    .catch((err: unknown): CatalogState => ({ status: "failed", message: err instanceof Error ? err.message : String(err), previous }))
+    .catch((err: unknown): CatalogState => ({ status: "failed", message: describeError(err, "terminal"), previous }))
     .then((state) => {
       store.update((all) => ({ ...all, [launcher]: state }));
       return state;

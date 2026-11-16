@@ -147,7 +147,7 @@ fn main() {
         cases.push(Case::new(
             "coverage cold scan, early hits in large sources",
             move || {
-                turn = !turn;
+                turn.toggle();
                 std::fs::write(
                     &report_path,
                     lcov(

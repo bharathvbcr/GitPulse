@@ -8,6 +8,8 @@ mod registration_timing;
 pub(crate) mod skip;
 #[cfg(all(test, unix))]
 mod storm;
+#[cfg(test)]
+mod turn_ref_tests;
 
 pub use debouncer::RepoFileWatcher;
 
@@ -877,7 +879,36 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if is_other_checkout_state(path, internal_roots) {
         return true;
     }
+    if is_turn_checkpoint_ref(path, internal_roots) {
+        return true;
+    }
     is_noise_leaf_name(path)
+}
+
+/// A write under `refs/gitpulse/turns/` (or its reflog): a turn checkpoint
+/// (`engine::turn_checkpoint`), taken at every turn of every agent session. It
+/// moves no branch, tag, remote or op-log ref and changes nothing the UI
+/// shows, so it must not refresh the repository. `refs/gitpulse/ops/` and
+/// every other ref stay `Refs`.
+fn is_turn_checkpoint_ref(path: &Path, internal_roots: &[PathBuf]) -> bool {
+    const TURNS: [&str; 3] = ["refs", "gitpulse", "turns"];
+    internal_roots.iter().any(|root| {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut components = relative.components().map(|c| c.as_os_str());
+        let first = components.next();
+        // `logs/refs/gitpulse/turns/…` is the reflog of the same refs.
+        let head = if first.is_some_and(|c| c == "logs") {
+            components.next()
+        } else {
+            first
+        };
+        let mut under = head.into_iter().chain(components);
+        TURNS
+            .iter()
+            .all(|want| under.next().is_some_and(|c| c == *want))
+    })
 }
 
 /// State that belongs to another checkout of the same repository, seen only
@@ -2369,17 +2400,13 @@ mod tests {
 
     #[test]
     fn unwatch_waits_for_the_retired_callback_to_release_its_resources() {
-        struct Released(Arc<AtomicBool>);
-        impl Drop for Released {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();
         let released = Arc::new(AtomicBool::new(false));
-        let resource = Released(released.clone());
+        let resource = std::mem::DropGuard::new(released.clone(), |released| {
+            released.store(true, Ordering::SeqCst);
+        });
         let key = start_watch_inner(
             &state,
             dir.path().to_string_lossy().into_owned(),
@@ -3970,15 +3997,6 @@ mod tests {
     fn a_full_refresh_announces_no_change_under_any_index_feature() {
         use crate::engine::git_reader::GitReader;
         use std::process::Command;
-        struct StopDaemon(PathBuf);
-        impl Drop for StopDaemon {
-            fn drop(&mut self) {
-                let _ = Command::new("git")
-                    .args(["fsmonitor--daemon", "stop"])
-                    .current_dir(&self.0)
-                    .output_locked();
-            }
-        }
         let git = |root: &Path, args: &[&str]| {
             let out = Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
@@ -4014,7 +4032,12 @@ mod tests {
         for config in configs {
             let temp = TempDir::new().unwrap();
             let (rx, stop, root) = spawn_loop(temp.path());
-            let _daemon = StopDaemon(root.clone());
+            let _daemon = std::mem::DropGuard::new(root.clone(), |root| {
+                let _ = Command::new("git")
+                    .args(["fsmonitor--daemon", "stop"])
+                    .current_dir(&root)
+                    .output_locked();
+            });
             crate::test_support::trust_repo(&root);
             for (key, value) in config {
                 git(&root, &["config", key, value]);
@@ -4113,23 +4136,6 @@ mod tests {
                 crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET),
             )
         };
-        struct StopDaemon(PathBuf);
-        impl Drop for StopDaemon {
-            fn drop(&mut self) {
-                // Never panics: this also runs while the test's own failure
-                // unwinds, and a stop that hangs must not outlive its bound.
-                let mut cmd = Command::new("git");
-                cmd.args(["fsmonitor--daemon", "stop"]).current_dir(&self.0);
-                let _ = crate::engine::git_cli::run_bounded(
-                    cmd,
-                    "git fsmonitor--daemon stop",
-                    // Held to the runner's ceiling: relaxed past it, the stop is refused unrun.
-                    crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET)
-                        .min(crate::engine::git_cli::NETWORK_TIMEOUT),
-                    None,
-                );
-            }
-        }
         let status = |root: &Path| {
             let out = git(root, &["status", "--porcelain=v2"], true);
             assert!(out.success, "{}", String::from_utf8_lossy(&out.stderr));
@@ -4139,7 +4145,20 @@ mod tests {
         // The bounded runner holds git to the same repository-trust gate the
         // product's own reads pass.
         crate::test_support::trust_repo(&root);
-        let _daemon = StopDaemon(root.clone());
+        let _daemon = std::mem::DropGuard::new(root.clone(), |root| {
+            // Never panics: this also runs while the test's own failure
+            // unwinds, and a stop that hangs must not outlive its bound.
+            let mut cmd = Command::new("git");
+            cmd.args(["fsmonitor--daemon", "stop"]).current_dir(&root);
+            let _ = crate::engine::process::run_bounded(
+                cmd,
+                "git fsmonitor--daemon stop",
+                // Held to the runner's ceiling: relaxed past it, the stop is refused unrun.
+                crate::test_support::coverage_relaxed(FSMONITOR_GIT_BUDGET)
+                    .min(crate::engine::process::NETWORK_TIMEOUT),
+                None,
+            );
+        });
         let enabled = git(&root, &["config", "core.fsmonitor", "true"], false);
         assert!(enabled.success);
         // Start the daemon outside the measured window; its first run creates
@@ -4626,13 +4645,7 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
         }
         let (rx, stop, canonical) = spawn_loop(dir.path());
-        struct StopOnDrop(Arc<StopSignal>);
-        impl Drop for StopOnDrop {
-            fn drop(&mut self) {
-                self.0.stop();
-            }
-        }
-        let _stop = StopOnDrop(stop);
+        let _stop = std::mem::DropGuard::new(stop, |stop| stop.stop());
         prime_watcher(&rx, &canonical, PRIME_DEADLINE);
         await_watcher_quiescence(&rx);
         for i in 0..120 {

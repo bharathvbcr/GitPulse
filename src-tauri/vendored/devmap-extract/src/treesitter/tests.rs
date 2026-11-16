@@ -1,13 +1,9 @@
 use super::*;
 
 fn assert_finalization_refused(hook: fn()) {
-    struct ClearHook;
-    impl Drop for ClearHook {
-        fn drop(&mut self) {
-            EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
-        }
-    }
-    let _clear = ClearHook;
+    let _clear = std::mem::DropGuard::new((), |()| {
+        EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+    });
     EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(hook)));
     let extraction = extract_treesitter_with_budget(
         "finish.py",
@@ -4304,13 +4300,9 @@ fn note_deadline_at_finish() {
 /// `974edaa3`.
 #[test]
 fn the_walk_deadline_is_armed_again_after_a_kotlin_recovery() {
-    struct ClearHook;
-    impl Drop for ClearHook {
-        fn drop(&mut self) {
-            EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
-        }
-    }
-    let _clear = ClearHook;
+    let _clear = std::mem::DropGuard::new((), |()| {
+        EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+    });
     DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow_mut().clear());
     EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
     let extraction = extract_treesitter_with_budget(

@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { actionFailure, FRECENCY_KEY, MAX_QUERY_LENGTH, PALETTE_MODES, parsePaletteQuery, rankItems, readFrecency, recordFrecency, type PaletteStorage } from "./model";
+import { actionFailure, FRECENCY_KEY, MAX_QUERY_LENGTH, modeLandsOnRepositoryPage, PALETTE_MODES, parsePaletteQuery, rankItems, readFrecency, recordFrecency, type PaletteStorage } from "./model";
 
 const item = (id: string, label = id, description = "", disabledReason?: string) => ({ id, label, description, disabledReason, category: "Commands" });
 function storage(raw: string | null): PaletteStorage {
   let value = raw;
   return { getItem: key => key === FRECENCY_KEY ? value : null, setItem: (_key, next) => { value = next; } };
 }
+
+describe("modes that land on the repository page", () => {
+  it("is every mode whose result is a file, branch, commit or symbol, and no other", () => {
+    expect(PALETTE_MODES.filter(entry => modeLandsOnRepositoryPage(entry.mode)).map(entry => entry.mode).sort())
+      .toEqual(["branches", "commits", "files", "symbols", "workspace"]);
+  });
+});
 
 describe("palette query and relevance", () => {
   it.each(PALETTE_MODES)("parses $mode and its longest prefix", entry => {
@@ -75,7 +82,7 @@ describe("optional bounded palette history", () => {
   });
   it("distinguishes refusal or cancellation from completion", () => {
     expect(actionFailure({ ok: false, error: "Policy denied" })).toBe("Policy denied");
-    expect(actionFailure({ ok: false })).toContain("cancelled");
+    expect(actionFailure({ ok: false })).toContain("canceled");
     expect(actionFailure({ ok: true })).toBeNull();
     expect(actionFailure(undefined)).toBeNull();
   });

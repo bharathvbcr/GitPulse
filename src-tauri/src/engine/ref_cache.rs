@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::engine::git_cli::{self, Incomplete};
+use crate::engine::git_cli;
+use crate::engine::process::{self, Incomplete};
 
 /// How close to "now" a stamped timestamp may be before the stamp is not
 /// trusted to tell two writes apart. Generous for 1–2 s filesystems.
@@ -131,9 +132,13 @@ fn file_inode(meta: &std::fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::ino(meta)
 }
 
-/// Windows has no stable inode through `std`; size and mtime still move on
-/// every lockfile rename git performs.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn file_inode(_meta: &std::fs::Metadata) -> u64 {
     0
 }
@@ -559,7 +564,7 @@ pub(crate) fn through_stamped_coalesced(
     coalesced_flights().run(key, || through_stamped(repo, args, stamp, run))
 }
 
-type CoalesceKey = (PathBuf, Vec<String>, u64, git_cli::Admission);
+type CoalesceKey = (PathBuf, Vec<String>, u64, process::Admission);
 // A waiter is handed the leader's answer, and a refusal in it carries its own
 // kind, so the waiter's command types it the way the leader's does.
 type CoalescedFlights =
@@ -575,7 +580,7 @@ fn coalesce_key(repo: &Path, args: &[&str], stamp: &Stamp) -> CoalesceKey {
         repo.to_path_buf(),
         args.iter().map(|arg| (*arg).to_string()).collect(),
         stamp.0.fingerprint(),
-        git_cli::current_admission(),
+        process::current_admission(),
     )
 }
 
@@ -711,13 +716,9 @@ pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) fn eager<T>(f: impl FnOnce() -> T) -> T {
     RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            RACY_OVERRIDE.with(|cell| cell.set(None));
-        }
-    }
-    let _reset = Reset;
+    let _reset = std::mem::DropGuard::new((), |()| {
+        RACY_OVERRIDE.with(|cell| cell.set(None));
+    });
     f()
 }
 
@@ -783,7 +784,7 @@ mod tests {
 
     fn fixture(ref_format: Option<&str>) -> Option<Fixture> {
         let holder = tempfile::tempdir().unwrap();
-        let base = crate::engine::git_cli::canonicalize_plain(holder.path()).unwrap();
+        let base = crate::engine::process::canonicalize_plain(holder.path()).unwrap();
         let main = base.join("main");
         std::fs::create_dir(&main).unwrap();
         let mut init = vec!["init", "-q", "-b", "main"];
@@ -1128,7 +1129,7 @@ mod tests {
                 git_text(&fx.main, BRANCHES, BRANCH_ARGS).unwrap();
             }
         });
-        let spawned = git_cli::spawn_log::spawns_in(&fx.main)
+        let spawned = process::spawn_log::spawns_in(&fx.main)
             .into_iter()
             .filter(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
             .count();
@@ -1166,7 +1167,7 @@ mod tests {
                 crate::engine::GitReader::default_branch_name(path).unwrap();
             }
         });
-        let spawned = git_cli::spawn_log::spawns_in(&fx.main);
+        let spawned = process::spawn_log::spawns_in(&fx.main);
         let count = |needle: &str| {
             spawned
                 .iter()
@@ -1859,9 +1860,9 @@ mod tests {
                             {
                                 std::thread::yield_now();
                             }
-                            Err(git_cli::refusal_message(
+                            Err(process::refusal_message(
                                 "git log",
-                                git_cli::Refusal::Refused {
+                                process::Refusal::Refused {
                                     waited: Duration::from_millis(2000),
                                 },
                             ))

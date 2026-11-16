@@ -921,3 +921,103 @@ describe("file scopes follow the filesystem's case rules", () => {
     expect(planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }).chosen.map((c) => c.id)).toEqual(["a", "b"]);
   });
 });
+
+describe("DAG readiness ordering", () => {
+  type TestReadiness = import("./readiness").ReadinessCheck;
+  const ready = (id: string): TestReadiness => ({
+    ok: true,
+    readiness: {
+      id,
+      ready: true,
+      ready_with_subtasks: true,
+      readiness_reason: "ready",
+      blocked_by: [],
+      blocking: [],
+      open_subtasks: [],
+      open_subtask_count: 0,
+      total_subtask_count: 0,
+    },
+  });
+  const blockedBy = (id: string, depId: string, depTitle: string): TestReadiness => ({
+    ok: true,
+    readiness: {
+      id,
+      ready: false,
+      ready_with_subtasks: false,
+      readiness_reason: "blocked_by_tasks",
+      blocked_by: [{ id: depId, title: depTitle, status: "ready" }],
+      blocking: [],
+      open_subtasks: [],
+      open_subtask_count: 0,
+      total_subtask_count: 0,
+    },
+  });
+
+  it("skips blocked or unreadable candidates before scope claiming and admits unblocked work behind them", () => {
+    // `a` is blocked and has an unknown scope; skipping it before scope matching lets `b` and `c` run together.
+    const scopes = new Map([["b", ["src/b.ts"]], ["c", ["src/c.ts"]]]);
+    const readiness = new Map([
+      ["a", blockedBy("a", "dep-1", "Finish API")],
+      ["b", ready("b")],
+      ["c", ready("c")],
+      ["d", { ok: false as const, error: "store closed" }],
+    ]);
+    const plan = planBatch(
+      [task("a"), task("b"), task("c"), task("d"), task("missing")],
+      scopes,
+      3,
+      new Set(),
+      { caseInsensitive: false },
+      [],
+      readiness,
+    );
+    expect(plan.chosen.map((c) => c.id)).toEqual(["b", "c"]);
+    expect(plan.skipped).toEqual([
+      { id: "a", title: "Task a", reason: 'blocked by "Finish API" (dep-1)' },
+      { id: "d", title: "Task d", reason: "readiness couldn't be checked (store closed)" },
+      { id: "missing", title: "Task missing", reason: "readiness couldn't be checked (no readiness entry returned)" },
+    ]);
+  });
+
+  it("defers a blocked dependent to batch 2 until its blocker finishes merging in batch 1", async () => {
+    const w = world({
+      candidates: [
+        [task("dependent"), task("blocker")],
+        [task("dependent")],
+      ],
+      scopes: { dependent: ["src/dep.ts"], blocker: ["src/blocker.ts"] },
+    });
+    w.deps.readiness = async (ids) => {
+      const blockerMerged = w.merged.includes("blocker");
+      return new Map(
+        ids.map((id) => {
+          if (id === "dependent" && !blockerMerged) {
+            return [id, blockedBy("dependent", "blocker", "blocker")];
+          }
+          return [id, ready(id)];
+        }),
+      );
+    };
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(w.launched).toEqual(["blocker", "dependent"]);
+    expect(w.merged).toEqual(["blocker", "dependent"]);
+  });
+
+  it("finishes cleanly in done when all remaining candidates are blocked without spinning extra batches", async () => {
+    let readinessCalls = 0;
+    const w = world({
+      candidates: [[task("blocked")], [task("blocked")]],
+      scopes: { blocked: ["src/a.ts"] },
+    });
+    w.deps.readiness = async (ids) => {
+      readinessCalls += 1;
+      return new Map(ids.map((id) => [id, blockedBy(id, "other", "Other task")]));
+    };
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 3 }, w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(done.note).toMatch(/blocked by "Other task" \(other\)/);
+    expect(w.launched).toEqual([]);
+    expect(readinessCalls).toBe(1);
+  });
+});

@@ -629,24 +629,22 @@
 
           // ---- reorder: the context menu, the keyboard, a drag --------------
           const placeOf = (path) => order().indexOf(path);
-          m = await openTabMenu(WT_B);
           const startAt = placeOf(WT_B);
-          itemNamed(m, "Move right").click();
+          tabBtn(WT_B).focus();
+          key(tabBtn(WT_B), { key: "ArrowRight", ctrlKey: true, shiftKey: true });
           await settle(); await wait(20);
-          check("Move right shifts the tab one place and announces its position", () =>
+          check("Ctrl+Shift+→ shifts the tab one place and announces its position", () =>
             placeOf(WT_B) === startAt + 1 && /^Moved agent-models to position \d+ of \d+$/.test(announcement().textContent));
           m = await openTabMenu(WT_B);
-          itemNamed(m, "Move left").click();
-          await settle(); await wait(20);
-          check("Move left puts it back", () => placeOf(WT_B) === startAt);
-          m = await openTabMenu(WT_B);
+          check("the tab menu leaves single steps to the keyboard, palette and drag", () =>
+            !itemNamed(m, "Move left") && !itemNamed(m, "Move right"));
           itemNamed(m, "Move to start").click();
           await settle(); await wait(20);
           check("Move to start seats it first", () => placeOf(WT_B) === 0);
           m = await openTabMenu(WT_B);
-          check("a tab already first cannot be told to move left or to the start", () =>
-            itemNamed(m, "Move left").getAttribute("aria-disabled") === "true" && itemNamed(m, "Move to start").getAttribute("aria-disabled") === "true" &&
-            itemNamed(m, "Move right").getAttribute("aria-disabled") === "false");
+          check("a tab already first cannot be told to move to the start", () =>
+            itemNamed(m, "Move to start").getAttribute("aria-disabled") === "true" &&
+            itemNamed(m, "Move to end").getAttribute("aria-disabled") === "false");
           itemNamed(m, "Move to end").click();
           await settle(); await wait(20);
           check("Move to end seats it last", () => placeOf(WT_B) === order().length - 1);
@@ -754,20 +752,22 @@
             !!$('[data-group-color="teal"]', groupHead("operations")) && $$('[data-tab-color="teal"][data-tab-color-source="group"]', strip()).length === 3);
           m = await openTabMenu(MAIN);
           const tabLabels = items(m).map(words);
-          check("a tab outside any group offers Add to group, Move to group and the group-wide actions", () =>
-            tabLabels.includes("Add to group…") && tabLabels.includes('Move to group "operations"') && tabLabels.includes("Group all by parent folder") &&
-            tabLabels.includes("Collapse all groups") && tabLabels.includes("Expand all groups") && tabLabels.includes("Ungroup all repositories") &&
-            !tabLabels.includes("Remove from group"));
+          check("a tab outside any group offers Add to group and no group-wide or strip-wide actions", () =>
+            tabLabels.includes("Add to group…") && !tabLabels.includes("Remove from group") &&
+            !tabLabels.some((label) => /^(Move to group|Group all by parent folder|Collapse|Expand|Ungroup|Close group|Open repository)/.test(label)));
+          // The colour swatches are menuitems too; they share one row.
+          check("the tab menu stays short", () => items(m).filter((el) => !el.hasAttribute("data-color-choice")).length <= 12);
           itemNamed(m, "Add to group…").click();
           await settle(); await wait(20);
-          check("Add to group asks for a name", () => promptNow()?.options.title === "Add to group");
+          check("Add to group asks for a name and names the groups it could join", () =>
+            promptNow()?.options.title === "Add to group" && promptNow().options.message.includes("Existing groups: operations"));
           await answer("tools");
           check("the name becomes the tab's group", () => rec(MAIN).group === "tools" && !!groupHead("tools"));
           m = await openTabMenu(MAIN);
           const inGroupLabels = items(m).map(words);
-          check("a grouped tab offers Change group, Remove from group, Collapse group and Close group", () =>
+          check("a grouped tab offers Change group and Remove from group, leaving the group's own controls to its head", () =>
             inGroupLabels.includes("Change group… (tools)") && inGroupLabels.includes("Remove from group") &&
-            inGroupLabels.includes('Collapse group "tools"') && inGroupLabels.includes('Close group "tools"…'));
+            !inGroupLabels.some((label) => /^(Collapse|Expand|Close group)/.test(label)));
           itemNamed(m, "Remove from group").click();
           await settle();
           check("Remove from group ungroups just that tab", () => !rec(MAIN).group && rec(SITE).group === "operations");
@@ -852,7 +852,9 @@
               .map((el) => el.getBoundingClientRect().right));
             return scroller().scrollWidth <= scroller().clientWidth + 1
               // The zone follows the list, is wide, and drags...
-              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 48 && zone.hasAttribute("data-tauri-drag-region")
+              && zoneBox.left >= listEnd - 1 && zoneBox.width >= 24 && zone.hasAttribute("data-tauri-drag-region")
+              // ...is marked by a hairline that does not take the drag away...
+              && !!zone.querySelector("[data-drag-zone-rule]") && getComputedStyle(zone.querySelector("[data-drag-zone-rule]")).pointerEvents === "none"
               // ...Open sits right of the zone, its menu arrow against it...
               && openBox.left >= zoneBox.right - 1 && menuBtn.getBoundingClientRect().left >= openBox.right - 8
               // ...and the last control sits at the bar's own right edge.

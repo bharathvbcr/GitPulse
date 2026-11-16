@@ -96,7 +96,7 @@
   });
 </script>
 
-<section aria-label="Global build cleaner" class="space-y-4 text-xs max-w-5xl">
+<section aria-label="Global build cleaner" class="@container space-y-4 text-xs">
   <div class="flex flex-wrap justify-between gap-3">
     <div><h3 class="flex items-center gap-2 font-semibold text-sm text-textPrimary"><ShieldCheck size={16} /> Global build cleaner</h3><p class="mt-1 text-textMuted">Maintain repositories beneath your chosen roots, including repositories that are closed in GitPulse. This policy is the scheduler's own: it keeps its own retention because a sweep runs without this window, and a repository's override in Storage does not change it.</p></div>
     <button class="gp-btn" data-size="sm" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
@@ -108,7 +108,7 @@
     {#if cleaner.background_error}<p role="alert" class="gp-notice" data-tone="warn">Couldn't set up background runs, so the schedule is off. {cleaner.background_error}</p>{/if}
     <fieldset disabled={busy} class="space-y-4 border-0 p-0 m-0 min-w-0">
     {#if !cleaner.supported}<p class="gp-notice" data-tone="warn">Cleanup is unavailable on this platform: removal relies on Unix descriptor-relative deletion that has no Windows implementation, so nothing is deleted here. Inventory and policy guidance remain available.</p>{/if}
-    <div class="grid gap-3 md:grid-cols-2">
+    <div class="grid gap-3 @2xl:grid-cols-2">
       <label class="space-y-1">Repository roots · one absolute directory per line<textarea aria-label="Repository roots" class="gp-field-multi block w-full font-mono" rows="3" bind:value={rootsText} oninput={edited} disabled={busy}></textarea></label>
       <label class="space-y-1">Excluded directories · one absolute directory per line<textarea aria-label="Excluded directories" class="gp-field-multi block w-full font-mono" rows="3" bind:value={exclusionsText} oninput={edited} disabled={busy}></textarea></label>
     </div>

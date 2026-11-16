@@ -33,9 +33,9 @@ Four **views**, each a header tab. Sections inside a view are lenses on the same
 flowchart LR
     subgraph Views["The four views"]
         Work["Work — Overview · Remote · Tasks"]
-        Code["Code — Explorer · Blame · Search · Map"]
+        Code["Code — Explorer (Search and Blame toggles) · Map"]
         History["History — Graph (commits / HEAD moves / suspects) · Diff"]
-        Insights["Insights — Pulse · Coverage · Health · Secrets · Storage"]
+        Insights["Insights — Pulse · Coverage · Health (includes Secrets) · Storage"]
     end
     subgraph Beside["Not views"]
         Tasks["Tasks — global and saved-workspace boards"]

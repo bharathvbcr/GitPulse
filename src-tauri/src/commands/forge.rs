@@ -74,6 +74,22 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
     .unwrap_or_else(DependabotReport::transport_failure)
 }
 
+/// GitHub avatars for commit authors, resolved from commit oids via
+/// `gh api graphql`. The report carries its own error state instead of
+/// rejecting: "could not look up" must stay distinct from "no GitHub account".
+#[tauri::command(async)]
+pub async fn cmd_github_author_avatars(
+    repo_path: String,
+    authors: Vec<AuthorAvatarQuery>,
+) -> AuthorAvatarReport {
+    off_thread(move || {
+        Ok::<_, String>(load_author_avatars(&repo_path, authors)).map_err(CommandError::from)
+    })
+    .await
+    .map_err(|e| e.message)
+    .unwrap_or_else(AuthorAvatarReport::transport_failure)
+}
+
 /// Open GitHub code scanning alerts for the Health view, via `gh api`. Like
 /// [`cmd_github_dependabot_alerts`], the report carries its own error state
 /// instead of rejecting: "could not check" must stay distinct from "no alerts".

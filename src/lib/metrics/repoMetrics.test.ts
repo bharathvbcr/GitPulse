@@ -92,6 +92,32 @@ describe("failures are recorded under the panel that used to own the fetch", () 
     expect(snapshot.error).toBe("scan exploded");
   });
 
+  it.each([
+    [locMetric, "pulse"],
+    [coverageMetric, "coverage"],
+    [storageMetric, "storage"],
+  ] as const)("%s shows plain copy for a runtime fault, recording the raw fault once under %s", async (metric, source) => {
+    const { INTERNAL_ERROR_COPY } = await import("../ui/formatError");
+    const { diagnostics } = await import("../diagnostics/diagnostics");
+    const { get } = await import("svelte/store");
+    diagnostics.clear();
+    try {
+      invokeMock.mockRejectedValue(new TypeError("Cannot read properties of undefined (reading 'invoke')"));
+      await metric.refresh(REPO, { force: true });
+      const snapshot = metric.snapshot(REPO);
+      expect(snapshot.state).toBe("failed");
+      expect(snapshot.error).toBe(INTERNAL_ERROR_COPY);
+      // The plain sentence is not logged as a fault of its own…
+      expect(reportMock).not.toHaveBeenCalled();
+      // …and the raw fault is in Diagnostics, once, under the metric's source.
+      const entries = get(diagnostics).filter((entry) => entry.message.includes("reading 'invoke'"));
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.source).toBe(source);
+    } finally {
+      diagnostics.clear();
+    }
+  });
+
   it("redacts credentials a failed git command carried before they reach the banner", async () => {
     invokeMock.mockRejectedValue(new Error("fatal: unable to access 'https://user:hunter2secret@example.com/r.git/'"));
     await locMetric.refresh(REPO, { force: true });

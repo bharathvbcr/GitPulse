@@ -208,7 +208,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
     updated_at: 100,
     title: "[#42] Fix watcher race",
     kind: "bug",
-    status: "inbox",
+    status: "backlog",
     priority: 2,
     severity: null,
     owner: null,
@@ -226,7 +226,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
     updated_at: 100,
     title: "Unrelated task without number",
     kind: "feature",
-    status: "inbox",
+    status: "backlog",
     priority: 1,
     severity: null,
     owner: null,
@@ -259,7 +259,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
       updated_at: 100,
       title: "[#100] Fix regression introduced in #42",
       kind: "bug",
-      status: "inbox",
+      status: "backlog",
       priority: 2,
       severity: null,
       owner: null,
@@ -289,8 +289,8 @@ describe("isIssueInTask and findTaskForIssue", () => {
     expect(isIssueInTask(cardOther, 42)).toBe(false);
   });
 
-  it("matches tasks regardless of task status (inbox, ready, in_progress, review, done)", () => {
-    const statuses = ["inbox", "ready", "in_progress", "review", "done"] as const;
+  it("matches tasks regardless of task status (backlog, ready, in_progress, review, done)", () => {
+    const statuses = ["backlog", "ready", "in_progress", "review", "done"] as const;
     for (const status of statuses) {
       const card: TaskCard = { ...card1, status };
       expect(isIssueInTask(card, 42)).toBe(true);
@@ -305,7 +305,7 @@ describe("issueToTaskDraft", () => {
 
     expect(draft.title).toBe("[#42] Race condition in watcher sync loop");
     expect(draft.kind).toBe("bug");
-    expect(draft.status).toBe("inbox");
+    expect(draft.status).toBe("backlog");
     expect(draft.priority).toBe(1);
     expect(draft.primary_repository_id).toBe("repo-123");
     expect(draft.repository_ids).toEqual(["repo-123"]);
@@ -407,7 +407,7 @@ describe("createTaskFromIssue and batchCreateTasksFromIssues", () => {
       updated_at: 100,
       title: "[#10] Already imported",
       kind: "bug",
-      status: "inbox",
+      status: "backlog",
       priority: 1,
       severity: null,
       owner: null,

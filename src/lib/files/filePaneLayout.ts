@@ -1,6 +1,13 @@
 export const FILE_EXPLORER_WIDTH = 288;
 export const FILE_DASHBOARD_WIDTH = 320;
 export const FILE_EDITOR_MIN_WIDTH = 420;
+/**
+ * Each side pane is a floating card (`gp-float-card`, app.css) with a 6px
+ * margin on either side, so it takes its width plus this much from the row.
+ */
+export const FILE_SIDE_CARD_GUTTERS = 12;
+const EXPLORER_FOOTPRINT = FILE_EXPLORER_WIDTH + FILE_SIDE_CARD_GUTTERS;
+const DASHBOARD_FOOTPRINT = FILE_DASHBOARD_WIDTH + FILE_SIDE_CARD_GUTTERS;
 
 export type FileSidePane = "explorer" | "dashboard";
 export type FilePaneLayoutMode = "unmeasured" | "wide" | "single" | "compact";
@@ -46,8 +53,8 @@ export function resolveFilePaneLayout(input: FilePaneLayoutInput): FilePaneLayou
   }
 
   const requestedWidth =
-    (explorerRequested ? FILE_EXPLORER_WIDTH : 0) +
-    (dashboardRequested ? FILE_DASHBOARD_WIDTH : 0);
+    (explorerRequested ? EXPLORER_FOOTPRINT : 0) +
+    (dashboardRequested ? DASHBOARD_FOOTPRINT : 0);
   if (containerWidth >= FILE_EDITOR_MIN_WIDTH + requestedWidth) {
     return {
       mode: "wide",
@@ -58,9 +65,9 @@ export function resolveFilePaneLayout(input: FilePaneLayoutInput): FilePaneLayou
   }
 
   const canFitExplorer =
-    explorerRequested && containerWidth >= FILE_EDITOR_MIN_WIDTH + FILE_EXPLORER_WIDTH;
+    explorerRequested && containerWidth >= FILE_EDITOR_MIN_WIDTH + EXPLORER_FOOTPRINT;
   const canFitDashboard =
-    dashboardRequested && containerWidth >= FILE_EDITOR_MIN_WIDTH + FILE_DASHBOARD_WIDTH;
+    dashboardRequested && containerWidth >= FILE_EDITOR_MIN_WIDTH + DASHBOARD_FOOTPRINT;
   const compactPaneRequested = compactPane === "explorer"
     ? explorerRequested
     : compactPane === "dashboard" ? dashboardRequested : false;

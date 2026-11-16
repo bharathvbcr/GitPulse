@@ -19,6 +19,7 @@
 
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { isSessionId } from "./tabs";
+import { describeError } from "../ui/copy/describeFailure";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -86,7 +87,7 @@ export async function checkTranscripts(
   try {
     return readTranscripts(await invoke<unknown>("cmd_terminal_conversations", { sessionIds: asked }), asked);
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = describeError(error, "terminal");
     return new Map(asked.map((id) => [id, { state: "unknown" as const, reason }]));
   }
 }

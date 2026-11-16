@@ -102,9 +102,9 @@ describe("task tab model", () => {
   it("retargets a saved draft onto the new id, or focuses a collision instead of duplicating", () => {
     let state = openTaskTab(emptyTaskTabs(), tab("draft-1", { draft: true, title: "New task" }));
     state = openTaskTab(state, tab("saved"));
-    const renamed = retargetTaskTab(state, "draft-1", tab("created", { title: "Created", status: "inbox" }));
+    const renamed = retargetTaskTab(state, "draft-1", tab("created", { title: "Created", status: "backlog" }));
     expect(renamed.tabs.map((item) => item.id)).toEqual(["created", "saved"]);
-    expect(renamed.tabs[0]).toMatchObject({ title: "Created", draft: false, status: "inbox" });
+    expect(renamed.tabs[0]).toMatchObject({ title: "Created", draft: false, status: "backlog" });
 
     const clash = retargetTaskTab(renamed, "created", tab("saved", { title: "Saved" }));
     expect(clash.tabs.map((item) => item.id)).toEqual(["saved"]);

@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { formatError, isMissingFileError } from "./formatError";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  INTERNAL_ERROR_COPY,
+  formatError,
+  formatErrorRaw,
+  isMissingFileError,
+  isProgrammingError,
+  markProgrammingErrorRecorded,
+  setProgrammingErrorSink,
+} from "./formatError";
 
 describe("formatError", () => {
   it("passes non-empty strings through trimmed", () => {
@@ -14,7 +22,7 @@ describe("formatError", () => {
 
   it("prefers the message field of Error instances", () => {
     expect(formatError(new Error("db locked"))).toBe("db locked");
-    expect(formatError(new TypeError("not a function"))).toBe("not a function");
+    expect(formatErrorRaw(new TypeError("not a function"))).toBe("not a function");
   });
 
   it("prefers a string .message on plain objects", () => {
@@ -107,5 +115,102 @@ describe("isMissingFileError", () => {
     expect(isMissingFileError("profile not found:")).toBe(false);
     expect(isMissingFileError("not found: file")).toBe(false);
     expect(isMissingFileError("")).toBe(false);
+  });
+});
+
+describe("isProgrammingError", () => {
+  it("is true for the four JavaScript runtime faults", () => {
+    for (const fault of [new TypeError("a"), new ReferenceError("b"), new RangeError("c"), new SyntaxError("d")]) {
+      expect(isProgrammingError(fault)).toBe(true);
+    }
+  });
+
+  it("is false for backend text, plain errors and objects", () => {
+    for (const other of ["Cannot read properties of undefined", new Error("db locked"), { message: "rpc failed" }, null, undefined, 42]) {
+      expect(isProgrammingError(other)).toBe(false);
+    }
+  });
+});
+
+describe("formatError on a JavaScript runtime fault", () => {
+  const RAW = "Cannot read properties of undefined (reading 'invoke')";
+
+  afterEach(() => {
+    setProgrammingErrorSink(null);
+    vi.restoreAllMocks();
+  });
+
+  it("returns the plain sentence and hands the raw error to the registered sink", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    for (const fault of [new TypeError(RAW), new ReferenceError("x is not defined"), new RangeError("Invalid array length"), new SyntaxError("Unexpected token")]) {
+      sink.mockClear();
+      const text = formatError(fault);
+      expect(text).toBe(INTERNAL_ERROR_COPY);
+      expect(text).not.toContain(fault.message);
+      expect(sink).toHaveBeenCalledTimes(1);
+      expect(sink).toHaveBeenCalledWith("ui", fault);
+    }
+  });
+
+  it("names the caller's source when it gives one", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    const fault = new TypeError(RAW);
+    formatError(fault, "storage");
+    expect(sink).toHaveBeenCalledWith("storage", fault);
+  });
+
+  it("leaves strings, plain errors, IpcError-like and plain objects unchanged and records nothing", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    class IpcLike extends Error {
+      constructor(readonly code: string, message: string) {
+        super(message);
+        this.name = "IpcError";
+      }
+    }
+    expect(formatError("clone failed")).toBe("clone failed");
+    expect(formatError(new Error("db locked"))).toBe("db locked");
+    expect(formatError(new IpcLike("unclassified", "File not found: a.ts"))).toBe("File not found: a.ts");
+    expect(formatError({ message: "rpc failed", code: -1 })).toBe("rpc failed");
+    expect(formatError({ code: -1, kind: "io" })).toBe('{"code":-1,"kind":"io"}');
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it("falls back to console.error when no sink is registered, so the fault is never dropped", () => {
+    setProgrammingErrorSink(null);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fault = new TypeError(RAW);
+    expect(formatError(fault)).toBe(INTERNAL_ERROR_COPY);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]).toContain(fault);
+  });
+
+  it("records one fault once, however often it is rendered", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    const fault = new TypeError(RAW);
+    formatError(fault);
+    formatError(fault);
+    formatError(fault, "other");
+    expect(sink).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not record a fault that was already recorded elsewhere", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    const fault = new TypeError(RAW);
+    markProgrammingErrorRecorded(fault);
+    expect(formatError(fault)).toBe(INTERNAL_ERROR_COPY);
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it("formatErrorRaw keeps the fault's own text and records nothing", () => {
+    const sink = vi.fn();
+    setProgrammingErrorSink(sink);
+    expect(formatErrorRaw(new TypeError(RAW))).toBe(RAW);
+    expect(formatErrorRaw("clone failed")).toBe("clone failed");
+    expect(sink).not.toHaveBeenCalled();
   });
 });

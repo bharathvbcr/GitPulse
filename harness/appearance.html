@@ -201,6 +201,42 @@
     applyTransparency("standard");
     await setValue(blur, 34); await setValue(material, 0);
 
+    // --- theme presets and the wallpaper ---------------------------------------
+    // The wallpaper is drawn on body, beneath the shell veil, and only there:
+    // that placement is what keeps the material model's any-desktop proof true.
+    const bodyImage = () => cs(document.body).backgroundImage;
+    await press($('[data-setting="theme-gallery"]'), "Neural HUD");
+    check("a preset applies its palette, stamps its wallpaper and marks its card", () =>
+      root.getAttribute("data-backdrop") === "neural" &&
+      root.style.getPropertyValue("--c-bg").trim() !== "" &&
+      $('[data-preset="neural-hud"]').getAttribute("aria-pressed") === "true");
+    check("the wallpaper is painted on body as the built-in SVG", () => bodyImage().startsWith('url("data:image/svg+xml,'));
+    check("and never on the shell, above the veil", () => !cs($(".gp-shell")).backgroundImage.includes("svg+xml"));
+    await press($('[data-setting="transparency"]'), "Reduced");
+    check("Reduced transparency removes the wallpaper", () => bodyImage() === "none");
+    await press($('[data-setting="transparency"]'), "Auto");
+    check("Auto draws it again", () => bodyImage().startsWith("url("));
+    applyTransparency("reduced"); await settle();
+    check("a system Reduce Transparency removes it too", () => bodyImage() === "none");
+    applyTransparency("standard"); await settle();
+    $('[data-backdrop-option="hex"]').click(); await settle();
+    check("picking another wallpaper swaps it and keeps the theme", () => root.getAttribute("data-backdrop") === "hex" && $('[data-preset="neural-hud"]').getAttribute("aria-pressed") === "false" && root.style.getPropertyValue("--c-bg").trim() !== "");
+    $('[data-backdrop-option="none"]').click(); await settle();
+    check("None clears the wallpaper attribute and the body image", () => !root.hasAttribute("data-backdrop") && bodyImage() === "none");
+    await press($('[data-setting="theme-gallery"]'), "Pure Black");
+    check("Pure Black draws a black ground with an opaque material", () =>
+      root.style.getPropertyValue("--c-bg").trim() === "0 0 0" && cs(root).getPropertyValue("--gp-material").trim() === "1");
+    await press($('[data-setting="theme-gallery"]'), "Paper");
+    check("a light preset switches the window to light", () => root.classList.contains("light") && !root.classList.contains("dark"));
+    await setValue($("[data-save-theme-name]"), "Harness look", ["input"]);
+    await press($('[data-setting="theme-gallery"]'), "Save current look");
+    check("Save current look puts the theme on the shelf", () => $('[data-saved-theme="Harness look"]') !== null);
+    await press($('[data-saved-theme="Harness look"]'), "Remove “Harness look” from my themes");
+    check("and Remove takes it off again", () => $('[data-saved-theme="Harness look"]') === null);
+    interfaceStore.patchAppearance({ customTheme: null, backdrop: "none", materialIntensity: { light: 0, dark: 0 } });
+    themeStore.setTheme("dark"); await settle();
+    check("clearing the theme returns to the shipped palette", () => root.style.getPropertyValue("--c-bg") === "" && !root.hasAttribute("data-backdrop"));
+
     // --- light theme floor ---------------------------------------------------
     themeStore.setTheme("light"); await settle();
     check("the light theme's slider floor is the measured 30%", () => Number($('[data-setting="material-intensity"] input[type="range"]').min) === 0.3);

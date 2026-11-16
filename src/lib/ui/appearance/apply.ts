@@ -52,8 +52,10 @@ import {
 } from "../color/oklch";
 import { setUserTransparencyReduced } from "../transparencyPreference";
 import { DEFAULT_MONO_STACK, DEFAULT_UI_STACK, fontStack, normalizeFamily } from "./fonts";
-import { measureFloor } from "./materialModel";
+import { derivedPalette, measureFloor } from "./materialModel";
 import { RADIUS_SCALE_RANGE, validateTheme, type GitPulseTheme } from "./themeSchema";
+import { backdropCssValue, builtinBackdropUrl, isBackdropId, isBuiltinBackdrop, type BackdropId } from "./backdrops";
+import { readSavedThemes } from "./savedThemes";
 
 export type FieldLevel = "off" | "subtle" | "vivid";
 export const FIELD_LEVELS: readonly FieldLevel[] = ["off", "subtle", "vivid"];
@@ -87,6 +89,13 @@ export interface AppearancePrefs {
   readonly fieldHue: number;
   /** The reader's one-way "Transparency: reduced" choice. */
   readonly reduceTransparency: boolean;
+  /**
+   * The wallpaper under the window material: none, a built-in picture, or the
+   * reader's own image (stored apart from these preferences; see wallpaperStore.ts).
+   */
+  readonly backdrop: BackdropId;
+  /** The reader's theme shelf. `customTheme` is the applied one; these are the ones kept. */
+  readonly savedThemes: readonly GitPulseTheme[];
 }
 
 export const FLOAT_BLUR_SHIPPED = 34;
@@ -107,6 +116,8 @@ export const APPEARANCE_DEFAULTS: AppearancePrefs = {
   fieldLevel: "vivid",
   fieldHue: 0,
   reduceTransparency: false,
+  backdrop: "none",
+  savedThemes: [],
 };
 
 /** Level -> fraction of the theme's shipped field gain. Never above shipped (§11). */
@@ -195,6 +206,8 @@ export function sanitizeAppearance(raw: Readonly<Record<string, unknown>>): Appe
     fieldLevel: isFieldLevel(raw.fieldLevel) ? raw.fieldLevel : APPEARANCE_DEFAULTS.fieldLevel,
     fieldHue: normalizeHue(finite(raw.fieldHue, 0)),
     reduceTransparency: raw.reduceTransparency === true,
+    backdrop: isBackdropId(raw.backdrop) ? raw.backdrop : APPEARANCE_DEFAULTS.backdrop,
+    savedThemes: readSavedThemes(raw.savedThemes),
   };
 }
 
@@ -295,13 +308,26 @@ export interface AppearancePlan {
   readonly accentOverride: string | null;
   /** The reader's one-way transparency choice, forwarded to the bridge. */
   readonly transparencyReduced: boolean;
+  /**
+   * The lowest material intensity this window may draw at: measured over the
+   * palette in force, so an applied theme gets its own floor rather than the
+   * shipped one. The settings slider reads it too.
+   */
+  readonly materialFloor: number;
   readonly notes: readonly AppearanceNote[];
 }
+
+/** What the custom wallpaper store can say about the reader's own image. */
+export type CustomBackdrop =
+  | { readonly status: "ready"; readonly url: string }
+  | { readonly status: "loading" | "none" | "unavailable" };
 
 export interface AppearanceContext {
   readonly theme: Appearance;
   /** `HostProfile.native_material`: whether the glass tokens mean anything here. */
   readonly nativeMaterial: boolean;
+  /** The reader's own wallpaper; only read while `backdrop` is `custom`. */
+  readonly customBackdrop?: CustomBackdrop;
 }
 
 /** Every inline property this module may set, so a plan can clear what it no longer sets. */
@@ -318,9 +344,15 @@ export const MANAGED_VARS: readonly string[] = [
   "--mac-hue-c",
   "--mac-hue-d",
   "--mac-hue-gain",
+  "--gp-backdrop",
 ];
 
-export const MANAGED_ATTRIBUTES: readonly string[] = ["data-density", "data-radius-scale", "data-float-blur"];
+export const MANAGED_ATTRIBUTES: readonly string[] = [
+  "data-density",
+  "data-radius-scale",
+  "data-float-blur",
+  "data-backdrop",
+];
 
 function themeInputs(theme: GitPulseTheme, accent: string): DeriveInputs {
   const { colors } = theme;
@@ -366,10 +398,12 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
         ? presetHex(prefs.accent, theme)
         : null;
   let themeApplied = false;
+  let appliedTokens: Readonly<Record<(typeof TOKEN_KEYS)[number], string>> | null = null;
   if (themeActive && customTheme !== null) {
     const result = deriveTokens(themeInputs(customTheme, requestedAccent ?? customTheme.colors.accent), theme);
     if (result.ok) {
       themeApplied = true;
+      appliedTokens = result.tokens;
       for (const key of TOKEN_KEYS) {
         if (key === "--c-accent") accentOverride = result.tokens[key];
         else vars[key] = result.tokens[key];
@@ -438,10 +472,31 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
     attributes["data-radius-scale"] = null;
   }
 
+  // The background field in force, and the material floor measured over it.
+  const shipped = SHIPPED_FIELD[theme];
+  const fieldTheme = themeApplied && customTheme?.field ? customTheme.field : null;
+  const hues = fieldTheme ? fieldTheme.hues.map((hex) => parseHex(hex) ?? shipped.hues[0]) : shipped.hues;
+  const share = fieldTheme ? fieldTheme.gain : FIELD_GAIN[prefs.fieldLevel];
+  // The shipped palette's floor is measured once at load. An applied theme
+  // changes the veil, the surfaces and the inks, so its floor is measured over
+  // its own derived ladder: a theme is never held to a floor computed for a
+  // palette it does not draw.
+  const materialFloor =
+    appliedTokens === null
+      ? MATERIAL_FLOOR[theme]
+      : measureFloor(
+          theme,
+          derivedPalette(theme, appliedTokens, {
+            blobs: hues.map((hue) => rotateHue(hue as Rgb, prefs.fieldHue)),
+            gain: shipped.gain * share,
+          }),
+        ).floor;
+
   // Material, float blur, background field: the `html.macos` tokens.
   attributes["data-float-blur"] = null;
+  attributes["data-backdrop"] = null;
   if (context.nativeMaterial) {
-    const floor = MATERIAL_FLOOR[theme];
+    const floor = materialFloor;
     const wanted = prefs.materialIntensity[theme];
     const intensity = clamp(wanted, floor, 1);
     if (intensity > 0) vars["--gp-material"] = String(Number(intensity.toFixed(3)));
@@ -457,10 +512,6 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
     if (blur === 0) attributes["data-float-blur"] = "off";
     else if (blur !== FLOAT_BLUR_SHIPPED) vars["--gp-float-blur"] = `${blur}px`;
 
-    const shipped = SHIPPED_FIELD[theme];
-    const fieldTheme = themeApplied && customTheme?.field ? customTheme.field : null;
-    const hues = fieldTheme ? fieldTheme.hues.map((hex) => parseHex(hex) ?? shipped.hues[0]) : shipped.hues;
-    const share = fieldTheme ? fieldTheme.gain : FIELD_GAIN[prefs.fieldLevel];
     if (share !== 1) vars["--mac-hue-gain"] = String(Number((shipped.gain * share).toFixed(3)));
     if (fieldTheme || prefs.fieldHue !== 0) {
       const names = ["--mac-hue-a", "--mac-hue-b", "--mac-hue-c", "--mac-hue-d"];
@@ -468,6 +519,46 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
         vars[names[index]] = formatTriplet(rotateHue(hue as Rgb, prefs.fieldHue));
       });
     }
+
+    // Wallpaper. Painted beneath the shell veil (app.css), where the material
+    // model's white/black-desktop proof already covers any picture.
+    const url = backdropUrl(prefs.backdrop, context.customBackdrop);
+    const css = url === null ? null : backdropCssValue(url);
+    if (css !== null) {
+      vars["--gp-backdrop"] = css;
+      attributes["data-backdrop"] = prefs.backdrop;
+      if (prefs.reduceTransparency) {
+        notes.push({
+          id: "backdrop-hidden",
+          tone: "info",
+          text: "Transparency is reduced, so surfaces are solid and the wallpaper is hidden.",
+        });
+      } else if (intensity >= 0.95) {
+        notes.push({
+          id: "backdrop-hidden",
+          tone: "info",
+          text: `Material intensity is ${Math.round(intensity * 100)}%, which covers the wallpaper. Lower it to let the picture through.`,
+        });
+      }
+    } else if (prefs.backdrop === "custom") {
+      const status = context.customBackdrop?.status ?? "loading";
+      if (status !== "loading") {
+        notes.push({
+          id: "backdrop-missing",
+          tone: "warn",
+          text:
+            status === "unavailable"
+              ? "Your wallpaper image couldn't be read from this window's storage, so none is drawn."
+              : "Your wallpaper image is no longer stored, so none is drawn. Choose an image again.",
+        });
+      }
+    }
+  } else if (prefs.backdrop !== "none") {
+    notes.push({
+      id: "backdrop-host",
+      tone: "info",
+      text: "Wallpapers draw behind the translucent window material, which this computer's window doesn't use.",
+    });
   }
 
   return {
@@ -475,8 +566,16 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
     attributes,
     accentOverride,
     transparencyReduced: context.nativeMaterial && prefs.reduceTransparency,
+    materialFloor,
     notes,
   };
+}
+
+/** The URL a wallpaper choice draws, or null when there is nothing to draw (yet). */
+export function backdropUrl(backdrop: BackdropId, custom: CustomBackdrop | undefined): string | null {
+  if (isBuiltinBackdrop(backdrop)) return builtinBackdropUrl(backdrop);
+  if (backdrop === "custom" && custom?.status === "ready") return custom.url;
+  return null;
 }
 
 // --- DOM --------------------------------------------------------------------
@@ -508,10 +607,18 @@ const noteStore = writable<readonly AppearanceNote[]>([]);
 /** The notices the last plan owed the reader (a guard adjustment, a refused theme). */
 export const appearanceNotes: Readable<readonly AppearanceNote[]> = { subscribe: noteStore.subscribe };
 
+const floorStore = writable<number>(0);
+/** The material floor the last plan measured, for the intensity slider's minimum. */
+export const appearanceMaterialFloor: Readable<number> = { subscribe: floorStore.subscribe };
+
+const NO_CUSTOM_BACKDROP: Readable<CustomBackdrop> = { subscribe: (run) => (run({ status: "none" }), () => {}) };
+
 export interface AppearanceSources {
   readonly prefs: Readable<AppearancePrefs>;
   readonly theme: Readable<Appearance>;
   readonly platform: Readable<{ readonly native_material: boolean }>;
+  /** The reader's own wallpaper image; omitted where there is none to read. */
+  readonly customBackdrop?: Readable<CustomBackdrop>;
   readonly target?: AppearanceTarget | null;
 }
 
@@ -524,11 +631,17 @@ export function installAppearance(sources: AppearanceSources): () => void {
   const target = sources.target ?? (typeof document === "undefined" ? null : document.documentElement);
   if (!target) return () => {};
   const combined = derived(
-    [sources.prefs, sources.theme, sources.platform],
-    ([prefs, theme, platform]) => ({ prefs, theme, nativeMaterial: platform.native_material }),
+    [sources.prefs, sources.theme, sources.platform, sources.customBackdrop ?? NO_CUSTOM_BACKDROP],
+    ([prefs, theme, platform, customBackdrop]) => ({
+      prefs,
+      theme,
+      nativeMaterial: platform.native_material,
+      customBackdrop,
+    }),
   );
-  return combined.subscribe(({ prefs, theme, nativeMaterial }) => {
-    const plan = planAppearance(prefs, { theme, nativeMaterial });
+  return combined.subscribe(({ prefs, theme, nativeMaterial, customBackdrop }) => {
+    const plan = planAppearance(prefs, { theme, nativeMaterial, customBackdrop });
+    floorStore.set(plan.materialFloor);
     // Order matters: the override first, so the `applyAccent` below (and the one
     // App.svelte runs on every accent change) writes the same value.
     setAccentOverride(plan.accentOverride);

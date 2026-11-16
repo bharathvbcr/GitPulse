@@ -191,7 +191,7 @@ pub(crate) fn merge_conflicts_within(
         out.ok = false;
         out.error = if reasons
             .iter()
-            .all(|reason| crate::engine::git_cli::is_deferred_under_load(reason))
+            .all(|reason| crate::engine::process::is_deferred_under_load(reason))
         {
             reasons
                 .iter()

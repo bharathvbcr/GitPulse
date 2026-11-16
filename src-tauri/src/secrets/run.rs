@@ -1,10 +1,9 @@
 //! Tool lookup, scrubbed spawn, fixed argv, and scan scheduling for Kingfisher.
 
 use super::parse::{parse_kingfisher_json, SecretsReport};
-use super::report::{assemble, git_view, RunFacts};
-use crate::engine::git_cli::{
-    run_observed, validate_repo, Incomplete, OutputStream, ProcessObserver,
-};
+use super::report::{assemble, git_view, scan_exclusions, RunFacts};
+use crate::engine::git_cli::validate_repo;
+use crate::engine::process::{run_observed, Incomplete, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -58,8 +57,12 @@ fn scan_jobs() -> usize {
 /// means finding both. Inline `kingfisher:ignore` directives stay honoured
 /// (no `--no-ignore`): they are the repository author's recorded decision,
 /// and the panel says they apply.
-pub fn build_scan_argv(repo: impl AsRef<Path>) -> Vec<String> {
-    vec![
+///
+/// `excluded` are absolute directories left out with `--exclude`
+/// ([`super::report::scan_exclusions`] chooses them and keeps out any path
+/// that would read as a glob).
+pub fn build_scan_argv(repo: impl AsRef<Path>, excluded: &[PathBuf]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
         "--no-update-check".into(),
         "scan".into(),
         repo.as_ref().to_string_lossy().into_owned(),
@@ -77,7 +80,34 @@ pub fn build_scan_argv(repo: impl AsRef<Path>) -> Vec<String> {
         "--jobs".into(),
         scan_jobs().to_string(),
         "--quiet".into(),
-    ]
+    ];
+    for tree in excluded {
+        argv.push("--exclude".into());
+        argv.push(tree.to_string_lossy().into_owned());
+    }
+    argv
+}
+
+/// Linked worktrees of `repo`, canonical, for [`super::report::scan_exclusions`]
+/// to keep the ones inside it. A listing that cannot be read leaves none out:
+/// the scan is then slower, never narrower.
+fn linked_worktrees(repo: &Path) -> Vec<PathBuf> {
+    match crate::engine::worktree::read_worktree_entries(repo) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| PathBuf::from(entry.path))
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .filter(|path| path != repo)
+            .collect(),
+        Err(error) => {
+            log::info!(
+                target: "secrets",
+                "worktrees not listed, so none are left out of the scan: {}",
+                error.message()
+            );
+            Vec::new()
+        }
+    }
 }
 
 pub fn build_version_argv() -> [&'static str; 1] {
@@ -120,7 +150,7 @@ fn process_scrubbed_env() -> BTreeMap<String, OsString> {
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, so a Homebrew install was reported as
 /// "not installed".
 pub fn resolve_kingfisher() -> Option<PathBuf> {
-    crate::engine::git_cli::find_external_tool("kingfisher").map(PathBuf::from)
+    crate::engine::process::find_external_tool("kingfisher").map(PathBuf::from)
 }
 
 /// [`resolve_kingfisher`] under an injected environment, for reproducing a
@@ -131,7 +161,7 @@ pub(super) fn resolve_kingfisher_with(
     path_var: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    crate::engine::git_cli::find_external_tool_with("kingfisher", path_var, home).map(PathBuf::from)
+    crate::engine::process::find_external_tool_with("kingfisher", path_var, home).map(PathBuf::from)
 }
 
 fn scrubbed_command(binary: &Path) -> Command {
@@ -157,7 +187,22 @@ pub fn failed_report(reason: &str, version: Option<String>) -> SecretsReport {
 /// The one reason a non-success exit is reported with. A signal has no exit
 /// status on Unix (`code()` is `None`, carried as -1), and saying "exited
 /// with status -1" names a status that never existed.
-fn exit_reason(status: i32) -> String {
+///
+/// When the signal is known it is named, and a fault the scanner raised itself
+/// (SIGBUS, SIGSEGV, ...) is a crash, not a termination: a crash repeats on
+/// the same input, a termination does not, and the person reading the banner
+/// needs to know which they are looking at. A scan GitPulse stopped never gets
+/// here (it is reported as superseded first), nor does one that hit its
+/// deadline.
+fn exit_reason(status: i32, signal: Option<i32>) -> String {
+    if let Some(signal) = signal {
+        let name = signal_name(signal);
+        return if is_crash_signal(signal) {
+            format!("kingfisher crashed ({name})")
+        } else {
+            format!("kingfisher was stopped by {name} before it finished")
+        };
+    }
     if cfg!(unix) && status == -1 {
         "kingfisher was terminated before it finished".into()
     } else {
@@ -165,10 +210,56 @@ fn exit_reason(status: i32) -> String {
     }
 }
 
+/// Whether `signal` is one a process raises on itself by faulting, as opposed
+/// to one somebody sent it.
+fn is_crash_signal(signal: i32) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            signal,
+            libc::SIGBUS
+                | libc::SIGSEGV
+                | libc::SIGILL
+                | libc::SIGABRT
+                | libc::SIGFPE
+                | libc::SIGTRAP
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        false
+    }
+}
+
+fn signal_name(signal: i32) -> String {
+    #[cfg(unix)]
+    {
+        let known = [
+            (libc::SIGBUS, "SIGBUS"),
+            (libc::SIGSEGV, "SIGSEGV"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGTRAP, "SIGTRAP"),
+            (libc::SIGKILL, "SIGKILL"),
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGHUP, "SIGHUP"),
+            (libc::SIGPIPE, "SIGPIPE"),
+        ];
+        if let Some((_, name)) = known.iter().find(|(number, _)| *number == signal) {
+            return (*name).to_string();
+        }
+    }
+    format!("signal {signal}")
+}
+
 /// Map a finished child (any exit) into a report without retaining stdout,
 /// locating findings under `root` with `view`.
 pub(crate) fn report_from_run(
     status: i32,
+    signal: Option<i32>,
     stdout: &[u8],
     version: Option<String>,
     root: &Path,
@@ -176,7 +267,7 @@ pub(crate) fn report_from_run(
     facts: RunFacts,
 ) -> SecretsReport {
     if !SUCCESS_EXITS.contains(&status) {
-        return failed_report(&exit_reason(status), version);
+        return failed_report(&exit_reason(status, signal), version);
     }
     match parse_kingfisher_json(stdout, version.clone()) {
         Ok(envelope) => assemble(
@@ -195,6 +286,7 @@ pub(crate) fn report_from_run(
 pub fn report_from_exit(status: i32, stdout: &[u8], version: Option<String>) -> SecretsReport {
     report_from_run(
         status,
+        None,
         stdout,
         version,
         Path::new("/repo"),
@@ -204,6 +296,7 @@ pub fn report_from_exit(status: i32, stdout: &[u8], version: Option<String>) -> 
             duration_ms: 0,
             nested_repos_scanned: nested_repos_scanning_enabled(),
             max_file_size_mb: MAX_FILE_SIZE_MB,
+            excluded_paths: Vec::new(),
         },
     )
 }
@@ -352,7 +445,15 @@ pub fn scan_with_binary(
     if ticket.superseded() {
         return failed_report(SUPERSEDED, version);
     }
-    let argv = build_scan_argv(repo);
+    // Read before the scan so the same listing chooses what is left out and
+    // locates what is found.
+    let view = git_view(repo);
+    let excluded_paths = scan_exclusions(repo, view.as_ref().ok(), &linked_worktrees(repo));
+    let excluded: Vec<PathBuf> = excluded_paths
+        .iter()
+        .map(|rel| repo.join(rel.trim_end_matches('/')))
+        .collect();
+    let argv = build_scan_argv(repo, &excluded);
     let jobs = argv_value(&argv, "--jobs");
     let mut cmd = scrubbed_command(binary);
     cmd.args(&argv);
@@ -384,18 +485,22 @@ pub fn scan_with_binary(
 
     // Destructure so stderr is dropped here and never reaches the report.
     // Byte counts were already taken by the ticket; the bytes stay here.
-    let crate::engine::git_cli::BoundedRun {
+    let crate::engine::process::BoundedRun {
         stdout,
         stderr: _stderr,
         status_code,
+        signal,
         incomplete,
         cancelled,
         ..
     } = run;
 
     // Before the exit status: a cancelled child was killed by us, and its
-    // status (-1) is not something Kingfisher said.
-    if cancelled || ticket.superseded() {
+    // status (-1) is not something Kingfisher said. A child that died by a
+    // signal nobody here sent (`cancelled` is false) crashed before any newer
+    // scan could have mattered, so it is reported as that and not as
+    // superseded.
+    if cancelled || (ticket.superseded() && signal.is_none()) {
         return failed_report(SUPERSEDED, version);
     }
     if let Some(incomplete) = incomplete {
@@ -417,15 +522,17 @@ pub fn scan_with_binary(
 
     let mut report = report_from_run(
         status_code,
+        signal,
         &stdout,
         version.clone(),
         repo,
-        || git_view(repo),
+        || view,
         RunFacts {
             scanned_at_ms: now_ms(),
             duration_ms,
             nested_repos_scanned: nested_repos_scanning_enabled(),
             max_file_size_mb: MAX_FILE_SIZE_MB,
+            excluded_paths,
         },
     );
     if !report.ok {
@@ -498,9 +605,9 @@ fn note_failure(report: &mut SecretsReport, reason: &str, facts: &ScanDiagnostic
 /// path, so none of it is forwarded — but each cause gets its own sentence:
 /// "timed out waiting for a process slot" is not the scan timing out.
 pub(super) fn runner_failure_reason(err: &str, deadline: Duration) -> String {
-    if crate::engine::git_cli::is_deferred_under_load(err) {
+    if crate::engine::process::is_deferred_under_load(err) {
         "kingfisher was deferred: GitPulse was under load and started no new process in time".into()
-    } else if crate::engine::git_cli::is_slot_wait_timeout(err) {
+    } else if crate::engine::process::is_slot_wait_timeout(err) {
         "kingfisher could not start: no process slot became free in time".into()
     } else if err.contains("cancelled before spawn") {
         SUPERSEDED.into()

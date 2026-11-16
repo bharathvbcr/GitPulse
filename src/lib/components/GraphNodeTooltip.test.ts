@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
+import { interfaceStore } from "../stores/interfaceStore";
 
 const row: VisualCommitRow = {
   id: "0123456789abcdef0123456789abcdef01234567",
@@ -223,5 +224,30 @@ describe("tag chips in the graph tooltip", () => {
     });
     expect(body).toContain("unmeasured");
     expect(body).not.toMatch(/\+\d/);
+  });
+});
+
+describe("GraphNodeTooltip GitHub profile picture", () => {
+  const withPicture: VisualCommitRow = { ...row, author_email: "42+ada@users.noreply.github.com" };
+
+  it("overlays the picture on both author discs, initials stay as the base", () => {
+    const { body } = render(GraphNodeTooltip, { props: { row: withPicture, hitKind: "node", authorCommitCount: 3 } });
+    expect(body.match(/avatars\.githubusercontent\.com\/u\/42/g)).toHaveLength(2);
+    expect(body.match(/>\s*AL\s*</g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+
+  it("has no picture without a known URL", () => {
+    const { body } = render(GraphNodeTooltip, { props: { row, hitKind: "node", authorCommitCount: 3 } });
+    expect(body).not.toContain("avatars.githubusercontent.com");
+  });
+
+  it("has no picture when the setting is off", () => {
+    interfaceStore.setShowGithubAvatars(false);
+    try {
+      const { body } = render(GraphNodeTooltip, { props: { row: withPicture, hitKind: "node", authorCommitCount: 3 } });
+      expect(body).not.toContain("avatars.githubusercontent.com");
+    } finally {
+      interfaceStore.setShowGithubAvatars(true);
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { isTauri } from "../platform";
-import { invoke } from "../ipc/invoke";
+import { invoke, type IpcOptions } from "../ipc/invoke";
 import { createWorkbenchChanges, type WorkbenchSubscriber } from "./changes";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
@@ -8,7 +8,7 @@ import { selectionWire, type ModelSelection } from "./taskModel";
 import type { ProposalMethod } from "./proposals";
 import { isSessionId } from "../terminal/tabs";
 import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults";
-import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
+import { PERMISSION_MODES, asAgentProvider, asTaskStatus, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
 export type { WorkbenchChange, WorkbenchSubscriber } from "./changes";
@@ -133,7 +133,7 @@ export interface WorkbenchError {
 }
 
 export const ATTENTION_TITLES = {
-  run_exited: "Coding agent exited", run_failed: "Coding agent failed to start",
+  run_exited: "Coding agent exited", run_failed: "Coding agent couldn't start",
   run_exit_failed: "Coding agent exited with an error",
   run_unresolved: "Coding agent outcome needs attention",
   enhancement_ready: "Task enhancement ready to review", enhancement_failed: "Task enhancement failed",
@@ -142,7 +142,7 @@ export const ATTENTION_TITLES = {
   // A host watcher's CI result on an agent's branch (dc-store `signals.record`). They are `run` targets with a
   // `run_` kind because every reader holds the closed set run|enhancement|decision and requires the prefix.
   run_ci_passed: "Coding agent branch passed CI", run_ci_failed: "Coding agent branch failed CI",
-  run_ci_cancelled: "Coding agent branch CI was cancelled",
+  run_ci_cancelled: "Coding agent branch CI was canceled",
 } as const;
 /** Where a CI result was observed. */
 export const CI_SOURCES = ["github", "ci_local"] as const;
@@ -226,11 +226,15 @@ export async function getAttention(id: string): Promise<Attention> {
   const result = record(await request("attention.get", { id }), attention);
   return result.id === id ? result : invalid();
 }
-export function attentionWrite(item: Attention, action: AttentionAction): AttentionWrite {
+export function attentionWrite(item: Pick<AttentionRow, "id" | "revision">, action: AttentionAction): AttentionWrite {
   return { id: item.id, expected_revision: item.revision, request_id: newID(), action, ...(action === "snooze" ? { seconds: 3600 } : {}) };
 }
-export async function updateAttention(input: AttentionWrite): Promise<Attention> {
-  const result = record(await request("attention.update", { ...input }), attention);
+/**
+ * The store applies an action to a notice of any kind, so the receipt is decoded as an inbox row: a kind this build
+ * cannot read can still be dismissed, and its receipt comes back as the same {@link UnreadAttention} row it was.
+ */
+export async function updateAttention(input: AttentionWrite): Promise<AttentionRow> {
+  const result = record(await request("attention.update", { ...input }), attentionRow);
   if (result.id !== input.id || result.revision !== input.expected_revision + 1) return invalid();
   return result;
 }
@@ -428,7 +432,7 @@ export function workspaceCard(value: unknown): WorkspaceCard { const raw = objec
 export function workspace(value: unknown): Workspace { const raw = object(value); return { ...workspaceBase(raw), description: text(raw.description), repository_ids: strings(raw.repository_ids) }; }
 export function taskCard(value: unknown): TaskCard {
   const raw = object(value);
-  const status = STATUSES.find((s) => s === raw.status);
+  const status = asTaskStatus(raw.status);
   const priority = integer(raw.priority);
   const repositories = strings(raw.repository_ids);
   const primary = text(raw.primary_repository_id);
@@ -571,8 +575,9 @@ export function explainError(error: unknown): string {
   return typeof error === "string" ? error : "Task storage is unavailable. Try again.";
 }
 export function newID(): string { return crypto.randomUUID(); }
-export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>): Promise<unknown> {
-  try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) })); }
+export const WORKBENCH_REQUEST_TIMEOUT_MS = 30_000;
+export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>, options?: IpcOptions): Promise<unknown> {
+  try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) }, options)); }
   catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : "transport_error";
     throw new WorkbenchError(code, explainError(error));
@@ -963,7 +968,9 @@ export async function listTasks(
   cursor?: string,
   limit = TASK_PAGE_SIZE,
   filter: TaskListFilter = {},
+  options?: IpcOptions,
 ): Promise<Page<TaskCard>> {
+  const effectiveOptions: IpcOptions = { deadlineMs: WORKBENCH_REQUEST_TIMEOUT_MS, ...options };
   const result = page(
     await request("items.list", {
       ...scopeParams(scope),
@@ -974,7 +981,7 @@ export async function listTasks(
       query,
       limit,
       ...(cursor ? { cursor } : {}),
-    }),
+    }, effectiveOptions),
     taskCard,
   );
   // A store that ignored the filter would hand the board archived cards as
@@ -1224,12 +1231,12 @@ export interface SuggestParams { limit?: number; max_priority?: number; reposito
 export const MAX_SUGGESTIONS = 20;
 function suggestion(value: unknown): TaskSuggestion {
   const raw = object(value);
-  const priority = integer(raw.priority), status = text(raw.status);
+  const priority = integer(raw.priority), status = asTaskStatus(text(raw.status));
   // Manvi builds before the fix sent `null` for a task that earned no points; that is no signals, not a bad answer.
   const signals = raw.signals === null ? [] : raw.signals;
-  if (priority > 3 || !(STATUSES as readonly string[]).includes(status) || !Array.isArray(signals) || signals.length > 32) return invalid();
+  if (priority > 3 || !status || !Array.isArray(signals) || signals.length > 32) return invalid();
   return {
-    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status: status as TaskStatus, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
+    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
     reason: text(raw.reason),
     signals: signals.map((entry) => { const signal = object(entry); return { name: text(signal.name), points: Number.isFinite(signal.points) ? (signal.points as number) : invalid(), detail: text(signal.detail) }; }),
   };
@@ -1302,14 +1309,14 @@ export interface TaskOrganization {
 export interface OrganizeParams { repository_id?: string }
 function organizeChange(value: unknown): TaskOrganizeChange {
   const raw = object(value);
-  const from = integer(raw.from), to = integer(raw.to), revision = integer(raw.revision), status = text(raw.status);
-  if (from > 3 || to > 3 || revision <= 0 || !(STATUSES as readonly string[]).includes(status)) return invalid();
-  return { id: text(raw.id), title: text(raw.title), status: status as TaskStatus, revision, from, to, rule: text(raw.rule), reason: text(raw.reason) };
+  const from = integer(raw.from), to = integer(raw.to), revision = integer(raw.revision), status = asTaskStatus(text(raw.status));
+  if (from > 3 || to > 3 || revision <= 0 || !status) return invalid();
+  return { id: text(raw.id), title: text(raw.title), status, revision, from, to, rule: text(raw.rule), reason: text(raw.reason) };
 }
 function organizeOrder(value: unknown): TaskOrganizeOrder {
-  const raw = object(value), status = text(raw.status);
-  if (!(STATUSES as readonly string[]).includes(status)) return invalid();
-  return { status: status as TaskStatus, ids: strings(raw.ids) };
+  const raw = object(value), status = asTaskStatus(text(raw.status));
+  if (!status) return invalid();
+  return { status, ids: strings(raw.ids) };
 }
 /** The decoder `organizeTasks` applies. A reply that is not this shape is a protocol error. */
 export function taskOrganization(value: unknown): TaskOrganization {

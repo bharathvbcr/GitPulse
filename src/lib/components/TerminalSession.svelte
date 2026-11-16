@@ -135,7 +135,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
   import { themeStore } from "../stores/themeStore";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
   import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
   import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
@@ -149,10 +149,12 @@
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
+  import { saveExport } from "../desktop/saveFile";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
   import { AGY_CONTINUE_SENTINEL, conversationForStart, hostedClaude, resolveTranscriptAnswer, resumers, settleConversation, unindexedExitOffer, type ExitFacts, type ResumeOutcome } from "../terminal/hostedAgent";
+  import type { TerminalResume } from "../terminal/sessionLedger";
   import { agentEvents } from "../terminal/agentEvents";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
@@ -409,9 +411,9 @@
       if (onOpenSnippetSplit?.(artifact.title, artifact.content)) {
         return;
       }
-      warning = "Could not open agent plan beside this terminal.";
+      warning = "Couldn't open the agent plan beside this terminal.";
     } catch (err) {
-      warning = `Could not open agent plan: ${formatError(err)}`;
+      warning = `Couldn't open the agent plan: ${describeError(err, "terminal")}`;
     }
   }
 
@@ -533,13 +535,13 @@
           await terminalLaunchRequests.requestBrowser(repoPath, resolved.url);
           return;
         } catch (err) {
-          warning = `${resolved.url} opened in your browser: a browser session couldn't (${formatError(err)}).`;
+          warning = `${resolved.url} opened in your browser: a browser session couldn't (${describeError(err, "terminal")}).`;
         }
       }
       try {
         await openExternal(resolved.url);
       } catch (err) {
-        warning = `Couldn't open ${resolved.url}. ${formatError(err)}`;
+        warning = `Couldn't open ${resolved.url}. ${describeError(err, "terminal")}`;
       }
       return;
     }
@@ -865,7 +867,7 @@
    */
   const acks = createAckCoalescer((sessionId, bytes) => {
     void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
-      if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
+      if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${describeError(err, "terminal")}`, true);
     });
   });
 
@@ -888,7 +890,7 @@
       term.write(bytes, written);
     },
     onError(err) {
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     },
   });
 
@@ -904,7 +906,7 @@
       rafWrites.enqueue(bytes, written);
     },
     onError(err) {
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     },
   });
 
@@ -920,7 +922,7 @@
       });
     } catch (err) {
       acknowledgeOutput(token.sessionId, token.release());
-      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+      lifecycle?.fail(`Terminal output was not painted: ${describeError(err, "terminal")}`, true);
     }
   }
 
@@ -993,6 +995,12 @@
     resumePrompt = undefined;
     return prompt;
   }
+  let reopenRowPending: string | null = untrack(() => resume?.ledgerRowId ?? null);
+  function takeReopenRowId(): string | null {
+    const rowId = reopenRowPending;
+    reopenRowPending = null;
+    return rowId;
+  }
 
   /**
    * The mode this tab will start in, decided here rather than in the backend
@@ -1033,6 +1041,8 @@
   let transcriptNote = $state<string | null>(null);
   /** Set to relaunch the conversation a signal ended; consumed by the next spawn. */
   let resumeOverride: string | null = null;
+  /** Newly minted session UUID once a `--fork-session` launch succeeds; subsequent restarts resume it instead of re-forking. */
+  let forkedId: string | null = null;
   /** The conversation a signal ended in this tab, which Resume relaunches. */
   let resumeOffer = $state<string | null>(null);
   /** The dead PTY the offer was registered under for an incident's "Resume N". */
@@ -1137,8 +1147,12 @@
           // ordinary way, because the session it took over has ended.
           const attachTo = attachPending;
           attachPending = null;
-          const resumeId = resumeOverride;
+          const hadResumeOverride = resumeOverride !== null;
+          const resumeId = resumeOverride ?? forkedId ?? resume?.sessionId ?? null;
           resumeOverride = null;
+          const reopenRowId = attachTo || hadResumeOverride ? null : takeReopenRowId();
+          const fork = Boolean(!hadResumeOverride && !forkedId && !attachTo && resume?.fork && resumeId);
+          let spawnResume: TerminalResume | null = null;
           hostedId = null;
           // A conversation GitPulse can name is one it can resume. A fresh
           // Claude launch is given an id and a resumed one keeps its own; a
@@ -1149,11 +1163,13 @@
             const provider = launcher === "agy" ? "agy" : "claude";
             const decided = conversationForStart(hostedClaude, {
               attach: attachTo, resumeId, args: cfg.args,
+              fork,
               record: { repoPath: workPath, startDir: startDir ?? null, mode: permissionMode, startedAt: Date.now(), provider },
               provider,
             });
             cfg.args = decided.args;
             hostedId = decided.sessionId;
+            spawnResume = decided.resume;
           }
           if (attachTo) {
             return withOutput((onOutput) => invoke<TerminalSpawned>("cmd_terminal_attach", { sessionId: attachTo, rows, cols, onOutput }));
@@ -1172,6 +1188,9 @@
             // this unconditionally would fail on the next ordinary launch
             // rather than wait to matter.
             acknowledged: requiresAcknowledgement(permissionMode) ? acknowledgedBypass : false,
+            resume: spawnResume,
+            sessionId: !spawnResume || spawnResume.fork ? hostedId : null,
+            reopenRowId,
             onOutput,
           }));
         },
@@ -1229,6 +1248,7 @@
           if (hostedId) {
             hostedClaude.bind(hostedId, spawned.id);
             hostedLive = true;
+            if (resume?.fork && !forkedId) forkedId = hostedId;
           }
           const rememberedMeta = hostedClaude.byTerminal(spawned.id);
           if (rememberedMeta?.artifactDir) {
@@ -1356,7 +1376,7 @@
     else if (status === "starting") noteAttempt(runId, "starting", `Starting ${launcherLabel(launcher)}…`);
     else if (status === "error" && !nativeSessionId) {
       // The lifecycle stringifies the rejection; its "Error: " says nothing.
-      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "The terminal failed to start.";
+      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "Couldn't start the terminal.";
       queueMicrotask(() => {
         if (nativeSessionId || get(terminalSessions).some((record) => record.key === tabId)) return;
         noteAttempt(runId, "failed", cause);
@@ -1426,7 +1446,7 @@
     try {
       await openTaskForRun(linkedRunId);
     } catch (cause) {
-      toastStore.error(`This attempt's task couldn't be opened: ${formatError(cause)}`);
+      toastStore.error(`This attempt's task couldn't be opened: ${describeError(cause, "terminal")}`);
     }
   }
 
@@ -1468,13 +1488,13 @@
       return false;
     }
     const ok = await copyText(last.output);
-    warning = ok ? null : "Could not copy last command output.";
+    warning = ok ? null : "Couldn't copy the last command output.";
     return ok;
   }
 
   export async function exportOutput() {
-    try { await invoke<boolean>("cmd_terminal_export", { data: retainedOutput() }); }
-    catch (err) { if (!disposed) warning = formatError(err); }
+    try { await saveExport({ kind: "terminal_output", fileName: "terminal-output.txt", data: retainedOutput() }); }
+    catch (err) { if (!disposed) warning = describeError(err, "terminal"); }
   }
 
   export function serializeVisualOutput(): string {
@@ -1730,7 +1750,7 @@
           insertText(formatted, { focus: true });
         })
         .catch((err) => {
-          if (!disposed) warning = `Could not paste clipboard image: ${formatError(err)}`;
+          if (!disposed) warning = `Couldn't paste the clipboard image: ${describeError(err, "terminal")}`;
         });
     };
     /**
@@ -2233,7 +2253,7 @@
         // 5s (e.g. a modal was open), keep manual [Deliver] on screen.
       }, 5_000);
     } catch (err: unknown) {
-      if (!fromAutoWake && !disposed) warning = formatError(err);
+      if (!fromAutoWake && !disposed) warning = describeError(err, "terminal");
     } finally {
       peerDelivering = false;
     }
@@ -2494,7 +2514,7 @@
          the height go (inline style beats h-8); every other row stays fixed. -->
     <div
       data-terminal-status
-      class="shrink-0 min-w-0 bg-surface/60 flex items-center gap-2 px-4 h-8"
+      class="shrink-0 min-w-0 flex items-center gap-2 px-4 h-8"
       style:height={error && !spawning ? "auto" : undefined}
       style:min-height={error && !spawning ? "2rem" : undefined}
       style:padding-block={error && !spawning ? "0.25rem" : undefined}

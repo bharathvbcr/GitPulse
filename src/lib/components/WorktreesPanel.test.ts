@@ -413,3 +413,46 @@ describe("WorktreesPanel DevMap seeding and sparse-cone provisioning", () => {
     expect(reset).toContain('sparsePathsInput = "";');
   });
 });
+
+describe("WorktreesPanel fork lane flow", () => {
+  it("arms with target capture, verifies trust and active target, forks via repoStore.addWorktree(forkFrom), checks transcript, and requests a forked Claude session", () => {
+    const fn = source.slice(source.indexOf("async function forkLane"), source.indexOf("const hasOpenTab ="));
+    expect(fn).toContain("const armed = repoStore.captureTarget();");
+    expect(fn).toContain("forkTarget = armed;");
+    expect(fn).toContain("await repoStore.trustRepo(wt.path)");
+    expect(fn).toContain("if (!repoStore.targetIsActive(target))");
+    expect(fn).toContain("forkFrom: wt.path,");
+    expect(fn).toContain("await repoStore.trustRepo(created.path)");
+    expect(fn).toContain("resolveClaudeForkSource(");
+    expect(fn).toContain("created.source_session_id");
+    expect(fn).toContain("mode: resumeMode");
+    expect(fn).toContain("await checkTranscripts([sourceSessionId])");
+    expect(fn).toContain('resolveTranscriptAnswer(hostedClaude, sourceSessionId, "claude", answer)');
+    expect(fn).toContain('await terminalLaunchRequests.request(activeForkPath, "claude", undefined, undefined, {');
+    expect(fn).toContain("fork: true");
+
+    const captured = fn.indexOf("repoStore.captureTarget()");
+    const firstAwait = fn.indexOf("await ");
+    expect(captured).toBeGreaterThan(-1);
+    expect(captured).toBeLessThan(firstAwait);
+    expect(fn.indexOf("repoStore.targetIsActive(target)")).toBeLessThan(fn.indexOf("repoStore.addWorktree("));
+
+    expect(source).toContain('data-testid="worktree-fork"');
+    expect(source).toContain('data-testid="worktree-fork-confirm"');
+
+    const effect = source.slice(
+      source.indexOf("const generation = $derived($repoStore.generation);"),
+      source.indexOf("async function load"),
+    );
+    const reset = source.slice(
+      source.indexOf("const tabScope = repoScope("),
+      source.indexOf("\n  );", source.indexOf("const tabScope = repoScope(")),
+    );
+    for (const block of [effect, reset]) {
+      expect(block).toContain("forkTarget = null;");
+      expect(block).toContain("clearTimeout(forkTimer)");
+      expect(block).toContain("forkConfirmPath = null;");
+      expect(block).toContain("forkingPath = null;");
+    }
+  });
+});

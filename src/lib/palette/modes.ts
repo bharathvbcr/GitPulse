@@ -11,6 +11,18 @@ export type PaletteMode = "commands" | "files" | "repositories" | "commits" | "b
 
 export const MAX_QUERY_LENGTH = 256;
 
+/**
+ * Modes whose results are things on the repository page: a file opens in
+ * Explorer, a branch is checked out, a commit opens in History, a symbol opens
+ * its file. Running one from Fleet, Agents or Tasks (the view bar's field is
+ * on those surfaces too) has to bring the repository page back, or the result
+ * lands behind the surface the user is looking at. Commands carry their own
+ * destination, and the Repositories and Help modes stay where they are.
+ */
+export function modeLandsOnRepositoryPage(mode: PaletteMode): boolean {
+  return mode === "files" || mode === "symbols" || mode === "workspace" || mode === "branches" || mode === "commits";
+}
+
 export const PALETTE_MODES: ReadonlyArray<{ mode: PaletteMode; prefix: string; label: string; hint: string }> = [
   { mode: "commands", prefix: ">", label: "Commands", hint: "Search actions, settings and views" },
   { mode: "files", prefix: "/", label: "Files", hint: "Search repository file names and paths" },

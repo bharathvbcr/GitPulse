@@ -1539,7 +1539,7 @@ mod cached_read_tests {
         let start = Instant::now();
         let mut flip = false;
         while start.elapsed() < Duration::from_millis(250) {
-            flip = !flip;
+            flip.toggle();
             let json = if flip { &left_json } else { &right_json };
             let conn = lock_conn(&store.conn).expect("writer");
             conn.execute(
@@ -1566,7 +1566,7 @@ mod cached_read_tests {
         let mut deep = "[".repeat(200);
         deep.push_str(&"]".repeat(200));
         let mut huge = String::from("{");
-        huge.extend(std::iter::repeat(' ').take(256 * 1024));
+        huge.extend(std::iter::repeat_n(' ', 256 * 1024));
         let samples = [
             "",
             "{",

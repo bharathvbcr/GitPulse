@@ -39,8 +39,8 @@ use super::{
     read_listing, AgentSummary, ChangesFacet, CollisionRisk, GitFacets, InsightsSnapshot,
     WorktreeFacet, MAX_SNAPSHOT_WORKTREES,
 };
-use crate::engine::git_cli::{with_admission, Admission};
 use crate::engine::git_reader::GitReader;
+use crate::engine::process::{with_admission, Admission};
 use crate::engine::worktree::{self, ScanDeadline, StatusRead, WorktreeInfo};
 use crate::ipc_error::CommandError;
 
@@ -638,6 +638,15 @@ pub fn snapshot_from_app(
                     "the app's answer is partial: {}",
                     partial.join(", ")
                 ));
+            }
+            if !worktrees.truncated {
+                let member_paths: Vec<&str> = worktrees
+                    .items
+                    .iter()
+                    .filter(|w| !w.is_bare)
+                    .map(|w| w.path.as_str())
+                    .collect();
+                crate::engine::worktree::remember_verified_member_paths(repo_path, &member_paths);
             }
             Ok(complete_snapshot(
                 repo_path,

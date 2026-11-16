@@ -1,5 +1,6 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { createScanJoin } from "../runtime/autoScan";
   import type {
     DepsHealthReport,
     DependabotReport,
@@ -20,10 +21,19 @@
     };
   }
 
+  /**
+   * The dependency audit running for each repository. Module-level so a panel
+   * left and reopened while an audit is still running joins it instead of
+   * starting a second one beside it.
+   */
+  const inflightAudits = createScanJoin<DepsHealthReport>();
+
   // Survives the per-tab remount so revisiting the Health view renders the
   // last scan instantly; the fetch then refreshes it in place.
   const healthCache = createRepoPanelCache<{
     deps: DepsHealthReport;
+    /** When `deps` was scanned (epoch ms), the stamp runtime/autoScan.ts judges freshness by. */
+    scannedAtMs: number;
     dependabot: DependabotReport | null;
     dependabotCheckedAt: number | null;
     dependabotRequestFailed: boolean;
@@ -34,10 +44,19 @@
 </script>
 
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
+  import {
+    activeScanBackoff,
+    clearScanFailure,
+    describeBackoff,
+    isScanStale,
+    noteScanFailure,
+    scheduleAutoScan,
+    type AutoScanBackoff,
+  } from "../runtime/autoScan";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,
@@ -77,15 +96,17 @@
   import {
     dependabotBadgeClass as badgeClassFor,
     formatAuditCoverage,
+    severityLabel,
     toneLabel,
     updateKind,
   } from "../health/format";
   import { issueNoticeTone, roleTone, severityTone, updateKindTextClass } from "./health/tone";
   import { describeFailure } from "../ui/copy/describeFailure";
   import EmptyState from "./EmptyState.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
-  import { HEALTH_CONTENT_WIDTH, HEALTH_PREVIEW_ROWS, HEALTH_PROSE_WIDTH } from "../health/sections";
-  import { previewSlice } from "../ui/previewList";
+  import PageBody from "./PageBody.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import type { SecretsReport } from "../secrets/types";
   import { vulnerabilityEmptyMessage, type SectionCount } from "../health/counts";
   import { withoutTrailingPeriod } from "../format";
@@ -98,7 +119,7 @@
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
   import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
   import SecretsSection from "./health/SecretsSection.svelte";
-  import HealthPreviewToggle from "./health/HealthPreviewToggle.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
@@ -155,6 +176,12 @@
    */
   let codegraph = $state<CodeintelStatus | null>(null);
   let loading = $state(false);
+  /**
+   * The failure holding automatic audits off for this repository, when one is.
+   * It is printed, so an audit that could not complete never reads as a clean
+   * result or as "not scanned yet".
+   */
+  let held = $state<AutoScanBackoff | null>(null);
   let checkingGithub = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -172,7 +199,7 @@
 
   /**
    * Which long lists the reader expanded. Every list opens on its first
-   * HEALTH_PREVIEW_ROWS rows, and collapses again for the next repository.
+   * LIST_PREVIEW_ROWS rows, and collapses again for the next repository.
    * The heading counts are untouched: they state what the scan saw, and the
    * toggle states what it can reveal.
    */
@@ -183,12 +210,13 @@
     issues: false,
     outdated: false,
     packages: false,
+    ecosystems: false,
     "dead-code": false,
   };
   type PreviewedList = keyof typeof COLLAPSED_LISTS;
   let expandedLists = $state({ ...COLLAPSED_LISTS });
   function previewed<T>(list: PreviewedList, rows: readonly T[]): T[] {
-    return previewSlice(rows, expandedLists[list], HEALTH_PREVIEW_ROWS);
+    return previewSlice(rows, expandedLists[list], LIST_PREVIEW_ROWS);
   }
   let copied = $state(false);
   let fixing = $state(false);
@@ -495,6 +523,8 @@
    */
   function recordScanFailure(repoPath: string, reason: unknown) {
     errorMsg = reportPanelError("health", reason);
+    noteScanFailure(`deps:${repoPath}`, errorMsg);
+    held = activeScanBackoff(`deps:${repoPath}`);
     if (!report || reportPath !== repoPath) {
       report = null;
       reportPath = null;
@@ -504,25 +534,78 @@
     scanned.path = "";
   }
 
-  async function scan(path?: string) {
+  /**
+   * An automatic scan waiting for this panel to settle (runtime/autoScan.ts).
+   * Any scan that starts, a click included, ends the wait.
+   */
+  let cancelPending: (() => void) | null = null;
+  let pending = $state(false);
+  function stopPending() {
+    cancelPending?.();
+    cancelPending = null;
+    pending = false;
+  }
+  onDestroy(stopPending);
+
+  /**
+   * `reuse` answers the dependency audit from a result that is still fresh
+   * instead of running it again; the code-map queries beside it are cheap and
+   * always run. A reused result keeps its original stamp, so reuse never
+   * renews itself.
+   */
+  function cacheFinishedAudit(repoPath: string, deps: DepsHealthReport) {
+    const prior = healthCache.get(repoPath);
+    healthCache.set(repoPath, {
+      deps,
+      scannedAtMs: Date.now(),
+      dependabot: prior?.dependabot ?? null,
+      dependabotCheckedAt: prior?.dependabotCheckedAt ?? null,
+      dependabotRequestFailed: prior?.dependabotRequestFailed ?? false,
+      codeScanning: prior?.codeScanning ?? null,
+      codeScanningCheckedAt: prior?.codeScanningCheckedAt ?? null,
+      codeScanningRequestFailed: prior?.codeScanningRequestFailed ?? false,
+    });
+  }
+
+  async function scan(path?: string, reuse?: { deps: DepsHealthReport; scannedAtMs: number }) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
+    stopPending();
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
+    held = null;
     errorMsg = null;
     actionError = null;
     // Automatic local scans stay local. GitHub alerts use the GitHub CLI
     // and the network; they run through scanDependabot, not this path.
     const [deps, dead, graph] = await Promise.allSettled([
-      invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+      reuse
+        ? Promise.resolve(reuse.deps)
+        : inflightAudits.run(repoPath, () =>
+            invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+          ),
       getDeadSymbols(repoPath),
       getCodeintelStatus(repoPath),
     ]);
-    if (!guard.isLive()) return;
+    if (!guard.isLive()) {
+      // The panel was left, or the repository changed, while this audit ran.
+      // What is on screen now is not this scan's to write, but the audit is a
+      // finished answer for `repoPath`: keeping it means the return does not
+      // run it again.
+      if (deps.status === "fulfilled" && !reuse) cacheFinishedAudit(repoPath, deps.value);
+      // The repository's record, not this pane's: a failure seen after the
+      // pane was left still holds the next automatic start off.
+      if (!reuse) {
+        if (deps.status === "fulfilled") clearScanFailure(`deps:${repoPath}`);
+        else noteScanFailure(`deps:${repoPath}`, formatError(deps.reason));
+      }
+      return;
+    }
     try {
       if (deps.status === "fulfilled") {
+        if (!reuse) clearScanFailure(`deps:${repoPath}`);
         report = deps.value;
         reportPath = repoPath;
         // A new scan supersedes whatever a plan was written against.
@@ -567,6 +650,7 @@
       if (deps.status === "fulfilled") {
         healthCache.set(repoPath, {
           deps: deps.value,
+          scannedAtMs: reuse ? reuse.scannedAtMs : Date.now(),
           dependabot,
           dependabotCheckedAt,
           dependabotRequestFailed,
@@ -607,6 +691,9 @@
     if (!deps) return;
     healthCache.set(repoPath, {
       deps,
+      // The audit itself did not rerun, so its stamp stays what it was. Unknown
+      // (0) reads as stale and is rescanned on the next visit.
+      scannedAtMs: healthCache.get(repoPath)?.scannedAtMs ?? 0,
       dependabot: result,
       dependabotCheckedAt: checkedAt,
       dependabotRequestFailed: requestFailed,
@@ -895,6 +982,7 @@
   $effect(() => {
     const path = $currentRepoPath;
     if (!path) {
+      stopPending();
       inflight?.cancel();
       dependabotInflight?.cancel();
       fixInflight?.cancel();
@@ -923,6 +1011,10 @@
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    stopPending();
+    // The audit of the repository just left must not land on this one. It is
+    // not lost: it caches itself when it finishes (see `scan`).
+    inflight?.cancel();
     dependabotInflight?.cancel();
     cancelHealthAgentLaunch();
     untrack(() => {
@@ -935,6 +1027,12 @@
     const github = githubAlertsCache.get(path);
     untrack(() => {
       checkingGithub = false;
+      // The cancelled scan's `finally` no longer releases this; the next scan
+      // to start sets it again.
+      loading = false;
+      // Nothing said about the repository just left belongs on this one.
+      errorMsg = null;
+      held = null;
       if (cached) {
         report = cached.deps;
         reportPath = path;
@@ -970,7 +1068,34 @@
         codeScanningRequestFailed = github.codeScanningRequestFailed;
       }
     });
-    void scan(path);
+    // A still-fresh audit is reused and starts nothing. Otherwise the scan
+    // waits for the panel to stay put: a visit shorter than the settle pays
+    // for no audit, and a failed scan leaves `scanned.path` cleared so the
+    // next visit tries again.
+    if (cached && !isScanStale(cached.scannedAtMs, Date.now())) {
+      untrack(() => void scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs }));
+    } else if (inflightAudits.has(path)) {
+      // An audit for this repository is already running (this panel was left
+      // and reopened): listening to it costs nothing, so it is joined at once.
+      untrack(() => void scan(path));
+    } else if (activeScanBackoff(`deps:${path}`)) {
+      // The last audit failed a moment ago. Starting another would run the same
+      // audit into the same failure on every visit, so automatic scanning waits
+      // out the interval; the failure is shown, and Scan local retries now.
+      untrack(() => {
+        held = activeScanBackoff(`deps:${path}`);
+        errorMsg = held?.reason ?? null;
+      });
+    } else {
+      untrack(() => {
+        pending = true;
+        cancelPending = scheduleAutoScan({
+          key: `deps:${path}`,
+          stillNeeded: () => $currentRepoPath === path,
+          run: () => void scan(path),
+        });
+      });
+    }
     // Launch also fetches these; this call joins that in-flight request or
     // hydrates from its cache so opening Health after a warning is not empty.
     if ($interfaceStore.autoScanGithubAlerts && !github) void scanDependabot(path);
@@ -992,9 +1117,10 @@
   <!-- The local scan failed. When an earlier report of this repository is still
        on screen the banner says so, so its findings are not read as current. -->
   {#snippet scanFailureBanner()}
-    <div role="alert" class="gp-notice flex-wrap items-center justify-between {HEALTH_PROSE_WIDTH}" data-tone="danger">
+    <div role="alert" class="gp-notice flex-wrap items-center justify-between" data-tone="danger">
       <span class="min-w-0 wrap-break-word"
-        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
+        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}{#if held}
+          <span class="block opacity-80" data-testid="health-backoff">{describeBackoff(held)}</span>{/if}</span
       >
       <span class="flex items-center gap-2 shrink-0">
         <button type="button" onclick={() => scan()} disabled={loading} class="gp-btn" data-size="sm">
@@ -1013,17 +1139,14 @@
   {/snippet}
   {#snippet dependabotRows()}
     {#each keyedList(previewed("dependabot", dependabot?.alerts ?? []), (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
+      {@const where = `${alert.ecosystem}${alert.scope ? ` · ${alert.scope}` : ""}${alert.manifest_path ? ` · ${alert.manifest_path}` : ""}${alert.vulnerable_range ? ` · ${alert.vulnerable_range}` : ""}`}
       <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
+          <span class="gp-chip" data-kind="label" data-tone={severityTone(alert.severity)}>{severityLabel(alert.severity)}</span>
         </td>
         <td class="px-3 py-1.5">
-          <div class="font-mono text-textPrimary">{alert.package}</div>
-          <div class="text-micro text-textMuted">
-            {alert.ecosystem}{alert.scope ? ` · ${alert.scope}` : ""}
-            {#if alert.manifest_path} · {alert.manifest_path}{/if}
-            {#if alert.vulnerable_range} · {alert.vulnerable_range}{/if}
-          </div>
+          <div class="font-mono text-textPrimary truncate" title={alert.package}>{alert.package}</div>
+          <div class="text-micro text-textMuted truncate" title={where}>{where}</div>
         </td>
         <td class="px-3 py-1.5 text-textPrimary">
           {alert.title}
@@ -1049,21 +1172,16 @@
 
   {#snippet codeScanningRows()}
     {#each keyedList(previewed("code-scanning", codeScanning?.alerts ?? []), (alert) => `${alert.number}:${alert.rule_id}:${alert.path}:${alert.start_line}`) as { item: alert, key } (key)}
+      {@const location = alert.path ? `${alert.path}${alert.start_line > 0 ? `:${alert.start_line}` : ""}` : "—"}
       <tr class="align-top">
         <td class="px-3 py-1.5">
-          <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(alert.severity)}>{alert.severity || "unranked"}</span>
+          <span class="gp-chip" data-kind="label" data-tone={severityTone(alert.severity)}>{severityLabel(alert.severity)}</span>
         </td>
         <td class="px-3 py-1.5">
-          <div class="font-mono text-textPrimary">{alert.rule_id || alert.rule_name || "rule"}</div>
+          <div class="font-mono text-textPrimary truncate" title={alert.rule_id || alert.rule_name}>{alert.rule_id || alert.rule_name || "rule"}</div>
           <div class="text-micro text-textMuted">{alert.title}</div>
         </td>
-        <td class="px-3 py-1.5 font-mono text-textMuted">
-          {#if alert.path}
-            {alert.path}{#if alert.start_line > 0}:{alert.start_line}{/if}
-          {:else}
-            —
-          {/if}
-        </td>
+        <td class="px-3 py-1.5 font-mono text-textMuted truncate" title={alert.path ? location : undefined}>{location}</td>
         <td class="px-3 py-1.5 text-textMuted">
           {alert.tool || "—"}{#if alert.tool_version} {alert.tool_version}{/if}
         </td>
@@ -1116,10 +1234,8 @@
     <SecretsSection bind:report={secretsReport} tone={facetTone("secrets")} onagent={sendSecretsToAgent} />
   {/snippet}
 
-  <div class="gp-header justify-between gap-3">
-    <div class="flex items-center gap-2 min-w-0">
-      <ShieldAlert size={16} class="text-accent shrink-0" />
-      <span class="font-semibold text-textPrimary shrink-0">Health</span>
+  <PageHeader title="Health">
+    {#snippet meta()}
       <!-- One verdict, from one owner, instead of the five `truncate` spans
            this row used to carry. Those rendered as "58 outd… · Dependabot 0
            … · Code scanning unav…" — the summary was unreadable at exactly
@@ -1152,8 +1268,8 @@
           · Code scanning {openCodeScanningCount}{codeScanning?.truncated ? "+" : ""}
         </span>
       {/if}
-    </div>
-    <div class="flex items-center gap-2 shrink-0">
+    {/snippet}
+    {#snippet actions()}
       <button
         type="button"
         aria-describedby="dependabot-permission-note"
@@ -1204,8 +1320,8 @@
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Scan local
       </button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   <!-- A row of its own, allowed to wrap: the header above is checked for
        clipping at 1280px and has no room for two selects and three buttons.
@@ -1215,14 +1331,14 @@
     <div
       role="group"
       aria-label="Send a health task to a coding agent"
-      class="px-4 py-1.5 bg-surface/40 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-meta"
+      class="px-4 py-1.5 flex flex-wrap items-center gap-x-2 gap-y-1.5 shrink-0 text-meta"
     >
       <Terminal size={13} class="shrink-0 text-textMuted" />
       <span class="shrink-0 text-textMuted">Agent</span>
-      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40">
+      <select aria-label="Health coding agent" bind:value={agentLauncher} class="gp-select max-w-40" data-width-cap="a single select, sized to its option labels">
         {#each PROMPT_LAUNCHERS as kind (kind)}<option value={kind}>{PROVIDER_LABELS[kind]}</option>{/each}
       </select>
-      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44">
+      <select aria-label="Health agent task" bind:value={agentAction} class="gp-select max-w-44" data-width-cap="a single select, sized to its option labels">
         {#each HEALTH_AGENT_ACTIONS as action (action.id)}<option value={action.id}>{action.label}</option>{/each}
       </select>
       <button
@@ -1292,16 +1408,21 @@
     </div>
   {/if}
 
-  <div class="flex-1 overflow-auto p-4 space-y-5">
-    <!-- Four lines of prose about GitHub CLI permissions used to be pinned at
-         the top of this scroll in every state, above every finding, forever.
-         It is the button's explanation, not the page's, so it is the button's
-         `aria-describedby` target and a one-line disclosure: the freshness —
-         the part a reader actually re-reads — stays on the visible summary
-         line, and the permission text is one click away rather than four
-         lines of column height on every visit. -->
+  <!-- Four lines of prose about GitHub CLI permissions used to be pinned at
+       the top of this scroll in every state, above every finding, forever.
+       It is the button's explanation, not the page's, so it is the button's
+       `aria-describedby` target and a one-line disclosure: the freshness —
+       the part a reader actually re-reads — stays on the visible summary
+       line, and the permission text is one click away rather than four
+       lines of column height on every visit.
+
+       With a report loaded it sits beneath the verdict, so the first thing in
+       the scroll answers "is this repository OK?"; before one exists (loading,
+       a failed scan) there is no verdict to put first and it leads. -->
+  {#snippet githubFreshness()}
     <details
-      class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted {HEALTH_PROSE_WIDTH}"
+      data-health-github-freshness
+      class="rounded-xl border border-edge bg-surface px-3 py-1.5 text-meta text-textMuted"
     >
       <!-- `role="status"` belongs on the text, not on the `<summary>`: a
            summary is an interactive disclosure control and cannot also be a
@@ -1324,17 +1445,23 @@
         Critical and high findings raise a warning.
       </p>
     </details>
+  {/snippet}
+
+  <PageBody>
+    {#if !report}
+      {@render githubFreshness()}
+    {/if}
     <!-- Non-fatal action failures render ahead of the state chain so they stay
          visible in every state instead of shadowing (or being shadowed by) the
          load-error branch. Same shape as GitHubPanel's actionError banner. -->
     {#if actionError}
-      <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+      <div role="status" class="gp-notice" data-tone="warn">
         <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
-    {#if loading && !report}
-      <div class="space-y-4 {HEALTH_CONTENT_WIDTH}">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+    {#if (loading || pending) && !report}
+      <div class="space-y-4">
+        <div class="grid grid-cols-1 @2xl:grid-cols-3 gap-3">
           <Skeleton variant="card" count={3} />
         </div>
         <div class="space-y-2 pt-2">
@@ -1355,9 +1482,10 @@
           <HealthSummaryCard {summary} rendered={renderedSections} />
         </HealthSection>
       {/if}
+      {@render githubFreshness()}
 
       {#if planError}
-        <div role="alert" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="danger">
+        <div role="alert" class="gp-notice" data-tone="danger">
           <div class="min-w-0 flex-1">
             <span class="font-medium">{PLAN_FAILED}</span>
             {planError}
@@ -1533,10 +1661,10 @@
           </div>
         {/snippet}
         {#if auditCensus}
-          <p class="text-textMuted {HEALTH_PROSE_WIDTH}" data-testid="audit-coverage">{auditCensus}.</p>
+          <p class="text-textMuted" data-testid="audit-coverage">{auditCensus}.</p>
         {/if}
         {#if !report.npm_cli_present && report.manifests.length > 0}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</div>
           </div>
         {:else if visibleVulns.length === 0}
@@ -1547,7 +1675,7 @@
           {:else}
             <!-- An audit that did not finish, or never ran, is not "none": the
                  unknown tone is drawn dashed so it cannot pass for a clean one. -->
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div role="status" class="gp-notice" data-tone="unknown">
               <div class="min-w-0 flex-1">
                 {auditsRan
                   ? `Local audit incomplete${gap ? ` (${gap})` : ""}; no all-clear is available.`
@@ -1558,16 +1686,14 @@
         {:else}
           <HealthTable caption="Known vulnerabilities in this repository's dependencies" columns={VULNERABILITY_COLUMNS}>
             {#each keyedList(previewed("vulnerabilities", visibleVulns), (vuln) => `${vuln.ecosystem}:${vuln.name}:${vuln.range}:${vuln.title}`) as { item: vuln, key } (key)}
+              {@const vulnWhere = `${vuln.ecosystem}${vuln.is_direct ? " · direct" : " · transitive"}${vuln.range ? ` · ${vuln.range}` : ""}`}
               <tr class="align-top">
                 <td class="px-3 py-1.5">
-                  <span class="gp-chip capitalize" data-kind="label" data-tone={severityTone(vuln.severity)}>{vuln.severity}</span>
+                  <span class="gp-chip" data-kind="label" data-tone={severityTone(vuln.severity)}>{severityLabel(vuln.severity)}</span>
                 </td>
                 <td class="px-3 py-1.5">
-                  <div class="font-mono text-textPrimary">{vuln.name}</div>
-                  <div class="text-micro text-textMuted">
-                    {vuln.ecosystem}{vuln.is_direct ? " · direct" : " · transitive"}
-                    {#if vuln.range} · {vuln.range}{/if}
-                  </div>
+                  <div class="font-mono text-textPrimary truncate" title={vuln.name}>{vuln.name}</div>
+                  <div class="text-micro text-textMuted truncate" title={vulnWhere}>{vulnWhere}</div>
                 </td>
                 <td class="px-3 py-1.5 text-textPrimary">{vuln.title}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{vuln.fix_available}</td>
@@ -1583,7 +1709,7 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={visibleVulns.length}
             noun="vulnerabilities"
             bind:expanded={expandedLists.vulnerabilities}
@@ -1598,12 +1724,12 @@
         {#if report.issues.length === 0}
           <EmptyState icon={ShieldCheck} title="No repository configuration issues were reported by this scan." compact />
         {:else}
-          <div class="space-y-1.5 {HEALTH_PROSE_WIDTH}">
+          <div class="space-y-1.5">
             {#each keyedList(previewed("issues", report.issues), (issue) => `${issue.code}:${issue.path ?? ""}:${issue.message}`) as { item: issue, key } (key)}
               <div class="gp-notice flex-col" data-tone={issueNoticeTone(issue.severity)}>
                 <div class="flex items-center gap-2 min-w-0 w-full">
                   <AlertTriangle size={12} class="shrink-0" style="color: var(--gp-notice-ink)" aria-hidden="true" />
-                  <span class="font-medium capitalize text-micro shrink-0">{issue.severity}</span>
+                  <span class="font-medium text-micro shrink-0">{severityLabel(issue.severity)}</span>
                   <!-- A flex item has to be allowed to shrink before `truncate`
                        can clip it; without `min-w-0` it sizes to its content. -->
                   <span class="font-mono text-micro opacity-70 truncate min-w-0">{issue.code}</span>
@@ -1615,7 +1741,7 @@
               </div>
             {/each}
           </div>
-          <HealthPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
+          <ListPreviewToggle total={report.issues.length} noun="issues" bind:expanded={expandedLists.issues} />
         {/if}
       </HealthSection>
 
@@ -1624,7 +1750,7 @@
           {#if report.npm_cli_present}
             <EmptyState icon={Package} title="No outdated npm packages reported." compact />
           {:else}
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+            <div role="status" class="gp-notice" data-tone="unknown">
               <div class="min-w-0 flex-1">Outdated checks need npm on PATH.</div>
             </div>
           {/if}
@@ -1633,7 +1759,7 @@
             {#each keyedList(previewed("outdated", report.outdated), (pkg) => `${pkg.location}:${pkg.name}:${pkg.current}`) as { item: pkg, key } (key)}
               {@const kind = updateKind(pkg.current, pkg.latest)}
               <tr>
-                <td class="px-3 py-1.5 font-mono text-textPrimary">{pkg.name}</td>
+                <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={pkg.name}>{pkg.name}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.current}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{pkg.wanted}</td>
                 <td class="px-3 py-1.5 font-mono {updateKindTextClass(kind)}">
@@ -1644,7 +1770,7 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={report.outdated.length}
             noun="outdated packages"
             bind:expanded={expandedLists.outdated}
@@ -1675,7 +1801,7 @@
             compact
           />
         {:else}
-          <div class="grid gap-2 md:grid-cols-2">
+          <div class="grid gap-2 @2xl:grid-cols-2">
             {#each keyedList(previewed("packages", report.manifests), (pkg) => pkg.path) as { item: pkg, key } (key)}
               <!-- Grid items default to `min-width: auto`, so a long manifest
                    path widens its column instead of wrapping inside it. -->
@@ -1707,7 +1833,7 @@
               </div>
             {/each}
           </div>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={report.manifests.length}
             noun="package manifests"
             bind:expanded={expandedLists.packages}
@@ -1720,7 +1846,7 @@
                crates produced three lines of run-together file paths with no
                structure to scan. -->
           <dl class="pt-1 space-y-1.5">
-            {#each keyedList(report.ecosystems, (eco) => eco.family) as { item: eco, key } (key)}
+            {#each keyedList(previewed("ecosystems", report.ecosystems), (eco) => eco.family) as { item: eco, key } (key)}
               {@const shown = eco.manifests.slice(0, 4)}
               {@const seen = ecosystemArtifactTotal(eco)}
               <!-- `minmax(0,1fr)`, not `1fr`: a grid track's default minimum is
@@ -1742,6 +1868,11 @@
               </div>
             {/each}
           </dl>
+          <ListPreviewToggle
+            total={report.ecosystems.length}
+            noun="ecosystems"
+            bind:expanded={expandedLists.ecosystems}
+          />
         {/if}
       </HealthSection>
 
@@ -1772,7 +1903,7 @@
             </p>
           </div>
         {:else if codegraph}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+          <div role="status" class="gp-notice" data-tone="warn">
             <div class="min-w-0 flex-1">
               No code map for this repository — impact edges, symbol search and dead-code
               detection have nothing to read.
@@ -1782,7 +1913,7 @@
             </div>
           </div>
         {:else}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Code map status has not been read for this repository.</div>
           </div>
         {/if}
@@ -1795,7 +1926,7 @@
         caveat={deadCodeCaveat}
       >
         {#if codegraph?.available && !deadSymbolsAvailable}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">
               Dead-code check couldn't run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
               That is not the same as finding no unreferenced symbols.
@@ -1803,7 +1934,7 @@
           </div>
         {:else if deadSymbolsAvailable && deadSymbols.length === 0 && !deadSymbolsIncomplete}
           {#if deadSymbolsTruncated}
-            <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="warn">
+            <div role="status" class="gp-notice" data-tone="warn">
               <div class="min-w-0 flex-1">
                 The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear.
               </div>
@@ -1815,8 +1946,8 @@
           <HealthTable caption="Symbols the code map found no reference to" columns={DEAD_CODE_COLUMNS}>
             {#each keyedList(previewed("dead-code", deadSymbols), (sym) => `${sym.file_path}:${sym.symbol_name}`) as { item: sym, key } (key)}
               <tr>
-                <td class="px-3 py-1.5 font-mono text-textPrimary font-medium">{sym.symbol_name}</td>
-                <td class="px-3 py-1.5 font-mono text-textMuted">{sym.file_path}</td>
+                <td class="px-3 py-1.5 font-mono text-textPrimary font-medium truncate" title={sym.symbol_name}>{sym.symbol_name}</td>
+                <td class="px-3 py-1.5 font-mono text-textMuted truncate" title={sym.file_path}>{sym.file_path}</td>
                 <td class="px-3 py-1.5 font-mono text-textMuted">{(sym.confidence * 100).toFixed(0)}%</td>
                 <td class="px-3 py-1.5 text-textMuted">
                   {#if sym.is_exempt}
@@ -1832,13 +1963,13 @@
               </tr>
             {/each}
           </HealthTable>
-          <HealthPreviewToggle
+          <ListPreviewToggle
             total={deadSymbols.length}
             noun="candidates"
             bind:expanded={expandedLists["dead-code"]}
           />
         {:else}
-          <div role="status" class="gp-notice {HEALTH_PROSE_WIDTH}" data-tone="unknown">
+          <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">No dead-code result for this repository yet.</div>
           </div>
         {/if}
@@ -1855,5 +1986,5 @@
     {:else}
       <EmptyState icon={FolderOpen} title="Open a repository to scan dependency health" />
     {/if}
-  </div>
+  </PageBody>
 </div>

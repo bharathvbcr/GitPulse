@@ -147,19 +147,27 @@ describe("attemptUrgency", () => {
     expect(attemptUrgency([])).toBeNull();
     expect(attemptUrgency([glance("error")], { pendingRequests: 0 })).toBe("error");
   });
-  it("puts only a request, an error or a bell on the reader's plate", () => {
-    // A bell counts. The notifier folds a hooked agent's bell into the reason
-    // its hook gave, so one that still reads "signalled" came from an agent
-    // with no hooks — for which the bell is the only way to say it is blocked.
-    // The board and the tray count it the same way.
+  it("puts a request or an error on the reader's plate, and a bell only when opted in", () => {
+    // A bell is opt-in (off by default). Hooked permission asks and errors
+    // always count; a bell from a hook-less agent counts only when the reader
+    // turns the setting on. The board and the tray count it the same way.
     expect(asksForReader("needs-you")).toBe(true);
     expect(asksForReader("error")).toBe(true);
-    expect(asksForReader("signalled")).toBe(true);
+    expect(asksForReader("signalled")).toBe(false);
     for (const tone of ["finished", "active", "quiet", "problem", "starting", "adopted", null] as const) expect(asksForReader(tone)).toBe(false);
     // One rule: the pane's tones that are attention kinds answer as the
-    // shared rule does.
+    // shared rule does, both off (default) and opted in.
     for (const kind of ["needs-you", "error", "signalled", "finished"] as const) {
       expect(asksForReader(kind), kind).toBe(sharedAsksForReader(kind));
+    }
+    try {
+      setSignalledAsksForReader(true);
+      expect(asksForReader("signalled")).toBe(true);
+      for (const kind of ["needs-you", "error", "signalled", "finished"] as const) {
+        expect(asksForReader(kind), kind).toBe(sharedAsksForReader(kind));
+      }
+    } finally {
+      setSignalledAsksForReader(false);
     }
   });
 });
@@ -275,13 +283,13 @@ describe("the bell setting reaches the board and the pane through one rule", () 
     records: [record({ key: "k", taskRunId: "a", sessionId: "term-a" })], requests: [], capacityFull: false,
     activity: () => bell, pending: () => undefined, now: NOW, clock: NOW,
   });
-  afterEach(() => setSignalledAsksForReader(true));
+  afterEach(() => setSignalledAsksForReader(false));
 
-  it("counts a bell by default and stops counting it with the setting off", () => {
+  it("ignores a bell by default and counts it when opted in", () => {
+    expect(taskAgentSummaries([attempt], context()).get("t1")).toEqual({ working: 1, asking: 0, tone: "signalled" });
+    expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "running" });
+    setSignalledAsksForReader(true);
     expect(taskAgentSummaries([attempt], context()).get("t1")).toEqual({ working: 1, asking: 1, tone: "signalled" });
     expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "needs-you" });
-    setSignalledAsksForReader(false);
-    expect(taskAgentSummaries([attempt], context()).get("t1")).toMatchObject({ working: 1, asking: 0 });
-    expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "running" });
   });
 });

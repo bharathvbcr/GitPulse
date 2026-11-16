@@ -16,7 +16,12 @@
  * or no stated consequence must never reach the screen.
  */
 
-import { formatError } from "../formatError";
+import { diagnostics } from "../../diagnostics/diagnostics";
+import { INTERNAL_ERROR_COPY, formatError } from "../formatError";
+
+// Defined beside `formatError` (which cannot import Diagnostics); re-exported
+// so existing imports from this module keep working.
+export { INTERNAL_ERROR_COPY };
 
 /** Longest `detail` / `reason` / destructive `body`, in characters, ellipsis included. */
 export const DETAIL_MAX_CHARS = 240;
@@ -96,15 +101,40 @@ function capitalize(word: string): string {
 }
 
 /**
+ * The user-visible reason for any thrown or rejected value. It is
+ * `formatError` with a named `source`: the backend's text as it said it, and
+ * `INTERNAL_ERROR_COPY` for a runtime fault in this page, whose raw error is
+ * recorded in Diagnostics under `source` (once, through the same path every
+ * `formatError` call uses). `formatErrorRaw` is the renderer for logs and
+ * Diagnostics themselves.
+ */
+export function describeError(err: unknown, source: string = "ui"): string {
+  return formatError(err, source);
+}
+
+/**
+ * Mirror a message a person was shown into the Diagnostics log.
+ *
+ * `INTERNAL_ERROR_COPY` is the sentence shown *instead of* a runtime fault,
+ * and `describeError` has already recorded that fault's raw text. Logging the
+ * sentence too would add a second entry that is not a fault at all, so it is
+ * skipped here, at the one place the store mirrors and the App forwarder share.
+ */
+export function mirrorUserFacingError(source: string, message: string): void {
+  if (message === INTERNAL_ERROR_COPY) return;
+  diagnostics.error(source, message);
+}
+
+/**
  * Build the error copy for a failed action. `err` is whatever was thrown or
  * rejected. The headline is built only from `action`; the reason is
- * `formatError(err)`, flattened to one line and capped.
+ * `describeError(err)`, flattened to one line and capped.
  */
 export function describeFailure(action: FailureAction, err: unknown, opts: FailureOptions = {}): FailureCopy {
   const verb = bareWord(action.verb, "finish").toLowerCase();
   const object = bareWord(action.object, "that");
   const headline = `Couldn't ${verb} ${object}${object.endsWith(ELLIPSIS) ? "" : "."}`;
-  const detail = toOneLine(formatError(err), opts.maxDetailChars ?? DETAIL_MAX_CHARS);
+  const detail = toOneLine(describeError(err, "failure"), opts.maxDetailChars ?? DETAIL_MAX_CHARS);
   return detail.length > 0
     ? { headline, detail, retryLabel: "Try again" }
     : { headline, retryLabel: "Try again" };

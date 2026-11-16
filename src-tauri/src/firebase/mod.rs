@@ -35,11 +35,15 @@
 //! deployed", and only a real answer may say that.
 
 pub mod apphosting;
+pub mod diagnose;
 
-use crate::engine::git_cli::{
-    capture_command, sandbox_join_canonical, validate_repo, CapturedOutput,
-};
+use crate::engine::git_cli::{sandbox_join_canonical, validate_repo};
+use crate::engine::process::CapturedOutput;
 use crate::ipc_error::CommandError;
+use diagnose::{
+    classify_failure, run_recorded, spawn_firebase, FirebaseAttempt, FirebaseFailure,
+    FirebaseFailureKind, FirebaseSpawn,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -80,6 +84,15 @@ pub struct FirebaseCliProbe {
     pub program: String,
     pub version: Option<String>,
     pub reason: Option<String>,
+    /// Why the CLI could not be used, classified. `None` when it answered.
+    ///
+    /// `CliMissing` and `CliStartup` are the two that matter here, and they
+    /// are not the same: the beta's "Unable to obtain permissions for
+    /// firebase-debug.log" was an installed CLI crashing at startup, which a
+    /// bare `present: false` rendered exactly like a missing one.
+    pub failure: Option<FirebaseFailure>,
+    /// What the probe ran and what came back, for the panel's diagnostics.
+    pub attempt: Option<FirebaseAttempt>,
 }
 
 /// One `.firebaserc` alias and the project id it names.
@@ -102,6 +115,8 @@ pub struct FirebaseCapability {
     pub available: bool,
     pub checked: bool,
     pub reason: Option<String>,
+    /// The help invocation that answered the question, when one ran.
+    pub attempt: Option<FirebaseAttempt>,
 }
 
 impl FirebaseCapability {
@@ -110,6 +125,7 @@ impl FirebaseCapability {
             available: false,
             checked: false,
             reason: Some(reason.into()),
+            attempt: None,
         }
     }
 }
@@ -190,6 +206,8 @@ impl FirebaseStatus {
                 program: firebase_program(),
                 version: None,
                 reason: Some(reason.clone()),
+                failure: None,
+                attempt: None,
             },
             FirebaseCapability::unchecked("The Firebase status could not be read at all."),
         );
@@ -215,33 +233,70 @@ pub(crate) fn firebase_program() -> String {
 /// it. Success is treated as presence; the reason distinguishes the two ways
 /// absence happens.
 pub fn firebase_cli_probe() -> FirebaseCliProbe {
+    firebase_cli_probe_with(spawn_firebase)
+}
+
+/// Where the probes run from: a directory that always exists and that the
+/// user can write to.
+///
+/// Never the app's own working directory. A Dock launch's is `/`, and
+/// firebase-tools 15.34 opens its debug log in its working directory before it
+/// parses an argument — so a probe started there died with "Unable to obtain
+/// permissions for firebase-debug.log" on every machine, whatever the account
+/// could do. [`FirebaseSpawn`] also moves that log out with
+/// `FIREBASE_DEBUG_PATH`; this covers a CLI old enough not to read it.
+fn probe_cwd() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
+/// [`firebase_cli_probe`] with its one invocation injectable.
+fn firebase_cli_probe_with(
+    run: impl FnOnce(&FirebaseSpawn) -> Result<CapturedOutput, CommandError>,
+) -> FirebaseCliProbe {
     let program = firebase_program();
     let overridden = program != "firebase";
-    match capture_command(&program, &["--version"], None, PROBE_TIMEOUT, &[]) {
+    let spawn = FirebaseSpawn::new(
+        program.clone(),
+        vec!["--version".to_string()],
+        probe_cwd(),
+        PROBE_TIMEOUT,
+    );
+    let (result, attempt) = run_recorded(&spawn, run);
+    match result {
         Ok(output) if output.success => FirebaseCliProbe {
             present: true,
             program,
             version: Some(output.stdout_text().trim().to_string()).filter(|v| !v.is_empty()),
             reason: None,
+            failure: None,
+            attempt: Some(attempt),
         },
         Ok(output) => {
-            let tail = crate::engine::git_cli::byte_tail(&output.stderr, MAX_FIREBASE_ERROR_BYTES);
+            let tail = crate::engine::process::byte_tail(&output.stderr, MAX_FIREBASE_ERROR_BYTES);
+            let reason = if tail.trim().is_empty() {
+                format!("firebase --version exited {}", output.status_code)
+            } else {
+                crate::ledger::redact::text(tail.trim())
+            };
+            // `--version` touches no account and no network, so a non-zero exit
+            // is the CLI failing to start. A message the classifier does not
+            // know is still that, never "unknown".
+            let mut failure = classify_failure(&reason, None);
+            if failure.kind == FirebaseFailureKind::Unknown {
+                failure = startup_failure();
+            }
             FirebaseCliProbe {
                 present: false,
                 program,
                 version: None,
-                reason: Some(if tail.trim().is_empty() {
-                    format!("firebase --version exited {}", output.status_code)
-                } else {
-                    tail.trim().to_string()
-                }),
+                reason: Some(reason),
+                failure: Some(failure),
+                attempt: Some(attempt),
             }
         }
-        Err(error) => FirebaseCliProbe {
-            present: false,
-            program,
-            version: None,
-            reason: Some(if overridden {
+        Err(error) => {
+            let timed_out = error.message().contains("timed out");
+            let reason = if overridden {
                 format!(
                     "{FIREBASE_BIN_ENV} is set but could not be run: {error}",
                     error = error.message()
@@ -256,8 +311,47 @@ pub fn firebase_cli_probe() -> FirebaseCliProbe {
                      {FIREBASE_BIN_ENV} to its absolute path.",
                     error = error.message()
                 )
-            }),
-        },
+            };
+            let failure = if timed_out {
+                startup_failure()
+            } else {
+                diagnose::FirebaseFailure {
+                    kind: FirebaseFailureKind::CliMissing,
+                    title: "The Firebase CLI could not be run".into(),
+                    next_step: format!(
+                        "Install it with `npm install -g firebase-tools`. If it is already \
+                         installed under nvm, fnm or volta, set {FIREBASE_BIN_ENV} to the \
+                         absolute path of `firebase` and relaunch GitPulse."
+                    ),
+                    permission: None,
+                    role: None,
+                    api: None,
+                }
+            };
+            FirebaseCliProbe {
+                present: false,
+                program,
+                version: None,
+                reason: Some(crate::ledger::redact::text(&reason)),
+                failure: Some(failure),
+                attempt: Some(attempt),
+            }
+        }
+    }
+}
+
+/// An installed CLI that did not get as far as answering `--version`.
+fn startup_failure() -> FirebaseFailure {
+    FirebaseFailure {
+        kind: FirebaseFailureKind::CliStartup,
+        title: "The Firebase CLI could not start".into(),
+        next_step:
+            "It was found but did not answer `firebase --version`. Run that in a terminal; \
+                    if it works there, copy the diagnostics below — they include what GitPulse saw."
+                .into(),
+        permission: None,
+        role: None,
+        api: None,
     }
 }
 
@@ -307,9 +401,7 @@ fn help_lists_rollout_listing(help: &str) -> bool {
 const ROLLOUTS_GROUP_HELP: &[&str] = &["apphosting:rollouts", "--help"];
 
 fn probe_rollout_listing(cli_present: bool) -> FirebaseCapability {
-    probe_rollout_listing_with(cli_present, |program, args| {
-        capture_command(program, args, None, PROBE_TIMEOUT, &[]).map_err(CommandError::into_message)
-    })
+    probe_rollout_listing_with(cli_present, spawn_firebase)
 }
 
 /// [`probe_rollout_listing`] with its one invocation injectable.
@@ -320,19 +412,28 @@ fn probe_rollout_listing(cli_present: bool) -> FirebaseCapability {
 /// A fake runner sees all three — and sees them without depending on this host
 /// getting a child process as far as `main` inside [`PROBE_TIMEOUT`], which is a
 /// measurement of machine load rather than of this module.
-/// `git_cli::capture_command` owns the other half, that a child really runs and
+/// `crate::engine::process::capture_command` owns the other half, that a child really runs and
 /// its output comes back.
 fn probe_rollout_listing_with(
     cli_present: bool,
-    run: impl FnOnce(&str, &[&str]) -> Result<CapturedOutput, String>,
+    run: impl FnOnce(&FirebaseSpawn) -> Result<CapturedOutput, CommandError>,
 ) -> FirebaseCapability {
     if !cli_present {
         return FirebaseCapability::unchecked(
             "The Firebase CLI could not be run, so what it supports is unknown.",
         );
     }
-    let program = firebase_program();
-    match run(&program, ROLLOUTS_GROUP_HELP) {
+    let spawn = FirebaseSpawn::new(
+        firebase_program(),
+        ROLLOUTS_GROUP_HELP
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect(),
+        probe_cwd(),
+        PROBE_TIMEOUT,
+    );
+    let (result, attempt) = run_recorded(&spawn, run);
+    let mut capability = match result {
         Ok(output) if output.success => {
             let available = help_lists_rollout_listing(&output.stdout_text());
             FirebaseCapability {
@@ -343,6 +444,7 @@ fn probe_rollout_listing_with(
                 } else {
                     Some(ROLLOUT_LISTING_REMEDY.to_string())
                 },
+                attempt: None,
             }
         }
         Ok(output) => FirebaseCapability::unchecked(format!(
@@ -351,9 +453,12 @@ fn probe_rollout_listing_with(
             output.status_code
         )),
         Err(error) => FirebaseCapability::unchecked(format!(
-            "Could not ask the Firebase CLI which App Hosting commands it has: {error}"
+            "Could not ask the Firebase CLI which App Hosting commands it has: {}",
+            crate::ledger::redact::text(error.message())
         )),
-    }
+    };
+    capability.attempt = Some(attempt);
+    capability
 }
 
 /// Reads one repository-root config file, or `None` when it does not exist.
@@ -640,7 +745,7 @@ Commands:
     /// every sidecar test while a process started, and a [`PROBE_TIMEOUT`] that
     /// a loaded host blows through without anything here being wrong. The
     /// remaining half is owned where it belongs, by
-    /// `git_cli::capture_command`'s own tests.
+    /// `crate::engine::process::capture_command`'s own tests.
     #[test]
     fn the_probe_asks_the_cli_and_reads_the_answer_it_gets() {
         for (help, expected_available) in [
@@ -648,8 +753,8 @@ Commands:
             (GROUP_HELP_WITH_LISTING, true),
         ] {
             let mut asked: Option<(String, String)> = None;
-            let capability = probe_rollout_listing_with(true, |program, args| {
-                asked = Some((program.to_string(), args.join(" ")));
+            let capability = probe_rollout_listing_with(true, |spawn| {
+                asked = Some((spawn.program.clone(), spawn.args.join(" ")));
                 Ok(cli_answer(help, true))
             });
             let (program, args) = asked.expect("the probe must actually ask the CLI");
@@ -680,9 +785,8 @@ Commands:
     /// may be reported as one.
     #[test]
     fn an_answer_the_probe_never_got_is_never_read_as_a_capability() {
-        let unrunnable = probe_rollout_listing_with(true, |_, _| {
-            Err("firebase: no such file or directory".into())
-        });
+        let unrunnable =
+            probe_rollout_listing_with(true, |_| Err("firebase: no such file or directory".into()));
         assert!(
             !unrunnable.checked,
             "a probe that could not run must not claim to have checked"
@@ -699,13 +803,97 @@ Commands:
         );
 
         let refused =
-            probe_rollout_listing_with(true, |_, _| Ok(cli_answer(GROUP_HELP_WITH_LISTING, false)));
+            probe_rollout_listing_with(true, |_| Ok(cli_answer(GROUP_HELP_WITH_LISTING, false)));
         assert!(
             !refused.checked,
             "a non-zero exit is not an answer about capability, even with help text on stdout"
         );
         assert!(!refused.available);
         assert!(refused.reason.is_some());
+    }
+
+    /// The beta regression. A Dock launch's working directory is `/`, and
+    /// firebase-tools 15.34 opens `firebase-debug.log` in its working directory
+    /// before it parses an argument — so a probe that inherited the app's cwd
+    /// died with "Unable to obtain permissions for firebase-debug.log" on every
+    /// machine. Both probes must start somewhere writable *and* move the log
+    /// out with `FIREBASE_DEBUG_PATH`.
+    #[test]
+    fn neither_probe_starts_the_cli_where_it_cannot_write_its_debug_log() {
+        let mut seen: Vec<diagnose::FirebaseSpawn> = Vec::new();
+        let _ = firebase_cli_probe_with(|spawn| {
+            seen.push(spawn.clone());
+            Ok(cli_answer("15.34.2\n", true))
+        });
+        let _ = probe_rollout_listing_with(true, |spawn| {
+            seen.push(spawn.clone());
+            Ok(cli_answer(GROUP_HELP_WITH_LISTING, true))
+        });
+        assert_eq!(seen.len(), 2, "both probes must actually run");
+        for spawn in &seen {
+            assert_ne!(
+                spawn.cwd,
+                std::path::Path::new("/"),
+                "{:?} would start where a Dock launch cannot write",
+                spawn.args
+            );
+            assert!(
+                spawn.cwd.is_absolute() && spawn.cwd.is_dir(),
+                "{:?}",
+                spawn.cwd
+            );
+            assert!(
+                spawn
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == diagnose::FIREBASE_DEBUG_PATH_ENV),
+                "{:?} must carry FIREBASE_DEBUG_PATH",
+                spawn.args
+            );
+        }
+    }
+
+    /// What 15.34.2 printed when the probe ran from `/`, verbatim.
+    const STARTUP_FAILURE_STDERR: &str = "Error: Unable to obtain permissions for firebase-debug.log\n    at findAvailableLogFile (/opt/homebrew/lib/node_modules/firebase-tools/lib/logger.js:148:11)";
+
+    #[test]
+    fn a_cli_that_crashes_at_startup_is_not_reported_as_missing_or_as_a_permission() {
+        let probe = firebase_cli_probe_with(|_| {
+            Ok(CapturedOutput {
+                stdout: Vec::new(),
+                stderr: STARTUP_FAILURE_STDERR.as_bytes().to_vec(),
+                success: false,
+                status_code: 1,
+            })
+        });
+        assert!(!probe.present);
+        let failure = probe
+            .failure
+            .expect("a failed probe must say why, classified");
+        assert_eq!(failure.kind, FirebaseFailureKind::CliStartup);
+        let attempt = probe.attempt.expect("the probe must record what it ran");
+        assert_eq!(attempt.exit_code, Some(1));
+        assert!(attempt.stderr_tail.contains("firebase-debug.log"));
+
+        // An unknown non-zero `--version` is still a startup fault: that
+        // command touches no account and no network.
+        let odd = firebase_cli_probe_with(|_| Ok(cli_answer("", false)));
+        assert_eq!(
+            odd.failure.map(|f| f.kind),
+            Some(FirebaseFailureKind::CliStartup)
+        );
+
+        // And a CLI that cannot be spawned at all is missing, not crashed.
+        let absent = firebase_cli_probe_with(|_| Err("No such file or directory".into()));
+        assert_eq!(
+            absent.failure.map(|f| f.kind),
+            Some(FirebaseFailureKind::CliMissing)
+        );
+        assert_eq!(absent.attempt.and_then(|a| a.exit_code), None);
+
+        let ok = firebase_cli_probe_with(|_| Ok(cli_answer("15.34.2\n", true)));
+        assert!(ok.present && ok.failure.is_none());
+        assert_eq!(ok.version.as_deref(), Some("15.34.2"));
     }
 
     #[test]

@@ -601,7 +601,7 @@ fn parse_charged_ranges(reason: &str) -> (Vec<(usize, usize)>, usize) {
             .char_indices()
             .find(|&(_, c)| match c {
                 '`' => {
-                    in_name = !in_name;
+                    in_name.toggle();
                     false
                 }
                 ')' => !in_name,

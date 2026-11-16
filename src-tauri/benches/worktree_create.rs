@@ -202,7 +202,7 @@ fn remove_lane(repo: &Repo, lane: &Path, branch: &str) {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("worktree_create");
     let temp = tempfile::tempdir().expect("temp dir");
     // `GITPULSE_BENCH_REPO=<path>` times the same call on a real checkout (its

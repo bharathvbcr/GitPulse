@@ -2,7 +2,7 @@
 /**
  * design-lint: the mechanical half of docs/design/UI_RULES.md section 1.
  *
- * It implements rules 1-18. Rule 14 (banned copy terms) reads the list owned
+ * It implements rules 1-19. Rule 14 (banned copy terms) reads the list owned
  * by the vocabulary (`BANNED_UI_TERMS` in src/lib/ui/copy/vocabulary.ts); it is
  * one entry in the flat `RULES` registry below. That list is a .ts file, which
  * node loads by type stripping (node 22.18+ / 24+; the repo runs node 26).
@@ -207,6 +207,14 @@
  *      starts with it. Blind spot: a class built from pieces sharing no literal prefix
  *      is reported as unused when it is not. Rules 17 and 18 need the whole tree, so
  *      they run in lintFiles/lintRepo (RULES entries with runRepo), not lintSource.
+ *   19 page width cap: in a page component (one that renders PageHeader or PageBody, wears
+ *      gp-page / gp-page-body, or is named in PAGE_COMPONENTS), a `max-w-*` token that is a
+ *      cap: the named scale (`max-w-xl`, `max-w-4xl`), a spacing step (`max-w-40`) or an
+ *      arbitrary length (`max-w-[32rem]`). Page content fills its pane; `gp-page` steps
+ *      spacing and columns from the pane's own width. Not caps: `max-w-full|none|min|max|fit|0`,
+ *      `max-w-[N%]` and `max-w-[var(...)]`. A control that must stay narrow (one select, a
+ *      truncating cell) opts out with `data-width-cap="<reason>"` on the same element.
+ *      Running text takes `gp-prose`. Misses a cap in `style=` or a `<style>` block.
  *
  * GATE. `--strict` (the `design:gate` script, a step of `bun run ci:local`) adds
  * what the ratchet alone does not say: every violation must be either fixed or
@@ -1374,6 +1382,24 @@ export function fontShorthandSize(value) {
   return null;
 }
 
+/**
+ * Rule 19. Page components that are read even when they do not render PageHeader or
+ * PageBody: the pages that were moved onto the fluid page body. A new page is found by
+ * what it renders; this list is the floor that keeps a migrated page from sliding back.
+ */
+export const PAGE_COMPONENTS = new Set([
+  "StoragePanel", "FirebasePanel", "GitHubPanel", "CodeStackViewer", "WorkView", "HygienePanel",
+  "RepoPanel", "OutgoingCommitReview", "CoverageViewer", "GlobalCleaner", "AgentsView", "HealthPanel",
+].map((n) => `src/lib/components/${n}.svelte`));
+/** A width that is not a cap: the parent's own measure, or none. */
+const PAGE_CAP_EXEMPT = /^max-w-(?:full|none|min|max|fit|0|\[\d*\.?\d+%\]|\[var\(.*\)\])$/;
+/** @param {Model} m */
+function isPageComponent(m) {
+  if (m.kind !== "svelte") return false;
+  if (PAGE_COMPONENTS.has(m.file)) return true;
+  return /<(?:PageHeader|PageBody)\b/.test(m.clean) || m.classSources.some((cs) => cs.tokens.some((t) => t.util === "gp-page" || t.util === "gp-page-body"));
+}
+
 /** @type {Rule[]} */
 export const RULES = [
   {
@@ -1891,6 +1917,33 @@ export const RULES = [
       }
     },
   },
+  {
+    id: 19,
+    name: "page-width-cap",
+    summary: "a fixed max-w-* cap on page content (a page fills its pane)",
+    svelte: true,
+    ts: false,
+    css: false,
+    run(m, report) {
+      // A PAGE is a component that renders PageHeader or PageBody, wears gp-page /
+      // gp-page-body, or is named in PAGE_COMPONENTS (so a page that is moved off the
+      // shared body is still read). Its content is fluid: `gp-page` measures the pane
+      // and steps spacing and columns (DESIGN_LANGUAGE 7a), so a `max-w-*` that leaves
+      // a notice or card in a narrow column with dead space beside it is a finding.
+      // Not a cap: full, none, min, max, fit, 0, a percentage of the parent, a var().
+      // A cap that is legitimate (a single select, a truncating cell) says so with
+      // `data-width-cap="<reason>"` on the SAME element; an empty reason does not count.
+      // A running-text measure is `gp-prose`, which is CSS, not a token. Misses a cap
+      // written as `style="max-width: ..."` or in a `<style>` block (rule 19 reads
+      // class tokens only) and a cap built by string concatenation.
+      if (!isPageComponent(m)) return;
+      eachToken(m, (t, cs) => {
+        if (!/^max-w-/.test(t.util) || PAGE_CAP_EXEMPT.test(t.util)) return;
+        if (cs.tag >= 0 && (m.attrs ?? []).some((a) => a.tag === cs.tag && a.name === "data-width-cap" && a.segs.some((s) => s.end > s.start))) return;
+        report(t.start, `${t.util}: page content fills its pane; use gp-page-grid for a list of cards, gp-prose for running text, or data-width-cap="<reason>" on a single control (DESIGN_LANGUAGE 7a)`);
+      });
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2358,7 +2411,7 @@ function git(root, args) {
 export function usage() {
   return formatUsage({
     name: "design-lint",
-    summary: "Check UI_RULES section 1 (rules 1-18) against a per-rule, per-file baseline that may only go down.",
+    summary: "Check UI_RULES section 1 (rules 1-19) against a per-rule, per-file baseline that may only go down.",
     flags: [
       { flag: "--baseline", description: "write scripts/design-lint.baseline.json from the current tree and HEAD" },
       { flag: "--allow-dirty", description: "with --baseline: accept uncommitted changes under src/" },

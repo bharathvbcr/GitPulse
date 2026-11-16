@@ -22,11 +22,31 @@
  * platform is reported as SKIPPED with the reason and counted separately,
  * because a check that could not run must never read like one that passed.
  *
- * Exit codes: 0 every gate that ran passed · 1 at least one gate failed.
+ * Many agent sessions edit this working tree while the gates run, so a pass can
+ * describe neither the tree the run started on nor the one it ended on. The run
+ * therefore reads Git's tree id for the working tree (tracked changes and
+ * untracked files in, ignored files out) once before the first gate and once
+ * after the last, and the summary says which tree was tested, or that the tree
+ * moved, or that it could not be read. `workingTreeId` does this through a
+ * private temporary index, so the real index, HEAD and every file are untouched;
+ * the only trace is unreferenced blob and tree objects in the object database,
+ * which `git gc` collects.
+ *
+ * `Tested-tree: <id>` is printed as the very last line when, and only when, all
+ * of these hold: every gate in GATES ran (none skipped), every one passed, and
+ * both tree readings succeeded and are equal. It is evidence of exactly which
+ * files passed; any other run prints no such line. (There is no gate filter or
+ * subset option; a subset of GATES passed to `execute` never prints it.)
+ *
+ * Exit codes: 0 every gate that ran passed · 1 at least one gate failed · 2
+ * unknown option · 3 only with --strict-tree: every gate that ran passed but the
+ * working tree changed during the run or could not be read. Without
+ * --strict-tree a changed or unreadable tree is reported and the code is 0/1.
  */
 
 import { spawnSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
@@ -145,6 +165,13 @@ export const GATES = [
     produces: ["coverage/lcov.info"],
   },
   {
+    id: "timezone-tests",
+    name: "Frontend timezone and DST tests",
+    program: "bun",
+    args: ["run", "test:tz"],
+    covers: ["bun run test:tz"],
+  },
+  {
     id: "browser-regressions",
     name: "Browser regressions (headless Chrome)",
     program: "bun",
@@ -256,6 +283,116 @@ export const GATES = [
   },
 ];
 
+/** Exit code of a `--strict-tree` run whose gates passed but whose tree moved or was unreadable. */
+export const EXIT_TREE_UNSTABLE = 3;
+
+const GIT_TIMEOUT_MS = 120_000;
+const OBJECT_ID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
+/**
+ * @typedef {{ status: number | null, stdout: string, stderr: string, error?: string }} GitResult
+ * @typedef {(args: string[], where: { cwd: string, env: NodeJS.ProcessEnv }) => GitResult} GitRunner
+ * @type {GitRunner}
+ */
+function runGit(args, { cwd, env }) {
+  const result = spawnSync("git", args, {
+    cwd,
+    env,
+    encoding: "utf8",
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error ? result.error.message : undefined,
+  };
+}
+
+/**
+ * Git's tree id for the working tree exactly as it is now: tracked changes and
+ * untracked files included, ignored files excluded. A private copy of the real
+ * index is used (so Git's stat cache is reused and the real index is never
+ * written); with no index to copy, `git add` builds one. The temporary index is
+ * removed on success and on failure. Anything that goes wrong, including being
+ * outside a repository, yields `{ ok: false, reason }` and never an id.
+ *
+ * @typedef {{ ok: true, id: string } | { ok: false, reason: string }} TreeReading
+ * @param {string} root the repository's top directory
+ * @param {{ run?: GitRunner, tmpRoot?: string, env?: NodeJS.ProcessEnv }} [options]
+ * @returns {TreeReading}
+ */
+export function workingTreeId(root, options = {}) {
+  const { run = runGit, tmpRoot = tmpdir(), env = process.env } = options;
+  /** @type {TreeReading} */
+  let result;
+  /** @type {string | undefined} */
+  let scratch;
+  /** @param {string[]} args @param {NodeJS.ProcessEnv} stepEnv */
+  const git = (args, stepEnv) => {
+    const out = run(args, { cwd: root, env: stepEnv });
+    const label = args.find((arg) => ["rev-parse", "add", "write-tree"].includes(arg));
+    if (out.error) throw new Error(`git ${label}: ${out.error}`);
+    if (out.status !== 0) {
+      const why = out.stderr.trim().split("\n")[0] || `exit ${out.status}`;
+      throw new Error(`git ${label} failed: ${why}`);
+    }
+    return out.stdout;
+  };
+  try {
+    const realIndex = path.resolve(root, git(["rev-parse", "--git-path", "index"], env).trim());
+    scratch = mkdtempSync(path.join(tmpRoot, "ci-local-tree-"));
+    const tmpIndex = path.join(scratch, "index");
+    if (existsSync(realIndex)) {
+      copyFileSync(realIndex, tmpIndex);
+      // Keep the real index's timestamp: Git decides whether an entry is
+      // "racily clean" by comparing it with the index file's mtime.
+      const { atime, mtime } = statSync(realIndex);
+      utimesSync(tmpIndex, atime, mtime);
+    }
+    const privateEnv = { ...env, GIT_INDEX_FILE: tmpIndex };
+    git(["-c", "core.fsmonitor=false", "add", "-A", "--", ":/"], privateEnv);
+    const id = git(["-c", "core.fsmonitor=false", "write-tree"], privateEnv).trim();
+    if (!OBJECT_ID.test(id)) throw new Error(`git write-tree printed ${JSON.stringify(id)}, not an object id`);
+    result = { ok: true, id };
+  } catch (error) {
+    result = { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  if (scratch !== undefined) {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch (error) {
+      const cleanup = `could not remove the temporary index: ${error instanceof Error ? error.message : String(error)}`;
+      result = { ok: false, reason: result.ok ? cleanup : `${result.reason}; ${cleanup}` };
+    }
+  }
+  return result;
+}
+
+/**
+ * What two readings of the working tree, taken before the first gate and after
+ * the last, say about the run.
+ *
+ * @typedef {{ state: "stable", id: string }
+ *   | { state: "changed", before: string, after: string }
+ *   | { state: "unknown", reasons: string[] }} TreeVerdict
+ * @param {TreeReading} before @param {TreeReading} after @returns {TreeVerdict}
+ */
+export function compareTrees(before, after) {
+  if (before.ok && after.ok) {
+    return before.id === after.id
+      ? { state: "stable", id: before.id }
+      : { state: "changed", before: before.id, after: after.id };
+  }
+  /** @type {string[]} */
+  const reasons = [];
+  if (!before.ok) reasons.push(`before the first gate: ${before.reason}`);
+  if (!after.ok) reasons.push(`after the last gate: ${after.reason}`);
+  return { state: "unknown", reasons };
+}
+
 /** @param {Gate} gate @returns {string} */
 export function commandLine(gate) {
   return [gate.program, ...gate.args].join(" ");
@@ -322,8 +459,11 @@ export function runGates(gates, options = {}) {
   return outcomes;
 }
 
-/** @param {ReturnType<typeof runGates>} outcomes */
-export function summarize(outcomes) {
+/**
+ * @param {ReturnType<typeof runGates>} outcomes
+ * @param {TreeVerdict} [tree] omitted by callers that did not read the tree
+ */
+export function summarize(outcomes, tree) {
   const lines = ["", "── ci:local ".padEnd(60, "─"), ""];
   /** @type {Record<string, string>} */
   const mark = { passed: "PASS", failed: "FAIL", skipped: "SKIP" };
@@ -349,8 +489,72 @@ export function summarize(outcomes) {
     lines.push("");
     for (const { gate } of failed) lines.push(`  failed: ${commandLine(gate)}`);
   }
+  if (tree) lines.push("", ...treeLines(tree));
   lines.push("");
   return lines.join("\n");
+}
+
+/** @param {TreeVerdict} tree @returns {string[]} */
+function treeLines(tree) {
+  if (tree.state === "stable") {
+    return [`  tested tree: ${tree.id}`, "  (identical when the first gate started and when the last one ended)"];
+  }
+  if (tree.state === "changed") {
+    return [
+      "  TREE CHANGED DURING THE RUN",
+      `    at start: ${tree.before}`,
+      `    at end:   ${tree.after}`,
+      "  The working tree changed while the gates ran, so this result does not describe either tree.",
+      "  RESULT: INCONCLUSIVE, not a clean pass. Re-run when the tree is quiet.",
+    ];
+  }
+  return [
+    "  tree: could not be read, so which files were tested is not recorded",
+    ...tree.reasons.map((reason) => `    ${reason}`),
+  ];
+}
+
+/**
+ * The paste-able evidence line, or null. It exists only when every gate in
+ * GATES ran and passed and the tree was read twice with the same answer.
+ *
+ * @param {ReturnType<typeof runGates>} outcomes @param {TreeVerdict} tree
+ * @returns {string | null}
+ */
+export function testedTreeLine(outcomes, tree) {
+  const everyGate = outcomes.length === GATES.length && outcomes.every((o, i) => o.gate.id === GATES[i].id);
+  if (!everyGate || !outcomes.every((o) => o.status === "passed") || tree.state !== "stable") return null;
+  return `Tested-tree: ${tree.id}`;
+}
+
+/**
+ * Read the tree, run the gates, read the tree again, print the summary, and
+ * return the exit code.
+ *
+ * @param {{ strictTree?: boolean, gates?: Gate[], readTree?: () => TreeReading,
+ *           run?: (gate: Gate) => { ok: boolean, detail: string, ms: number },
+ *           platform?: NodeJS.Platform, log?: (line: string) => void, root?: string }} [options]
+ * @returns {number}
+ */
+export function execute(options = {}) {
+  const {
+    strictTree = false,
+    gates = GATES,
+    readTree = () => workingTreeId(REPO_ROOT),
+    run,
+    platform,
+    log = console.log,
+    root,
+  } = options;
+  const before = readTree();
+  const outcomes = runGates(gates, { run, platform, log, root });
+  const after = readTree();
+  const tree = compareTrees(before, after);
+  log(summarize(outcomes, tree));
+  const tested = testedTreeLine(outcomes, tree);
+  if (tested) log(tested);
+  if (outcomes.some((o) => o.status === "failed")) return 1;
+  return strictTree && tree.state !== "stable" ? EXIT_TREE_UNSTABLE : 0;
 }
 
 function usage() {
@@ -359,9 +563,15 @@ function usage() {
     summary: "Run the local gates (a subset of CI), without one failure hiding the rest.",
     flags: [
       { flag: "--list", description: "Print the gates and exit" },
+      {
+        flag: "--strict-tree",
+        description: "Exit 3 when every gate passed but the working tree changed during the run or could not be read",
+      },
       { flag: "--help, -h", description: "Show this message" },
     ],
-    exits: "0 every gate that ran passed · 1 at least one gate failed",
+    exits:
+      "0 every gate that ran passed · 1 at least one gate failed · 2 unknown option · " +
+      "3 (--strict-tree only) gates passed but the working tree changed during the run or could not be read",
   });
 }
 
@@ -378,15 +588,13 @@ export function main(argv = process.argv.slice(2)) {
     }
     return 0;
   }
-  const unknown = argv.find((a) => !["--list", "--help", "-h"].includes(a));
+  const unknown = argv.find((a) => !["--list", "--strict-tree", "--help", "-h"].includes(a));
   if (unknown) {
     console.error(`FAIL: unknown option ${JSON.stringify(unknown)}\n`);
     console.error(usage());
     return 2;
   }
-  const outcomes = runGates(GATES, { root: REPO_ROOT });
-  console.log(summarize(outcomes));
-  return outcomes.some((o) => o.status === "failed") ? 1 : 0;
+  return execute({ strictTree: argv.includes("--strict-tree"), root: REPO_ROOT });
 }
 
 if (process.argv[1]?.endsWith("ci-local.mjs")) {

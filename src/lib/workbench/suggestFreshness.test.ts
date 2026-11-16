@@ -6,15 +6,15 @@ beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
 const card = (id: string, status: TaskStatus, priority: number, extra: Partial<TaskCard> = {}) => ({ id, status, priority, title: id, position: 1, ...extra }) as TaskCard;
-const columns = (...cards: TaskCard[]) => ({ inbox: { items: cards } as unknown as Page<TaskCard> });
+const columns = (...cards: TaskCard[]) => ({ backlog: { items: cards } as unknown as Page<TaskCard> });
 
 describe("suggestSignature", () => {
   it("changes with a task's priority, status or presence and ignores order, titles and positions", () => {
-    const base = suggestSignature(columns(card("a", "inbox", 2), card("b", "ready", 1)));
-    expect(suggestSignature(columns(card("b", "ready", 1, { title: "renamed", position: 9 }), card("a", "inbox", 2)))).toBe(base);
-    expect(suggestSignature(columns(card("a", "inbox", 0), card("b", "ready", 1)))).not.toBe(base);
+    const base = suggestSignature(columns(card("a", "backlog", 2), card("b", "ready", 1)));
+    expect(suggestSignature(columns(card("b", "ready", 1, { title: "renamed", position: 9 }), card("a", "backlog", 2)))).toBe(base);
+    expect(suggestSignature(columns(card("a", "backlog", 0), card("b", "ready", 1)))).not.toBe(base);
     expect(suggestSignature(columns(card("a", "ready", 2), card("b", "ready", 1)))).not.toBe(base);
-    expect(suggestSignature(columns(card("a", "inbox", 2)))).not.toBe(base);
+    expect(suggestSignature(columns(card("a", "backlog", 2)))).not.toBe(base);
   });
 });
 

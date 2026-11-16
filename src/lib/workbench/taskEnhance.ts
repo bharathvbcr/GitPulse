@@ -261,7 +261,7 @@ export class EnhancementAction {
   async run(method: EnhancementMutation, input: Record<string, unknown>, taskID: string): Promise<{ proposal: Enhancement; task: Task | null }> {
     if (this.running) throw new WorkbenchError("busy", "An enhancement action is already in progress.");
     if (this.pending && (method !== this.pending.method || input.request_id !== this.pending.input.request_id || taskID !== this.pending.taskID)) {
-      throw new WorkbenchError("busy", "Retry the pending enhancement action first.");
+      throw new WorkbenchError("busy", "Try the pending enhancement action again first.");
     }
     this.pending ??= { method, input: structuredClone(input), taskID, result: null };
     this.running = true;

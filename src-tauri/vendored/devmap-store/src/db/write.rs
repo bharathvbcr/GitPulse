@@ -2581,82 +2581,84 @@ impl Store {
         // K5 / Optimization: Eliminate O(N) full-view JSON deserialization.
         // On whole-tree builds, count canonical failures directly from in-memory extractions.
         // On incremental builds, track delta from prev_gen's build_history plus modified/deleted files.
-        let parse_failed: i64 = if full_rewrite || prev_gen.is_none() {
-            extractions.iter().filter(|e| e.is_parse_failure()).count() as i64
-        } else {
-            let prev_id = prev_gen.unwrap();
-            let prev_count: Option<i64> = tx
-                .query_row(
-                    "SELECT parse_failed FROM build_history WHERE generation_id = ?1",
-                    params![prev_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+        let parse_failed: i64 = match prev_gen.filter(|_| !full_rewrite) {
+            None => extractions.iter().filter(|e| e.is_parse_failure()).count() as i64,
+            Some(prev_id) => {
+                let prev_count: Option<i64> = tx
+                    .query_row(
+                        "SELECT parse_failed FROM build_history WHERE generation_id = ?1",
+                        params![prev_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
 
-            if let Some(prev_failures) = prev_count {
-                // Check whether any modified or deleted file was a parse failure in prev_gen
-                let mut retired_failures = 0i64;
-                let mut check_paths = std::collections::HashSet::new();
-                for p in &opts.affected_paths {
-                    check_paths.insert(p.as_str());
-                }
-                for p in &opts.deleted_paths {
-                    check_paths.insert(p.as_str());
-                }
-                for e in &fresh {
-                    check_paths.insert(e.file_path.as_str());
-                }
+                if let Some(prev_failures) = prev_count {
+                    // Check whether any modified or deleted file was a parse failure in prev_gen
+                    let mut retired_failures = 0i64;
+                    let mut check_paths = std::collections::HashSet::new();
+                    for p in &opts.affected_paths {
+                        check_paths.insert(p.as_str());
+                    }
+                    for p in &opts.deleted_paths {
+                        check_paths.insert(p.as_str());
+                    }
+                    for e in &fresh {
+                        check_paths.insert(e.file_path.as_str());
+                    }
 
-                if !check_paths.is_empty() {
-                    let mut prev_stmt = tx.prepare_cached(
-                        "SELECT f.parse_outcome_json, f.engine_json
+                    if !check_paths.is_empty() {
+                        let mut prev_stmt = tx.prepare_cached(
+                            "SELECT f.parse_outcome_json, f.engine_json
                          FROM generation_files f
                          JOIN paths p ON p.id = f.file_id
                          WHERE f.generation_id = ?1 AND p.path = ?2",
-                    )?;
-                    for path in check_paths {
-                        if let Some((p_json, e_json)) = prev_stmt
-                            .query_row(params![prev_id, path], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                            })
-                            .optional()?
-                        {
-                            let (outcome, engine) = decode_stored_outcome(path, &p_json, &e_json)?;
-                            if stored_is_parse_failure(&outcome, &engine) {
-                                retired_failures += 1;
+                        )?;
+                        for path in check_paths {
+                            if let Some((p_json, e_json)) = prev_stmt
+                                .query_row(params![prev_id, path], |row| {
+                                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                                })
+                                .optional()?
+                            {
+                                let (outcome, engine) =
+                                    decode_stored_outcome(path, &p_json, &e_json)?;
+                                if stored_is_parse_failure(&outcome, &engine) {
+                                    retired_failures += 1;
+                                }
                             }
                         }
                     }
-                }
 
-                // Count failures in fresh extractions
-                let fresh_failures = fresh.iter().filter(|e| e.is_parse_failure()).count() as i64;
-                (prev_failures - retired_failures + fresh_failures).max(0)
-            } else {
-                // Fallback: fast query filtering only rows containing '{"Failed":'
-                let mut stmt = tx.prepare(
-                    "SELECT p.path, f.parse_outcome_json, f.engine_json
+                    // Count failures in fresh extractions
+                    let fresh_failures =
+                        fresh.iter().filter(|e| e.is_parse_failure()).count() as i64;
+                    (prev_failures - retired_failures + fresh_failures).max(0)
+                } else {
+                    // Fallback: fast query filtering only rows containing '{"Failed":'
+                    let mut stmt = tx.prepare(
+                        "SELECT p.path, f.parse_outcome_json, f.engine_json
                      FROM generation_files f
                      JOIN paths p ON p.id = f.file_id
                      WHERE f.generation_id = ?1 AND f.parse_outcome_json LIKE '{\"Failed\":%'",
-                )?;
-                let rows = stmt.query_map(params![gen_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                let mut count = 0i64;
-                for row in rows {
-                    let (path, parse_json, engine_json) = row?;
-                    let (outcome, engine) =
-                        decode_stored_outcome(&path, &parse_json, &engine_json)?;
-                    if stored_is_parse_failure(&outcome, &engine) {
-                        count += 1;
+                    )?;
+                    let rows = stmt.query_map(params![gen_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    let mut count = 0i64;
+                    for row in rows {
+                        let (path, parse_json, engine_json) = row?;
+                        let (outcome, engine) =
+                            decode_stored_outcome(&path, &parse_json, &engine_json)?;
+                        if stored_is_parse_failure(&outcome, &engine) {
+                            count += 1;
+                        }
                     }
+                    count
                 }
-                count
             }
         };
         Self::scrub_secret_values(&tx)?;

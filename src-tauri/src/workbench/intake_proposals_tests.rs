@@ -46,7 +46,7 @@ fn filing_the_same_proposal_twice_files_one_card() {
     }
     let cards = board(&store, &repo);
     assert_eq!(cards.len(), 1, "{cards:?}");
-    assert_eq!(cards[0]["status"], "inbox");
+    assert_eq!(cards[0]["status"], "backlog");
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn an_accepted_refinement_goes_through_the_stored_proposal_and_keeps_what_was_th
         card["title"], "Ship the exporter",
         "title is not Manvi's to change"
     );
-    // Each split is one inbox task, parented to this one, with an id the host made.
+    // Each split is one backlog task, parented to this one, with an id the host made.
     let created = applied["created_item_ids"].as_array().unwrap();
     assert_eq!(created.len(), 2, "{applied}");
     for (index, title) in ["Alpha indexer", "Zebra exporter"].iter().enumerate() {
@@ -247,7 +247,8 @@ fn an_accepted_refinement_goes_through_the_stored_proposal_and_keeps_what_was_th
             .unwrap()
             .unwrap();
         assert_eq!(split["title"], *title);
-        assert_eq!(split["status"], "inbox");
+        // The store creates a split with its own default status.
+        assert_eq!(split["status"], "backlog");
         assert_eq!(split["links"][0]["kind"], "parent");
         assert_eq!(split["links"][0]["item_id"], id.as_str());
     }

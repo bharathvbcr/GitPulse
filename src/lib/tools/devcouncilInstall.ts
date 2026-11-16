@@ -20,13 +20,13 @@ export const DEVCOUNCIL_PRESETS: {
 }[] = [
   {
     id: "devmap",
-    label: "DevMap only",
+    label: "Code map only (DevMap)",
     detail: "Standalone code-intelligence CLI. GitPulse Map needs only this.",
   },
   {
     id: "analysis",
     label: "Analysis suite",
-    detail: "The DevMap, dcstore, dcverify and dcgrep commands — no Go host.",
+    detail: "The code map (DevMap), dcstore, dcverify and dcgrep commands — no Go host.",
   },
   {
     id: "all",
@@ -89,7 +89,7 @@ export function buildDevcouncilInstallCommand(input: InstallCommandInput): Insta
   const timeoutSecs = INSTALL_TIMEOUT_SECS;
   const label =
     input.preset === "devmap"
-      ? "Install DevMap"
+      ? "Install the code map (DevMap)"
       : input.preset === "analysis"
         ? "Install analysis suite"
         : "Install DevCouncil";

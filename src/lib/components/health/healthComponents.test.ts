@@ -6,7 +6,8 @@ import { render } from "svelte/server";
 import GithubAlertsSection from "./GithubAlertsSection.svelte";
 import HealthSection from "./HealthSection.svelte";
 import HealthTable from "./HealthTable.svelte";
-import { HEALTH_CONTENT_WIDTH, HEALTH_SECTIONS } from "../../health/sections";
+import * as sections from "../../health/sections";
+import { HEALTH_SECTIONS } from "../../health/sections";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = (file: string) => readFileSync(join(here, file), "utf8");
@@ -233,24 +234,22 @@ describe("HealthTable", () => {
   });
 });
 
-describe("Health components share one measure and one link affordance", () => {
+describe("Health components fill the pane and share one link affordance", () => {
   /**
-   * The panel used to mix `max-w-2xl`, `3xl`, `4xl` and `5xl` across sibling
-   * sections, so the right edge stepped in and out down the page. The width
-   * is now stated once; a component that hard-codes its own has reintroduced
-   * the defect.
+   * The panel used to cap its sections at `max-w-5xl` (and its notices at
+   * `max-w-3xl`) through two exported constants, which left dead space beside
+   * every section on a wide pane. That contract is retired: the page is fluid
+   * (`PageBody`, DESIGN_LANGUAGE 7a), so no health component may carry a named
+   * `max-w-*` content cap, and the constants must not come back.
    */
-  it("no health component hard-codes a content width of its own", () => {
+  it("no health component carries a content width cap, and the retired constants are gone", () => {
     for (const file of componentFiles) {
       const text = source(file);
-      const widths = [...text.matchAll(/max-w-(\d?xl|screen-\w+)/g)].map((m) => m[0]);
-      for (const width of widths) {
-        expect(
-          width,
-          `${file} hard-codes ${width}; use HEALTH_CONTENT_WIDTH / HEALTH_PROSE_WIDTH`,
-        ).toBe(HEALTH_CONTENT_WIDTH);
-      }
+      const widths = [...text.matchAll(/max-w-(\d?xl|screen-\w+|prose)/g)].map((m) => m[0]);
+      expect(widths, `${file} caps its content at ${widths.join(", ")}; page content fills the pane`).toEqual([]);
     }
+    expect(Object.keys(sections)).not.toContain("HEALTH_CONTENT_WIDTH");
+    expect(Object.keys(sections)).not.toContain("HEALTH_PROSE_WIDTH");
   });
 
   it("names every icon-only control", () => {
@@ -274,5 +273,45 @@ describe("Health components share one measure and one link affordance", () => {
       }
       expect(known, `HealthPanel renders section "${id}" with no catalog entry`).toContain(id);
     }
+  });
+});
+
+describe("HealthPanel — verdict first, identifiers truncated", () => {
+  const panel = readFileSync(join(here, "..", "HealthPanel.svelte"), "utf8");
+
+  it("puts the verdict ahead of the GitHub freshness line once a report is loaded", () => {
+    // The freshness disclosure used to open the scroll in every state. With a
+    // report it now follows the verdict card; before one exists it still leads.
+    const lead = panel.indexOf("{#if !report}\n      {@render githubFreshness()}");
+    const verdict = panel.indexOf("<HealthSummaryCard");
+    const after = panel.indexOf("{@render githubFreshness()}", verdict);
+    expect(lead).toBeGreaterThan(-1);
+    expect(verdict).toBeGreaterThan(lead);
+    expect(after).toBeGreaterThan(verdict);
+    expect(panel.match(/\{@render githubFreshness\(\)\}/g)).toHaveLength(2);
+  });
+
+  it("prints every severity chip through one case helper", () => {
+    expect(panel).toContain("severityLabel(alert.severity)");
+    expect(panel).toContain("severityLabel(vuln.severity)");
+    expect(panel).toContain("severityLabel(issue.severity)");
+    // `capitalize` leaves GitHub's "HIGH" alone, which is how one page showed
+    // HIGH, High and Warning.
+    expect(panel).not.toMatch(/gp-chip capitalize/);
+  });
+
+  it("truncates package names and paths and keeps the full text on a title", () => {
+    for (const cell of [
+      'title={alert.package}',
+      "title={vuln.name}",
+      "title={pkg.name}",
+      "title={sym.symbol_name}",
+      "title={sym.file_path}",
+      "title={where}",
+      "title={vulnWhere}",
+    ]) {
+      expect(panel, cell).toContain(cell);
+    }
+    expect(panel).toMatch(/font-mono text-textPrimary truncate" title=\{pkg\.name\}/);
   });
 });

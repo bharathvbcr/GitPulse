@@ -30,7 +30,7 @@
   import { invoke } from "../ipc/invoke";
   import { pageZoom } from "../ui/uiScale";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
   import {
     browserIpc,
@@ -103,7 +103,7 @@
     queue = queue
       .then(() => (disposed ? undefined : op()))
       .catch((cause: unknown) => {
-        if (!disposed) error = formatError(cause);
+        if (!disposed) error = describeError(cause, "browser");
       });
     return queue;
   }
@@ -331,7 +331,7 @@
     try {
       await openExternal(url);
     } catch (cause) {
-      error = `Couldn't open ${url} in your browser. ${formatError(cause)}`;
+      error = `Couldn't open ${url} in your browser. ${describeError(cause, "browser")}`;
     }
   }
 
@@ -345,7 +345,7 @@
       const formattedPath = /\s/.test(pngPath) ? `"${pngPath}"` : pngPath;
       onSendToAgent(`@${formattedPath} `);
     } catch (cause) {
-      if (!disposed) error = `Could not capture snapshot: ${formatError(cause)}`;
+      if (!disposed) error = `Couldn't capture the snapshot: ${describeError(cause, "browser")}`;
     } finally {
       if (!disposed) capturing = false;
     }
@@ -367,7 +367,7 @@
         picking = true;
       }
     } catch (cause) {
-      if (!disposed) error = `Could not start element picker: ${formatError(cause)}`;
+      if (!disposed) error = `Couldn't start the element picker: ${describeError(cause, "browser")}`;
     } finally {
       if (!disposed) capturing = false;
     }
@@ -403,7 +403,7 @@
     } catch (cause) {
       if (!disposed) {
         cancelPickElement();
-        error = `Could not inspect element: ${formatError(cause)}`;
+        error = `Couldn't inspect the element: ${describeError(cause, "browser")}`;
       }
     } finally {
       if (!disposed) inspecting = false;
@@ -427,7 +427,7 @@
 </script>
 
 <div class="h-full flex flex-col min-h-0" data-browser-session={tabId}>
-  <form class="shrink-0 flex items-center gap-1 px-2 h-8 bg-surface/40" onsubmit={submit}>
+  <form class="shrink-0 flex items-center gap-1 px-2 h-8" onsubmit={submit}>
     <button type="button" class="gp-icon-btn" aria-label="Back" title="Back" disabled={!opened} onclick={() => step("back")}><ArrowLeft size={13} /></button>
     <button type="button" class="gp-icon-btn" aria-label="Forward" title="Forward" disabled={!opened} onclick={() => step("forward")}><ArrowRight size={13} /></button>
     <button type="button" class="gp-icon-btn" aria-label="Reload" title="Reload" disabled={!opened} onclick={() => step("reload")}>

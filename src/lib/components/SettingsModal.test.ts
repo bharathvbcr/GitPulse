@@ -136,7 +136,7 @@ describe("SettingsModal", () => {
 
     expect(body).toContain('role="switch"');
     expect(body).toContain('aria-label="Show the language mix in the status bar"');
-    expect(body).toContain('aria-label="Show Manvi status in the title bar"');
+    expect(body).toContain('aria-label="Show Manvi status"');
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
@@ -146,7 +146,7 @@ describe("SettingsModal", () => {
     // able to push the categories or the footer buttons off a short window.
     expect(source).toContain("max-h-[calc(100vh-2rem)]");
     expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
-    expect(source).toContain("w-36 shrink-0 overflow-y-auto");
+    expect(source).toContain("w-52 shrink-0 overflow-y-auto");
     expect(source).toContain("shrink-0");
   });
 });
@@ -199,8 +199,8 @@ describe("SettingsModal layout options", () => {
       'aria-label="Hide the repository tab strip while a single repository is open"',
     );
     expect(layout).toContain('aria-label="Show the language mix in the status bar"');
-    expect(layout).toContain('aria-label="Show Manvi status in the title bar"');
-    expect(prose(layout)).toContain("Policy and local-model status in the title bar.");
+    expect(layout).toContain('aria-label="Show Manvi status"');
+    expect(prose(layout)).toContain("Policy and local-model status: in the status bar on a repository, in the title bar on Fleet, Agents and Tasks.");
   });
 
   it("says a hidden status bar still comes back for anything that needs attention", () => {
@@ -267,18 +267,18 @@ describe("SettingsModal automatic GitHub alerts", () => {
 });
 
 describe("SettingsModal bell toggle", () => {
-  it("offers counting a terminal bell as waiting, on by default, and says what off means", () => {
+  it("offers counting a terminal bell as waiting, off by default, and says what on and off mean", () => {
     const agents = panel(open(), "agents");
     const start = agents.indexOf('data-setting="bell-asks"');
     expect(start, "no bell-asks row in the agents panel").toBeGreaterThan(-1);
     const row = prose(agents.slice(start, start + 2500));
     expect(row).toContain("Count a terminal bell as waiting for you");
-    expect(row).toMatch(/role="switch"[^>]*aria-checked="true"|aria-checked="true"[^>]*role="switch"/);
-    expect(row).toContain("On by default");
+    expect(row).toMatch(/role="switch"[^>]*aria-checked="false"|aria-checked="false"[^>]*role="switch"/);
+    expect(row).toContain("Off by default");
     expect(row).toContain("menu-bar count");
-    // The Agents view stops counting a bell too, and stops listing it as a reason.
+    // Turning it on counts a bell across the board, task pane, Agents view and tray.
     expect(row).toContain("the Agents view and the menu-bar count");
-    expect(row).toContain("The Agents view also stops listing a bell as a reason");
+    expect(row).toContain("While off, the Agents view also stops listing a bell as a reason");
     expect(row).toContain("reports through its hooks");
   });
 });

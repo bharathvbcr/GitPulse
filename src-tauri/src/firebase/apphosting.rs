@@ -38,12 +38,24 @@
 //! claim — "this backend has never deployed" — and only a real answer may
 //! make it.
 
+use super::diagnose::{
+    account_matters, classify_failure, lookup_account_with, run_recorded, spawn_firebase,
+    FirebaseAccount, FirebaseAttempt, FirebaseFailure, FirebaseFailureKind, FirebaseSpawn,
+};
 use super::{
     firebase_program, validate_project_id, FIREBASE_CALL_TIMEOUT, MAX_FIREBASE_ERROR_BYTES,
 };
-use crate::engine::git_cli::{byte_tail, capture_command, validate_repo};
+use crate::engine::git_cli::validate_repo;
+use crate::engine::process::{byte_tail, CapturedOutput};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// How a `firebase` child is run. Production passes [`spawn_firebase`]; tests
+/// pass a fake that answers by argv, so the listing and the account question
+/// that follows a failure are both observable without a process.
+pub(crate) type FirebaseRunner<'a> =
+    dyn FnMut(&FirebaseSpawn) -> Result<CapturedOutput, CommandError> + 'a;
 
 /// Upper bound on rollouts shown. One extra row is fetched so a capped list
 /// reports itself instead of looking complete.
@@ -205,6 +217,13 @@ pub struct FirebaseRolloutsReport {
     pub unreachable: Vec<String>,
     pub walk_incomplete: Option<String>,
     pub error: Option<String>,
+    /// `error`, classified into a state with a next step. `None` on success.
+    pub failure: Option<FirebaseFailure>,
+    /// Every `firebase` invocation this report made, in order, redacted.
+    pub attempts: Vec<FirebaseAttempt>,
+    /// Who the CLI is signed in as, asked only after a failure where it
+    /// changes the next step. `None` means it was not asked.
+    pub account: Option<FirebaseAccount>,
 }
 
 impl FirebaseRolloutsReport {
@@ -229,7 +248,28 @@ impl FirebaseRolloutsReport {
             unreachable: Vec::new(),
             walk_incomplete: None,
             error,
+            failure: None,
+            attempts: Vec::new(),
+            account: None,
         }
+    }
+
+    fn failed(
+        cli_present: bool,
+        project_id: &str,
+        backend_id: &str,
+        failure: ListingFailure,
+    ) -> Self {
+        let mut report = Self::unavailable(
+            cli_present,
+            project_id.to_string(),
+            backend_id.to_string(),
+            Some(failure.message),
+        );
+        report.failure = Some(failure.failure);
+        report.attempts = failure.attempts;
+        report.account = failure.account;
+        report
     }
 }
 
@@ -244,6 +284,10 @@ pub struct FirebaseBackendsReport {
     pub unreachable: Vec<String>,
     pub walk_incomplete: Option<String>,
     pub error: Option<String>,
+    /// See [`FirebaseRolloutsReport::failure`].
+    pub failure: Option<FirebaseFailure>,
+    pub attempts: Vec<FirebaseAttempt>,
+    pub account: Option<FirebaseAccount>,
 }
 
 impl FirebaseBackendsReport {
@@ -258,7 +302,19 @@ impl FirebaseBackendsReport {
             unreachable: Vec::new(),
             walk_incomplete: None,
             error,
+            failure: None,
+            attempts: Vec::new(),
+            account: None,
         }
+    }
+
+    fn failed(cli_present: bool, project_id: &str, failure: ListingFailure) -> Self {
+        let mut report =
+            Self::unavailable(cli_present, project_id.to_string(), Some(failure.message));
+        report.failure = Some(failure.failure);
+        report.attempts = failure.attempts;
+        report.account = failure.account;
+        report
     }
 }
 
@@ -604,29 +660,111 @@ pub fn parse_backends(
 // Execution
 // ---------------------------------------------------------------------------
 
-/// Runs one `firebase` invocation inside the repository.
+/// Runs one `firebase` invocation inside `repo` and records it.
 ///
 /// `args` is a full argv line starting with the program name; everything after
 /// it is passed verbatim, so the line the gate judged is the line that runs.
-pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8>, CommandError> {
+/// The child is built by [`FirebaseSpawn::new`], so it carries
+/// `FIREBASE_DEBUG_PATH` like every other `firebase` child: the CLI's debug log
+/// lands in GitPulse's own directory rather than in the user's repository.
+fn invoke_in(
+    repo: &Path,
+    args: &[String],
+    run: &mut FirebaseRunner<'_>,
+) -> (Result<Vec<u8>, String>, FirebaseAttempt) {
     let program = firebase_program();
     debug_assert!(
         args.first() == Some(&program),
         "argv builders must include the program name"
     );
-    let repo = validate_repo(repo_path)?;
-    let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    let output = capture_command(&program, &refs, Some(&repo), FIREBASE_CALL_TIMEOUT, &[])?;
-    if !output.success {
-        return Err(failure_reason(
+    let spawn = FirebaseSpawn::new(
+        program,
+        args.iter().skip(1).cloned().collect(),
+        repo.to_path_buf(),
+        FIREBASE_CALL_TIMEOUT,
+    );
+    let (result, attempt) = run_recorded(&spawn, &mut *run);
+    let result = match result {
+        Ok(output) if output.success => Ok(output.stdout),
+        Ok(output) => Err(failure_reason(
             &output.stdout,
             &output.stderr,
             output.status_code,
             args.get(1).map(String::as_str).unwrap_or("firebase"),
-        )
-        .into());
+        )),
+        Err(error) => Err(error.into_message()),
+    };
+    (result, attempt)
+}
+
+/// Why a listing produced no rows, everything needed to act on it, and the
+/// record of what was run.
+struct ListingFailure {
+    message: String,
+    failure: FirebaseFailure,
+    attempts: Vec<FirebaseAttempt>,
+    account: Option<FirebaseAccount>,
+}
+
+/// Classifies a listing failure and, when it would change the next step, asks
+/// the CLI who it is signed in as — from the repository, because the CLI keeps
+/// a per-folder account.
+fn listing_failure(
+    repo: Option<&Path>,
+    project_id: &str,
+    message: String,
+    mut attempts: Vec<FirebaseAttempt>,
+    run: &mut FirebaseRunner<'_>,
+) -> ListingFailure {
+    let message = crate::ledger::redact::text(&message);
+    let failure = classify_failure(&message, Some(project_id));
+    let account = match repo {
+        Some(repo) if account_matters(failure.kind) => {
+            let (account, attempt) = lookup_account_with(repo, &mut *run);
+            attempts.push(attempt);
+            Some(account)
+        }
+        _ => None,
+    };
+    ListingFailure {
+        message,
+        failure,
+        attempts,
+        account,
     }
-    Ok(output.stdout)
+}
+
+/// Runs a listing and unwraps its envelope, or explains why it could not.
+fn run_listing(
+    repo_path: &str,
+    project_id: &str,
+    argv: &[String],
+    run: &mut FirebaseRunner<'_>,
+) -> Result<(serde_json::Value, Vec<FirebaseAttempt>), Box<ListingFailure>> {
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            return Err(Box::new(listing_failure(
+                None,
+                project_id,
+                error.into_message(),
+                Vec::new(),
+                run,
+            )))
+        }
+    };
+    let (result, attempt) = invoke_in(&repo, argv, run);
+    let attempts = vec![attempt];
+    match result.and_then(|stdout| unwrap_envelope(&stdout)) {
+        Ok(value) => Ok((value, attempts)),
+        Err(message) => Err(Box::new(listing_failure(
+            Some(&repo),
+            project_id,
+            message,
+            attempts,
+            run,
+        ))),
+    }
 }
 
 /// The best reason available for a non-zero `firebase` exit.
@@ -677,12 +815,25 @@ pub struct RolloutCreateOutcome {
     pub backend_id: String,
     pub git_commit: String,
     pub created: bool,
-    /// Set when the CLI exited zero but did not confirm it in its output.
+    /// Set when GitPulse cannot confirm the outcome either way.
     ///
-    /// The rollout was still started. This field exists so the panel can say
-    /// "started, but the CLI did not confirm it" rather than pick one of the
-    /// two clean answers it does not have.
+    /// Two shapes. With `created: true`, the CLI exited zero but did not
+    /// confirm it in its output: the rollout was started. With
+    /// `created: false`, the CLI never reported an outcome — it was killed at
+    /// the deadline, or lost the network after the request may already have
+    /// reached Google. In both, the one safe next step is to look in the
+    /// Firebase console before retrying, because a second create deploys a
+    /// second time; this field exists so the panel says that instead of
+    /// picking one of the two clean answers it does not have.
     pub unconfirmed: Option<String>,
+    /// Why the CLI refused, when `created` is false. A failed deploy is an
+    /// answer with a reason, so it is returned rather than thrown: thrown, it
+    /// reached the panel as a bare string with nothing to classify or copy.
+    pub error: Option<String>,
+    pub failure: Option<FirebaseFailure>,
+    /// Every `firebase` invocation the attempt made, redacted.
+    pub attempts: Vec<FirebaseAttempt>,
+    pub account: Option<FirebaseAccount>,
 }
 
 /// Confirms a zero-exit envelope, without ever turning a success into an error.
@@ -716,6 +867,11 @@ fn confirm_created(stdout: &[u8]) -> Option<String> {
 /// The argv is built by the caller and passed through whole, so the line the
 /// policy gate judged is the line that runs — the property that matters most
 /// for the one command here that changes what production serves.
+///
+/// `Err` only when nothing ran (the repository failed validation). A CLI that
+/// ran and refused is `Ok` with `created: false` and a classified reason — the
+/// exit status still decides `created`, so a refusal can never read as a
+/// deployment, and a deployment can never read as a refusal.
 pub fn create_rollout(
     repo_path: &str,
     project_id: &str,
@@ -723,15 +879,67 @@ pub fn create_rollout(
     git_commit: &str,
     argv: &[String],
 ) -> Result<RolloutCreateOutcome, CommandError> {
-    let stdout = run_firebase_in(repo_path, argv)?;
-    Ok(RolloutCreateOutcome {
+    create_rollout_with(
+        repo_path,
+        project_id,
+        backend_id,
+        git_commit,
+        argv,
+        &mut spawn_firebase,
+    )
+}
+
+fn create_rollout_with(
+    repo_path: &str,
+    project_id: &str,
+    backend_id: &str,
+    git_commit: &str,
+    argv: &[String],
+    run: &mut FirebaseRunner<'_>,
+) -> Result<RolloutCreateOutcome, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let (result, attempt) = invoke_in(&repo, argv, run);
+    let mut outcome = RolloutCreateOutcome {
         project_id: project_id.to_string(),
         backend_id: backend_id.to_string(),
         git_commit: git_commit.to_string(),
-        created: true,
-        unconfirmed: confirm_created(&stdout),
-    })
+        created: false,
+        unconfirmed: None,
+        error: None,
+        failure: None,
+        attempts: vec![attempt],
+        account: None,
+    };
+    match result {
+        Ok(stdout) => {
+            outcome.created = true;
+            outcome.unconfirmed = confirm_created(&stdout);
+        }
+        Err(message) => {
+            let attempts = std::mem::take(&mut outcome.attempts);
+            let mut failure = listing_failure(Some(&repo), project_id, message, attempts, run);
+            // A timeout or a dropped connection is not a refusal: the create
+            // may have landed before the CLI lost track of it. "Try again" is
+            // the one wrong next step there — it deploys twice.
+            if failure.failure.kind == FirebaseFailureKind::Network {
+                outcome.unconfirmed = Some(DEPLOY_OUTCOME_UNKNOWN.to_string());
+                failure.failure.title =
+                    "The Firebase CLI did not report whether the rollout started".into();
+                failure.failure.next_step = DEPLOY_OUTCOME_UNKNOWN.to_string();
+            }
+            outcome.error = Some(failure.message);
+            outcome.failure = Some(failure.failure);
+            outcome.attempts = failure.attempts;
+            outcome.account = failure.account;
+        }
+    }
+    Ok(outcome)
 }
+
+/// What to do when a deploy's outcome is unknown.
+const DEPLOY_OUTCOME_UNKNOWN: &str = "The rollout may have started before the CLI lost track of \
+     it. Check the backend's rollouts in the Firebase console before deploying again — creating a \
+     rollout twice deploys twice.";
 
 /// Marks which rollout commits exist in the opened checkout.
 ///
@@ -784,34 +992,31 @@ pub fn load_backends_report(
     argv: &[String],
     cli_present: bool,
 ) -> FirebaseBackendsReport {
-    let stdout = match run_firebase_in(repo_path, argv) {
-        Ok(stdout) => stdout,
-        Err(error) => {
-            return FirebaseBackendsReport::unavailable(
-                cli_present,
-                project_id.to_string(),
-                Some(error.into_message()),
-            )
-        }
-    };
-    let result = match unwrap_envelope(&stdout) {
-        Ok(result) => result,
-        Err(error) => {
-            return FirebaseBackendsReport::unavailable(
-                cli_present,
-                project_id.to_string(),
-                Some(error),
-            )
-        }
+    load_backends_report_with(
+        repo_path,
+        project_id,
+        argv,
+        cli_present,
+        &mut spawn_firebase,
+    )
+}
+
+fn load_backends_report_with(
+    repo_path: &str,
+    project_id: &str,
+    argv: &[String],
+    cli_present: bool,
+    run: &mut FirebaseRunner<'_>,
+) -> FirebaseBackendsReport {
+    let (result, attempts) = match run_listing(repo_path, project_id, argv, run) {
+        Ok(listed) => listed,
+        Err(failure) => return FirebaseBackendsReport::failed(cli_present, project_id, *failure),
     };
     let (backends, truncated) = match parse_backends(&result, BACKEND_DISPLAY_LIMIT) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return FirebaseBackendsReport::unavailable(
-                cli_present,
-                project_id.to_string(),
-                Some(error),
-            )
+            let failure = listing_failure(None, project_id, error, attempts, run);
+            return FirebaseBackendsReport::failed(cli_present, project_id, failure);
         }
     };
     let (unreachable, walk_incomplete) = incompleteness(&read_unreachable(&result));
@@ -825,6 +1030,9 @@ pub fn load_backends_report(
         unreachable,
         walk_incomplete,
         error: None,
+        failure: None,
+        attempts,
+        account: None,
     }
 }
 
@@ -836,25 +1044,36 @@ pub fn load_rollouts_report(
     argv: &[String],
     cli_present: bool,
 ) -> FirebaseRolloutsReport {
-    let unavailable = |error: String| {
-        FirebaseRolloutsReport::unavailable(
-            cli_present,
-            project_id.to_string(),
-            backend_id.to_string(),
-            Some(error),
-        )
-    };
-    let stdout = match run_firebase_in(repo_path, argv) {
-        Ok(stdout) => stdout,
-        Err(error) => return unavailable(error.into_message()),
-    };
-    let result = match unwrap_envelope(&stdout) {
-        Ok(result) => result,
-        Err(error) => return unavailable(error),
+    load_rollouts_report_with(
+        repo_path,
+        project_id,
+        backend_id,
+        argv,
+        cli_present,
+        &mut spawn_firebase,
+    )
+}
+
+fn load_rollouts_report_with(
+    repo_path: &str,
+    project_id: &str,
+    backend_id: &str,
+    argv: &[String],
+    cli_present: bool,
+    run: &mut FirebaseRunner<'_>,
+) -> FirebaseRolloutsReport {
+    let (result, attempts) = match run_listing(repo_path, project_id, argv, run) {
+        Ok(listed) => listed,
+        Err(failure) => {
+            return FirebaseRolloutsReport::failed(cli_present, project_id, backend_id, *failure)
+        }
     };
     let (mut rollouts, truncated) = match parse_rollouts(&result, ROLLOUT_DISPLAY_LIMIT) {
         Ok(parsed) => parsed,
-        Err(error) => return unavailable(error),
+        Err(error) => {
+            let failure = listing_failure(None, project_id, error, attempts, run);
+            return FirebaseRolloutsReport::failed(cli_present, project_id, backend_id, failure);
+        }
     };
     mark_local_presence(repo_path, &mut rollouts);
     let (unreachable, walk_incomplete) = incompleteness(&read_unreachable(&result));
@@ -869,6 +1088,9 @@ pub fn load_rollouts_report(
         unreachable,
         walk_incomplete,
         error: None,
+        failure: None,
+        attempts,
+        account: None,
     }
 }
 
@@ -878,6 +1100,216 @@ mod tests {
 
     fn value(source: &str) -> serde_json::Value {
         serde_json::from_str(source).expect("test fixture parses")
+    }
+
+    /// A real (empty) repository `validate_repo` accepts, trusted through the
+    /// production grant path.
+    fn trusted_repo() -> tempfile::TempDir {
+        use crate::procguard::LockedSpawn;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let output = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        crate::test_support::trust_repo(dir.path());
+        dir
+    }
+
+    fn answer(stdout: &str, stderr: &str, code: i32) -> CapturedOutput {
+        CapturedOutput {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            success: code == 0,
+            status_code: code,
+        }
+    }
+
+    /// Google's IAM refusal as firebase-tools' `responseToError.js` wraps it,
+    /// inside the CLI's own `--json` envelope.
+    const IAM_403: &str = r#"{"status":"error","error":"Request to https://firebaseapphosting.googleapis.com/v1beta/projects/acme-prod/locations/-/backends had HTTP Error: 403, Permission 'firebaseapphosting.backends.list' denied on resource '//firebaseapphosting.googleapis.com/projects/acme-prod/locations/-' (or it may not exist)."}"#;
+
+    #[test]
+    fn a_refused_listing_is_classified_records_both_calls_and_names_the_account() {
+        let repo = trusted_repo();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let argv = backends_list_argv("acme-prod").expect("argv");
+        let mut seen: Vec<FirebaseSpawn> = Vec::new();
+        let mut run = |spawn: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+            seen.push(spawn.clone());
+            if spawn.args.first().map(String::as_str) == Some("login:list") {
+                Ok(answer("Logged in as ada@example.com\n", "", 0))
+            } else {
+                Ok(answer(IAM_403, "", 1))
+            }
+        };
+        let report = load_backends_report_with(&repo_path, "acme-prod", &argv, true, &mut run);
+
+        assert!(
+            !report.checked,
+            "a refused listing never reads as an empty one"
+        );
+        let failure = report.failure.as_ref().expect("classified");
+        assert_eq!(
+            failure.kind,
+            super::super::diagnose::FirebaseFailureKind::MissingPermission
+        );
+        assert_eq!(
+            failure.permission.as_deref(),
+            Some("firebaseapphosting.backends.list")
+        );
+        assert_eq!(
+            report.account.as_ref().and_then(|a| a.email.as_deref()),
+            Some("ada@example.com")
+        );
+        assert_eq!(
+            report.attempts.len(),
+            2,
+            "the listing, then the account question"
+        );
+        assert_eq!(report.attempts[0].exit_code, Some(1));
+        assert_eq!(report.attempts[0].argv[1], "apphosting:backends:list");
+
+        let canonical = std::fs::canonicalize(repo.path()).expect("canonical");
+        for spawn in &seen {
+            assert_eq!(
+                spawn.cwd, canonical,
+                "both run in the repository: {:?}",
+                spawn.args
+            );
+            assert!(spawn
+                .env
+                .iter()
+                .any(|(key, _)| key == super::super::diagnose::FIREBASE_DEBUG_PATH_ENV));
+        }
+        assert!(
+            !seen[1].args.iter().any(|arg| arg == "--json"),
+            "login:list --json would return every account's tokens"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_answers_carries_its_record_and_no_failure() {
+        let repo = trusted_repo();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let argv = backends_list_argv("acme-prod").expect("argv");
+        let mut calls = 0;
+        let mut run = |_: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+            calls += 1;
+            Ok(answer(
+                r#"{"status":"success","result":{"backends":[],"unreachable":[]}}"#,
+                "",
+                0,
+            ))
+        };
+        let report = load_backends_report_with(&repo_path, "acme-prod", &argv, true, &mut run);
+        assert!(report.checked && report.failure.is_none() && report.account.is_none());
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(calls, 1, "a success never asks who is signed in");
+    }
+
+    #[test]
+    fn a_refused_deploy_is_an_answer_with_a_reason_and_never_reads_as_created() {
+        let repo = trusted_repo();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let argv = rollout_create_argv("acme-prod", "web", sha).expect("argv");
+        let mut run = |spawn: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+            if spawn.args.first().map(String::as_str) == Some("login:list") {
+                Ok(answer("Logged in as ada@example.com\n", "", 0))
+            } else {
+                Ok(answer(IAM_403, "", 1))
+            }
+        };
+        let outcome =
+            create_rollout_with(&repo_path, "acme-prod", "web", sha, &argv, &mut run).expect("ran");
+        assert!(!outcome.created, "a non-zero exit is never a deployment");
+        assert!(outcome.unconfirmed.is_none());
+        assert_eq!(
+            outcome.failure.map(|f| f.kind),
+            Some(super::super::diagnose::FirebaseFailureKind::MissingPermission)
+        );
+        assert!(outcome.error.as_deref().unwrap_or_default().contains("403"));
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].argv[1], "apphosting:rollouts:create");
+
+        let mut ok = |_: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+            Ok(answer(r#"{"status":"success"}"#, "", 0))
+        };
+        let started =
+            create_rollout_with(&repo_path, "acme-prod", "web", sha, &argv, &mut ok).expect("ran");
+        assert!(started.created && started.failure.is_none() && started.error.is_none());
+        assert_eq!(
+            started.attempts.len(),
+            1,
+            "a deployment never asks who is signed in"
+        );
+    }
+
+    /// A deploy whose CLI was killed at the deadline (no exit observed) or lost
+    /// the network may already have started. It must never read as a clean
+    /// refusal with "try again" — that is the click that deploys twice.
+    #[test]
+    fn a_deploy_with_no_reported_outcome_says_check_before_retrying() {
+        let repo = trusted_repo();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let argv = rollout_create_argv("acme-prod", "web", sha).expect("argv");
+        for answer_with in [
+            Err(CommandError::from(
+                "firebase timed out after 60s and was stopped".to_string(),
+            )),
+            Ok(answer("", "Error: socket hang up", 1)),
+        ] {
+            let mut once = Some(answer_with);
+            let mut run = |_: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+                once.take()
+                    .expect("one call: a network failure never asks for the account")
+            };
+            let outcome = create_rollout_with(&repo_path, "acme-prod", "web", sha, &argv, &mut run)
+                .expect("ran");
+            assert!(!outcome.created);
+            let unconfirmed = outcome.unconfirmed.as_deref().unwrap_or_default();
+            assert!(
+                unconfirmed.contains("before deploying again"),
+                "an unknown outcome must say to check first: {outcome:?}"
+            );
+            let failure = outcome.failure.expect("classified");
+            assert!(
+                !failure.next_step.to_lowercase().contains("try again"),
+                "{failure:?}"
+            );
+            assert!(failure.next_step.contains("Firebase console"));
+        }
+    }
+
+    #[test]
+    fn a_network_failure_does_not_spend_a_call_on_the_account() {
+        let repo = trusted_repo();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let argv = rollouts_list_argv("acme-prod", "web").expect("argv");
+        let mut calls = 0;
+        let mut run = |_: &FirebaseSpawn| -> Result<CapturedOutput, CommandError> {
+            calls += 1;
+            Ok(answer(
+                "",
+                "Error: Failed to make request: getaddrinfo ENOTFOUND firebaseapphosting.googleapis.com",
+                1,
+            ))
+        };
+        let report =
+            load_rollouts_report_with(&repo_path, "acme-prod", "web", &argv, true, &mut run);
+        assert_eq!(
+            report.failure.map(|f| f.kind),
+            Some(super::super::diagnose::FirebaseFailureKind::Network)
+        );
+        assert!(report.account.is_none());
+        assert_eq!(calls, 1);
     }
 
     #[test]

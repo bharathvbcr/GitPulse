@@ -7,6 +7,7 @@ import {
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import { TASK_TERMINAL_STARTING } from "./sessionMessages";
 import type { LauncherKind } from "./tabs";
+import { describeError } from "../ui/copy/describeFailure";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -193,7 +194,7 @@ export function createSessionLifecycle(options: {
       }
     }).catch((error: unknown) => {
       // Keep the slot and process id: a failed kill is not a closed process.
-      state("error", `Close failed; use Sessions to retry. ${String(error)}`);
+      state("error", `Close failed; use Sessions to try again. ${describeError(error, "terminal")}`);
       throw error;
     }).finally(() => { closing = null; });
     return closing;
@@ -231,7 +232,7 @@ export function createSessionLifecycle(options: {
     try {
       kept = await terminalDeadline(transport.detach(target), CONTROL_QUICK_MS, "Detaching terminal", { clock: options.clock, pauseWhileHidden: true });
     } catch (error) {
-      if (id === target) slot?.update(`Still running; its view closed but it couldn't be detached. ${String(error)}`);
+      if (id === target) slot?.update(`Still running; its view closed but it couldn't be detached. ${describeError(error, "terminal")}`);
       throw error;
     }
     // Not kept: it had already ended, and its exit (still subscribed) releases.
@@ -299,7 +300,7 @@ export function createSessionLifecycle(options: {
       slot?.identify(spawned.id);
       if (timedOut) {
         await closeCurrent();
-        state("error", "Starting terminal timed out; the late process was closed. Retry to start again.");
+        state("error", "Starting terminal timed out; the late process was closed. Try again to start it.");
         return;
       }
       input?.dispose();
@@ -358,7 +359,7 @@ export function createSessionLifecycle(options: {
       if (!id) { subscription(); subscription = null; }
       else if (!disposed) void resizeLatest();
     } catch (error) {
-      state("error", String(error));
+      state("error", describeError(error, "terminal"));
       if (!id) release();
     } finally {
       if (watchdog !== null) clearTimeout(watchdog);
@@ -401,7 +402,7 @@ export function createSessionLifecycle(options: {
             resizeWarned = true;
             hooks.warning(error instanceof TerminalTimeoutError
               ? `Resize failed: no answer from the terminal backend for ${Math.round(error.ms / 1000)} s; the host may be overloaded.`
-              : `Resize failed: ${String(error)}`);
+              : `Resize failed: ${describeError(error, "terminal")}`);
           }
         }
       }
@@ -426,7 +427,7 @@ export function createSessionLifecycle(options: {
         await start();
         return lastLaunch;
       })().catch((error: unknown): LaunchOutcome => {
-        state("error", String(error));
+        state("error", describeError(error, "terminal"));
         return "failed";
       }).finally(() => { restarting = null; });
       return restarting;
@@ -445,7 +446,7 @@ export function createSessionLifecycle(options: {
       disposed = true;
       input?.dispose();
       pendingSize = null;
-      // Failures keep the slot in the global registry, with an explicit retry.
+      // Failures keep the slot in the global registry, with an explicit Try again.
       void leave().catch(() => { /* leave/closeCurrent retained and reported ownership */ });
     },
   };

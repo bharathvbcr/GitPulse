@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "MarkDev vault indexing: notes, the link graph, tags, rename, and search"
 license = "MIT"
+rust-version = "1.100"
 
 [dependencies]
 markdev-md = { path = "../markdev-md" }

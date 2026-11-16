@@ -88,7 +88,10 @@
   } from "../terminal/runResult";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
   import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -122,6 +125,15 @@
   let selectedScope = $state(false);
   let coverageRoot = $state<HTMLDivElement>();
   let languageStrip = $state<HTMLDivElement>();
+  /** The report files list in the aside opens on LIST_PREVIEW_ROWS and resets per repository. */
+  let artifactsExpanded = $state(false);
+  // A derived compares by value, so the reset runs on a repository switch and
+  // not on every repoStore publish (repoStoreEffects.contract.test.ts).
+  const artifactsRepo = $derived($repoStore.currentPath ?? "");
+  $effect(() => {
+    void artifactsRepo;
+    artifactsExpanded = false;
+  });
   const visibleFiles = $derived.by(() => filterCoverageFiles(report?.files ?? [], fileQuery, languageFilter, coverageFilter, fileSort));
   const filterLanguages = $derived.by(() => [...new Set(report?.files.map(file => file.language) ?? [])].sort());
   const selectedFile = $derived.by(() => report?.files.find(file => file.path.toLowerCase() === selectedPath?.toLowerCase()));
@@ -1462,9 +1474,12 @@
        and the facts about the scan belong to the same statement, and splitting
        them across stacked full-width strips cost ~100px above the data while
        leaving "Partial coverage" sitting alone with no cause beside it. -->
-  <div data-coverage-header class="px-4 py-2 bg-surface/60 flex flex-wrap gap-x-3 gap-y-1.5 items-center justify-between font-sans shrink-0">
-    <div class="flex items-center gap-x-2.5 gap-y-1 min-w-0 flex-wrap">
-      <Percent size={16} class="text-accent shrink-0" />
+  <div data-coverage-header class="shrink-0 font-sans">
+  <PageHeader
+    title="Coverage"
+    description={`Last scanned: ${lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}`}
+  >
+    {#snippet meta()}
       {#if report && report.overall.lines_found > 0}
         <div class="flex items-baseline gap-2 shrink-0">
           <span
@@ -1482,11 +1497,7 @@
         <span class="text-textMuted" title="No parsable coverage artifact contributed line records">
           No coverage data
         </span>
-      {:else}
-        <span class="text-textMuted">Test coverage</span>
       {/if}
-
-      <span class="w-px self-stretch bg-border/60 shrink-0" aria-hidden="true"></span>
 
       <!-- The status word carries its own reasons. "Partial coverage" has six
            possible causes and named none of them, so the one question it
@@ -1504,9 +1515,6 @@
       {#if scanReasons.length > 0}
         <span class="text-meta text-warn truncate min-w-0" title={scanStatusTitle}>{scanReasons[0]}{scanReasons.length > 1 ? ` · +${scanReasons.length - 1} more` : ""}</span>
       {/if}
-      <span class="text-meta text-textMuted truncate min-w-0">
-        Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}
-      </span>
       <!-- Qualifies a report that was read. With nothing parsed there is no
            artifact whose age could be unknown, and the caveat was noise. -->
       {#if report?.artifacts.some((artifact) => !artifact.skipped)}
@@ -1516,8 +1524,8 @@
         >Artifact age unknown</span>
       {/if}
       {#if scanError}<button type="button" class="gp-btn shrink-0" data-size="sm" disabled={isScanning} onclick={rescan}>Try again</button>{/if}
-    </div>
-    <div class="flex flex-wrap items-center gap-2">
+    {/snippet}
+    {#snippet actions()}
       <button
         type="button"
         class="gp-icon-btn" data-size="sm"
@@ -1590,7 +1598,8 @@
       >
         <RefreshCw size={13} class={isScanning ? "animate-spin" : ""} />
       </button>
-    </div>
+    {/snippet}
+  </PageHeader>
   </div>
 
   {#if report && scanError}
@@ -1652,7 +1661,7 @@
        into `unfoundViews`'s trailing summary, which keeps the found families
        and their expected paths one hover away. -->
   {#if report && (stripFamilies.length > 0 || report.truncated || Object.keys(scriptStatuses).length > 0)}
-    <div data-coverage-family-strip class="bg-surface/40 font-sans shrink-0">
+    <div data-coverage-family-strip class="font-sans shrink-0">
       <!-- Wraps; it does not scroll. With `overflow-x-auto` a long reason on
            one family (Python's "No Python tests found …") pushed every family
            after it past the right edge, behind a scrollbar macOS hides, so the
@@ -1665,7 +1674,7 @@
             <span class="text-textPrimary/80 shrink-0">{view.status.languages.join(", ") || view.label}</span>
             <span class="text-faint shrink-0">no report</span>
             {#if view.toolDetail}
-              <span class="text-warn truncate min-w-0 max-w-[32rem]" title={view.toolDetail}>{view.toolDetail}</span>
+              <span class="text-warn truncate min-w-0 max-w-[32rem]" data-width-cap="one truncating line of tool output beside the family label" title={view.toolDetail}>{view.toolDetail}</span>
             {/if}
             {#if view.pipeline}
               <button
@@ -1789,7 +1798,7 @@
   {#if report && report.languages.length > 0}
     <!-- The shared cue, not a fade class on the strip itself: a fade utility
          on the scroller painted its gradient across the whole bar. -->
-    <div class="relative bg-surface/20">
+    <div class="relative">
     <div bind:this={languageStrip} class="px-4 py-2 flex items-center gap-3 overflow-x-auto font-sans">
       <span class="gp-label shrink-0">By language</span>
       <!-- Fixed track width, not `min-w-36`. The bar length encodes the
@@ -1829,7 +1838,7 @@
   {/key}
 
   <div class="flex-1 flex min-h-0 min-w-0">
-    <div class="w-72 max-w-[40%] min-w-40 shrink-0 flex flex-col bg-surface/40 p-1.5 min-h-0">
+    <div class="gp-float-card w-72 max-w-[40%] min-w-40 shrink-0 flex flex-col p-1.5 min-h-0" data-coverage-file-card>
       {#if isScanning && !report}
         <div class="flex-1 flex items-center justify-center text-textMuted font-sans">Scanning coverage…</div>
       {:else if report && report.files.length > 0}
@@ -1929,7 +1938,7 @@
 
       {#if report && report.artifacts.length > 0}
         <div class="p-2 text-micro text-textMuted font-sans max-h-28 overflow-auto">
-          {#each report.artifacts as artifact, i (`${i}:${artifact.path}`)}
+          {#each previewSlice(report.artifacts, artifactsExpanded, LIST_PREVIEW_ROWS) as artifact, i (`${i}:${artifact.path}`)}
             <div class="truncate" title={artifact.skip_reason || artifact.format}>
               {artifact.path}
               <span class="text-faint">({artifact.format})</span>
@@ -1938,6 +1947,9 @@
               {/if}
             </div>
           {/each}
+        </div>
+        <div class="px-2 pb-2 empty:hidden">
+          <ListPreviewToggle total={report.artifacts.length} noun="coverage reports" bind:expanded={artifactsExpanded} />
         </div>
       {/if}
     </div>
@@ -1948,7 +1960,7 @@
              the gutter beneath all belong to the same pane; the legend in
              particular used to sit in the app header, a pane away from the
              only thing it explains. -->
-        <div class="px-3 py-1.5 bg-surface/30 font-sans flex flex-wrap items-center gap-x-2 gap-y-1 shrink-0">
+        <div class="px-3 py-1.5 font-sans flex flex-wrap items-center gap-x-2 gap-y-1 shrink-0">
           <span class="min-w-0 flex-1 truncate text-textPrimary" title={selectedPath}>{selectedPath}</span>
           <div class="flex items-center gap-1 shrink-0">
             <button type="button" class="gp-btn" data-size="sm" aria-label="Previous missed block" title={prevBlockTip} aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Prev</button>
@@ -1999,12 +2011,13 @@
               That is unmeasured, not 0%. Generate a report for each language below; the panel rescans when a run finishes.
             </p>
           </div>
+          <div class="gp-page-grid [--gp-page-col:24rem]">
           {#each familyViews as view (view.family)}
             {@const skipped = report.artifacts.filter((artifact) => artifact.skipped && artifact.family === view.family)}
             <section
               data-coverage-family-card={view.family}
               aria-label="{view.label} coverage"
-              class="max-w-3xl rounded-xl border border-edge bg-surface/40 p-3 space-y-2"
+              class="rounded-xl border border-edge bg-surface/40 p-3 space-y-2"
             >
               <div class="flex flex-wrap items-center gap-2">
                 <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {view.status.color_hex}"></span>
@@ -2066,6 +2079,7 @@
               </p>
             </section>
           {/each}
+          </div>
           {#if familyViews.length === 0}
             <p class="text-textMuted">No programming languages found to scan.</p>
           {/if}
@@ -2074,7 +2088,7 @@
         <div class="h-full flex items-center justify-center text-textMuted font-sans">Loading {selectedPath}…</div>
       {:else if fileError}
         <div class="h-full flex items-center justify-center font-sans p-4">
-          <div class="gp-notice max-w-lg" data-tone="danger" role="alert">
+          <div class="gp-notice" data-tone="danger" role="alert">
             <TriangleAlert size={13} class="mt-px shrink-0" style="color: var(--gp-notice-ink)" />
             <div class="min-w-0 flex-1" title={fileError}>
               <span class="font-medium">{fileFailure?.headline}</span>
@@ -2121,8 +2135,8 @@
     </div>
 
     {#if aiOpen && report}
-      <aside class="w-88 shrink-0 flex flex-col bg-surface/30 overflow-hidden font-sans">
-        <div class="px-3 py-2 bg-surface/40 space-y-2 shrink-0">
+      <aside class="gp-float-card w-88 shrink-0 flex flex-col font-sans" data-coverage-analysis-card>
+        <div class="px-3 py-2 space-y-2 shrink-0">
           <h3 class="gp-label flex items-center gap-1.5">
             <Sparkles size={11} class="text-accent" />
             Manvi coverage analysis

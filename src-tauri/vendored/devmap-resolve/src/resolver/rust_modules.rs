@@ -513,9 +513,7 @@ impl Resolver {
         // name, so dedup left one hit. The later body is `base@<start>`. That
         // is still one method, and the path is one caller of the unsuffixed
         // name, not a fan-out and not a miss.
-        let Some((target_file, target_symbol)) = Self::one_cfg_identity(&matched) else {
-            return None;
-        };
+        let (target_file, target_symbol) = Self::one_cfg_identity(&matched)?;
         Some(Resolution::ReceiverType {
             target_symbol: target_symbol.clone(),
             target_file: target_file.clone(),
@@ -529,7 +527,7 @@ impl Resolver {
         let Some(modules) = self.rust_inline_modules.get(file) else {
             return false;
         };
-        let path = receiver.strip_prefix("self::").unwrap_or(receiver);
+        let path = receiver.trim_prefix("self::");
         !path.is_empty()
             && path
                 .split("::")

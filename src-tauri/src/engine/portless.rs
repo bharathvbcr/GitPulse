@@ -142,7 +142,7 @@ fn is_dns_label(part: &str) -> bool {
 /// allowed. This is the only test of what a portless hostname is.
 fn portless_labels(hostname: &str) -> Option<Vec<String>> {
     let lowered = hostname.to_ascii_lowercase();
-    let host = lowered.strip_suffix('.').unwrap_or(&lowered);
+    let host = lowered.trim_suffix('.');
     if host.len() > 253 {
         return None;
     }

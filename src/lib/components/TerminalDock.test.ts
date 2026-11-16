@@ -91,19 +91,20 @@ describe("TerminalDock", () => {
     const stop = source.indexOf("function handleSeparatorKey(");
     expect(start).toBeGreaterThan(-1);
     const drag = source.slice(start, stop);
-    const move = drag.slice(drag.indexOf("const move = "), drag.indexOf("const end = "));
-    expect(move).toContain("dragHeight = clampTerminalDockHeight(");
+    // The capture / move / end / cancel plumbing and the clamp are ui/paneHeight's
+    // (its test pins them); the dock's part is what the callbacks do with a height.
+    expect(drag).toContain("startPaneDrag(event, startHeight, TERMINAL_DOCK_BOUNDS, {");
+    const move = drag.slice(drag.indexOf("onHeight:"), drag.indexOf("onEnd:"));
+    expect(move).toContain("dragHeight = px");
     expect(move).not.toContain("interfaceStore.");
-    const end = drag.slice(drag.indexOf("const end = "));
+    const end = drag.slice(drag.indexOf("onEnd:"));
     expect(end).toContain("commitDragHeight();");
-    expect(drag).toContain('handle.addEventListener("pointerup", end);');
-    expect(drag).toContain('handle.addEventListener("pointercancel", end);');
     // The rendered height follows the pending drag value while one exists.
     expect(source).toContain("fitTerminalDockHeight(dragHeight, containerHeight)");
     // Keyboard nudges still write straight through.
     const keys = source.slice(stop);
-    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight + TERMINAL_DOCK_RESIZE_STEP)");
-    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight - TERMINAL_DOCK_RESIZE_STEP)");
+    expect(keys).toContain("nudgedPaneHeight(event.key, currentHeight, TERMINAL_DOCK_RESIZE_STEP)");
+    expect(keys).toContain("interfaceStore.setTerminalDockHeight(next)");
   });
 });
 
@@ -137,7 +138,8 @@ describe("TerminalDock modes", () => {
   it("dismisses on an outside pointerdown only while floating and open, with its status-bar trigger inside", () => {
     expect(source).toContain("use:popover={dockDismissOptions}");
     expect(source).toContain('pointer: overlay && open && !leaving ? "pointerdown" : "none"');
-    expect(source).toContain('floatingPanelDismiss("[data-terminal-dock]", "[data-terminal-pill], [data-terminal-pill-menu]")');
+    expect(source).toContain('const DOCK_TRIGGER = "[data-terminal-pill], [data-terminal-pill-menu]";');
+    expect(source).toContain('floatingPanelDismiss("[data-terminal-dock]", DOCK_TRIGGER)');
   });
 
   it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
@@ -180,6 +182,23 @@ describe("App hosts the terminal as a dock, not a view", () => {
     // Control, not Command, on macOS too: ⌘` is the OS window cycler.
     expect(app).toContain('e.key === "`"');
     expect(app).toContain("repoStore.toggleTerminal()");
+  });
+
+  it("hides on a double-click on the page or its tab bar, heard before the page can stop it", () => {
+    // vitest never runs $effect, so this pins the wiring; the judgement of
+    // which targets count is panelDismiss.test.ts's, and the real double-click
+    // is harness/terminal.html's "double-click on the page hides the dock".
+    expect(source).toContain(
+      'const scope = { panel: "[data-terminal-dock]", trigger: DOCK_TRIGGER, column, page: "[data-viewbar]" };',
+    );
+    expect(source).toMatch(
+      /if \(isWindowDragDoubleClick\(event\.composedPath\(\)\)\) return;\s*if \(pageDoubleClickHidesPanel\(event\.target, scope\)\) onClose\(\);/,
+    );
+    expect(source).toContain('document.addEventListener("dblclick", onDoubleClick, true);');
+    expect(source).toContain('document.removeEventListener("dblclick", onDoubleClick, true);');
+    expect(source).toMatch(/if \(!column \|\| !open\) return;\s*const scope/);
+    // The tab bar the scope names is the view bar's root.
+    expect(readFileSync(join(here, "ViewBar.svelte"), "utf8")).toMatch(/<nav[^>]*\n(?:[^>]*\n)*?\s*data-viewbar\n/);
   });
 
   it("reads the dock's open state from the repository tab, not a workspace preference", () => {

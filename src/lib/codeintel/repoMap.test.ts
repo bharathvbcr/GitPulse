@@ -4,6 +4,7 @@ import {
   formatCap,
   preferredDeadLists,
   roleSample,
+  unavailableAnalysisLabel,
   unwiredExclusionSummary,
 } from "./repoMap";
 import type { RepoMapDocument, RepoMapSubsystem } from "./types";
@@ -279,5 +280,18 @@ describe("unwiredExclusionSummary", () => {
       excluded_exempt: -1 as unknown as number,
     });
     expect(phrases).toEqual([]);
+  });
+});
+
+describe("unavailableAnalysisLabel", () => {
+  it("spells a producer key in plain words", () => {
+    expect(unavailableAnalysisLabel("unreachable_files")).toBe("unreachable files");
+    expect(unavailableAnalysisLabel("dead-symbol__scan")).toBe("dead symbol scan");
+  });
+
+  it("never returns an identifier or an empty name", () => {
+    expect(unavailableAnalysisLabel("")).toBe("an analysis");
+    expect(unavailableAnalysisLabel("___")).toBe("an analysis");
+    expect(unavailableAnalysisLabel("Unwired")).not.toContain("_");
   });
 });

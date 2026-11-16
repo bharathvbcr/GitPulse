@@ -16,6 +16,29 @@ describe("CommitDetails", () => {
     expect(body).toBeDefined();
   });
 
+  it("has a resizable top edge: an accessible separator, no fixed h-64", () => {
+    expect(source).not.toContain("h-64");
+    expect(source).toContain('aria-label="Resize the commit details pane"');
+    expect(source).toContain('role="separator"');
+    expect(source).toContain("aria-valuemax={paneCeiling}");
+    expect(source).toContain('title="Drag to resize · ↑/↓ to nudge"');
+    expect(source).toContain("startPaneDrag(event, paneHeight, COMMIT_PANE_BOUNDS, {");
+    expect(source).toContain("nudgedPaneHeight(event.key, paneHeight, COMMIT_PANE_RESIZE_STEP)");
+  });
+
+  it("sizes from the stored preference, capped by the column, and writes the store once per drag", () => {
+    expect(source).toContain("dragHeight ?? $interfaceStore.commitPaneHeight");
+    expect(source).toContain("COMMIT_PANE_MIN_VIEW_HEIGHT");
+    expect(source).toContain("observeResize(parent,");
+    const start = source.indexOf("function startResize(");
+    const stop = source.indexOf("function handleResizeKey(");
+    const drag = source.slice(start, stop);
+    expect(drag.slice(drag.indexOf("onHeight:"), drag.indexOf("onEnd:"))).not.toContain("interfaceStore.");
+    expect(drag).toContain("commitDragHeight();");
+    expect(source).toContain("interfaceStore.setCommitPaneHeight(dragHeight)");
+    expect(source).toContain("interfaceStore.setCommitPaneHeight(next)");
+  });
+
   it("integrates LanguageLogo and formatPathParts for changed files", () => {
     expect(source).toContain("LanguageLogo");
     expect(source).toContain("formatPathParts");

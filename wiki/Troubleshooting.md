@@ -23,7 +23,7 @@ GitPulse never stores GitHub credentials. If `gh` is missing, the rest of the ap
 
 ## Policy shows Unchecked
 
-MANVI is optional. **Unchecked** means the harness was absent or that rung could not run. It is not a pass. Install from **Settings → Agents** (or the MANVI panel's Install button) when a sibling `Manvi` checkout is available, or run `go -C manvi install ./cmd/manvi` yourself, then press Reconnect. Otherwise treat Unchecked as "this check did not run". See [[Policy and AI]].
+MANVI is optional. **Unchecked** means the harness was absent or that rung could not run. It is not a pass. Install from **Settings → Agents** (or the policy card in Work → Overview) when a sibling `Manvi` checkout is available, or run `go -C manvi install ./cmd/manvi` yourself, then press Reconnect. Otherwise treat Unchecked as "this check did not run". See [[Policy and AI]].
 
 ## Local AI will not connect
 
@@ -39,7 +39,7 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 ## Code map / Map panel says unavailable
 
-DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **27**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
+DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
 Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
 lookup, build/background-refresh state, visible errors, and recent DevMap entries
@@ -58,7 +58,7 @@ rotated out. Each copied section is capped at 64 Ki characters and says when cut
 
 ## Terminal vanished after switching views
 
-The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switching **repositories** does. Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size or toggle the dock to return to the repository view.
+The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositories** does not kill the session: each repository tab has its own terminal dock and preserves its sessions until you close the terminal tab or repository tab (and on Unix, PTY sessions live in `gitpulse-ptyd` and survive app quit or crash unless stopped). Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size, double-click a page header/background, or toggle the dock to return to the repository view.
 
 ## Terminal shows non-GPU rendering or text glitching
 

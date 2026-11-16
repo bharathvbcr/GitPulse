@@ -1,5 +1,13 @@
 import { writable } from "svelte/store";
-import { isSessionId, normalizePaneFilePath, type LauncherKind, type SessionKind, type TabKind } from "./tabs";
+import {
+  isResumableSessionRef,
+  isSessionId,
+  normalizePaneFilePath,
+  type LauncherKind,
+  type ResumeLaunch,
+  type SessionKind,
+  type TabKind,
+} from "./tabs";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
@@ -40,18 +48,15 @@ export function agentPromptArgs(launcher: SessionKind, prompt?: string): string[
 }
 
 /**
- * The arguments that pick a Claude Code or Antigravity conversation back up,
- * optionally with a first prompt: `claude --resume <id> -- <prompt>` or
- * `agy --conversation <id> --prompt-interactive <prompt>`. Nothing here goes
- * through a shell. The prompt is held to the same ceiling as an initial prompt;
- * `sessionId` must be a valid canonical session UUID.
+ * Prompt arguments that accompany a typed `resume: { session_id, fork }`
+ * request to `cmd_terminal_spawn` (`S2-07`: the Rust owner `terminal_command::resume`
+ * builds `--resume` / `--conversation` / `--continue`, never the frontend).
  */
 export function resumeArgs(sessionId: string, prompt?: string, provider: "claude" | "agy" = "claude"): string[] {
-  if (!isSessionId(sessionId)) throw new Error("Only a Claude Code conversation with a valid session id can be resumed.");
-  if (provider === "agy") {
-    return ["--conversation", sessionId, ...(agentPromptArgs("agy", prompt) ?? [])];
+  if (!isResumableSessionRef(sessionId, provider)) {
+    throw new Error("Only a Claude Code or Antigravity conversation with a valid session id can be resumed.");
   }
-  return ["--resume", sessionId, ...(agentPromptArgs("claude", prompt) ?? [])];
+  return [...(agentPromptArgs(provider, prompt) ?? [])];
 }
 
 interface LaunchRequest {
@@ -75,6 +80,10 @@ interface LaunchRequest {
   column?: number | null;
   /** Pre-arms quiescent peer auto-wake on unattended kickoff launches. */
   autoWake?: boolean;
+  /** Typed resume or fork-resume launch metadata (`--fork-session`). */
+  resume?: ResumeLaunch;
+  /** Optional custom tab label when opening this requested session. */
+  name?: string;
   complete(error?: string): void;
 }
 
@@ -139,13 +148,36 @@ export function createTerminalLaunchRequests() {
       launcher: SessionKind,
       prompt?: string,
       signal?: AbortSignal,
-      options?: { autoWake?: boolean },
+      options?: { autoWake?: boolean; resume?: ResumeLaunch; name?: string },
     ): Promise<void> {
       // Validates here, at the boundary, so a bad prompt is refused before a
       // panel is asked to open a tab for it. A promptless launch returns null
       // for every launcher, which is what makes "new shell" fit this channel.
       agentPromptArgs(launcher, prompt);
-      return enqueue({ repoPath, launcher, prompt, ...(options?.autoWake ? { autoWake: true } : {}) }, signal);
+      if (options?.resume) {
+        if (options.resume.fork) {
+          if (launcher !== "claude" || !isSessionId(options.resume.sessionId)) {
+            throw new Error("Forking a conversation requires Claude Code with a valid session UUID.");
+          }
+        } else if (
+          (launcher !== "claude" && launcher !== "agy")
+          || !isResumableSessionRef(options.resume.sessionId, launcher)
+        ) {
+          throw new Error("Only a Claude Code or Antigravity conversation with a valid session id can be resumed.");
+        }
+      }
+      const trimmedName = options?.name?.trim();
+      return enqueue(
+        {
+          repoPath,
+          launcher,
+          prompt,
+          ...(options?.autoWake ? { autoWake: true } : {}),
+          ...(options?.resume ? { resume: { ...options.resume } } : {}),
+          ...(trimmedName ? { name: trimmedName } : {}),
+        },
+        signal,
+      );
     },
     /**
      * A browser session on `url` in `repoPath`'s dock: a session already on

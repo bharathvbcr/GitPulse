@@ -656,8 +656,8 @@
           {#each linkedThreads as thread (thread.thread_key)}
             <li class="linked-thread-item">
               <div class="subtask-row-top">
-                <span class="gp-chip" data-tone="neutral">{thread.status}</span>
-                <span class="kind">{thread.from_agent}</span>
+                <span class="gp-chip shrink-0" data-tone="neutral">{thread.status}</span>
+                <span class="kind thread-sender" title={thread.from_agent}>{thread.from_agent}</span>
                 <span class="title">{parseAskSummary(thread.latest_msg.body)}</span>
               </div>
               {#if repositoryPath.trim()}
@@ -760,6 +760,9 @@
   .done{text-decoration:line-through;color:rgb(var(--c-text-muted))}
   .gone{color:rgb(var(--c-text-muted));font-style:italic}
   .kind{color:rgb(var(--c-text-muted));flex-shrink:0}
+  /* A sender is often a bare session uuid: it gives way to the summary, cut
+     with an ellipsis, instead of pushing the row past the sheet's column. */
+  .thread-sender{flex:0 1 auto;min-width:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .add{display:flex;gap:6px;align-items:center}
   .add input{flex:1}
   .add button,.add select{flex-shrink:0}

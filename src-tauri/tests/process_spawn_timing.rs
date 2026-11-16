@@ -10,7 +10,7 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
-use gitpulse_lib::engine::git_cli::capture_command;
+use gitpulse_lib::engine::process::capture_command;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

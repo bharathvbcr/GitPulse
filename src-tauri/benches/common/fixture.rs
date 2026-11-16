@@ -33,11 +33,13 @@ pub fn git(cwd: &Path, args: &[&str]) -> String {
 }
 
 /// Admits the fixture through the real trust boundary, into the hermetic
-/// store. A session grant for a repository the bench itself just created.
+/// store. Saved on Unix so the out-of-process `gitpulse-ptyd` reads it too;
+/// a session grant on non-Unix where terminals run in-process.
 pub fn trust_repo(repo: &Path) {
     let path = repo.to_str().expect("fixture path is UTF-8");
     let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
+    gitpulse_lib::repository_trust::grant(path, &preview.identity, cfg!(unix))
+        .expect("approve fixture");
 }
 
 /// The shape of a generated repository.

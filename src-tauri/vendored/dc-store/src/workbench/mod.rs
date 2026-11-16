@@ -12,6 +12,8 @@ mod input;
 mod items;
 mod legacy;
 mod notifications;
+mod outbox;
+mod queue;
 mod refine;
 mod runs;
 mod scope;
@@ -31,7 +33,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 15;
+pub const WORKBENCH_SCHEMA: i64 = 17;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -43,7 +45,24 @@ const MAX_PAGE_DOCUMENTS: usize = 2 * 1024 * 1024 - 4096;
 /// repository is somebody else's work and never offered here.
 pub const LOCAL_REPOSITORY_ID: &str = "this-repo";
 const LOCAL_REPOSITORY_IDENTITY: &str = "devcouncil:this-repo";
-const STATUSES: &[&str] = &["inbox", "backlog", "ready", "in_progress", "review", "done"];
+const STATUSES: &[&str] = &["backlog", "ready", "in_progress", "review", "done"];
+/// The name the Backlog column had before the Inbox status was merged into it
+/// (schema 16). It is still accepted from a caller, as an alias, and is never
+/// stored as a task's status or returned as one.
+const LEGACY_INBOX: &str = "inbox";
+
+/// The one place a task status from outside is read, for a save and for a
+/// listing alike: the legacy `inbox` is `backlog`, and any other word outside
+/// the vocabulary is refused. The alias is the exact lowercase word, with no
+/// trimming and no case folding, so nothing else is silently accepted.
+fn task_status(raw: &str) -> Result<&'static str> {
+    let named = if raw == LEGACY_INBOX { "backlog" } else { raw };
+    STATUSES
+        .iter()
+        .copied()
+        .find(|known| *known == named)
+        .ok_or_else(|| Error::invalid("unknown task status"))
+}
 
 #[derive(Debug)]
 pub struct Error {
@@ -93,6 +112,9 @@ enum Entity {
     NotificationSettings,
     NotificationDelivery,
     Decision,
+    Queue,
+    IssueSync,
+    Outbox,
 }
 impl Entity {
     fn table(self) -> &'static str {
@@ -107,6 +129,9 @@ impl Entity {
             Self::NotificationSettings => "work_notification_settings",
             Self::NotificationDelivery => "work_notification_deliveries",
             Self::Decision => "work_decisions",
+            Self::Queue => "work_queue",
+            Self::IssueSync => "work_issue_sync",
+            Self::Outbox => "work_outbox",
         }
     }
     fn name(self) -> &'static str {
@@ -121,6 +146,9 @@ impl Entity {
             Self::NotificationSettings => "notification_settings",
             Self::NotificationDelivery => "notification_delivery",
             Self::Decision => "decision",
+            Self::Queue => "queue",
+            Self::IssueSync => "issue_sync",
+            Self::Outbox => "outbox",
         }
     }
     fn live(self) -> &'static str {
@@ -132,7 +160,10 @@ impl Entity {
             | Self::Attention
             | Self::NotificationSettings
             | Self::NotificationDelivery
-            | Self::Decision => "1",
+            | Self::Decision
+            | Self::Queue
+            | Self::IssueSync
+            | Self::Outbox => "1",
             _ => "deleted=0",
         }
     }
@@ -206,6 +237,24 @@ impl Store {
                 | "decisions.claim"
                 | "decisions.resolve"
                 | "signals.record"
+                | "queue.enqueue"
+                | "queue.acquire"
+                | "queue.member.update"
+                | "queue.verify"
+                | "queue.sweep"
+                | "queue.cancel"
+                | "github_sync.link"
+                | "github_sync.observe"
+                | "github_sync.accept"
+                | "github_sync.dismiss"
+                | "outbox.enqueue"
+                | "outbox.claim"
+                | "outbox.sweep_restart"
+                | "outbox.mark_unknown"
+                | "outbox.preflight"
+                | "outbox.complete"
+                | "outbox.fail"
+                | "outbox.cancel"
                 | "store.compact"
                 | "store.upgrade"
         );
@@ -219,6 +268,7 @@ impl Store {
                     | "items.list"
                     | "items.get"
                     | "items.brief.get"
+                    | "items.readiness"
                     | "events.list"
                     | "items.history"
                     | "enhancements.get"
@@ -235,6 +285,13 @@ impl Store {
                     | "notifications.activations.list"
                     | "decisions.get"
                     | "decisions.list"
+                    | "queue.get"
+                    | "queue.list"
+                    | "github_sync.get"
+                    | "github_sync.list"
+                    | "outbox.preview"
+                    | "outbox.get"
+                    | "outbox.list"
             )
         {
             return Err(Error {
@@ -280,6 +337,7 @@ impl Store {
                     | "notifications.pending.list"
                     | "decisions.get"
                     | "decisions.list"
+                    | "outbox.list"
             ) {
                 self.workbench_now_millis()? / 1000
             } else {
@@ -484,6 +542,23 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
             // a signal row by revision comparison, so older hosts must refuse
             // this profile.
             conn.execute("UPDATE work_meta SET version=15 WHERE id=1", [])?;
+        }
+        15 => {
+            // The Inbox status is merged into Backlog: no task is stored as
+            // `inbox` any more, and every stored copy of one is rewritten
+            // (`status_merge.sql`). No table changes. A schema 15 host would
+            // keep offering an Inbox column, empty now that its tasks moved to
+            // Backlog, and would save `inbox` into the profile, which this
+            // build refuses to read as a status. Older hosts must refuse this
+            // profile.
+            conn.execute_batch(include_str!("status_merge.sql"))?;
+        }
+        16 => {
+            // Cross-repository execution queue (`work_queue`, `work_queue_members`),
+            // two-way GitHub issue sync (`work_issue_sync`), and opt-in confirmed
+            // durable outbox (`work_outbox`). Older hosts do not know these
+            // tables or their invariants and must refuse this profile.
+            conn.execute_batch(include_str!("queue_outbox.sql"))?;
         }
         other => {
             return Err(Error {
@@ -695,6 +770,24 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         | "notifications.ack" => Entity::NotificationDelivery,
         "runs.prepare" | "runs.claim" | "runs.started" | "runs.bind_thread" | "runs.protocol"
         | "runs.finish" | "runs.reconcile" | "runs.cancel" => Entity::Run,
+        "queue.enqueue"
+        | "queue.acquire"
+        | "queue.member.update"
+        | "queue.verify"
+        | "queue.sweep"
+        | "queue.cancel" => Entity::Queue,
+        "github_sync.link"
+        | "github_sync.observe"
+        | "github_sync.accept"
+        | "github_sync.dismiss" => Entity::IssueSync,
+        "outbox.enqueue"
+        | "outbox.claim"
+        | "outbox.sweep_restart"
+        | "outbox.mark_unknown"
+        | "outbox.preflight"
+        | "outbox.complete"
+        | "outbox.fail"
+        | "outbox.cancel" => Entity::Outbox,
         "enhancements.create"
         | "enhancements.complete"
         | "enhancements.accept"
@@ -782,6 +875,14 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         }
         method if matches!(entity, Entity::Run) => {
             runs::mutate(input, method, &id, revision, now)?;
+            Affected::none()
+        }
+        method if matches!(entity, Entity::Queue) => {
+            queue::mutate(input, method, &id, revision, now)?;
+            Affected::none()
+        }
+        method if matches!(entity, Entity::IssueSync | Entity::Outbox) => {
+            outbox::mutate(input, entity, method, &id, revision, now)?;
             Affected::none()
         }
         _ => {
@@ -1051,10 +1152,10 @@ fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Re
             "the repository is already linked to that checkout",
         ));
     }
-    if runs::active_on_repository(input.conn, id, now)? {
+    if runs::active_on_repository(input.conn, id, now)? || queue::active_on_repository(input.conn, id)? {
         return Err(Error {
             code: "repository_busy",
-            message: "a run is active on this repository; finish or cancel it before relinking"
+            message: "a run or queue lease is active on this repository; finish or cancel it before relinking"
                 .into(),
         });
     }
@@ -1089,11 +1190,12 @@ fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Re
                 [&holder],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
-            if links + members + runs > 0 {
+            let queue_members = queue::member_count_for_repository(input.conn, &holder)?;
+            if links + members + runs + queue_members > 0 {
                 return Err(Error {
                     code: "repository_not_empty",
                     message: format!(
-                        "the repository registered at that checkout holds {links} task link(s), {members} workspace membership(s) and {runs} run(s); distinct records are never merged"
+                        "the repository registered at that checkout holds {links} task link(s), {members} workspace membership(s), {runs} run(s) and {queue_members} queue membership(s); distinct records are never merged"
                     ),
                 });
             }
@@ -1169,10 +1271,7 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
     if kind.trim().is_empty() {
         return Err(Error::invalid("kind must not be blank"));
     }
-    let status = input.text("status", 32)?.unwrap_or_else(|| "inbox".into());
-    if !STATUSES.contains(&status.as_str()) {
-        return Err(Error::invalid("unknown task status"));
-    }
+    let status = task_status(input.text("status", 32)?.as_deref().unwrap_or("backlog"))?;
     let priority = input.integer("priority", Some(1), 3)?;
     let position = input.integer("position", Some(0), MAX_INTEGER)?;
     let severity = input.text("severity", 32)?;
@@ -1221,7 +1320,7 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
             "deleted task IDs cannot be reused; restore the task instead",
         ));
     }
-    let (body, links) = items::apply(input, id, &status, body, now)?;
+    let (body, links) = items::apply(input, id, status, body, now)?;
     let body = scope::apply(input, id, body)?;
     let text_changed: bool = input.conn.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND title=?2 AND description=?3)",
@@ -1327,12 +1426,20 @@ fn read(input: &Input<'_>, method: &str, now: i64) -> Result<String> {
         "repositories.get" => get_repository(input),
         "items.get" => get(input, Entity::Item),
         "items.brief.get" => briefs::get(input),
+        "items.readiness" => items::readiness(input),
         "enhancements.get" => get(input, Entity::Enhancement),
         "enhancements.list" => enhancements::list(input),
         "automation.get" => get(input, Entity::Automation),
         "automation.list" => automation::list(input),
         "runs.get" => runs::get(input),
         "runs.list" => runs::list(input),
+        "queue.get" => get(input, Entity::Queue),
+        "queue.list" => queue::list(input),
+        "github_sync.get" => outbox::get_sync(input),
+        "github_sync.list" => outbox::list_sync(input),
+        "outbox.preview" => outbox::preview(input),
+        "outbox.get" => get(input, Entity::Outbox),
+        "outbox.list" => outbox::list_outbox(input, now),
         "notifications.settings.get" => get(input, Entity::NotificationSettings),
         "notifications.delivery.get" => get(input, Entity::NotificationDelivery),
         "notifications.pending.list" => notifications::pending(input, now),
@@ -1654,13 +1761,10 @@ fn list_items(input: &Input<'_>) -> Result<String> {
     }
     require_record(input, Entity::Workspace, workspace.as_deref(), false)?;
     require_record(input, Entity::Repository, repo.as_deref(), false)?;
-    let status = input.text("status", 32)?;
-    if status
-        .as_deref()
-        .is_some_and(|status| !STATUSES.contains(&status))
-    {
-        return Err(Error::invalid("unknown task status"));
-    }
+    let status = input
+        .text("status", 32)?
+        .map(|named| task_status(&named))
+        .transpose()?;
     let query = input.text("query", 512)?;
     let fts = query.filter(|q| !q.trim().is_empty()).map(|q| {
         let tokens = q
@@ -1675,7 +1779,7 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         }
     });
     let filter = ItemFilter {
-        status: status.as_deref(),
+        status,
         archived,
         deleted,
     };

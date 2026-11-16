@@ -43,7 +43,7 @@ fn logs_round_trip_on_put_and_brief_and_are_stripped_from_cards() {
         Some("error: E42\n    at src/main.rs:12\n```` inner")
     );
     let listed = store
-        .workbench_request("items.list", r#"{"status":"inbox","limit":30}"#)
+        .workbench_request("items.list", r#"{"status":"backlog","limit":30}"#)
         .unwrap();
     assert!(extract(&store, &listed, "$.items[0].logs").is_none());
     assert!(extract(&store, &listed, "$.items[0].description").is_none());

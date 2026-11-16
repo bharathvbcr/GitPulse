@@ -353,7 +353,7 @@ export function issueToTaskDraft(
   return {
     title,
     kind,
-    status: options.status || "inbox",
+    status: options.status || "backlog",
     priority,
     severity,
     owner: null,
@@ -379,16 +379,16 @@ export async function createTaskFromIssue(
   options: IssueTaskOptions = {},
 ): Promise<Task> {
   if (!repoPath || !repoPath.trim()) {
-    throw new Error("Cannot create task: repository path is not available.");
+    throw new Error("Couldn't create the task: the repository path isn't available.");
   }
   if (!issue || typeof issue.number !== "number" || issue.number <= 0) {
-    throw new Error("Cannot create task: invalid or missing issue information.");
+    throw new Error("Couldn't create the task: the issue information is invalid or missing.");
   }
 
   // 1. Register or resolve repository in SQLite workbench store
   const repo = await bounded(registerRepository(repoPath));
   if (!repo || !repo.id) {
-    throw new Error("Failed to register repository in workbench store.");
+    throw new Error("Couldn't register the repository in the workbench store.");
   }
 
   // 2. Build draft
@@ -404,7 +404,7 @@ export async function createTaskFromIssue(
 
 /** Why an import was refused before it wrote anything. */
 export const TASK_CATALOG_UNREAD_MESSAGE =
-  "The existing task list has not been read (it is still loading or failed to load), so issues cannot be checked against it. Reload the tasks and retry.";
+  "The existing task list has not been read (it is still loading or failed to load), so issues cannot be checked against it. Refresh the tasks and try again.";
 
 /**
  * Batch create workbench tasks from multiple GitHub issues, skipping any
@@ -422,7 +422,7 @@ export async function batchCreateTasksFromIssues(
   options: IssueTaskOptions = {},
 ): Promise<BatchCreateResult> {
   if (!repoPath || !repoPath.trim()) {
-    throw new Error("Cannot batch create tasks: repository path is missing.");
+    throw new Error("Couldn't create the tasks: the repository path is missing.");
   }
   if (existingTasks === null) throw new Error(TASK_CATALOG_UNREAD_MESSAGE);
 
@@ -439,7 +439,7 @@ export async function batchCreateTasksFromIssues(
   // Register repository once for the batch
   const repo = await bounded(registerRepository(repoPath));
   if (!repo || !repo.id) {
-    throw new Error("Failed to register repository in workbench store.");
+    throw new Error("Couldn't register the repository in the workbench store.");
   }
 
   // Keep track of tasks created during the current batch to avoid internal duplicates
@@ -477,7 +477,7 @@ export async function batchCreateTasksFromIssues(
 
 /**
  * Loads all tasks associated with a repository across all statuses
- * (inbox, ready, in_progress, review, done), paginating until all
+ * (backlog, ready, in_progress, review, done), paginating until all
  * tasks are retrieved or maxTasks is reached.
  */
 export async function listAllRepositoryTasks(

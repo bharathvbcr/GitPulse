@@ -480,11 +480,7 @@ fn module_rel_paths(module_name: &str) -> Result<(PathBuf, PathBuf), LeanKernelF
         ));
     }
     for seg in &segs {
-        if seg.is_empty()
-            || *seg == "."
-            || *seg == ".."
-            || seg.contains(['/', '\\', '\0'])
-        {
+        if seg.is_empty() || *seg == "." || *seg == ".." || seg.contains(['/', '\\', '\0']) {
             return Err(LeanKernelFailure::KernelRejected(format!(
                 "refusing unsafe Lean import module path `{module_name}`"
             )));

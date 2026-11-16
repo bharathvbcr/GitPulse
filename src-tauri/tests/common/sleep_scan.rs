@@ -182,8 +182,7 @@ fn sites_in(rel: &str, text: &str, regions: &[(usize, usize)]) -> Vec<Site> {
 }
 
 fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
+    path.trim_prefix(root)
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
@@ -663,7 +662,7 @@ impl Consts {
                 continue;
             };
             let tail = statement[at + keyword.len()..].trim_start();
-            let tail = tail.strip_prefix("mut ").unwrap_or(tail).trim_start();
+            let tail = tail.trim_prefix("mut ").trim_start();
             let name: String = tail
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')

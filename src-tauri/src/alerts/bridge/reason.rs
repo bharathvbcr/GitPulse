@@ -47,12 +47,16 @@ pub enum Reason {
     /// The session (or, for a report from outside any terminal, the class of
     /// them) is sending faster than a real agent does.
     RateLimited,
+    /// A hook report attempted to supply argv/command instructions (such as
+    /// `resume_argv`, `argv`, `args`, or `command`), which GitPulse refuses
+    /// because hooks may only report validated ids, never argv.
+    ForbiddenArgvField,
 }
 
 impl Reason {
     /// Every reason, so a test can prove the tokens are distinct and a caller
     /// can look one up without a second table.
-    pub const ALL: [Reason; 20] = [
+    pub const ALL: [Reason; 21] = [
         Reason::Oversized,
         Reason::Unreadable,
         Reason::AtCapacity,
@@ -73,6 +77,7 @@ impl Reason {
         Reason::NotRunning,
         Reason::UnknownSession,
         Reason::RateLimited,
+        Reason::ForbiddenArgvField,
     ];
 
     /// The wire token: lowercase, `_`-separated, never changed once shipped.
@@ -98,6 +103,7 @@ impl Reason {
             Reason::NotRunning => "not_running",
             Reason::UnknownSession => "unknown_session",
             Reason::RateLimited => "rate_limited",
+            Reason::ForbiddenArgvField => "forbidden_argv_field",
         }
     }
 
@@ -130,6 +136,7 @@ impl Reason {
             Reason::NotRunning => "the notification worker is not running",
             Reason::UnknownSession => "no terminal session has that id",
             Reason::RateLimited => "reporting faster than a session can",
+            Reason::ForbiddenArgvField => "hooks may not supply resume argv or commands",
         }
     }
 }

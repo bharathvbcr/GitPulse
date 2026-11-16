@@ -1,8 +1,6 @@
 module github.com/bharathvbcr/gitpulse/go
 
-go 1.26.6
-
-toolchain go1.27.2
+go 1.27.4
 
 require (
 	github.com/bharathvbcr/DevCouncil/backend/go_orchestrator v0.0.0

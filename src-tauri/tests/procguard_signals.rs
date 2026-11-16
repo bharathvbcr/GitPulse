@@ -411,5 +411,89 @@ fn the_shim_is_what_path_resolves_git_to() {
     );
 }
 
+/// Proves that the signal blast-radius guard prevents signals from targeting
+/// PID 0, PID 1, PID -1, or any part of the host process tree (current process,
+/// parent process, process group, or session), under both spawned and session
+/// bases.
+#[test]
+fn adversarial_signal_blast_radius_guard_blocks_host_tree() {
+    use gitpulse_lib::procguard::signal::{self, Basis, Me};
+
+    let me = Me::current();
+    assert!(me.pid > 1, "me.pid={}", me.pid);
+    assert!(me.ppid > 1, "me.ppid={}", me.ppid);
+    assert!(me.pgrp > 1, "me.pgrp={}", me.pgrp);
+    assert!(me.sid > 1, "me.sid={}", me.sid);
+
+    // Host tree IDs: me.pid, me.ppid, me.pgrp, me.sid
+    let host_ids = [me.pid, me.ppid, me.pgrp, me.sid];
+
+    // Boundary and wrap IDs: 0, 1, -1, -2, i32::MIN, u32::MAX as i32
+    let boundary_ids = [0, 1, -1, -2, i32::MIN, u32::MAX as i32];
+
+    // 1. Verify signal_group rejects all host and boundary IDs under Basis::Spawned
+    for id in host_ids.iter().chain(boundary_ids.iter()) {
+        let res = signal::signal_group(*id, libc::SIGKILL, Basis::Spawned, "adversarial-test");
+        assert!(res.is_err(), "signal_group should reject id {id}");
+        let err = res.unwrap_err();
+        assert!(
+            signal::is_refusal(&err),
+            "error for id {id} should be refusal: {err}"
+        );
+    }
+
+    // 2. Verify signal_group rejects host IDs under Basis::Session(me.sid)
+    for id in host_ids.iter() {
+        let res = signal::signal_group(
+            *id,
+            libc::SIGKILL,
+            Basis::Session(me.sid),
+            "adversarial-test",
+        );
+        assert!(
+            res.is_err(),
+            "signal_group in host session should reject id {id}"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            signal::is_refusal(&err),
+            "error for id {id} in host session should be refusal: {err}"
+        );
+    }
+
+    // 3. Verify signal_process rejects all host and boundary IDs
+    for id in host_ids.iter().chain(boundary_ids.iter()) {
+        let res = signal::signal_process(*id, 1, &|_| Some(1), libc::SIGKILL, "adversarial-test");
+        assert!(res.is_err(), "signal_process should reject id {id}");
+        let err = res.unwrap_err();
+        assert!(
+            signal::is_refusal(&err),
+            "error for id {id} should be refusal: {err}"
+        );
+    }
+
+    // 4. Verify vet_group specifically refuses host session under Basis::Spawned
+    // even when OS reports group == me.sid and sid == me.sid (the shell hanging up hazard)
+    let mock_pgid = |pid: i32| (pid == me.sid).then_some(me.sid);
+    let mock_sid = |pid: i32| (pid == me.sid).then_some(me.sid);
+    let vet_res = signal::vet_group(me.sid, Basis::Spawned, me, &mock_pgid, &mock_sid);
+    assert!(
+        vet_res.is_err(),
+        "vet_group must refuse host session under Basis::Spawned"
+    );
+    assert!(signal::is_refusal(&vet_res.unwrap_err()));
+
+    // 5. Verify vet_group specifically refuses parent PID (me.ppid)
+    let mock_pgid_ppid = |pid: i32| (pid == me.ppid).then_some(me.ppid);
+    let mock_sid_ppid = |pid: i32| (pid == me.ppid).then_some(me.sid);
+    let vet_ppid = signal::vet_group(me.ppid, Basis::Spawned, me, &mock_pgid_ppid, &mock_sid_ppid);
+    assert!(vet_ppid.is_err(), "vet_group must refuse parent PID");
+    assert!(signal::is_refusal(&vet_ppid.unwrap_err()));
+
+    // 6. Verify that our host process and parent remain completely intact
+    assert!(alive(me.pid), "this process must remain alive");
+    assert!(alive(me.ppid), "parent process must remain alive");
+}
+
 #[path = "common/process_trust.rs"]
 mod process_trust;

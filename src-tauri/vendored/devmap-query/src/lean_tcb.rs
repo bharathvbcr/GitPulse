@@ -92,10 +92,7 @@ fn is_ignored_dir(name: &str) -> bool {
 }
 
 fn rel_slash(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    path.trim_prefix(root).to_string_lossy().replace('\\', "/")
 }
 
 fn read_bounded_lean_file(path: &Path) -> Result<String, String> {

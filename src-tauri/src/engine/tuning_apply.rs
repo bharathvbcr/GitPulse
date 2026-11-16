@@ -18,8 +18,9 @@
 //! caller is `cmd_tuning_apply`, which only the Storage panel's confirm click
 //! invokes (`tests/tuning_apply_reach.rs` pins that over the source).
 
-use crate::engine::git_cli::{self, ProcessObserver};
+use crate::engine::git_cli;
 use crate::engine::git_writer::record_clicked_write;
+use crate::engine::process::{self, ProcessObserver};
 use crate::ipc_error::CommandError;
 use crate::singleflight::SingleFlight;
 use crate::storage::repo_tuning::{
@@ -398,8 +399,8 @@ fn run(
                     Some("stopped before git finished".to_string()),
                 )
             }
-            Ok(git_cli::BoundedRun {
-                incomplete: Some(git_cli::Incomplete::Deadline { message, .. }),
+            Ok(process::BoundedRun {
+                incomplete: Some(process::Incomplete::Deadline { message, .. }),
                 ..
             }) => {
                 failed = true;
@@ -414,12 +415,12 @@ fn run(
                     Some(format!(
                         "{} failed: {}",
                         step.argv.join(" "),
-                        git_cli::byte_tail(&run.stderr, 400).trim()
+                        process::byte_tail(&run.stderr, 400).trim()
                     )),
                 )
             }
             Err(error)
-                if flag.load(Ordering::SeqCst) && !git_cli::is_timed_out(error.message()) =>
+                if flag.load(Ordering::SeqCst) && !process::is_timed_out(error.message()) =>
             {
                 stopped = true;
                 (
@@ -430,7 +431,7 @@ fn run(
             }
             Err(error) => {
                 failed = true;
-                let ended = if git_cli::is_timed_out(error.message()) {
+                let ended = if process::is_timed_out(error.message()) {
                     "timed_out"
                 } else {
                     "failed"

@@ -23,7 +23,7 @@ workflow has been tested on that platform.
 > produced and covered by the automated suites, but are not exercised against a
 > running app by a person. Some features are deliberately macOS-only — desktop
 > notifications among them — and others are simply untried elsewhere.
-> [Platform coverage](QUALIFICATION.md#platform-coverage) lists which is which.
+> [Platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) lists which is which.
 
 Git must be installed and available to the app. For native build dependencies,
 see [Contributing](../CONTRIBUTING.md).
@@ -188,7 +188,7 @@ that it could not check, rather than claiming the app is up to date.
 **Upgrading a profile that has opened a newer task store.** The DevCouncil task
 store (dc-store) migrates one way: a profile migrated to a newer schema cannot be
 read back by a host built against an older one. (The dc-store vendored in this
-tree is store schema 11 with workbench schema 15.) GitPulse, Manvi and DevCouncil
+tree is store schema 11 with workbench schema 17.) GitPulse, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
 schema, before any of them opens it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
 (`bun run mcp:install`); a binary built against an older schema refuses the

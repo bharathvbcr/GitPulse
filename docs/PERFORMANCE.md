@@ -851,6 +851,72 @@ on the mailbox, which can run `git status` itself. The reply is trimmed to the
 requested file's row and the counts so it fits one frame. Same-uid, 0700 profile
 and 0600 socket rules are the gate's.
 
+## 2026-11-14: SessionStart brief asks the running app first (ft-d8b01d55)
+
+Previously, every `SessionStart` hook (`hooks::run_session_brief`) called
+`insights::snapshot` directly, listing all worktrees and running `git status`
+across every checkout even when GitPulse was running and already held a fresh
+read of the same facts (`17` worktrees on this repository on 2026-11-10, `24`
+`git` children per session start on a 17-worktree synthetic repository).
+
+**Shape and single-deadline bound.** `hooks::run_session_brief`
+(`src-tauri/src/hooks/mod.rs`) delegates to `run_session_brief_with`, which asks
+the running app once over the collision-guard mailbox (`Request::InsightsRead`)
+via `insights_from_app_within(&arg, ask_limit)` where
+`ask_limit = SESSION_BRIEF_APP_DEADLINE.min(effective_budget / 2)`
+(`SESSION_BRIEF_APP_DEADLINE` is 2 s, `BUDGET` is 5 s, `TOTAL_BUDGET` is 8 s).
+When the app answers with all four facets (`worktrees`, `agents`, `changes`,
+`collisions`) within `INSIGHTS_MAX_AGE_MS` (4 s), `session_brief_served` renders
+`served by: app (age <N> ms)` immediately below `repo:`. When the app is absent,
+slow, stale, or partial, the hook falls back to
+`insights::snapshot_bounded(&arg, scan_limit)` within the remaining wall-clock
+budget so a slow app costs at most one deadline (never one per facet), and
+`report_agent_session_meta` checks `ask_backoff::holding` so a slow or absent
+app does not incur a second mailbox wait on session metadata registration.
+
+**Zero-`git`-child completion and linked-worktree sharing.** Inside a cold hook
+process, `ledger::bindings::repository_status_readonly` resolves the repository's
+worktree family, which previously fell back to `git worktree list` because the
+per-process disk cache was empty. `insights::app_facets::snapshot_from_app`
+(`src-tauri/src/insights/app_facets.rs`) now passes non-truncated app worktree
+member paths to `engine::worktree::remember_verified_member_paths`
+(`src-tauri/src/engine/worktree.rs`), which checks `admit_worktree_pair` and
+set equality against `.git/worktrees/*/gitdir` metadata
+(`registered_checkouts`) before populating the in-process and disk family
+caches with zero `git` spawns. `CollisionMemo::memo_key`
+(`src-tauri/src/insights/collision_memo.rs`) runs `validate_repo` first and keys
+trusted checkouts on `resolve_git_common_dir` so linked worktrees share the
+family's listing memo instead of miskeying by checkout path.
+
+**Trust and honesty invariants.** `validate_repo` runs first in both the hook's
+ledger/graph steps and `insights::app_facets::serve`; an untrusted repository
+is refused by the app and produces the exact same brief as when no app is running.
+Partial or uncounted replies (`not_scanned` non-empty, `deadline_expired`,
+`unscanned_worktrees > 0`, `failed_worktrees > 0`, or `dirty_unknown > 0`) are
+rejected by `snapshot_from_app`, leaving missing facets to the hook's own scan
+so `N of N scanned`, `[partial scan]`, and `UNAVAILABLE` remain truthful.
+
+**Measured** (`src-tauri/tests/session_brief_bench.rs`,
+`session_brief_cost_before_and_after`, release `gitpulse-hook` binaries built
+from `HEAD` before vs this change, `n = 15` interleaved pairs alternating order
+across 17 worktrees = 1 main + 16 dirty linked siblings, per-process caches
+cleared before every sample, load average `{ 31.59 36.82 39.64 }` before and
+`{ 30.29 36.05 39.24 }` after):
+
+| variant | `n` | min ms | p50 ms | max ms | `worktree list` / call | `status` / call | other `git` / call | total `git` (`15` calls) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before (hook scans itself) | 15 | 258.02 ms | 305.58 ms | 507.30 ms | 1 | 17 | 6 | 360 (`24` / call) |
+| after (served by running app) | 15 | 38.49 ms | 50.22 ms | 557.14 ms | 0 | 0 | 0 | 0 (`0` / call) |
+
+The cold linked-worktree probe (`sibling-0`) in the same run also spawned `0`
+`git` children and rendered `served by: app (age ...)`. Reproduce with:
+
+```text
+GITPULSE_BENCH_HOOK_BEFORE="$BEFORE_HOOK" \
+GITPULSE_BENCH_HOOK_AFTER="$AFTER_HOOK" \
+cargo test --release --manifest-path src-tauri/Cargo.toml --test session_brief_bench session_brief_cost_before_and_after -- --ignored --nocapture
+```
+
 ## 2026-11-09: `gitpulse_insights` asks the app first (perf1109-mcp-asks-app)
 
 Every agent session has its own `gitpulse-mcp`, and each keeps its own
@@ -1000,11 +1066,12 @@ request to take UI-priority git slots, and a handler that cannot finish in
 1.6 s answers "not scanned" and frees its slot (the readings it abandons are
 capped at four).
 
-**Why a hook process scanned while the app was up (still unproven for the
-sampled pid).** One path never asks: `run_session_brief` calls
-`insights::snapshot` directly, so every SessionStart hook runs a full worktree
-scan whatever the app is doing. The other ways collision-guard itself scans are
-all logged at debug level (`collision guard: scanning here, the app did not:
+**Why a hook process scanned while the app was up (historical, 2026-11-09).** At
+the time of the 2026-11-09 sample, one path never asked: `run_session_brief`
+called `insights::snapshot` directly, so every `SessionStart` hook ran a full
+worktree scan whatever the app was doing (fixed in `ft-d8b01d55`, which routes
+`run_session_brief` through the ask-the-app-first path above). The other ways
+collision-guard itself scans are all logged at debug level (`collision guard: scanning here, the app did not:
 why`): the sink not attached, "busy" past `MAX_GATE_HANDLERS` (shared with gate
 verdicts), the mailbox's 24-connection admission (a connection past it is closed
 without a greeting), an answer older than 10 s, a reply that read no worktree,
@@ -1103,12 +1170,12 @@ measurement.
 
 | bench | rows | baseline for |
 | --- | --- | --- |
-| `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07 (protocol overhead only; the codeintel deadline overhead needs a DevMap store and is not measured) |
+| `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `sessions` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07; S3-04 `ft-9cfa5274` (protocol overhead + zero-git `gitpulse_sessions`; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
 | `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the size of the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
-| `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
+| `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details, and `PreToolUse` hook collision guard (`hook collision guard uncontended`, `hook collision guard contended`) on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards and `PreToolUse` collision latency (ft-9cfd557403d57dca25e3cfdb97144689); `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
 | `alerts_worker_throughput` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. Time is gated like every bench (the producer/worker hand-off is the work); counters gated: `notices`, `sessions`, and `drained`, 1 when the worker took a probe offered after the last notice | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
 | `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a GitPulse terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change (printed, never written to the JSON, so never in a baseline). Time is **recorded, not gated** (a process start); counters gated: `calls`, `stdin_bytes` and `reports_acked` (the reports the socket acknowledged). A hook that delivers but is slower is not caught: a 100 ms sleep added to it compared `OK` | ft-9cfd5174 (S1-15) |
@@ -1560,7 +1627,7 @@ two git features on? **Owner decision, unchanged by this spike:** GitPulse never
 writes repo config and never passes `-c core.untrackedCache` or
 `-c core.fsmonitor`. Two reasons stand independent of the numbers:
 
-* every git child runs with `GIT_OPTIONAL_LOCKS=0` (`engine/git_cli.rs`), which
+* every git child runs with `GIT_OPTIONAL_LOCKS=0` (`engine/process/env.rs` and `engine/git_cli.rs`), which
   stops `git status` from refreshing the index, and the untracked cache is a
   feature of the index, so `-c core.untrackedCache=true` could neither help nor
   persist;
@@ -2935,7 +3002,7 @@ How to read the new field: the periodic gate line now ends with the call sites b
 
     WARN [spawn_gate] reactive admitted=... | background shed=... | top: git rev-parse=N git worktree=... | rev-parse by: verification_gate.current_head=A graph.refs.detached_head=B unattributed=C rest=D
 
-- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `git_cli::with_spawn_source`, never a path or ref name.
+- `rev-parse by:` lists at most the 5 largest sources, largest first, ties by name. `rest=` sums the sources not shown (it is absent when zero). A source is a fixed call-site name set with `process::with_spawn_source`, never a path or ref name.
 - `unattributed` is a launch whose caller set no source. The share that is unattributed is the share still not accounted for; tag the biggest caller next.
 - At most 32 distinct sources are kept; beyond that, new ones count under `other`.
 - The counters are cumulative since process start, the same as `top:` and the class totals. To get a rate, take two lines and subtract; a single line says who has spent the most overall, not who is spending now.
@@ -3033,3 +3100,38 @@ Load average (1 min) at the start of the run 12.0, at the end 10.0, below the 30
 A separate, contaminated indication from a review (load average 41 falling to 25, so not a result): with GitPulse running, 13 of 20 six-second windows were quiet on the main checkout and on a lane; the windows that were not quiet were other lanes' `.git/worktrees/<lane>/index.lock` and files under the common directory. Any event moves the epoch, so another worktree's activity in the shared common directory costs this one a read that window, which is the safe direction.
 
 Not measured: a real app over wall-clock time with other tools writing in the worktree (DevMap and ledger writes under `.devcouncil` in a checkout are events and end the skip like any other), a worktree under `core.fsmonitor` or `core.splitIndex` (inert by construction), and anything on Linux or Windows.
+
+---
+
+## Pre-edit hook collision guard latency on 18 worktrees (ft-9cfd557403d57dca25e3cfdb97144689)
+
+Path-scoped `PreToolUse` collision checks (`hooks::run_collision_guard` -> `insights::collision_for_path` -> `worktree::changed_paths_only` with `-u -- :(literal)...`) replace the repo-wide `insights::collision_risk` read on an 18-worktree generated fixture (`600` tracked files, `61` commits, `1` main checkout + `17` linked dirty worktrees; `SPEC` in `src-tauri/benches/command_timings.rs`). `hooks::BUDGET` is `5 s`. Note that because `MAX_COLLISION_SCANS` is `16`, an uncontended edit across `17` other worktrees leaves one worktree unscanned and returns an incomplete-scan notice (`asked = 0`), while `d000/f000000.rs` (dirty in `wt00`) triggers entity classification and `Ask` (`asked = 1`).
+
+Measured with `GITPULSE_BENCH_HOOK_COLLISION_ONLY=1 cargo bench --manifest-path src-tauri/Cargo.toml --bench command_timings` (`n = 15` interleaved samples, `warmup = 2`, `18` CPUs; host was loaded at `load avg = 35.5` = `2.0x` cores, so absolute wall-clock times are upper bounds relative to an idle machine):
+
+| row | n | min | p50 | p95 | max | counters |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `hook collision guard uncontended` | 15 | 69.35ms | 94.03ms | 123.26ms | 125.68ms | `asked=0 git_processes=17` |
+| `hook collision guard contended` | 15 | 85.75ms | 133.89ms | 148.92ms | 195.66ms | `asked=1 git_processes=21` |
+| `hook collision repo-wide (pre-W6)` (unrecorded comparison) | 15 | 68.55ms | 109.61ms | 138.77ms | 152.44ms | `git_processes=17 overlapping_files=0 scanned_worktrees=16` |
+
+All timed samples in both the focused run (`max = 195.66ms`) and `cargo bench --manifest-path src-tauri/Cargo.toml --bench command_timings -- --smoke` (`n = 3`, `load avg = 26.9` = `1.5x` cores; `uncontended max = 166.78ms`, `contended max = 217.46ms`) stayed under the `5 s` `hooks::BUDGET` assertion while catching single-holder contention (`asked=1` vs `overlapping_files=0` from the pre-W6 repo-wide scan).
+
+---
+
+## 2026-11-14: `gitpulse_sessions` cold-process scan and zero-git MCP call (`ft-9cfa527403d342da25e756db971761c5`, S3-04; row in `ft-c0d9313f`)
+
+What: cold-process `insights::sessions` (`GITPULSE_HOST_LOAD_ONCE=mcp_sessions`) compared side by side against `ft-7ba9b4b2`'s `observe_sessions` scan (`GITPULSE_HOST_LOAD_ONCE=sessions`), plus `tools/call sessions` in `mcp_protocol -- --smoke` alongside `gitpulse_collision_risk` and `gitpulse_insights`.
+
+Where: Apple Silicon macOS release build (`host_load` 15 fresh cold processes each on the active repository with 27 host agent sessions and 4 repo-attributed sessions; `mcp_protocol -- --smoke` on a generated 400-file, 3-linked-worktree fixture under a hermetic `HOME` with `alerts::start` active).
+
+| path | min | p50 | p95 | max / worst | notes |
+| --- | --- | --- | --- | --- | --- |
+| `host_load` once `sessions` (`observe_sessions`, n=15) | 9.73 ms | 40.39 ms | 89.90 ms | 161.52 ms | 27 host sessions (`ok=true`) |
+| `host_load` once `mcp_sessions` (`insights::sessions`, n=15) | 11.90 ms | 16.03 ms | 32.16 ms | 36.49 ms | +registry, CARD 11, ledger, hub snapshot (`total=4`, `app_ok=false`, 0 git) |
+| `mcp_protocol` `tools/call sessions` (`--smoke`, n=3) | 26.46 ms | 34.20 ms | 47.51 ms | 47.51 ms | `facets_ok=7`, `git_processes=0`, `bytes=1690` (load avg 74.1 on 18 CPUs) |
+| `mcp_protocol` `tools/call collision_risk` (`--smoke`, n=3) | 110.98 ms | 163.04 ms | 289.38 ms | 289.38 ms | `facets_ok=1`, same smoke pass |
+| `mcp_protocol` `tools/call insights` (`--smoke`, n=3) | 180.23 ms | 274.93 ms | 675.48 ms | 675.48 ms | `facets_ok=10`, `git_processes=10`, same smoke pass |
+
+The cold-process `insights::sessions` call tracks `ft-7ba9b4b2`'s ~10 ms `observe_sessions` baseline (`min` 11.90 ms vs 9.73 ms on this host) and spawns 0 `git` processes (verified via git `trace2` in both `mcp_protocol` and `tests/mcp_sessions.rs`), compared to 10 `git` processes for `gitpulse_insights`. On `mcp_protocol -- --smoke`, load average was 74.1 across 18 CPUs, so absolute times reflect shared host load while `min`, relative ratios, `facets_ok`, and `git_processes=0` establish the comparison.
+

@@ -41,7 +41,6 @@ mod imp {
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
         acknowledge_output, kill_session, shutdown_sessions, spawn_session, write_to_session,
-        TerminalSessions,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,12 +75,12 @@ mod imp {
     }
 
     pub fn main() {
-        gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+        gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("terminal_pty");
         let app = tauri::test::mock_builder()
             .build(gitpulse_lib::context())
             .expect("mock app");
-        let state = TerminalSessions::default();
+        let state = super::common::terminals();
         let seen = Arc::new(Seen::default());
         let (exit_tx, exit_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         let exit_rx = Mutex::new(exit_rx);

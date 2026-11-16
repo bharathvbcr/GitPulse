@@ -5,7 +5,7 @@
   import { createResizeObservation } from "../dom/observeResize";
   import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, CircleAlert, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, ArrowDownWideNarrow, Bot, CircleAlert, CircleQuestionMark, ListFilter, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -17,8 +17,8 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
-  import { MAX_COLUMN_PAGES, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
-  import { createLiveLoader } from "../workbench/liveLoader";
+  import { MAX_COLUMN_PAGES, fillColumns, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
+  import { createLiveLoader, createLiveReturn, liveOnScreen } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, organizeTasks, putTask, registerRepository, restoreDeletedTask, suggestTasks, WorkbenchError,
@@ -41,6 +41,7 @@
   import { cardMatchesQuery, dueRangeFilter, parseTaskQuery, queryChips, queryControlValue, queryHas, removeQueryTerm, repositoryMatches, setQueryControl, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import PageHeader from "./PageHeader.svelte";
   import TaskSearchField from "./TaskSearchField.svelte";
   import { applyOrganizedPriority, cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, priorityOrderNote, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
@@ -219,6 +220,10 @@
   let candidates = $state.raw<CandidateSet | null>(null);
   /** What a Load all is walking — the search's candidates or one column — and the flag Stop sets for it to check between pages. */
   let loadingAll = $state<"search" | TaskStatus | null>(null); let stopLoadingAll = false;
+  /** The board is reading the rest of its tasks on its own (`fillBoard`); each fill takes a ticket so only the newest clears it. */
+  let filling = $state(false); let fillTicket = 0;
+  /** The newest fill, which the live loader waits for: a change mid-fill is read after it, not by killing it. */
+  let fillRun: Promise<void> = Promise.resolve();
   const boardKey = $derived(JSON.stringify([scope, plan.key]));
   /**
    * A new search on the same scope while its candidates load, or a cleared
@@ -680,7 +685,8 @@
     if (!candidates || loadedKey !== boardKey) return null;
     return describeSearch({ matched: visibleCount, set: candidates, word: plan.word, relaxed: ranking?.relaxed ?? false, ranked: order === "relevance" });
   });
-  const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** The search's own Load more and Load all: offered where the automatic read (`fillBoard`) stopped short, not while it runs. */
+  const moreCandidates = $derived(!filling && searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
   /** What hidden repositories keep off this board, counted over the loaded tasks; null when nothing is hidden here. */
   const hiddenRepositoryReport = $derived.by(() => {
     if (!hidingRepositories || !initialized || !candidates || loadedKey !== boardKey) return null;
@@ -765,6 +771,7 @@
         if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = (pages.in_progress?.items ?? []).filter((card) => !hiddenHere(card)).length;
         keepSelected(pages);
         settled(quiet);
+        void fillBoard(generation, key, target, current);
         return true;
       }
       // Columns are re-read as far as they were paged in (`boardPaging.ts`),
@@ -775,7 +782,9 @@
       const [pages, archive] = await Promise.all([
         Promise.all(STATUSES.map(async (status) => {
           // A column read past 600 cards (Load all) is read back at the store's page size, not cut to 600.
-          const loaded = kept ? columns[status]?.items.length ?? 0 : 0, size = reloadSize(loaded, TASK_PAGE_SIZE, CANDIDATE_PAGE);
+          // Past its first page a column was read on by the fill 200 at a time, and is read back that way:
+          // 450 cards are 3 requests a change, not 15.
+          const loaded = kept ? columns[status]?.items.length ?? 0 : 0, size = reloadSize(loaded, TASK_PAGE_SIZE, CANDIDATE_PAGE, TASK_PAGE_SIZE);
           return [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, size, BOARD), loaded, size)] as const;
         })),
         archived,
@@ -787,6 +796,7 @@
       keepSelected(read);
       settled(quiet);
       void loadCardReads(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
+      void fillBoard(generation, key, target, current);
       return true;
     } catch (cause) {
       // A background read that failed says so, and the next one that
@@ -798,6 +808,84 @@
   }
   /** A read landed: a failure only an earlier background read reported is over. */
   function settled(quiet: boolean) { if (quiet && refreshError) { error = ""; refreshError = false; } }
+  /**
+   * The rest of the board, read on its own after each read that landed: every
+   * column (or a search's candidates) to its end, `CANDIDATE_PAGE` tasks a
+   * request, one request at a time and drawn as each lands, until the board
+   * holds `MAX_CANDIDATES` cards. Columns used to stop at their first 30 until
+   * someone pressed Load more.
+   *
+   * It shows no loading state and leaves every control enabled. It gives way
+   * at once to anything newer: a read that replaced the board (the revision
+   * moved), and the reader starting a move or a Load more, whose answer it
+   * would otherwise race. Giving way to the reader asks the live loader for a
+   * quiet re-read, which fills again from the column as it then stands; a
+   * change that adds tasks past a full column does the same, so the board
+   * never settles short of its end while it is under the cap.
+   */
+  function fillBoard(generation: number, key: string, target: Scope, current: SearchPlan): Promise<void> {
+    fillRun = fillRest(generation, key, target, current);
+    return fillRun;
+  }
+  async function fillRest(generation: number, key: string, target: Scope, current: SearchPlan) {
+    const touched = interactions;
+    const stale = () => generation !== revision || disposed || key !== boardKey;
+    const live = () => !stale() && !moving && touched === interactions;
+    const unread = current.mode === "search" ? candidates !== null && canLoadMore(candidates) : STATUSES.some((status) => columns[status]?.next_cursor);
+    // A fill that cannot start yet (a move or Load more is under way) asks for
+    // the quiet re-read that starts it once the board is idle; a move's own
+    // reload, which runs while `moving` is still set, would otherwise leave a
+    // column short of its end.
+    if (unread && !stale() && !live()) background.schedule();
+    if (!unread || !live()) return;
+    // Taken only by a fill that runs: one that returned above must not keep an
+    // older fill's finally from clearing `filling`.
+    const ticket = ++fillTicket;
+    let grew = false;
+    filling = true;
+    try {
+      if (current.mode === "search") {
+        let shown = candidates;
+        if (!shown) return;
+        const read: CandidateRead = (query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD);
+        await readAllCandidates(shown, current.word, read, (next) => {
+          // Only over the set it read from: a reload or a Load more that replaced it wins.
+          if (!live() || candidates !== shown) return false;
+          candidates = shown = next; columns = bucketByStatus(next.cards);
+          return true;
+        });
+        if (live() && candidates === shown && shown && candidatesComplete(shown)) {
+          if (JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = (columns.in_progress?.items ?? []).filter((card) => !hiddenHere(card)).length;
+          settled(true);
+        }
+        if (!stale() && candidates && canLoadMore(candidates) && !live()) background.schedule();
+        return;
+      }
+      const outcome = await fillColumns<TaskStatus, TaskCard>({
+        keys: STATUSES,
+        current: (status) => columns[status],
+        read: (status, cursor) => listTasks(target, status, "", cursor, CANDIDATE_PAGE, BOARD),
+        apply: (status, page) => { if (!live()) return false; columns = { ...columns, [status]: page }; grew = true; return true; },
+        live,
+        budget: MAX_CANDIDATES,
+      });
+      if (stale()) return;
+      if (outcome === "stopped" && !live()) { background.schedule(); return; }
+      inProgressCount = columns.in_progress?.total ?? 0;
+      // A fill that read on cleanly ends what an earlier failed one said.
+      settled(true);
+    } catch (cause) {
+      // The board's own read, never the reader's: the next one that lands
+      // clears it (`settled`), and an error the reader caused is left alone.
+      if (!stale() && !(error && !refreshError)) { error = failure("load", "all tasks", cause); refreshError = true; }
+    } finally {
+      if (ticket === fillTicket) filling = false;
+      // The cards it added need their verdicts and subtask counts, whether or
+      // not it read to the end: a card shown without them must not look like
+      // one nobody checked. The read before the fill asked for its own.
+      if (grew && !stale()) void loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
+    }
+  }
   /** Drops from the selection what the read no longer holds; an unchanged selection keeps its identity. */
   function keepSelected(pages: Partial<Record<TaskStatus, Page<TaskCard>>>) {
     const kept = [...selected].filter((id) => loadedHas(id, pages));
@@ -879,15 +967,19 @@
    * A read that had to give way to the reader is asked again afterwards.
    */
   const background = createLiveLoader({
-    canRun: () => initialized && active && !disposed && !readBackgroundDocument(),
+    canRun: () => initialized && active && !disposed && liveOnScreen(),
     read: async () => {
-      // The agents on the cards follow the same spaced, foreground-only
-      // cadence; on every change they cost a read of runs and one per live run.
+      // The agents on the cards follow the same spaced cadence, on screen
+      // focused or not; on every change they cost a read of runs and one per
+      // live run (workbench reads, no git). Their own timer still stops on blur.
       void boardAgents.refresh();
       if (loading || moving) { background.schedule(); return; }
       membershipToken++;
       try { await catalog(); } catch (cause) { if (!disposed) catalogError = failure("refresh", "repositories and workspaces", cause); }
       if (!(await loadBoard(scope, plan, true)) && !disposed) background.schedule();
+      // The fill that read started runs inside this read, so a change that
+      // lands meanwhile is read once after it rather than restarting it.
+      await fillRun;
       await loadUnread();
     },
     onError: (cause) => { if (!disposed) liveNotice = `${failure("keep", "live updates running", cause)} Use Refresh.`; },
@@ -960,16 +1052,21 @@
     const changed = () => { scheduleRefresh(); };
     listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Couldn't watch for live updates. ${message} Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
+    const returned = createLiveReturn();
     const onForeground = () => {
       boardAgents.wake();
       // A checkout is moved in a file manager, not here; coming back to the
       // window is when that can have happened.
       if (!readBackgroundDocument()) checkoutToken++;
-      if (readBackgroundDocument()) {
+      // Only a hidden window pauses the board: one on screen beside another
+      // app is where an agent's new task is meant to show up (`liveOnScreen`).
+      const visible = liveOnScreen(), back = returned(visible);
+      if (!visible) {
         background.reset();
         return;
       }
-      scheduleRefresh();
+      // A blur while still on screen re-reads nothing: changes keep arriving as events.
+      if (back) scheduleRefresh();
     };
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
@@ -1486,14 +1583,15 @@
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "the column", cause); return false; }
     finally { if (generation === revision && !disposed) loading = false; }
   }
-  async function pageColumn(status: TaskStatus, cursor?: string) {
+  async function pageColumn(status: TaskStatus, cursor: string) {
     if (searching || loading || moving || loadedKey !== boardKey) return;
     const generation = revision, key = boardKey;
     interactions++; loading = true; error = ""; refreshError = false;
     try {
-      const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
+      // The fill's page size: past the board's cap this is how the rest of a column is reached.
+      const result = await listTasks(scope, status, "", cursor, CANDIDATE_PAGE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
-      const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
+      const items = [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()];
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
       loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = failure("load", "more tasks", cause); }
@@ -2025,7 +2123,7 @@
    * `quickAddDraft` refuses when no repository is linked, and the refusal names
    * the two ways out — the `^` marker, or the editor.
    */
-  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox", mode: QuickAddMode = "manual"): Promise<boolean> {
+  async function createFromQuickAdd(parsed: QuickAddResult, status: TaskStatus = "backlog", mode: QuickAddMode = "manual"): Promise<boolean> {
     if (busy || quickAdding) return false;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) {
@@ -2064,7 +2162,7 @@
   }
 
   /** Hand a typed quick-add line to the full editor rather than saving it. */
-  async function expandQuickAdd(parsed: QuickAddResult, status: TaskStatus = "inbox") {
+  async function expandQuickAdd(parsed: QuickAddResult, status: TaskStatus = "backlog") {
     if (busy) return;
     const draft = quickAddDraft(parsed, quickAddDefaults(status));
     if (!draft) { await createTask(status); return; }
@@ -2083,7 +2181,7 @@
     return parseQuickAddDue(word);
   }
 
-  async function createTask(status: TaskStatus = "inbox") {
+  async function createTask(status: TaskStatus = "backlog") {
     if (busy) return;
     // Every caller reads `creation` before offering this, so a refusal here is
     // a keyboard shortcut or a stale click — it still has to say why rather
@@ -2514,19 +2612,23 @@
        past a column's first page could not be reached from it at all, and the
        board's said "Next" for what appends rather than turns a page. -->
   {@const pageOf = columns[status]}
-  {#if pageOf && (pageOf.next_cursor || pageOf.items.length > TASK_PAGE_SIZE)}
+  <!-- The board reads every column to its end on its own (`fillBoard`), so
+       this shows only while a column still has tasks behind its cursor: while
+       that read is under way, and where it stopped at the board's cap of
+       MAX_CANDIDATES cards or on a failure, which Load more and Load all then
+       continue. A count short of the total is never drawn as the whole column. -->
+  {#if pageOf?.next_cursor}
     <div class="paging" data-task-paging={status}>
       <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
+      {#if filling && !loading}<span class="paging-note" data-testid="task-column-filling">Loading the rest…</span>{:else}
       {#if boardSort === "priority" && !searching && pageOf.next_cursor}
         {@const note = priorityOrderNote(pageOf.items.length, pageOf.total)}
         {#if note}<p class="paging-note" data-testid="task-priority-partial">{note} Load all orders the rest.</p>{/if}
       {/if}
-      {#if pageOf.next_cursor}<button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => pageColumn(status, pageOf.next_cursor ?? undefined)} disabled={loading}>Load more</button>{/if}
-      {#if pageOf.next_cursor}
+      <button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => { if (pageOf.next_cursor) void pageColumn(status, pageOf.next_cursor); }} disabled={loading}>Load more</button>
         {#if loadingAll === status}<button type="button" class="gp-btn" aria-label={`Stop loading ${STATUS_LABELS[status]} tasks`} onclick={() => { stopLoadingAll = true; }}>Stop</button>
-        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards; show only the first page of another column, or search, to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
+        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards, the most it reads on its own; Load more continues this column, or search to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
       {/if}
-      {#if pageOf.items.length > TASK_PAGE_SIZE}<button type="button" class="gp-btn" aria-label={`Show only the first ${STATUS_LABELS[status]} page`} onclick={() => pageColumn(status)} disabled={loading}>First page</button>{/if}
     </div>
   {/if}
 {/snippet}
@@ -2557,7 +2659,7 @@
 {#snippet scopeRail(overlay: boolean)}
   <!-- Justified: the keydown only moves focus among the rail's own buttons (the roving-list pattern); the nav itself is not a control. -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
+  <nav bind:this={railEl} id="task-scope-rail" class="navigator" class:gp-float-card={!overlay} class:is-overlay={overlay} class:gp-glass={overlay} class:shadow-float={overlay} class:nav-liquid={macos} data-task-rail aria-label="Task scopes" onkeydown={onRailKeydown}>
     {#if overlay && !railNarrow}
       <div class="nav-heading gp-label nav-dock">Task scopes<button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dock the task scopes beside the board" title="Dock the task scopes beside the board" onclick={dockRail}><PanelLeft size={12} /></button></div>
     {/if}
@@ -2663,45 +2765,45 @@
     {/if}
   {/if}
   <main class="board-main">
-    <header class="gp-glass gp-surface-header">
-      <div class="heading">
+    <PageHeader {title} level={1}>
+      {#snippet leading()}
         {#if !repositoryPath}
           <button bind:this={railToggleEl} type="button" class="gp-icon-btn" data-nav-toggle data-testid="task-nav-toggle" aria-expanded={railDocked || railOpen} aria-controls="task-scope-rail" aria-label={railDocked ? "Hide task scopes" : "Show task scopes"} title={railDocked ? "Hide task scopes" : "Show task scopes"} onclick={toggleRail}><PanelLeft size={13} /></button>
         {/if}
-        <h1 class="gp-surface-title">{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+      {/snippet}
+      {#snippet meta()}
+        {#if !loading && initialized}<span class="text-meta font-medium text-textMuted">{total}</span>{/if}
         {#if inProgressCount > 0}<span class="gp-chip" data-kind="label" data-tone="accent">{inProgressCount} in progress</span>{/if}
         <!-- A repository's board has no navigator, so this is its one way to
              the boards for every task and for its workspaces. -->
         {#if repositoryPath}<button type="button" class="gp-btn" data-variant="ghost" data-size="sm" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
-      </div>
-      <div class="actions">
+      {/snippet}
+      {#snippet actions()}
+        <!-- Two rows, laid out on purpose. The title row: find a task, the
+             board's own housekeeping (Inbox, Archive, Refresh), and New task.
+             The toolbar row: how the board is drawn on the left, Manvi's
+             tools on the right. Each group wraps as a unit, never button by
+             button. -->
         <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repository:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
         <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repository:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
-        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
-        <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
-          <!-- inline-flex: an icon is a block-level svg, so without it the
-               label wrapped under the icon and doubled the header's height. -->
-          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
-          <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
-        </div>
-        {#if initialized}<AutomaticEnhancements {active} compact />{/if}
+        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}><CircleQuestionMark size={13} /></button>
+        <span class="tool-sep" aria-hidden="true"></span>
         {#if initialized}
-          <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
+          <!-- Unread is a call for attention, so it is a corner badge on the
+               icon; the archived total is only a size, so it reads as muted
+               text beside the icon. Both stay the button's whole text. -->
+          <button type="button" class="gp-icon-btn relative" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
             <Inbox size={13} />
-            {#if !unreadError && unread > 0}<span class="gp-chip" data-kind="count" data-tone="accent">{unread}</span>{/if}
+            {#if !unreadError && unread > 0}<span class="gp-attention-badge bg-accent text-onAccent!">{unread}</span>{/if}
           </button>
           <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title="Archive — tasks filed away from this board, and deleted tasks to restore" onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
-            {#if archivedCount > 0}<span class="gp-chip" data-kind="count" data-tone="neutral">{archivedCount}</span>{/if}
+            {#if archivedCount > 0}<span class="tally">{archivedCount}</span>{/if}
           </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
-        <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
-        <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
-        <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}>Organize</button>
-        <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
-        <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
-        <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
+        <span class="tool-sep" aria-hidden="true"></span>
+        <button type="button" class="gp-btn" data-variant="primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task"><Plus size={12} />New task</button>
         <!-- A disabled New task always says why, and a caveat says what the
              sheet will ask for. This used to render only for a profile with no
              repositories at all, so an empty workspace left the button dead
@@ -2710,11 +2812,30 @@
           {#if creation.blocked && emptyAddLabel}
             <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
           {:else}
-            <span class="hint" data-testid="task-create-hint">{creation.blocked ?? creation.caveat}</span>
+            <span class="hint" data-testid="task-create-hint" title={creation.blocked ?? creation.caveat}>{creation.blocked ?? creation.caveat}</span>
           {/if}
         {/if}
-      </div>
-    </header>
+      {/snippet}
+      {#snippet toolbar()}
+        <div class="tool-group" role="group" aria-label="Board display">
+          <div class="gp-segmented layout-switch" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
+            <!-- inline-flex: an icon is a block-level svg, so without it the
+                 label wrapped under the icon and doubled the header's height. -->
+            <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
+            <button type="button" class="gp-seg-btn inline-flex items-center gap-1.5" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
+          </div>
+          <span class="tool-sep" aria-hidden="true"></span>
+          <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}><ListFilter size={12} />Filters</button>
+          <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
+          <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
+        </div>
+        <div class="tool-group tool-group-end" role="group" aria-label="Manvi">
+          <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}><Sparkles size={12} />Suggest next</button>
+          <button type="button" class="gp-btn" data-testid="task-organize-toggle" aria-pressed={showOrganize} aria-controls="task-organize" disabled={!initialized} title="Ask Manvi for a reviewable priority proposal. Nothing changes until you accept a row." onclick={toggleOrganize}><ArrowDownWideNarrow size={12} />Organize</button>
+          {#if initialized}<AutomaticEnhancements {active} compact />{/if}
+        </div>
+      {/snippet}
+    </PageHeader>
     {#if initialized && (showFilters || filtering)}
       <div class="facets" aria-label="Organize tasks">
         <select class="gp-select" aria-label="Filter by priority" bind:value={facet.priority}>
@@ -2812,6 +2933,7 @@
                it is partial and offers the next page; it never reads as
                everything that matches. -->
           <span class="query-coverage" role="status" data-testid="task-query-coverage">{searchReport}</span>
+          {#if filling && candidates && !candidatesComplete(candidates)}<span class="paging-note" data-testid="task-search-filling">Loading the rest…</span>{/if}
         {/if}
         {#if moreCandidates}
           <button type="button" class="gp-btn quick" data-size="sm" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
@@ -2857,7 +2979,7 @@
           placeholder="Add a task — try: Fix retry loop !1 #ci @ada due:friday"
           mode={$interfaceStore.taskQuickAddAssist ? "assist" : "manual"}
           onMode={(next) => interfaceStore.setTaskQuickAddAssist(next === "assist")}
-          onSubmit={(parsed, mode) => createFromQuickAdd(parsed, "inbox", mode)}
+          onSubmit={(parsed, mode) => createFromQuickAdd(parsed, "backlog", mode)}
           onExpand={(parsed) => void expandQuickAdd(parsed)}
         />
       </div>
@@ -2951,7 +3073,7 @@
       </div>
     {/if}
     {#if pendingUpdate && !moving}<div class="banner error gp-notice gp-notice-error" role="alert">Confirm the interrupted task update before making another change.<button type="button" class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Try again</button></div>{/if}
-    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
+    {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} onchange={() => void loadUnread()} />{/if}
     {#if showArchive}
       <TaskArchive
         {scope}
@@ -3193,7 +3315,7 @@
                   }
                 }}
               >
-                {#if !tab.draft}<span class="tab-pip" data-status={tab.status ?? "inbox"}></span>{/if}
+                {#if !tab.draft}<span class="tab-pip" data-status={tab.status ?? "backlog"}></span>{/if}
                 <span class="tab-title">{taskTabLabel(tab)}</span>
               </div>
               <button
@@ -3213,7 +3335,7 @@
       {#if session}
         {#key session.pane}
           <div id={TASK_EDITOR_PANE_ID} role="tabpanel" class="task-panel">
-            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={creation.seed.primaryRepositoryId} home={creation.seed.homeWorkspaceId} onSaved={onEditorSaved} onClose={onEditorClose} />
+            <TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={session.value} seed={session.seed ?? null} initialStatus={session.status ?? "backlog"} {repositories} {workspaces} openTabs={openTabRefs} primary={creation.seed.primaryRepositoryId} home={creation.seed.homeWorkspaceId} onSaved={onEditorSaved} onClose={onEditorClose} />
           </div>
         {/key}
       {/if}
@@ -3244,9 +3366,9 @@
      is for the overlay below, because only that one floats over the board. */
   /* `gp-glass` paints only on macOS and its rule is more specific than this
      fill, so the overlay is glass there and the same solid surface elsewhere. */
-  .navigator{width:188px;flex-shrink:0;margin:0;padding:10px 8px;overflow:auto;border-radius:0;background:var(--mac-fill-surface,rgb(var(--c-surface)))}
+  .navigator{width:188px;flex-shrink:0;padding:10px 8px;overflow:auto}
   .rail-overlay{position:absolute;bottom:0;left:0;display:flex;max-width:calc(100% - 24px)}
-  .navigator.is-overlay{width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
+  .navigator.is-overlay{background:var(--mac-fill-surface,rgb(var(--c-surface)));width:248px;max-width:100%;height:100%;border-radius:0 var(--gp-r-pane) var(--gp-r-pane) 0}
   .navigator .nav-scope{display:flex;align-items:center;gap:6px;flex:1;min-width:0;width:auto;position:relative;text-align:left;font-size:var(--text-xs);font-weight:400;background:transparent;box-shadow:none;color:rgb(var(--c-text))}
   .navigator .nav-scope:hover{background:rgb(var(--c-surface-hover) / 0.7)}
   .navigator .nav-scope.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent));font-weight:500}
@@ -3284,18 +3406,31 @@
   .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-pick{padding:0 8px}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
-  /* The header's box and the title's type are the shared gp-surface-header
-     and gp-surface-title (app.css), so Tasks and Agents read as one chrome. */
-  h1{display:flex;align-items:baseline;gap:8px}
-  h1 span{font-size:var(--text-meta);font-weight:500;color:rgb(var(--c-text-muted))}
-  .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  /* The header is the shared PageHeader, so every page reads as one chrome. */
+  .facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
   .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs)}
   .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:var(--gp-r-md)}
   .undo-strip>span{flex:1;min-width:0;font-size:var(--text-xs)}
   button,input,select{font-size:var(--text-xs)}
   button:disabled{opacity:.5}
-  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted))}
+  .hint{font-size:var(--text-meta);color:rgb(var(--c-text-muted));max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* The header's tool groups. A group never splits across lines; the
+     toolbar wraps whole groups, and Manvi's group keeps to the right edge. */
+  .tool-group{display:flex;align-items:center;gap:var(--gp-space-1);flex-wrap:nowrap;min-width:0}
+  .tool-group-end{margin-left:auto}
+  .tool-sep{width:1px;height:16px;margin-inline:2px;flex-shrink:0;background:rgb(var(--c-border) / .7)}
+  /* The archived total: muted text beside the icon, on the same 24px pill. */
+  .tally{margin-left:3px;font-size:var(--text-micro);font-variant-numeric:tabular-nums;line-height:1}
+  /* The shared macOS liquid track is a 34px view switcher; inside a toolbar
+     row of 24px buttons it is one size too large. Same track, compact. */
+  /* 24px segments in a 1px track inside its 1px edge: 28px overall. */
+  .layout-switch.gp-segmented{padding:1px}
+  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn{padding:2px 10px}
+  /* The shared liquid rule clears the active fill because a gliding
+     `.gp-liquid-selection` draws it; this switch has none, so on macOS the
+     chosen layout was marked by text colour alone. Draw the bubble here. */
+  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn[data-active="true"]{background:rgb(var(--c-surface-hover));box-shadow:inset 0 0 0 1px var(--mac-glass-edge),var(--shadow-bubble)}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
   .match-hint{display:block;margin-top:4px;font-size:var(--text-micro);line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
@@ -3339,7 +3474,6 @@
   .card:focus-visible,.row:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
   .card.dragging{opacity:.35;cursor:grabbing}
   .card.selected,.row.selected,.card.open,.row.open{border-color:rgb(var(--c-accent));box-shadow:inset 0 0 0 1px rgb(var(--c-accent) / 0.35)}
-  .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
   .open-mark{flex-shrink:0;margin-top:2px}
   /* Agents working on the card's task; warn when one needs the reader, as in the task's Agents pane.
      The host carries the hooks (testid, data-tone, data-asking) and draws nothing; the chip inside is the mark. */

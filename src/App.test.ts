@@ -237,7 +237,7 @@ describe("App overlay wiring", () => {
     const handler = source.slice(source.indexOf("isCommitSearchChord(e) &&"));
     const branch = handler.slice(0, handler.indexOf("return;"));
     expect(branch).toContain("fieldOwnsFindChord({");
-    expect(branch).toContain('onRepositorySurface: $interfaceStore.globalSurface === "repository"');
+    expect(branch).not.toContain("onRepositorySurface");
     expect(branch).toContain("defaultPrevented: e.defaultPrevented");
     expect(branch).toContain("focusPageSearch();");
     expect(branch).not.toContain("focusCommitSearch");
@@ -348,7 +348,10 @@ describe("App overlay wiring", () => {
     expect(start).toBeGreaterThan(-1);
     const effect = script.slice(script.lastIndexOf("$effect", start), start + 280);
     expect(effect).toContain("untrack(() => {");
-    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("diagnostics.error"));
+    // The Diagnostics write goes through mirrorUserFacingError, which skips the
+    // internal-fault sentence describeError already recorded.
+    expect(effect.indexOf("mirrorUserFacingError(")).toBeGreaterThan(-1);
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("mirrorUserFacingError("));
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("toastStore.error"));
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("repoStore.setError(null)"));
   });
@@ -502,6 +505,17 @@ describe("the two header rows", () => {
     const row = source.slice(source.indexOf('class="gp-titlebar-actions'), source.indexOf("</header>"));
     expect(row.indexOf("<HarnessBadge")).toBeGreaterThan(-1);
     expect(row.indexOf("<HarnessBadge")).toBeLessThan(row.indexOf('aria-label="Open Diagnostics"'));
+  });
+
+  it("keeps only the compact Manvi chip in the title bar, and only where the status bar is not showing it", () => {
+    const row = source.slice(source.indexOf('class="gp-titlebar-actions'), source.indexOf("</header>"));
+    expect(row).toContain('<HarnessBadge variant="compact" />');
+    expect(row).not.toContain('<HarnessBadge />');
+    // One signal: the status bar says whether it is on screen, the surface says whether it is visible.
+    expect(source).toContain('bind:shown={statusBarShown}');
+    expect(source).toMatch(
+      /manviInStatusBar = \$derived\(\$interfaceStore\.globalSurface === "repository" && statusBarShown\)/,
+    );
   });
 
   it("makes each row its own container and gives both the dense glass fill", () => {

@@ -200,9 +200,10 @@ impl AgentDefaults {
         self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
     }
 
-    /// Whether terminals live in the terminal host rather than the app.
+    /// Whether managed agent runs live in a hosted Manvi rather than closing
+    /// with the app. (On Unix, terminal sessions always live in `gitpulse-ptyd`.)
     pub fn keeps_terminals_running(&self) -> bool {
-        self.keep_terminals_running.unwrap_or(false)
+        self.keep_terminals_running.unwrap_or(true)
     }
 
     /// The terminal session limit to apply: the stored one, or the default.
@@ -566,6 +567,41 @@ where
     }))
 }
 
+/// Whether the hooks ask the app for a turn checkpoint at each agent turn
+/// boundary (`turn_checkpoints.enabled` in `tools.json`, under the platform
+/// config directory, or the file `GITPULSE_TOOL_CONFIG` names).
+///
+/// Off unless turned on: a checkpoint hashes the worktree's files, so it is
+/// the person's choice, never a default. A block this cannot read is read as
+/// off, and says so in the log. No UI sets it yet; write the key by hand:
+/// `{ "turn_checkpoints": { "enabled": true } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnCheckpointSettings {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl TurnCheckpointSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn lenient_turn_checkpoints<'de, D>(deserializer: D) -> Result<TurnCheckpointSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable turn_checkpoints block, checkpoints stay off: {error}"
+        );
+        TurnCheckpointSettings::default()
+    }))
+}
+
 /// Whether merging an agent attempt's commits needs a recorded review
 /// (`docs/AGENT_OUTPUT_REVIEW.md`): a host-wide default, and a per-repository
 /// override keyed by the repository's canonical common Git directory, so every
@@ -719,6 +755,13 @@ pub struct ToolConfig {
         skip_serializing_if = "HostLoadSettings::is_default"
     )]
     pub host_load: HostLoadSettings,
+    /// Whether hooks take turn checkpoints. Off by default.
+    #[serde(
+        default,
+        deserialize_with = "lenient_turn_checkpoints",
+        skip_serializing_if = "TurnCheckpointSettings::is_default"
+    )]
+    pub turn_checkpoints: TurnCheckpointSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -740,6 +783,7 @@ impl Default for ToolConfig {
             review_gate: ReviewGateSettings::default(),
             verify_status: VerifyStatusSettings::default(),
             host_load: HostLoadSettings::default(),
+            turn_checkpoints: TurnCheckpointSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1422,6 +1466,28 @@ pub fn host_load_settings() -> HostLoadSettings {
     load().map(|cfg| cfg.host_load).unwrap_or_default()
 }
 
+/// The stored turn-checkpoint switch. Any failure to read it is "off": a
+/// checkpoint is work the person opted into, and an unreadable file must not
+/// be what turns it on.
+pub fn turn_checkpoint_settings() -> TurnCheckpointSettings {
+    load().map(|cfg| cfg.turn_checkpoints).unwrap_or_default()
+}
+
+/// [`turn_checkpoint_settings`] read from `tools.json` in `dir`, for callers
+/// that already hold the profile directory (the hooks) and tests.
+pub fn turn_checkpoint_settings_in(dir: &Path) -> TurnCheckpointSettings {
+    read_disk(&dir.join("tools.json"))
+        .map(|cfg| cfg.turn_checkpoints)
+        .unwrap_or_default()
+}
+
+pub fn set_turn_checkpoint_settings(next: TurnCheckpointSettings) -> Result<(), String> {
+    update(|cfg| {
+        cfg.turn_checkpoints = next;
+        Ok(())
+    })
+}
+
 pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     let mut cfg = load()?;
     cfg.host_load = next;
@@ -1901,16 +1967,37 @@ mod tests {
     /// How many terminal sessions may be open is the user's: stored where the
     /// last release does not look, refused outside the terminal module's
     /// bounds at save, and degraded alone when a hand-edited value is bad.
-    /// "Keep terminals running when GitPulse quits": stored under
-    /// `agent_launch`, off when absent or unreadable, and what picks the
-    /// backend the app's registry is built on.
+    /// "Keep managed agent runs running when GitPulse quits": stored under
+    /// `agent_launch.keep_terminals_running`, on when absent or unreadable, and
+    /// independent of the terminal backend (which is unconditionally `host` on Unix).
     #[test]
-    fn keeping_terminals_running_is_stored_and_selects_the_terminal_host() {
+    fn keeping_terminals_running_is_stored_and_host_backend_stays_unconditional() {
         with_temp_config(|path| {
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
+            );
+            #[cfg(not(unix))]
             assert_eq!(
                 crate::terminal::TerminalSessions::from_settings().backend(),
                 "in-process"
+            );
+            let off = AgentDefaults {
+                keep_terminals_running: Some(false),
+                ..AgentDefaults::default()
+            };
+            set_agent_defaults(off.clone()).unwrap();
+            assert_eq!(agent_defaults(), off);
+            assert!(!agent_defaults().keeps_terminals_running());
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["keep_terminals_running"], false);
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
             );
             let on = AgentDefaults {
                 keep_terminals_running: Some(true),
@@ -1922,17 +2009,12 @@ mod tests {
             let written: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(written["agent_launch"]["keep_terminals_running"], true);
-            #[cfg(unix)]
-            assert_eq!(
-                crate::terminal::TerminalSessions::from_settings().backend(),
-                "host"
-            );
             // A value this build cannot read costs this setting alone.
             let mut text: serde_json::Value = written;
             text["agent_launch"]["keep_terminals_running"] = serde_json::json!("yes");
             text["agent_launch"]["max_terminal_sessions"] = serde_json::json!(40);
             fs::write(path, text.to_string()).unwrap();
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
             assert_eq!(agent_defaults().terminal_sessions(), 40);
         });
     }
@@ -2445,3 +2527,7 @@ mod model_setting_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "tool_config_turn_checkpoint_tests.rs"]
+mod turn_checkpoint_tests;
