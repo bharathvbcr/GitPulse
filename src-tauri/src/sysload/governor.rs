@@ -407,6 +407,8 @@ fn sample(input: &Input) -> Option<Sample> {
     }
     let mut best = (Tier::Clear, None);
     let mut fill = Tier::Clear;
+    let mut disk = Tier::Clear;
+    let mut others_clear = input.level == Some(Level::Normal) && !input.compressor_thrash;
     let mut consider = |tier: Tier, binding: Binding| {
         if tier > best.0 {
             best = (tier, Some(binding));
@@ -421,9 +423,23 @@ fn sample(input: &Input) -> Option<Sample> {
     if input.level == Some(Level::Warn) {
         consider(Tier::Elevated, Binding::MemoryPressure);
     }
-    for c in input.thresholds.assess(&input.readings).contributions {
+    let assessed = input.thresholds.assess(&input.readings);
+    // An input that could not be read is doubt, not quiet.
+    if assessed
+        .unreadable
+        .iter()
+        .any(|b| !matches!(b, Binding::DiskFilling | Binding::LowDisk))
+    {
+        others_clear = false;
+    }
+    for c in assessed.contributions {
         if c.binding == Binding::DiskFilling {
             fill = fill.max(c.tier);
+        }
+        if matches!(c.binding, Binding::DiskFilling | Binding::LowDisk) {
+            disk = disk.max(c.tier);
+        } else if c.tier != Tier::Clear {
+            others_clear = false;
         }
         consider(c.tier, c.binding);
     }
@@ -431,16 +447,24 @@ fn sample(input: &Input) -> Option<Sample> {
         tier: best.0,
         binding: best.1,
         fill,
+        disk,
+        others_clear,
     })
 }
 
-/// What one sample read: the tier and the resource that put it there, and,
-/// whichever of them won, the tier the fill rule itself read. The release hold
-/// follows that reading, not whichever cause the binding happens to name.
+/// What one sample read: the tier and the resource that put it there, and what
+/// the winner hides. `fill` is the tier the fill rule itself read: its release
+/// hold follows that reading, not whichever cause the binding happens to name.
+/// `disk` is the higher of the two disk inputs, and `others_clear` whether
+/// every other input (memory level, compressor thrash, every other
+/// contribution) read Clear: together, whether the disk is the only thing
+/// wrong.
 struct Sample {
     tier: Tier,
     binding: Option<Binding>,
     fill: Tier,
+    disk: Tier,
+    others_clear: bool,
 }
 
 fn level_words(level: Option<Level>) -> String {
@@ -616,9 +640,13 @@ pub struct Governor {
     fill_run: u32,
     /// Counted ticks since the fill rule last read Severe, once it read it for
     /// [`ENTER_SAMPLES`] in a row (so a blip under another cause's Severe arms
-    /// nothing): the fill hold. Leaving Severe waits for it to reach
-    /// [`FILL_SEVERE_RELEASE_SAMPLES`], whichever cause the held tier names.
+    /// nothing): the fill hold, `None` when not armed or once it has lapsed.
+    /// Leaving Severe waits for it to lapse, whichever cause the held tier
+    /// names.
     fill_since: Option<u32>,
+    /// Consecutive counted ticks in which every input other than low disk and
+    /// disk filling read Clear: what [`Governor::disk_only`] rests on.
+    others_clear_run: u32,
     last: Option<(Instant, Input)>,
     refusing_since: Option<Instant>,
     noticed: bool,
@@ -636,6 +664,7 @@ impl Default for Governor {
             down: (Tier::Clear, None),
             fill_run: 0,
             fill_since: None,
+            others_clear_run: 0,
             last: None,
             refusing_since: None,
             noticed: false,
@@ -693,8 +722,14 @@ impl Governor {
                 self.down_streak = 0;
                 self.fill_run = 0;
                 self.fill_since = None;
+                self.others_clear_run = 0;
             }
             Some(read) if counts => {
+                self.others_clear_run = if read.others_clear {
+                    self.others_clear_run.saturating_add(1)
+                } else {
+                    0
+                };
                 self.count_fill(read.fill);
                 self.count(read.tier, read.binding);
             }
@@ -720,8 +755,11 @@ impl Governor {
     }
 
     /// The fill hold's clock: armed by [`ENTER_SAMPLES`] consecutive Severe
-    /// readings of the fill rule, restarted by each one after that, and
-    /// advanced by every counted tick it reads lower.
+    /// readings of the fill rule, restarted by each one while it lasts,
+    /// advanced by every counted tick the fill rule reads lower, and disarmed
+    /// when it reaches [`FILL_SEVERE_RELEASE_SAMPLES`]. A lapsed hold is gone:
+    /// arming it again takes [`ENTER_SAMPLES`] in a row again, and nothing
+    /// names the fill rule for a Severe another cause keeps.
     fn count_fill(&mut self, fill: Tier) {
         if fill == Tier::Severe {
             self.fill_run += 1;
@@ -730,15 +768,18 @@ impl Governor {
             }
         } else {
             self.fill_run = 0;
-            self.fill_since = self.fill_since.map(|ticks| ticks.saturating_add(1));
+            self.fill_since = self
+                .fill_since
+                .map(|ticks| ticks.saturating_add(1))
+                .filter(|ticks| *ticks < FILL_SEVERE_RELEASE_SAMPLES);
         }
     }
 
-    /// Whether the fill hold lets Severe go: it was never armed, or the fill
-    /// rule has read lower for [`FILL_SEVERE_RELEASE_SAMPLES`] counted ticks.
+    /// Whether the fill hold lets Severe go: it was never armed, or it ran
+    /// out ([`FILL_SEVERE_RELEASE_SAMPLES`] counted ticks without the fill
+    /// rule reading Severe).
     fn fill_hold_released(&self) -> bool {
-        self.fill_since
-            .is_none_or(|ticks| ticks >= FILL_SEVERE_RELEASE_SAMPLES)
+        self.fill_since.is_none()
     }
 
     fn count(&mut self, tier: Tier, binding: Option<Binding>) {
@@ -824,7 +865,7 @@ impl Governor {
                     Some(read)
                         if held == Tier::Severe
                             && read.tier < Tier::Severe
-                            && self.fill_since.is_some() =>
+                            && !self.fill_hold_released() =>
                     {
                         Some(Binding::DiskFilling)
                     }
@@ -833,6 +874,28 @@ impl Governor {
                 decide(&aged, held, binding)
             }
         }
+    }
+
+    /// Whether the disk is the only reason the host is shedding at `now`.
+    /// True only when all of these hold, and false on any doubt:
+    /// the host is shedding (`shed` has a class); at least
+    /// [`EXIT_SAMPLES`] consecutive counted ticks have read every input other
+    /// than low disk and disk filling Clear (memory level normal, no
+    /// compressor thrash, no other contribution above Clear, none unreadable);
+    /// the last reading still has every one of those inputs Clear; and a disk
+    /// input reads at least Elevated now. A governor with no history (one from
+    /// [`Governor::instant`]) has counted nothing and answers false, as does
+    /// one whose sensor is unavailable.
+    pub fn disk_only(&self, now: Instant) -> bool {
+        let Some((at, input)) = &self.last else {
+            return false;
+        };
+        let shed = self.verdict(now).shed;
+        if !(shed.background || shed.reactive) || self.others_clear_run < EXIT_SAMPLES {
+            return false;
+        }
+        sample(&input.aged(now.saturating_duration_since(*at)))
+            .is_some_and(|read| read.others_clear && read.disk >= Tier::Elevated)
     }
 
     /// A person said "Admit anyway": launches pass for [`OVERRIDE_WINDOW`].
@@ -1311,6 +1374,31 @@ fn shed_now() -> Shed {
 /// pins [`shed`] to the spawn gate).
 pub fn shed_cause() -> Option<Binding> {
     shed_now().cause
+}
+
+/// Whether the disk is the ONLY reason the host is shedding: the answer for a
+/// caller that may do its (disk-freeing) work while the disk is the whole
+/// problem and must keep shedding when anything else is also pressed.
+/// [`shed_cause`] is one binding picked by priority, so it says "disk" for a
+/// disk Severe that has CPU Severe or thermal Critical beside it; this does
+/// not. True only when the host is shedding, a disk input reads Elevated or
+/// above, and every other input has read Clear for [`EXIT_SAMPLES`] counted
+/// ticks. False on any doubt: no governor in this process (the headless
+/// run, the MCP server, a hook), a governor with no history, an unavailable
+/// or stale sensor, an unreadable input. One short lock, no IO.
+pub fn shed_is_disk_only() -> bool {
+    let now = Instant::now();
+    #[cfg(test)]
+    if let Some(only) = INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.disk_only(now)))
+    {
+        return only;
+    }
+    APP_GOVERNOR.get().is_some_and(|governor| {
+        governor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disk_only(now)
+    })
 }
 
 /// A person's "Admit anyway": launches pass for [`OVERRIDE_WINDOW`]. Only the

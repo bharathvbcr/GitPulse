@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::sysload::diskrate::FillTracker;
-use crate::sysload::sensor::Why;
+use crate::sysload::sensor::{Thermal, Why};
 use crate::sysload::thresholds::InputMode;
 use crate::sysload::Reading;
 
@@ -697,6 +697,20 @@ impl Direct {
             Reading::Value(if fill_severe { 10 << 30 } else { 0 });
     }
 
+    /// One counted tick at memory level `level`, with the fill rule Severe or
+    /// not, and everything else as the test left it in `input`.
+    fn tick_at(&mut self, level: Level, fill_severe: bool) -> GovernorVerdict {
+        self.set(false, fill_severe);
+        self.input.level = Some(level);
+        self.now += Duration::from_millis(TICK_MS);
+        self.governor.observe(self.now, self.input.clone()).verdict
+    }
+
+    /// The accessor the spawn gate asks, as of the last tick.
+    fn disk_only(&self) -> bool {
+        self.governor.disk_only(self.now)
+    }
+
     /// One counted tick.
     fn tick(&mut self, memory_critical: bool, fill_severe: bool) -> GovernorVerdict {
         self.set(memory_critical, fill_severe);
@@ -832,6 +846,182 @@ fn a_sensor_that_goes_unavailable_mid_hold_carries_no_hold_back() {
         let v = d.tick(false, false);
         assert_eq!(v.tier == Tier::Severe, eased < EXIT_SAMPLES, "{v:?}");
     }
+}
+
+#[test]
+fn a_lapsed_fill_hold_is_gone_it_names_nothing_and_a_blip_does_not_rearm_it() {
+    for blip in [0u32, 1, 2] {
+        let mut d = Direct::new();
+        d.memory_severe_then_fill(5);
+        // Memory keeps Severe long past the hold's lapse.
+        for _ in 0..FILL_SEVERE_RELEASE_SAMPLES + 20 {
+            let v = d.tick(true, false);
+            assert_eq!(v.binding, Some(Binding::MemoryPressure), "{v:?}");
+        }
+        for _ in 0..blip {
+            d.tick(true, true);
+        }
+        for _ in 0..3 {
+            d.tick(true, false);
+        }
+        // Memory eases: Severe is left after EXIT_SAMPLES, and never labelled
+        // as the disk filling.
+        for eased in 1..=EXIT_SAMPLES {
+            let v = d.tick(false, false);
+            let severe = v.tier == Tier::Severe;
+            assert_eq!(
+                severe,
+                eased < EXIT_SAMPLES,
+                "{blip}-tick blip, {eased} ticks after memory eased: {v:?}"
+            );
+            assert_ne!(v.binding, Some(Binding::DiskFilling), "{v:?}");
+        }
+    }
+}
+
+/// CPU load of `per_cpu` on the 18 logical CPUs the calm readings carry.
+fn cpu_load(d: &mut Direct, per_cpu: f64) {
+    d.input.readings.load = Reading::Value([per_cpu * 18.0; 3]);
+}
+
+#[test]
+fn the_disk_is_not_the_only_reason_when_anything_else_is_pressed_too() {
+    // (what else, set up the other input, the tier the disk reads at)
+    type Setup = fn(&mut Direct);
+    let others: [(&str, Setup); 4] = [
+        ("CPU Severe", |d| cpu_load(d, 7.0)),
+        ("thermal Critical", |d| {
+            d.input.readings.thermal = Reading::Value(Thermal::Critical);
+        }),
+        ("an unreadable swap", |d| {
+            d.input.readings.swap_used = Reading::Unavailable(Why::Failed);
+        }),
+        ("CPU Elevated", |d| cpu_load(d, 4.0)),
+    ];
+    for (name, setup) in others {
+        // Disk Severe beside it, for long enough that the counter would have
+        // run out had the other input not been pressed.
+        let mut d = Direct::new();
+        setup(&mut d);
+        for _ in 0..3 * EXIT_SAMPLES {
+            d.tick(false, true);
+        }
+        assert_eq!(d.governor.held, Tier::Severe, "{name}");
+        assert!(!d.disk_only(), "disk Severe + {name}");
+    }
+    // Disk Elevated beside CPU Elevated.
+    let mut d = Direct::new();
+    cpu_load(&mut d, 4.0);
+    d.input.readings.disk_fill = Reading::Value(3 << 29);
+    for _ in 0..3 * EXIT_SAMPLES {
+        d.tick(false, false);
+    }
+    assert_eq!(d.governor.held, Tier::Elevated);
+    assert!(!d.disk_only(), "disk Elevated + CPU Elevated");
+    // Disk Severe beside memory at Warn.
+    let mut d = Direct::new();
+    for _ in 0..3 * EXIT_SAMPLES {
+        d.tick_at(Level::Warn, true);
+    }
+    assert_eq!(d.governor.held, Tier::Severe);
+    assert!(!d.disk_only(), "disk Severe + memory Warn");
+}
+
+#[test]
+fn the_disk_alone_is_the_only_reason_but_only_after_the_others_read_clear_long_enough() {
+    // From the start: the disk reads Severe on the third tick, and the others
+    // have read Clear throughout, so the counter is what decides.
+    let mut d = Direct::new();
+    for tick in 1..=2 * EXIT_SAMPLES {
+        d.tick(false, true);
+        assert_eq!(d.disk_only(), tick >= EXIT_SAMPLES, "tick {tick}");
+    }
+    // Disk Elevated alone counts too.
+    let mut d = Direct::new();
+    d.input.readings.disk_fill = Reading::Value(3 << 29);
+    for tick in 1..=2 * EXIT_SAMPLES {
+        d.tick(false, false);
+        assert_eq!(d.disk_only(), tick >= EXIT_SAMPLES, "tick {tick}");
+    }
+    // After another input was pressed: the counter starts when it clears.
+    let mut d = Direct::new();
+    cpu_load(&mut d, 7.0);
+    for _ in 0..10 {
+        d.tick(false, true);
+    }
+    assert!(!d.disk_only());
+    cpu_load(&mut d, 0.1);
+    for clear in 1..=2 * EXIT_SAMPLES {
+        d.tick(false, true);
+        assert_eq!(d.disk_only(), clear >= EXIT_SAMPLES, "{clear} clear ticks");
+    }
+}
+
+#[test]
+fn memory_that_recovered_a_tick_ago_is_not_clear_enough() {
+    let mut d = Direct::new();
+    for _ in 0..10 {
+        d.tick(true, true);
+    }
+    assert!(!d.disk_only());
+    // One tick of normal memory, the disk still Severe.
+    d.tick(false, true);
+    assert!(!d.disk_only(), "memory recovered one tick ago");
+    for _ in 1..EXIT_SAMPLES - 1 {
+        d.tick(false, true);
+        assert!(!d.disk_only());
+    }
+    d.tick(false, true);
+    assert!(d.disk_only(), "{EXIT_SAMPLES} normal ticks");
+    // A tick of memory Warn starts the count again.
+    d.tick_at(Level::Warn, true);
+    assert!(!d.disk_only());
+}
+
+#[test]
+fn an_unavailable_sensor_or_a_reader_with_no_history_is_never_disk_only() {
+    let mut d = Direct::new();
+    for _ in 0..2 * EXIT_SAMPLES {
+        d.tick(false, true);
+    }
+    assert!(d.disk_only());
+    // The sensor goes quiet: not disk only, and the count is gone when it
+    // returns.
+    d.input.state = SensorState::Dead;
+    d.tick(false, true);
+    assert!(!d.disk_only());
+    d.input.state = SensorState::Fresh;
+    for tick in 1..=EXIT_SAMPLES {
+        d.tick(false, true);
+        assert_eq!(d.disk_only(), tick >= EXIT_SAMPLES, "{tick} ticks back");
+    }
+    // A governor built from one sample has counted nothing.
+    let mut input = Input::test_pressure(Level::Normal);
+    input.readings.free_disk = Reading::Value(40 << 30);
+    input.readings.disk_fill_sustained = Reading::Value(10 << 30);
+    let now = Instant::now();
+    let instant = Governor::instant(now, input);
+    assert_eq!(instant.verdict(now).tier, Tier::Severe);
+    assert!(!instant.disk_only(now));
+}
+
+#[test]
+fn a_repeated_snapshot_does_not_advance_the_only_disk_count() {
+    let mut d = Direct::new();
+    cpu_load(&mut d, 7.0);
+    for _ in 0..10 {
+        d.tick(false, true);
+    }
+    cpu_load(&mut d, 0.1);
+    d.tick(false, true);
+    for _ in 0..50 {
+        d.repeat(false, true);
+    }
+    assert!(!d.disk_only());
+    for _ in 1..EXIT_SAMPLES {
+        d.tick(false, true);
+    }
+    assert!(d.disk_only());
 }
 
 #[test]

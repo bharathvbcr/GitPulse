@@ -59,9 +59,10 @@ pub use disk::{
 };
 pub use governor::{
     admit, admit_anyway, admit_on, decide, grant_override, note_launch_advisory,
-    report as governor_report, shed, shed_cause, Admitted, Advisory, Binding, Governor, GovernorPulse,
-    GovernorReport, GovernorVerdict, Input as GovernorInput, Observation, Reason, Refused, Shed,
-    Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
+    report as governor_report, shed, shed_cause, shed_is_disk_only, Admitted, Advisory, Binding,
+    Governor, GovernorPulse, GovernorReport, GovernorVerdict, Input as GovernorInput, Observation,
+    Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE,
+    REFUSAL_NOTICE_AFTER,
 };
 #[cfg(test)]
 pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};

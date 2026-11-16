@@ -651,6 +651,9 @@ pub struct Assessment {
     pub contributions: Vec<Contribution>,
     /// One per input that is governed on and could not be read.
     pub warnings: Vec<String>,
+    /// The inputs behind `warnings`, so a reader that must not treat an
+    /// unreadable input as a quiet one can tell which it is.
+    pub unreadable: Vec<Binding>,
 }
 
 fn high_tier(value: f64, rule: &Rule) -> Tier {
@@ -768,9 +771,11 @@ impl Thresholds {
                     binding,
                     tier: mode.cap(tier),
                 }),
-                Err(Gap::Failed) => out
-                    .warnings
-                    .push(format!("{label} is unreadable: not governed on")),
+                Err(Gap::Failed) => {
+                    out.warnings
+                        .push(format!("{label} is unreadable: not governed on"));
+                    out.unreadable.push(binding);
+                }
                 Err(Gap::Silent) => {}
             }
         };

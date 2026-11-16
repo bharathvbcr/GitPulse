@@ -785,7 +785,24 @@ is Severe at the same time as the fill, the hold still applies; while it alone
 keeps Severe (every current reading lower) the verdict names the fill rule and
 says it is held after the reading recovered, not that a threshold is crossed.
 The count is forgotten when the sensor goes unavailable and does not advance on
-a re-read snapshot. So
+a re-read snapshot. The hold is disarmed when its 180 s run out, so a Severe
+another cause keeps is never labelled as the disk filling after that, and one
+fill-Severe blip hours later arms nothing: arming again takes three in a row.
+
+**Is the disk the only reason?** `sysload::shed_is_disk_only()` answers it for
+a caller that may do disk-freeing work while the disk is the whole problem and
+must keep shedding when anything else is pressed too (`shed_cause()` is one
+binding picked by priority, so it says disk for a disk Severe with CPU Severe
+or thermal Critical beside it). True only when the host is shedding, a disk
+input (low disk, disk filling) reads Elevated or above now, and every other
+input (memory level normal, no compressor thrash, no other contribution above
+Clear, none unreadable) has read Clear for five counted ticks in a row; the
+count is reset when the run is forgotten and does not advance on a re-read
+snapshot. Any doubt is false: a process with no governor of its own (the
+headless cleaner run, the MCP server, a hook), a governor built from one
+sample (`Governor::instant`), an unavailable or stale-old sensor. The
+published snapshot does not carry the count, so a reader of it cannot answer
+this. So
 a build that writes in lumps with pauses of up to 240 s is held at Severe from
 the first bind until free space reaches the floor, where the level rule takes
 over, rather than admitting launches in each pause. The cost is a linger: a
