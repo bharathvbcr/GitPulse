@@ -152,7 +152,7 @@
       case "cmd_remove_worktree":worktreeCalls.push({cmd,...args});return {policy:null,output:null};
       case "cmd_delete_branch":worktreeCalls.push({cmd,...args});throw new Error("error: the branch 'gitpulse/fix-e42-wt0attem' is not fully merged");
       case "cmd_terminal_spawn":
-        if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); const resumed=`resume-${report.resumes.length}`; adoptOutput(resumed,args); return {id:resumed,cwd:args.repoPath,shell:"claude"}; }
+        if (args.resume?.session_id) { report.resumes.push({program:args.program,args:args.args??[],resume:args.resume,permissionMode:args.permissionMode??null}); show(); const resumed=`resume-${report.resumes.length}`; adoptOutput(resumed,args); return {id:resumed,cwd:args.repoPath,shell:"claude"}; }
         report.shellSpawns++;show();{const shell=`shell-${report.shellSpawns}`;adoptOutput(shell,args);return {id:shell,cwd:args.repoPath,shell:"/bin/sh"};}
       case "cmd_terminal_kill":report.kills++;show();return null;
       case "cmd_terminal_detach":report.detaches=(report.detaches??0)+1;show();return true;
@@ -475,7 +475,7 @@
       check("An attempt with no saved conversation says so and opens nothing",report.resumes.length===0&&report.conversationReads===1);
       interfaceStore.setGlobalSurface("tasks");
       conversationMissing=false;button("Resume conversation").click();await wait(()=>report.resumes.length===1);
-      check("Resume continues the attempt's own Claude Code session",report.resumes[0].program==="claude"&&report.resumes[0].args.join(" ")===`--resume ${ended.id}`);
+      check("Resume continues the attempt's own Claude Code session",report.resumes[0].program==="claude"&&report.resumes[0].resume.session_id===ended.id&&report.resumes[0].resume.fork===false&&!report.resumes[0].args.includes("--resume"));
       check("A resumed conversation keeps the attempt's permission mode",report.resumes[0].permissionMode===ended.permission_mode);
       check("Resuming keeps the reader on the task",read(interfaceStore).globalSurface==="tasks");
       await wait(()=>paneSessions().some(el=>el.textContent.includes("Resumed conversation")));
