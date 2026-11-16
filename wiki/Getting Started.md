@@ -14,6 +14,6 @@ and configure optional integrations.
 | Understand trust and network boundaries | [[Security]] |
 | Resolve an error | [[Troubleshooting]] |
 
-The title-bar **Walkthrough** button resumes or replays the app's guided tour.
+**Settings → Appearance → Guided walkthrough → Replay Tour** resumes or replays the app's guided tour.
 The [documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 links all maintained guides and separates them from historical audit evidence.

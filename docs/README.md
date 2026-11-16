@@ -5,7 +5,7 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 
 [Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
 [Website](https://gitpulse.vbcr.dev/) · [Project overview](../README.md) ·
-[Release notes](../CHANGELOG.md)
+[Release notes](../CHANGELOG.md) · [v2.0 Beta notes](RELEASE_NOTES_v2.0.0.md)
 
 ## Start here
 
@@ -24,18 +24,18 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 | --- | --- |
 | [Tasks and workspaces](TASKS_AND_WORKSPACES.md) | Quick add, boards, saved workspaces, drafting, archive, agent handoff |
 | [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse `--cone` checkouts, zero-copy DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
-| [Terminal](TERMINAL.md) | Sessions, split panes, search, export, recovery |
+| [Terminal](TERMINAL.md) · [Terminal host](TERMINAL_HOST.md) | Sessions, split panes, search, export, `gitpulse-ptyd` host & crash survival |
 | [Coverage](COVERAGE.md) | Report formats, generation, missing toolchains, diagnostics |
 | [Repository hygiene](REPOSITORY_HYGIENE.md) | Storage scopes, cleanup previews, scheduling |
 | [Native menus and status icon](MACOS_MENUS.md) | Desktop menus, contextual actions, macOS status popover |
-| [macOS appearance](MACOS_APPEARANCE.md) | Glass surfaces, opaque content, accessibility fallbacks |
+| [macOS appearance](MACOS_APPEARANCE.md) | Glass surfaces, theme presets, saved themes, window wallpapers, accessibility fallbacks |
 
 ## Integrations and trust
 
 - [Security and repository trust](SECURITY.md): execution authority, local state,
   network boundaries, MCP access, and vulnerability reporting.
 - [MCP and agents](../wiki/MCP%20and%20Agents.md): installation, compatible hosts,
-  repository context, and the read-only MCP surface.
+  repository context, and the read-only plus trust-gated MCP surface.
 - [Module integration](MODULE_INTEGRATION.md): GitPulse as host, Manvi as wrapper,
   and DevCouncil as independently updatable components.
 - [Policy and AI](../wiki/Policy%20and%20AI.md): policy outcomes and the distinction
@@ -45,7 +45,7 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 
 | Reference | Purpose |
 | --- | --- |
-| [Contributing](../CONTRIBUTING.md) | Setup, commands, test contracts, release procedure |
+| [Contributing](../CONTRIBUTING.md) · [Trademarks](../TRADEMARKS.md) | Setup, commands, test contracts, DCO sign-off, release procedure, trademark policy |
 | [Architecture](ARCHITECTURE.md) | Source ownership, IPC, state, execution paths |
 | [Good first issues](GOOD_FIRST_ISSUES.md) | Scoped contribution ideas |
 | [Dependency health](DEPENDENCY_HEALTH.md) | Dependency maintenance and unresolved advisories |
@@ -57,10 +57,12 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 
 ## Implementation and evidence
 
-[Open qualification](QUALIFICATION.md) tracks remaining verification gates.
-The [agentic workspace plan](AGENTIC_WORKSPACES_PLAN.md) is an implementation
-and acceptance ledger: a planned item is not a shipped capability. Dated audits,
-benchmarks, and migration records are not kept on `main`; they are preserved at
+Plans, design drafts, spikes, and qualification ledgers are not kept on `main`;
+[open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md)
+and the [agentic workspace plan](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md)
+(an implementation and acceptance ledger where a planned item is not a shipped
+capability) are preserved at commit `90362c2e`. Dated audits,
+benchmarks, and migration records are preserved at
 [commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/README.md).
 [Archive separation](ARCHIVE_SEPARATION.md) explains that boundary.
 

@@ -58,7 +58,7 @@ rotated out. Each copied section is capped at 64 Ki characters and says when cut
 
 ## Terminal vanished after switching views
 
-The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switching **repositories** does. Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size or toggle the dock to return to the repository view.
+The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositories** does not kill the session: each repository tab has its own terminal dock and preserves its sessions until you close the terminal tab or repository tab (and on Unix, PTY sessions live in `gitpulse-ptyd` and survive app quit or crash unless stopped). Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size, double-click a page header/background, or toggle the dock to return to the repository view.
 
 ## Terminal shows non-GPU rendering or text glitching
 
