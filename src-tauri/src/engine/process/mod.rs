@@ -24,7 +24,8 @@ mod awaiting_adversarial_tests;
 mod budget_churn_tests;
 #[cfg(all(test, unix))]
 mod grace_adversarial_tests;
-#[cfg(test)]
+// Real child processes signalled by pid (`libc::kill`), which Windows lacks.
+#[cfg(all(test, unix))]
 pub(crate) mod read_cancel_tests;
 #[cfg(test)]
 mod run_errors_adversarial_tests;

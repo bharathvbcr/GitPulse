@@ -101,6 +101,8 @@ pub fn unlock_window_high_refresh_rate(_window: &tauri::WebviewWindow) {}
 
 #[cfg(test)]
 mod tests {
+    // Only the macOS test below reaches into the parent module.
+    #[cfg(target_os = "macos")]
     use super::*;
 
     #[cfg(target_os = "macos")]

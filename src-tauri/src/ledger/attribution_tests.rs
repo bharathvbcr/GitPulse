@@ -528,6 +528,7 @@ fn a_batch_answers_every_commit_and_bounds_how_many_it_examines() {
     assert!(link_commits(&repo, &[]).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn only_git_commands_that_move_head_onto_a_commit_count() {
     let tree = tree();
@@ -921,6 +922,7 @@ fn a_git_run_aimed_at_this_worktree_still_links_and_one_aimed_elsewhere_does_not
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_that_cannot_create_a_commit_is_not_a_candidate_and_continue_is() {
     let tree = tree();
@@ -1082,6 +1084,7 @@ fn the_anchor_checkout_is_the_repository_however_it_is_spelled() {
     assert_eq!(link(&repo2, &sha(2)).session_id.as_deref(), Some("S1"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_spelling_of_a_worktree_is_the_same_worktree() {
     let (_d, repo) = repo_dir();
@@ -1242,13 +1245,18 @@ fn r2_reflog_message_table() {
     assert!(wrong.is_empty(), "misclassified:\n{}", wrong.join("\n"));
 }
 
+// The worktree layout these tests walk is made of symlinks, which Windows
+// creates only with a privilege, so the helper and its tests run on Unix hosts.
+#[cfg(unix)]
 struct Tree {
     _base: tempfile::TempDir,
     w: PathBuf,
     lane: PathBuf,
     deep: PathBuf,
 }
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 fn tree() -> Tree {
     let base = tempfile::tempdir().unwrap();
     let p = base.path().canonicalize().unwrap();
@@ -1271,12 +1279,14 @@ fn tree() -> Tree {
     }
 }
 
+#[cfg(unix)]
 fn r2_aimed_elsewhere(cmds: Vec<String>, t: &Tree) -> Vec<String> {
     cmds.into_iter()
         .filter(|c| runs_git_mutation(c, &t.w))
         .collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn r2_commands_aimed_at_another_worktree_are_not_credited() {
     let t = tree();
@@ -1318,6 +1328,7 @@ fn r2_commands_aimed_at_another_worktree_are_not_credited() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn r2_commands_aimed_here_still_count_controls() {
     let t = tree();
@@ -1336,6 +1347,7 @@ fn r2_commands_aimed_here_still_count_controls() {
 /// Where a run lands is judged as text and must be the worktree's root: a
 /// subdirectory of the worktree, once proved by the filesystem, is not (it may
 /// be a nested repository today or a link tomorrow), and neither is a `..`.
+#[cfg(unix)]
 #[test]
 fn w9r_only_the_worktrees_own_root_is_here() {
     let t = tree();
@@ -1357,6 +1369,7 @@ fn w9r_only_the_worktrees_own_root_is_here() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn r2_symlink_loop_does_not_hang() {
     let t = tree();
@@ -1364,6 +1377,7 @@ fn r2_symlink_loop_does_not_hang() {
     let _ = runs_git_mutation(&c, &t.w);
 }
 
+#[cfg(unix)]
 #[test]
 fn r2_removed_lane_replaced_by_symlink_must_not_match_another_worktree() {
     let (_d, repo) = repo_dir();

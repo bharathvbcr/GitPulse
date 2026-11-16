@@ -165,8 +165,8 @@ impl Executor {
     /// Queues `body` with nobody awaiting it: it reports its own result. For
     /// the terminal host, whose replies go back over a socket rather than to a
     /// future. Queued in call order, refused at once when the queue is full,
-    /// and a panic in `body` is contained like one in [`Executor::run`]'s.
-    #[cfg(unix)]
+    /// and a panic in `body` is contained like one in [`Executor::run`]'s. Not
+    /// Unix-only: the terminal's probe reply queues here on every host.
     pub(crate) fn spawn<F>(&self, operation: &'static str, body: F) -> Result<(), String>
     where
         F: FnOnce() -> Result<(), String> + Send + 'static,
