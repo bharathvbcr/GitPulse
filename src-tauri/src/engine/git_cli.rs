@@ -34,7 +34,8 @@ mod shared_budget;
 
 pub(crate) mod read_cancel;
 
-#[cfg(test)]
+// Real child processes signalled by pid (`libc::kill`), which Windows lacks.
+#[cfg(all(test, unix))]
 mod read_cancel_tests;
 
 #[cfg(test)]

@@ -519,7 +519,9 @@ fn an_abandoned_read_that_panics_gives_its_slot_back() {
 }
 
 /// Every read is of the canonical path validation returned: asked through a
-/// link, the app reads (and names) the real repository.
+/// link, the app reads (and names) the real repository. Creating a link needs a
+/// privilege on Windows, so this runs on Unix hosts.
+#[cfg(unix)]
 #[test]
 fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
     let farm = farm(1, false);
