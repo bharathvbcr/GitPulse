@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+// Bare `Duration` is named by the macOS-only `AskerDeadline::new` and, through
+// `use super::*`, by this module's test files; everything else spells the path.
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
