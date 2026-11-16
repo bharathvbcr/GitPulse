@@ -1395,7 +1395,11 @@ fn a_session_without_a_registry_id_is_identified_from_its_command_line() {
     }
     let argv = |pid: u32| -> Option<Vec<String>> {
         let args: &[&str] = match pid {
-            11 => &["claude", "--session-id", "session-0009-cccccccc"],
+            11 => &[
+                "claude",
+                crate::workbench::terminal_command::CLAUDE_SESSION_ID_FLAG,
+                "session-0009-cccccccc",
+            ],
             12 => &["/x/rg", "--files"],
             13 => &["claude", "--chrome-native-host"],
             _ => return None,

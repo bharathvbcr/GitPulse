@@ -763,6 +763,11 @@ pub fn session_id_args(provider: &str, session_id: &str) -> Result<Vec<String>, 
 /// Verified against Claude Code CLI `CLAUDE_FORK_VERIFIED_VERSION` (`2.1.325`)
 /// and [`CLAUDE_FORK_DOC_URL`].
 pub const CLAUDE_FORK_SESSION_FLAG: &str = "--fork-session";
+/// The Claude Code CLI flag that names the session a process runs as. This
+/// file builds it; a reader of another process's arguments (the session
+/// detector's fallback in `sysload::procscan`) takes the spelling from here,
+/// so the flag is written in one place.
+pub const CLAUDE_SESSION_ID_FLAG: &str = "--session-id";
 pub const CLAUDE_FORK_DOC_URL: &str = "https://code.claude.com/docs/en/cli-reference";
 pub const CLAUDE_FORK_VERIFIED_VERSION: &str = "2.1.325";
 

@@ -2065,11 +2065,16 @@ fn classify_use(spellings: &[PathBuf], process: &ProcessUse) -> Option<UseKind> 
 /// id, so it would name a session that is not the one running. The value must be
 /// shaped like an id (letters, digits, `-` and `_`, 8 to 96 long).
 pub(crate) fn claude_session_id_in(argv: &[String]) -> Option<String> {
+    // The flag's spelling belongs to the file that builds it.
+    let flag = crate::workbench::terminal_command::CLAUDE_SESSION_ID_FLAG;
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
-        let value = if arg == "--session-id" {
+        let value = if arg == flag {
             iter.next()?.as_str()
-        } else if let Some(value) = arg.strip_prefix("--session-id=") {
+        } else if let Some(value) = arg
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
             value
         } else {
             continue;
