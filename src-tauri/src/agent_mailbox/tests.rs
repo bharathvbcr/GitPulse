@@ -823,3 +823,54 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
         .unwrap());
     assert_eq!(mailbox.status(SESSION, "msg-hop-max"), Delivery::Claimed);
 }
+
+#[test]
+fn the_app_ui_deposit_still_arrives_as_human_confirmed_with_a_sidecar() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "ui-1", "the person approved this", now)
+        .unwrap();
+    let key = session_key(SESSION).unwrap();
+    assert_eq!(
+        mailbox.read_provenance(&key, "ui-1").unwrap(),
+        EnvelopeProvenance::HumanConfirmed
+    );
+    let claimed = mailbox.try_claim_batch(SESSION, 8, now).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].provenance, EnvelopeProvenance::HumanConfirmed);
+}
+
+#[test]
+fn a_lost_provenance_sidecar_never_reads_as_human_confirmed() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    let provenance = EnvelopeProvenance::PeerAgent {
+        msg_id: "lost-1".into(),
+        from_peer: "claude:coder".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 1,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: false,
+        repo_root: "/tmp/repo".into(),
+    };
+    mailbox
+        .deposit_with_provenance(SESSION, "lost-1", "an agent message", provenance, now)
+        .unwrap();
+    let key = session_key(SESSION).unwrap();
+    std::fs::remove_file(mailbox.meta_path(&key, "lost-1")).unwrap();
+
+    assert!(
+        mailbox.read_provenance(&key, "lost-1").is_err(),
+        "a missing sidecar is an error, not a human"
+    );
+    let claimed = mailbox.try_claim_batch(SESSION, 8, now).unwrap();
+    assert!(
+        claimed
+            .iter()
+            .all(|env| env.provenance != EnvelopeProvenance::HumanConfirmed),
+        "a lost sidecar must not upgrade an agent message to human-confirmed: {claimed:?}"
+    );
+}

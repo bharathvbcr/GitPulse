@@ -4596,6 +4596,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let kind = a.kind.as_deref().unwrap_or("note");
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 a.to_agent.as_deref(),
                 a.thread_key.as_deref(),
@@ -4774,6 +4775,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 };
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 a.to_agent.as_deref(),
                 Some(&a.thread_key),
@@ -4818,6 +4820,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
             let message = crate::engine::agent_bus::withdraw_ask(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 &a.thread_key,
                 &a.reason,
@@ -4894,6 +4897,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             });
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 Some(&a.to_agent),
                 Some(&thread_key),

@@ -1401,6 +1401,7 @@ pub async fn cmd_inbox_decompose_task(
             });
             let bus_msg = crate::engine::agent_bus::post_thread_message(
                 &repo_path,
+                crate::engine::agent_bus::MessageOrigin::Person,
                 "developer",
                 assign_agent.as_deref(),
                 Some(&thread_key),

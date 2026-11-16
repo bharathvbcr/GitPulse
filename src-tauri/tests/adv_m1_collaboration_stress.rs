@@ -70,6 +70,7 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     // 1. Empty body must be rejected
     let err = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-1"),
@@ -87,6 +88,7 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     // 2. Whitespace-only body must be rejected
     let err_ws = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-1"),
@@ -104,6 +106,7 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     // 3. Null byte in body must be rejected
     let err_null = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-1"),
@@ -121,6 +124,7 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     // 4. Empty from_agent must be rejected
     let err_agent = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "",
         None,
         Some("thread-1"),
@@ -136,7 +140,14 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     );
 
     // 5. Empty reason in withdraw must be rejected
-    let err_reason = withdraw_ask(repo_path, "agent-1", "thread-1", "").unwrap_err();
+    let err_reason = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "thread-1",
+        "",
+    )
+    .unwrap_err();
     assert!(
         err_reason.message().contains("empty"),
         "Expected empty reason rejection, got: {}",
@@ -144,7 +155,13 @@ fn test_agent_bus_empty_and_whitespace_validation() {
     );
 
     // 6. Non-empty thread_key validation in withdraw_ask
-    let unattached_withdraw = withdraw_ask(repo_path, "agent-1", "", "reason");
+    let unattached_withdraw = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "",
+        "reason",
+    );
     assert!(
         unattached_withdraw.is_err(),
         "withdraw_ask must reject empty thread_key"
@@ -156,7 +173,13 @@ fn test_agent_bus_empty_and_whitespace_validation() {
         err_tk.message()
     );
 
-    let ws_withdraw = withdraw_ask(repo_path, "agent-1", "   \t\n  ", "reason");
+    let ws_withdraw = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "   \t\n  ",
+        "reason",
+    );
     assert!(
         ws_withdraw.is_err(),
         "withdraw_ask must reject whitespace thread_key"
@@ -172,6 +195,7 @@ fn test_agent_bus_payload_boundaries() {
     let exact_body = "x".repeat(MAX_MESSAGE_BODY_BYTES);
     let msg_ok = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-bound"),
@@ -185,6 +209,7 @@ fn test_agent_bus_payload_boundaries() {
     let excess_body = "x".repeat(MAX_MESSAGE_BODY_BYTES + 1);
     let err_body = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("thread-bound-2"),
@@ -203,6 +228,7 @@ fn test_agent_bus_payload_boundaries() {
     let exact_tk = "k".repeat(80);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(&exact_tk),
@@ -215,6 +241,7 @@ fn test_agent_bus_payload_boundaries() {
     let excess_tk = "k".repeat(81);
     let err_tk = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(&excess_tk),
@@ -233,6 +260,7 @@ fn test_agent_bus_payload_boundaries() {
     let exact_agent = "a".repeat(128);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         &exact_agent,
         None,
         Some("thread-1"),
@@ -245,6 +273,7 @@ fn test_agent_bus_payload_boundaries() {
     let excess_agent = "a".repeat(129);
     let err_agent = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         &excess_agent,
         None,
         Some("thread-1"),
@@ -263,10 +292,24 @@ fn test_agent_bus_payload_boundaries() {
 
     // 5. withdraw reason max length 600 chars
     let exact_reason = "r".repeat(600);
-    assert!(withdraw_ask(repo_path, "agent-1", "thread-1", &exact_reason).is_ok());
+    assert!(withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "thread-1",
+        &exact_reason
+    )
+    .is_ok());
 
     let excess_reason = "r".repeat(601);
-    let err_reason = withdraw_ask(repo_path, "agent-1", "thread-1", &excess_reason).unwrap_err();
+    let err_reason = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "thread-1",
+        &excess_reason,
+    )
+    .unwrap_err();
     assert!(
         err_reason
             .message()
@@ -293,6 +336,7 @@ fn test_agent_bus_nonexistent_thread_and_filtering() {
     // 3. Post a message to thread-A, thread-B
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-alpha",
         Some("agent-beta"),
         Some("thread-A"),
@@ -304,6 +348,7 @@ fn test_agent_bus_nonexistent_thread_and_filtering() {
 
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-gamma",
         Some("agent-delta"),
         Some("thread-B"),
@@ -336,7 +381,14 @@ fn test_agent_bus_nonexistent_thread_and_filtering() {
     assert_eq!(answered_threads.len(), 0);
 
     // Answer thread-A
-    answer_ask(repo_path, "agent-beta", "thread-A", "Choice A confirmed").expect("answer A");
+    answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-beta",
+        "thread-A",
+        "Choice A confirmed",
+    )
+    .expect("answer A");
 
     let updated_open = list_inbox_threads(repo_path, None, Some("open")).expect("list open");
     assert_eq!(updated_open.len(), 1);
@@ -357,6 +409,7 @@ fn test_agent_bus_ring_buffer_eviction_threads_integrity() {
     for i in 1..=100 {
         post_thread_message(
             repo_path,
+            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-worker",
             None,
             Some("thread-1"),
@@ -370,6 +423,7 @@ fn test_agent_bus_ring_buffer_eviction_threads_integrity() {
     for i in 101..=200 {
         post_thread_message(
             repo_path,
+            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-worker",
             None,
             Some("thread-2"),
@@ -383,6 +437,7 @@ fn test_agent_bus_ring_buffer_eviction_threads_integrity() {
     for i in 201..=300 {
         post_thread_message(
             repo_path,
+            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
             "agent-worker",
             None,
             Some("thread-3"),
