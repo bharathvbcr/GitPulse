@@ -174,6 +174,13 @@ export interface AgentSession {
    */
   parent_pid: number | null;
   footprint: Reading<number>;
+  /**
+   * Bytes per second the session's own process and its attached descendants
+   * wrote since the previous tick. A floor, never the whole: a process that
+   * started and exited between two ticks is never read. It names who wrote,
+   * not which folder the bytes went to.
+   */
+  write_rate: Reading<number>;
   members: number;
   unreadable_members: number;
 }

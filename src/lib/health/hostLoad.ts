@@ -9,6 +9,8 @@
  */
 import { humanBytes } from "../storage/format";
 import type {
+  AgentKind,
+  AgentSession,
   Binding,
   DiskFill,
   GovernorPulse,
@@ -246,6 +248,60 @@ export function refusalNotice(governor: GovernorPulse): string {
       : `largest foreign footprint ${bytes(governor.largest_foreign)}`;
   const cause = bindingCause(governor.binding);
   return `Refusing agent launches for ${minutes} min under ${cause}; ${largest}.`;
+}
+
+/**
+ * The slowest session write rate worth naming, in bytes a second. Below it
+ * every session is ordinary background churn and a "fastest" line would only
+ * point at noise.
+ */
+export const FASTEST_WRITER_MIN_RATE = 1_048_576;
+
+const AGENT_LABEL: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  antigravity: "Antigravity",
+  dev_council: "DevCouncil",
+  manvi: "Manvi",
+};
+
+export interface FastestWriter {
+  session: AgentSession;
+  /** Bytes a second, a floor. */
+  rate: number;
+  line: string;
+}
+
+/**
+ * The session whose processes wrote fastest over the last tick, and the
+ * sentence that says so; null when there is nothing honest to say: no reading
+ * yet (no baseline), no session at or above the threshold, or no sessions.
+ *
+ * It is a statement about which session's processes are writing, never about
+ * which folder grows: the counters are per process, not per path. The rate is
+ * a floor (a process that started and exited between two ticks is never
+ * read), so the sentence says "at least". On a truncated list the claim is
+ * only about the sessions shown. A tie goes to the lower pid, so the answer
+ * does not flip between ticks.
+ */
+export function fastestWriter(sessions: AgentSession[], truncated: boolean): FastestWriter | null {
+  let best: { session: AgentSession; rate: number } | null = null;
+  for (const session of sessions) {
+    const rate = valueOf(session.write_rate);
+    if (rate === null || rate < FASTEST_WRITER_MIN_RATE) continue;
+    if (best === null || rate > best.rate || (rate === best.rate && session.pid < best.session.pid)) {
+      best = { session, rate };
+    }
+  }
+  if (best === null) return null;
+  const { session, rate } = best;
+  const where = session.cwd ? `in ${session.cwd}` : "in an unknown directory";
+  const lead = truncated ? "Writing fastest of the sessions shown" : "Writing fastest";
+  return {
+    session,
+    rate,
+    line: `${lead}: ${AGENT_LABEL[session.kind]} session ${session.pid} ${where}, at least ${bytesPerSecond(rate)}`,
+  };
 }
 
 /** A fill rate in bytes a minute: "2.7 GB/min". */

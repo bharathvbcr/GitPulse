@@ -754,6 +754,14 @@ pub struct AgentSession {
     pub parent_pid: Option<i32>,
     /// The session's own process plus every descendant still attached.
     pub footprint: Reading<u64>,
+    /// Bytes per second the session's own process and its attached
+    /// descendants wrote since the previous tick: the same members as
+    /// `footprint`, each process counted in exactly one session. A floor,
+    /// never the whole: a process that started and exited between two ticks is
+    /// never read, a process that exited since the last tick takes its latest
+    /// bytes with it, and a process whose counter cannot be read adds nothing.
+    /// It says which processes wrote, not to which folder.
+    pub write_rate: Reading<u64>,
     pub members: u32,
     pub unreadable_members: u32,
     #[serde(skip)]
@@ -1184,7 +1192,9 @@ impl Scanner {
                 None => {}
             }
             if let Some(s) = self.session_of[i] {
-                per_session[s as usize].add(f.footprint);
+                let sum = &mut per_session[s as usize];
+                sum.add(f.footprint);
+                sum.written = sum.written.saturating_add(written_delta);
             }
             if f.ident.memguard
                 && memguard.is_none_or(|m| {
@@ -1313,6 +1323,7 @@ impl Scanner {
                     |pid| session_pids.contains(&pid),
                 ),
                 footprint: sum.reading(),
+                write_rate: rate(sum.written),
                 members: sum.readable + sum.unreadable,
                 unreadable_members: sum.unreadable,
                 ide_hosted: f.ident.ide_hosted,
@@ -1711,6 +1722,7 @@ fn assemble_scan(
             // This path does not read footprints. Unavailable is the
             // not-measured signal; zero would say the session uses no memory.
             footprint: Reading::Unavailable(Why::Unsupported),
+            write_rate: Reading::Unavailable(Why::Unsupported),
             members: 1,
             unreadable_members: 0,
             ide_hosted: row.ide_hosted,
@@ -5485,6 +5497,81 @@ pub(crate) mod tests {
         facts.lock().unwrap()[0].written = Reading::Value(5);
         let third = scan.scan(&ctx(14_000_000));
         assert_eq!(third.launched_write_rate, Reading::Value(0));
+    }
+
+    /// The session's write rate is the same sum its footprint is: its own
+    /// process and what is attached below it, each process in one session.
+    #[test]
+    fn a_sessions_write_rate_counts_its_descendants_once_where_its_footprint_lands() {
+        let (mut scan, facts) = scanner(vec![
+            // An observed session with a shell and a build under it.
+            p(20, 1, CLAUDE),
+            p(21, 20, "/bin/sh"),
+            p(22, 21, "/usr/bin/rustc"),
+            // A Claude started in that shell is a session of its own.
+            p(30, 21, CLAUDE),
+            p(31, 30, "/bin/dd"),
+            // A launched session: its tree and its session are the same set.
+            P {
+                env: &["GITPULSE_RUN_ID=w"],
+                ..p(40, 1, CLAUDE)
+            },
+            P {
+                env: &["GITPULSE_RUN_ID=w"],
+                ..p(41, 40, "/bin/dd")
+            },
+        ]);
+        let rate_of = |view: &ProcView, pid: i32| {
+            view.sessions
+                .iter()
+                .find(|s| s.pid == pid)
+                .unwrap_or_else(|| panic!("no session {pid}: {:?}", view.sessions))
+                .write_rate
+        };
+        let first = scan.scan(&ctx(10_000_000));
+        for pid in [20, 30, 40] {
+            assert_eq!(rate_of(&first, pid), Reading::Unavailable(Why::NotYet));
+        }
+        {
+            let mut f = facts.lock().unwrap();
+            for (pid, bytes) in [
+                (20, 10_000_000),
+                (21, 20_000_000),
+                (22, 30_000_000),
+                (30, 40_000_000),
+                (31, 50_000_000),
+                (40, 8_000_000),
+                (41, 12_000_000),
+            ] {
+                f.iter_mut().find(|r| r.pid == pid).unwrap().written = Reading::Value(bytes);
+            }
+            // Born after the first tick: all its bytes are new, and they are
+            // the outer session's.
+            f.extend(facts_of(vec![P {
+                written: 4_000_000,
+                start_us: 11_000_000,
+                ..p(23, 20, "/usr/bin/cc")
+            }]));
+        }
+        let second = scan.scan(&ctx(12_000_000));
+        // 10 + 20 + 30 + 4 MB over 2 s; the nested session's bytes are its own.
+        assert_eq!(rate_of(&second, 20), Reading::Value(32_000_000));
+        assert_eq!(rate_of(&second, 30), Reading::Value(45_000_000));
+        let launched = rate_of(&second, 40);
+        assert_eq!(launched, Reading::Value(10_000_000));
+        let tree = second.trees.iter().find(|t| t.tree == "run:w").unwrap();
+        assert_eq!(tree.write_rate, launched);
+        // Every written byte is in exactly one session.
+        let total: u64 = second
+            .sessions
+            .iter()
+            .map(|s| s.write_rate.value().unwrap())
+            .sum();
+        assert_eq!(total, 87_000_000);
+        // A member gone between ticks takes its bytes with it.
+        facts.lock().unwrap().retain(|r| r.pid != 22);
+        let third = scan.scan(&ctx(14_000_000));
+        assert_eq!(rate_of(&third, 20), Reading::Value(0));
     }
 
     #[test]

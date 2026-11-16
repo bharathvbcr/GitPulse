@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import type { GovernorReport, HostLoadPulse, MemguardHealth, Reading, Snapshot } from "../stores/hostLoadStore";
+import type {
+  AgentSession,
+  GovernorReport,
+  HostLoadPulse,
+  MemguardHealth,
+  Reading,
+  Snapshot,
+} from "../stores/hostLoadStore";
 import {
+  FASTEST_WRITER_MIN_RATE,
   admissionLine,
+  fastestWriter,
   bytes,
   bindingLabel,
   describeReading,
@@ -368,5 +377,71 @@ describe("the fill rate line tells not measured from not falling", () => {
   it("gives the projection when the disk is heading for the floor, and nothing without a snapshot", () => {
     expect(fillRateLine(snapshot({ status: "value", value: 2.7 * GIB }), projection)).toBe(diskFillLine(projection));
     expect(fillRateLine(null, null)).toBeNull();
+  });
+});
+
+describe("fastestWriter", () => {
+  // humanBytes counts in 1024s and labels them MB.
+  const MB = 1_048_576;
+  const session = (
+    pid: number,
+    write_rate: Reading<number>,
+    over: Partial<AgentSession> = {},
+  ): AgentSession => ({
+    kind: "claude",
+    pid,
+    start_us: 1,
+    cwd: `/work/${pid}`,
+    tree: null,
+    run_id: null,
+    parent_pid: null,
+    footprint: { status: "value", value: 1 },
+    write_rate,
+    members: 1,
+    unreadable_members: 0,
+    ...over,
+  });
+  const rate = (value: number): Reading<number> => ({ status: "value", value });
+  const notYet: Reading<number> = { status: "unavailable", value: "not_yet" };
+
+  it("says nothing without a baseline or without any session", () => {
+    expect(fastestWriter([], false)).toBeNull();
+    expect(fastestWriter([session(1, notYet), session(2, { status: "unavailable", value: "unsupported" })], false)).toBeNull();
+  });
+
+  it("says nothing when no session writes above the threshold, zero included", () => {
+    expect(fastestWriter([session(1, rate(0)), session(2, rate(FASTEST_WRITER_MIN_RATE - 1))], false)).toBeNull();
+  });
+
+  it("names the fastest session, its kind, pid and directory, as a floor about its processes", () => {
+    const found = fastestWriter(
+      [session(1, rate(2 * MB)), session(2, rate(85 * MB), { kind: "codex", cwd: "/Users/me/app" }), session(3, notYet)],
+      false,
+    );
+    expect(found?.session.pid).toBe(2);
+    expect(found?.rate).toBe(85 * MB);
+    expect(found?.line).toBe("Writing fastest: Codex session 2 in /Users/me/app, at least 85.0 MB/s");
+    expect(found?.line).not.toMatch(/folder|growing/i);
+  });
+
+  it("breaks a tie toward the lower pid whatever the order", () => {
+    const a = session(9, rate(5 * MB));
+    const b = session(4, rate(5 * MB));
+    expect(fastestWriter([a, b], false)?.session.pid).toBe(4);
+    expect(fastestWriter([b, a], false)?.session.pid).toBe(4);
+  });
+
+  it("limits the claim to the sessions shown when the list was cut", () => {
+    const found = fastestWriter([session(7, rate(10 * MB))], true);
+    expect(found?.line).toBe("Writing fastest of the sessions shown: Claude session 7 in /work/7, at least 10.0 MB/s");
+  });
+
+  it("treats a launched and an observed session alike, and admits an unknown directory", () => {
+    const launched = session(10, rate(3 * MB), { tree: "run:r1", run_id: "r1" });
+    const observed = session(11, rate(6 * MB), { cwd: null });
+    expect(fastestWriter([launched, observed], false)?.line).toBe(
+      "Writing fastest: Claude session 11 in an unknown directory, at least 6.00 MB/s",
+    );
+    expect(fastestWriter([launched], false)?.session.run_id).toBe("r1");
   });
 });
