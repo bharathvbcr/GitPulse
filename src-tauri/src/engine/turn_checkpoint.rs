@@ -74,9 +74,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+// Only the macOS handler resolves a request's cwd to its repository root.
+#[cfg(target_os = "macos")]
+use crate::engine::git_cli::find_git_root;
 use crate::engine::git_cli::{
-    find_git_root, git_captured, git_captured_with_stdin, git_text_capped, git_with_index,
-    validate_repo,
+    git_captured, git_captured_with_stdin, git_text_capped, git_with_index, validate_repo,
 };
 use crate::engine::git_writer::{
     absent_oid_for_len, validate_oid, validate_ref_name, SNAPSHOT_IDENTITY_ARGS,
@@ -1471,6 +1473,7 @@ pub fn diff_turn_checkpoint(
 /// git process runs, no ref is written and no ledger row is appended (the row
 /// needs the repository's address, which reads Git). Otherwise every attempt
 /// writes one ledger row naming its outcome; the reply carries the same result.
+#[cfg(target_os = "macos")]
 pub fn serve_turn_checkpoint(
     request: &crate::desktop::instance::Request,
 ) -> Result<serde_json::Value, String> {
@@ -1480,6 +1483,7 @@ pub fn serve_turn_checkpoint(
 }
 
 /// [`serve_turn_checkpoint`] with where the setting is read from passed in.
+#[cfg(target_os = "macos")]
 pub(crate) fn serve_turn_checkpoint_with(
     request: &crate::desktop::instance::Request,
     enabled: &dyn Fn() -> bool,

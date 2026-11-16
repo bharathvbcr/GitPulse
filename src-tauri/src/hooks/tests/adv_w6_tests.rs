@@ -9,6 +9,8 @@
 //! pins a hole.
 
 use super::*;
+// Its methods are called only by the macOS tests below.
+#[cfg(target_os = "macos")]
 use crate::procguard::LockedSpawn;
 use crate::test_support::git_in;
 use std::path::Path;

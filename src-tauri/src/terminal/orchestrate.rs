@@ -22,6 +22,7 @@ use crate::terminal::{
     bounded_pty_size, detach_session, is_session_id, spawn_at, write_input, OutputSink, Place,
     SessionEvents, SharedSessionTelemetry, TerminalSessions,
 };
+#[cfg(unix)]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

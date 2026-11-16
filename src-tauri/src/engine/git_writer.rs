@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+// Bare `Duration` is named by the macOS-only `AskerDeadline::new` and, through
+// `use super::*`, by macOS-only tests; everything else spells the path.
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -4466,7 +4470,7 @@ fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
     let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
     op_snapshot_test_failures()
@@ -4494,7 +4498,9 @@ pub(crate) struct AskerDeadline {
 }
 
 impl AskerDeadline {
-    /// `budget` from `start`, on the real clock.
+    /// `budget` from `start`, on the real clock. Only the macOS op-record
+    /// handler builds one.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(start: Instant, budget: Duration) -> Self {
         Self {
             expires_at: start + budget,
@@ -4502,7 +4508,7 @@ impl AskerDeadline {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
         Self { expires_at, now }
     }
@@ -4529,7 +4535,9 @@ pub(crate) const OP_DEADLINE_PASSED: &str =
 
 impl GitWriter {
     /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
-    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]). Only the macOS
+    /// op-record handler calls it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn record_op_snapshot(
         repo_path: &str,
         command: &str,
@@ -5033,6 +5041,7 @@ impl GitWriter {
     /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
     /// logged like any other failure (under the request's id), which is also
     /// what settles the hook's "unknown" row for the same write.
+    #[cfg(target_os = "macos")]
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
         not_after_send: Instant,
@@ -9927,6 +9936,7 @@ mod bound_to_checked_state {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
         let (_dir, repo) = repo_with_unprunable_expired_snapshot();
@@ -9982,7 +9992,8 @@ mod adv_tests;
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
 
-#[cfg(test)]
+// Every case builds a `desktop::instance::Request`, which exists on macOS only.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "git_writer_op_deadline_tests.rs"]
 mod op_deadline_tests;
 

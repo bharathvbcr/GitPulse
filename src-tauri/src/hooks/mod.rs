@@ -3664,6 +3664,10 @@ fn report_agent_session_meta(_repo_root: &str, _input: &HookInput) {}
 
 /// Repo-relative edit or Antigravity plan artifact extracted from a successful
 /// file-modifying `PostToolUse` hook payload for live "Follow Agent" split panes.
+///
+/// Only `report_agent_touched_file` (macOS) sends it, and the tests read it on
+/// every host, so it exists on macOS and under `cfg(test)`.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TouchedFileReport {
     pub repo: String,
@@ -3671,6 +3675,7 @@ pub(crate) struct TouchedFileReport {
     pub artifact: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn normalize_normal_relative(rel: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for component in rel.components() {
@@ -3692,6 +3697,7 @@ fn normalize_normal_relative(rel: &Path) -> Option<String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn extract_touched_file_report(input: &HookInput) -> Option<TouchedFileReport> {
     if input.incoming.is_none()
         || input.hook_event_name == "PostToolUseFailure"
@@ -9172,7 +9178,7 @@ done
         assert!(output.is_silent());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn session_start_input(cwd: &str) -> HookInput {
         HookInput {
             hook_event_name: SESSION_START.to_string(),
@@ -9182,7 +9188,7 @@ done
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn brief_context(output: &HookOutput) -> &str {
         output
             .hook_specific_output
