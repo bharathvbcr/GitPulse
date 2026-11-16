@@ -290,6 +290,9 @@ struct PruneOutcome {
     reason: Option<String>,
     branch_deleted: Option<bool>,
     reaped: Vec<i32>,
+    /// Processes the reaper leaves running (agent sessions, interactive
+    /// shells, supervisor-owned launches), still working in the worktree.
+    spared: Vec<i32>,
     cleanup_error: Option<String>,
 }
 
@@ -300,24 +303,9 @@ impl PruneOutcome {
             reason,
             branch_deleted: None,
             reaped: Vec::new(),
+            spared: Vec::new(),
             cleanup_error: None,
         }
-    }
-}
-
-/// Why a worktree is not removed out from under a live process: one stands in
-/// it, runs from it, or names it in its arguments or environment. A process
-/// table that could not be read in full refuses too.
-fn worktree_in_use(path: &std::path::Path) -> Option<String> {
-    match crate::sysload::procscan::processes_using(path) {
-        Err(e) => Some(format!("could not check for live processes: {e}")),
-        Ok(pids) if !pids.is_empty() => Some(format!(
-            "{} live process(es) use it (pids {pids:?}): their working directory, executable, \
-             arguments or environment is inside or names it; stop them, or pass \
-             reap_processes: true to terminate those standing in it",
-            pids.len()
-        )),
-        Ok(_) => None,
     }
 }
 
@@ -331,6 +319,14 @@ fn prune_one(
     reap: bool,
 ) -> PruneOutcome {
     let skipped = |reason: String| PruneOutcome::new("skipped", Some(reason));
+    // First, and whatever `force` says: an agent working in the lane (a lane
+    // claim, a live session attributed to it) is not removed over MCP, where
+    // there is nobody to confirm it. Nothing is signalled before this passes.
+    if let Some(reason) =
+        crate::engine::worktree::agent_hold(repo_path, &wt.path, wt.branch.as_deref(), true)
+    {
+        return skipped(reason);
+    }
     if !force {
         // A check that could not run is a skip with its error, never a pass.
         match crate::engine::worktree::user_changed_paths(&wt.path) {
@@ -368,11 +364,18 @@ fn prune_one(
     }
     let mut reaped = Vec::new();
     if reap {
-        match crate::engine::worktree::reap_processes_in_dir(
-            std::path::Path::new(&wt.path),
-            dry_run,
-        ) {
-            Ok(r) => reaped = r.pids_terminated,
+        // A spared process is a reason to keep the worktree and its branch,
+        // with or without `force`, in a dry run as in a real one.
+        match crate::engine::worktree::reap_then_hold(std::path::Path::new(&wt.path), dry_run) {
+            Ok(r) => {
+                reaped = r.terminated;
+                if let Some(reason) = r.hold {
+                    let mut out = skipped(reason);
+                    out.reaped = reaped;
+                    out.spared = r.spared;
+                    return out;
+                }
+            }
             Err(e) => {
                 return PruneOutcome::new(
                     "failed",
@@ -380,27 +383,13 @@ fn prune_one(
                 )
             }
         }
-    } else {
+    } else if let Some(reason) =
         // Not removing a worktree out from under a process that is working in it.
-        if let Some(reason) = worktree_in_use(std::path::Path::new(&wt.path)) {
-            return skipped(reason);
-        }
-    }
-    if reap && !dry_run {
-        // Reaping signals only processes standing in the worktree. One that
-        // merely names it (a build run from elsewhere) is not signalled, and
-        // one that was is given a moment to exit: removal waits for neither.
-        let mut reason = worktree_in_use(std::path::Path::new(&wt.path));
-        for _ in 0..20 {
-            if reason.is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            reason = worktree_in_use(std::path::Path::new(&wt.path));
-        }
-        if let Some(reason) = reason {
-            return skipped(format!("after terminating processes: {reason}"));
-        }
+        crate::engine::worktree::live_process_refusal(std::path::Path::new(&wt.path))
+    {
+        return skipped(format!(
+            "{reason}; reap_processes: true terminates those standing in it"
+        ));
     }
     if dry_run {
         let mut out = PruneOutcome::new("would_remove", None);
@@ -2358,7 +2347,7 @@ fn build_tools() -> Vec<Value> {
         destructive_tool(
             "gitpulse_worktree_prune",
             "Prune worktrees",
-            "Safely prune worktrees and delete branches verified as integrated via 6-point check. A worktree with a live process working inside it is skipped with the reason unless reap_processes is true (opt-in: it terminates those processes). Every worktree gets its own outcome in `outcomes` (removed, would_remove, removed_branch_kept, skipped or failed, with why); one failing never aborts the rest. In a dry run `pruned_worktrees` lists what would be removed",
+            "Safely prune worktrees and delete branches verified as integrated via 6-point check. A worktree with a live process working inside it is skipped with the reason unless reap_processes is true (opt-in: it terminates those processes), and even then a process the reaper spares (an agent session, an interactive shell, a supervisor-owned launch) keeps the worktree and its branch: it is skipped and named in `spared_pids`. `force` skips only the uncommitted-changes and integration checks: it never removes a worktree that has a lane claim (gitpulse_worktree_claim) or an attributed live agent session. There is no confirmation channel over MCP, so the person removes such a worktree in the app, or the agent calls gitpulse_worktree_release first. Every worktree gets its own outcome in `outcomes` (removed, would_remove, removed_branch_kept, skipped or failed, with why); one failing never aborts the rest. In a dry run `pruned_worktrees` lists what would be removed",
             WorktreePruneArgs::properties(),
             &WorktreePruneArgs::required(),
             json!({
@@ -2379,6 +2368,7 @@ fn build_tools() -> Vec<Value> {
                                 "reason": { "type": ["string", "null"] },
                                 "branch_deleted": { "type": ["boolean", "null"] },
                                 "reaped_pids": { "type": "array", "items": { "type": "integer" } },
+                                "spared_pids": { "type": "array", "items": { "type": "integer" }, "description": "Processes the reaper leaves running (agent sessions, interactive shells, supervisor-owned launches) that still work in the worktree; any of them keeps the worktree and its branch" },
                                 "cleanup_error": { "type": ["string", "null"] }
                             },
                             "required": ["worktree_path", "status"]
@@ -2391,7 +2381,7 @@ fn build_tools() -> Vec<Value> {
         destructive_tool(
             "gitpulse_worktree_merge",
             "Merge worktree",
-            "Automated merge pipeline: 6-point check, quarantined 3-way conflict detection, squash or merge commit, process reaping, and worktree/branch teardown",
+            "Automated merge pipeline: 6-point check, quarantined 3-way conflict detection, squash or merge commit, process reaping, and worktree/branch teardown. The teardown keeps the worktree and its branch (the merge still succeeds; `worktree_kept_reason` says why) while an attributed live agent session or any process the reaper spares (an agent session, an interactive shell, a supervisor-owned launch) works in it",
             WorktreeMergeArgs::properties(),
             &WorktreeMergeArgs::required(),
             json!({
@@ -2403,6 +2393,7 @@ fn build_tools() -> Vec<Value> {
                     "squashed_commit": { "type": ["string", "null"] },
                     "merged_sha": { "type": ["string", "null"] },
                     "worktree_removed": { "type": "boolean" },
+                    "worktree_kept_reason": { "type": ["string", "null"], "description": "Why the source worktree and its branch were kept although remove_worktree was true: an agent session or process still works in it, the command gate refused, or git could not remove it. The merge itself still happened" },
                     "error": { "type": ["string", "null"] }
                 },
                 "required": ["ok", "source_branch", "target_branch", "worktree_removed"]
@@ -4539,6 +4530,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     "reason": outcome.reason,
                     "branch_deleted": outcome.branch_deleted,
                     "reaped_pids": outcome.reaped,
+                    "spared_pids": outcome.spared,
                     "cleanup_error": outcome.cleanup_error
                 }));
             }
@@ -4570,6 +4562,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "squashed_commit": res.squashed_commit,
                 "merged_sha": res.merged_sha,
                 "worktree_removed": res.worktree_removed,
+                "worktree_kept_reason": res.worktree_kept_reason,
                 "error": res.error
             }))
         }
@@ -5583,13 +5576,13 @@ mod tests {
         let elsewhere = root.join("elsewhere");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
-        let idle = worktree_in_use(&worktree);
+        let idle = crate::engine::worktree::live_process_refusal(&worktree);
         assert!(idle.is_none(), "nothing uses an empty directory: {idle:?}");
         let mut child =
             crate::sysload::procscan::tests::directory_use_child(&worktree, &elsewhere, true);
         let mut reason = None;
         let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
-            reason = worktree_in_use(&worktree);
+            reason = crate::engine::worktree::live_process_refusal(&worktree);
             reason.is_some()
         });
         drop(child.stdin.take());
@@ -12564,6 +12557,212 @@ mod tests {
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
+    }
+
+    /// A process the reaper spares (an interactive shell here) with its
+    /// working directory in `wt`, shown in the process table before it is
+    /// returned.
+    #[cfg(unix)]
+    fn spared_shell_in(wt: &str) -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("read line")
+            .current_dir(wt)
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn sh");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let target = std::path::Path::new(wt).canonicalize().expect("canonical");
+        let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+            crate::sysload::procscan::processes_using(&target).is_ok_and(|pids| pids.contains(&pid))
+        });
+        assert!(seen, "the shell never showed in the process table");
+        child
+    }
+
+    #[cfg(unix)]
+    fn stop(mut child: std::process::Child) -> bool {
+        let alive = child.try_wait().expect("try_wait").is_none();
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        alive
+    }
+
+    fn outcome_for(out: &Value, path: &str) -> Value {
+        out["outcomes"]
+            .as_array()
+            .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+            .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
+            .clone()
+    }
+
+    fn branch_exists(repo: &str, branch: &str) -> bool {
+        let mut cmd = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
+        cmd.args(["-C", repo, "rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .output_locked()
+            .expect("git")
+            .status
+            .success()
+    }
+
+    /// The reaper spares an agent session or shell and says so in
+    /// `pids_spared`. A spared process is a reason to keep the worktree and its
+    /// branch, with or without `force`, and the answer names it as spared.
+    #[cfg(unix)]
+    #[test]
+    fn prune_with_reap_keeps_a_worktree_whose_process_the_reaper_spared() {
+        for force in [false, true] {
+            let (_sandbox, repo) = honesty_repo();
+            let wt = create_lane(&repo, "feat/spared");
+            let child = spared_shell_in(&wt);
+            let pid = i64::from(child.id());
+            let (err, out) = tool_json(
+                "gitpulse_worktree_prune",
+                json!({ "repo_path": repo, "reap_processes": true, "force": force }),
+            );
+            let alive = stop(child);
+            assert!(!err, "force={force}: {out}");
+            assert!(
+                alive,
+                "force={force}: the spared process was signalled: {out}"
+            );
+            assert!(
+                std::path::Path::new(&wt).is_dir(),
+                "force={force}: worktree removed under a spared process: {out}"
+            );
+            assert!(
+                branch_exists(&repo, "feat/spared"),
+                "force={force}: branch deleted under a spared process: {out}"
+            );
+            let outcome = outcome_for(&out, &wt);
+            assert_eq!(outcome["status"], "skipped", "force={force}: {out}");
+            assert!(
+                outcome["spared_pids"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|p| p.as_i64() == Some(pid))),
+                "force={force}: the answer must name the spared pid {pid}: {out}"
+            );
+        }
+    }
+
+    /// A dry run answers what a real run would: a spared process keeps the
+    /// worktree, so it is not `would_remove`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_run_with_reap_does_not_promise_to_remove_a_spared_process_worktree() {
+        let (_sandbox, repo) = honesty_repo();
+        let wt = create_lane(&repo, "feat/dry");
+        let child = spared_shell_in(&wt);
+        let (err, out) = tool_json(
+            "gitpulse_worktree_prune",
+            json!({ "repo_path": repo, "reap_processes": true, "dry_run": true }),
+        );
+        let _ = stop(child);
+        assert!(!err, "{out}");
+        assert_eq!(outcome_for(&out, &wt)["status"], "skipped", "{out}");
+        assert_eq!(out["pruned_worktrees"], json!([]), "{out}");
+    }
+
+    /// `force` skips the dirty and integration checks. It never overrides a
+    /// lane claim: nobody can confirm over MCP, so the person removes such a
+    /// worktree in the app.
+    #[test]
+    fn force_does_not_remove_a_worktree_with_a_lane_claim() {
+        let (_sandbox, repo) = honesty_repo();
+        let wt = create_lane(&repo, "feat/claimed");
+        crate::engine::agent_bus::register_or_update_lane(
+            &repo,
+            "agent-claimed",
+            "feat/claimed",
+            Some(&wt),
+            &[],
+            &[],
+            &[],
+        )
+        .expect("claim the lane");
+        for force in [false, true] {
+            let (err, out) = tool_json(
+                "gitpulse_worktree_prune",
+                json!({ "repo_path": repo, "force": force }),
+            );
+            assert!(!err, "force={force}: {out}");
+            assert!(
+                std::path::Path::new(&wt).is_dir(),
+                "force={force}: a claimed lane's worktree was removed: {out}"
+            );
+            assert!(
+                branch_exists(&repo, "feat/claimed"),
+                "force={force}: a claimed lane's branch was deleted: {out}"
+            );
+            let outcome = outcome_for(&out, &wt);
+            assert_eq!(outcome["status"], "skipped", "force={force}: {out}");
+            assert!(
+                outcome["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("agent-claimed")),
+                "force={force}: the reason names the claim: {out}"
+            );
+        }
+    }
+
+    /// The merge succeeds; the teardown that follows it keeps the worktree and
+    /// the branch while a spared process works in it, and says why.
+    #[cfg(unix)]
+    #[test]
+    fn merge_teardown_keeps_a_worktree_whose_process_the_reaper_spared() {
+        let (_sandbox, repo) = honesty_repo();
+        // The squash commit the merge makes is written by this identity.
+        git_ok(&["-C", &repo, "config", "user.name", "T"]);
+        git_ok(&["-C", &repo, "config", "user.email", "t@example.com"]);
+        let wt = create_lane(&repo, "feat/merge-busy");
+        std::fs::write(std::path::Path::new(&wt).join("lane.txt"), "lane\n").expect("write");
+        git_ok(&["-C", &wt, "add", "lane.txt"]);
+        git_ok(&[
+            "-C",
+            &wt,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "lane work",
+        ]);
+        let child = spared_shell_in(&wt);
+        let pid = i64::from(child.id());
+        let (err, out) = tool_json(
+            "gitpulse_worktree_merge",
+            json!({
+                "repo_path": repo,
+                "source_branch": "feat/merge-busy",
+                "target_branch": "main",
+                "squash": true,
+                "remove_worktree": true
+            }),
+        );
+        let alive = stop(child);
+        assert!(!err, "{out}");
+        assert_eq!(out["ok"], true, "the merge itself succeeds: {out}");
+        assert!(alive, "the spared process was signalled: {out}");
+        assert!(
+            std::path::Path::new(&wt).is_dir(),
+            "worktree removed under a spared process: {out}"
+        );
+        assert!(
+            branch_exists(&repo, "feat/merge-busy"),
+            "branch deleted while its worktree was kept: {out}"
+        );
+        assert_eq!(out["worktree_removed"], false, "{out}");
+        assert!(
+            out["worktree_kept_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(&pid.to_string())),
+            "the merge result names why the worktree was kept: {out}"
+        );
     }
 
     #[test]
