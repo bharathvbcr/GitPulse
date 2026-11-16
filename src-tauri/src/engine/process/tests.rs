@@ -5306,3 +5306,95 @@ fn run_options_custom_kill_grace_reaps_sigterm_ignoring_child_promptly() {
         DEFAULT_KILL_GRACE
     );
 }
+
+/// Records what the runner says about how a child's wait ended.
+#[derive(Default)]
+struct RecordsExit {
+    facts: Option<ExitFacts>,
+    /// Cancels once the child has written something, which is after it started:
+    /// a cancel raised earlier is a spawn that never happened.
+    cancel_after_output: bool,
+    heard: bool,
+}
+
+impl ProcessObserver for RecordsExit {
+    fn cancelled(&self) -> bool {
+        self.cancel_after_output && self.heard
+    }
+    fn output(&mut self, _stream: OutputStream, bytes: &[u8]) {
+        self.heard |= !bytes.is_empty();
+    }
+    fn exited(&mut self, facts: &ExitFacts) {
+        assert!(self.facts.is_none(), "told twice");
+        self.facts = Some(*facts);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_observer_is_told_the_raw_wait_status_of_a_child_a_signal_ended() {
+    let mut observer = RecordsExit::default();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "kill -9 $$"]);
+    let run = run_observed(
+        &mut cmd,
+        "killed",
+        Duration::from_secs(20),
+        None,
+        1024,
+        &mut observer,
+    )
+    .unwrap();
+    let facts = observer.facts.expect("told how the wait ended");
+    assert_eq!(facts.raw_wait_status, Some(libc::SIGKILL));
+    assert_eq!(facts.signal, Some(libc::SIGKILL));
+    assert_eq!(run.signal, facts.signal);
+    assert!(!facts.core_dumped && facts.stopped_signal.is_none() && !facts.continued);
+    assert!(!facts.cancelled && !facts.deadline_expired);
+    assert!(
+        !facts.runner_signalled_group,
+        "the child killed itself; the runner signalled nothing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_observer_is_told_when_the_runner_itself_stopped_the_child() {
+    let mut cancelled = RecordsExit {
+        cancel_after_output: true,
+        ..RecordsExit::default()
+    };
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "echo started; sleep 30"]);
+    let run = run_observed(
+        &mut cmd,
+        "cancelled",
+        Duration::from_secs(60),
+        None,
+        1024,
+        &mut cancelled,
+    )
+    .unwrap();
+    assert!(run.cancelled);
+    let facts = cancelled.facts.expect("told how the wait ended");
+    assert!(facts.cancelled && facts.runner_signalled_group, "{facts:?}");
+    assert!(!facts.deadline_expired);
+
+    let mut late = RecordsExit::default();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 30"]);
+    let _ = run_observed(
+        &mut cmd,
+        "slow",
+        Duration::from_millis(200),
+        None,
+        1024,
+        &mut late,
+    );
+    let facts = late.facts.expect("told how the wait ended");
+    assert!(
+        facts.deadline_expired && facts.runner_signalled_group,
+        "{facts:?}"
+    );
+    assert_eq!(facts.raw_wait_status, None, "no status was read: {facts:?}");
+}

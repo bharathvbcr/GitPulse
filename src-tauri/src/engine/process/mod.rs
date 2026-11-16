@@ -98,7 +98,7 @@ pub use runner::{
 pub(crate) use runner::{
     capture_command_scrubbed, capture_command_with_env, classify_tool_probe, is_run_timeout,
     is_timed_out, last_process_failure, note_process_failure, process_failures, run_bounded,
-    run_bounded_capped, run_observed, text_from_bytes, BoundedRun, KeepDeadlinePrefix,
+    run_bounded_capped, run_observed, text_from_bytes, BoundedRun, ExitFacts, KeepDeadlinePrefix,
     OutputStream, ProcessObserver, RunError, ToolProbe,
 };
 #[cfg(test)]

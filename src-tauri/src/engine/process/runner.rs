@@ -648,6 +648,78 @@ pub(crate) struct BoundedRun {
     pub cancelled: bool,
 }
 
+/// Everything the runner itself knows about how a child's life ended, for an
+/// observer that has to explain a death `BoundedRun` flattens to a status of -1.
+///
+/// Nothing here is inferred: each field is read from the wait status, from a
+/// branch the runner took, or from the process-wide shutdown flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExitFacts {
+    /// The raw wait status word (`wait(2)`) on Unix, the exit code elsewhere.
+    /// `None` when the child was never waited on to a status: a deadline that
+    /// ended it.
+    pub raw_wait_status: Option<i32>,
+    /// The signal that ended the child, when the status says one did.
+    pub signal: Option<i32>,
+    /// Whether the status says the child dumped core.
+    pub core_dumped: bool,
+    /// The signal that stopped the child, when the status says it stopped
+    /// rather than exited.
+    pub stopped_signal: Option<i32>,
+    /// Whether the status says the child was continued after a stop.
+    pub continued: bool,
+    /// The observer's cancel fired while the runner waited.
+    pub cancelled: bool,
+    /// The runtime deadline ran out while the runner waited.
+    pub deadline_expired: bool,
+    /// The runner itself asked the child's group to stop and then killed it.
+    /// True exactly for a cancel or a deadline, the only two places the runner
+    /// signals a child it has not been told to give up on.
+    pub runner_signalled_group: bool,
+    /// [`crate::procguard::reap_all`] had started when the wait ended, so the
+    /// shutdown sweep may have signalled the child.
+    pub shutdown_sweep_started: bool,
+}
+
+impl ExitFacts {
+    fn of(
+        status: Option<std::process::ExitStatus>,
+        cancelled: bool,
+        deadline_expired: bool,
+    ) -> Self {
+        #[cfg(unix)]
+        let (raw_wait_status, signal, core_dumped, stopped_signal, continued) = {
+            use std::os::unix::process::ExitStatusExt;
+            (
+                status.map(ExitStatusExt::into_raw),
+                status.and_then(|status| status.signal()),
+                status.is_some_and(|status| status.core_dumped()),
+                status.and_then(|status| status.stopped_signal()),
+                status.is_some_and(|status| status.continued()),
+            )
+        };
+        #[cfg(not(unix))]
+        let (raw_wait_status, signal, core_dumped, stopped_signal, continued) = (
+            status.and_then(|status| status.code()),
+            None,
+            false,
+            None,
+            false,
+        );
+        Self {
+            raw_wait_status,
+            signal,
+            core_dumped,
+            stopped_signal,
+            continued,
+            cancelled,
+            deadline_expired,
+            runner_signalled_group: cancelled || deadline_expired,
+            shutdown_sweep_started: crate::procguard::shutdown_started(),
+        }
+    }
+}
+
 impl BoundedRun {
     /// Parsers must establish completeness before interpreting a prefix.
     pub(crate) fn require_complete(self, label: &str) -> Result<Self, CommandError> {
@@ -684,6 +756,10 @@ pub(crate) trait ProcessObserver {
         None
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+    /// Told once, on the waiter, how the child's wait ended, just before the
+    /// run is returned. Not called when the run fails with an error instead of
+    /// producing a [`BoundedRun`].
+    fn exited(&mut self, _facts: &ExitFacts) {}
     /// True when the observer keeps what it needs from stdout itself, so the
     /// run need not retain it: each chunk is dropped once `output` has seen it
     /// and the returned [`BoundedRun::stdout`] holds only the unseen tail
@@ -1435,6 +1511,11 @@ fn run_admitted_inner(
     } else {
         unread.map(Incomplete::Unread)
     };
+    observer.exited(&ExitFacts::of(
+        status,
+        cancelled,
+        deadline_message.is_some(),
+    ));
     Ok(BoundedRun {
         stdout: stdout.bytes,
         stderr: stderr.bytes,
