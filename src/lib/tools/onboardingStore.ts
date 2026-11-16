@@ -29,7 +29,7 @@ import type { DevcouncilPreset } from "./devcouncilInstall";
 import { formatError } from "../ui/formatError";
 import { describeError } from "../ui/copy/describeFailure";
 
-export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "done";
+export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "connect" | "done";
 
 export interface SetupWizardState {
   open: boolean;
