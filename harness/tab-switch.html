@@ -1036,15 +1036,31 @@
             // Rows 1 and 2 are drawn on the window's own ground, the same ground
             // the sidebar and workspace cards float on. A fill, sheen, shade or
             // drop shadow on either row made the chrome a band across the top of
-            // every page. The page stamps html.macos, where the glass is drawn,
-            // so this cannot pass by not applying.
+            // every page. html.macos is stamped from the browser's own platform
+            // (platform.ts), so on a Linux or Windows host the glass is not drawn
+            // and the rows are painted in the window's opaque ground instead. Both
+            // states are held to the rule, so the glass is checked on every host:
+            // the host's own stamp, then html.macos forced on for the macOS
+            // rules, so this cannot pass by not applying. A row may be transparent
+            // or exactly the ground colour; a sheen, edge or shadow is never allowed.
             check("header: rows 1 and 2 sit on the window's ground: no fill, no sheen, no edge, no shadow", () => {
+              const root = document.documentElement;
+              const ground = getComputedStyle(document.body).backgroundColor;
               const bare = (el) => {
                 const style = getComputedStyle(el);
                 return style.boxShadow === "none" && style.backgroundImage === "none" &&
-                  /^rgba\(0, 0, 0, 0\)$|^transparent$/.test(style.backgroundColor);
+                  (/^rgba\(0, 0, 0, 0\)$|^transparent$/.test(style.backgroundColor) || style.backgroundColor === ground);
               };
-              return document.documentElement.classList.contains("macos") && bare(row1) && bare(row2);
+              const hostStamped = bare(row1) && bare(row2);
+              const hadMacos = root.classList.contains("macos");
+              root.classList.add("macos");
+              try {
+                const glassStamped = bare(row1) && bare(row2);
+                const glassClear = [row1, row2].every((el) => /^rgba\(0, 0, 0, 0\)$|^transparent$/.test(getComputedStyle(el).backgroundColor));
+                return hostStamped && glassStamped && glassClear;
+              } finally {
+                if (!hadMacos) root.classList.remove("macos");
+              }
             });
             // Row 2's search is one field for every page (search/pageSearch.svelte.ts):
             // History's graph filters commits through it, its Diff section finds in
