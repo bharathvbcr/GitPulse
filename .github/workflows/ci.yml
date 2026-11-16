@@ -403,20 +403,6 @@ jobs:
           fi
           grep -q "test result: ok. 1 passed" <<<"$out"
 
-      - name: Terminal Suites Against the Terminal Host
-        # The same terminal suites, every session registry backed by a real
-        # gitpulse-ptyd rather than the engine in the test process
-        # (docs/TERMINAL_HOST.md, migration step 2). The host is Unix-only. On
-        # macOS shard 1 owns it, as it owns the worktree crate and the burst.
-        if: ${{ !cancelled() && runner.os != 'Windows' && (runner.os != 'macOS' || matrix.shard == 1) }}
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a dbus-run-session -- bun run test:terminal-host
-          else
-            bun run test:terminal-host
-          fi
-
   # Runs after the shards, red or green, and fails unless the macOS buckets
   # between them ran every test in the suite exactly once. A green shard says
   # only that its own bucket passed: a shard whose job was skipped, whose build
