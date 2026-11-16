@@ -634,7 +634,7 @@ fn execute_with_activity<T>(
             .map(|s| s.bytes)
     };
     let success = result.is_ok();
-    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}", error = error.message()) };
+    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after, counting each file once and only files wholly inside the folder; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}", error = error.message()) };
     Ok((
         policy,
         HygieneOutcome {

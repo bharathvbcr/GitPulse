@@ -409,27 +409,71 @@ mod unix {
         Ok(current)
     }
 
+    fn fstat(file: &File) -> Result<libc::stat, String> {
+        // SAFETY: fstat initializes the supplied stat on success.
+        let mut raw = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(file.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(unsafe { raw.assume_init() })
+    }
+
+    /// Opens the leaf of a file that has other names, without following it,
+    /// and requires it to be the file just checked.
+    fn open_tracking(
+        container: &File,
+        leaf: &CString,
+        identity: (u64, u64),
+    ) -> Result<File, String> {
+        const REFUSED: &str =
+            "a file with other names could not be opened to track them; stopped before removing it";
+        // SAFETY: the leaf is relative to an open directory; O_NOFOLLOW makes
+        // a substituted symlink fail rather than be followed, and O_NONBLOCK
+        // keeps a substituted FIFO from blocking the open.
+        let fd = unsafe {
+            libc::openat(
+                container.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("{REFUSED} ({})", std::io::Error::last_os_error()));
+        }
+        // SAFETY: fd was just opened and is owned by nothing else.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let raw = fstat(&file)?;
+        #[allow(clippy::unnecessary_cast)]
+        if (raw.st_dev as u64, raw.st_ino as u64) != identity {
+            return Err("Entry was replaced after preview; stopped without following it".into());
+        }
+        Ok(file)
+    }
+
     /// Whether a file still matches its stamp from the preview. Its size must
-    /// match. A file none of whose names this removal has unlinked must also
-    /// have the same change time. One it has (another name of the same file)
-    /// has a new change time because of that unlink, so the change time is
-    /// excused and the modification time, which our unlink does not move, is
-    /// checked instead: a write after the preview still stops the removal.
+    /// match, and so must its change time: the one in the stamp, or, for a file
+    /// this removal has already unlinked a name of, exactly the change time that
+    /// unlink left (`recorded`, read from a descriptor held across it). Nobody
+    /// can set a change time, so a write after the preview, or a restored
+    /// modification time, still stops the removal.
     pub(super) fn file_unchanged(
         approved: &Stamp,
         size: i64,
         changed: (i64, i64),
-        modified: u128,
-        other_name_unlinked: bool,
+        recorded: Option<(i64, i64)>,
     ) -> bool {
-        if u64::try_from(size).ok() != Some(approved.len) {
-            return false;
-        }
-        if other_name_unlinked {
-            modified == approved.modified
-        } else {
-            changed == approved.changed
-        }
+        u64::try_from(size).ok() == Some(approved.len)
+            && changed == recorded.unwrap_or(approved.changed)
+    }
+
+    // Test seam: called after each successful unlink with the reviewed path,
+    // so a test can act between two unlinks. Absent from non-test builds.
+    #[cfg(test)]
+    pub(super) type UnlinkHook = Box<dyn FnMut(&Path)>;
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static AFTER_UNLINK: std::cell::RefCell<Option<UnlinkHook>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Removes the reviewed entries. A failure after some were already
@@ -481,9 +525,10 @@ mod unix {
         // and a run that stops half way leaves a partly removed folder.
         let deadline = Instant::now()
             + Duration::from_secs(60 + u64::try_from(expected.entries.len() / 5_000).unwrap_or(0));
-        // Files of which this removal has already unlinked a name.
-        let mut unlinked_files: std::collections::HashSet<(u64, u64)> =
-            std::collections::HashSet::new();
+        // Files of which this removal has already unlinked a name, with the
+        // change time that unlink left (read from a descriptor held across it).
+        let mut unlinked_files: std::collections::HashMap<(u64, u64), (i64, i64)> =
+            std::collections::HashMap::new();
         // Children sort after their parents in BTreeMap; reverse traversal
         // deletes only reviewed leaves, then empty directories. New entries
         // survive and cause ENOTEMPTY, never an unreviewed recursive sweep.
@@ -534,28 +579,32 @@ mod unix {
             }
             #[allow(clippy::unnecessary_cast)]
             let changed = (raw.st_ctime as i64, raw.st_ctime_nsec as i64);
-            let modified = u128::try_from(
-                i128::from(raw.st_mtime) * 1_000_000_000 + i128::from(raw.st_mtime_nsec),
-            )
-            .unwrap_or(0);
             // A file that has several names changes its ctime when another
-            // name is unlinked. If this removal has already unlinked a name of
-            // this very file, that is expected and everything else is checked.
+            // name is unlinked. For a later name of a file this removal has
+            // already unlinked a name of, the change time must be exactly the
+            // one that unlink left.
             if !approved.directory
                 && !file_unchanged(
                     approved,
                     raw.st_size,
                     changed,
-                    modified,
-                    unlinked_files.contains(&identity),
+                    unlinked_files.get(&identity).copied(),
                 )
             {
                 return Err(
                     "File content changed after preview; stopped before removing it".into(),
                 );
             }
-            let frees_it = raw.st_nlink <= 1;
-            let has_other_names = raw.st_nlink > 1;
+            // A file with other names is held open across its unlink: the
+            // descriptor's link count afterwards says whether the unlink freed
+            // it, and its change time is what the next name is checked against.
+            // Opened before anything of the file is removed, so a file that
+            // cannot be opened stops the removal with nothing of it gone.
+            let held_file = if !approved.directory && raw.st_nlink > 1 {
+                Some(open_tracking(&container, &leaf, identity)?)
+            } else {
+                None
+            };
             // SAFETY: the leaf is relative to an open, non-symlink parent.
             // unlinkat never traverses the final component, even in a race.
             if unsafe {
@@ -576,14 +625,34 @@ mod unix {
             if !approved.directory {
                 // Only the unlink of a file's last name frees it: a file that
                 // keeps a name outside the tree is not freed, and a file with
-                // several names inside is counted once, on its last.
-                if frees_it {
-                    *removed_bytes = removed_bytes.saturating_add(approved.len);
-                }
-                if has_other_names {
-                    unlinked_files.insert(identity);
+                // several names inside is counted once, on its last. The
+                // evidence is the link count read after the unlink.
+                match held_file {
+                    Some(file) => {
+                        let after = fstat(&file)?;
+                        if after.st_nlink > 0 {
+                            #[allow(clippy::unnecessary_cast)]
+                            unlinked_files.insert(
+                                identity,
+                                (after.st_ctime as i64, after.st_ctime_nsec as i64),
+                            );
+                        } else {
+                            unlinked_files.remove(&identity);
+                            *removed_bytes = removed_bytes.saturating_add(approved.len);
+                        }
+                    }
+                    None => {
+                        unlinked_files.remove(&identity);
+                        *removed_bytes = removed_bytes.saturating_add(approved.len);
+                    }
                 }
             }
+            #[cfg(test)]
+            AFTER_UNLINK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(relative);
+                }
+            });
         }
         Ok(())
     }
@@ -931,11 +1000,13 @@ mod tests {
         assert!(root.join("debug/deps/foo-1234").exists());
     }
 
-    /// What a name whose file this removal already unlinked another name of may
-    /// differ in: the ctime, nothing else. Any other entry is checked in full.
+    /// The chain rule: a file none of whose names was unlinked must match its
+    /// stamped ctime; a later name of one this removal unlinked a name of must
+    /// match exactly the ctime that unlink left. Neither looks at the
+    /// modification time, which anyone can set.
     #[cfg(unix)]
     #[test]
-    fn the_unchanged_check_excuses_only_the_ctime_of_an_already_unlinked_file() {
+    fn the_unchanged_check_follows_the_recorded_ctime_chain() {
         let approved = super::Stamp {
             directory: false,
             len: 10,
@@ -943,20 +1014,109 @@ mod tests {
             identity: (1, 2),
             changed: (7, 0),
         };
-        let now = |size, changed, modified, unlinked| {
-            super::unix::file_unchanged(&approved, size, changed, modified, unlinked)
+        let now = |size, changed, recorded| {
+            super::unix::file_unchanged(&approved, size, changed, recorded)
         };
-        assert!(now(10, (7, 0), 5_000_000_000, false));
+        assert!(now(10, (7, 0), None));
         assert!(
-            !now(10, (8, 0), 5_000_000_000, false),
+            !now(10, (8, 0), None),
             "a file none of whose names was touched is checked in full"
         );
+        assert!(now(10, (8, 0), Some((8, 0))), "the ctime our unlink left");
         assert!(
-            now(10, (8, 0), 5_000_000_000, true),
-            "our own unlink moved it"
+            !now(10, (7, 0), Some((8, 0))),
+            "the stamped ctime no longer applies once a name was unlinked"
         );
-        assert!(!now(11, (8, 0), 5_000_000_000, true), "size");
-        assert!(!now(10, (8, 0), 5_000_000_001, true), "content written");
+        assert!(
+            !now(10, (9, 0), Some((8, 0))),
+            "a write after our unlink moved it again"
+        );
+        assert!(!now(11, (8, 0), Some((8, 0))), "size");
+    }
+
+    /// A file rewritten at the same size, with its modification time put back,
+    /// between the unlinks of its two names: the second name is not removed.
+    /// Only a change time catches it, and nobody can set that.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_rewritten_with_its_mtime_restored_keeps_its_second_name() {
+        use std::cell::Cell;
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("t");
+        linked_tree(&root, &["debug/foo", "debug/deps/foo-1234"], 4096);
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        let kept = root.join("debug/deps/foo-1234");
+        let approved_mtime = fs::metadata(&kept).unwrap().modified().unwrap();
+        let fired = std::rc::Rc::new(Cell::new(false));
+        let hook_fired = fired.clone();
+        let hook_path = kept.clone();
+        super::unix::AFTER_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                if hook_fired.replace(true) {
+                    return;
+                }
+                fs::write(&hook_path, vec![b'y'; 4096]).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&hook_path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(approved_mtime))
+                    .unwrap();
+            }));
+        });
+        let partial = super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false));
+        super::unix::AFTER_UNLINK.with(|hook| *hook.borrow_mut() = None);
+        let partial = partial.expect_err("the rewrite must stop the removal");
+        assert!(fired.get(), "the seam ran between the two unlinks");
+        assert!(
+            partial.error.contains("changed after preview"),
+            "{partial:?}"
+        );
+        assert!(kept.exists(), "the second name was not unlinked");
+        assert!(!root.join("debug/foo").exists(), "the first was");
+        assert_eq!(partial.bytes, 0, "the file was not freed");
+    }
+
+    /// A file with two names that cannot be opened to track them stops the
+    /// removal before either name is unlinked: nothing of it is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_that_cannot_be_opened_stops_before_any_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root opens a mode 000 file, so there is no failure to provoke");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("t");
+        linked_tree(&root, &["debug/foo", "debug/deps/foo-1234"], 4096);
+        fs::set_permissions(root.join("debug/foo"), fs::Permissions::from_mode(0o000)).unwrap();
+        let reviewed = super::snapshot_within(
+            &root,
+            false,
+            &AtomicBool::new(false),
+            super::Budget::STANDARD,
+        )
+        .unwrap();
+        let partial = super::remove_reviewed_counted(&root, &reviewed, &AtomicBool::new(false))
+            .expect_err("it could not be opened");
+        assert!(
+            partial.error.contains("could not be opened to track them"),
+            "{partial:?}"
+        );
+        assert_eq!(partial.entries, 0, "nothing was unlinked: {partial:?}");
+        assert!(root.join("debug/foo").exists());
+        assert!(root.join("debug/deps/foo-1234").exists());
     }
 
     #[test]

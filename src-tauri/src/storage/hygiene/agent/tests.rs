@@ -1592,22 +1592,29 @@ fn a_profile_needs_real_directories_and_a_real_lock_file() {
     );
 }
 
-/// A scan root that cannot be listed at all is unexamined, not an empty root:
-/// nothing in it was looked at.
+/// A scan root GitPulse may not list is a kept answer with the reason, not an
+/// empty root: nothing in it was looked at.
 #[cfg(unix)]
 #[test]
-fn a_root_that_cannot_be_listed_is_unexamined_not_empty() {
+fn a_root_that_cannot_be_listed_is_kept_not_empty() {
     let (_temp, root) = temp_root();
     let sealed = root.join("sealed");
     fs::create_dir_all(&sealed).unwrap();
     let _mode = Mode::set(&sealed, 0o000);
     let scan = run(&nobody(), &idle, |ctx| {
-        let mut scan = Scan::default();
+        let mut scan = Scan {
+            complete: true,
+            ..Scan::default()
+        };
         let found = find_targets(&sealed, &mut scan, SCOPE_REPOSITORY, ctx);
         assert!(found.is_empty());
         scan
     });
-    assert_eq!(scan.unexamined, 1, "{:?}", scan.kept);
+    assert!(
+        denied_and_complete(&scan),
+        "a first listing GitPulse may not read follows the same rule as every other site: {:?}",
+        scan.kept
+    );
 }
 
 /// A wrapper folder that cannot be listed is a could-not-look with a named
@@ -1930,7 +1937,7 @@ fn the_runs_own_removal_is_ignored_only_where_it_happened() {
     assert!(session_quiet(&session, &ctx!(Some(&removals))).unwrap() >= 29);
 
     // The run removed a target from `scratchpad/`.
-    removals.note_removal(&session, &pad);
+    removals.note_removal(&session, &pad, now());
     unlink_in(&pad);
     assert!(
         kept(session_quiet(&session, &ctx!(None))),
@@ -1960,7 +1967,7 @@ fn the_runs_own_removal_is_ignored_only_where_it_happened() {
     );
     quiet_sessions(&root, 30);
     // Same under a wrapper: removed a child of it, then a session writes in it.
-    removals.note_removal(&session, &wrapper);
+    removals.note_removal(&session, &wrapper, now());
     unlink_in(&wrapper);
     assert!(session_quiet(&session, &ctx!(Some(&removals))).is_ok());
     let inside = wrapper.join("late.log");
@@ -1977,6 +1984,110 @@ fn the_runs_own_removal_is_ignored_only_where_it_happened() {
     quiet_sessions(&root, 30);
     unlink_in(&other);
     assert!(kept(session_quiet(&other_session, &ctx!(Some(&removals)))));
+}
+
+fn recency_context<'a>(
+    live: &'a LiveSessions,
+    cancel: &'a AtomicBool,
+    removals: Option<&'a SelfRemovals>,
+    use_of: &'a dyn Fn(&Path) -> Result<DirUse, String>,
+) -> Context<'a> {
+    Context {
+        now: now(),
+        retention_days: 7,
+        live,
+        use_of,
+        cancel,
+        deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: CARGO_TARGET_BUDGET,
+        removals,
+    }
+}
+
+/// A removal refused before it unlinked anything changed nothing, so it does
+/// not excuse its parent: a write to the parent afterwards still reads as the
+/// session being alive.
+#[test]
+fn a_removal_refused_before_its_first_unlink_does_not_excuse_its_parent() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let session = pad.parent().unwrap().to_path_buf();
+    let target = pad.join("cargo-target");
+    cargo_target(&target, 30);
+    quiet_sessions(&root, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        super::scan_sessions(&root, UID, ctx, false)
+    });
+    let candidate = scan.candidates[0].clone();
+    let removals = SelfRemovals::default();
+    let calls = Cell::new(0);
+    // The re-check right before the first unlink is the moment something is
+    // added to the target's top level: its directory stamp no longer matches,
+    // which the removal reads before it unlinks anything.
+    let adds_a_file = |_: &Path| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 2 {
+            fs::write(target.join("late.log"), "x").unwrap();
+        }
+        Ok(DirUse::default())
+    };
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = recency_context(&live, &cancel, Some(&removals), &adds_a_file);
+    let failure = remove_judged(&candidate, &ctx, u64::MAX).unwrap_err();
+    assert!(
+        matches!(&failure, Refusal::Kept(why) if why.contains("changed after preview")),
+        "refused before the first unlink: {failure:?}"
+    );
+    assert!(target.join("debug/app.o").exists(), "nothing was removed");
+    // The file the fixture added changed the target's own time: put it back,
+    // so the only recent time left is the one the parent gets below.
+    fs::remove_file(target.join("late.log")).unwrap();
+    age(&target, 30);
+    // A session writes into the scratchpad afterwards.
+    fs::write(pad.join("late.txt"), "x").unwrap();
+    fs::remove_file(pad.join("late.txt")).unwrap();
+    let live = nobody();
+    let ctx = recency_context(&live, &cancel, Some(&removals), &idle);
+    assert!(
+        matches!(session_quiet(&session, &ctx), Err(Refusal::Kept(_))),
+        "the parent's new time is not excused by a removal that removed nothing"
+    );
+}
+
+/// The instant is per parent directory: one first removed from later in the
+/// run does not inherit an earlier parent's instant, so a change to it dated
+/// between the two is not excused.
+#[test]
+fn each_parent_has_its_own_first_removal_instant() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let session = pad.parent().unwrap().to_path_buf();
+    let wrapper = pad.join("target-wrap");
+    fs::create_dir_all(&wrapper).unwrap();
+    quiet_sessions(&root, 30);
+    let removals = SelfRemovals::default();
+    let t = now();
+    removals.note_removal(&session, &pad, t - 600);
+    removals.note_removal(&session, &wrapper, t - 300);
+    // A change to the wrapper dated between the two instants.
+    fs::File::open(&wrapper)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(450)))
+        .unwrap();
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = recency_context(&live, &cancel, Some(&removals), &idle);
+    assert!(
+        matches!(session_quiet(&session, &ctx), Err(Refusal::Kept(_))),
+        "dated before the wrapper's own first removal, so it is a session's doing"
+    );
+    // At or after its own instant it is the run's.
+    fs::File::open(&wrapper)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(200)))
+        .unwrap();
+    assert!(session_quiet(&session, &ctx).is_ok());
 }
 
 /// A marker GitPulse may not read is no evidence either way: the folder is

@@ -176,8 +176,9 @@ impl From<&str> for Refusal {
 ///   the scan stays complete;
 /// - a could-not-look that may clear on its own stays `Unexamined` and the
 ///   scan incomplete: the host shed the check, the process table or a process
-///   could not be read, a time budget ran out, a cancelled walk, any other I/O
-///   error.
+///   could not be read (in the agent scopes; the worktree-cache scope keeps
+///   main's plain refusal there), a time budget ran out, a cancelled walk,
+///   any other I/O error.
 ///
 /// Why the line matters: one incomplete scan clears the shared
 /// `scopes_complete` flag, which approves no reclaim scope at all.
@@ -431,13 +432,10 @@ pub(crate) struct Context<'a> {
     pub removals: Option<&'a SelfRemovals>,
 }
 
-/// What one run removed from one session folder: the instant just before its
-/// first removal there, and the directories whose entry it removed.
-#[derive(Clone)]
-struct SelfRemoval {
-    since: u64,
-    dirs: std::collections::HashSet<PathBuf>,
-}
+/// What one run removed from one session folder: for each directory it
+/// removed an entry from, the instant just before it first unlinked anything
+/// there.
+type SelfRemoval = std::collections::HashMap<PathBuf, u64>;
 
 /// The run's own removals, so the recency guard does not mistake them for a
 /// session writing.
@@ -447,33 +445,31 @@ struct SelfRemoval {
 /// candidate at delete time, so without this the second target of one finished
 /// session would be refused as "too recent" for a whole retention period.
 /// `session_quiet` ignores the modification time of those parent directories
-/// only, only when it is at or after the recorded instant, and reads the
-/// entries inside them instead: a file a live session writes afterwards still
-/// keeps the folder. Never `tasks/`, never a file, never any other directory.
+/// only, only when it is at or after that directory's own recorded instant, and
+/// reads the entries inside them instead: a file a live session writes
+/// afterwards still keeps the folder. Never `tasks/`, never a file, never any
+/// other directory. A removal is recorded only once it has unlinked something,
+/// so one refused before its first unlink leaves the parent's time fully
+/// visible. A session that only deletes files in such a parent, or moves in a
+/// file with an old date, leaves no trace here; the process check covers a
+/// live session.
 #[derive(Default)]
 pub(crate) struct SelfRemovals {
     by_session: std::sync::Mutex<std::collections::HashMap<PathBuf, SelfRemoval>>,
 }
 
 impl SelfRemovals {
-    /// Called just before the run unlinks the first entry of a target whose
-    /// parent directory is `parent`, inside `session_dir`. The instant is kept
-    /// from the first call per session folder.
-    fn note_removal(&self, session_dir: &Path, parent: &Path) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let mut by_session = self
-            .by_session
+    /// Called after a removal that unlinked something from `parent`, inside
+    /// `session_dir`; `since` is the instant taken just before that removal
+    /// began. The instant is kept from the first call per parent directory.
+    fn note_removal(&self, session_dir: &Path, parent: &Path, since: u64) {
+        self.by_session
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = by_session
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(session_dir.to_path_buf())
-            .or_insert_with(|| SelfRemoval {
-                since: now,
-                dirs: std::collections::HashSet::new(),
-            });
-        entry.dirs.insert(parent.to_path_buf());
+            .or_default()
+            .entry(parent.to_path_buf())
+            .or_insert(since);
     }
 
     fn of(&self, session_dir: &Path) -> Option<SelfRemoval> {
@@ -561,11 +557,7 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                scan.refuse(
-                    &dir,
-                    scope,
-                    &Refusal::Unexamined(format!("it could not be listed: {e}")),
-                );
+                scan.unreadable_io(&dir, scope, "it could not be listed", &e);
                 continue;
             }
         };
@@ -1093,7 +1085,8 @@ fn session_quiet(session_dir: &Path, ctx: &Context<'_>) -> Result<u64, Refusal> 
         // file a live session writes afterwards still keeps the folder.
         if own
             .as_ref()
-            .is_some_and(|own| own.dirs.contains(what) && seconds >= own.since)
+            .and_then(|own| own.get(what))
+            .is_some_and(|since| seconds >= *since)
         {
             return Ok(());
         }
@@ -1121,7 +1114,7 @@ fn session_quiet(session_dir: &Path, ctx: &Context<'_>) -> Result<u64, Refusal> 
         }
         let mut wrappers = Vec::new();
         list_newest(&dir, &mut note, &mut |path| {
-            if own.as_ref().is_some_and(|own| own.dirs.contains(path)) {
+            if own.as_ref().is_some_and(|own| own.contains_key(path)) {
                 wrappers.push(path.to_path_buf());
             }
         })?;
@@ -1630,25 +1623,38 @@ pub(super) fn remove_judged(
     // first deletion. A build that starts after this is not prevented; removal
     // stops at the first entry that changed since the review.
     let _ = unused_now(ctx, &verdict.guarded)?;
-    // Taken just before the first unlink: the removal changes the target's
-    // parent directory's time, which the recency guard must not read as a
-    // session writing (see [`SelfRemovals`]).
-    if let (Some(removals), Some(session_dir), Some(parent)) =
-        (ctx.removals, &session_of_target, target.parent())
-    {
-        removals.note_removal(session_dir, parent);
-    }
+    // Taken just before the removal, and recorded only if it unlinked
+    // something: the removal changes the target's parent directory's time,
+    // which the recency guard must not read as a session writing (see
+    // [`SelfRemovals`]), but a removal refused before its first unlink changed
+    // nothing.
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let note = |unlinked: bool| {
+        if let (true, Some(removals), Some(session_dir), Some(parent)) =
+            (unlinked, ctx.removals, &session_of_target, target.parent())
+        {
+            removals.note_removal(session_dir, parent, since);
+        }
+    };
     match tree::remove_reviewed_counted(target, &verdict.snapshot, ctx.cancel) {
-        Ok(removed) => Ok(removed),
+        Ok(removed) => {
+            note(true);
+            Ok(removed)
+        }
         // Nothing was unlinked: an ordinary refusal. Something was: the bytes
         // are gone and the run has to charge them.
         Err(partial) if partial.bytes == 0 && partial.entries == 0 => {
             Err(Refusal::Kept(partial.error))
         }
-        Err(partial) => Err(Refusal::PartlyRemoved {
-            why: partial.error,
-            bytes: partial.bytes,
-        }),
+        Err(partial) => {
+            note(partial.entries > 0);
+            Err(Refusal::PartlyRemoved {
+                why: partial.error,
+                bytes: partial.bytes,
+            })
+        }
     }
 }
 
