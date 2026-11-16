@@ -289,8 +289,9 @@ pub fn default_dir() -> Option<PathBuf> {
     crate::tool_config::default_config_dir().map(|dir| dir.join("gitpulsed"))
 }
 
-/// The Tauri command the diagnostics view reads.
-#[tauri::command]
+/// The Tauri command the diagnostics view reads. Off the GUI thread: it reads
+/// the lock file from disk on every poll.
+#[tauri::command(async)]
 pub fn cmd_daemon_status() -> DaemonStatus {
     let app_version = env!("CARGO_PKG_VERSION");
     match default_dir() {
