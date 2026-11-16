@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
+import { createRawSnippet } from "svelte";
 import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
 import type { ToolsStatus } from "../tools/externalTools";
@@ -60,6 +61,20 @@ describe("MissingToolNotice", () => {
     expect(pending).toContain("not the same as no suspects");
     expect(pending).not.toContain("Set up code map");
     expect(pending).not.toContain("Build index");
+  });
+
+  it("prints the surface's text once: never beside an install prompt, with its controls otherwise", () => {
+    const retry = createRawSnippet(() => ({ render: () => "<button>Try search again</button>" }));
+    const note = "Symbol search unavailable: devmap: command not found";
+    onboardingStore.status.set(tools(false));
+    const missing = html({ graph: { available: false }, otherText: note, children: retry });
+    expect(missing).toContain("Set up code map");
+    expect(missing).not.toContain(note);
+    expect(missing).not.toContain("Try search again");
+    const other = html({ graph: { available: true }, otherText: note, children: retry });
+    expect(other.split(note).length - 1).toBe(1);
+    expect(other).toContain("Try search again");
+    expect(other).not.toContain("Set up code map");
   });
 
   it("another failure with no text of its own renders nothing", () => {

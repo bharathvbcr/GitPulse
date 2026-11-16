@@ -315,9 +315,13 @@
   {#if mode === "symbols" && searchResult.failed}
     <!-- Only a missing CLI or index earns the Set up / Build button; a timeout
          or a failed read keeps the note and Try again alone. -->
-    <MissingToolNotice repoPath={repoPath} reason={searchResult.note} feature="symbol search" onBeforeSetup={async () => { closeForHandoff(); await tick(); }} />
+    <!-- The notice prints the failure text itself (once): the install prompt
+         for a missing CLI or index, otherwise the note with Try again. -->
+    <MissingToolNotice repoPath={repoPath} reason={searchResult.note} otherText={searchNote} feature="symbol search" onBeforeSetup={async () => { closeForHandoff(); await tick(); }}>
+      {#if isRemoteSearch}<button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>{/if}
+    </MissingToolNotice>
   {/if}
-  {#if searchNote || historyNote}
+  {#if (searchNote || historyNote) && !(mode === "symbols" && searchResult.failed)}
     <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
       <p>{searchNote ?? historyNote}</p>
       {#if isRemoteSearch}

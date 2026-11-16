@@ -18,6 +18,11 @@ describe("CommandPalette optional-tools entry points", () => {
     expect(source).toContain('<MissingToolNotice repoPath={repoPath}');
     expect(source).toContain('mode === "symbols" && searchResult.failed');
     expect(source).not.toContain('openSetupWizard("devmap", "explain"); }}>Set up code map');
+    // A failed symbol search hands its note to the notice, which prints it
+    // once; the palette's own note block stands aside so the reason is not
+    // printed again above an install prompt.
+    expect(source).toContain("otherText={searchNote}");
+    expect(source).toContain('(searchNote || historyNote) && !(mode === "symbols" && searchResult.failed)');
   });
 
   it("offers optional tools setup from the palette", () => {

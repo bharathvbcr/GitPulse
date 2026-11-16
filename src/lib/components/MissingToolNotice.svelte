@@ -17,6 +17,7 @@
    * surface that already holds the status passes it as `graph`; otherwise the
    * notice reads it itself, once per repository.
    */
+  import type { Snippet } from "svelte";
   import { Loader2 } from "@lucide/svelte";
   import { buildBlockReason } from "../codeintel/buildBlock";
   import { liveIndex } from "../codeintel/liveIndex";
@@ -39,6 +40,7 @@
     inset = false,
     onBeforeSetup,
     onBuilt,
+    children,
   }: {
     repoPath: string | null;
     /** What the code map gives this surface, e.g. "impact edges and symbol search". */
@@ -55,6 +57,12 @@
     onBeforeSetup?: () => void | Promise<void>;
     /** Runs after a build that succeeded, so the surface can reload. */
     onBuilt?: () => void;
+    /**
+     * The surface's own controls for the `otherText` case (e.g. Try again),
+     * shown beside that text and never beside an install prompt, so a surface
+     * that hands its failure text here prints it once.
+     */
+    children?: Snippet;
   } = $props();
 
   const toolsStatus = onboardingStore.status;
@@ -167,7 +175,8 @@
     {/if}
   </div>
 {:else if (gap === "other" || gap === null) && otherText}
-  <p class="gp-notice mx-0 mt-0 min-w-0" data-tone="warn" data-testid="missing-tool-other" title={reasonTitle}>
-    <span class="min-w-0 line-clamp-3">{otherText}</span>
-  </p>
+  <div class="gp-notice mx-0 mt-0 flex min-w-0 flex-wrap items-center gap-2" data-tone="warn" data-testid="missing-tool-other" role="status" title={reasonTitle}>
+    <p class="min-w-0 flex-1 line-clamp-3">{otherText}</p>
+    {@render children?.()}
+  </div>
 {/if}
