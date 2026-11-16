@@ -1864,6 +1864,15 @@ pub(crate) struct ProcessUse {
     pub env: Option<Vec<String>>,
 }
 
+impl ProcessUse {
+    /// One of the user's own processes with a working directory, argument list
+    /// or environment the OS would not show: it cannot be shown not to use a
+    /// directory. Another user's process is never unproven, only counted.
+    pub(crate) fn unproven(&self) -> bool {
+        self.mine && (self.argv.is_none() || self.env.is_none() || self.cwd.is_none())
+    }
+}
+
 /// Who is using a directory, and what could not be checked.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct DirUse {
@@ -2101,7 +2110,7 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
             out.users.push((process.pid, kind));
         } else if !process.mine {
             out.other_users += 1;
-        } else if process.argv.is_none() || process.env.is_none() || process.cwd.is_none() {
+        } else if process.unproven() {
             // A working directory the OS would not show is as unproven as an
             // argument list it would not show, whatever the reason: no path is
             // not "inside nothing". (macOS keeps answering with the old path
@@ -2113,18 +2122,63 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
     out
 }
 
+/// How many times [`settle_unproven`] re-reads the rows still unproven.
+const USE_SETTLE_ROUNDS: usize = 3;
+
+/// The pause before each settle round. Worst case [`USE_SETTLE_ROUNDS`] x this
+/// is 60 ms, and only when some row of the user's is unproven after the first
+/// read; a table with no unproven row pays nothing.
+const USE_SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Give a process caught mid-exit time to finish exiting. Each round, when any
+/// row is unproven, `pause` runs once and every unproven pid is read again:
+/// `None` (gone, or a zombie) removes the row, `Some` replaces it. After the
+/// last round whatever is still unproven stays in the table, so a process that
+/// is alive and really unreadable is still refused on, never dropped.
+fn settle_unproven(
+    mut rows: Vec<ProcessUse>,
+    mut reread: impl FnMut(i32) -> Option<ProcessUse>,
+    mut pause: impl FnMut(),
+) -> Vec<ProcessUse> {
+    for _ in 0..USE_SETTLE_ROUNDS {
+        if !rows.iter().any(ProcessUse::unproven) {
+            break;
+        }
+        pause();
+        rows = rows
+            .into_iter()
+            .filter_map(|row| {
+                if row.unproven() {
+                    reread(row.pid)
+                } else {
+                    Some(row)
+                }
+            })
+            .collect();
+    }
+    rows
+}
+
 /// Every process the OS lists, read for [`dir_use_in`]. A process that exits
 /// while the table is read is dropped; a table that cannot be listed is an
-/// `Err`.
+/// `Err`. A row of the user's own still unreadable after the first pass is
+/// read again, up to [`USE_SETTLE_ROUNDS`] times with [`USE_SETTLE_PAUSE`]
+/// between, so a process in the middle of exiting is dropped rather than
+/// reported as unreadable; one that stays unreadable is kept.
 pub(crate) fn read_use_table() -> Result<Vec<ProcessUse>, String> {
     let mut pids = Vec::new();
     os::list_pids(&mut pids)?;
     let mut buf = Vec::new();
-    Ok(pids
+    let rows = pids
         .into_iter()
         .filter(|pid| *pid > 0)
         .filter_map(|pid| os::read_use(pid, &mut buf))
-        .collect())
+        .collect();
+    Ok(settle_unproven(
+        rows,
+        |pid| os::read_use(pid, &mut buf),
+        || std::thread::sleep(USE_SETTLE_PAUSE),
+    ))
 }
 
 /// Who is using `dir` right now, read from the live process table.
@@ -3913,8 +3967,126 @@ pub(crate) mod tests {
         assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
     }
 
+    fn unreadable_row(pid: i32) -> ProcessUse {
+        ProcessUse {
+            pid,
+            mine: true,
+            ..Default::default()
+        }
+    }
+
+    fn complete_row(pid: i32, cwd: &str) -> ProcessUse {
+        ProcessUse {
+            pid,
+            mine: true,
+            cwd: Some(PathBuf::from(cwd)),
+            exe: Some("/bin/tool".into()),
+            argv: Some(vec!["tool".into()]),
+            env: Some(Vec::new()),
+        }
+    }
+
+    /// A process caught mid-exit is unreadable on the first read and gone on
+    /// the next: it is dropped, and the directory is then provably unused.
+    #[test]
+    fn a_row_that_is_gone_on_the_reread_is_dropped() {
+        let dir = Path::new("/work/x");
+        let (mut rereads, mut pauses) = (Vec::new(), 0usize);
+        let table = settle_unproven(
+            vec![unreadable_row(7), complete_row(9, "/elsewhere")],
+            |pid| {
+                rereads.push(pid);
+                None
+            },
+            || pauses += 1,
+        );
+        assert_eq!(
+            table.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![9],
+            "the exiting process must be dropped and the complete one kept"
+        );
+        assert_eq!(rereads, vec![7]);
+        assert_eq!(pauses, 1);
+        assert!(dir_use_in(dir, &table, 1).provably_unused());
+    }
+
+    /// The re-read row replaces the unproven one: its content is used, not
+    /// only its absence.
+    #[test]
+    fn a_row_that_is_complete_on_the_reread_replaces_the_unproven_one() {
+        let dir = Path::new("/work/x");
+        let table = settle_unproven(
+            vec![unreadable_row(7)],
+            |pid| Some(complete_row(pid, "/work/x/sub")),
+            || {},
+        );
+        let reading = dir_use_in(dir, &table, 1);
+        assert!(reading.unreadable.is_empty(), "{reading:?}");
+        assert_eq!(reading.users, vec![(7, UseKind::WorkingDirectory)]);
+    }
+
+    /// A process that is alive and really unreadable is still unproven after
+    /// every round, and the settle pass is bounded.
+    #[test]
+    fn a_row_still_unproven_after_every_round_stays_and_the_pass_is_bounded() {
+        let dir = Path::new("/work/x");
+        let (mut rereads, mut pauses) = (0usize, 0usize);
+        let table = settle_unproven(
+            vec![unreadable_row(7)],
+            |pid| {
+                rereads += 1;
+                Some(unreadable_row(pid))
+            },
+            || pauses += 1,
+        );
+        assert_eq!(dir_use_in(dir, &table, 1).unreadable, vec![7]);
+        // Three rounds, stated outright: comparing with the constant alone
+        // would pass a pass that does nothing at zero rounds.
+        assert_eq!(rereads, 3, "one re-read per round, no more");
+        assert_eq!(pauses, 3, "one pause per round, no more");
+        assert_eq!(USE_SETTLE_ROUNDS, 3);
+    }
+
+    /// A table with nothing unproven costs nothing: no re-read, no pause.
+    #[test]
+    fn a_table_with_no_unproven_row_is_not_reread_or_paused() {
+        let (mut rereads, mut pauses) = (0usize, 0usize);
+        let table = settle_unproven(
+            vec![complete_row(7, "/a"), complete_row(8, "/b")],
+            |_| {
+                rereads += 1;
+                None
+            },
+            || pauses += 1,
+        );
+        assert_eq!(table.len(), 2);
+        assert_eq!((rereads, pauses), (0, 0));
+    }
+
+    /// Another user's process cannot be inspected, so it is never re-read.
+    #[test]
+    fn another_users_row_is_never_reread() {
+        let foreign = ProcessUse {
+            pid: 8,
+            mine: false,
+            ..Default::default()
+        };
+        assert!(!foreign.unproven());
+        let (mut rereads, mut pauses) = (0usize, 0usize);
+        let table = settle_unproven(
+            vec![foreign],
+            |_| {
+                rereads += 1;
+                None
+            },
+            || pauses += 1,
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!((rereads, pauses), (0, 0));
+    }
+
     /// A relative build directory means the process's own working directory:
-    /// `--target-dir rel`, `--target-dir=rel` and `CARGO_TARGET_DIR=rel` each
+    /// `--target-dir rel`,`--target-dir=rel` and `CARGO_TARGET_DIR=rel` each
     /// name the directory from another cwd, and none of them from a cwd that
     /// resolves elsewhere or a value that names a longer sibling.
     #[test]

@@ -223,7 +223,9 @@ as empty (it cannot be told apart from a genuinely empty environment, so it is
 not marked unproven: doing so would keep every folder while any `/bin/sh` runs);
 a `target-dir` set only in a `.cargo/config` file; and other users' processes,
 which are counted and reported but not inspected. Worktree teardown uses the
-same check, and a process of yours it could not read refuses. A process whose
+same check, and a process of yours it could not read refuses, after the unreadable
+ones are read again up to three times, 20 ms apart, so one caught mid-exit is not
+mistaken for one that cannot be read. A process whose
 owner the OS will not name is treated as yours and unreadable. A working
 directory the OS gives no path for, for any reason, is unproven, not "inside
 nothing". (macOS keeps answering with the old path for a directory removed
