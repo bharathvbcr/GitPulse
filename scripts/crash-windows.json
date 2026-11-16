@@ -456,7 +456,8 @@
           "file": "src-tauri/src/engine/git_writer.rs",
           "name": "serve_op_record_answers_snapshotted_when_only_the_prune_failed",
           "cfg": [
-            "all(test,unix)"
+            "all(test,unix)",
+            "target_os=\"macos\""
           ]
         }
       ],
