@@ -250,11 +250,15 @@
         }),
       };
       const opened = [];
+      const eventHandlers = {};
+      const emitEvent = (event, payload) => { for (const handler of eventHandlers[event] ?? []) handler({ event, id: 0, payload }); };
       // The workbench change listener unlistens through this on teardown.
       window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => {
           if (cmd === "plugin:opener|open_url") { opened.push(args.url); return null; }
+          // Kept so a check can deliver a host event, such as workbench-changed.
+          if (cmd === "plugin:event|listen") { (eventHandlers[args.event] ??= []).push(args.handler); return 1; }
           if (cmd.startsWith("plugin:")) return 1;
           calls.push({ cmd, args: args ?? {} });
           if (fixtures[cmd]) return fixtures[cmd](args ?? {});
@@ -270,6 +274,7 @@
       const { get } = await import("svelte/store");
       const { createChecks } = await import("./checks.ts");
       const { holdForeground } = await import("./foreground.ts");
+      const { noteForegroundFocus } = await import("../src/lib/runtime/foreground.ts");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
       const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
       const { filterStore } = await import("../src/lib/stores/filterStore.ts");
@@ -355,9 +360,9 @@
           // The last such control in the section: the duration timeline above the
           // cards has an expander of its own.
           const runExpander = () => $$("button", runsSection()).filter((el) => ["Show all 15 runs", "Show fewer"].includes(words(el))).at(-1);
-          check("runs preview three cards, with a collapsed expander", () =>
-            runTitles().length === 3 && runExpander()?.getAttribute("aria-expanded") === "false");
-          check("the duration timeline measures every run the filter admits, not the three cards", () =>
+          check("runs preview five cards, with a collapsed expander", () =>
+            runTitles().length === 5 && runExpander()?.getAttribute("aria-expanded") === "false");
+          check("the duration timeline measures every run the filter admits, not the five cards", () =>
             $$("[data-delivery-strip-seg]", runsSection()).length === 15);
           runExpander().click();
           await settle();
@@ -470,7 +475,7 @@
           filterStore.clear();
 
           // ---- external links --------------------------------------------------
-          button("New pull request", $("h2", stage).parentElement.parentElement).click();
+          button("New pull request", $("[data-page-header]", stage)).click();
           await settle();
           check("New pull request opens GitHub's compare form through the canonical opener", () =>
             opened.at(-1)?.startsWith("https://github.com/acme/app/compare/main...") && windowOpens.length === 0);
@@ -550,7 +555,7 @@
           await until(() => text().includes("PR 5"));
           check("a repository switch drops the filter, the branch narrowing, the expansions and all-releases", () =>
             $('input[aria-label="Filter pull requests"]', stage).value === "" && prCards() === 5 &&
-            button("this branch").getAttribute("aria-pressed") === "false" && wfRows().length === 5 && runTitles().length === 3 &&
+            button("this branch").getAttribute("aria-pressed") === "false" && wfRows().length === 5 && runTitles().length === 5 &&
             button("latest only").getAttribute("aria-pressed") === "true");
 
           // A switch to a repository whose context is cached shows that listing at
@@ -816,6 +821,18 @@
           await settle();
           check("Try again reads the catalog, and the existing tasks show as In tasks rather than being re-created", () =>
             taskStore.length === putsPaused && $$("button", issues()).filter((el) => words(el) === "In tasks").length === 5);
+
+          // An agent in another app's terminal removes one of those tasks while
+          // GitPulse sits beside it on screen without focus. The task list
+          // follows the change: pausing on lost focus dropped it until the
+          // next click into the window.
+          noteForegroundFocus(false);
+          taskStore.splice(taskStore.length - 1, 1);
+          emitEvent("workbench-changed", { sequence: null, source: "external" });
+          const followed = await until(() => $$("button", issues()).filter((el) => words(el) === "Add to tasks").length === 1, 6000);
+          noteForegroundFocus(true);
+          check("on screen without focus, the task list follows a change another process made", () =>
+            followed && $$("button", issues()).filter((el) => words(el) === "In tasks").length === 4);
 
           // Report issue… stays available when the listing itself failed.
           await activate(B);

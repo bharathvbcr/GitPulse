@@ -390,7 +390,7 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         no_symlinks(&path)
             .expect("canonical paths start with a volume prefix; that prefix is not statted");
-        let plain = crate::engine::git_cli::canonicalize_plain(temp.path())
+        let plain = crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("owned");
         no_symlinks(&plain)

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  WorkbenchError, explainError, getTask, getWorkspace, listRepositories,
+  WorkbenchError, WORKBENCH_REQUEST_TIMEOUT_MS, explainError, getTask, getWorkspace, listRepositories,
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
   getEnhancement, listEnhancements, latestEnhancement, LIVE_ENHANCEMENT_STATES, ACTIVE_ENHANCEMENT_STATES, changeEnhancement, enhancementConfiguration,
@@ -20,7 +20,7 @@ function reply(items: unknown[], total = items.length, cursor: string | null = n
   return JSON.stringify({ ok: true, items, shown: items.length, total, has_more: cursor !== null, next_cursor: cursor });
 }
 
-beforeEach(() => native.mockReset());
+beforeEach(() => { native.mockReset(); });
 
 describe("native workbench boundary", () => {
   it("registers a path as data with independent record and request identities", async () => {
@@ -264,6 +264,97 @@ describe("schema 11 board calls", () => {
     ]) {
       native.mockResolvedValueOnce(JSON.stringify(reply));
       await expect(mergeTasks("repo_1", card("keep"), [card("a"), card("b")], "why"), JSON.stringify(reply)).rejects.toMatchObject({ code: "protocol_error" });
+    }
+  });
+});
+
+describe("workbench request deadlines and cancellation (ft-3b404cb4)", () => {
+  it("exports WORKBENCH_REQUEST_TIMEOUT_MS set to 30,000 ms", () => {
+    expect(WORKBENCH_REQUEST_TIMEOUT_MS).toBe(30_000);
+  });
+
+  it("passes deadlineMs: 30_000 to invoke by default in listTasks() and times out with WorkbenchError('transport_error')", async () => {
+    vi.useFakeTimers();
+    try {
+      native.mockImplementation(() => new Promise(() => {}));
+      let settled: "pending" | "rejected" = "pending";
+      let error: unknown = null;
+      listTasks({ kind: "global" }).then(
+        () => {},
+        (e) => {
+          settled = "rejected";
+          error = e;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(settled).toBe("pending");
+      await vi.advanceTimersByTimeAsync(2);
+      expect(settled).toBe("rejected");
+      expect(error).toBeInstanceOf(WorkbenchError);
+      expect((error as WorkbenchError).code).toBe("transport_error");
+      expect((error as WorkbenchError).message).toMatch(/cmd_workbench_request timed out after 30 s/);
+    } finally {
+      native.mockReset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out request('items.list', ..., { deadlineMs: 30_000 }) with WorkbenchError('transport_error')", async () => {
+    vi.useFakeTimers();
+    try {
+      native.mockImplementation(() => new Promise(() => {}));
+      let settled: "pending" | "rejected" = "pending";
+      let error: unknown = null;
+      request("items.list", { limit: 1 }, { deadlineMs: 30_000 }).then(
+        () => {},
+        (e) => {
+          settled = "rejected";
+          error = e;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(settled).toBe("pending");
+      await vi.advanceTimersByTimeAsync(2);
+      expect(settled).toBe("rejected");
+      expect(error).toBeInstanceOf(WorkbenchError);
+      expect((error as WorkbenchError).code).toBe("transport_error");
+      expect((error as WorkbenchError).message).toMatch(/cmd_workbench_request timed out after 30 s/);
+    } finally {
+      native.mockReset();
+      vi.useRealTimers();
+    }
+  });
+
+  it("forwards options allowing custom deadlines and cancellation", async () => {
+    vi.useFakeTimers();
+    try {
+      native.mockImplementation(() => new Promise(() => {}));
+      let requestError: unknown = null;
+      request("items.list", {}, { deadlineMs: 5_000 }).catch((e) => { requestError = e; });
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(requestError).toBeInstanceOf(WorkbenchError);
+      expect((requestError as WorkbenchError).code).toBe("transport_error");
+      expect((requestError as WorkbenchError).message).toMatch(/timed out after 5 s/);
+
+      let customListError: unknown = null;
+      listTasks({ kind: "global" }, null, "", undefined, 30, {}, { deadlineMs: 10_000 }).catch((e) => { customListError = e; });
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(customListError).toBeNull();
+      await vi.advanceTimersByTimeAsync(2);
+      expect(customListError).toBeInstanceOf(WorkbenchError);
+      expect((customListError as WorkbenchError).code).toBe("transport_error");
+      expect((customListError as WorkbenchError).message).toMatch(/timed out after 10 s/);
+
+      const controller = new AbortController();
+      let abortError: unknown = null;
+      listTasks({ kind: "global" }, null, "", undefined, 30, {}, { signal: controller.signal }).catch((e) => { abortError = e; });
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(abortError).toBeInstanceOf(WorkbenchError);
+      expect((abortError as WorkbenchError).code).toBe("transport_error");
+    } finally {
+      native.mockReset();
+      vi.useRealTimers();
     }
   });
 });

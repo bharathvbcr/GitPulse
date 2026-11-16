@@ -274,7 +274,7 @@
     releasePendingPreparation(pending.task_id, pending.id);
     pending = null;
     error = "";
-    note = "Discarded. If the store did create that run it is listed under this task's Agents, holds its checkout until it expires, and can be cancelled there.";
+    note = "Discarded. If the store did create that run it is listed under this task's Agents, holds its checkout until it expires, and can be canceled there.";
     void loadHolding(selected);
   }
 

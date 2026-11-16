@@ -77,7 +77,7 @@
   const card = () => target().querySelector("[data-panel=delivery]");
   const detailRows = () => [...target().querySelectorAll("[data-delivery-row]")];
   const stripSegs = () => [...target().querySelectorAll("[data-delivery-strip-seg]")];
-  const expandBtn = () => target().querySelector("[data-delivery-expand]");
+  const expandBtn = () => target().querySelector("[data-list-preview-toggle]");
   const fitsRail = () => {
     const el = card();
     return !!el && el.scrollWidth <= el.clientWidth + 1;
@@ -260,11 +260,13 @@
         () => flat().includes("capped — more exist"));
       check("a 280px rail does not overflow while collapsed",
         () => fitsRail());
-      check("the three preview runs sit on one glance row", () => {
+      check("the preview runs lay out three to a glance row, the rest wrapping beneath", () => {
         const boxes = detailRows().map(el => el.getBoundingClientRect());
         if (boxes.length !== TIMELINE_PREVIEW_COUNT) return false;
         const top = Math.round(boxes[0].top);
-        return boxes.every(box => Math.round(box.top) === top);
+        const firstRow = boxes.slice(0, 3).every(box => Math.round(box.top) === top);
+        const wrapped = boxes.slice(3).every(box => Math.round(box.top) > top);
+        return firstRow && wrapped;
       });
       check("glance tiles do not print the commit subject",
         () => !flat().includes("a-very-long-branch-name") && !flat().includes("workflow_dispatch"));
@@ -297,12 +299,12 @@
       check("the expander uses the listing's own noun",
         () => flat().includes("Show all 20 rollouts"));
 
-      // Three 1s runs, then seventeen hour-long ones. If the bar scale used
-      // only the preview, the three shorts would all be 100%. Against the
-      // full sample they floor at a sliver.
+      // A preview's worth of 1s runs, then hour-long ones. If the bar scale used
+      // only the preview, the shorts would all be 100%. Against the full sample
+      // they floor at a sliver.
       await remount({ rows: runTimelineRows([
-        ...[1, 2, 3].map((id) => run({ id, updated_at: iso(T0 + 1_000) })),
-        ...Array.from({ length: 17 }, (_, i) => run({ id: i + 4, updated_at: iso(T0 + 3_600_000) })),
+        ...Array.from({ length: TIMELINE_PREVIEW_COUNT }, (_, i) => run({ id: i + 1, updated_at: iso(T0 + 1_000) })),
+        ...Array.from({ length: 20 - TIMELINE_PREVIEW_COUNT }, (_, i) => run({ id: i + TIMELINE_PREVIEW_COUNT + 1, updated_at: iso(T0 + 3_600_000) })),
       ]), checked: true }, 280);
       check("collapsed bars still scale against the full sample", () => {
         const widths = bars().map((bar) => Number.parseFloat(bar.style.width));

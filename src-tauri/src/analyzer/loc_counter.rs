@@ -633,7 +633,7 @@ impl LocCounter {
 /// does not start with `//` and the file's first comment counts as code.
 /// Editors on Windows write BOMs routinely, so this was not a rare path.
 fn strip_bom(content: &str) -> &str {
-    content.strip_prefix('\u{feff}').unwrap_or(content)
+    content.trim_prefix('\u{feff}')
 }
 
 /// Classifies one line and advances the cross-line `carry` state.

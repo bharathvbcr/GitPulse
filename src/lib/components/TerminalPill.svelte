@@ -1,6 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { hostPlatform } from "../stores/platformStore";
+  import { describeError } from "../ui/copy/describeFailure";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { LAYERS } from "../ui/layers";
   import { SquareTerminal } from "@lucide/svelte";
@@ -149,7 +150,7 @@
       }
       closeMenu();
     } catch (error) {
-      launchError = error instanceof Error ? error.message : String(error);
+      launchError = describeError(error, "terminal-pill");
     }
   }
 
@@ -166,7 +167,7 @@
       await launched;
       closeMenu();
     } catch (error) {
-      launchError = error instanceof Error ? error.message : String(error);
+      launchError = describeError(error, "terminal-pill");
     } finally {
       launching = false;
     }

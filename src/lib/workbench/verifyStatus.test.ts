@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "../ipc/invoke";
-import { POST_CONFIRM, postAvailability, postedSummary, postVerifyResult, setVerifyStatus, verifyStatusEnabled, type PostedVerifyStatus } from "./verifyStatus";
+import { POST_CONFIRM, postAvailability, postConfirm, postedSummary, postVerifyResult, setVerifyStatus, verifyStatusEnabled, type PostedVerifyStatus } from "./verifyStatus";
 vi.mock("../ipc/invoke", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
 beforeEach(() => native.mockReset());
@@ -38,10 +38,18 @@ describe("when the sheet may post", () => {
     expect(POST_CONFIRM.title).toBe("Post verify result?");
     expect(POST_CONFIRM.message).toContain("devcouncil/verify");
     expect(POST_CONFIRM.message).toContain("never as a pass");
+    expect(postConfirm(false)).toEqual(POST_CONFIRM);
+    expect(postConfirm(true).message).toContain("open pull requests");
   });
-  it("says what a post did, and that a dry result sent nothing", () => {
+  it("says what a post did, surfaces comment notes, and says when a dry result sent nothing", () => {
     const base: PostedVerifyStatus = { sha: "0123456789abcdef", state: "success", description: "", dry_run: false, status_posted: true, commented: [4, 9], comment_note: null, would_run: [] };
     expect(postedSummary(base)).toBe("Posted success for 0123456 and commented on #4, #9.");
+    expect(postedSummary({ ...base, commented: [], comment_note: "no open pull request contains this commit" })).toBe(
+      "Posted success for 0123456 (no open pull request contains this commit).",
+    );
+    expect(postedSummary({ ...base, commented: [], comment_note: "the comment on #7 failed: HTTP 403" })).toBe(
+      "Posted success for 0123456 (the comment on #7 failed: HTTP 403).",
+    );
     expect(postedSummary({ ...base, status_posted: false, commented: [] })).toBe("Nothing was posted for 0123456.");
   });
 });

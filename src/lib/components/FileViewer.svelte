@@ -43,7 +43,6 @@
     PanelLeftClose,
     PanelLeftOpen,
     FileText,
-    Search,
     Copy,
     ExternalLink,
     ChevronRight,
@@ -57,6 +56,7 @@
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { copyText } from "../desktop/clipboard";
   import { askConfirm } from "../stores/modalStore";
   import { openInDefaultApp } from "../desktop/openInShell";
@@ -67,7 +67,7 @@
   import FileTreeColumn from "./files/FileTreeColumn.svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import LazyView from "./LazyView.svelte";
-  import { explorerLens, showExplorerRail, toggleBlameLens } from "../files/explorerLens";
+  import { explorerLens, toggleBlameLens } from "../files/explorerLens";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -79,6 +79,7 @@
   import {
     FILE_DASHBOARD_WIDTH,
     FILE_EDITOR_MIN_WIDTH,
+    FILE_SIDE_CARD_GUTTERS,
     resolveFilePaneLayout,
   } from "../files/filePaneLayout";
   import {
@@ -168,9 +169,10 @@
     compactPane,
   }));
   // The tree may grow, but not into the editor's minimum — or the dashboard,
-  // which stays a fixed rail beside it.
+  // which stays a fixed rail beside it. Each side column is a floating card
+  // whose margins the editor has to leave room for too.
   let explorerReserve = $derived(
-    FILE_EDITOR_MIN_WIDTH + (paneLayout.dashboardVisible ? FILE_DASHBOARD_WIDTH : 0),
+    FILE_EDITOR_MIN_WIDTH + FILE_SIDE_CARD_GUTTERS + (paneLayout.dashboardVisible ? FILE_DASHBOARD_WIDTH + FILE_SIDE_CARD_GUTTERS : 0),
   );
 
   let pathSegments = $derived.by(() => (activeTabPath ? activeTabPath.split("/") : []));
@@ -396,7 +398,7 @@
       // byte-exact even over a disk file the editor could not round-trip.
       await saveDraft(path, draft.content, conflict.actual, true);
     } catch (err: unknown) {
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     }
   }
 
@@ -507,7 +509,7 @@
     // Rust validates containment and rebuilds the absolute path; a failure
     // surfaces rather than leaving a menu item that quietly does nothing.
     void openInDefaultApp(repo, activeTabPath).catch((err) =>
-      repoStore.setError(formatError(err)),
+      repoStore.setError(describeError(err, "repo")),
     );
   }
 
@@ -530,22 +532,6 @@
     if (!activeTabPath) return;
     repoStore.selectFilePath(activeTabPath);
     repoStore.setActiveTab("history", "diff");
-  }
-
-  const searchRailUp = $derived(paneLayout.explorerVisible && $explorerLens.rail === "search");
-
-  /**
-   * Search lives in the Explorer column, so asking for it while that column
-   * is hidden shows the column on Search rather than flipping a mode nobody
-   * can see.
-   */
-  function toggleSearchRail() {
-    if (searchRailUp) {
-      showExplorerRail("files");
-      return;
-    }
-    showExplorerRail("search");
-    if (!paneLayout.explorerVisible) toggleSidePane("explorer");
   }
 
   // A request to search made from elsewhere (the command palette) must be
@@ -770,7 +756,9 @@
     and Left/Right/Home/End move between them, which is what `role="tab"`
     already promised a keyboard user.
   -->
-  <div class="flex items-center px-1.5 bg-surface/90 gp-section-edge shrink-0 h-9 gap-1.5">
+  <!-- The Code page's own bar sits on the page's ground, like the window's
+       header rows: no band fill and no edge line under it. -->
+  <div class="flex items-center px-1.5 shrink-0 h-9 gap-1.5" data-file-view-bar>
     <button
       type="button"
       onclick={() => toggleSidePane("explorer")}
@@ -784,18 +772,6 @@
       {:else}
         <PanelLeftOpen size={14} />
       {/if}
-    </button>
-
-    <button
-      type="button"
-      onclick={toggleSearchRail}
-      aria-label="Search file contents"
-      aria-pressed={searchRailUp}
-      title={searchRailUp ? "Back to the file tree" : "Search file contents across the repository"}
-      data-search-toggle
-      class="gp-icon-btn shrink-0 {searchRailUp ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
-    >
-      <Search size={14} />
     </button>
 
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
@@ -879,7 +855,7 @@
           type="button"
           onclick={closeOtherTabs}
           aria-label="Close other tabs"
-          title="Close Other Tabs"
+          title="Close other tabs"
           class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
         >
           <Columns2 size={13} />
@@ -888,7 +864,7 @@
           type="button"
           onclick={closeAllTabs}
           aria-label="Close all tabs"
-          title="Close All Tabs"
+          title="Close all tabs"
           class="gp-icon-btn text-textMuted hover:text-danger" data-size="sm"
         >
           <XCircle size={13} />
@@ -900,12 +876,12 @@
         type="button"
         onclick={() => toggleSidePane("dashboard")}
         aria-pressed={paneLayout.dashboardVisible}
-        aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
-        title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard ({shortcutTextLabel('⌘⇧D', $hostPlatform.os)})"
+        aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live pulse dashboard"
+        title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live pulse dashboard ({shortcutTextLabel('⌘⇧D', $hostPlatform.os)})"
         class="gp-btn px-2! flex items-center gap-1 text-meta {paneLayout.dashboardVisible ? 'border-accent bg-accent/15 text-accent font-semibold' : ''}" data-size="sm"
       >
         <Activity size={12} />
-        <span>Live Pulse</span>
+        <span>Live pulse</span>
       </button>
     </div>
   </div>
@@ -918,7 +894,7 @@
       question a breadcrumb exists to answer — "where is this?" — and the
       answer used to require scrolling the tree by hand.
     -->
-    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 gp-section-edge shrink-0 text-xs">
+    <div class="flex items-center justify-between gap-2 px-2.5 py-1 gp-section-edge shrink-0 text-xs" data-file-path-strip>
       <div class="relative min-w-0 flex-1">
       <nav
         bind:this={pathStrip}
@@ -962,7 +938,7 @@
           onclick={copyActivePath}
           class="gp-icon-btn text-textMuted hover:text-textPrimary" data-size="sm"
           aria-label="Copy relative path"
-          title="Copy Relative Path"
+          title="Copy relative path"
         >
           <Copy size={12} />
         </button>
@@ -1018,11 +994,11 @@
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
     {#if paneLayout.explorerVisible}
       {#if paneLayout.editorVisible}
-        <FileTreeColumn reserve={explorerReserve}>
+        <FileTreeColumn class="gp-float-card" reserve={explorerReserve}>
           {@render explorerTree()}
         </FileTreeColumn>
       {:else}
-        <div class="h-full overflow-hidden flex-1 min-w-0">
+        <div class="gp-float-card flex-1 min-w-0" data-explorer-card>
           {@render explorerTree()}
         </div>
       {/if}
@@ -1085,7 +1061,8 @@
     {/if}
 
     {#if paneLayout.dashboardVisible}
-      <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-80 shrink-0' : 'flex-1 min-w-0'}">
+      <!-- A floating card beside the editor, like the sidebar beside the workspace. -->
+      <div class="gp-float-card {paneLayout.editorVisible ? 'w-80 shrink-0' : 'flex-1 min-w-0'}" data-live-pulse-card>
         <LivePulseDashboard selectedFile={activeTabPath} onSelectFile={(path) => previewFile(path)} />
       </div>
     {/if}

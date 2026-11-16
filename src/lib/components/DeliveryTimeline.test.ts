@@ -58,8 +58,8 @@ describe("DeliveryTimeline preview contracts", () => {
     expect(source).toContain('from "../ui/previewList"');
     expect(source).not.toContain('from "../github/runActions"');
     expect(source).toContain("previewSlice(rows, expanded, TIMELINE_PREVIEW_COUNT)");
-    expect(source).toContain("overflowsPreview(rows.length, TIMELINE_PREVIEW_COUNT)");
-    expect(source).toContain("expandLabel(rows.length, expanded, sampleNoun)");
+    // The control is the shared one, not a local button with its own label.
+    expect(source).toContain("<ListPreviewToggle total={rows.length} noun={sampleNoun} bind:expanded />");
   });
 
   it("measures the full sample even when the list is collapsed", () => {
@@ -92,8 +92,8 @@ describe("DeliveryTimeline preview contracts", () => {
 });
 
 describe("DeliveryTimeline collapsed listing", () => {
-  it("draws three recent rows of twenty and keeps the sample honest", () => {
-    expect(TIMELINE_PREVIEW_COUNT).toBe(3);
+  it("draws five recent rows of twenty and keeps the sample honest", () => {
+    expect(TIMELINE_PREVIEW_COUNT).toBe(5);
     const rows = [
       ...manyRows(6, "settled_bad"),
       ...manyRows(14, "settled_ok").map((row, i) => ({ ...row, id: String(i + 7) })),

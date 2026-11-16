@@ -212,9 +212,9 @@
   });
 </script>
 
-<div class="flex flex-col h-full bg-surface/40 font-sans text-xs min-h-0 select-none overflow-y-auto gp-scroll">
+<div class="flex flex-col h-full font-sans text-xs min-h-0 select-none overflow-y-auto gp-scroll">
   <!-- Top Live Pulse Header -->
-  <div class="flex items-center justify-between px-3 py-2.5 gp-section-edge bg-surface/80 shrink-0">
+  <div class="flex items-center justify-between px-3 py-2.5 shrink-0">
     <div class="flex items-center gap-2">
       {#if isDirty}
         <span class="relative flex h-2.5 w-2.5">

@@ -69,6 +69,16 @@ describe("parseTaskQuery", () => {
     expect(bad.problems[0]).toMatch(/status:shipped is not a column/);
   });
 
+  it("reads a saved search that says status:inbox as backlog, with no problem", () => {
+    for (const spelling of ["status:inbox", "state:Inbox", 'status:"inbox"']) {
+      const parsed = parseTaskQuery(spelling);
+      expect(parsed.problems, spelling).toEqual([]);
+      expect(parsed.terms[0], spelling).toMatchObject({ key: "status", value: "backlog" });
+    }
+    expect(matches("status:inbox", { status: "backlog" })).toBe(true);
+    expect(matches("status:inbox", { status: "ready" })).toBe(false);
+  });
+
   it("refuses an unreadable priority or due filter instead of searching for its words", () => {
     const parsed = parseTaskQuery("priority:huge due:tomorrow");
     expect(parsed.terms).toEqual([]);
@@ -390,7 +400,7 @@ describe("completions", () => {
   });
 
   it("offers fixed vocabularies and the board's own is: words without loaded tasks", () => {
-    expect(suggest("status:in", {}).map((s) => s.insert)).toEqual(["status:inbox", "status:in_progress"]);
+    expect(suggest("status:in", {}).map((s) => s.insert)).toEqual(["status:in_progress"]);
     expect(suggest("is:", sources).map((s) => s.insert)).toEqual(["is:open", "is:closed", "is:done", "is:unassigned", "is:overdue", "is:improvement"]);
     expect(suggest("priority:", {}).length).toBe(4);
     expect(suggest("due:", {}).map((s) => s.insert)).toEqual(["due:overdue", "due:soon", "due:later", "due:none", "due:any"]);

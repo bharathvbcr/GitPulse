@@ -87,7 +87,7 @@ describe("shape, space, density and edge tokens", () => {
     );
     // The pane radius is the macOS one that already exists, with its own 14 as the fallback.
     expect(theme.get("--gp-r-pane")).toBe("var(--gp-pane-radius, 14px)");
-    expect(css).toMatch(/html\.macos \{\s*--gp-pane-gutter:\s*0px;\s*--gp-pane-radius:\s*14px;/);
+    expect(css).toMatch(/html\.macos \{\s*--gp-pane-gutter:\s*6px;\s*--gp-pane-radius:\s*14px;/);
   });
 
   it("declares the 4px space steps", () => {
@@ -256,7 +256,7 @@ describe("nothing the sheet defined before the vocabulary was lost", () => {
     "gp-btn", "gp-btn-primary", "gp-btn-danger", "gp-icon-btn", "gp-pill", "gp-card", "gp-scrim",
     "gp-scroll-cue", "gp-scroll-cue-start", "gp-scroll-cue-end", "gp-scroll-cue-y", "gp-scroll-cue-top",
     "gp-scroll-cue-bottom", "gp-scroll-cue-btn", "gp-menu", "gp-menu-item", "gp-separator", "gp-menu-sep",
-    "gp-section-edge", "gp-segmented", "gp-surface-header", "gp-surface-title", "gp-notice", "gp-notice-error",
+    "gp-section-edge", "gp-segmented", "gp-surface-title", "gp-notice", "gp-notice-error",
     "gp-notice-warn", "gp-seg-btn", "gp-field", "gp-field-multi", "gp-chip", "gp-floor", "gp-select", "gp-keycap",
   ];
 

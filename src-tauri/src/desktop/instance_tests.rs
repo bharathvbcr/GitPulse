@@ -410,6 +410,7 @@ fn malformed_frames_are_refused_and_the_owner_keeps_answering() {
         b"{\"v\":1,\"request\":{\"kind\":\"launch_missiles\"}}\n",
         b"{\"v\":1,\"request\":{\"kind\":\"open\",\"paths\":[\"relative\"]}}\n",
         b"{\"v\":1,\"request\":{\"kind\":\"notification\",\"id\":\"\",\"snooze\":false}}\n",
+        b"{\"v\":1,\"request\":{\"kind\":\"agent_session_meta\",\"terminal_id\":\"term-1\",\"agent\":\"claude\",\"conversation_id\":\"6f0a6d1e-1111-4222-8333-444455556666\",\"resume_argv\":[\"claude\",\"--resume\"]}}\n",
     ];
     for line in refused {
         let (mut stream, mut reader) = raw(dir.path());
@@ -766,6 +767,107 @@ fn a_full_frame_from_a_peer_that_then_left_is_refused_not_probed() {
         "{ended:?}"
     );
     assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
+/// Waits, bounded, until every descriptor of the peer's end is closed: the
+/// kernel's POLLHUP, which a forking test's copy of the descriptor would delay.
+fn wait_for_hang_up(control: &UnixStream) {
+    let until = std::time::Instant::now() + coverage_relaxed(Duration::from_secs(30));
+    loop {
+        let mut watched = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(control),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` for a descriptor `control` owns.
+        unsafe { libc::poll(&mut watched, 1, 10) };
+        if watched.revents & libc::POLLHUP != 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the peer's descriptors were never all closed, so it never hung up"
+        );
+    }
+}
+
+#[test]
+fn a_gate_asker_that_left_before_its_verdict_is_not_a_refused_launch() {
+    // The 13 "instance mailbox refused a launch: write: Broken pipe" warnings
+    // of one loaded session: an edit hook asks for a verdict, waits its 750 ms
+    // (`GATE_APP_DEADLINE`), judges the command itself and leaves. The owner's
+    // late verdict then meets a closed socket. Nothing was refused and no launch
+    // was involved; what is worth keeping is which answer was late, and by how
+    // much.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let control = server.try_clone().unwrap();
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_cwd: &str, _command: &str| {
+        wait_for_hang_up(&control);
+        Ok(serde_json::json!({ "decision": "allow" }))
+    }));
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::GateCommand {
+            id: "g1".into(),
+            cwd: "/".into(),
+            command: "ls".into(),
+        },
+    })
+    .unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        read_frame(&mut reader).unwrap().expect("greeting");
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(writer);
+        drop(reader);
+        served.join().unwrap()
+    });
+    let Err(ended) = outcome else {
+        panic!("an answer nobody was left to read was not delivered")
+    };
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Info, "{line}");
+    assert!(!line.contains("refused a launch"), "{line}");
+    assert!(line.contains("the gate"), "names what was asked: {line}");
+    assert!(
+        line.contains(" ms"),
+        "says how long the answer took: {line}"
+    );
+}
+
+#[test]
+fn an_undelivered_answer_stays_loud_unless_the_ask_was_read_only_and_its_asker_left() {
+    let epipe = || "write: Broken pipe (os error 32)".to_string();
+    let started = std::time::Instant::now();
+
+    // A delivery, orchestration or op record has already acted when its ack
+    // cannot be written: the asker does not know it happened.
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    let ended = Ended::after_ask(&server, "the agent delivery", false, started, epipe());
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Warn);
+    assert!(line.contains("the agent delivery"), "{line}");
+
+    // A read-only ask whose asker is still connected: the failure is not
+    // explained by its leaving.
+    let (server, _held) = UnixStream::pair().unwrap();
+    let ended = Ended::after_ask(&server, "the collision scan", true, started, epipe());
+    assert!(matches!(ended, Ended::Refused(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+
+    // A read-only ask whose asker is gone fell back on its own deadline.
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    let ended = Ended::after_ask(&server, "the insights read", true, started, epipe());
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    assert_eq!(ended.log_line().0, log::Level::Info);
 }
 
 #[test]
@@ -2207,4 +2309,275 @@ fn agent_deliver_echoes_request_id_and_caps_concurrent_handlers_at_four() {
         let reply = worker.join().unwrap().expect("deliver reply");
         assert_eq!(reply["delivery_outcome"], "woken_immediately");
     }
+}
+
+#[test]
+fn turn_checkpoints_have_their_own_small_cap_and_never_starve_a_gate_request() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let req = |id: &str| Request::RecordTurnCheckpoint {
+        id: id.into(),
+        cwd: "/repo/wt".into(),
+        session_id: None,
+        event: "turn_start".into(),
+        label: None,
+    };
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_turn_checkpointer(Arc::new(move |_| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({"outcome": "captured"}))
+        }));
+    }
+    owner.attach_gate(Arc::new(|_, _| Ok(serde_json::json!({"ok": true}))));
+
+    let held: Vec<_> = (0..MAX_CHECKPOINT_HANDLERS)
+        .map(|n| {
+            let socket = socket.clone();
+            let r = req(&format!("c-{n}"));
+            std::thread::spawn(move || {
+                Secondary::connect(&socket)
+                    .ok()
+                    .expect("reach the owner")
+                    .record_turn_checkpoint(&r, Duration::from_secs(30))
+            })
+        })
+        .collect();
+    assert!(
+        crate::test_support::env::wait_until(Duration::from_secs(10), || {
+            entered.load(Ordering::Acquire) >= MAX_CHECKPOINT_HANDLERS
+        }),
+        "checkpoint handlers never filled"
+    );
+
+    // One past the cap is told it is busy, at once, and that matches the
+    // refusal every hook treats as "the owner is alive but occupied".
+    let over = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_turn_checkpoint(&req("c-over"), Duration::from_secs(5))
+        .expect_err("a checkpoint past the cap must be refused as busy");
+    assert_eq!(over, "the turn checkpoint is busy");
+    assert!(is_busy_refusal(&over));
+
+    // A gate-class asked request is still answered while the cap is full.
+    let gate = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-while-held"), Duration::from_secs(5));
+    assert!(gate.is_ok(), "{gate:?}");
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in held {
+        let reply = worker.join().unwrap().expect("checkpoint reply");
+        assert_eq!(reply["outcome"], "captured");
+    }
+    // The slots come back: a request after the burst is served, not refused.
+    let after = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_turn_checkpoint(&req("c-after"), Duration::from_secs(10));
+    assert!(after.is_ok(), "{after:?}");
+}
+
+fn op_request(id: &str) -> Request {
+    Request::RecordGitOp {
+        id: id.into(),
+        cwd: "/".into(),
+        command: "git reset --hard HEAD".into(),
+        session_id: Some("s-1".into()),
+        task_id: None,
+    }
+}
+
+/// The request an installed app has always understood. The enum refuses
+/// unknown fields, so a newer hook that added one would make every git write
+/// of an older app "unsnapshotted"; this is what keeps the wire the same.
+#[test]
+fn the_record_git_op_request_keeps_the_fields_it_has_always_had() {
+    let envelope = Envelope {
+        v: PROTOCOL,
+        request: op_request("op-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(&envelope).unwrap(),
+        serde_json::json!({
+            "v": 1,
+            "request": {
+                "kind": "record_git_op",
+                "id": "op-1",
+                "cwd": "/",
+                "command": "git reset --hard HEAD",
+                "session_id": "s-1",
+            }
+        })
+    );
+    let with_task = Request::RecordGitOp {
+        id: "op-2".into(),
+        cwd: "/".into(),
+        command: "git reset --hard HEAD".into(),
+        session_id: None,
+        task_id: Some("t-1".into()),
+    };
+    let wire = serde_json::to_value(&with_task).unwrap();
+    let mut keys: Vec<&str> = wire
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["command", "cwd", "id", "kind", "task_id"]);
+    assert_eq!(PROTOCOL, 1, "the protocol version is not bumped for this");
+
+    // The reason the shape is frozen: a field this build does not know is refused.
+    let extra = r#"{"kind":"record_git_op","id":"x","cwd":"/","command":"c","deadline_ms":2000}"#;
+    assert!(serde_json::from_str::<Request>(extra).is_err());
+}
+
+#[test]
+fn the_op_budget_is_one_constant_the_hook_and_the_app_both_read() {
+    assert_eq!(OP_RECORD_DEADLINE, Duration::from_secs(2));
+}
+
+#[test]
+fn an_op_record_exchange_says_how_far_it_got() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let connect = || Secondary::connect(&socket).ok().expect("reach the owner");
+    let within = Duration::from_secs(5);
+
+    // Nothing attached: the owner reads the request and refuses it.
+    let sent = AtomicBool::new(false);
+    let refused = connect()
+        .record_git_op(&op_request("op-a"), within, &sent)
+        .expect_err("refused");
+    assert_eq!(refused.reached, Reached::Refused, "{refused:?}");
+    assert!(sent.load(Ordering::Acquire), "a refusal is after the send");
+
+    // A request that is not an op record never leaves.
+    let sent = AtomicBool::new(false);
+    let never = connect()
+        .record_git_op(&gate_request("g-1"), within, &sent)
+        .expect_err("not an op request");
+    assert_eq!(never.reached, Reached::NotSent);
+    assert!(!sent.load(Ordering::Acquire));
+
+    // An invalid request is refused before anything is written.
+    let sent = AtomicBool::new(false);
+    let invalid = connect()
+        .record_git_op(&op_request(""), within, &sent)
+        .expect_err("empty id");
+    assert_eq!(invalid.reached, Reached::NotSent, "{invalid:?}");
+    assert!(!sent.load(Ordering::Acquire));
+
+    // The sink gets the instant the mailbox received the request.
+    let received = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&received);
+    owner.attach_op_recorder(Arc::new(move |_, at| {
+        *seen.lock().unwrap() = Some(at);
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+    let before = Instant::now();
+    let sent = AtomicBool::new(false);
+    let reply = connect()
+        .record_git_op(&op_request("op-b"), within, &sent)
+        .expect("answered");
+    assert_eq!(reply["snapshotted"], true);
+    let at = received
+        .lock()
+        .unwrap()
+        .expect("the sink was handed the receipt");
+    assert!(at >= before && at <= Instant::now());
+    drop(owner);
+}
+
+/// The instant the sink is handed is no later than the asker's send, however
+/// long the asker took between reading the greeting and sending. An instant
+/// taken after the request was read and parsed would fall after the asker's
+/// send, and a budget counted from it could outlast the asker's own wait.
+#[test]
+fn the_op_record_budget_starts_before_the_greeting_not_after_the_request_is_read() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let handed = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&handed);
+    owner.attach_op_recorder(Arc::new(move |_, at| {
+        *seen.lock().unwrap() = Some(at);
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+
+    let asker = Secondary::connect(&socket).ok().expect("reach the owner");
+    let greeting_read = Instant::now();
+    // A long gap between the greeting and the send, made by spinning until it
+    // has really passed, so the order below does not depend on a fast host.
+    // It is a floor the test waits out, not a limit a loaded host could miss.
+    let gap = Duration::from_millis(20);
+    let send_no_earlier_than = greeting_read + gap;
+    while Instant::now() < send_no_earlier_than {
+        std::thread::yield_now();
+    }
+    let sent = AtomicBool::new(false);
+    asker
+        .record_git_op(&op_request("op-gap"), Duration::from_secs(5), &sent)
+        .expect("answered");
+    let send_completed = Instant::now();
+
+    let at = handed
+        .lock()
+        .unwrap()
+        .expect("the sink was handed an instant");
+    assert!(
+        at <= greeting_read,
+        "the budget must start before the asker could have sent, not when the request was parsed"
+    );
+    assert!(
+        send_completed.duration_since(at) >= gap,
+        "the asker's gap is inside the app's budget: the app's deadline is the earlier one"
+    );
+    drop(owner);
+}
+
+#[test]
+fn an_op_record_that_goes_unanswered_after_the_send_is_sent_unanswered() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    // The sink holds the answer until the test lets it go, so the asker's read
+    // deadline is what ends the exchange: no timing decides the outcome.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    owner.attach_op_recorder(Arc::new(move |_, _| {
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(serde_json::json!({"snapshotted": true}))
+    }));
+    let sent = AtomicBool::new(false);
+    let unanswered = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .record_git_op(&op_request("op-c"), Duration::from_millis(1500), &sent)
+        .expect_err("no answer in time");
+    assert_eq!(
+        unanswered.reached,
+        Reached::SentUnanswered,
+        "{unanswered:?}"
+    );
+    assert!(sent.load(Ordering::Acquire));
+    release_tx.send(()).unwrap();
+    drop(owner);
 }

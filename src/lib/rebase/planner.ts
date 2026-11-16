@@ -37,7 +37,7 @@ export function rebasePlanProblem(items: ReadonlyArray<Pick<PlannerItem, "id" | 
     if (item.action === "Pick" || item.action === "Reword") {
       hasKeptCommit = true;
     } else if ((item.action === "Squash" || item.action === "Fixup") && !hasKeptCommit) {
-      return `Cannot ${item.action.toLowerCase()} ${item.id.slice(0, 8)}: no kept commit before it to combine into.`;
+      return `Can't ${item.action.toLowerCase()} ${item.id.slice(0, 8)}: no kept commit before it to combine into.`;
     }
   }
   return null;

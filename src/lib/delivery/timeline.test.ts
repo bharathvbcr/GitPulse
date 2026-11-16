@@ -36,8 +36,8 @@ function makeRow(overrides: Partial<TimelineRow> = {}): TimelineRow {
 }
 
 describe("timeline preview length", () => {
-  it("draws three recent rows so a twenty-run sample cannot bury the rail", () => {
-    expect(TIMELINE_PREVIEW_COUNT).toBe(3);
+  it("draws five recent rows so a twenty-run sample cannot bury the rail", () => {
+    expect(TIMELINE_PREVIEW_COUNT).toBe(5);
   });
 });
 

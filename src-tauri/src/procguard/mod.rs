@@ -44,7 +44,7 @@
 //! A process group of its own is a *background* group with respect to the
 //! controlling terminal: a child in one that reads the tty gets SIGTTIN and
 //! stops. Every child spawned through this module is given piped or null stdio
-//! by its caller (`engine::git_cli::run_bounded_capped`,
+//! by its caller (`engine::process::run_bounded_capped`,
 //! `harness::sidecar::spawn`), so none of them has a tty to touch. A future
 //! caller that wants `Stdio::inherit()` on a terminal must not use [`spawn`].
 //!
@@ -318,10 +318,40 @@ impl Registration {
     /// on Windows the tree kill is all there is.
     pub fn kill_tree(&self, child: &mut Child) {
         let pid = lock(&self.slot.pid);
-        if let Some(pid) = *pid {
-            let _ = sys::force_kill(pid, &self.slot.label);
+        match *pid {
+            Some(pid) => {
+                match sys::force_kill(pid, &self.slot.label) {
+                    Ok(signalled) => {
+                        // If the group had no living members remaining (Ok(false)),
+                        // backstop with direct child kill only if child still belongs to us.
+                        if !signalled {
+                            let _ = child.kill();
+                        }
+                    }
+                    Err(error) => {
+                        if is_refusal(&error) {
+                            log::error!(
+                                target: "procguard",
+                                "kill_tree for {} (pid {pid}) REFUSED by signal guard: {error}; suppressing direct child.kill() backstop",
+                                self.slot.label
+                            );
+                        } else {
+                            // System call failed unexpectedly; attempt direct kill as emergency fallback
+                            let _ = child.kill();
+                        }
+                    }
+                }
+            }
+            None => {
+                // Pid already cleared/reaped! Absolutely DO NOT call child.kill(),
+                // as the kernel may have recycled the PID.
+                log::debug!(
+                    target: "procguard",
+                    "kill_tree skipped for {}: pid already reaped",
+                    self.slot.label
+                );
+            }
         }
-        let _ = child.kill();
     }
 
     /// Gives a child that has already been asked to stop `grace` to do it on
@@ -393,11 +423,22 @@ impl Registration {
         child: &mut Child,
         wait: &mut dyn FnMut(Duration),
     ) -> io::Result<ExitStatus> {
+        self.ask_then_stop_and_reap_with_grace(child, CHILD_GRACE, wait)
+    }
+
+    /// [`Self::ask_then_stop_and_reap_waiting`] with an explicit soft-stop
+    /// grace period instead of the default [`CHILD_GRACE`].
+    pub fn ask_then_stop_and_reap_with_grace(
+        &self,
+        child: &mut Child,
+        grace: Duration,
+        wait: &mut dyn FnMut(Duration),
+    ) -> io::Result<ExitStatus> {
         let grace = if sys::CAN_ASK_TO_STOP {
             if let Some(pid) = *lock(&self.slot.pid) {
                 let _ = sys::request_stop(pid, &self.slot.label);
             }
-            CHILD_GRACE
+            grace
         } else {
             Duration::ZERO
         };
@@ -672,7 +713,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
 /// scheduling priority, throttled disk I/O, and throttled network I/O for
 /// sockets it opens afterwards. Elsewhere it is [`spawn`].
 ///
-/// The caller decides *whether* — `engine::git_cli` does, from the admission
+/// The caller decides *whether* — `engine::process` does, from the admission
 /// class, which is the single source of truth for "this work may be starved".
 /// This function never looks at who is asking, so a child it is not called for
 /// is never touched.
@@ -797,13 +838,9 @@ thread_local! {
 /// depending on the OS refusing it.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn with_band_hook<T>(hook: BandHook, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<BandHook>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BAND_HOOK_OVERRIDE.set(self.0);
-        }
-    }
-    let _restore = Restore(BAND_HOOK_OVERRIDE.replace(Some(hook)));
+    let _restore = std::mem::DropGuard::new(BAND_HOOK_OVERRIDE.replace(Some(hook)), |prev| {
+        BAND_HOOK_OVERRIDE.set(prev);
+    });
     body()
 }
 
@@ -1381,12 +1418,8 @@ mod sys {
     /// been recycled, and the registry's rule that a reaped pid is forgotten
     /// under the entry lock is what rules that out.
     fn signal_group(pid: u32, signo: libc::c_int, who: &str) -> io::Result<bool> {
-        let pgid = i32::try_from(pid).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pid {pid} does not fit a pid_t"),
-            )
-        })?;
+        let pgid = i32::try_from(pid)
+            .map_err(|_| super::signal::refusal(format!("pid {pid} does not fit a pid_t")))?;
         // The guarded primitive refuses 0, 1, negative ids, our own group and a
         // leader that is no longer one of ours; see `super::signal`.
         super::signal::signal_group(pgid, signo, super::signal::Basis::Spawned, who)
@@ -2439,7 +2472,7 @@ mod tests {
             command.arg("--ignored");
             command.arg("--test-threads=1");
             command.env(CHILD, "1");
-            let run = crate::engine::git_cli::run_bounded_capped(
+            let run = crate::engine::process::run_bounded_capped(
                 command,
                 "descriptor inheritance fixture",
                 Duration::from_secs(20 * 60),
@@ -2737,7 +2770,10 @@ mod tests {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         if std::env::var_os("PROCGUARD_SELF_AIM").is_some() {
             let me = unsafe { libc::getpgrp() } as u32;
-            for target in [me, 0, 1, u32::MAX] {
+            let pid = unsafe { libc::getpid() } as u32;
+            let ppid = unsafe { libc::getppid() } as u32;
+            let sid = unsafe { libc::getsid(0) } as u32;
+            for target in [me, pid, ppid, sid, 0, 1, u32::MAX] {
                 assert!(sys::force_kill(target, "self-aim").is_err(), "{target}");
                 assert!(sys::request_stop(target, "self-aim").is_err(), "{target}");
             }
@@ -2825,7 +2861,8 @@ mod adv_keep_pid_tests {
         );
     }
 
-    /// ATTACK 1b: `kill_tree` ignores the error but must not forget the pid.
+    /// ATTACK 1b: `kill_tree` ignores the error but must not forget the pid, and
+    /// suppresses direct child.kill() backstop when force_kill is refused.
     #[test]
     fn adv_kill_tree_after_a_failed_kill_keeps_the_pid() {
         let b = bystander();
@@ -2839,7 +2876,8 @@ mod adv_keep_pid_tests {
         registration.kill_tree(&mut backstop);
         let pid_after = *lock(&slot.pid);
         let alive = b_alive(&b);
-        let _ = backstop.wait();
+        let backstop_alive = b_alive(&backstop);
+        reap(backstop);
         // Not registered in the global registry: forget the Registration's drop.
         std::mem::forget(registration);
         reap(b);
@@ -2851,6 +2889,30 @@ mod adv_keep_pid_tests {
             alive,
             "kill_tree killed a process outside procguard's groups"
         );
+        assert!(
+            backstop_alive,
+            "kill_tree direct child.kill() backstop must be suppressed when force_kill is refused"
+        );
+    }
+
+    #[test]
+    fn kill_tree_does_not_call_child_kill_when_pid_is_none() {
+        let mut c = bystander();
+        let slot = Arc::new(Entry {
+            label: "test-none".to_string(),
+            pid: Mutex::new(None),
+            kill_failures: AtomicU32::new(0),
+            born: (0, 0),
+        });
+        let registration = Registration {
+            key: next_key(),
+            slot,
+        };
+        registration.kill_tree(&mut c);
+        let alive = b_alive(&c);
+        reap(c);
+        std::mem::forget(registration);
+        assert!(alive, "kill_tree called child.kill() when pid was None");
     }
 
     fn b_alive(c: &Child) -> bool {

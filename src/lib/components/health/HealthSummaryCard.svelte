@@ -101,7 +101,7 @@
   </ul>
 
   {#if summary.caveats.length > 0}
-    <details class="group">
+    <details class="group" data-health-caveats>
       <summary
         class="cursor-pointer text-meta text-warn marker:content-[''] select-none"
       >

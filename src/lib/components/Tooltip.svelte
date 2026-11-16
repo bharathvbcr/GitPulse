@@ -32,6 +32,8 @@
    *
    * Shows after a short delay, follows neither mouse nor scroll (scroll hides),
    * flips above the anchor near the viewport bottom, and clamps horizontally.
+ * Text wraps anywhere, not only at spaces: a file path is one unbroken word
+ * and would otherwise run past the bubble's max width.
    * Canvas targets do not inherit a titled ancestor — the commit graph owns
    * GraphNodeTooltip, and a gutter layout hint must not replace it.
    * The entrance reuses the shared gp-pop keyframe (disabled under
@@ -171,7 +173,7 @@
     role="tooltip"
     class="gp-pop pointer-events-none fixed border border-edgeStrong bg-surface text-meta leading-snug text-textPrimary shadow-pop {guide
       ? 'w-72 overflow-hidden rounded-xl p-0'
-      : 'max-w-xs whitespace-pre-line rounded-lg px-2.5 py-1.5'} {placed
+      : 'max-w-xs whitespace-pre-line [overflow-wrap:anywhere] rounded-lg px-2.5 py-1.5'} {placed
       ? 'opacity-100'
       : 'opacity-0'}"
     style="left: {left}px; top: {top}px; z-index: {LAYERS.TOOLTIP}"

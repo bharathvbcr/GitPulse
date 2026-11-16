@@ -15,6 +15,8 @@
    */
   import { onDestroy, onMount } from "svelte";
   import { keyedList } from "../../ui/eachKeys";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
+  import ListPreviewToggle from "../ListPreviewToggle.svelte";
   import HealthTable from "./HealthTable.svelte";
   import {
     admitAnyway,
@@ -72,6 +74,8 @@
   }
 
   let error = $state<FailureCopy | null>(null);
+  /** Which process tables the reader expanded; each opens on LIST_PREVIEW_ROWS rows. */
+  let expanded = $state({ sessions: false, trees: false, foreign: false, orphans: false });
   let confirming = $state<number | null>(null);
   let terminating = $state(false);
   let outcome = $state("");
@@ -215,7 +219,7 @@
     </div>
 
     {#if host && snap}
-      <dl class="grid grid-cols-2 md:grid-cols-4 gap-2" data-testid="host-load-readings">
+      <dl class="grid grid-cols-2 @2xl:grid-cols-4 gap-2" data-testid="host-load-readings">
         <div><dt class="text-textMuted">Swap used</dt><dd class="text-textPrimary">{describeReading(host.swap_used, bytes)} of {describeReading(host.swap_total, bytes)}</dd></div>
         <div><dt class="text-textMuted">Compressor</dt><dd class="text-textPrimary">{describeReading(host.compressed_bytes, bytes)}{snap.compressor_thrash ? " · thrashing" : ""}</dd></div>
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>
@@ -251,7 +255,7 @@
 
       {#if procs.sessions.length > 0}
         <HealthTable caption="Agent sessions running on this machine" columns={SESSION_COLUMNS}>
-          {#each keyedList(procs.sessions, (s) => `${s.pid}:${s.start_us}`) as { item: session, key } (key)}
+          {#each keyedList(previewSlice(procs.sessions, expanded.sessions, LIST_PREVIEW_ROWS), (s) => `${s.pid}:${s.start_us}`) as { item: session, key } (key)}
             <tr>
               <td class="px-3 py-1.5 text-textPrimary">{session.kind}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted">{session.pid}</td>
@@ -261,6 +265,7 @@
             </tr>
           {/each}
         </HealthTable>
+        <ListPreviewToggle total={procs.sessions.length} noun="sessions" bind:expanded={expanded.sessions} />
         {#if procs.sessions_truncated}
           <p class="text-warn">More sessions are running than one scan describes; the counts above are a floor.</p>
         {/if}
@@ -268,7 +273,7 @@
 
       {#if procs.trees.length > 0}
         <HealthTable caption="Process trees GitPulse started" columns={TREE_COLUMNS}>
-          {#each keyedList(procs.trees, (t) => t.tree) as { item: tree, key } (key)}
+          {#each keyedList(previewSlice(procs.trees, expanded.trees, LIST_PREVIEW_ROWS), (t) => t.tree) as { item: tree, key } (key)}
             <tr>
               <td class="px-3 py-1.5 font-mono text-textPrimary">{tree.run_id ? `task ${tree.run_id}` : (tree.session_id ?? tree.tree)}</td>
               <td class="px-3 py-1.5 text-textMuted">{tree.members}</td>
@@ -277,11 +282,12 @@
             </tr>
           {/each}
         </HealthTable>
+        <ListPreviewToggle total={procs.trees.length} noun="process trees" bind:expanded={expanded.trees} />
       {/if}
 
       {#if procs.foreign_top.length > 0}
         <HealthTable caption="The heaviest processes GitPulse did not start" columns={FOREIGN_COLUMNS}>
-          {#each keyedList(procs.foreign_top, (p) => String(p.pid)) as { item: proc, key } (key)}
+          {#each keyedList(previewSlice(procs.foreign_top, expanded.foreign, LIST_PREVIEW_ROWS), (p) => String(p.pid)) as { item: proc, key } (key)}
             <tr>
               <td class="px-3 py-1.5 text-textPrimary">{proc.name}{proc.session ? ` (${proc.session} session)` : ""}</td>
               <td class="px-3 py-1.5 font-mono text-textMuted">{proc.pid}</td>
@@ -289,6 +295,7 @@
             </tr>
           {/each}
         </HealthTable>
+        <ListPreviewToggle total={procs.foreign_top.length} noun="processes" bind:expanded={expanded.foreign} />
         <p class="text-textMuted">
           Memory a virtual machine or a browser takes shows up in the pressure level about 6 s after it is
           allocated, so a sudden jump can appear here before the level moves. Other users' processes cannot be
@@ -298,7 +305,7 @@
 
       {#if procs.orphans.length > 0}
         <HealthTable caption="Processes that look orphaned" columns={ORPHAN_COLUMNS}>
-          {#each keyedList(procs.orphans, (o) => `${o.pid}:${o.start_us}`) as { item: orphan, key } (key)}
+          {#each keyedList(previewSlice(procs.orphans, expanded.orphans, LIST_PREVIEW_ROWS), (o) => `${o.pid}:${o.start_us}`) as { item: orphan, key } (key)}
             <tr>
               <td class="px-3 py-1.5 text-textPrimary" title={orphan.exec ?? ""}>{orphan.name} <span class="font-mono text-textMuted">{orphan.pid}</span></td>
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{orphan.checkout}</td>
@@ -321,6 +328,7 @@
             </tr>
           {/each}
         </HealthTable>
+        <ListPreviewToggle total={procs.orphans.length} noun="processes" bind:expanded={expanded.orphans} />
         <p class="text-textMuted">
           Each has no parent left, works in a git worktree, belongs to no agent session or GitPulse run, and has
           kept a CPU busy for most of its life. GitPulse only lists them; Terminate asks you to confirm in a system

@@ -9,6 +9,7 @@
 //! pins a hole.
 
 use super::*;
+use crate::procguard::LockedSpawn;
 use crate::test_support::git_in;
 use std::path::Path;
 
@@ -388,4 +389,142 @@ fn w6_contended_cost_on_an_eighteen_worktree_farm() {
         asks(&output)
     );
     assert!(asks(&output), "{}", say(&output));
+}
+
+/// S3-08 / path-scoped status: when a sibling holds an untracked directory
+/// `fresh/inner.txt` and this worktree edits a file named `fresh`, or a
+/// sibling holds an untracked file/symlink `fresh` and this worktree edits
+/// `fresh/inner.txt`, git pathspec-limited status emits the sibling's actual
+/// path rather than the queried spelling. Both directions must never be silent.
+#[cfg(unix)]
+#[test]
+fn w6_untracked_file_vs_directory_in_both_directions_is_never_silent() {
+    // Direction 1: sibling has untracked `fresh/inner.txt`; editor targets `fresh`.
+    {
+        let farm = farm_bound(false, false, 1);
+        let dir = farm.sibling_dirs[0].join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inner.txt"), "theirs\n").unwrap();
+
+        let output = guard_here(&target(&farm, "fresh"));
+        assert!(asks(&output), "dir-vs-file should ask: {}", say(&output));
+        assert!(
+            reason_of(&output).contains("sibling-0"),
+            "missing holder name: {}",
+            reason_of(&output)
+        );
+    }
+
+    // Direction 2: sibling has untracked file `fresh`; editor targets `fresh/inner.txt`.
+    {
+        let farm = farm_bound(false, false, 1);
+        std::fs::write(farm.sibling_dirs[0].join("fresh"), "theirs\n").unwrap();
+
+        let output = guard_here(&target(&farm, "fresh/inner.txt"));
+        assert!(asks(&output), "file-vs-dir should ask: {}", say(&output));
+        assert!(
+            reason_of(&output).contains("sibling-0"),
+            "missing holder name: {}",
+            reason_of(&output)
+        );
+    }
+}
+
+/// App-served `CollisionMemo::assemble` reads whole-worktree cached paths and
+/// must agree with `changed_paths_only` on case-variant filenames,
+/// file-vs-directory collisions in both directions, and dirty submodules.
+#[cfg(target_os = "macos")]
+#[test]
+fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
+    // 1. Case variant on APFS: sibling dirties `fresh.txt`, editor asks for `Fresh.txt`.
+    {
+        let farm = farm_bound(false, false, 1);
+        let _app = app_for(&farm.repo, true);
+        std::fs::write(farm.sibling_dirs[0].join("fresh.txt"), "theirs\n").unwrap();
+        let output = guard_here(&target(&farm, "Fresh.txt"));
+        assert!(
+            asks(&output),
+            "case variant via app should ask: {}",
+            say(&output)
+        );
+    }
+
+    // 2. Untracked directory vs file: sibling dirties `fresh/inner.txt`, editor asks for `fresh`.
+    {
+        let farm = farm_bound(false, false, 1);
+        let _app = app_for(&farm.repo, true);
+        let dir = farm.sibling_dirs[0].join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inner.txt"), "theirs\n").unwrap();
+        let output = guard_here(&target(&farm, "fresh"));
+        assert!(
+            asks(&output),
+            "dir-vs-file via app should ask: {}",
+            say(&output)
+        );
+    }
+
+    // 3. Untracked file vs directory: sibling dirties `blocker`, editor asks for `blocker/inner.txt`.
+    {
+        let farm = farm_bound(false, false, 1);
+        let _app = app_for(&farm.repo, true);
+        std::fs::write(farm.sibling_dirs[0].join("blocker"), "theirs\n").unwrap();
+        let output = guard_here(&target(&farm, "blocker/inner.txt"));
+        assert!(
+            asks(&output),
+            "file-vs-dir via app should ask: {}",
+            say(&output)
+        );
+    }
+
+    // 4. Dirty submodule: sibling has a tracked submodule `libsub` with dirty `s.txt`.
+    {
+        let farm = farm_bound(false, false, 1);
+        let _app = app_for(&farm.repo, true);
+        let sub_src = farm.sibling_dirs[0].parent().unwrap().join("sub_src");
+        std::fs::create_dir_all(&sub_src).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output_locked()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} in {:?} failed: {}",
+                args,
+                cwd,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&sub_src, &["init", "-q"]);
+        run(&sub_src, &["config", "user.email", "test@example.com"]);
+        run(&sub_src, &["config", "user.name", "Test"]);
+        std::fs::write(sub_src.join("s.txt"), "clean\n").unwrap();
+        run(&sub_src, &["add", "s.txt"]);
+        run(&sub_src, &["commit", "-q", "-m", "sub init"]);
+
+        let sib = &farm.sibling_dirs[0];
+        let sub_dst = sib.join("libsub");
+        run(
+            sib,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "-q",
+                sub_src.to_str().unwrap(),
+                sub_dst.to_str().unwrap(),
+            ],
+        );
+        run(sib, &["add", "libsub"]);
+        std::fs::write(sub_dst.join("s.txt"), "dirty\n").unwrap();
+
+        let output = guard_here(&target(&farm, "libsub/s.txt"));
+        assert!(
+            asks(&output),
+            "submodule via app should ask: {}",
+            say(&output)
+        );
+    }
 }

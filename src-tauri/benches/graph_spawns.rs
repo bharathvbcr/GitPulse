@@ -75,7 +75,7 @@ fn stack_refresh(path: &str) -> (u64, u64) {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("graph_spawns");
     let temp = tempfile::tempdir().expect("temp dir");
     let graph = build_chain(&temp.path().join("graph"), GRAPH_COMMITS, 0);
@@ -125,7 +125,7 @@ fn main() {
     let mut stack_turn = false;
     let cases = vec![
         Case::new("graph default page 5k (S4-04)", || {
-            graph_turn = !graph_turn;
+            graph_turn.toggle();
             touch(&graph, graph_turn);
             let started = std::time::Instant::now();
             let (rows, _) = graph_page(&graph);
@@ -137,7 +137,7 @@ fn main() {
         Case::new(
             "stack refresh 20 branches beyond the window (S4-03)",
             || {
-                stack_turn = !stack_turn;
+                stack_turn.toggle();
                 touch(&stack, stack_turn);
                 let started = std::time::Instant::now();
                 let (nodes, parented) = stack_refresh(&stack);

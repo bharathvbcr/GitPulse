@@ -65,6 +65,7 @@
     Layers,
   } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
+  import PageHeader from "./PageHeader.svelte";
   import Skeleton from "./Skeleton.svelte";
   import RepoPanel from "./RepoPanel.svelte";
   import LazyView from "./LazyView.svelte";
@@ -471,31 +472,29 @@
      cap (it used to centre in max-w-6xl, which on a wide window left a quarter
      of the pane blank on each side), and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
-<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto font-sans text-xs text-textPrimary">
-  <div class="flex items-start justify-between gap-3 mb-3 w-full">
-    <div class="min-w-0">
-      <h2 class="text-lg font-semibold tracking-tight">Overview</h2>
-      <p class="mt-1 text-textMuted text-xs leading-relaxed">
-        {hasTasks
-          ? "Your workspace, from tasks to pull requests."
-          : "Your workspace, from local changes to pull requests."}
-      </p>
-    </div>
-    <div class="flex flex-col items-end gap-1 shrink-0">
+<div class="flex flex-1 min-h-0 min-w-0 flex-col font-sans text-xs text-textPrimary">
+<PageHeader
+  title="Overview"
+  description={hasTasks
+    ? "Your workspace, from tasks to pull requests."
+    : "Your workspace, from local changes to pull requests."}
+>
+  {#snippet actions()}
+    <span class="text-micro text-textMuted" aria-live="polite">
+      {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{/if}
+    </span>
     <button
       type="button"
-      class="gp-btn shrink-0 mt-1"
+      class="gp-btn shrink-0"
       disabled={loading || !$repoStore.currentPath}
       onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath, true)}
     >
       <RefreshCw size={12} class={loading ? "animate-spin" : ""} />
       {loading ? "Refreshing" : "Refresh"}
     </button>
-    <span class="text-micro text-textMuted" aria-live="polite">
-      {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{/if}
-    </span>
-    </div>
-  </div>
+  {/snippet}
+</PageHeader>
+<div class="work-overview gp-page flex flex-col">
   {#if refreshError || navigationError || $repoStore.error}
     <p role="alert" class="mb-3 w-full text-warn">{refreshError || navigationError || $repoStore.error}</p>
   {/if}
@@ -631,7 +630,7 @@
     <!-- Each tile selects the rows it counted. Tiles the projection can only
          ever count as zero would be four doors to an empty room, so a zero
          tile stays readable but is not offered as a filter. -->
-    <div aria-label="Workspace summary filters" class="overview-metrics mb-3 w-full grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div aria-label="Workspace summary filters" class="overview-metrics mb-3 w-full grid grid-cols-2 @2xl:grid-cols-4 gap-3">
       <button
         type="button"
         aria-pressed={facet === "all"}
@@ -1095,7 +1094,7 @@
             </div>
           {/if}
           {#if (row.kind !== "worktree" && row.worktrees.length > 0) || row.pullRequests.length > 0}
-            <div class="mt-3 grid gap-2 md:grid-cols-2">
+            <div class="mt-3 grid gap-2 @2xl:grid-cols-2">
               {#if row.kind !== "worktree" && row.worktrees.length > 0}
                 <ul class="space-y-1">
                   {#each row.worktrees as binding, i (`${binding.worktree.path}#${i}`)}
@@ -1218,14 +1217,17 @@
     {/if}
   {/if}
 </div>
+</div>
 
 <style>
   .work-overview {
     container-type: inline-size;
-    /* Block padding is a band of pane background under the section tabs and
-       again under the last block. Inline padding stays. */
+    /* The header above is told apart from the blocks by one gap step of
+       nothing (design language section 7). The buffer under the last block is
+       gp-page's own, so Overview ends like every other page.
+       Inline padding stays. */
     padding-inline: clamp(16px, 1.6vw, 24px);
-    padding-block: 0;
+    padding-block-start: var(--gp-space-2);
   }
 
   .overview-repository {
@@ -1268,7 +1270,6 @@
   }
 
   @container (max-width: 660px) {
-    .overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .overview-row-heading { flex-wrap: wrap; }
     .overview-branch > :last-child { margin-left: 0; width: 100%; }
   }

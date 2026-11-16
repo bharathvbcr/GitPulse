@@ -3,6 +3,7 @@
  * panel. Kept out of the component so the run-state vocabulary — which must
  * match both gh's statuses and the backend's gating — is unit-testable.
  */
+import { LIST_PREVIEW_ROWS } from "../ui/previewList";
 import type { WorkflowRunInfo } from "./types";
 
 /** A finished run can be re-run (`gh run rerun`). */
@@ -100,17 +101,16 @@ export {
   previewSlice,
 } from "../ui/previewList";
 
-/** Workflow rows rendered before the reader asks for the rest. */
-export const WORKFLOW_PREVIEW_COUNT = 5;
-
 /**
- * Run cards rendered before the reader asks for the rest.
+ * Workflow rows and run cards rendered before the reader asks for the rest.
  *
- * The backend fetches twenty, and the duration timeline above these cards
- * previews the same three. Five used to bury the rest of the rail; three
- * leaves the actions reachable without a second scroll.
+ * Both are the app-wide `LIST_PREVIEW_ROWS`: the rail used to preview three
+ * run cards against five workflows, which read as two different rules. These
+ * names are kept for the call sites that say which list they slice; they are
+ * the one constant, not copies of it.
  */
-export const RUN_PREVIEW_COUNT = 3;
+export const WORKFLOW_PREVIEW_COUNT = LIST_PREVIEW_ROWS;
+export const RUN_PREVIEW_COUNT = LIST_PREVIEW_ROWS;
 
 /**
  * Rendered-row count at which rows tighten.

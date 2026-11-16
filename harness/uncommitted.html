@@ -65,6 +65,12 @@ const fixtures={
  // has no agents fixture, so the read is answered as unavailable on purpose;
  // the bar shows that state and nothing here depends on the snapshot.
  cmd_insights_snapshot:async()=>{throw Error("insights unavailable in this harness");},
+ // The status bar carries the Manvi pill on the repository surface, and the
+ // pill probes Manvi and the local model once at startup. Answered as a build
+ // with neither: the wire shape of `AiStatus` (src/lib/stores/harnessStore.ts)
+ // and no harness binary. Nothing here inspects the pill.
+ cmd_harness_status:()=>null,
+ cmd_ai_status:()=>({harness:{available:false,binary:"",protocol:0,posture:"",ops:[],error:"",error_code:""},endpoints:[],selected:null,model_info:null,model_detail:"",ready:false,detail:"No local model in this fixture."}),
 };
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured preview command: ${cmd}`);},transformCallback:cb=>cb};
 const {mount,unmount,tick}=await import("svelte");

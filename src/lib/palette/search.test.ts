@@ -79,7 +79,7 @@ describe("palette search lifecycle", () => {
     expect(publish.mock.lastCall?.[0].files).toEqual(["README.md"]);
     deps.files.mockRejectedValueOnce(Error("File count limit"));
     scheduleSearch({ ...request, mode: "files" }, publish, deps); await vi.runAllTimersAsync();
-    expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: true, files: [], note: "Search failed: File count limit" });
+    expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: true, files: [], note: "Couldn't search: File count limit" });
   });
   it("retains workspace partial coverage and TF-IDF semantics even with no hits", async () => {
     vi.useFakeTimers(); const deps = dependencies(); const publish = vi.fn();
@@ -116,7 +116,7 @@ describe("palette search lifecycle", () => {
     expect(publish.mock.lastCall?.[0].note).toContain("No registered repositories");
     deps.repos.mockRejectedValueOnce(Error("Registry unreadable"));
     scheduleSearch({ ...request, mode: "workspace" }, publish, deps); await vi.runAllTimersAsync();
-    expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: true, workspace: [], note: "Search failed: Registry unreadable" });
+    expect(publish.mock.lastCall?.[0]).toMatchObject({ failed: true, workspace: [], note: "Couldn't search: Registry unreadable" });
   });
   it("folds a repeated walk_incomplete essay in the symbol note", async () => {
     vi.useFakeTimers();

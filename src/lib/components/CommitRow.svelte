@@ -6,7 +6,7 @@
     timestampTitle,
     type TimestampStyle,
   } from "../ui/timestampStyle";
-  import { authorColor, authorIdentity } from "../authors/authorIdentity";
+  import AuthorAvatar from "../authors/AuthorAvatar.svelte";
   import { isKeyboardFocus } from "../dom/focusVisibility";
   import {
     GitMerge,
@@ -110,7 +110,6 @@
 
   const isCompact = $derived(density === "compact");
   const isAbsoluteTime = $derived(timestampStyle === "absolute");
-  const avatar = $derived(authorIdentity(row.author_name, row.author_email));
 
   type ChipTone = "neutral" | "accent" | "ok" | "warn" | "danger" | "info" | "unknown";
 
@@ -370,13 +369,12 @@
   </span>
 
   <!-- Author Initials Avatar -->
-  <div
+  <AuthorAvatar
+    name={row.author_name}
+    email={row.author_email}
     class="{isCompact ? 'w-4 h-4' : 'w-5 h-5'} text-micro rounded-full flex items-center justify-center text-white font-semibold shrink-0 ring-1 ring-background"
-    style="background-color: {authorColor(avatar.hue)}"
     title="{row.author_name || 'Unknown'}{row.author_email ? ` <${row.author_email}>` : ''}"
-  >
-    {avatar.initials}
-  </div>
+  />
 </div>
 
 <!-- Context Menu -->

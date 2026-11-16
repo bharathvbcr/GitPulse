@@ -26,10 +26,10 @@
 //! * A productive build rests `max(30 s, 2 x its duration)`, capped at 10 min
 //!   ([`rest_after_build`]). It used to *clear* the wait instead, so an agent
 //!   editing continuously kept a build running back to back.
-//! * An `unchanged: true` echo or a failed build waits at least that long, and
-//!   longer on a streak (1 s → 2 s → … capped at 60 s, under the same floor):
-//!   both used to reopen a 1 Hz loop whenever the build wrote under a watched
-//!   path the noise gate missed.
+//! * An `unchanged: true` echo waits for its exponential cooldown (1 s → 2 s →
+//!   4 s → … capped at 60 s) directly without the 30-second productive rest
+//!   floor. A failed build waits at least `rest_after_build(elapsed)` and
+//!   longer on a streak (up to 60 s).
 //! * A build that ran past [`cli::BUILD_DEADLINE`] pauses automatic indexing
 //!   for at least 10 min, doubling on a streak, and the outcome says the index
 //!   is too slow ([`LiveRefreshOutcome::index_too_slow`]).
@@ -67,7 +67,7 @@
 //! of the child.
 
 use super::cli::{self, BuildOutcome, CliStatus};
-use crate::engine::git_cli::is_deferred_under_load;
+use crate::engine::process::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -230,6 +230,19 @@ pub fn clear_live_echo_cooldown(repo_path: &str) {
     forget_probe(repo_path);
 }
 
+/// Query the current consecutive echo/failure streak for a repository.
+pub fn live_echo_streak(repo_path: &str) -> u32 {
+    lock_live_waits().get(repo_path).map_or(0, |w| w.streak)
+}
+
+/// Reset the echo/failure streak to zero for `repo_path` without dropping the active wait.
+pub fn reset_live_echo_streak(repo_path: &str) {
+    let mut map = lock_live_waits();
+    if let Some(entry) = map.get_mut(repo_path) {
+        entry.streak = 0;
+    }
+}
+
 /// Test reset for all three process-wide maps. Not unix-specific (it only
 /// clears in-process state), so the ungated `concurrency_stress_*` test can
 /// use it on Windows too.
@@ -301,7 +314,8 @@ fn raise_live_wait(
     };
     let wait = match kind {
         WaitKind::Rest => rest_after_build(elapsed),
-        WaitKind::Echo | WaitKind::Failure => {
+        WaitKind::Echo => Duration::from_secs(cooldown_secs_for_streak(streak)),
+        WaitKind::Failure => {
             rest_after_build(elapsed).max(Duration::from_secs(cooldown_secs_for_streak(streak)))
         }
         WaitKind::TooSlow => too_slow_rest(too_slow_streak),
@@ -555,7 +569,7 @@ fn probe_status(repo_path: &str, now: Instant) -> ProbeAnswer {
     let repo = repo_path.to_string();
     let started =
         crate::supervisor::spawn_once("devmap-live-status", "devmap-live-status", move || {
-            crate::engine::git_cli::with_background_processes(|| run_probe(&repo, id, &answer));
+            crate::engine::process::with_background_processes(|| run_probe(&repo, id, &answer));
         });
     if let Err(error) = started {
         let mut probes = lock_live_probes();
@@ -1506,7 +1520,7 @@ pub(crate) fn live_refresh(
                 "devmap-live-build",
                 "devmap-live-build",
                 move || {
-                    crate::engine::git_cli::with_background_processes(|| {
+                    crate::engine::process::with_background_processes(|| {
                         run_detached_build(slot, thread_settle, build_clock, |settler| {
                             prepared.run_then(settler)
                         })
@@ -1794,7 +1808,7 @@ mod tests {
     /// messages, so a reworded refusal fails here rather than in the field.
     #[test]
     fn a_build_the_gate_declined_is_deferred_not_failed() {
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         let wanted = LiveRefreshDecision::Refresh;
         for refusal in [
             Refusal::Shed,
@@ -2202,9 +2216,232 @@ mod tests {
         assert_eq!(cooldown_secs_for_streak(0), 1);
         assert_eq!(cooldown_secs_for_streak(1), 2);
         assert_eq!(cooldown_secs_for_streak(2), 4);
+        assert_eq!(cooldown_secs_for_streak(3), 8);
+        assert_eq!(cooldown_secs_for_streak(4), 16);
         assert_eq!(cooldown_secs_for_streak(5), 32);
         assert_eq!(cooldown_secs_for_streak(6), 60);
         assert_eq!(cooldown_secs_for_streak(20), 60);
+        assert_eq!(cooldown_secs_for_streak(100), 60);
+    }
+
+    #[test]
+    fn echo_cooldown_does_not_impose_30s_productive_rest_floor() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let path = "/test/repo/echo_floor";
+        let start = Instant::now();
+        let settle = LiveSettle {
+            repo_path: path.to_string(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: start,
+        };
+        let echo = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": true})),
+        };
+        // Quick echo build of 10 ms: must produce 1s (1000ms), NOT >= 30,000ms.
+        let outcome = settle.record(Ok(echo), Duration::from_millis(10));
+        assert_eq!(
+            outcome.cooldown_remaining_ms,
+            Some(1_000),
+            "10ms echo build must produce 1s cooldown, not the 30s productive rest floor"
+        );
+        assert_eq!(live_echo_streak(path), 0);
+
+        // Contrast with a productive build of 10 ms which MUST impose LIVE_REST_FLOOR (30s)
+        clear_all_live_echo_cooldowns();
+        let productive = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": false})),
+        };
+        let productive_outcome = settle.record(Ok(productive), Duration::from_millis(10));
+        assert_eq!(
+            productive_outcome.cooldown_remaining_ms,
+            Some(30_000),
+            "10ms productive build must impose 30s rest floor"
+        );
+        assert_eq!(live_echo_streak(path), 0);
+    }
+
+    #[test]
+    fn echo_cooldown_streak_increases_and_resets_on_productive_build() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let path = "/test/repo/echo_streaks";
+        let start = Instant::now();
+        let settle = LiveSettle {
+            repo_path: path.to_string(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: start,
+        };
+        let echo = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": true})),
+        };
+        let productive = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": false})),
+        };
+
+        // 1st echo: streak 0 -> wait 1s (1000ms)
+        let o1 = settle.record(Ok(echo.clone()), Duration::from_millis(10));
+        assert_eq!(o1.cooldown_remaining_ms, Some(1_000));
+        assert_eq!(live_echo_streak(path), 0);
+
+        // 2nd echo: streak 1 -> wait 2s (2000ms)
+        let o2 = settle.record(Ok(echo.clone()), Duration::from_millis(10));
+        assert_eq!(o2.cooldown_remaining_ms, Some(2_000));
+        assert_eq!(live_echo_streak(path), 1);
+
+        // 3rd echo: streak 2 -> wait 4s (4000ms)
+        let o3 = settle.record(Ok(echo.clone()), Duration::from_millis(10));
+        assert_eq!(o3.cooldown_remaining_ms, Some(4_000));
+        assert_eq!(live_echo_streak(path), 2);
+
+        // 4th echo: streak 3 -> wait 8s (8000ms)
+        let o4 = settle.record(Ok(echo.clone()), Duration::from_millis(10));
+        assert_eq!(o4.cooldown_remaining_ms, Some(8_000));
+        assert_eq!(live_echo_streak(path), 3);
+
+        // Productive build: streak resets to 0, wait enters WaitKind::Rest (>= 30s)
+        let op = settle.record(Ok(productive), Duration::from_millis(10));
+        assert_eq!(op.cooldown_remaining_ms, Some(30_000));
+        assert_eq!(
+            live_echo_streak(path),
+            0,
+            "productive build resets streak to 0"
+        );
+
+        // Subsequent echo starts at streak 0 again -> wait 1s
+        let o_sub = settle.record(Ok(echo), Duration::from_millis(10));
+        assert_eq!(o_sub.cooldown_remaining_ms, Some(1_000));
+        assert_eq!(live_echo_streak(path), 0);
+    }
+
+    #[test]
+    fn reset_live_echo_streak_clears_streak_count() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let path = "/test/repo/reset_streak";
+        let start = Instant::now();
+        let settle = LiveSettle {
+            repo_path: path.to_string(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: start,
+        };
+        let echo = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": true})),
+        };
+
+        // Run 4 consecutive echoes to accumulate streak = 3 (8s cooldown)
+        for _ in 0..4 {
+            settle.record(Ok(echo.clone()), Duration::from_millis(10));
+        }
+        assert_eq!(live_echo_streak(path), 3);
+
+        // Explicit reset of streak without clearing the active wait:
+        reset_live_echo_streak(path);
+        assert_eq!(live_echo_streak(path), 0, "streak must be reset to 0");
+
+        // Wait is still active:
+        assert!(
+            live_wait(path, Instant::now()).is_some(),
+            "wait itself should remain active"
+        );
+
+        // Next echo sees prev.streak == 0, so next streak is 1 (2s), not 4 (16s)
+        let next_echo = settle.record(Ok(echo), Duration::from_millis(10));
+        assert_eq!(next_echo.cooldown_remaining_ms, Some(2_000));
+        assert_eq!(live_echo_streak(path), 1);
+    }
+
+    #[test]
+    fn genuine_edit_during_echo_cooldown_is_not_starved() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let path = "/test/repo/genuine_edit";
+        let start = Instant::now();
+        let settle = LiveSettle {
+            repo_path: path.to_string(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: start,
+        };
+        let echo = BuildOutcome {
+            ok: true,
+            binary: "/bin/devmap".into(),
+            lookup: cli::DevmapLookup::PathSearch,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            report: Some(json!({"ok": true, "unchanged": true})),
+        };
+
+        // Echo build finishes at `start`, setting a 1s cooldown (until `start + 1s`).
+        let outcome = settle.record(Ok(echo), Duration::from_millis(10));
+        assert_eq!(outcome.cooldown_remaining_ms, Some(1_000));
+
+        // Genuine edit arriving 500ms later (within the 1s cooldown):
+        let during_wait = live_refresh(
+            path,
+            true,
+            start + Duration::from_millis(500),
+            LiveBuildRun::Inline,
+        );
+        assert_eq!(
+            during_wait.decision,
+            LiveRefreshDecision::SkipCooldown,
+            "during 1s cooldown, watcher tick returns SkipCooldown"
+        );
+        assert!(during_wait
+            .cooldown_remaining_ms
+            .is_some_and(|ms| ms > 0 && ms <= 1_000));
+
+        // Genuine edit arriving at 1200ms (after the 1s cooldown has expired):
+        let after_wait = live_wait(path, start + Duration::from_millis(1200));
+        assert!(
+            after_wait.is_none(),
+            "cooldown must expire after 1s, leaving the repository open for the user edit"
+        );
     }
 
     #[test]
@@ -2320,13 +2557,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":true,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
 
         let path = repo.path().to_string_lossy().into_owned();
         let mut builds = 0u32;
@@ -2432,13 +2665,9 @@ exit 2
     fn productive_edit_storm_builds_at_most_once_per_rest_window() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2529,13 +2758,9 @@ exit 2
     fn a_timed_out_build_pauses_automatic_indexing_and_says_the_index_is_too_slow() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2623,13 +2848,9 @@ exit 2
     fn a_build_that_cannot_run_waits_like_a_failed_one() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2662,13 +2883,9 @@ exit 2
     fn start_refresh_answers_before_the_build_and_the_next_ask_collects_it() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2744,13 +2961,9 @@ exit 2
     fn start_refresh_answers_before_a_hung_status_probe_and_collects_it_once() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2833,13 +3046,9 @@ exit 2
     fn adversarial_hung_30s_status_probe_returns_within_grace_and_does_not_block_ipc() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository(
             r#"#!/bin/sh
 if [ "$1" = "build" ]; then
@@ -2904,8 +3113,8 @@ exit 2
         );
 
         // Step 3: Interactive execution is not starved while probe is hung in background
-        let interactive_ran = crate::engine::git_cli::with_admission(
-            crate::engine::git_cli::Admission::Interactive,
+        let interactive_ran = crate::engine::process::with_admission(
+            crate::engine::process::Admission::Interactive,
             || true,
         );
         assert!(interactive_ran);
@@ -2922,13 +3131,9 @@ exit 2
     fn a_probe_answer_is_reused_briefly_unless_it_could_not_run_or_a_build_intervened() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let (repo, bound) = stub_repository("#!/bin/sh\nexit 2\n");
         let path = repo.path().to_string_lossy().into_owned();
 
@@ -2987,13 +3192,9 @@ exit 2
     fn only_a_few_status_probes_run_at_once() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let bound = cli::bind_test_binary("/gitpulse-test/no-such-devmap");
         let release = bound.set_status_delayed(
             cli::available_status(r#"{"is_fresh":true,"schema_outdated":false}"#),
@@ -3020,14 +3221,10 @@ exit 2
     fn a_panicking_detached_build_frees_the_slot_and_records_a_failure() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-                crate::supervisor::note_recovered("devmap-live-build");
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+            crate::supervisor::note_recovered("devmap-live-build");
+        });
         let path = "/gitpulse-test/panicking-detached-build".to_string();
         let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
         assert!(
@@ -3091,13 +3288,9 @@ exit 2
     fn a_settled_detached_build_records_its_outcome_and_frees_the_slot() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = "/gitpulse-test/settled-detached-build".to_string();
         let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
         let settle = LiveSettle {
@@ -3329,13 +3522,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let first = maybe_refresh(&path, true);
         assert_eq!(first.decision, LiveRefreshDecision::Refresh);
@@ -3390,13 +3579,9 @@ exit 2
         bound.set_status(cli::available_status(
             r#"{"is_fresh":false,"schema_outdated":false}"#,
         ));
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let first = maybe_refresh(&path, true);
         assert_eq!(first.decision, LiveRefreshDecision::Refresh);
@@ -3442,13 +3627,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         // The two payloads the stub used to serve from a file it re-read on every
         // spawn. Stated directly, so what changes between the two calls is the
@@ -3545,13 +3726,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
 
         // The store this repository does not have yet. The stub used to derive
@@ -3649,13 +3826,9 @@ exit 2
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         let bound = cli::bind_test_binary(bin.to_string_lossy().into_owned());
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
-        }
-        let _reset = ResetCooldowns;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_all_live_echo_cooldowns();
+        });
         let path = repo.path().to_string_lossy().into_owned();
 
         bound.set_status(cli::available_status(

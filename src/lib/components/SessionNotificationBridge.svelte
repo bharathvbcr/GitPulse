@@ -14,6 +14,7 @@
    */
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { describeError } from "../ui/copy/describeFailure";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
@@ -64,7 +65,7 @@
       (count) => {
         if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the terminal dock.`, 10000);
       },
-      (error: unknown) => say(`Terminal sessions left running before the window reloaded couldn't be listed: ${String(error)}`, 15000),
+      (error: unknown) => say(`Terminal sessions left running before the window reloaded couldn't be listed: ${describeError(error, "session-notifications")}`, 15000),
     );
     const listeners = createListenerTracker();
     void listen<string>("gitpulse-session-notification-open", (event) => void open(event.payload))
@@ -75,9 +76,9 @@
     // What each agent last asked for, for a task's Agents pane — and, once
     // listening, what stood while this page was not (start-up, a reload).
     void bindAttention(listen, sessionActivity, standingAttention, (error: unknown) =>
-      say(`Agents that asked for you before the window loaded cannot be shown: ${String(error)}`, 15000))
+      say(`Agents that asked for you before the window loaded cannot be shown: ${describeError(error, "session-notifications")}`, 15000))
       .then((unlisten) => listeners.track(unlisten))
-      .catch((error: unknown) => say(`Agents asking for you cannot be shown in their task: ${String(error)}`, 15000));
+      .catch((error: unknown) => say(`Agents asking for you cannot be shown in their task: ${describeError(error, "session-notifications")}`, 15000));
     return () => {
       if (timer) clearTimeout(timer);
       listeners.dispose();

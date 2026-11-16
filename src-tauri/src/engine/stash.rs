@@ -154,10 +154,184 @@ fn parse_stash_list(raw: &str) -> StashList {
     StashList { entries, truncated }
 }
 
+/// Recorded reason a `stash::apply_oid_with_gate` call did not leave the target
+/// worktree with the applied changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StashApplyError {
+    /// Applying the stash commit conflicted (or failed), and the target
+    /// worktree was reset and cleaned back to an empty porcelain status.
+    Conflict(String),
+    /// Applying the stash commit failed AND resetting/cleaning the target
+    /// worktree failed or left non-empty porcelain status.
+    RollbackFailed(String),
+    /// Validation, parked-repo refusal, or gate refusal before applying.
+    Git(CommandError),
+}
+
+impl std::fmt::Display for StashApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(msg) | Self::RollbackFailed(msg) => f.write_str(msg),
+            Self::Git(err) => f.write_str(err.message()),
+        }
+    }
+}
+
+impl std::error::Error for StashApplyError {}
+
+impl From<CommandError> for StashApplyError {
+    fn from(err: CommandError) -> Self {
+        Self::Git(err)
+    }
+}
+
+impl From<StashApplyError> for CommandError {
+    fn from(err: StashApplyError) -> Self {
+        match err {
+            StashApplyError::Git(e) => e,
+            other => CommandError::from(other.to_string()),
+        }
+    }
+}
+
 /// Lists the stash stack, newest first.
 pub fn list(repo_path: &str) -> Result<StashList, CommandError> {
     let repo = validate_repo(repo_path)?;
     list_in(&repo)
+}
+
+/// Records an anonymous `git stash create` commit capturing tracked working-tree
+/// and index modifications without touching the working tree, the index, or
+/// `refs/stash` (`git stash list` stays unchanged). Returns `Ok(None)` when
+/// there are no tracked modifications (or on an unborn branch with no `HEAD`).
+pub fn stash_create(repo_path: &str) -> Result<Option<String>, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    stash_create_in(&repo)
+}
+
+/// Gated [`stash_create`] that also refuses when the repository is parked
+/// mid-operation (merge, rebase, cherry-pick) so unmerged index state never
+/// turns into a confusing snapshot error.
+pub(crate) fn stash_create_with_gate(
+    repo_path: &str,
+    gate: crate::engine::worktree::GitWriteGate<'_>,
+) -> Result<Option<String>, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    if let Some(parked) = crate::engine::repo_op::detect(&repo)? {
+        return Err(format!(
+            "Cannot snapshot uncommitted changes while a {} is in progress. Finish or abort it first.",
+            parked.kind.label()
+        )
+        .into());
+    }
+    let lock = repo_mutation_lock(&repo);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gate(&["stash", "create"])?;
+    stash_create_in(&repo)
+}
+
+/// Applies an anonymous or stack stash commit `oid` into `worktree_path` with
+/// `--index` preserved; on conflict, resets and cleans `worktree_path` back to
+/// an empty porcelain status before returning an error.
+pub fn apply_oid(worktree_path: &str, oid: &str) -> Result<(), CommandError> {
+    apply_oid_with_gate(worktree_path, oid, &mut |_| Ok(())).map_err(Into::into)
+}
+
+/// Gated variant of [`apply_oid`]. Every git write (`stash apply`, and any
+/// conflict rollback `reset --hard HEAD` + `clean -fd`) passes through `gate`.
+pub(crate) fn apply_oid_with_gate(
+    worktree_path: &str,
+    oid: &str,
+    mut gate: crate::engine::worktree::GitWriteGate<'_>,
+) -> Result<(), StashApplyError> {
+    let worktree = validate_repo(worktree_path)?;
+    validate_oid(oid)?;
+    if let Some(parked) = crate::engine::repo_op::detect(&worktree)? {
+        return Err(StashApplyError::Git(
+            format!(
+                "Cannot apply stash changes while a {} is in progress. Finish or abort it first.",
+                parked.kind.label()
+            )
+            .into(),
+        ));
+    }
+    let lock = repo_mutation_lock(&worktree);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    gate(&["stash", "apply", "--index", oid])?;
+    match git_text(&worktree, &["stash", "apply", "--index", oid]) {
+        Ok(_) => Ok(()),
+        Err(apply_err) => {
+            let rollback_err = rollback_clean_worktree(&worktree, &mut gate);
+            if let Err(rb) = rollback_err {
+                return Err(StashApplyError::RollbackFailed(format!(
+                    "Applying stash {oid} failed ({}); resetting the target worktree also failed ({}).",
+                    apply_err.message(),
+                    rb.message()
+                )));
+            }
+            Err(StashApplyError::Conflict(format!(
+                "Applying uncommitted changes from {oid} conflicted: {}. Target worktree was reset cleanly.",
+                apply_err.message()
+            )))
+        }
+    }
+}
+
+fn rollback_clean_worktree(
+    worktree: &Path,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    gate(&["reset", "--hard", "HEAD"])?;
+    git_text(worktree, &["reset", "--hard", "HEAD"])?;
+    gate(&["clean", "-fd"])?;
+    git_text(worktree, &["clean", "-fd"])?;
+    let residual = git_text(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+    if !residual.trim().is_empty() {
+        return Err(format!(
+            "target worktree still has residual changes after rollback: {}",
+            residual.trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn stash_create_in(repo: &Path) -> Result<Option<String>, CommandError> {
+    let head_check =
+        crate::engine::git_cli::git_captured(repo, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    if !head_check.success {
+        return Ok(None);
+    }
+    let out = git_text(
+        repo,
+        &[
+            "-c",
+            "user.name=GitPulse",
+            "-c",
+            "user.email=gitpulse@local",
+            "-c",
+            "commit.gpgsign=false",
+            "stash",
+            "create",
+            "gitpulse-op-snapshot",
+        ],
+    )?;
+    let oid = out.trim();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    validate_oid(oid)?;
+    Ok(Some(oid.to_string()))
 }
 
 fn list_in(repo: &Path) -> Result<StashList, CommandError> {
@@ -835,6 +1009,183 @@ mod tests {
             .expect("drop");
             assert!(output.contains(&oid), "{output}");
             assert!(list(path.to_str().unwrap()).unwrap().entries.is_empty());
+        }
+
+        #[test]
+        fn op_log_stash_create_returns_none_when_clean_and_commit_without_touching_worktree_or_stash_list(
+        ) {
+            let dir = repo_with_base();
+            let path = dir.path();
+            let repo_str = path.to_str().unwrap();
+            let cfg_before = std::fs::read(path.join(".git/config")).unwrap();
+
+            assert_eq!(stash_create(repo_str).unwrap(), None);
+            assert!(list(repo_str).unwrap().entries.is_empty());
+
+            std::fs::write(path.join("a.txt"), "dirty tracked edit\n").unwrap();
+            let oid = stash_create(repo_str)
+                .unwrap()
+                .expect("dirty working tree yields a stash-create commit");
+            validate_oid(&oid).unwrap();
+            assert_eq!(git(path, &["cat-file", "-t", &oid]), "commit");
+            assert_eq!(
+                std::fs::read_to_string(path.join("a.txt")).unwrap(),
+                "dirty tracked edit\n",
+                "working tree must remain untouched"
+            );
+            assert_eq!(git(path, &["status", "--porcelain"]), "M a.txt");
+            assert!(
+                list(repo_str).unwrap().entries.is_empty(),
+                "git stash list must remain empty"
+            );
+            assert_eq!(
+                std::fs::read(path.join(".git/config")).unwrap(),
+                cfg_before,
+                "stash_create must write no git config"
+            );
+        }
+
+        #[test]
+        fn fork_stash_create_and_apply_oid_preserves_staged_and_unstaged_without_touching_stash_stack(
+        ) {
+            let dir = repo_with_base();
+            let path = dir.path();
+            let repo_str = path.to_str().unwrap();
+
+            // Pre-existing stash on the stack must remain intact and unshifted.
+            stash_of(path, "keep.txt", "existing stash entry\n");
+            let before_stack = oids(path);
+            assert_eq!(before_stack.len(), 1);
+
+            // Track a second file so we can test staged + unstaged edits together.
+            std::fs::write(path.join("b.txt"), "base b\n").unwrap();
+            git(path, &["add", "b.txt"]);
+            git(path, &["commit", "-m", "add b"]);
+            let head_oid = git(path, &["rev-parse", "HEAD"]);
+
+            // Stage a change to `a.txt` and leave an unstaged edit to `b.txt`.
+            std::fs::write(path.join("a.txt"), "staged edit\n").unwrap();
+            git(path, &["add", "a.txt"]);
+            std::fs::write(path.join("b.txt"), "unstaged edit\n").unwrap();
+            let source_porcelain = git(path, &["status", "--porcelain"]);
+
+            let mut gated_create: Vec<Vec<String>> = Vec::new();
+            let oid = stash_create_with_gate(repo_str, &mut |args| {
+                gated_create.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(())
+            })
+            .expect("stash create")
+            .expect("dirty worktree returns stash oid");
+            assert_eq!(gated_create, vec![vec!["stash", "create"]]);
+            assert_eq!(oids(path), before_stack, "refs/stash must remain unchanged");
+            assert_eq!(
+                git(path, &["status", "--porcelain"]),
+                source_porcelain,
+                "source working tree and index must stay untouched"
+            );
+
+            // Provision a linked worktree at the same HEAD and apply the stash oid.
+            let fork_dir = tempfile::tempdir().expect("fork parent");
+            let fork_path = fork_dir.path().join("fork");
+            git(
+                path,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "fork-branch",
+                    fork_path.to_str().unwrap(),
+                    &head_oid,
+                ],
+            );
+            crate::test_support::trust_repo(&fork_path);
+
+            let mut gated_apply: Vec<Vec<String>> = Vec::new();
+            apply_oid_with_gate(fork_path.to_str().unwrap(), &oid, &mut |args| {
+                gated_apply.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(())
+            })
+            .expect("clean apply into fork");
+            assert_eq!(gated_apply, vec![vec!["stash", "apply", "--index", &oid]]);
+            assert_eq!(
+                git(&fork_path, &["status", "--porcelain"]),
+                source_porcelain,
+                "fork must carry identical staged and unstaged porcelain"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fork_path.join("a.txt")).unwrap(),
+                "staged edit\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fork_path.join("b.txt")).unwrap(),
+                "unstaged edit\n"
+            );
+            assert_eq!(
+                oids(path),
+                before_stack,
+                "source stash stack stays untouched"
+            );
+        }
+
+        #[test]
+        fn fork_stash_apply_oid_conflict_rolls_back_target_cleanly() {
+            let dir = repo_with_base();
+            let path = dir.path();
+            let repo_str = path.to_str().unwrap();
+            let base_oid = git(path, &["rev-parse", "HEAD"]);
+
+            // Snapshot an edit to `a.txt` from base.
+            std::fs::write(path.join("a.txt"), "fork edit on a\n").unwrap();
+            let oid = stash_create(repo_str)
+                .expect("stash create")
+                .expect("stash oid");
+            git(path, &["checkout", "--", "a.txt"]);
+
+            // Fork worktree advances `a.txt` differently so applying `oid` conflicts.
+            let fork_dir = tempfile::tempdir().expect("fork parent");
+            let fork_path = fork_dir.path().join("fork-conflict");
+            git(
+                path,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "conflict-branch",
+                    fork_path.to_str().unwrap(),
+                    &base_oid,
+                ],
+            );
+            crate::test_support::trust_repo(&fork_path);
+            std::fs::write(fork_path.join("a.txt"), "conflicting commit on a\n").unwrap();
+            git(&fork_path, &["add", "a.txt"]);
+            git(&fork_path, &["commit", "-m", "diverge"]);
+
+            let mut gated: Vec<Vec<String>> = Vec::new();
+            let err = apply_oid_with_gate(fork_path.to_str().unwrap(), &oid, &mut |args| {
+                gated.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(())
+            })
+            .expect_err("conflicting apply must fail closed");
+            assert!(
+                matches!(err, StashApplyError::Conflict(_)),
+                "expected Conflict variant, got {err:?}"
+            );
+            assert_eq!(
+                git(
+                    &fork_path,
+                    &["status", "--porcelain", "--untracked-files=normal"]
+                ),
+                "",
+                "target fork worktree must be left with empty porcelain after conflict"
+            );
+            assert_eq!(
+                gated,
+                vec![
+                    vec!["stash", "apply", "--index", &oid],
+                    vec!["reset", "--hard", "HEAD"],
+                    vec!["clean", "-fd"],
+                ]
+            );
         }
     }
 

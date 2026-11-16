@@ -105,6 +105,7 @@
         cmd_workbench_request: () => JSON.stringify({ ok: true, items: [], total: 0, shown: 0, has_more: false, next_cursor: null }),
         cmd_github_workflows: () => ({ available: false, cli_present: true, workflows: [], truncated: false, error: null }),
         cmd_get_reflog: () => [],
+        cmd_list_op_snapshots: () => ({ entries: [], total: 0, truncated: false }),
         cmd_get_head_id: () => "c".repeat(40),
         cmd_get_file_content: () => "# churn\n",
         cmd_codeintel_cancel: () => null,

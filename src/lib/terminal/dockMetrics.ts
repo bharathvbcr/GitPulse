@@ -3,8 +3,11 @@
  *
  * Kept beside `sidebar/metrics.ts` and shaped the same way: the constants and
  * the clamp have one owner, so the drag handle, the keyboard step and the
- * persisted preference cannot drift apart.
+ * persisted preference cannot drift apart. The arithmetic is `ui/paneHeight`,
+ * shared with the commit details pane; this file supplies the dock's bounds.
  */
+
+import { clampPaneHeight, fitPaneHeight, type PaneBounds } from "../ui/paneHeight";
 
 export const TERMINAL_DOCK_MIN_HEIGHT = 200;
 export const TERMINAL_DOCK_MAX_HEIGHT = 2400;
@@ -12,21 +15,18 @@ export const TERMINAL_DOCK_DEFAULT_HEIGHT = 280;
 /** Keyboard resize step for the dock separator (ArrowUp/ArrowDown). */
 export const TERMINAL_DOCK_RESIZE_STEP = 24;
 
+export const TERMINAL_DOCK_BOUNDS: PaneBounds = {
+  min: TERMINAL_DOCK_MIN_HEIGHT,
+  max: TERMINAL_DOCK_MAX_HEIGHT,
+  fallback: TERMINAL_DOCK_DEFAULT_HEIGHT,
+};
+
 /**
- * Clamp a requested dock height to the supported range.
- *
- * Fail-closed on hostile input: a non-finite value falls back to the default
- * rather than poisoning a persisted preference, which is exactly how a stored
- * `NaN` height would render the dock as a zero-pixel strip the user cannot
- * grab to fix.
+ * Clamp a requested dock height to the supported range. A non-finite value
+ * falls back to the default; the rest is `clampPaneHeight`.
  */
 export function clampTerminalDockHeight(px: number): number {
-  if (!Number.isFinite(px)) return TERMINAL_DOCK_DEFAULT_HEIGHT;
-  if (px < TERMINAL_DOCK_MIN_HEIGHT) return TERMINAL_DOCK_MIN_HEIGHT;
-  if (px > TERMINAL_DOCK_MAX_HEIGHT) return TERMINAL_DOCK_MAX_HEIGHT;
-  // Whole pixels: fractional heights from sub-pixel drag deltas make the
-  // flex layout shimmer between paints, and xterm re-fits on every change.
-  return Math.round(px);
+  return clampPaneHeight(px, TERMINAL_DOCK_BOUNDS);
 }
 
 /**
@@ -41,9 +41,5 @@ export function fitTerminalDockHeight(
   containerHeight: number,
   minViewHeight = 160,
 ): number {
-  const clamped = clampTerminalDockHeight(requested);
-  if (!Number.isFinite(containerHeight) || containerHeight <= 0) return clamped;
-  const ceiling = containerHeight - minViewHeight;
-  if (ceiling < TERMINAL_DOCK_MIN_HEIGHT) return TERMINAL_DOCK_MIN_HEIGHT;
-  return Math.min(clamped, Math.round(ceiling));
+  return fitPaneHeight(requested, containerHeight, minViewHeight, TERMINAL_DOCK_BOUNDS);
 }

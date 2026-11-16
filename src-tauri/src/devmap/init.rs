@@ -23,9 +23,8 @@
 //! for ignoring something in one clone, it is never committed, and it applies
 //! to linked worktrees through the common directory.
 
-use crate::engine::git_cli::{
-    git_captured, is_deferred_under_load, resolve_git_common_dir, validate_repo,
-};
+use crate::engine::git_cli::{git_captured, resolve_git_common_dir, validate_repo};
+use crate::engine::process::is_deferred_under_load;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

@@ -12,7 +12,7 @@
   const hygiene = $derived(computeHygiene(commits));
 </script>
 
-<div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+<div class="grid grid-cols-2 @3xl:grid-cols-5 gap-3">
   <!-- Conventional Commits -->
   <div class="gp-card p-3.5 flex flex-col justify-between">
     <div class="flex items-center justify-between mb-1">
@@ -71,7 +71,7 @@
   </div>
 
   <!-- Co-authored Rate -->
-  <div class="gp-card p-3.5 flex flex-col justify-between col-span-2 sm:col-span-1">
+  <div class="gp-card p-3.5 flex flex-col justify-between col-span-2 @xl:col-span-1">
     <div class="flex items-center justify-between mb-1">
       <span class="gp-label">Co-authored</span>
       <Users size={14} class="text-accent shrink-0" />

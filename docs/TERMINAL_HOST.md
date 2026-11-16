@@ -25,23 +25,27 @@ itself dying. Only moving the masters out of the app can.
                                                                          │ kill/reap, exit receipts
 ```
 
-* **The engine** is the code that exists today: `spawn_session_inner`, the
-  reader loop, `OutputFlow`, `kill_session`, `terminate_pty_child`,
-  `session_context`. It moves *as a unit* into the host process. It no longer
-  takes a Tauri `AppHandle`: everything it used one for (`terminal-loss`,
-  `terminal-exit`, incidents, alert banners) goes through a `SessionEvents`
-  value the caller supplies, so the same engine runs in the app (in-process
-  backend) and in `gitpulse-ptyd` (host backend).
-* **The host** is a new binary, `gitpulse-ptyd` (Rust, `src/bin/gitpulse-ptyd.rs`).
-  It is not a mode of `gitpulsed`: that daemon's contract is that it *does not
-  serve requests* and holds no children past a cycle, and its single-instance
-  lock is per profile, not per protocol. A request server that owns
-  long-lived children is a different process with a different lifecycle.
+* **The engine** (`Engine`, `terminal::engine`) is the core PTY engine:
+  `spawn_session_inner`, the reader loop, `OutputFlow`, `kill_session`,
+  `terminate_pty_child`, `session_context`. It lives inside `gitpulse-ptyd` on
+  Unix and in `TerminalSessions` only on non-Unix (`#[cfg(not(unix))]`, Windows
+  until its ConPTY host ships); the Unix in-process engine path in the app
+  process has been deleted. It no longer takes a Tauri `AppHandle`: everything
+  it used one for (`terminal-loss`, `terminal-exit`, incidents, alert banners)
+  goes through a `SessionEvents` value the caller supplies.
+* **The host** is a binary, `gitpulse-ptyd` (Rust, `src/bin/gitpulse-ptyd.rs`),
+  started unconditionally on Unix. It is not a mode of `gitpulsed`: that
+  daemon's contract is that it *does not serve requests* and holds no children
+  past a cycle, and its single-instance lock is per profile, not per protocol.
+  A request server that owns long-lived children is a different process with a
+  different lifecycle.
 * **The facade** is `TerminalSessions`. Every caller keeps holding it and
-  calling the same `terminal::` functions; inside, it is either the engine
-  (in-process) or a client of the host. `commands/terminals.rs`,
-  `workbench/terminal_run.rs`, `teardown.rs`, `desktop/mod.rs` and the
-  frontend contract are unchanged in shape.
+  calling the same `terminal::` functions; on Unix (`#[cfg(unix)]`), it
+  unconditionally wraps `HostClient` (failing closed via
+  `HostClient::unavailable` if the host directory or binary cannot be used),
+  while `#[cfg(not(unix))]` retains the in-process `Engine`.
+  `commands/terminals.rs`, `workbench/terminal_run.rs`, `teardown.rs`,
+  `desktop/mod.rs` and the frontend contract are unchanged in shape.
 
 ## Protocol
 
@@ -170,7 +174,7 @@ host of another protocol by accident.
 * The app also looks for sockets of *other* protocol versions in the host
   directory and sends each the frozen `hello`. A live host of another protocol
   is reported loudly — logged as a warning, and shown under Settings → Agents →
-  "Keep terminals running when GitPulse quits" (`cmd_terminal_backend`'s
+  "Keep managed agent runs running when GitPulse quits" (`cmd_terminal_backend`'s
   `trouble`) — with its build, pid and session count:
   * with **no sessions**, the app sends it `retire` (also frozen) and it exits;
   * with **sessions**, it is left running, untouched, and the report says how
@@ -233,9 +237,11 @@ in `Ring::push` (`terminal/ring.rs`), the one place that sees all of a session's
 output: a detached session's bytes never reach the output sink, so a tap on the
 sink would miss exactly the output this exists for. The tap is armed before the
 fork (`Taps`, claimed when the session's ring is made), so a program that prints
-and exits at once is recorded from its first byte. Only the host records; the
-in-process backend keeps nothing, and a read says so (`unavailable`), not
-`missing`.
+and exits at once is recorded from its first byte. Only the host records; on
+non-Unix (`#[cfg(not(unix))]`) where terminals still run in-process, nothing is
+recorded and a read says so (`unavailable`), not `missing` (whereas a Unix app
+whose host could not start returns `Err`, failing closed via
+`HostClient::unavailable`).
 
 **The reader never waits on the disk.** `Ring::push` runs with the ring's lock
 held, and that lock is held across the wait for the view's credit, so the tap
@@ -341,7 +347,7 @@ the 512 KiB header bound. The answer (`terminal::TranscriptRead`) is one of:
 | `missing` | no transcript: never recorded, evicted, or aged out |
 | `unreadable` | one exists or should and could not be read; `reason` says why. A transcript that is a symbolic link, is not a regular file, belongs to another user, or could not be recorded (disk full, directory gone) is `unreadable`, as is a host whose transcript store would not open |
 | `reused` | the read named a run and what is saved under the id is not that run's (a later session took the id, or the session had no run); `reason` says which |
-| `unavailable` | the app runs terminals itself (never sent by a host) |
+| `unavailable` | non-Unix in-process apps with no terminal host (never sent by a host) |
 
 The renderer's `readSavedTranscript` adds `failed` (the call failed, timed out,
 or the answer was malformed), which is not `missing`: the output may be there.
@@ -381,15 +387,17 @@ sequence in another), and the file is reachable only by the user who owns it.
   opening line is not is masked up to the closing line. What it cannot see: a
   secret split by the margin's own start, or a key body longer than the margin
   with neither line in view. Redaction is a mask for display, not a guarantee.
-* `keep_terminals_running` stays default-off; a user who never turns it on has
-  no host and no transcripts. The sign-off in the security statement below covers
-  what a transcript at rest widens.
+* On Unix `gitpulse-ptyd` and `0600` `pty-host/transcripts/` are unconditional
+  (covered by the owner security sign-off below). `keep_terminals_running`
+  now defaults on (`unwrap_or(true)`) and governs hosted Manvi for managed
+  agent runs rather than PTY hosting.
 
 ## Quit
 
-With the host backend a quit no longer has to end anything, so it asks:
+On Unix the host backend is unconditional, so quitting no longer ends any
+terminal session on its own:
 
-* **Cmd-Q with live sessions** asks (`quitChoice.ts`): *Quit and Leave
+* **Cmd-Q with live sessions** always asks (`quitChoice.ts`): *Quit and Leave
   Running* (the default button), *Stop Them and Quit*, or *Keep Working*. A
   session list that cannot be read still asks, saying so. The answer reaches
   the backend as `cmd_exit_app`'s `terminals` (`"leave"` or `"stop"`).
@@ -399,28 +407,33 @@ With the host backend a quit no longer has to end anything, so it asks:
 * **SIGTERM / SIGKILL / a crash of the app** leaves sessions running (that is
   the point of the card): the teardown for a signal, like a quit that did not
   choose, disconnects instead of stopping (`teardown::close_terminals`).
-* With the in-process backend nothing changes: quitting stops every session.
+* On non-Unix (`#[cfg(not(unix))]`, Windows), the in-process engine stops every
+  session on quit.
 
 ## Managed runs in a hosted Manvi
 
 Managed Codex and Claude runs are not PTY sessions: Manvi drives them, and they
 live in the memory of the `manvi serve` that GitPulse spawns, so closing that
-child cancels every run. The same setting (`keep_terminals_running`) therefore
-also hosts that child outside the app, in Manvi's socket mode
-(`manvi serve --listen`, `docs/SERVE_HOST_PLANE.md` in Manvi). Code:
-`harness/hosted.rs` (paths, record, capability, the account Settings reads) and
-`harness/sidecar.rs` (the connection, which speaks to the socket exactly as to a
-pipe).
+child cancels every run. The `keep_terminals_running` setting (labeled *"Keep
+managed agent runs running when GitPulse quits"* in Settings → Agents,
+default-on via `unwrap_or(true)`) therefore hosts that child outside the app,
+in Manvi's socket mode (`manvi serve --listen`, `docs/SERVE_HOST_PLANE.md` in
+Manvi). `KeepTerminalsSetting.svelte` toggles `keep_terminals_running` and also
+renders the read-only Unix terminal host (`gitpulse-ptyd`) status and any
+`trouble` message. Code: `harness/hosted.rs` (paths, record, capability, the
+account Settings reads) and `harness/sidecar.rs` (the connection, which speaks
+to the socket exactly as to a pipe).
 
-* **When.** Only for the app's own profile worker, and only with the setting on.
-  With it off, or on an installed Manvi that predates `--listen`, the worker is
-  the stdio child it has always been, and Settings → Agents says why on a line of
-  its own (`cmd_terminal_backend`'s `managed`): *"Managed agent runs end when
-  GitPulse quits: the installed Manvi (…) cannot serve on a socket; update
-  Manvi."* Support is read from `manvi serve --help` naming `--listen` (starting
-  nothing, once per binary file), and checked again from the running server's
-  `hello` (`serve.status` and `serve.stop_all` must be served). The policy and
-  hook sidecars never host runs and are untouched.
+* **When.** Only for the app's own profile worker, and with `keep_terminals_running`
+  on (default). With it explicitly turned off, or on an installed Manvi that
+  predates `--listen`, the worker is the stdio child it has always been, and
+  Settings → Agents says why on a line of its own (`cmd_terminal_backend`'s
+  `managed`): *"Managed agent runs end when GitPulse quits: the installed
+  Manvi (…) cannot serve on a socket; update Manvi."* Support is read from
+  `manvi serve --help` naming `--listen` (starting nothing, once per binary
+  file), and checked again from the running server's `hello` (`serve.status`
+  and `serve.stop_all` must be served). The policy and hook sidecars never
+  host runs and are untouched.
 * **Where.** `<config>/GitPulse/manvi-host/`: the socket (`serve.sock`), the
   server's persistent state directory, `serve.log`, and `host.json`, the record
   GitPulse writes when it starts a server (socket, owner id, pid, the model
@@ -496,7 +509,8 @@ pipe).
   they cannot be controlled from the app until they end, and a quit does not
   dial the server. Settings then describes the stdio child's behaviour (runs end
   with the app), which is not true of runs that server already holds; turn the
-  setting back on to adopt them.
+  setting back on to adopt them. Interactive PTY terminal sessions stay in
+  `gitpulse-ptyd` on Unix regardless of this toggle.
 * **Socket path.** The path must fit both the system's limit and Manvi's own
   (100 bytes); a longer one is refused before anything is started, with the
   reason.
@@ -540,9 +554,9 @@ into the rows they belong to (2, 3 and 4).
 | # | Coupling point | Moves to host | Stays in app | Deleted |
 |---|---|---|---|---|
 | 1 | Workbench: `terminal_run.rs:73` `spawn(&TerminalSessions)`, `:159` `start(&TerminalSessions)`, `:270` `impl SessionObserver for RunObserver` | — | **Stays.** Both functions keep their `&TerminalSessions` parameter (the facade). `RunObserver` stays in the app: it writes to the workbench store, which the host never opens. Its `before_spawn` runs before the spawn request (the app now picks the session id), `started` when the reply names the pid, `finished` when the `exit` event or a receipt arrives. A run whose observer died with an earlier app gets an *adopted* observer that rebuilds `receipts::Observed` from the stored run. | — |
-| 2 | `TerminalSessions` `Arc<Mutex<HashMap>>` cloned into teardown (`lib.rs:177-178`, `:625`); `teardown.rs:46` | The session map itself (masters, children, readers) | The facade's clone into teardown and `procguard::set_shutdown_hook`. `teardown.rs:46` (`stop_terminals`) becomes *stop* or *disconnect* by the quit choice; a signal exit disconnects. | — |
+| 2 | `TerminalSessions` `Arc<Mutex<HashMap>>` cloned into teardown (`lib.rs:177-178`, `:625`); `teardown.rs:46` | The `Engine` session map itself (masters, children, readers) inside `gitpulse-ptyd` | On `#[cfg(unix)]`, `TerminalSessions` holds only `host: HostClient` (cloned into teardown and `procguard::set_shutdown_hook`). `teardown.rs:46` (`stop_terminals`) becomes *stop* or *disconnect* by the quit choice; a signal exit disconnects. Non-Unix (`#[cfg(not(unix))]`) keeps `Engine` in-process. | **Unix in-process engine path & `Option<HostClient>` deleted** (Migration Step 3): `TerminalSessions::engine` on Unix and all Unix fallback branches in `terminal/mod.rs`, `terminal/ipc.rs`, and `terminal/orchestrate.rs`. |
 | 3 | Page-load detach (`desktop/mod.rs:255-256`) | `detach_all` runs in the host | The call site stays and sends `detach_all`; it is a disconnect of views, never a stop. | — |
-| 4 | `cmd_terminal_*` (`commands/terminals.rs`), and `quitRisks` | — | **Stays**, unchanged in signature. Each command calls the same `terminal::` function, which the facade routes. `cmd_terminal_sessions` returns the host's list, so `quitRisks` (`quitGuard.ts`) already treats the host list as authoritative and needs no change. | — |
+| 4 | `cmd_terminal_*` (`commands/terminals.rs`), and `quitRisks` | — | **Stays**, unchanged in signature. Each command calls the same `terminal::` function, which routes unconditionally to `state.host` on Unix (`cmd_terminal_ack` unconditionally runs on the async control pool). `cmd_terminal_sessions` returns the host's list, so `quitRisks` (`quitGuard.ts`) already treats the host list as authoritative and needs no change. | **Unix in-process branch deleted** in `commands/terminals.rs` (`cmd_terminal_ack` and helpers no longer check an `is_host` opt-in). |
 | 5 | Per-session `Channel` + `OutputFlow` credit, `Route::Hold` dropping bytes (mod.rs:1783-1785), no ring | `OutputFlow` (the window) and the new ring | The `Channel` (a webview object) and the relay that forwards `output`/`end` frames to it and `ack`s back | Dropping detached bytes: replaced by the ring. |
 | 6 | `terminal-loss` / `terminal-exit` / incident emits | The decision to emit (reader, finalize) | The emits themselves and the incident `Recorder`, fed by `loss` and `exit` events through `SessionEvents` | The `AppHandle` parameter of the engine |
 | 7 | `SessionWatcher::observe` on raw bytes in the reader (mod.rs:759-825, `:1872`) | **Runs in the host's reader**, on every byte as now, so a detached session's bell is still seen while an app is connected | `alerts::offer` runs in the app, fed by `notice` events | — |
@@ -584,7 +598,7 @@ directory could be swapped between check and fork. The app's own checks stay
 in front of the request (permission-mode refusals, the launch-flag table, the
 load governor), so a request that reaches the host has passed both.
 
-**Bounds.** Header frames ≤ 64 KiB, payloads ≤ 64 KiB, argv/env bounds as
+**Bounds.** Header frames ≤ 512 KiB, payloads ≤ 64 KiB, argv/env bounds as
 today (`validate_pty_options`), the session cap as today. A peer that sends a
 malformed or oversized frame is disconnected.
 
@@ -593,24 +607,26 @@ read a session's output only by attaching to it, while it lived. Now it can read
 the last 8 MiB per session of finished ones from the socket (`transcript`) or
 from the files, for up to 14 days or until the 256 MiB directory bound evicts
 them. The same-user reasoning above holds (the files are `0600` in a `0700`
-directory), but a transcript outlives the session, and that is new at rest; it
-is on disk only when the host is, which is opt-in. See [Saved
-transcripts](#saved-transcripts).
+symlink-refused directory, opened `O_NOFOLLOW`), and on Unix `gitpulse-ptyd`
+writes `pty-host/transcripts/` unconditionally under the owner sign-off below.
+See [Saved transcripts](#saved-transcripts).
 
 **Signals.** The host signals only through `procguard::signal` and only
 processes in sessions it created; the app never signals the host.
 
-**Hosted managed runs (Manvi).** With the same opt-in, a `manvi serve --listen`
-process outlives the app, holding managed Codex and Claude runs.
+**Hosted managed runs (Manvi).** With `keep_terminals_running` enabled (default
+on via `unwrap_or(true)`), a `manvi serve --listen` process outlives the app,
+holding managed Codex and Claude runs.
 
 * *What it widens.* Agents keep running, with the repository's trust and the
   user's permissions, after the window is closed, and there is a second socket
   that can drive them: `manvi-host/serve.sock` accepts any process of the same
   user that can prepare, activate, stop and read managed runs for the profile.
-  Quitting no longer ends an agent the person has forgotten about; it ends only
-  when it finishes, is stopped, or the machine restarts. This is the posture the
-  setting already has for terminals, and the default stays off for the same
-  reason (the sign-off below).
+  Quitting no longer ends an agent the person has forgotten about unless they
+  choose *Stop Them and Quit* (or disable `"Keep managed agent runs running when GitPulse quits"`
+  so runs revert to the stdio child); otherwise a left-running agent ends when
+  it finishes, is stopped, or the machine restarts. This shares the same-user
+  threat model above, now default-on under the owner sign-off below.
 * *What a same-user peer can do with the socket.* Everything the app can: start
   and stop managed runs on the profile's repositories, read what they printed
   (checkpointed in the run record). Nothing it could not do by editing the
@@ -638,19 +654,33 @@ process outlives the app, holding managed Codex and Claude runs.
   the recorded owner and profile, never started, never taken over. It widens
   nothing a same-user process could not already do.
 
-**Sign-off.** This statement needs the owner's review before the host
-becomes the default (migration step 3). Until then the host is opt-in.
+**Sign-off.** Owner security sign-off granted **2026-11-14** approving:
+1. Making `gitpulse-ptyd` unconditional on Unix (`#[cfg(unix)]`), deleting the
+   Unix in-process PTY fallback, and failing closed (`HostClient::unavailable`)
+   when the host cannot start (`0700` symlink-refused host dir, `0600`
+   `ptyd-v<N>.sock` via `local_socket::bind_private`, mandatory `peer_uid` check,
+   host-side `validate_repo` + saved repository trust +
+   `require_unsubstitutable_dir`, `procguard::signal` routing, and
+   `signal_guard` protection).
+2. Unconditional `0600` `pty-host/transcripts/` at rest on Unix inside the
+   `0700` symlink-refused host directory (`O_NOFOLLOW`, owner check).
+3. Flipping `keep_terminals_running` default to on (`unwrap_or(true)`) for
+   hosted Manvi managed runs under the same-user posture above.
 
 ## Migration
 
-1. **Done in this change:** the engine is decoupled from Tauri; the host binary,
-   the protocol, the client and the facade exist; the ring exists in the engine
-   for both backends, and exit receipts in the host.
-2. **Done in this change:** Settings → Agents, "Keep terminals running when
-   GitPulse quits", selects the host for the next launch (default off). The
-   integration suites run against the host when
-   `GITPULSE_TEST_TERMINAL_BACKEND=host` (`bun run test:terminal-host`); CI runs
-   them both ways on its macOS and Linux legs, and `ci:local` does too.
-3. **Not in this change:** make the host the default and delete the in-process
-   backend (the app constructing the engine itself) in the same commit. Blocked
-   on the security sign-off above.
+1. **Done (prior change):** the engine is decoupled from Tauri; the host
+   binary, the protocol, the client and the facade exist; the ring exists in
+   the engine for both backends, and exit receipts in the host.
+2. **Done (prior change):** Settings → Agents selected the host as an opt-in
+   (`default off`) while both backends ran under `GITPULSE_TEST_TERMINAL_BACKEND=host`
+   (a `test:terminal-host` runner, removed once step 3 made every suite use the
+   host, which left it re-running the same seven suites).
+3. **Done (2026-11-14):** `gitpulse-ptyd` is the unconditional Unix default
+   and the Unix in-process app PTY path (`TerminalSessions` owning `Engine` on
+   Unix and Unix fallback branches) has been deleted in the same change. Unix
+   apps fail closed via `HostClient::unavailable` if the host cannot start,
+   all Unix integration suites run directly against `gitpulse-ptyd`,
+   `keep_terminals_running` defaults on (`unwrap_or(true)`) for hosted Manvi,
+   and Windows keeps the in-process `Engine` under `#[cfg(not(unix))]` until
+   its ConPTY host card.

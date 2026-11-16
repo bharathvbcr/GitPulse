@@ -8,7 +8,7 @@
    * stored proposal) at the proposal and task revisions that were reviewed: if
    * the task moved since, the write is refused, the task is re-read, and the
    * proposal is dropped for a new one; it is never merged into a task that
-   * changed. Accepted splits become new inbox tasks parented to this one, with
+   * changed. Accepted splits become new backlog tasks parented to this one, with
    * ids the host makes.
    */
   import { untrack } from "svelte";
@@ -103,7 +103,7 @@
       if (receipt.outcome === "related_tasks_exist") { held = receipt; reviewed = sent; return; }
       held = null; reviewed = [];
       // Applied, whatever follows: the write is done and a retry would be refused as a reused request.
-      message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in the inbox.`;
+      message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in Backlog.`;
       result = null;
       try { onApplied(await getTask(reviewedProposal.task_id)); }
       catch (reread) { message += ` ${failure("re-read", "the task", reread, "Refresh it to see the result.")}`; }
@@ -182,7 +182,7 @@
 
       {#if diff.splits.length > 0}
         <h4 class="gp-label">Split into</h4>
-        <Checkbox testId={partTestId("split_into")} label="Create these as new inbox tasks" description={locked.includes("split_into") ? "Locked on this task." : ""} checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} />
+        <Checkbox testId={partTestId("split_into")} label="Create these as new backlog tasks" description={locked.includes("split_into") ? "Locked on this task." : ""} checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} />
         <ul class="rows">
           {#each diff.splits as part, index}
             <li data-testid="task-refine-split-{index}">

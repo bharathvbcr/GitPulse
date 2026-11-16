@@ -41,8 +41,25 @@ pub async fn cmd_add_worktree(
     zero_copy_devmap: Option<bool>,
     seed_devmap: Option<bool>,
     sparse_paths: Option<Vec<String>>,
+    fork_from: Option<String>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, IpcError> {
     off_thread(move || {
+        if let Some(source_wt) = fork_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return fork_worktree_guarded(
+                &repo_path,
+                source_wt,
+                target_path.trim(),
+                new_branch.as_deref(),
+                cow_caches.unwrap_or(false),
+                run_hooks.unwrap_or(false),
+                devmap_mode(zero_copy_devmap, seed_devmap),
+                &|repo, argv| guard(repo, argv),
+            );
+        }
         add_worktree_guarded(
             &repo_path,
             &target_path,
@@ -146,6 +163,83 @@ pub(crate) fn add_worktree_guarded(
     Ok(Guarded {
         policy: policy.ok_or_else(|| {
             CommandError::plain("The worktree was created without being judged by the policy gate.")
+        })?,
+        output: created,
+    })
+}
+
+/// Forks `source_worktree_path` at its `HEAD`, carrying uncommitted changes via
+/// `stash create` + `stash apply --index` and recording its verified source
+/// Claude session id (when present) for CARD 33's `--fork-session` launch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fork_worktree_guarded(
+    repo_path: &str,
+    source_worktree_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    cow_caches: bool,
+    run_hooks: bool,
+    devmap: crate::engine::worktree::DevmapMode,
+    gate: WorktreeGate<'_>,
+) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, CommandError> {
+    let explicit_target = target_path.trim();
+    let (resolved_target, resolved_branch) = if explicit_target.is_empty() {
+        let (planned_path, planned_branch) = crate::workbench::agent_worktree::plan_fork_target(
+            repo_path,
+            source_worktree_path,
+            new_branch,
+        )?;
+        (planned_path, Some(planned_branch))
+    } else {
+        // Explicit callers cannot target the `.gitpulse/worktrees` lane container directly.
+        crate::engine::worktree::refuse_gitpulse_lane_target(explicit_target)?;
+        (
+            explicit_target.to_string(),
+            new_branch
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        )
+    };
+
+    let mut policy = None;
+    let mut judge = |args: &[&str]| -> Result<(), CommandError> {
+        let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+        let verdict = gate(repo_path, &argv)?;
+        policy.get_or_insert(verdict);
+        Ok(())
+    };
+
+    let mut created = crate::engine::worktree::fork_worktree_extended(
+        repo_path,
+        source_worktree_path,
+        &resolved_target,
+        resolved_branch.as_deref(),
+        cow_caches,
+        run_hooks,
+        devmap,
+        &mut judge,
+    )?;
+
+    created.source_session_id = crate::workbench::conversation::latest_claude_session_for_checkout(
+        std::path::Path::new(source_worktree_path),
+    );
+
+    if matches!(
+        created.devmap,
+        crate::engine::worktree::DevmapOutcome::Provisioned { zero_copy: false }
+    ) {
+        crate::devmap::live::refresh_seeded_worktree(
+            &created.path,
+            crate::devmap::live::SeededRefresh::Background,
+        );
+    }
+
+    Ok(Guarded {
+        policy: policy.ok_or_else(|| {
+            CommandError::plain(
+                "The forked worktree was created without being judged by the policy gate.",
+            )
         })?,
         output: created,
     })
@@ -442,15 +536,15 @@ pub(super) fn worktree_ai_summary(
     // three absent the summary used to say "Worktree clean". A read that
     // produced no answer fails the summary instead, with its own cause —
     // a deferral keeps its marker, so the call is asked again later.
-    let failures = crate::engine::git_cli::process_failures();
+    let failures = crate::engine::process::process_failures();
     let diff_stat = crate::engine::worktree::measure_diff_stat(wt);
     let repo = crate::engine::validate_repo(repo_path).ok();
     let divergence = repo
         .as_ref()
         .and_then(|r| crate::engine::worktree::measure_main_divergence(r, branch));
     let log_out = git_text(wt, &["log", "-1", "--pretty=%s"]).unwrap_or_default();
-    if crate::engine::git_cli::process_failures() != failures {
-        return Err(crate::engine::git_cli::last_process_failure()
+    if crate::engine::process::process_failures() != failures {
+        return Err(crate::engine::process::last_process_failure()
             .unwrap_or_else(|| "a git read for the worktree summary produced no answer".into()));
     }
     let last_msg = log_out.trim();
@@ -554,7 +648,7 @@ pub async fn cmd_inbox_post(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let effective_kind = kind.as_deref().unwrap_or("ask");
         let effective_body =
             if let Some(title_str) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -611,7 +705,7 @@ pub async fn cmd_worktree_send_message(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let effective_kind = kind.as_deref().unwrap_or("note");
         let message = crate::engine::agent_bus::post_thread_message(
             &repo_path,
@@ -641,7 +735,7 @@ pub async fn cmd_inbox_withdraw(
 ) -> Result<InboxMessageReceipt, IpcError> {
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let message =
             crate::engine::agent_bus::withdraw_ask(&repo_path, &from_agent, &thread_key, &reason)?;
         Ok(InboxMessageReceipt {
@@ -957,5 +1051,95 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn fork_worktree_guarded_plans_gitpulse_lane_and_refuses_direct_lane_target_on_add() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main", "."]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Tester"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "file.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "init"]);
+        crate::test_support::trust_repo(repo);
+
+        // Plain add_worktree_guarded still refuses direct targets inside `.gitpulse/worktrees/`.
+        let direct_lane = repo.join(".gitpulse/worktrees/manual");
+        let refused = add_worktree_guarded(
+            repo.to_str().unwrap(),
+            direct_lane.to_str().unwrap(),
+            Some("feat/manual"),
+            None,
+            false,
+            false,
+            false,
+            devmap_mode(None, None),
+            None,
+            &|r, argv| crate::harness::guard_command(r, argv),
+        );
+        assert!(
+            refused.is_err(),
+            "manual add into .gitpulse/worktrees must stay refused"
+        );
+
+        // Forking into an empty target plans inside `.gitpulse/worktrees/`, carries dirty
+        // tracked edits and user config, and skips unignored machine state (`.devmap/`,
+        // `.devcouncil/ledger.sqlite*`).
+        std::fs::write(repo.join("file.txt"), "forked dirty\n").unwrap();
+        std::fs::create_dir_all(repo.join(".devcouncil")).unwrap();
+        std::fs::write(repo.join(".devcouncil/config.yaml"), "version: 1\n").unwrap();
+        std::fs::create_dir_all(repo.join(".devmap/codeintel")).unwrap();
+        std::fs::write(repo.join(".devmap/codeintel/devmap.sqlite"), "stub-index").unwrap();
+        let forked = fork_worktree_guarded(
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            "",
+            None,
+            false,
+            false,
+            devmap_mode(None, None),
+            &|r, argv| crate::harness::guard_command(r, argv),
+        )
+        .expect("fork_worktree_guarded");
+        let fork_wt = std::path::Path::new(&forked.output.path);
+        let layout = crate::engine::worktree::agent_layout(&forked.output.path)
+            .expect("fork target is an agent layout");
+        assert!(crate::engine::worktree::is_gitpulse_lane(&layout.kind));
+        assert!(forked.output.carried_uncommitted);
+        assert_eq!(
+            std::fs::read_to_string(fork_wt.join("file.txt")).unwrap(),
+            "forked dirty\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_wt.join(".devcouncil/config.yaml")).unwrap(),
+            "version: 1\n"
+        );
+        assert!(!fork_wt.join(".devcouncil/ledger.sqlite").exists());
+        assert!(!fork_wt.join(".devmap").exists());
+        let fork_status = crate::engine::git_cli::git_text(
+            fork_wt,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+        let mut fork_entries: Vec<&str> = fork_status.lines().map(str::trim).collect();
+        fork_entries.sort_unstable();
+        assert_eq!(
+            fork_entries,
+            vec!["?? .devcouncil/config.yaml", "M file.txt"]
+        );
+        // Guard ledger writes into `<repo>/.devcouncil/`, while excluded `.gitpulse/worktrees/`
+        // keeps main checkout's `git status` clean of the container.
+        let status = crate::engine::git_cli::git_text(
+            repo,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert!(status.lines().any(|line| line.trim() == "M file.txt"));
+        assert!(
+            !status.contains(".gitpulse"),
+            "fork worktree container leaked into main checkout status:\n{status}"
+        );
     }
 }

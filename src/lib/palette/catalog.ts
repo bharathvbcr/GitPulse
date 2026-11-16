@@ -160,7 +160,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
   // doors. They keep the ids and labels they had, so a remembered command
   // still finds them, and each lands on Explorer already showing its toggle.
   const explorerToggles: PaletteItem[] = [
-    { id: "code:search", label: "Open Search — find text across the repository", description: "Code → Explorer → Search · Search file contents across the working tree or a revision, beside the editor. A capped, cut or cancelled result says it is partial.", keywords: "Code Explorer Search find grep text contents", category: "Views", icon: icons.code, disabledReason: unavailable, action: () => {
+    { id: "code:search", label: "Open Search — find text across the repository", description: "Code → Explorer → Search · Search file contents across the working tree or a revision, beside the editor. A capped, cut or canceled result says it is partial.", keywords: "Code Explorer Search find grep text contents", category: "Views", icon: icons.code, disabledReason: unavailable, action: () => {
       interfaceStore.setGlobalSurface("repository");
       repoStore.setActiveTab("code", "explorer");
       showExplorerRail("search");
@@ -262,7 +262,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "diagnostics", label: "Open diagnostics", category: "Help", icon: Bug, closeBefore: true, action: () => dispatch("gitpulse:diagnostics") },
     { id: "settings", label: "Open Settings", category: "Settings", icon: Settings, shortcut: "⌘,", closeBefore: true, action: () => dispatch("gitpulse:settings") },
     { id: "mcp_setup", label: "Connect an agent (MCP 2.0 / Agent Plugins)", category: "Settings", icon: Plug, closeBefore: true, action: () => dispatch("gitpulse:settings") },
-    { id: "optional_tools_setup", label: "Set up optional tools (DevMap and Manvi)", category: "Settings", icon: Wrench, closeBefore: true, action: () => openSetupWizard("devmap", "explain") },
+    { id: "optional_tools_setup", label: "Set up optional tools (code map and Manvi)", category: "Settings", icon: Wrench, closeBefore: true, action: () => openSetupWizard("devmap", "explain") },
   ];
 }
 

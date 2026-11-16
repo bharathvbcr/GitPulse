@@ -37,20 +37,20 @@ const launch = (sessionId: string, provider: AgentProvider = "claude", startedAt
 });
 
 describe("hostedAgent session flag detection and argument generation", () => {
-  it("gives a fresh Claude launch --session-id in front of its arguments by default", () => {
+  it("assigns a fresh Claude sessionId without injecting --session-id into args", () => {
     const { args, sessionId } = withSessionId(["--", "fix it"], () => ID.toUpperCase());
     expect(sessionId).toBe(ID);
-    expect(args).toEqual(["--session-id", ID, "--", "fix it"]);
+    expect(args).toEqual(["--", "fix it"]);
   });
 
-  it("does not inject resume-only --conversation on a fresh Antigravity launch", () => {
+  it("does not assign a sessionId or alter args on a fresh Antigravity launch", () => {
     const { args, sessionId } = withSessionId(["--prompt-interactive", "fix bug"], () => ID.toUpperCase(), "agy");
     expect(sessionId).toBeNull();
     expect(args).toEqual(["--prompt-interactive", "fix bug"]);
   });
 
-  it("gives a Claude launch with no arguments a generated session id, while fresh Antigravity stays clean", () => {
-    expect(withSessionId(undefined, () => ID, "claude")).toEqual({ args: ["--session-id", ID], sessionId: ID });
+  it("gives a Claude launch with no arguments a generated sessionId while keeping args empty, while fresh Antigravity stays clean", () => {
+    expect(withSessionId(undefined, () => ID, "claude")).toEqual({ args: [], sessionId: ID });
     expect(withSessionId(undefined, () => ID, "agy")).toEqual({ args: [], sessionId: null });
   });
 
@@ -81,7 +81,7 @@ describe("hostedAgent session flag detection and argument generation", () => {
     expect(carriesSession(["--", "--conversation", OTHER])).toBe(false);
     expect(carriesSession(["--", "--resume", OTHER])).toBe(false);
     const outClaude = withSessionId(["--", "--resume", OTHER], () => ID, "claude");
-    expect(outClaude.args).toEqual(["--session-id", ID, "--", "--resume", OTHER]);
+    expect(outClaude.args).toEqual(["--", "--resume", OTHER]);
     expect(outClaude.sessionId).toBe(ID);
 
     const outAgy = withSessionId(["--", "--conversation", OTHER], () => ID, "agy");
@@ -110,7 +110,7 @@ describe("conversationForStart provider routing", () => {
       newId: () => ID,
       provider: "agy",
     });
-    expect(freshAgy).toEqual({ args: ["--mode", "default"], sessionId: null });
+    expect(freshAgy).toEqual({ args: ["--mode", "default"], sessionId: null, resume: null });
     expect(store.get(ID)).toBeUndefined();
 
     const freshClaude = conversationForStart(store, {
@@ -121,11 +121,11 @@ describe("conversationForStart provider routing", () => {
       newId: () => OTHER,
       provider: "claude",
     });
-    expect(freshClaude).toEqual({ args: ["--session-id", OTHER, "--mode", "code"], sessionId: OTHER });
+    expect(freshClaude).toEqual({ args: ["--mode", "code"], sessionId: OTHER, resume: null });
     expect(store.get(OTHER)?.provider).toBe("claude");
   });
 
-  it("handles conversationForStart for resumed Antigravity and Claude sessions", () => {
+  it("handles conversationForStart for resumed Antigravity and Claude sessions with typed resume payload", () => {
     const store = createHostedAgentStore(null);
 
     const resumedAgy = conversationForStart(store, {
@@ -136,7 +136,7 @@ describe("conversationForStart provider routing", () => {
       newId: () => OTHER,
       provider: "agy",
     });
-    expect(resumedAgy).toEqual({ args: ["--conversation", ID], sessionId: ID });
+    expect(resumedAgy).toEqual({ args: undefined, sessionId: ID, resume: { session_id: ID, fork: false } });
     expect(store.get(ID)?.provider).toBe("agy");
 
     const resumedClaude = conversationForStart(store, {
@@ -147,7 +147,7 @@ describe("conversationForStart provider routing", () => {
       newId: () => ID,
       provider: "claude",
     });
-    expect(resumedClaude).toEqual({ args: ["--resume", OTHER], sessionId: OTHER });
+    expect(resumedClaude).toEqual({ args: undefined, sessionId: OTHER, resume: { session_id: OTHER, fork: false } });
     expect(store.get(OTHER)?.provider).toBe("claude");
   });
 
@@ -163,7 +163,7 @@ describe("conversationForStart provider routing", () => {
       record,
       provider: "agy",
     });
-    expect(attached).toEqual({ args: ["--mode", "code"], sessionId: ID });
+    expect(attached).toEqual({ args: ["--mode", "code"], sessionId: ID, resume: null });
   });
 });
 
@@ -366,7 +366,7 @@ describe("resolveTranscriptAnswer and fresh Antigravity signal-exit recovery", (
     expect(unindexedExitOffer("agy", ID, exit({ signal: "Terminated: 15" }))).toBeNull();
     expect(unindexedExitOffer("claude", null, exit({ signal: "Terminated: 15" }))).toBeNull();
 
-    // conversationForStart expands sentinel into agy --continue --add-dir <dir> with sessionId: null
+    // conversationForStart passes typed resume sentinel without constructing --continue / --add-dir in TS
     const store = createHostedAgentStore(null);
     const continued = conversationForStart(store, {
       attach: null,
@@ -376,12 +376,13 @@ describe("resolveTranscriptAnswer and fresh Antigravity signal-exit recovery", (
       provider: "agy",
     });
     expect(continued).toEqual({
-      args: ["--continue", "--add-dir", "/work/repo/packages/web"],
+      args: ["--prompt-interactive", "initial prompt should not repeat"],
       sessionId: null,
+      resume: { session_id: sentinel, fork: false },
     });
     expect(store.list()).toEqual([]);
 
-    // UUID-bound agy resume continues to use --conversation <uuid>
+    // UUID-bound agy resume returns typed resume payload without constructing --conversation in TS
     const explicit = conversationForStart(store, {
       attach: null,
       resumeId: ID,
@@ -390,8 +391,9 @@ describe("resolveTranscriptAnswer and fresh Antigravity signal-exit recovery", (
       provider: "agy",
     });
     expect(explicit).toEqual({
-      args: ["--conversation", ID],
+      args: [],
       sessionId: ID,
+      resume: { session_id: ID, fork: false },
     });
   });
 
@@ -488,5 +490,75 @@ describe("resolveTranscriptAnswer and fresh Antigravity signal-exit recovery", (
     stopMeta();
     stopPanel();
     expect(listeners.size).toBe(0);
+  });
+
+  it("mints a distinct forked hosted record with forkedFrom and fail-closed validation when fork is true", () => {
+    const record = { repoPath: "/work/repo", startDir: null, mode: null, startedAt: 10 };
+    const storage = memory();
+    const store = createHostedAgentStore(storage);
+    store.begin({ ...record, provider: "claude", sessionId: ID, mode: "edit" });
+
+    const forked = conversationForStart(store, {
+      attach: null,
+      resumeId: ID.toUpperCase(),
+      fork: true,
+      args: ["--", "try another angle"],
+      record: { ...record, mode: "edit" },
+      newId: () => OTHER,
+      provider: "claude",
+    });
+
+    expect(forked).toEqual({
+      args: ["--", "try another angle"],
+      sessionId: OTHER,
+      resume: { session_id: ID, fork: true },
+    });
+    expect(store.get(ID)?.forkedFrom).toBeNull();
+    expect(store.get(OTHER)?.forkedFrom).toBe(ID);
+    expect(store.get(OTHER)?.provider).toBe("claude");
+
+    const reloaded = createHostedAgentStore(storage);
+    expect(reloaded.get(OTHER)?.forkedFrom).toBe(ID);
+    reloaded.bindAgentMeta({
+      terminalId: "term-fork",
+      sessionId: OTHER,
+      provider: "claude",
+      repoPath: "/work/repo",
+      startDir: null,
+      mode: "edit",
+    });
+    expect(reloaded.get(OTHER)?.forkedFrom).toBe(ID);
+
+    expect(() =>
+      conversationForStart(store, {
+        attach: null,
+        resumeId: ID,
+        fork: true,
+        args: [],
+        record,
+        provider: "agy",
+      }),
+    ).toThrow("Claude Code");
+    expect(() =>
+      conversationForStart(store, {
+        attach: null,
+        resumeId: "not-a-uuid",
+        fork: true,
+        args: [],
+        record,
+        provider: "claude",
+      }),
+    ).toThrow("UUID");
+    expect(() =>
+      conversationForStart(store, {
+        attach: null,
+        resumeId: ID,
+        fork: true,
+        args: [],
+        record,
+        newId: () => ID,
+        provider: "claude",
+      }),
+    ).toThrow("distinct");
   });
 });

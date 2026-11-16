@@ -44,7 +44,7 @@ pub(super) fn skeleton_symbol_tokens(item: &SkeletonSymbol) -> u32 {
 /// relative key.
 pub(super) fn resolve_skeleton_path(repo_root: Option<&str>, path: &str) -> String {
     let unified = path.trim().replace('\\', "/");
-    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
+    let stripped = unified.trim_prefix("./");
     let raw = Path::new(stripped);
     if raw.is_absolute() {
         if let Some(root) = repo_root {

@@ -690,7 +690,7 @@ mod tests {
             );
             let task = host.request("items.get", r#"{"id":"task"}"#).unwrap();
             assert_eq!(task["item"]["revision"], 1);
-            assert_eq!(task["item"]["status"], "inbox");
+            assert_eq!(task["item"]["status"], "backlog");
             assert_eq!(
                 std::fs::read_dir(root).unwrap().count(),
                 1,
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(result, replay);
         assert_eq!(
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["status"],
-            "inbox"
+            "backlog"
         );
     }
 

@@ -29,8 +29,8 @@
 
 use crate::engine::git_cli::{
     git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
-    BoundedRun, MAX_OUTPUT_BYTES,
 };
+use crate::engine::process::{BoundedRun, MAX_OUTPUT_BYTES};
 use crate::ipc_error::CommandError;
 // The one partial-clone probe lives with the quarantine; `git_writer` reaches it here.
 pub(crate) use crate::engine::object_quarantine::is_partial_clone;
@@ -2595,7 +2595,7 @@ impl NoteSource {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
-    use crate::engine::git_cli::Incomplete;
+    use crate::engine::process::Incomplete;
     use crate::procguard::LockedSpawn;
     use std::process::Command;
 
@@ -3342,7 +3342,7 @@ mod batch_tests {
     fn a_single_commit_spends_a_process_only_on_what_it_reads() {
         let repo = Repo::new(3);
         let root = repo.path().canonicalize().unwrap();
-        let spawned = || crate::engine::git_cli::spawn_log::spawns_in(&root);
+        let spawned = || crate::engine::process::spawn_log::spawns_in(&root);
 
         let unnoted = repo.rev("HEAD~1");
         let before = spawned().len();
@@ -3493,9 +3493,9 @@ mod batch_tests {
         }
         let revs: Vec<String> = (0..6).map(|n| repo.rev(&format!("HEAD~{n}"))).collect();
         let root = repo.path().canonicalize().unwrap();
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let before = crate::engine::process::spawn_log::spawns_in(&root).len();
         let rows = freshness_batch(repo.as_str(), &revs, Some("main"));
-        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let used = crate::engine::process::spawn_log::spawns_in(&root)[before..].to_vec();
         let count = |needle: &str| {
             used.iter()
                 .filter(|argv| argv.iter().any(|a| a == needle))
@@ -3562,18 +3562,18 @@ mod batch_tests {
         let revs: Vec<String> = (0..3).map(|n| repo.rev(&format!("HEAD~{n}"))).collect();
         let root = repo.path().canonicalize().unwrap();
         let listings = |from: usize| {
-            crate::engine::git_cli::spawn_log::spawns_in(&root)[from..]
+            crate::engine::process::spawn_log::spawns_in(&root)[from..]
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "notes"))
                 .count()
         };
 
         crate::engine::ref_cache::eager(|| {
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&root).len();
             let first = freshness_batch(repo.as_str(), &revs, Some("main"));
             assert_eq!(listings(before), 2, "both refs are listed the first time");
 
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&root).len();
             let again = freshness_batch(repo.as_str(), &revs, Some("main"));
             assert_eq!(
                 listings(before),
@@ -3585,7 +3585,7 @@ mod batch_tests {
             // A new note moves the verification ref: that listing is asked
             // for again and the new note is seen; the sessions ref is not.
             repo.verify("HEAD", "failed");
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&root).len();
             let moved = freshness_batch(repo.as_str(), &revs, Some("main"));
             assert_eq!(listings(before), 1, "only the ref that moved is listed");
             assert_eq!(
@@ -3609,9 +3609,9 @@ mod batch_tests {
         }
         let tips: Vec<String> = (1..5).map(|n| repo.rev(&format!("b{n}"))).collect();
         let root = repo.path().canonicalize().unwrap();
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let before = crate::engine::process::spawn_log::spawns_in(&root).len();
         let rows = freshness_batch(repo.as_str(), &tips, Some("main"));
-        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let used = crate::engine::process::spawn_log::spawns_in(&root)[before..].to_vec();
         let count = |needle: &str| {
             used.iter()
                 .filter(|argv| argv.iter().any(|a| a == needle))
@@ -3646,9 +3646,9 @@ mod batch_tests {
             .map(|spec| repo.rev(spec))
             .collect();
         let root = repo.path().canonicalize().unwrap();
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+        let before = crate::engine::process::spawn_log::spawns_in(&root).len();
         let rows = freshness_batch(repo.as_str(), &revs, Some("main"));
-        let used = crate::engine::git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let used = crate::engine::process::spawn_log::spawns_in(&root)[before..].to_vec();
         let distances: Vec<Option<u32>> = rows.iter().map(|row| row.distance).collect();
         assert_eq!(distances, vec![Some(1), Some(2), Some(3)], "{rows:?}");
         let walks = used
@@ -3664,6 +3664,7 @@ mod batch_tests {
             stderr: stderr.as_bytes().to_vec(),
             success,
             status_code: if success { 0 } else { 1 },
+            signal: None,
             incomplete,
             stderr_incomplete: None,
             cancelled: false,

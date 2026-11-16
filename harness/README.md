@@ -159,7 +159,7 @@ Check global/workspace/repository counts, create a task with multiple repository
 links, edit its title and status, change group membership, reload, and verify the
 saved description, acceptance criteria and revisions. Use the visible runtime
 error count as part of the result. Current interaction evidence is recorded in
-[the implementation plan](../docs/AGENTIC_WORKSPACES_PLAN.md).
+[the implementation plan](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md).
 
 For brief checks, first enable **Capture copies in fixture**. Then open a task and
 use **Copy saved brief**. The harness captures the text in its visible output
@@ -351,7 +351,7 @@ The September 2026 redesign was initially checked with MarkDev's 288 files,
 now supplies 5,094 relationships from that source graph, including calls,
 references, and inheritance. All 226 Swift files have displayed connections.
 The preview explicitly reports 13 unresolvable graph records.
-See [docs/QUALIFICATION.md](../docs/QUALIFICATION.md) for open gates and [the archived DevMap audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md) for the dated verification ledger.
+See [docs/QUALIFICATION.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md) for open gates and [the archived DevMap audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md) for the dated verification ledger.
 Browser callback verification does
 not verify opening a file inside the installed Tauri application.
 

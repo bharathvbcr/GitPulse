@@ -272,3 +272,30 @@ pub async fn cmd_publish_release(
     })
     .await
 }
+
+#[tauri::command(async)]
+pub async fn cmd_list_op_snapshots(
+    repo_path: String,
+    limit: Option<usize>,
+) -> Result<crate::engine::OpSnapshotList, IpcError> {
+    off_thread(move || GitWriter::list_op_snapshots(&repo_path, limit.unwrap_or(50))).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_undo_op_snapshot(
+    repo_path: String,
+    plan: crate::engine::OpUndoPlan,
+) -> Result<Guarded<crate::engine::OpUndoOutcome>, IpcError> {
+    off_thread(move || {
+        let fold = VerdictFold::default();
+        let outcome = GitWriter::undo_op_snapshot_with_gate(&repo_path, &plan, &mut |argv| {
+            fold.record(guard(&repo_path, argv)?);
+            Ok(())
+        })?;
+        Ok(Guarded {
+            policy: fold.finish().unwrap_or_else(no_git_verdict),
+            output: outcome,
+        })
+    })
+    .await
+}

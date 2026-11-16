@@ -113,6 +113,7 @@ describe("release version gate", () => {
       "src-tauri/tauri.conf.json",
       "src-tauri/Cargo.toml",
       `src-tauri/Cargo.lock (${CRATE_NAME})`,
+      `crates/gitpulse-worktree/Cargo.lock (${CRATE_NAME})`,
       "plugins/gitpulse/plugin.json",
       "plugins/gitpulse/.claude-plugin/plugin.json",
       "plugins/gitpulse/.codex-plugin/plugin.json",
@@ -144,6 +145,33 @@ describe("release version gate", () => {
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
     expect(stdout).toMatch(new RegExp(`src-tauri/Cargo\\.lock \\(${CRATE_NAME}\\) = "0\\.4\\.1"`));
+  });
+
+  it("fails when a crates/<name>/Cargo.lock that records the app crate lags", async () => {
+    // crates/gitpulse-worktree depends on the app crate by path, so its own
+    // lock records the app version too. Bumping only src-tauri left it at the
+    // old version and every `--locked` build of that crate refused to start.
+    const dir = await scratchTree("crate-lock-lag");
+    await mkdir(path.join(dir, "crates", "gitpulse-worktree"), { recursive: true });
+    await writeFile(
+      path.join(dir, "crates", "gitpulse-worktree", "Cargo.lock"),
+      `version = 4\n\n[[package]]\nname = "${CRATE_NAME}"\nversion = "0.4.1"\n\n[[package]]\nname = "gitpulse-worktree"\nversion = "9.9.9"\n`,
+    );
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(new RegExp(`crates/gitpulse-worktree/Cargo\\.lock \\(${CRATE_NAME}\\) = "0\\.4\\.1"`));
+  });
+
+  it("ignores a crate's Cargo.lock that does not record the app crate", async () => {
+    const dir = await scratchTree("crate-lock-unrelated");
+    await mkdir(path.join(dir, "crates", "standalone"), { recursive: true });
+    await writeFile(
+      path.join(dir, "crates", "standalone", "Cargo.lock"),
+      `version = 4\n\n[[package]]\nname = "standalone"\nversion = "3.0.0"\n`,
+    );
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(0);
+    expect(stdout).not.toContain("crates/standalone");
   });
 
   it("does not gate on a package-lock.json, which Bun neither writes nor reads", async () => {

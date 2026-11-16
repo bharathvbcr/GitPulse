@@ -30,6 +30,7 @@ import {
   clampTerminalDockHeight,
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
+import { clampPaneHeight, COMMIT_PANE_BOUNDS } from "../ui/paneHeight";
 import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
 import {
   APPEARANCE_DEFAULTS,
@@ -42,6 +43,10 @@ import {
 import type { Appearance } from "../ui/color/derive";
 import { densityFromLegacy, type Density } from "../ui/appearance/density";
 import type { GitPulseTheme } from "../ui/appearance/themeSchema";
+import type { BackdropId } from "../ui/appearance/backdrops";
+import { presetPatch, themeSelectionPatch, type ThemePreset } from "../ui/appearance/presets";
+import { withSavedTheme, withoutSavedTheme, type SaveOutcome } from "../ui/appearance/savedThemes";
+import { customWallpaper } from "../ui/appearance/wallpaperStore";
 import { themeStore } from "./themeStore";
 import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
@@ -148,6 +153,8 @@ export interface InterfacePrefs extends AppearancePrefs {
   showHarnessBadges: boolean;
   /** Author-avatar column in the commit graph gutter. */
   showGraphAvatars: boolean;
+  /** GitHub profile pictures instead of initials, resolved through the GitHub CLI. */
+  showGithubAvatars: boolean;
   /** Maximum share of the graph view used by the lane viewport. */
   graphWidthMode: GraphWidthMode;
   /**
@@ -319,6 +326,8 @@ export interface InterfacePrefs extends AppearancePrefs {
    */
   /** Dock height in CSS pixels, clamped on read; the user drags to resize. */
   terminalDockHeight: number;
+  /** Commit details pane height in CSS pixels, clamped on read; the user drags to resize. */
+  commitPaneHeight: number;
   terminalFontSize: number;
   /**
    * Rows of history a shell terminal keeps, and the (smaller) amount an agent
@@ -393,15 +402,23 @@ export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Whether a terminal bell or OSC notice counts as an agent waiting on the
    * reader, on the board, the task pane, the Agents view and the menu-bar
-   * count. On by default: an agent without hooks can only ask by ringing the
-   * bell, so turning this off stops those asks from counting. The Agents view
-   * also stops listing a bell as a reason (the task pane and the board still
-   * show the bell and only stop counting it). A request an agent reports
-   * through its hooks (`needs-you`, `error`) counts either way. Owned by
+   * count. Off by default (opt-in): turning this on counts terminal bells from
+   * agents without hooks on those surfaces. While off, the Agents view also
+   * stops listing a bell as a reason (the task pane and the board still show
+   * the bell and only stop counting it). A request an agent reports through
+   * its hooks (`needs-you`, `error`) counts either way. Owned by
    * `sessionActivity`, which cannot import this store, so every change is
    * pushed to it from here.
    */
   bellAsksForReader: boolean;
+  /**
+   * Which default `bellAsksForReader` was last reconciled against. Pre-revision-1
+   * `true` was the old default written by every preference save rather than an
+   * opt-in, so a read that finds it under an older revision moves it to `false`
+   * once; `BELL_ASKS_FOR_READER_REV` is written back on every save, so turning
+   * the opt-in on afterwards stays `true`.
+   */
+  bellAsksForReaderRev: number;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -429,6 +446,28 @@ export function migrateBranchRowLayout(stored: unknown, storedRev: unknown): Bra
   return stored;
 }
 
+/**
+ * Revision of the `bellAsksForReader` default. Bumped to 1 when the default
+ * moved from on to opt-in (`false`); see `bellAsksForReaderRev`.
+ */
+export const BELL_ASKS_FOR_READER_REV = 1;
+
+/**
+ * Whether a stored `bellAsksForReader` opts in, reconciled once against the
+ * opt-in default.
+ *
+ * - Not `true` (`false`, missing, corrupt): `false` — an unreadable value
+ *   never opts a reader in.
+ * - `true` saved before revision 1: the old default rather than a choice, so
+ *   it becomes `false` once. Every save writes `BELL_ASKS_FOR_READER_REV`, so
+ *   turning the setting on afterwards is kept.
+ * - `true` at or after revision 1: `true`.
+ */
+export function migrateBellAsksForReader(stored: unknown, storedRev: unknown): boolean {
+  if (stored !== true) return false;
+  return typeof storedRev === "number" && storedRev >= BELL_ASKS_FOR_READER_REV;
+}
+
 const DEFAULTS: InterfacePrefs = {
   ...APPEARANCE_DEFAULTS,
   accent: DEFAULT_ACCENT,
@@ -447,6 +486,7 @@ const DEFAULTS: InterfacePrefs = {
   codePercentageMode: "code-only",
   showHarnessBadges: true,
   showGraphAvatars: true,
+  showGithubAvatars: true,
   graphWidthMode: "balanced",
   graphRefScope: "named",
   uiFontScale: 1.0,
@@ -481,6 +521,7 @@ const DEFAULTS: InterfacePrefs = {
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
+  commitPaneHeight: COMMIT_PANE_BOUNDS.fallback,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
   terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
   terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
@@ -495,7 +536,8 @@ const DEFAULTS: InterfacePrefs = {
   dismissedUpdateVersion: "",
   autoRunCoverage: false,
   autoScanGithubAlerts: true,
-  bellAsksForReader: true,
+  bellAsksForReader: false,
+  bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
 };
 
 /**
@@ -604,6 +646,7 @@ function readPrefs(): InterfacePrefs {
         parsed.codePercentageMode === "all" ? "all" : "code-only",
       showHarnessBadges: bool(parsed.showHarnessBadges, DEFAULTS.showHarnessBadges),
       showGraphAvatars: bool(parsed.showGraphAvatars, DEFAULTS.showGraphAvatars),
+      showGithubAvatars: bool(parsed.showGithubAvatars, DEFAULTS.showGithubAvatars),
       graphWidthMode: isGraphWidthMode(parsed.graphWidthMode)
         ? parsed.graphWidthMode
         : DEFAULTS.graphWidthMode,
@@ -677,6 +720,11 @@ function readPrefs(): InterfacePrefs {
         typeof parsed.terminalDockHeight === "number"
           ? clampTerminalDockHeight(parsed.terminalDockHeight)
           : DEFAULTS.terminalDockHeight,
+      // Same rule as the dock height: validated on read as well as on write.
+      commitPaneHeight:
+        typeof parsed.commitPaneHeight === "number"
+          ? clampPaneHeight(parsed.commitPaneHeight, COMMIT_PANE_BOUNDS)
+          : DEFAULTS.commitPaneHeight,
       seenCoachMarks:
         parsed.seenCoachMarks && typeof parsed.seenCoachMarks === "object"
           ? parsed.seenCoachMarks
@@ -694,7 +742,11 @@ function readPrefs(): InterfacePrefs {
         parsed.autoScanGithubAlerts,
         DEFAULTS.autoScanGithubAlerts,
       ),
-      bellAsksForReader: bool(parsed.bellAsksForReader, DEFAULTS.bellAsksForReader),
+      bellAsksForReader: migrateBellAsksForReader(
+        parsed.bellAsksForReader,
+        parsed.bellAsksForReaderRev,
+      ),
+      bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -793,9 +845,44 @@ function createInterfaceStore() {
     setCustomTheme: (theme: GitPulseTheme | null) => patch({ customTheme: theme }),
     /** Applies several appearance fields at once (an imported theme), as one save. */
     patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
-    /** Puts every Appearance preference back without touching the rest. */
+    /**
+     * Puts every Appearance preference back without touching the rest. The
+     * reader's saved themes are a library, not a setting, so they stay.
+     */
     resetAppearance: () =>
-      patch({ ...APPEARANCE_DEFAULTS, accent: DEFAULT_ACCENT, nativeGlass: false, highRefresh: false }),
+      patch((prefs) => ({
+        ...APPEARANCE_DEFAULTS,
+        savedThemes: prefs.savedThemes,
+        accent: DEFAULT_ACCENT,
+        nativeGlass: false,
+        highRefresh: false,
+      })),
+    setBackdrop: (backdrop: BackdropId) => patch({ backdrop }),
+    /**
+     * Applies a built-in preset: its theme, wallpaper and material, and switches
+     * the window to the preset's appearance, because a theme only draws in its own.
+     */
+    applyPreset: (preset: ThemePreset) => {
+      patch((prefs) => presetPatch(preset, prefs));
+      themeStore.setTheme(preset.theme.appearance);
+    },
+    /** Applies a theme from the reader's shelf, in its own appearance. The wallpaper is left as it is. */
+    applyTheme: (theme: GitPulseTheme) => {
+      patch(themeSelectionPatch(theme));
+      themeStore.setTheme(theme.appearance);
+    },
+    /** Puts `theme` on the shelf. A full shelf refuses rather than dropping someone's theme. */
+    saveTheme: (theme: GitPulseTheme): SaveOutcome => {
+      let outcome: SaveOutcome = "full";
+      patch((prefs) => {
+        const next = withSavedTheme(prefs.savedThemes, theme);
+        outcome = next.outcome;
+        return { savedThemes: next.list };
+      });
+      return outcome;
+    },
+    removeSavedTheme: (theme: Pick<GitPulseTheme, "name" | "appearance">) =>
+      patch((prefs) => ({ savedThemes: withoutSavedTheme(prefs.savedThemes, theme) })),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setNativeGlass: (on: boolean) => patch({ nativeGlass: on }),
     setHighRefresh: (on: boolean) => patch({ highRefresh: on }),
@@ -810,6 +897,7 @@ function createInterfaceStore() {
     setCodePercentageMode: (mode: CodePercentageMode) => patch({ codePercentageMode: mode }),
     setShowHarnessBadges: (show: boolean) => patch({ showHarnessBadges: show }),
     setShowGraphAvatars: (show: boolean) => patch({ showGraphAvatars: show }),
+    setShowGithubAvatars: (show: boolean) => patch({ showGithubAvatars: show }),
     setGraphWidthMode: (mode: GraphWidthMode) => patch({ graphWidthMode: mode }),
     setGraphRefScope: (scope: RefScope) => patch({ graphRefScope: scope }),
     toggleGraphAvatars: () =>
@@ -961,6 +1049,8 @@ function createInterfaceStore() {
     setTerminalLauncher: (launcher: SessionKind) => patch({ terminalLauncher: SESSION_TYPES.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
+    setCommitPaneHeight: (px: number) =>
+      patch({ commitPaneHeight: clampPaneHeight(px, COMMIT_PANE_BOUNDS) }),
     setCheckForUpdates: (enabled: boolean) =>
       // Turning the check off also clears the dismissal, so re-enabling it
       // later reports honestly instead of staying silent about a version
@@ -986,5 +1076,10 @@ export const interfaceStore = createInterfaceStore();
 // The document follows the preferences from here on, whichever window or test
 // harness imported the store first; there is one subscription and it lives as
 // long as the page. It is a no-op without a document.
-installAppearance({ prefs: interfaceStore, theme: themeStore, platform: hostPlatform });
+installAppearance({
+  prefs: interfaceStore,
+  theme: themeStore,
+  platform: hostPlatform,
+  customBackdrop: customWallpaper,
+});
 installHeaderLabels(interfaceStore);

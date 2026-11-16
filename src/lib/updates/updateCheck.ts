@@ -10,6 +10,7 @@
  */
 import { writable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** Mirrors `crate::updates::UpdateCheck` (serde `camelCase`). */
 export interface UpdateCheck {
@@ -137,7 +138,7 @@ async function performUpdateCheck(
       updateAvailable: false,
       releaseUrl: "",
       checked: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: describeError(error, "updates"),
     };
   }
 }

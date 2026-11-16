@@ -93,10 +93,12 @@ describe("FileTreePanel source contracts", () => {
     expect(forced).toContain("input:focus-visible");
     expect(forced).toContain("outline: 2px solid Highlight");
 
-    const marker = 'placeholder="Filter files"';
+    // The one Explorer search field: its placeholder follows the mode.
+    const marker = "placeholder={fieldLabel}";
     const at = source.indexOf(marker);
     expect(at).toBeGreaterThan(-1);
-    const field = source.slice(source.lastIndexOf("<div", at), source.indexOf("/>", at));
+    const pillAt = source.lastIndexOf("file-tree-filter-pill", at);
+    const field = source.slice(source.lastIndexOf("<div", pillAt), source.indexOf("/>", at));
     expect(field).toContain("file-tree-filter-pill");
     expect(field).toContain("rounded-full");
     // The field focus edge every text field uses, on the pill.
@@ -109,5 +111,35 @@ describe("FileTreePanel source contracts", () => {
     const style = styleAt === -1 ? "" : source.slice(styleAt, source.indexOf("</style>", styleAt));
     expect(style).not.toContain("var(--ring-focus)");
     expect(style).not.toMatch(/\.file-tree-filter:focus/);
+  });
+
+  /**
+   * One search field, not two: Explorer's toolbar no longer carries a content
+   * search toggle, and the field's Names | Contents segment is the only way
+   * into Contents besides the palette.
+   */
+  it("is the single search field, with a Names | Contents segment inside it", () => {
+    expect(source.match(/<input\b/g)?.length).toBe(1);
+    const pillAt = source.indexOf("file-tree-filter-pill");
+    const segmentAt = source.indexOf("<SettingSegment", pillAt);
+    expect(segmentAt).toBeGreaterThan(pillAt);
+    expect(source.indexOf("</div>", segmentAt)).toBeGreaterThan(segmentAt);
+    expect(source).toContain("options={EXPLORER_SEARCH_MODES}");
+
+    const viewer = readFileSync(new URL("../FileViewer.svelte", import.meta.url), "utf8");
+    expect(viewer).not.toContain("data-search-toggle");
+    expect(viewer).not.toContain("toggleSearchRail");
+  });
+
+  it("hides the tree in Contents mode instead of unmounting it", () => {
+    expect(source).toContain("class:hidden={contentMode}");
+    expect(source).toContain("class:hidden={!contentMode}");
+    expect(source).not.toMatch(/\{#if contentMode\}\s*<div[^>]*role="tree"/);
+  });
+
+  it("sends Enter in Contents mode to the content search rather than the tree", () => {
+    const body = functionBody(source, "handleFieldKeydown");
+    expect(body).toContain("onContentSubmit");
+    expect(body).toContain("fieldEscape(");
   });
 });

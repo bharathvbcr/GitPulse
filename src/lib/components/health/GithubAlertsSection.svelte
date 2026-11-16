@@ -1,7 +1,7 @@
 <script lang="ts">
   import HealthSection from "./HealthSection.svelte";
   import HealthTable from "./HealthTable.svelte";
-  import HealthPreviewToggle from "./HealthPreviewToggle.svelte";
+  import ListPreviewToggle from "../ListPreviewToggle.svelte";
   import { healthSection } from "../../health/sections";
   import { describeFailure } from "../../ui/copy/describeFailure";
   import type { SectionCount } from "../../health/counts";
@@ -147,6 +147,6 @@
     <HealthTable caption={`${spec?.heading ?? id}: ${noun}`} {columns}>
       {@render row()}
     </HealthTable>
-    <HealthPreviewToggle total={rowCount} {noun} bind:expanded />
+    <ListPreviewToggle total={rowCount} {noun} bind:expanded />
   {/if}
 </HealthSection>

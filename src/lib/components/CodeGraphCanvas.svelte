@@ -43,8 +43,9 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { easeOutCubic, motionDuration, prefersReducedMotion } from "../motion/easing";
   import { observeResize } from "../dom/observeResize";
+  import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
   import { themeStore } from "../stores/themeStore";
-  import { Filter, Minus, Network, Plus } from "@lucide/svelte";
+  import { Filter, Info, Minus, Network, Plus } from "@lucide/svelte";
   import Checkbox from "./Checkbox.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -72,9 +73,11 @@
      * node is in the model; set it to null (or another id) to re-arm.
      */
     focusNodeId?: string | null;
+    /** What this graph shows, for a newcomer; drawn as an info hint beside the heading. */
+    about?: string;
   }
 
-  let { load = null, loading = false, scopeKey = "", onOpenNode, focusNodeId = null }: Props = $props();
+  let { load = null, loading = false, scopeKey = "", onOpenNode, focusNodeId = null, about }: Props = $props();
 
   const FOCUS_TWEEN_MS = 280;
   const KEY_ROTATION = (10 * Math.PI) / 180;
@@ -307,6 +310,12 @@
     }
   }
 
+  function onPointerLeave() {
+    if (dragging) return;
+    hoverScheduler.cancel();
+    hoveredId = null;
+  }
+
   function onClick(e: MouseEvent) {
     if (!canvasEl || dragDistance > 4) return;
     const rect = canvasEl.getBoundingClientRect();
@@ -434,6 +443,7 @@
 
   function setGlobe(on: boolean) {
     cancelTween();
+    hoverScheduler.cancel();
     globeOn = on;
     globeChoice = on;
     hoveredId = null;
@@ -484,13 +494,16 @@
     // Updating responsive classes inside an observer delivery can resize the
     // observed stage again. Defer and coalesce writes outside that delivery.
     if (hostEl) stopResize = observeResize(hostEl, () => measure());
+    const detachDpr = watchDevicePixelRatio(() => schedulePaint());
     const canvas = canvasEl;
     canvas?.addEventListener("contextlost", onContextLost);
     canvas?.addEventListener("contextrestored", onContextRestored);
     return () => {
+      detachDpr();
       canvas?.removeEventListener("contextlost", onContextLost);
       canvas?.removeEventListener("contextrestored", onContextRestored);
-    };  });
+    };
+  });
 
   onDestroy(() => {
     scheduler.cancel();
@@ -502,6 +515,7 @@
   });
 
   function filtersChanged() {
+    hoverScheduler.cancel();
     selectedId = null; hoveredId = null; page = 0; connectionPage = 0;
   }
 
@@ -567,7 +581,7 @@
   });
 
   $effect(() => {
-    // Re-layout when payload or size changes.
+    // Repaint when model, viewport, or visual state changes.
     void model;
     void width;
     void height;
@@ -589,7 +603,19 @@
 <div class="code-map bg-background flex flex-col min-h-0 flex-1" class:narrow={width <= 760}>
   <div class="map-toolbar flex flex-wrap items-center gap-x-3 gap-y-2 px-5 pt-4 pb-3">
     <div class="map-heading min-w-0 mr-auto">
-      <span class="gp-label block">Dependency map</span>
+      <span class="gp-label flex items-center gap-1">
+        Dependency map
+        {#if about}
+          <!-- A button only so keyboard users can focus it and get the tooltip; it has no action. -->
+          <button
+            type="button"
+            class="map-about"
+            aria-label={`About this view: ${about}`}
+            title={about}
+            data-testid="code-graph-about"
+          ><Info size={12} strokeWidth={1.8} aria-hidden="true" /></button>
+        {/if}
+      </span>
       {#if loading}
         <Skeleton variant="text" width="12rem" height="0.75rem" class="mt-1.5" />
       {:else}
@@ -684,7 +710,7 @@
       class="absolute inset-0 w-full h-full cursor-grab active:cursor-grabbing"
       style={`width:${width}px;height:${height}px;touch-action:none`}
       onpointerdown={onPointerDown} onpointermove={onPointerMove} onpointerup={onPointerUp}
-      onpointercancel={onPointerUp} onpointerleave={() => { if (!dragging) hoveredId = null; }}
+      onpointercancel={onPointerUp} onpointerleave={onPointerLeave}
       onclick={onClick} ondblclick={onDblClick} onwheel={onWheel} onkeydown={onKeyDown}
       tabindex="0" aria-label={canvasLabel}
     ></canvas>
@@ -783,6 +809,9 @@
     --map-border: rgb(var(--c-border) / 0.45);
     --map-muted: rgb(var(--c-text-muted));
     --map-hover: rgb(var(--c-surface-hover) / 0.55); }
+  .map-about { display: inline-flex; padding: 0; border: 0; background: none; color: var(--map-muted); cursor: help; border-radius: 50%; }
+  .map-about:hover { color: rgb(var(--c-text)); }
+  .map-about:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .map-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; font-size: var(--text-meta); color: var(--map-muted); }
   canvas:focus-visible { outline: 2px solid rgb(var(--c-accent)); outline-offset: 2px; }
   .map-honesty { margin: 0; padding: 0 20px 10px; color: rgb(var(--c-warn)); font-size: var(--text-meta); }

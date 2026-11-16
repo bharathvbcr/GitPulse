@@ -397,7 +397,7 @@
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
-  <div class="px-4 py-2 bg-surface/60 flex items-center justify-between gap-3 font-sans shrink-0">
+  <div class="px-4 py-2 flex items-center justify-between gap-3 font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <FileCode size={16} class="text-accent" />
       <!-- The file, named rather than typed. Blame is Explorer's other lens
@@ -484,7 +484,7 @@
     named chips rather than being quietly left out of the denominator.
   -->
   {#if blameLines.length > 0 && !errorMsg}
-    <div class="px-4 py-2 bg-surface/30 font-sans shrink-0 flex flex-col gap-1.5">
+    <div class="px-4 py-2 font-sans shrink-0 flex flex-col gap-1.5">
       <div class="flex items-end gap-3">
         {#if timeline.periods.length > 0}
           <div class="flex-1 min-w-0 flex flex-col gap-1">

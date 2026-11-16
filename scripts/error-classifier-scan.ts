@@ -20,7 +20,7 @@ import {
  * from* an error:
  * - a `catch` binding, or what is destructured from one;
  * - `.message` of anything (an `IpcError`, an `Error`, a payload);
- * - `String(x)` and `formatError(x)`, and what the string methods make of one
+ * - `String(x)` and `formatError(x)` and `formatErrorRaw(x)`, and what the string methods make of one
  *   (`toLowerCase`, `trim`, `slice`, `replace`, `split` and an index into it,
  *   a cast, a non-null assertion, a template, `??`);
  * - a variable initialised from any of those, anywhere in the same file;
@@ -125,7 +125,7 @@ export function classifierMatches(file: string, source: string): ClassifierMatch
     }
     if (isCallExpression(node)) {
       const callee = unwrap(node.expression);
-      if (isIdentifier(callee) && (callee.text === "String" || callee.text === "formatError")) return true;
+      if (isIdentifier(callee) && (callee.text === "String" || callee.text === "formatError" || callee.text === "formatErrorRaw")) return true;
       if (isPropertyAccessExpression(callee) && STRING_PRESERVING.has(callee.name.text)) return derives(callee.expression);
     }
     return false;

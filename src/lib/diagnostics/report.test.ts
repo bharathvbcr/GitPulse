@@ -3,12 +3,14 @@ import { get } from "svelte/store";
 import {
   createReporter,
   formatDiagnosticFailure,
+  formatDisplayFailure,
   reportPanelError,
   withBackendLogSection,
   withPersistedLogSection,
 } from "./report";
 import { unreadablePersistedLog, type PersistedLog } from "./types";
 import { diagnostics } from "./diagnostics";
+import { INTERNAL_ERROR_COPY } from "../ui/copy/describeFailure";
 
 /** Recording sink shaped like the DiagnosticsStore slice the reporter uses. */
 function makeSink() {
@@ -23,6 +25,14 @@ function makeSink() {
 }
 
 describe("createReporter", () => {
+  it("logs a runtime fault raw but hands the banner a plain sentence", () => {
+    const sink = makeSink();
+    const report = createReporter(sink);
+    const banner = report("fleet", new TypeError("Cannot read properties of undefined (reading 'invoke')"));
+    expect(banner).toBe(INTERNAL_ERROR_COPY);
+    expect(sink.recorded[0]?.message).toContain("Cannot read properties of undefined");
+  });
+
   it("redacts a secret-bearing IPC rejection before it can reach UI state", () => {
     const detail = formatDiagnosticFailure(
       new Error(
@@ -38,7 +48,7 @@ describe("createReporter", () => {
   it("formats the error once and routes it as a source-tagged warning by default", () => {
     const sink = makeSink();
     const report = createReporter(sink);
-    const banner = report("blame", new TypeError("nope"));
+    const banner = report("blame", new Error("nope"));
     expect(banner).toBe("nope");
     expect(sink.recorded).toEqual([
       { severity: "warning", source: "blame", message: "nope" },
@@ -87,6 +97,34 @@ describe("createReporter", () => {
       expect(entries).toHaveLength(1);
       expect(entries[0].count).toBe(2);
       expect(entries[0].severity).toBe("warning");
+    } finally {
+      diagnostics.clear();
+    }
+  });
+});
+
+describe("formatDisplayFailure", () => {
+  it("shows plain copy for a runtime fault and records the raw text under the source", () => {
+    try {
+      diagnostics.clear();
+      const shown = formatDisplayFailure(new TypeError("Cannot read properties of undefined (reading 'invoke')"), "coverage");
+      expect(shown).toBe(INTERNAL_ERROR_COPY);
+      const entries = get(diagnostics);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.source).toBe("coverage");
+      expect(entries[0]?.message).toContain("reading 'invoke'");
+    } finally {
+      diagnostics.clear();
+    }
+  });
+
+  it("keeps a backend failure's own words, redacted, and records nothing", () => {
+    try {
+      diagnostics.clear();
+      const shown = formatDisplayFailure(new Error("fatal: unable to access 'https://me:hunter2@example.test/r'"), "coverage");
+      expect(shown).toContain("fatal: unable to access");
+      expect(shown).not.toContain("hunter2");
+      expect(get(diagnostics)).toHaveLength(0);
     } finally {
       diagnostics.clear();
     }

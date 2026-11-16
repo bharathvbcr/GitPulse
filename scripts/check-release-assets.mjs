@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
+import { SOURCE_MAP_SCANNED_EXTENSIONS, hasSourceMapComment, isSourceMapDocument, isSourceMapPath } from "./build-evidence.mjs";
 import { parseTag } from "./check-release-version.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -292,6 +293,8 @@ const MAX_ARCHIVE_ENTRIES = 100_000;
 const EXTRACT_TIMEOUT_MS = 120_000;
 
 const MACHO_FAT_MAGIC = 0xcafebabe;
+const MACHO_MAGIC_64 = 0xfeedfacf;
+const MACHO_FILETYPE_EXECUTE = 2;
 const MACHO_CPU_ARM64 = 0x0100000c;
 const MACHO_CPU_X86_64 = 0x01000007;
 const ELF_MACHINE = { x64: 0x3e, arm64: 0xb7 };
@@ -526,27 +529,93 @@ function judgeTarParents(entries, required) {
 }
 
 /**
+ * @param {TarEntry[]} entries
+ * @returns {string[]}
+ */
+function judgeTarSourceMaps(entries) {
+  /** @type {string[]} */
+  const found = [];
+  for (const entry of entries) {
+    const normalized = normalizeTarPath(entry.path);
+    if (isSourceMapPath(normalized)) {
+      found.push(`sourcemap: ${normalized}`);
+    } else if (
+      entry.type === "file"
+      && SOURCE_MAP_SCANNED_EXTENSIONS.has(path.extname(normalized).toLowerCase())
+      && hasSourceMapComment(normalized, entry.data.toString("utf8"))
+    ) {
+      found.push(`sourcemap-ref: ${normalized}`);
+    }
+  }
+  return found;
+}
+
+/**
+ * Validates a universal fat Mach-O header and slice bounds against the file size.
+ *
+ * @param {Buffer} header
+ * @param {number} totalSize
+ * @returns {string | null}
+ */
+function judgeUniversalMachOHeader(header, totalSize) {
+  if (header.length < 8 || header.readUInt32BE(0) !== MACHO_FAT_MAGIC) return "wrong-arch";
+  const count = header.readUInt32BE(4);
+  const headerEnd = 8 + count * 20;
+  if (count === 0 || count > 8 || headerEnd > header.length || headerEnd > totalSize) return "wrong-arch";
+  const cpus = [];
+  for (let index = 0; index < count; index += 1) {
+    const at = 8 + index * 20;
+    const offset = header.readUInt32BE(at + 8);
+    const size = header.readUInt32BE(at + 12);
+    if (size === 0 || offset < headerEnd || offset + size > totalSize) return "wrong-arch";
+    cpus.push(header.readUInt32BE(at));
+  }
+  const unique = new Set(cpus);
+  return unique.size === 2 && unique.has(MACHO_CPU_ARM64) && unique.has(MACHO_CPU_X86_64) && cpus.length === 2 ? null : "wrong-arch";
+}
+
+/**
  * A universal Mach-O must carry exactly an arm64 and an x86_64 slice, each
  * inside the file and past the fat header.
  *
  * @param {TarEntry} entry
  */
 function judgeUniversalMachO(entry) {
-  const { data } = entry;
-  if (data.length < 8 || data.readUInt32BE(0) !== MACHO_FAT_MAGIC) return "wrong-arch";
-  const count = data.readUInt32BE(4);
-  const headerEnd = 8 + count * 20;
-  if (count === 0 || count > 8 || headerEnd > data.length) return "wrong-arch";
-  const cpus = [];
-  for (let index = 0; index < count; index += 1) {
-    const at = 8 + index * 20;
-    const offset = data.readUInt32BE(at + 8);
-    const size = data.readUInt32BE(at + 12);
-    if (size === 0 || offset < headerEnd || offset + size > data.length) return "wrong-arch";
-    cpus.push(data.readUInt32BE(at));
+  return judgeUniversalMachOHeader(entry.data, entry.data.length);
+}
+
+/**
+ * Checks a Mach-O executable on disk without reading the whole binary into memory.
+ * When `requireUniversal` is true, requires a fat arm64+x86_64 header; otherwise
+ * also accepts a thin 64-bit arm64 or x86_64 `MH_EXECUTE` slice for local builds.
+ *
+ * @param {string} filePath
+ * @param {number} fileSize
+ * @param {boolean} requireUniversal
+ * @returns {string | null}
+ */
+function judgeMachOFile(filePath, fileSize, requireUniversal) {
+  const fd = openSync(filePath, "r");
+  try {
+    const head = Buffer.alloc(Math.min(fileSize, 4096));
+    const bytesRead = readSync(fd, head, 0, head.length, 0);
+    const sample = head.subarray(0, bytesRead);
+    if (sample.length >= 8 && sample.readUInt32BE(0) === MACHO_FAT_MAGIC) {
+      return judgeUniversalMachOHeader(sample, fileSize);
+    }
+    if (
+      !requireUniversal
+      && sample.length >= 16
+      && sample.readUInt32LE(0) === MACHO_MAGIC_64
+      && (sample.readUInt32LE(4) === MACHO_CPU_ARM64 || sample.readUInt32LE(4) === MACHO_CPU_X86_64)
+      && sample.readUInt32LE(12) === MACHO_FILETYPE_EXECUTE
+    ) {
+      return null;
+    }
+    return "wrong-arch";
+  } finally {
+    closeSync(fd);
   }
-  const unique = new Set(cpus);
-  return unique.size === 2 && unique.has(MACHO_CPU_ARM64) && unique.has(MACHO_CPU_X86_64) && cpus.length === 2 ? null : "wrong-arch";
 }
 
 /** @param {"x64" | "arm64"} arch @returns {(entry: TarEntry) => string | null} */
@@ -685,26 +754,108 @@ export function checkSevenZipListing(listing, maxBytes, format) {
 }
 
 /**
- * Every file under `root`, by `lstat`: a symlink is a finding and is never
- * followed, so extraction output cannot point the walk elsewhere.
+ * @typedef {{ name: string, full: string, symlink: boolean, hardlink: boolean, size: number, regular: boolean, dir: boolean, mode: number }} WalkedEntry
+ */
+
+/**
+ * Every entry under `root`, by `lstat`: a symlink is never followed, so the
+ * walk stays strictly inside `root`.
  *
  * @param {string} root
- * @returns {{ name: string, full: string, symlink: boolean, hardlink: boolean, size: number, regular: boolean }[]}
+ * @param {string} [tooManyMessage]
+ * @returns {WalkedEntry[]}
  */
-function walkExtracted(root) {
+function walkExtracted(root, tooManyMessage = "installer unpacks to too many files") {
+  /** @type {WalkedEntry[]} */
   const found = [];
   const pending = [root];
   while (pending.length > 0) {
     const dir = /** @type {string} */ (pending.pop());
-    for (const item of readdirSync(dir, { withFileTypes: true })) {
+    for (const item of readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
       const full = path.join(dir, item.name);
       const stat = lstatSync(full);
-      if (stat.isDirectory()) { pending.push(full); continue; }
-      found.push({ name: item.name, full, symlink: stat.isSymbolicLink(), hardlink: stat.isFile() && stat.nlink > 1, size: stat.size, regular: stat.isFile() });
-      if (found.length > MAX_ARCHIVE_ENTRIES) throw new UnreadableBundle("installer unpacks to too many files");
+      const isDir = stat.isDirectory();
+      found.push({
+        name: item.name,
+        full,
+        symlink: stat.isSymbolicLink(),
+        hardlink: stat.isFile() && stat.nlink > 1,
+        size: isDir ? 0 : stat.size,
+        regular: stat.isFile(),
+        dir: isDir,
+        mode: stat.mode,
+      });
+      if (found.length > MAX_ARCHIVE_ENTRIES) throw new UnreadableBundle(tooManyMessage);
+      if (isDir) pending.push(full);
     }
   }
   return found;
+}
+
+/**
+ * Enforces an unpacked byte ceiling and verifies no symlink points outside `root`.
+ *
+ * @param {WalkedEntry[]} entries
+ * @param {string} root
+ * @param {number} maxBytes
+ * @param {string} subject
+ */
+function checkExtractedBoundsAndLinks(entries, root, maxBytes, subject) {
+  const total = entries.reduce((sum, entry) => sum + (entry.regular ? entry.size : 0), 0);
+  if (total > maxBytes) throw new UnreadableBundle(`${subject} unpacked to ${total} bytes, over the ${maxBytes} bound`);
+  for (const entry of entries) {
+    if (!entry.symlink) continue;
+    const target = path.resolve(path.dirname(entry.full), readlinkSync(entry.full));
+    if (target !== root && !target.startsWith(root + path.sep)) {
+      throw new UnreadableBundle(`${subject} left a link pointing outside its directory: ${entry.name}`);
+    }
+  }
+}
+
+/**
+ * Flags any `.map` entry, `.js`/`.mjs`/`.cjs`/`.css` `sourceMappingURL` comment,
+ * or (for WiX MSIs whose CAB IDs erase filenames) Source Map v3 JSON payload.
+ *
+ * @param {WalkedEntry[]} entries
+ * @param {string} root
+ * @param {{ detectWixMapJson?: boolean }} [options]
+ * @returns {string[]}
+ */
+function judgeExtractedSourceMaps(entries, root, { detectWixMapJson = false } = {}) {
+  /** @type {string[]} */
+  const violations = [];
+  const withRel = entries
+    .map((entry) => ({ entry, rel: path.relative(root, entry.full).split(path.sep).join("/") }))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (const { entry, rel } of withRel) {
+    if (isSourceMapPath(rel)) {
+      violations.push(`sourcemap: ${rel}`);
+    } else if (entry.regular && !entry.symlink) {
+      if (SOURCE_MAP_SCANNED_EXTENSIONS.has(path.extname(rel).toLowerCase())) {
+        if (hasSourceMapComment(rel, readFileSync(entry.full, "utf8"))) violations.push(`sourcemap-ref: ${rel}`);
+      } else if (
+        detectWixMapJson
+        && /^PathFile_I[0-9a-f]{32}(?:_\d+)?$/i.test(entry.name)
+        && entry.size >= 2
+        && entry.size <= 64 * 1024 * 1024
+        && isSourceMapDocument(readFileSync(entry.full))
+      ) {
+        violations.push(`sourcemap: ${rel}`);
+      }
+    }
+  }
+  return violations;
+}
+
+/**
+ * @param {unknown} binaries
+ */
+function validateBinaries(binaries) {
+  if (!Array.isArray(binaries) || binaries.length === 0 || !binaries.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name))) {
+    throw new Error("binaries must be a non-empty list of binary names");
+  }
+  if (new Set(binaries).size !== binaries.length) throw new Error("binaries contains duplicate binary names");
+  if (!binaries.includes(MAIN_BINARY)) throw new Error(`binaries must include the main binary ${MAIN_BINARY}`);
 }
 
 /**
@@ -735,14 +886,10 @@ function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extra
   const outDir = mkdtempSync(path.join(workDir, "unpack-"));
   try {
     extract(archive, outDir, { format, maxBytes, budget });
-    const files = walkExtracted(outDir);
-    const total = files.reduce((sum, file) => sum + (file.regular ? file.size : 0), 0);
-    if (total > maxBytes) throw new UnreadableBundle(`installer unpacked to ${total} bytes, over the ${maxBytes} bound`);
+    const entries = walkExtracted(outDir);
     const root = path.resolve(outDir);
-    for (const file of files.filter((candidate) => candidate.symlink)) {
-      const target = path.resolve(path.dirname(file.full), readlinkSync(file.full));
-      if (target !== root && !target.startsWith(root + path.sep)) throw new UnreadableBundle(`extraction left a link pointing outside its directory: ${file.name}`);
-    }
+    checkExtractedBoundsAndLinks(entries, root, maxBytes, "extraction");
+    const files = entries.filter((entry) => !entry.dir);
     /** @type {string[]} */
     const violations = [];
     const atRoot = new Set(files.filter((file) => path.dirname(file.full) === root).map((file) => file.name));
@@ -762,6 +909,7 @@ function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extra
       else if (file.size === 0) violations.push(`empty: ${binary}`);
       else if (peMachine(file.full) !== PE_MACHINE[arch]) violations.push(`wrong-arch: ${binary}`);
     }
+    violations.push(...judgeExtractedSourceMaps(entries, root, { detectWixMapJson: format === "msi" }));
     return violations;
   } finally {
     rmSync(outDir, { recursive: true, force: true });
@@ -828,11 +976,8 @@ function coverageSummary(version, opened) {
  * @returns {ContentCheck}
  */
 export function inspectBundleContents({ version, binaries, files, workDir, extract = extractWithSevenZip, maxUnpackedBytes = MAX_UNPACKED_BYTES, budget }) {
-  if (!Array.isArray(binaries) || binaries.length === 0 || !binaries.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name))) {
-    throw new Error("binaries must be a non-empty list of binary names");
-  }
+  validateBinaries(binaries);
   if (new Set(binaries.map(msiFileId)).size !== binaries.length) throw new Error("two binaries share one MSI file id");
-  if (!binaries.includes(MAIN_BINARY)) throw new Error(`binaries must include the main binary ${MAIN_BINARY}`);
   const root = workDir ?? mkdtempSync(path.join(tmpdir(), "bundle-check-"));
   /** @type {string[]} */
   const violations = [];
@@ -854,7 +999,7 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
           const packed = spec.format === "deb" ? readDebData(archive) : archive;
           const entries = readTar(gunzipSync(packed, { maxOutputLength: maxUnpackedBytes }));
           const wanted = binaries.map((binary) => (spec.format === "deb" ? `usr/bin/${binary}` : `GitPulse.app/Contents/MacOS/${binary}`));
-          found = [...unsafeTarPaths(entries), ...judgeTarParents(entries, wanted)];
+          found = [...unsafeTarPaths(entries), ...judgeTarParents(entries, wanted), ...judgeTarSourceMaps(entries)];
           for (const [index, binary] of binaries.entries()) {
             found.push(...judgeTarBinary(entries, wanted[index], binary,
               spec.format === "deb" ? judgeElf(/** @type {"x64" | "arm64"} */ (spec.arch)) : judgeUniversalMachO));
@@ -879,12 +1024,73 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
   return { ok: !invalid && violations.length === 0, invalid, violations, opened, coverage: coverageSummary(version, opened.length) };
 }
 
+/**
+ * Inspects a built macOS `.app` directory on disk: requires `Contents/Info.plist`,
+ * every declared `[[bin]]` as an executable Mach-O under `Contents/MacOS/`, and no
+ * `.map` files or `sourceMappingURL` references anywhere inside the bundle.
+ *
+ * @param {{ appPath: string, binaries: string[], universal?: boolean, maxUnpackedBytes?: number }} input
+ * @returns {{ ok: boolean, invalid: boolean, violations: string[] }}
+ */
+export function inspectAppBundle({ appPath, binaries, universal = false, maxUnpackedBytes = MAX_UNPACKED_BYTES }) {
+  validateBinaries(binaries);
+  if (typeof appPath !== "string" || appPath.trim() === "") throw new Error("appPath must be a non-empty string");
+  const root = path.resolve(appPath);
+  try {
+    const rootStat = lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new UnreadableBundle(`app bundle ${appPath} is not a directory`);
+    }
+    const entries = walkExtracted(root, "app bundle has too many files");
+    checkExtractedBoundsAndLinks(entries, root, maxUnpackedBytes, "app bundle");
+    const byRel = new Map(entries.map((entry) => [path.relative(root, entry.full).split(path.sep).join("/"), entry]));
+    /** @type {string[]} */
+    const violations = [];
+    for (const parentRel of ["Contents", "Contents/MacOS"]) {
+      const parent = byRel.get(parentRel);
+      if (!parent) { violations.push(`missing: ${parentRel}`); continue; }
+      if (!parent.dir) {
+        const kind = parent.symlink ? "symlink" : parent.hardlink ? "hardlink" : parent.regular ? "file" : "other";
+        violations.push(`${kind}-parent: ${parentRel} is not a directory`);
+      }
+    }
+    const plist = byRel.get("Contents/Info.plist");
+    if (!plist) violations.push("missing: Contents/Info.plist");
+    else if (plist.symlink) violations.push("symlink: Contents/Info.plist");
+    else if (plist.hardlink) violations.push("hardlink: Contents/Info.plist");
+    else if (!plist.regular) violations.push("not-regular: Contents/Info.plist");
+    else if (plist.size === 0) violations.push("empty: Contents/Info.plist");
+
+    for (const binary of binaries) {
+      const entry = byRel.get(`Contents/MacOS/${binary}`);
+      if (!entry) violations.push(`missing: ${binary}`);
+      else if (entry.symlink) violations.push(`symlink: ${binary}`);
+      else if (entry.hardlink) violations.push(`hardlink: ${binary}`);
+      else if (!entry.regular) violations.push(`not-regular: ${binary}`);
+      else if (entry.size === 0) violations.push(`empty: ${binary}`);
+      else if ((entry.mode & 0o111) === 0) violations.push(`not-executable: ${binary}`);
+      else {
+        const problem = judgeMachOFile(entry.full, entry.size, universal);
+        if (problem) violations.push(`${problem}: ${binary}`);
+      }
+    }
+    violations.push(...judgeExtractedSourceMaps(entries, root));
+    return { ok: violations.length === 0, invalid: false, violations };
+  } catch (error) {
+    return { ok: false, invalid: true, violations: [`cannot be opened: ${errorMessage(error)}`] };
+  }
+}
+
 /** @param {string[]} argv */
 function parseArgs(argv) {
-  /** @type {{ tag: string | null, jsonPath: string | null, bundles: string | null, platform: string | null, contents: string | null }} */
-  const options = { tag: null, jsonPath: null, bundles: null, platform: null, contents: null };
+  /** @type {{ tag: string | null, jsonPath: string | null, bundles: string | null, platform: string | null, contents: string | null, app: string | null, universal: boolean }} */
+  const options = { tag: null, jsonPath: null, bundles: null, platform: null, contents: null, app: null, universal: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
+    if (flag === "--universal") {
+      options.universal = true;
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value`);
     if (flag === "--tag") options.tag = value;
@@ -892,9 +1098,17 @@ function parseArgs(argv) {
     else if (flag === "--bundles") options.bundles = value;
     else if (flag === "--platform") options.platform = value;
     else if (flag === "--contents") options.contents = path.resolve(value);
+    else if (flag === "--app") options.app = path.resolve(value);
     else throw new Error(`unknown option ${flag}`);
     index += 1;
   }
+  if (options.app !== null) {
+    if (options.tag || options.jsonPath || options.bundles || options.platform || options.contents) {
+      throw new Error("--app cannot be combined with --tag, --json, --bundles, --platform or --contents");
+    }
+    return options;
+  }
+  if (options.universal) throw new Error("--universal requires --app");
   if (options.contents !== null) {
     if (!options.tag) throw new Error("--contents needs --tag");
     if (options.jsonPath || options.bundles || options.platform) throw new Error("--contents cannot be combined with --json, --bundles or --platform");
@@ -921,10 +1135,11 @@ export function usage() {
       { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag being verified" },
       { flag: "--json <path>".replace(/^"|"$/g, ""), description: "path to the release JSON from the GitHub API" },
       { flag: "--bundles <json> --platform <label>", description: "instead: check one runner's tauri-action artifactPaths against the installers it must upload, at the src-tauri/tauri.conf.json version" },
-      { flag: "--contents <dir> --tag <tag>", description: "instead: open the macOS archive, debs, MSIs and NSIS installers in <dir> and require every src-tauri/Cargo.toml [[bin]] inside (needs 7z; the dmg, rpm and AppImage are not opened)" },
+      { flag: "--contents <dir> --tag <tag>", description: "instead: open the macOS archive, debs, MSIs and NSIS installers in <dir> and require every src-tauri/Cargo.toml [[bin]] inside with no source maps (needs 7z; the dmg, rpm and AppImage are not opened)" },
+      { flag: "--app <path> [--universal]", description: "instead: inspect a built macOS .app bundle directory on disk for every src-tauri/Cargo.toml [[bin]] and no source maps" },
       { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
     ],
-    exits: "0 every expected asset is present · 1 one is missing or lacks a binary · 2 the check could not run",
+    exits: "0 every expected asset is present · 1 one is missing, lacks a binary or ships source maps · 2 the check could not run",
   });
 }
 
@@ -935,6 +1150,15 @@ export function main(argv = process.argv.slice(2)) {
   }
   try {
     const options = parseArgs(argv);
+    if (options.app) {
+      const cargo = readFileSync(path.join(REPO_ROOT, "src-tauri", "Cargo.toml"), "utf8");
+      const result = inspectAppBundle({ appPath: options.app, binaries: declaredBinaryNames(cargo), universal: options.universal });
+      for (const violation of result.violations) console.error(`FAIL: app bundle ${violation}`);
+      if (result.invalid) return 2;
+      if (!result.ok) return 1;
+      console.log(`OK: ${path.basename(options.app)} holds every declared binary and no source maps`);
+      return 0;
+    }
     if (options.contents) {
       const parsedTag = parseTag(options.tag ?? "");
       if (!parsedTag.ok) throw new Error(parsedTag.reason);
@@ -948,7 +1172,7 @@ export function main(argv = process.argv.slice(2)) {
       console.log(result.coverage);
       if (result.invalid) return 2;
       if (!result.ok) return 1;
-      console.log("OK: every opened bundle holds every declared binary");
+      console.log("OK: every opened bundle holds every declared binary and no source maps");
       return 0;
     }
     if (options.bundles && options.platform) {

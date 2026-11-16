@@ -382,9 +382,9 @@
 <div
   class={embedded
     ? "text-xs font-sans"
-    : "flex-1 min-h-0 overflow-auto bg-background p-4 text-xs font-sans"}
+    : "gp-page bg-background text-xs font-sans"}
 >
-  <div class={embedded ? "space-y-4" : "mx-auto max-w-4xl space-y-4"}>
+  <div class={embedded ? "space-y-4" : "gp-page-body"}>
     <!-- Remotes -->
     <section class="gp-card rounded-2xl p-4">
       <header class="mb-3 flex items-center justify-between gap-2">

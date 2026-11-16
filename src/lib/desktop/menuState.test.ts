@@ -205,7 +205,7 @@ describe("agents waiting on the reader", () => {
   const waiting = (count: number) =>
     buildMenuState(empty(), prefs(), "system", {}, false, undefined, undefined, count).agentsWaiting;
 
-  it("counts the sessions that ask for the reader, and not the ones that finished or ask nothing", () => {
+  it("counts the sessions that ask for the reader, excluding hook-less bells by default", () => {
     const activity = new Map<string, SessionActivity>([
       ["needs", session("needs-you")],
       ["done", session("finished")],
@@ -214,19 +214,21 @@ describe("agents waiting on the reader", () => {
       ["bell", session("signalled")],
       ["also-done", session("finished")],
     ]);
-    expect(countAgentsWaiting(activity)).toBe(3);
+    expect(countAgentsWaiting(activity)).toBe(2);
     expect(countAgentsWaiting(new Map())).toBe(0);
     expect(countAgentsWaiting(new Map([["done", session("finished")], ["quiet", session(null)]]))).toBe(0);
   });
 
-  it("does not count a signalled-only session once the bell setting is off, and still counts a needs-you one", () => {
-    interfaceStore.setBellAsksForReader(false);
+  it("counts a signalled-only session only when the bell opt-in is on", () => {
+    expect(countAgentsWaiting(new Map([["bell", session("signalled")]]))).toBe(0);
+    interfaceStore.setBellAsksForReader(true);
     try {
-      expect(countAgentsWaiting(new Map([["bell", session("signalled")]]))).toBe(0);
-      expect(countAgentsWaiting(new Map([["bell", session("signalled")], ["needs", session("needs-you")], ["broke", session("error")]]))).toBe(2);
+      expect(countAgentsWaiting(new Map([["bell", session("signalled")]]))).toBe(1);
+      expect(countAgentsWaiting(new Map([["bell", session("signalled")], ["needs", session("needs-you")], ["broke", session("error")]]))).toBe(3);
     } finally {
       interfaceStore.reset();
     }
+    expect(countAgentsWaiting(new Map([["bell", session("signalled")]]))).toBe(0);
   });
 
   it("emits zero when nobody is waiting, so an older caller's payload is unchanged", () => {

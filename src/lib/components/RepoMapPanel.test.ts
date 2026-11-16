@@ -70,8 +70,10 @@ describe("RepoMapPanel", () => {
     expect(source).toContain("brokenLinksHonesty");
     expect(source).toContain("getWorkspaceLinkCandidates");
     expect(source).toContain("linkCandidatesHonesty");
-    expect(source).toContain('data-testid="docs-panel"');
-    expect(source).toContain('data-testid="link-candidates-panel"');
+    // The two views are page bodies now: `PageBody` renders the test id as the
+    // `data-testid` of its scroll area (it was a hand-written scroller).
+    expect(source).toContain('<PageBody testId="docs-panel">');
+    expect(source).toContain('<PageBody testId="link-candidates-panel">');
   });
 
   it("disables Build and Refresh when the CLI is known absent", () => {
@@ -89,9 +91,14 @@ describe("RepoMapPanel", () => {
     // preferredDeadLists dedupes, and the template still suffixes `#${i}` —
     // either layer alone is enough; both stay so a regression in one cannot
     // bring back each_key_duplicate (svelte.dev/e/each_key_duplicate).
-    expect(source).toContain("deadLists.deadSymbols as id, i");
-    expect(source).toContain("deadLists.unwired as path, i");
-    expect(source).toContain("selected.entry_points as path, i");
+    // The three path lists render through two snippets (`pathList`, `textList`),
+    // each keyed `value#index` over the previewed slice. The call sites below
+    // are the lists the old template keyed one by one.
+    expect(source).toContain('{@render textList(deadLists.deadSymbols, "deadSymbols"');
+    expect(source).toContain('{@render pathList(deadLists.unwired, "unwired"');
+    expect(source).toContain('{@render pathList(selected.entry_points, "entry"');
+    expect(source).toContain("as path, i (`${path}#${i}`)");
+    expect(source).toContain("as row, i (`${row}#${i}`)");
   });
 });
 
@@ -376,12 +383,15 @@ describe("RepoMapPanel map view tablist", () => {
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
 } {
   let resolve: (value: T) => void = () => {};
-  const promise = new Promise<T>((res) => {
+  let reject: (reason?: unknown) => void = () => {};
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 describe("RepoMapPanel map reload does not wait on devmap status", () => {
@@ -445,19 +455,91 @@ describe("RepoMapPanel map reload does not wait on devmap status", () => {
     expect(first.applied).toEqual([]);
   }, 1000);
 
-  it("clears loading from the map settlement, not from the status probe", () => {
-    const reload = source.slice(
-      source.indexOf("async function reload("),
-      source.indexOf("async function reloadGraph("),
-    );
-    expect(reload).toContain("settleMapBeforeStatus(");
-    expect(reload).not.toContain("Promise.all");
-    const onMap = reload.indexOf("onMap(mapResult)");
-    const onStatus = reload.indexOf("onStatus(statusResult)");
-    expect(onMap).toBeGreaterThan(-1);
-    expect(onStatus).toBeGreaterThan(onMap);
-    expect(reload.slice(onMap, onStatus)).toContain("loading = false");
-    expect(reload.slice(onStatus)).not.toContain("loading");
+  it("clears loading from the map settlement, not from the status probe", async () => {
+    let loading = true;
+    let statusLoading = true;
+    const map = deferred<string>();
+    const status = deferred<string>();
+
+    const done = settleMapBeforeStatus({
+      map: map.promise,
+      status: status.promise,
+      isCurrent: () => true,
+      onMap: () => {
+        loading = false;
+      },
+      onStatus: () => {
+        statusLoading = false;
+      },
+    });
+
+    expect(loading).toBe(true);
+    expect(statusLoading).toBe(true);
+
+    map.resolve("map-payload");
+    await done;
+
+    // Loading is cleared immediately by map resolution, while status remains pending
+    expect(loading).toBe(false);
+    expect(statusLoading).toBe(true);
+
+    status.resolve("status-payload");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statusLoading).toBe(false);
+  });
+
+  it("catches errors thrown inside onStatus without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const status = deferred<string>();
+      const done = settleMapBeforeStatus({
+        map: Promise.resolve("map-payload"),
+        status: status.promise,
+        isCurrent: () => true,
+        onMap: () => {},
+        onStatus: () => {
+          throw new Error("simulated status handler failure");
+        },
+      });
+
+      await done;
+      status.resolve("status-payload");
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("catches errors thrown inside onStatus when status probe rejects", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const status = deferred<string>();
+      const done = settleMapBeforeStatus({
+        map: Promise.resolve("map-payload"),
+        status: status.promise,
+        isCurrent: () => true,
+        onMap: () => {},
+        onStatus: () => {
+          throw new Error("simulated status handler failure on rejection");
+        },
+      });
+
+      await done;
+      status.reject(new Error("status probe rejected"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 });
 
@@ -573,5 +655,238 @@ describe("CodeView map section", () => {
   it("lazy-loads the Map panel beside Explorer and Blame", () => {
     expect(codeView).toContain('section === "map"');
     expect(codeView).toContain("loadMap");
+  });
+});
+
+describe("RepoMapPanel long lists preview five rows", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("uses the shared preview seam and does not write its own", () => {
+    expect(source).toContain('import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList"');
+    expect(source).toContain('import ListPreviewToggle from "./ListPreviewToggle.svelte"');
+    // No private row limit or expand label beside the shared ones.
+    expect(source).not.toMatch(/\b(?:PREVIEW|ROW_LIMIT|MAX_ROWS)\w*\s*=\s*\d/);
+    expect(source).not.toMatch(/Show all \$\{/);
+  });
+
+  it("slices every data-driven list and gives each one its toggle", () => {
+    // Lists drawn by the two snippets: the call sites name the list.
+    for (const call of [
+      'pathList(importantFiles, "important"',
+      'pathList(selected.entry_points, "entry"',
+      'pathList(selected.critical_files, "critical"',
+      'pathList(tests.paths, "tests"',
+      'pathList(deadLists.unwired, "unwired"',
+      'textList(deadLists.deadSymbols, "deadSymbols"',
+      'textList(deadLists.unreachable, "unreachable"',
+    ]) {
+      expect(template, call).toContain(call);
+    }
+    // The snippets slice by list and bind the toggle to that list's flag.
+    expect(template).toContain("previewSlice(paths, expandedLists[list], LIST_PREVIEW_ROWS)");
+    expect(template).toContain("previewSlice(rows, expandedLists[list], LIST_PREVIEW_ROWS)");
+    expect(template.match(/bind:expanded=\{expandedLists\[list\]\}/g)).toHaveLength(2);
+    // Lists drawn in place.
+    for (const key of ["neighbors", "hits", "broken", "links"] as const) {
+      expect(template, key).toContain(`previewSlice(`);
+      expect(template, key).toContain(`bind:expanded={expandedLists.${key}}`);
+    }
+    expect(template).toContain("previewSlice(selected.neighbors, expandedLists.neighbors, LIST_PREVIEW_ROWS)");
+    expect(template).toContain("previewSlice(docsHits, expandedLists.hits, LIST_PREVIEW_ROWS)");
+    expect(template).toContain("previewSlice(brokenDisplay.shown, expandedLists.broken, LIST_PREVIEW_ROWS)");
+    expect(template).toContain("previewSlice(linkResult.links, expandedLists.links, LIST_PREVIEW_ROWS)");
+  });
+
+  it("hands each toggle the rows the list holds, never the index's total", () => {
+    expect(template).toContain("<ListPreviewToggle total={paths.length}");
+    expect(template).toContain("<ListPreviewToggle total={rows.length}");
+    expect(template).toContain("total={selected.neighbors.length}");
+    expect(template).toContain("total={docsHits.length}");
+    expect(template).toContain("total={brokenDisplay.shown.length}");
+    expect(template).toContain("total={linkResult.links.length}");
+    // The caps stay as their own visible text beside the collapsed list.
+    expect(template).toContain("Sample of {tests.paths.length}; {tests.total} total for this area.");
+    expect(template).toContain("brokenDisplay.honesty");
+  });
+
+  it("no longer scrolls inside a list: the page scrolls and the toggle reveals the rest", () => {
+    expect(template).not.toMatch(/max-h-(?:24|32|40|64)\b/);
+  });
+
+  it("leaves the subsystem navigator fully listed", () => {
+    const tree = template.slice(template.indexOf('role="tree"'), template.indexOf("</nav>"));
+    expect(tree).toContain("{#each visibleRows as row (row.key)}");
+    expect(tree).not.toContain("previewSlice");
+    expect(tree).not.toContain("ListPreviewToggle");
+  });
+
+  it("collapses every list again when the subsystem, the repository or the hits change", () => {
+    // Keyed on a primitive: `selectedRow` is a new object after every index
+    // refresh, and an effect that read it would close the lists a reader had
+    // just opened on each background refresh of the same subsystem.
+    expect(source).toContain("const selectedRowKey = $derived(selectedRow?.key ?? null);");
+    expect(source).not.toMatch(/void selectedRow\b(?!Key)/);
+    const resetOnRow = source.slice(source.indexOf("void selectedRowKey;"));
+    expect(resetOnRow.slice(0, 200)).toContain("expandedLists = collapsedLists();");
+    // Keyed on the row, not `selectedKey`, which is null while the first row is the selection.
+    expect(source).not.toMatch(/void selectedKey;/);
+    const repoEffect = source.slice(source.indexOf("cancelRequests();\n      load = null;"));
+    expect(repoEffect.slice(0, 400)).toContain("expandedLists = collapsedLists();");
+    expect(source).toMatch(/void searchedQuery;\s*untrack\(\(\) => \{\s*expandedLists\.hits = false;/);
+  });
+
+  it("starts every list collapsed", () => {
+    const collapsed = source.slice(source.indexOf("const collapsedLists"), source.indexOf("let expandedLists"));
+    expect(collapsed.match(/: false/g)).toHaveLength(11);
+    expect(collapsed).not.toContain("true");
+  });
+});
+
+describe("RepoMapPanel states say plainly what happened", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("shows a degraded graph instead of presenting its lists as complete", () => {
+    expect(template).toContain("{#if doc.graph_degraded}");
+    expect(template).toContain('data-testid="map-graph-degraded"');
+    expect(template).toContain("The code map is degraded.");
+    expect(template).toContain("boundStrip(doc.graph_degraded_reason)");
+  });
+
+  it("says a stale index is stale, and acts only on a status that said so", () => {
+    expect(template).toContain("statusPayload && statusPayload.is_fresh === false");
+    expect(template).toContain('data-testid="map-index-stale"');
+    expect(template).toContain("The index is out of date.");
+    expect(source).toContain("boundStrip(reason)");
+    expect(template).toContain("{degradedStatusReason}");
+    // "Behind the latest commit" was wrong: freshness is about the source tree.
+    expect(template).not.toContain("behind the latest commit");
+  });
+
+  it("names the analyses the producer could not run", () => {
+    expect(source).toContain("map.liveness_meta?.unavailable");
+    expect(template).toContain('data-testid="map-unavailable"');
+    // In words, never the producer's snake_case key (design-lint cannot see a dynamic string).
+    expect(template).toContain("Couldn't check {unavailableAnalyses.map(([name]) => unavailableAnalysisLabel(name)).join(\", \")}.");
+    expect(template).toContain("{unavailableAnalysisLabel(name)}: {boundStrip(reason)}");
+    expect(template).not.toMatch(/\{name\}:/);
+    // The unreachable list already says it is hidden; the notice does not repeat it.
+    expect(source).toContain('name === "unreachable_files" && map.liveness_unreachable_unreliable === true');
+  });
+
+  it("shows a fresh index's degraded reason too, so a current index never reads as clean", () => {
+    expect(template).toContain("{:else if degradedStatusReason}");
+    expect(template).toContain('data-testid="map-index-degraded"');
+    expect(template).toContain("The index is degraded.");
+    expect(source).toContain("const degradedStatusReason = $derived.by");
+  });
+
+  it("states no count for a list the producer can cap without saying by how much", () => {
+    // Entry points, critical files, neighbors and unreachable files carry no
+    // per-list cap meta, so their headings carry no number: the toggle already
+    // names the rows it reveals.
+    for (const id of ["map-entry-points", "map-critical", "map-neighbors"]) {
+      const heading = template.slice(template.indexOf(`id="${id}"`), template.indexOf("</h3>", template.indexOf(`id="${id}"`)));
+      expect(heading, id).not.toContain("{");
+    }
+    expect(template).not.toContain("{deadLists.unreachable.length}");
+  });
+
+  it("does not call a status that has not arrived yet unknown", () => {
+    expect(source).toContain("let statusLoading = $state(false);");
+    expect(source).toContain("statusLoading = true;");
+    expect(source).toMatch(/onStatus\(statusResult\) \{\s*statusLoading = false;/);
+    expect(template).toContain('data-testid="map-status-pending"');
+    expect(template).toContain("Checking index status…");
+    expect(template).toContain("Couldn't read the index status.");
+    expect(template).not.toContain("Status unknown");
+  });
+
+  it("does not read a capped, empty sample as 'none'", () => {
+    expect(template).toContain("doc.liveness_meta.unwired.total > 0");
+    expect(template).toContain("doc.liveness_meta.dead_symbol.total > 0");
+    expect(template).toContain("Sample empty; the index lists");
+  });
+
+  it("says a map with no subsystems has none, instead of 'No areas match'", () => {
+    expect(template).toContain("{#if areaRows.length === 0}");
+    expect(template).toContain('data-testid="map-no-subsystems"');
+    expect(template).toContain("This map lists no subsystems");
+  });
+
+  it("opens with an overview of size, index state and what to look at", () => {
+    expect(template).toContain('data-testid="map-overview"');
+    expect(source).toContain('stat("Subsystems", meta.subsystems)');
+    expect(source).toContain('stat("Important files", meta.important_files)');
+    expect(source).toContain('{ label: "Languages"');
+    // The overview comes before the selected subsystem's own header.
+    expect(template.indexOf('data-testid="map-overview"')).toBeLessThan(template.indexOf("{#if selected}"));
+    // Repository-wide candidates are labelled as such, apart from the subsystem.
+    expect(template).toContain("Across the repository");
+  });
+});
+
+describe("RepoMapPanel layout follows the pane", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("builds the detail, docs and links views on the page body", () => {
+    expect(template).toContain('<PageBody class="flex-1 min-w-0" testId="map-detail">');
+    expect(template.match(/<PageBody\b/g)).toHaveLength(3);
+    expect(template).not.toMatch(/overflow-y-auto p-3 space-y-/);
+  });
+
+  it("measures the pane with container variants, never the window, and holds no width cap", () => {
+    // Same rule `pageLayout.contract.test.ts` pins for the migrated pages.
+    expect(template).not.toMatch(/(?<![\w@-])(?:sm|md|lg|xl|2xl):[\w-]/);
+    const caps: string[] = [];
+    for (const tag of template.matchAll(/<[A-Za-z][^<>]*>/g)) {
+      if (/data-width-cap="[^"]+"/.test(tag[0])) continue;
+      for (const token of tag[0].matchAll(/(?<![\w-])(?:[\w@-]+:)*(max-w-[^\s"'{}`]+)/g)) {
+        if (!/^max-w-(?:full|none|min|max|fit|0|\[\d*\.?\d+%\])$/.test(token[1])) caps.push(token[1]);
+      }
+    }
+    expect(caps).toEqual([]);
+    expect(template).toContain("@2xl:grid-cols-3");
+  });
+
+  it("lets the subsystem card shrink with a narrow pane", () => {
+    const at = template.indexOf("data-repomap-subsystems-card");
+    const tag = template.slice(template.lastIndexOf("<nav", at), template.indexOf(">", at) + 1);
+    expect(tag).toContain("gp-float-card w-64 max-w-[40%] min-w-40 shrink-0");
+    expect(tag).not.toMatch(/\bh-full\b/);
+  });
+
+  it("puts no tinted band on a full-width row", () => {
+    expect(template).not.toMatch(/bg-surface\/\d+/);
+  });
+});
+
+describe("RepoMapPanel graph view descriptions", () => {
+  // The graph tabs were titled "File import graph (ranked cap)" and
+  // "Subsystem handoff map": accurate, but nothing a first-time user could act
+  // on. Each now says what a dot and a line are and what clicking does.
+  it("gives the Files, Symbols and Subsystems tabs a plain-language tooltip", () => {
+    const { body } = render(RepoMapPanel);
+    const at = body.indexOf('aria-label="Map views"');
+    const region = body.slice(at, body.indexOf('role="tabpanel"', at));
+    const tabs = new Map(
+      [...region.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map((match) => [
+        (match[2] ?? "").replace(/<[^>]+>/g, "").trim(),
+        match[1] ?? "",
+      ]),
+    );
+    for (const [label, says] of [
+      ["Files", "Each dot is a file"],
+      ["Symbols", "Each dot is a symbol"],
+      ["Subsystems", "Each dot is a subsystem"],
+    ] as const) {
+      const title = tabs.get(label)?.match(/\btitle="([^"]*)"/)?.[1] ?? "";
+      expect(title, `${label} tab tooltip`).toContain(says);
+      expect(title, `${label} tab tooltip`).toContain("Click a");
+      expect(title).not.toMatch(/ranked cap|handoff/);
+    }
+  });
+
+  it("hands the active view's description to the canvas as its About hint", () => {
+    expect(source).toContain("about={MAP_VIEWS.find((v) => v.id === mapView)?.title}");
   });
 });

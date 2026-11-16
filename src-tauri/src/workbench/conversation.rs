@@ -30,7 +30,7 @@ struct Request {
 
 /// What the transcript search found.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Transcript {
+pub(crate) enum Transcript {
     Found,
     Absent,
     Unknown(String),
@@ -276,34 +276,132 @@ pub(crate) fn config_dirs_in(
     out
 }
 
-/// Looks for `<home>/projects/<any>/<session>.jsonl`.
-///
-/// Every project directory is tried rather than the one Claude Code would
-/// derive from the checkout path, because that derivation is Claude Code's
-/// own and unpublished; a transcribed copy of it is a copy that drifts. The
-/// session id is a canonical UUID by the time it gets here, so it cannot
-/// name anything outside the directory it is joined to.
-pub(super) fn search(home: &Path, session: &str) -> Transcript {
-    let projects = home.join("projects");
-    let entries = match std::fs::read_dir(&projects) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Transcript::Absent,
-        Err(error) => return Transcript::Unknown(error.to_string()),
+/// Outcome of locating a Claude Code conversation transcript (`<uuid>.jsonl`)
+/// across [`ClaudeConfigDirs`], distinguishing whether it resides in `checkout`'s
+/// own project directory or another checkout's project directory (relevant for
+/// cross-worktree `--fork-session`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeTranscriptLocation {
+    Found {
+        path: PathBuf,
+        in_checkout_project: bool,
+    },
+    Absent,
+    Unknown(String),
+}
+
+fn checkout_project_names(checkout: Option<&Path>) -> Vec<String> {
+    let Some(co) = checkout else {
+        return Vec::new();
     };
-    let name = format!("{session}.jsonl");
-    for (seen, entry) in entries.enumerate() {
-        if seen >= MAX_PROJECTS {
-            return Transcript::Unknown(format!(
-                "more than {MAX_PROJECTS} Claude Code project directories"
-            ));
-        }
-        match entry {
-            Ok(entry) if entry.path().join(&name).is_file() => return Transcript::Found,
-            Ok(_) => {}
-            Err(error) => return Transcript::Unknown(error.to_string()),
+    let mut names = Vec::new();
+    let canon = co.canonicalize().unwrap_or_else(|_| co.to_path_buf());
+    for candidate in [&canon, &co.to_path_buf()] {
+        let encoded = claude_project_dir_name(candidate);
+        if !encoded.is_empty() && !names.contains(&encoded) {
+            names.push(encoded);
         }
     }
-    Transcript::Absent
+    names
+}
+
+/// Locates `<config_dir>/projects/<project>/<session>.jsonl` across `configs`.
+/// When `checkout` is `Some`, prefers a transcript inside that checkout's
+/// encoded project directory (`in_checkout_project: true`), falling back to
+/// any sibling checkout's project directory (`in_checkout_project: false`) and
+/// preserving `Unknown` if any store could not be read and no match was found.
+pub(crate) fn locate_claude_transcript_in(
+    configs: &ClaudeConfigDirs,
+    session: &str,
+    checkout: Option<&Path>,
+) -> ClaudeTranscriptLocation {
+    let want_projects = checkout_project_names(checkout);
+    let name = format!("{session}.jsonl");
+    let mut first_cross_checkout: Option<PathBuf> = None;
+    let mut first_unknown: Option<String> = None;
+
+    for dir in &configs.dirs {
+        let projects = dir.join("projects");
+        let entries = match std::fs::read_dir(&projects) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                if first_unknown.is_none() {
+                    first_unknown = Some(error.to_string());
+                }
+                continue;
+            }
+        };
+        for (seen, entry) in entries.enumerate() {
+            if seen >= MAX_PROJECTS {
+                if first_unknown.is_none() {
+                    first_unknown = Some(format!(
+                        "more than {MAX_PROJECTS} Claude Code project directories"
+                    ));
+                }
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if first_unknown.is_none() {
+                        first_unknown = Some(error.to_string());
+                    }
+                    break;
+                }
+            };
+            let candidate = entry.path().join(&name);
+            if candidate.is_file() {
+                let in_checkout = checkout.is_none()
+                    || entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|dir_name| want_projects.iter().any(|w| w == dir_name));
+                if in_checkout {
+                    return ClaudeTranscriptLocation::Found {
+                        path: candidate,
+                        in_checkout_project: true,
+                    };
+                }
+                if first_cross_checkout.is_none() {
+                    first_cross_checkout = Some(candidate);
+                }
+            }
+        }
+    }
+
+    if let Some(path) = first_cross_checkout {
+        return ClaudeTranscriptLocation::Found {
+            path,
+            in_checkout_project: false,
+        };
+    }
+    if let Some(why) = first_unknown {
+        return ClaudeTranscriptLocation::Unknown(why);
+    }
+    if let Some(err) = &configs.error {
+        return ClaudeTranscriptLocation::Unknown(err.clone());
+    }
+    if configs.dirs.is_empty() {
+        return ClaudeTranscriptLocation::Unknown(
+            "no home directory to find Claude Code's in".into(),
+        );
+    }
+    ClaudeTranscriptLocation::Absent
+}
+
+/// Looks for `<home>/projects/<any>/<session>.jsonl`.
+#[cfg(test)]
+pub(super) fn search(home: &Path, session: &str) -> Transcript {
+    let single = ClaudeConfigDirs {
+        dirs: vec![home.to_path_buf()],
+        error: None,
+    };
+    match locate_claude_transcript_in(&single, session, None) {
+        ClaudeTranscriptLocation::Found { .. } => Transcript::Found,
+        ClaudeTranscriptLocation::Absent => Transcript::Absent,
+        ClaudeTranscriptLocation::Unknown(why) => Transcript::Unknown(why),
+    }
 }
 
 /// Looks for `<home>/conversations/<session>.db` or `<session>.pb` (standalone CLI).
@@ -343,7 +441,7 @@ pub(super) fn search_antigravity(home: &Path, session: &str) -> Transcript {
     }
 }
 
-pub(super) fn search_antigravity_homes(homes: &[PathBuf], session: &str) -> Transcript {
+pub(crate) fn search_antigravity_homes(homes: &[PathBuf], session: &str) -> Transcript {
     if homes.is_empty() {
         return Transcript::Unknown("no home directory to find Antigravity's in".into());
     }
@@ -394,29 +492,12 @@ pub struct ConversationTranscript {
 /// `~/.config/claude`, `~/.claude-*`, `~/.claude-accounts`, `CLAUDE_CONFIG_DIR`,
 /// `GITPULSE_CLAUDE_CONFIG_DIRS`), preserving `Transcript::Unknown` whenever a
 /// directory could not be read or the config-directory list itself is incomplete or empty.
-pub(super) fn search_claude_configs(configs: &ClaudeConfigDirs, session: &str) -> Transcript {
-    let mut first_unknown: Option<String> = None;
-    for dir in &configs.dirs {
-        match search(dir, session) {
-            Transcript::Found => return Transcript::Found,
-            Transcript::Absent => {}
-            Transcript::Unknown(why) => {
-                if first_unknown.is_none() {
-                    first_unknown = Some(why);
-                }
-            }
-        }
+pub(crate) fn search_claude_configs(configs: &ClaudeConfigDirs, session: &str) -> Transcript {
+    match locate_claude_transcript_in(configs, session, None) {
+        ClaudeTranscriptLocation::Found { .. } => Transcript::Found,
+        ClaudeTranscriptLocation::Absent => Transcript::Absent,
+        ClaudeTranscriptLocation::Unknown(why) => Transcript::Unknown(why),
     }
-    if let Some(why) = first_unknown {
-        return Transcript::Unknown(why);
-    }
-    if let Some(err) = &configs.error {
-        return Transcript::Unknown(err.clone());
-    }
-    if configs.dirs.is_empty() {
-        return Transcript::Unknown("no home directory to find Claude Code's in".into());
-    }
-    Transcript::Absent
 }
 
 pub(crate) fn transcripts(session_ids: &[String]) -> Result<Vec<ConversationTranscript>, String> {
@@ -468,6 +549,120 @@ fn answer(session: &str, found: Transcript) -> ConversationTranscript {
     }
 }
 
+/// Checks whether `provider` exposes an on-disk transcript locator that can
+/// prove a conversation exists before offering or running `--resume`.
+pub fn has_transcript_locator(provider: &str) -> bool {
+    matches!(provider.trim(), "claude" | "agy" | "antigravity")
+}
+
+/// Result of verifying whether a recorded session can be resumed right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResumability {
+    pub resumable: bool,
+    pub reason: Option<String>,
+}
+
+/// Checks whether a session for `provider` (`claude`, `agy`, `codex`, `grok`,
+/// `manvi`, `shell`, ...) with optional `session_id` and working directory
+/// `cwd` can be resumed, using `probe` to inspect transcripts on disk.
+pub(crate) fn check_session_resumability_with(
+    provider: &str,
+    session_id: Option<&str>,
+    cwd: &Path,
+    probe: impl FnOnce(&str, &str) -> Transcript,
+) -> ProviderResumability {
+    let provider = provider.trim();
+    if provider.is_empty() || provider == "shell" {
+        return ProviderResumability {
+            resumable: false,
+            reason: Some("not restorable".into()),
+        };
+    }
+    if !has_transcript_locator(provider) {
+        return ProviderResumability {
+            resumable: false,
+            reason: Some(format!(
+                "Provider {provider} has no transcript locator; sessions cannot be resumed."
+            )),
+        };
+    }
+    let sid = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let Some(sid) = sid else {
+        return ProviderResumability {
+            resumable: false,
+            reason: Some(format!(
+                "No {provider} session id was recorded for this tab."
+            )),
+        };
+    };
+    if provider == "agy" && sid == super::terminal_command::AGY_CONTINUE_SENTINEL {
+        if !cwd.is_dir() {
+            return ProviderResumability {
+                resumable: false,
+                reason: Some(format!(
+                    "Working directory no longer exists: {}",
+                    cwd.display()
+                )),
+            };
+        }
+        return ProviderResumability {
+            resumable: true,
+            reason: None,
+        };
+    }
+    if !is_canonical_uuid(sid) {
+        return ProviderResumability {
+            resumable: false,
+            reason: Some(format!(
+                "Recorded {provider} session id is not a canonical UUID."
+            )),
+        };
+    }
+    if !cwd.is_dir() {
+        return ProviderResumability {
+            resumable: false,
+            reason: Some(format!(
+                "Working directory no longer exists: {}",
+                cwd.display()
+            )),
+        };
+    }
+    match probe(provider, sid) {
+        Transcript::Found => ProviderResumability {
+            resumable: true,
+            reason: None,
+        },
+        Transcript::Absent => ProviderResumability {
+            resumable: false,
+            reason: Some(format!(
+                "No saved {provider} transcript was found for session {sid}."
+            )),
+        },
+        Transcript::Unknown(why) => ProviderResumability {
+            resumable: false,
+            reason: Some(format!("Could not verify saved conversation: {why}")),
+        },
+    }
+}
+
+/// Checks whether a recorded session is resumable using live transcript
+/// discovery for `provider` (`claude` or `agy`).
+pub fn check_session_resumability(
+    provider: &str,
+    session_id: Option<&str>,
+    cwd: &Path,
+) -> ProviderResumability {
+    check_session_resumability_with(provider, session_id, cwd, |prov, sid| {
+        if prov == "agy" || prov == "antigravity" {
+            let homes = antigravity_homes();
+            search_antigravity_homes(&homes, sid)
+        } else {
+            let configs = claude_config_dirs();
+            search_claude_configs(&configs, sid)
+        }
+    })
+}
+
 /// Checks whether a saved transcript exists for `provider` and canonical UUID `session`.
 pub(crate) fn has_saved_transcript(provider: &str, session: &str) -> bool {
     if !is_canonical_uuid(session) {
@@ -482,6 +677,112 @@ pub(crate) fn has_saved_transcript(provider: &str, session: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Claude Code's project directory name for `checkout`: every non-alphanumeric
+/// character becomes `-` (so `/Users/a/repo_1` maps to `-Users-a-repo-1`).
+pub fn claude_project_dir_name(checkout: &Path) -> String {
+    checkout
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Finds the newest non-empty Claude Code transcript (`<uuid>.jsonl`) stored
+/// for `checkout` across `dirs`. Returns `None` when none exists or is readable.
+pub(crate) fn latest_claude_session_in(dirs: &ClaudeConfigDirs, checkout: &Path) -> Option<String> {
+    let mut project_names = Vec::new();
+    let canon = checkout
+        .canonicalize()
+        .unwrap_or_else(|_| checkout.to_path_buf());
+    for path in [&canon, &checkout.to_path_buf()] {
+        let encoded = claude_project_dir_name(path);
+        if !encoded.is_empty() && !project_names.contains(&encoded) {
+            project_names.push(encoded);
+        }
+    }
+
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for config_dir in &dirs.dirs {
+        let projects_root = config_dir.join("projects");
+        for name in &project_names {
+            let dir = projects_root.join(name);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for (seen, entry) in entries.enumerate() {
+                if seen >= MAX_PROJECTS {
+                    break;
+                }
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if !is_canonical_uuid(stem) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() || meta.len() == 0 {
+                    continue;
+                }
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let sid = stem.to_ascii_lowercase();
+                let replace = match &newest {
+                    None => true,
+                    Some((prev_time, prev_sid)) => {
+                        modified > *prev_time || (modified == *prev_time && sid > *prev_sid)
+                    }
+                };
+                if replace {
+                    newest = Some((modified, sid));
+                }
+            }
+        }
+    }
+    newest.map(|(_, sid)| sid)
+}
+
+/// Finds the newest saved Claude Code session id for `checkout` in the default
+/// Claude config directories (`CLAUDE_CONFIG_DIR` / `~/.claude`).
+pub fn latest_claude_session_for_checkout(checkout: &Path) -> Option<String> {
+    let dirs = claude_config_dirs();
+    latest_claude_session_in(&dirs, checkout)
+}
+
+/// Verifies `session_id` does not already have a saved Claude Code transcript
+/// in `dirs`. Forking into an existing `--session-id` fails in Claude Code 2.1.325
+/// with `"Session ID ... is already in use."`, so callers fail closed here.
+pub(crate) fn verify_unused_claude_session_in(
+    dirs: &ClaudeConfigDirs,
+    session_id: &str,
+) -> Result<(), String> {
+    if !is_canonical_uuid(session_id) {
+        return Err(format!(
+            "Claude Code session_id must be a canonical UUID, got {session_id:?}."
+        ));
+    }
+    match search_claude_configs(dirs, session_id) {
+        Transcript::Absent => Ok(()),
+        Transcript::Found => Err(format!(
+            "Session ID {session_id} already has a saved Claude Code transcript and cannot be used for a forked session."
+        )),
+        Transcript::Unknown(why) => Err(format!(
+            "Could not verify that session ID {session_id} is unused: {why}"
+        )),
+    }
+}
+
+/// Live-config wrapper around [`verify_unused_claude_session_in`].
+pub fn verify_unused_claude_session(session_id: &str) -> Result<(), String> {
+    let dirs = claude_config_dirs();
+    verify_unused_claude_session_in(&dirs, session_id)
 }
 
 pub(super) fn find(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
@@ -844,5 +1145,171 @@ mod tests {
         assert_eq!(resumed["resumable"], true);
         assert_eq!(resumed["session_id"], THREAD);
         assert_eq!(resumed["provider"], "agy");
+    }
+
+    #[test]
+    fn provider_without_transcript_locator_and_shells_are_not_resumable_with_reasons() {
+        let cwd = tempfile::tempdir().unwrap();
+        for provider in ["codex", "grok", "manvi"] {
+            let status =
+                super::check_session_resumability_with(provider, Some(ID), cwd.path(), |_, _| {
+                    unreachable!("locator should not be called")
+                });
+            assert!(!status.resumable, "{provider} must not be resumable");
+            assert!(
+                status
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("no transcript locator")),
+                "{provider}: {:?}",
+                status.reason
+            );
+        }
+
+        let shell = super::check_session_resumability_with("shell", None, cwd.path(), |_, _| {
+            unreachable!("shell should not query transcript")
+        });
+        assert!(!shell.resumable);
+        assert_eq!(shell.reason.as_deref(), Some("not restorable"));
+
+        let missing_dir = cwd.path().join("gone");
+        let gone =
+            super::check_session_resumability_with("claude", Some(ID), &missing_dir, |_, _| {
+                Transcript::Found
+            });
+        assert!(!gone.resumable);
+        assert!(gone
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("no longer exists")));
+
+        let found =
+            super::check_session_resumability_with("claude", Some(ID), cwd.path(), |prov, sid| {
+                assert_eq!(prov, "claude");
+                assert_eq!(sid, ID);
+                Transcript::Found
+            });
+        assert!(found.resumable);
+        assert_eq!(found.reason, None);
+    }
+
+    #[test]
+    fn latest_claude_session_and_unused_session_check_work_against_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("claude-cfg");
+        let checkout = tmp.path().join("repo_wt");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let canon = checkout.canonicalize().unwrap();
+        let proj = config_dir
+            .join("projects")
+            .join(super::claude_project_dir_name(&canon));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let older = "11111111-1111-4111-8111-111111111111";
+        let newer = "22222222-2222-4222-8222-222222222222";
+        let empty = "33333333-3333-4333-8333-333333333333";
+        let unused = "44444444-4444-4444-8444-444444444444";
+
+        let older_path = proj.join(format!("{older}.jsonl"));
+        let newer_path = proj.join(format!("{newer}.jsonl"));
+        std::fs::write(&older_path, "{\"type\":\"user\"}\n").unwrap();
+        std::fs::write(&newer_path, "{\"type\":\"user\"}\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&older_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newer_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000))
+            .unwrap();
+        std::fs::write(proj.join(format!("{empty}.jsonl")), "").unwrap();
+        std::fs::write(proj.join("not-a-uuid.jsonl"), "{}").unwrap();
+
+        let dirs = super::ClaudeConfigDirs {
+            dirs: vec![config_dir],
+            error: None,
+        };
+        assert_eq!(
+            super::latest_claude_session_in(&dirs, &checkout).as_deref(),
+            Some(newer)
+        );
+        assert!(super::verify_unused_claude_session_in(&dirs, unused).is_ok());
+        assert!(super::verify_unused_claude_session_in(&dirs, older).is_err());
+
+        let unreadable = super::ClaudeConfigDirs {
+            dirs: vec![],
+            error: Some("HOME missing".to_string()),
+        };
+        assert!(super::verify_unused_claude_session_in(&unreadable, unused).is_err());
+    }
+
+    #[test]
+    fn locate_claude_transcript_distinguishes_same_checkout_from_cross_checkout_and_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_first = tmp.path().join("cfg-first");
+        let dir_second = tmp.path().join("cfg-second");
+        let src_wt = tmp.path().join("wt-src");
+        let fork_wt = tmp.path().join("wt-fork");
+        std::fs::create_dir_all(&src_wt).unwrap();
+        std::fs::create_dir_all(&fork_wt).unwrap();
+        let src_canon = src_wt.canonicalize().unwrap();
+        let fork_canon = fork_wt.canonicalize().unwrap();
+
+        let src_proj = dir_first
+            .join("projects")
+            .join(super::claude_project_dir_name(&src_canon));
+        let fork_proj = dir_second
+            .join("projects")
+            .join(super::claude_project_dir_name(&fork_canon));
+        std::fs::create_dir_all(&src_proj).unwrap();
+        std::fs::create_dir_all(&fork_proj).unwrap();
+
+        let src_transcript = src_proj.join(format!("{ID}.jsonl"));
+        std::fs::write(&src_transcript, "{\"type\":\"user\"}\n").unwrap();
+
+        let dirs = super::ClaudeConfigDirs {
+            dirs: vec![dir_first, dir_second],
+            error: None,
+        };
+        assert_eq!(
+            super::locate_claude_transcript_in(&dirs, ID, Some(&src_wt)),
+            super::ClaudeTranscriptLocation::Found {
+                path: src_transcript.clone(),
+                in_checkout_project: true,
+            }
+        );
+        assert_eq!(
+            super::locate_claude_transcript_in(&dirs, ID, Some(&fork_wt)),
+            super::ClaudeTranscriptLocation::Found {
+                path: src_transcript,
+                in_checkout_project: false,
+            }
+        );
+        assert_eq!(
+            super::locate_claude_transcript_in(&dirs, THREAD, Some(&fork_wt)),
+            super::ClaudeTranscriptLocation::Absent
+        );
+
+        // If a transcript also exists under fork_wt's own project dir later in `dirs`,
+        // same-checkout wins over an earlier cross-checkout match.
+        let fork_transcript = fork_proj.join(format!("{ID}.jsonl"));
+        std::fs::write(&fork_transcript, "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(
+            super::locate_claude_transcript_in(&dirs, ID, Some(&fork_wt)),
+            super::ClaudeTranscriptLocation::Found {
+                path: fork_transcript,
+                in_checkout_project: true,
+            }
+        );
+
+        let empty = super::ClaudeConfigDirs::default();
+        assert!(matches!(
+            super::locate_claude_transcript_in(&empty, ID, Some(&fork_wt)),
+            super::ClaudeTranscriptLocation::Unknown(_)
+        ));
     }
 }

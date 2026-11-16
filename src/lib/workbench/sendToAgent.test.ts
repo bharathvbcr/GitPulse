@@ -78,7 +78,7 @@ describe("what can be sent", () => {
 
 describe("the words for a route", () => {
   it("names each route and gives Confirm a label for every route but the unavailable one", () => {
-    expect(["mailbox", "resume", "managed", "unavailable"].map((route) => routeTitle(route as never))).toEqual(["Live session", "Resume the conversation", "Managed follow-up", "Cannot be sent"]);
+    expect(["mailbox", "resume", "managed", "unavailable"].map((route) => routeTitle(route as never))).toEqual(["Live session", "Resume the conversation", "Managed follow-up", "Can't be sent"]);
     expect(confirmLabel("mailbox")).toBe("Send to the live session");
     expect(confirmLabel("resume")).toBe("Resume and send");
     expect(confirmLabel("managed")).toBe("Send as the next turn");

@@ -138,3 +138,49 @@ describe("avatar hit-testing", () => {
     expect(renderer.getCommitAtPoint(nodeX, y, rows, 0, 1, 0, nodeX + 4)?.id).toBe("a");
   });
 });
+
+describe("author-avatar profile pictures", () => {
+  const AVATAR_X = 200;
+  const opts = { theme: THEME, viewportHeight: 800, showAvatars: true, avatarX: AVATAR_X };
+
+  it("draws the image clipped to the disc, with no initials, when one is available", () => {
+    const renderer = new GraphRenderer();
+    const image = {} as CanvasImageSource;
+    const { ctx, calls } = makeRecordingCtx();
+    renderer.render(ctx, [row({ id: "a" })], 0, 1, 0, undefined, { ...opts, avatarImageFor: () => image });
+    expect(calls.filter((c) => c.op === "fillText")).toHaveLength(0);
+    const idx = calls.findIndex((c) => c.op === "drawImage");
+    expect(idx).toBeGreaterThan(0);
+    const draw = calls[idx];
+    const r = renderer.getAvatarStyle().radius;
+    expect(draw.image).toBe(image);
+    expect(draw.w).toBe(r * 2);
+    expect(draw.x).toBe(AVATAR_X - r);
+    // A clip to the avatar circle immediately precedes the draw.
+    const clipIdx = calls.slice(0, idx).map((c) => c.op).lastIndexOf("clip");
+    expect(clipIdx).toBeGreaterThan(-1);
+    const arcBeforeClip = calls.slice(0, clipIdx).filter((c) => c.op === "arc").pop();
+    expect(arcBeforeClip).toMatchObject({ x: AVATAR_X, r });
+  });
+
+  it("falls back to initials for rows whose image is not ready", () => {
+    const renderer = new GraphRenderer();
+    const { ctx, calls } = makeRecordingCtx();
+    renderer.render(ctx, [row({ id: "a" }), row({ id: "b", author_email: "bo@example.com", author_name: "Bo Peep" })], 0, 2, 0, undefined, {
+      ...opts,
+      avatarImageFor: (r) => (r.id === "a" ? ({} as CanvasImageSource) : null),
+    });
+    expect(calls.filter((c) => c.op === "drawImage")).toHaveLength(1);
+    const labels = calls.filter((c) => c.op === "fillText");
+    expect(labels).toHaveLength(1);
+    expect(labels[0].text).toBe(authorIdentity("Bo Peep", "bo@example.com").initials);
+  });
+
+  it("keeps the ring when it draws a picture", () => {
+    const renderer = new GraphRenderer();
+    const { ctx, calls } = makeRecordingCtx();
+    renderer.render(ctx, [row({ id: "a" })], 0, 1, 0, undefined, { ...opts, avatarImageFor: () => ({}) as CanvasImageSource });
+    const ring = calls.find((c) => c.op === "arc" && c.x === AVATAR_X && (c.r as number) > renderer.getAvatarStyle().radius);
+    expect(ring).toBeTruthy();
+  });
+});

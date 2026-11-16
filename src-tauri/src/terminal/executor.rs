@@ -16,7 +16,7 @@
 //!   close nor a context read. It is never used for a keystroke or a resize:
 //!   a close can occupy a thread for seconds.
 //!
-//! None of this runs inside `git_cli::run_command_scope`. That scope exists so
+//! None of this runs inside `crate::engine::process::run_command_scope`. That scope exists so
 //! a pool thread does not carry one git command's admission class and marked
 //! repository into the next (`ADMISSION`, `MARKED_REPO`), and only the git spawn
 //! gate, `engine::worktree` and `engine::git_reader` read them. Nothing a lane

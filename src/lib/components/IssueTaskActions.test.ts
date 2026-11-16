@@ -88,9 +88,9 @@ describe("IssueTaskActions task integration", () => {
     expect(source).toContain("const tasks = await listAllRepositoryTasks(registered.id);");
   });
 
-  it("subscribes to workbench-changed with a foreground-gated live loader and tears it down", () => {
+  it("subscribes to workbench-changed with an on-screen-gated live loader and tears it down", () => {
     expect(source).toContain("changed: scheduleRefreshRepoTasks");
-    expect(source).toContain("canRun: () => !readBackgroundDocument()");
+    expect(source).toContain("canRun: () => liveOnScreen()");
     expect(source).toContain("function scheduleRefreshRepoTasks() { repoTaskLoader.schedule(); }");
     expect(source).toContain("bindForegroundChanges");
     expect(source).toContain("createListenerTracker()");

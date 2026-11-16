@@ -6,6 +6,7 @@
   import { LAYERS } from "../ui/layers";
   import { graphStore } from "../stores/graphStore";
   import CommitCadence from "./CommitCadence.svelte";
+  import HarnessBadge from "./HarnessBadge.svelte";
   import LanguageSegment from "./LanguageSegment.svelte";
   import {
     GitBranch,
@@ -31,8 +32,16 @@
 
   let {
     onOpenShortcuts,
+    shown = $bindable(false),
   }: {
     onOpenShortcuts?: () => void;
+    /**
+     * Whether the bar is on screen, for the host. The bar owns its visibility
+     * (see `resolved`), and it carries the Manvi pill, so a host that keeps a
+     * title-bar chip for the surfaces without a bar needs the answer from here
+     * rather than a second copy of the rule. False again when the bar unmounts.
+     */
+    shown?: boolean;
   } = $props();
 
   let currentBranch = $derived($repoStore.currentBranch || "HEAD");
@@ -96,6 +105,13 @@
       : undefined,
   );
 
+  $effect(() => {
+    shown = detail !== "hidden";
+    return () => {
+      shown = false;
+    };
+  });
+
   function openShortcuts() {
     if (onOpenShortcuts) {
       onOpenShortcuts();
@@ -115,10 +131,10 @@
 <!-- svelte-ignore a11y_no_redundant_roles -->
 <footer
   title={forcedTip}
-  class="gp-glass h-6 shrink-0 bg-surface gp-section-edge px-3 flex items-center justify-between text-meta font-sans text-textMuted select-none"
+  class="gp-glass gp-status-bar h-6 shrink-0 bg-background gp-section-edge px-3 flex items-center justify-between text-meta font-sans text-textMuted select-none"
   style:z-index={LAYERS.SCROLL_CUE}
   role="contentinfo"
-  aria-label="Repository Status Bar"
+  aria-label="Repository status bar"
 >
   <!-- Left Segment: Branch, Ahead/Behind, Dirty & Conflicts -->
   <div class="flex items-center gap-3 min-w-0">
@@ -281,14 +297,16 @@
     {/if}
   </div>
 
-  <!-- Right Segment: Quick Shortcuts -->
-  {#if detail === "full"}
+  <!-- Right Segment: Manvi, then the quick shortcuts. The Manvi pill stays in
+       the minimal bar too: a failing policy gate is not an ambient readout.
+       Its menu opens upward, since below is off the bottom of the window. -->
   <div class="flex items-center gap-3">
+    {#if detail === "full"}
     <button
       type="button"
       onclick={openCommandPalette}
       class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-micro"
-      title="Open Command Palette"
+      title="Open command palette"
     >
       <span class="gp-keycap">{shortcutTextLabel("⌘K", $hostPlatform.os)}</span>
       <span class="hidden md:inline">Palette</span>
@@ -298,13 +316,19 @@
       type="button"
       onclick={openShortcuts}
       class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors text-micro"
-      title="Open Keyboard Shortcuts"
+      title="Open keyboard shortcuts"
     >
       <Keyboard size={11} class="shrink-0" />
       <span class="gp-keycap">?</span>
       <span class="hidden md:inline">Shortcuts</span>
     </button>
+    {/if}
+    <!-- Only on the repository surface: under Fleet, Agents and Tasks this bar
+         stays mounted at zero height, and a pill left in it would be a second,
+         invisible but focusable Manvi chip beside the title bar's. -->
+    {#if $interfaceStore.globalSurface === "repository"}
+      <HarnessBadge variant="full" />
+    {/if}
   </div>
-  {/if}
 </footer>
 {/if}

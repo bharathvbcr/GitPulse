@@ -150,7 +150,7 @@ export function nextLabels(current: readonly string[], label: string, add: boole
 export const WORKTREE_PREPARE_TIMEOUT_MS = 60 * 60_000;
 
 /** `withDeadline` that reports a timeout as the workbench's retryable `transport_error`. */
-export function bounded<T>(work: Promise<T>, ms: number = TASK_ACTION_TIMEOUT_MS, message = "Task action timed out. Retry to confirm its result.", signal?: AbortSignal): Promise<T> {
+export function bounded<T>(work: Promise<T>, ms: number = TASK_ACTION_TIMEOUT_MS, message = "Task action timed out. Try again to confirm its result.", signal?: AbortSignal): Promise<T> {
   return withDeadline(work, ms, { message, signal, timeoutError: (text) => new WorkbenchError("transport_error", text) });
 }
 

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import TerminalIncidentsSection from "../components/health/TerminalIncidentsSection.svelte";
 import {
@@ -9,7 +9,12 @@ import {
   describeSender,
   mergeIncident,
 } from "./terminalIncidents";
+import { setSessionLedgerViewForTest, type SessionLedgerOffer } from "../terminal/sessionLedger";
 import type { TerminalIncident } from "../terminal/incident";
+
+afterEach(() => {
+  setSessionLedgerViewForTest({ offers: [], reopenable_count: 0, unreadable_count: 0 });
+});
 
 const incident = (id: string, at_ms: number, over: Partial<TerminalIncident> = {}): TerminalIncident => ({
   id,
@@ -60,5 +65,71 @@ describe("terminal incidents", () => {
   it("renders its section shell", () => {
     const { body } = render(TerminalIncidentsSection);
     expect(body).toContain('data-health-section="terminal-incidents"');
+  });
+
+  it("renders Reopen N agents ledger offers, not restorable shells, unreadable corrupt rows, and per-row errors in Health (S2-03 & S2-05)", () => {
+    const base = (over: Partial<SessionLedgerOffer>): SessionLedgerOffer => ({
+      row_id: "row-1",
+      terminal_id: "term-1",
+      launcher: "claude",
+      native_id: "6f0a6d1e-1111-4222-8333-444455556661",
+      repo_path: "/work/repo",
+      start_dir: null,
+      cwd: "/work/repo",
+      mode: "edit",
+      started_at: 1000,
+      ended_at: 2000,
+      end_state: "app_quit",
+      signal: null,
+      resumable: true,
+      reason: null,
+      last_error: null,
+      ...over,
+    });
+
+    setSessionLedgerViewForTest({
+      offers: [
+        base({ row_id: "row-claude-1", end_state: "app_quit", mode: "bypass" }),
+        base({ row_id: "row-claude-2", end_state: "lost", native_id: "6f0a6d1e-1111-4222-8333-444455556662" }),
+        base({
+          row_id: "row-shell",
+          launcher: "shell",
+          native_id: null,
+          mode: null,
+          resumable: false,
+          reason: "not restorable",
+        }),
+        base({
+          row_id: "row-gone",
+          cwd: "/missing/cwd",
+          resumable: false,
+          reason: "Recorded working directory /missing/cwd no longer exists.",
+          last_error: "Recorded working directory /missing/cwd no longer exists.",
+        }),
+        base({
+          row_id: "corrupt-line-1",
+          launcher: "unreadable",
+          native_id: null,
+          repo_path: "",
+          cwd: "",
+          mode: null,
+          end_state: "unreadable",
+          resumable: false,
+          reason: "unreadable",
+        }),
+      ],
+      reopenable_count: 2,
+      unreadable_count: 1,
+    });
+
+    const { body } = render(TerminalIncidentsSection);
+    expect(body).toContain('data-testid="health-session-ledger"');
+    expect(body).toContain("Reopen 2 agents");
+    expect(body).toContain('data-testid="health-ledger-not-restorable"');
+    expect(body).toContain("not restorable");
+    expect(body).toContain('data-testid="health-ledger-unreadable"');
+    expect(body).toContain("unreadable");
+    expect(body).toContain('data-testid="health-ledger-row-error"');
+    expect(body).toContain("Recorded working directory /missing/cwd no longer exists.");
   });
 });

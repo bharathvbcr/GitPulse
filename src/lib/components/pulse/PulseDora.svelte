@@ -92,7 +92,7 @@
 
   {#if loading && !dora}
     <div class="flex flex-col gap-3">
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      <div class="grid grid-cols-1 @xl:grid-cols-2 @4xl:grid-cols-4 gap-3">
         {#each [0, 1, 2, 3] as slot (slot)}
           <Skeleton variant="rect" height="6rem" />
         {/each}
@@ -127,7 +127,7 @@
       <PulseStaleNotice {error} {measuredAt} />
     {/if}
     <!-- The four DORA tiles -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+    <div class="grid grid-cols-1 @xl:grid-cols-2 @4xl:grid-cols-4 gap-3">
       <!-- 1. Deployment frequency -->
       <div class="p-3.5 rounded-xl bg-surfaceHover/40 flex flex-col justify-between">
         <div class="flex items-center justify-between gap-2 text-textMuted text-xs">

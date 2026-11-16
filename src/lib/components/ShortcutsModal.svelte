@@ -188,7 +188,7 @@
   <div
     role="dialog"
     aria-modal="true"
-    aria-label="Keyboard Shortcuts"
+    aria-label="Keyboard shortcuts"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && close()}
     onkeydown={(e) => isDialogEscape(e) && close()}
@@ -211,7 +211,7 @@
             <Keyboard size={18} />
           </div>
           <div>
-            <h2 class="text-sm font-semibold text-textPrimary">Keyboard Shortcuts</h2>
+            <h2 class="text-sm font-semibold text-textPrimary">Keyboard shortcuts</h2>
             <p class="text-meta text-textMuted">GitPulse navigation and workflow accelerators</p>
           </div>
         </div>

@@ -337,7 +337,7 @@
             {/if}
           </div>
         </div>
-        <div class="grid gap-2 md:grid-cols-2" aria-label="Activity history status">
+        <div class="grid gap-2 @2xl:grid-cols-2" aria-label="Activity history status">
           {#each activityHistory as status, i (`${status.label}#${i}`)}
             <div class="gp-notice" data-tone={NOTICE_TONE[status.tone]} role="status">
               <div class="min-w-0 flex-1">

@@ -168,6 +168,27 @@ export function discoverPluginPackages(root) {
 }
 
 /**
+ * Every `crates/<name>/Cargo.lock`, in a stable order. Whether one is a
+ * version source depends on whether it records the app crate, which the
+ * caller decides by reading it.
+ *
+ * @param {string} root
+ * @returns {string[]} absolute lockfile paths
+ */
+export function discoverCrateLocks(root) {
+  /** @type {string[]} */
+  const locks = [];
+  const crates = path.join(root, "crates");
+  if (isDirectory(crates)) {
+    for (const name of readdirSync(crates).sort()) {
+      const lock = path.join(crates, name, "Cargo.lock");
+      if (existsSync(lock)) locks.push(lock);
+    }
+  }
+  return locks;
+}
+
+/**
  * The per-client manifest names inside one package directory.
  *
  * `plugin.json` is required — it is the manifest every client falls back to,
@@ -231,6 +252,21 @@ export function collectVersions(sources) {
   add(`src-tauri/Cargo.lock (${CRATE_NAME})`, sources.cargoLockPath, () =>
     parseCargoLockVersion(readFileSync(sources.cargoLockPath, "utf8"), CRATE_NAME),
   );
+  // A crate under crates/ that depends on the app by path records the app's
+  // version in its own lock, and `--locked` refuses to build it once that
+  // copy lags. A lock with no entry for the app crate is not a version source.
+  for (const lock of discoverCrateLocks(sources.root)) {
+    const rel = path.relative(sources.root, lock).split(path.sep).join("/");
+    let text;
+    try {
+      text = readFileSync(lock, "utf8");
+    } catch (err) {
+      found.push({ label: `${rel} (${CRATE_NAME})`, file: lock, version: null, error: /** @type {Error} */ (err).message });
+      continue;
+    }
+    if (parseCargoLockVersion(text, CRATE_NAME) === null) continue;
+    add(`${rel} (${CRATE_NAME})`, lock, () => parseCargoLockVersion(text, CRATE_NAME));
+  }
   // Plugin manifests are separate files for separate clients, so each is read
   // on its own; a shared reader would hide one lagging the others.
   const packages = discoverPluginPackages(sources.root);

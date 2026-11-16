@@ -44,12 +44,13 @@
     ChevronsUpDown,
     Globe,
     Eye,
+    RotateCw,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import TerminalSession from "./TerminalSession.svelte";
   import BrowserSession from "./BrowserSession.svelte";
   import TerminalFilePane from "./TerminalFilePane.svelte";
@@ -63,6 +64,17 @@
   import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
   import { detachedAdoptionSettled, reclaimAdoptedSession } from "../terminal/detachedSessions";
   import { isTauri } from "../platform";
+  import {
+    describeEndState,
+    dismissSessionLedgerRow,
+    filterOffersForRepo,
+    reopenAllSessionLedgerOffers,
+    reopenBannerHeading,
+    reopenSessionLedgerOffer,
+    reopenableOffers,
+    sessionLedgerStore,
+    subscribeSessionLedger,
+  } from "../terminal/sessionLedger";
   import { formatDroppedPathsForSession, relativeToRepo } from "../terminal/dropFormatting";
   import { classifyDropRegion, terminalDropZones, type DropRegion } from "../terminal/dropZoneRegistry";
   import {
@@ -119,7 +131,9 @@
     tabFor,
     paneOnScreen,
     setTabAutoWake,
+    setTabResume,
     setTabStartDir,
+    type ResumeLaunch,
     setTabTitle,
     setTabUrl,
     browserTabFor,
@@ -257,8 +271,10 @@
       onOpenFile: handleAgentOpenFile,
       onTouchedFile: handleAgentTouchedFile,
     });
+    const unsubSessionLedger = subscribeSessionLedger();
     return () => {
       unsubAgentPanel();
+      unsubSessionLedger();
       if (adoptionFallbackTimer !== null) clearTimeout(adoptionFallbackTimer);
       if (copiedResetTimer !== null) {
         clearTimeout(copiedResetTimer);
@@ -829,7 +845,7 @@
     const sep = trimmedRepo.includes("\\") ? "\\" : "/";
     const lastSep = Math.max(trimmedRepo.lastIndexOf("/"), trimmedRepo.lastIndexOf("\\"));
     if (lastSep <= 0) {
-      sessionError = "Could not resolve parent directory for sibling worktree.";
+      sessionError = "Couldn't resolve the parent directory for the sibling worktree.";
       return;
     }
     const parentDir = trimmedRepo.slice(0, lastSep);
@@ -843,9 +859,9 @@
       if (!outcome.ok) {
         if (outcome.error) {
           if (visible && repoPath && sameRepo(repoPath, baseRepo, pathOpts)) {
-            sessionError = `Could not create isolated worktree: ${outcome.error}`;
+            sessionError = `Couldn't create the isolated worktree: ${outcome.error}`;
           } else {
-            toastStore.error(`Could not create isolated worktree: ${outcome.error}`);
+            toastStore.error(`Couldn't create the isolated worktree: ${outcome.error}`);
           }
         }
         return;
@@ -875,7 +891,7 @@
         splitRoot = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
       }
     } catch (err) {
-      sessionError = `Could not create isolated worktree: ${formatError(err)}`;
+      sessionError = `Couldn't create the isolated worktree: ${describeError(err, "terminal")}`;
     } finally {
       creatingWorktreePreset = false;
     }
@@ -953,6 +969,56 @@
     const request = requestFor($taskTerminalRequests, repoPath, pathOpts, checkouts);
     return request && !canCreate && !tabFor(tabState, request) ? request : null;
   });
+
+  const repoLedgerOffers = $derived(filterOffersForRepo($sessionLedgerStore.offers, repoPath, pathOpts));
+  const repoReopenableOffers = $derived(reopenableOffers(repoLedgerOffers));
+  let reopeningLedgerRowId = $state<string | null>(null);
+  let reopeningAllLedger = $state(false);
+  let ledgerRowErrors = $state<Record<string, string>>({});
+
+  async function handleReopenLedgerRow(offer: (typeof repoLedgerOffers)[number]) {
+    reopeningLedgerRowId = offer.row_id;
+    try {
+      const outcome = await reopenSessionLedgerOffer(offer);
+      if (!outcome.reopened) {
+        ledgerRowErrors = { ...ledgerRowErrors, [offer.row_id]: outcome.error };
+      } else if (offer.row_id in ledgerRowErrors) {
+        const next = { ...ledgerRowErrors };
+        delete next[offer.row_id];
+        ledgerRowErrors = next;
+      }
+    } finally {
+      reopeningLedgerRowId = null;
+    }
+  }
+
+  async function handleReopenAllLedgerRows() {
+    reopeningAllLedger = true;
+    try {
+      const summary = await reopenAllSessionLedgerOffers(repoLedgerOffers);
+      const nextErrors = { ...ledgerRowErrors };
+      for (const item of summary.results) {
+        if (!item.reopened) nextErrors[item.offer.row_id] = item.error;
+        else delete nextErrors[item.offer.row_id];
+      }
+      ledgerRowErrors = nextErrors;
+    } finally {
+      reopeningAllLedger = false;
+    }
+  }
+
+  async function handleDismissLedgerRow(rowId: string) {
+    if (rowId in ledgerRowErrors) {
+      const next = { ...ledgerRowErrors };
+      delete next[rowId];
+      ledgerRowErrors = next;
+    }
+    try {
+      await dismissSessionLedgerRow(rowId);
+    } catch (error) {
+      ledgerRowErrors = { ...ledgerRowErrors, [rowId]: describeError(error, "terminal") };
+    }
+  }
 
   /**
    * Tabs opened for a queued request that do not hold a session slot yet.
@@ -1065,7 +1131,7 @@
     try {
       await openTaskForRun(runId);
     } catch (cause) {
-      sessionError = `That session's task couldn't be opened: ${formatError(cause)}`;
+      sessionError = `That session's task couldn't be opened: ${describeError(cause, "terminal")}`;
     }
   }
 
@@ -1083,12 +1149,19 @@
     }
   }
 
-  function newTab(launcher: SessionKind, initialPrompt?: string, autoWake = false): boolean {
+  function newTab(
+    launcher: SessionKind,
+    initialPrompt?: string,
+    autoWake = false,
+    resume?: ResumeLaunch,
+    customName?: string,
+  ): boolean {
     if (!repoPath || !canCreateKind(launcher)) return false;
     const prevActive = tabState.activeId;
     focusTabStrip = false;
     tabState = openTab(tabState, launcher, initialPrompt);
     if (autoWake && tabState.activeId) tabState = setTabAutoWake(tabState, tabState.activeId, true);
+    if (resume && tabState.activeId) tabState = setTabResume(tabState, tabState.activeId, resume, customName);
     if (splitRoot && prevActive && tabState.activeId && tabState.activeId !== prevActive && !hasPane(splitRoot, tabState.activeId)) {
       splitRoot = replacePane(splitRoot, prevActive, tabState.activeId);
     }
@@ -1116,7 +1189,7 @@
     try {
       await closeWithConfirmation(session);
     } catch (error: unknown) {
-      sessionError = formatError(error);
+      sessionError = describeError(error, "terminal");
     }
   }
 
@@ -1143,7 +1216,7 @@
       try {
         await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
       } catch (error: unknown) {
-        sessionError = formatError(error);
+        sessionError = describeError(error, "terminal");
         return;
       }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
@@ -1190,13 +1263,19 @@
         );
         return;
       }
-      const opened = newTab(claimed.launcher, claimed.prompt, claimed.autoWake === true);
+      const opened = newTab(
+        claimed.launcher,
+        claimed.prompt,
+        claimed.autoWake === true,
+        claimed.resume,
+        claimed.name,
+      );
       const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
       // started from the palette must not appear in the agent list that
       // Coverage's "View agent session" reads.
       const agent = isPromptLauncher(claimed.launcher) ? claimed.launcher : null;
-      if (opened && id && agent && claimed.prompt !== undefined) terminalLaunchRequests.remember({
+      if (opened && id && agent && (claimed.prompt !== undefined || claimed.resume !== undefined)) terminalLaunchRequests.remember({
         id, repoPath: claimed.repoPath, launcher: agent, status: "starting",
         reveal() {
           mode = "shell";
@@ -1416,7 +1495,7 @@
       try {
         await sessions[child.id]?.close();
       } catch (error: unknown) {
-        sessionError = formatError(error);
+        sessionError = describeError(error, "terminal");
         continue;
       }
       if (tabState.tabs.some((candidate) => candidate.id === child.id)) {
@@ -2052,7 +2131,7 @@
         verdict: response.policy ?? null,
       });
     } catch (err) {
-      const errMessage = formatError(err);
+      const errMessage = describeError(err, "terminal");
       executions = executions.map((e) =>
         e.id === entryId ? { ...e, running: false, error: errMessage } : e,
       );
@@ -2134,7 +2213,7 @@
 <!-- Justified: keyboard events bubble from the region's interactive controls; the region itself is not a focus stop. -->
 <div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Terminal" onkeydown={handlePanelKey}>
   <!-- Header Bar -->
-  <div class="px-3 py-1.5 bg-surface/60 flex flex-wrap gap-2 items-center shrink-0">
+  <div class="px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0">
     <div class="flex flex-1 items-center gap-2 min-w-0">
       <Terminal size={14} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
@@ -2379,11 +2458,98 @@
       <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
+  {#if repoLedgerOffers.length > 0 && mode === "shell"}
+    <div
+      class="gp-notice flex flex-col gap-1.5"
+      data-tone={repoReopenableOffers.length > 0 ? "warn" : "unknown"}
+      role="region"
+      aria-label="Recoverable agent sessions"
+      data-testid="terminal-session-ledger-banner"
+    >
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <span class="font-medium text-textPrimary" data-testid="terminal-session-ledger-heading">
+          {reopenBannerHeading(repoReopenableOffers.length)}
+        </span>
+        {#if repoReopenableOffers.length > 1}
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            data-testid="terminal-reopen-all-btn"
+            disabled={reopeningAllLedger}
+            onclick={() => void handleReopenAllLedgerRows()}
+          >
+            <RotateCw size={12} /> {reopenBannerHeading(repoReopenableOffers.length)}
+          </button>
+        {/if}
+      </div>
+      <ul class="space-y-1 max-h-40 overflow-y-auto">
+        {#each repoLedgerOffers as offer (offer.row_id)}
+          {@const rowErr = ledgerRowErrors[offer.row_id] ?? offer.last_error ?? (offer.end_state !== "unreadable" && offer.launcher !== "shell" && !offer.resumable ? offer.reason : null)}
+          <li
+            class="flex items-start justify-between gap-2 rounded-lg border border-border/60 bg-surface/60 px-2 py-1 text-micro"
+            data-testid="terminal-ledger-row"
+            data-end-state={offer.end_state}
+          >
+            <div class="min-w-0 flex-1 space-y-0.5">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <span class="font-medium text-textPrimary">
+                  {offer.end_state === "unreadable" ? "Corrupt ledger entry" : launcherLabel(offer.launcher as LauncherKind)}
+                </span>
+                <span class="gp-chip" data-tone={offer.end_state === "unreadable" ? "danger" : "neutral"}>
+                  {describeEndState(offer.end_state, offer.signal)}
+                </span>
+                {#if offer.launcher === "shell"}
+                  <span class="text-textMuted" data-testid="terminal-ledger-not-restorable">not restorable</span>
+                {:else if offer.end_state === "unreadable"}
+                  <span class="text-danger" data-testid="terminal-ledger-unreadable">unreadable</span>
+                {/if}
+                {#if offer.mode}
+                  <span class="font-mono text-textMuted">{offer.mode}</span>
+                {/if}
+              </div>
+              {#if offer.cwd}
+                <div class="font-mono text-textMuted truncate" title={offer.cwd}>{offer.cwd}</div>
+              {/if}
+              {#if rowErr}
+                <div class="text-danger" role="alert" data-testid="terminal-ledger-row-error" style="overflow-wrap:anywhere">
+                  {rowErr}
+                </div>
+              {/if}
+            </div>
+            <div class="flex items-center gap-1 shrink-0">
+              {#if offer.resumable}
+                <button
+                  type="button"
+                  class="gp-btn"
+                  data-size="sm"
+                  data-testid="terminal-ledger-reopen-btn"
+                  disabled={reopeningAllLedger || reopeningLedgerRowId === offer.row_id}
+                  onclick={() => void handleReopenLedgerRow(offer)}
+                >
+                  <RotateCw size={11} /> Reopen
+                </button>
+              {/if}
+              <button
+                type="button"
+                class="gp-icon-btn"
+                data-size="sm"
+                data-testid="terminal-ledger-dismiss-btn"
+                aria-label="Dismiss session offer"
+                title="Dismiss"
+                onclick={() => void handleDismissLedgerRow(offer.row_id)}
+              >✕</button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
   <!-- Tab strip + sessions. Rendered in BOTH modes and merely hidden in
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0 bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0"
       class:hidden={mode !== "shell"}
       data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
     >
@@ -2647,7 +2813,7 @@
             class="gp-menu-item text-textMuted"
             data-testid="terminal-preset-worktree-agent"
             disabled={!repoPath || !onCreateAgentWorktree || creatingWorktreePreset || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 1 > $terminalSessionLimit}
-            title="Provision a fresh sibling Git worktree (CoW caches + DevMap) and open an agent + live diff split inside it"
+            title="Provision a fresh sibling Git worktree (CoW caches + the code map) and open an agent + live diff split inside it"
             onclick={() => void openWorktreeAgentPreset()}
           >
             Isolated Worktree Agent Split…
@@ -3057,7 +3223,7 @@
   </div>
 
   <!-- Input Bar -->
-  <div class="p-3 bg-surface shrink-0 space-y-2">
+  <div class="p-3 shrink-0 space-y-2">
     {#if validationError}
       <div class="gp-notice mx-0! mt-0! flex items-center gap-1.5" data-tone="danger">
         <AlertCircle size={13} class="shrink-0" />

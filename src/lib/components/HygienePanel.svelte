@@ -1,5 +1,7 @@
 <script lang="ts">
   import Checkbox from "./Checkbox.svelte";
+  import ListPreviewToggle from "./ListPreviewToggle.svelte";
+  import { LIST_PREVIEW_ROWS, previewSlice } from "../ui/previewList";
   import { onMount } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { RefreshCw, ShieldCheck, FolderTree, Clock, X, GitBranch, Trash2 } from "@lucide/svelte";
@@ -11,7 +13,7 @@
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import { reportPanelError } from "../diagnostics/report";
-  import { formatError } from "../ui/formatError";
+  import { formatError, formatErrorRaw } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { readBackgroundDocument } from "../runtime/foreground";
 
@@ -21,6 +23,8 @@
   let inventory = $state<CacheInventory | null>(null);
   let plan = $state<HygienePlan | null>(null);
   let result = $state<HygieneOutcome | null>(null);
+  /** Which long lists the reader expanded; the panel remounts per repository, so they reset with it. */
+  let expandedLists = $state({ artifacts: false, entries: false });
   let busy = $state(false);
   let scanning = $state(false);
   let executing = $state(false);
@@ -135,12 +139,12 @@
       alive = false;
       epoch++;
       stopTimer();
-      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", formatError(e)));
+      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", formatErrorRaw(e)));
     };
   });
 </script>
 
-<section class="gp-card space-y-4 max-w-4xl p-4" aria-label="Repository hygiene">
+<section class="gp-card space-y-4 p-4" aria-label="Repository hygiene">
   <div class="flex items-start justify-between gap-3">
     <div>
       <h3 class="flex items-center gap-2 text-sm font-semibold text-textPrimary"><ShieldCheck size={16} /> Repository hygiene</h3>
@@ -213,7 +217,7 @@
     <summary class="cursor-pointer text-xs font-semibold text-textSecondary">Repository output ({report.artifacts.length} shown)</summary>
     {#if report.scan.truncated}<p class="mt-2 text-xs text-warn">Inventory is partial. Every selected directory must pass a separate complete inspection.</p>{/if}
     <div class="mt-2 space-y-2">
-      {#each report.artifacts as artifact (artifact.path)}
+      {#each previewSlice(report.artifacts, expandedLists.artifacts, LIST_PREVIEW_ROWS) as artifact (artifact.path)}
         {@const blocked = report.reclaim.find(item => item.label === artifact.path)?.blocked_reason}
         <div class="flex flex-wrap items-center gap-2 py-2 text-xs">
           <FolderTree size={12} class="text-textMuted" /><span class="flex-1 min-w-32 font-mono break-all">{artifact.path}</span>
@@ -227,11 +231,12 @@
         </div>
       {:else}<p class="py-2 text-xs text-textMuted">No build or cache directories were found in this scan.</p>{/each}
     </div>
+    <ListPreviewToggle class="mt-2" total={report.artifacts.length} noun="directories" bind:expanded={expandedLists.artifacts} />
   </details>
   {#if inventory}
     <div class="space-y-3">
       <h4 class="text-xs font-semibold text-textSecondary">Shared caches · measured {new Date(inventory.measured_at * 1000).toLocaleString()}</h4>
-      {#each inventory.entries as entry (entry.id)}
+      {#each previewSlice(inventory.entries, expandedLists.entries, LIST_PREVIEW_ROWS) as entry (entry.id)}
         <div class="rounded-xl bg-surface/60 p-3 text-xs space-y-1">
           <div class="flex items-center justify-between gap-2"><strong>{entry.label}</strong><span class="font-mono">{entry.bytes === null ? "Not measured" : humanBytes(entry.bytes)}</span></div>
           {#if entry.path}<p class="break-all font-mono text-textMuted">{entry.path}</p>{/if}
@@ -240,6 +245,7 @@
           {#if entry.action}<button class="gp-btn mt-2" disabled={busy || executing || scanning} onclick={() => preview(`cache:${entry.id}`)}>{entry.action}…</button>{/if}
         </div>
       {/each}
+      <ListPreviewToggle total={inventory.entries.length} noun="shared caches" bind:expanded={expandedLists.entries} />
     </div>
   {/if}
   <details class="text-xs text-textMuted">

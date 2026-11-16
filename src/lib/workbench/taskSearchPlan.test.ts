@@ -13,7 +13,7 @@ const plan = (text: string, scope: Parameters<typeof planSearch>[0] = { kind: "g
   planSearch(scope, parseTaskQuery(text), facet, repos, complete);
 function card(id: string, over: Partial<TaskCard> = {}): TaskCard {
   return {
-    id, revision: 1, updated_at: 1, title: id, kind: "task", status: "inbox", priority: 2, severity: null, owner: null,
+    id, revision: 1, updated_at: 1, title: id, kind: "task", status: "backlog", priority: 2, severity: null, owner: null,
     due_at: null, labels: [], repository_ids: ["r1"], primary_repository_id: "r1", home_workspace_id: null, position: 1,
     archived: false, completed_at: null, ...over,
   };
@@ -91,8 +91,8 @@ describe("candidates", () => {
   });
 
   it("buckets candidates into every column", () => {
-    const columns = bucketByStatus([card("a", { status: "done" }), card("b", { status: "inbox" })]);
-    expect(Object.keys(columns)).toEqual(["inbox", "backlog", "ready", "in_progress", "review", "done"]);
+    const columns = bucketByStatus([card("a", { status: "done" }), card("b", { status: "backlog" })]);
+    expect(Object.keys(columns)).toEqual(["backlog", "ready", "in_progress", "review", "done"]);
     expect(columns.done).toEqual({ items: [expect.objectContaining({ id: "a" })], total: 1, shown: 1, has_more: false, next_cursor: null });
   });
 });

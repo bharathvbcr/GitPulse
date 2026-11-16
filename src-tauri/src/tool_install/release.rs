@@ -9,7 +9,7 @@
 //! unavailable with a reason, and the source installs remain.
 
 use super::{ExternalTool, PUBLIC_DEVMAP_REPO, PUBLIC_MANVI_REPO};
-use crate::engine::git_cli;
+use crate::engine::process;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -335,11 +335,11 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, CommandError> {
     #[cfg(test)]
     NETWORK_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let curl =
-        git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
+        process::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     let mut cmd = Command::new(&curl);
     cmd.args(curl_head_args(url));
     let run =
-        git_cli::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
+        process::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
     head_verdict(run.success, &run.stdout)
         .map_err(|e| format!("{e} (curl exit {})", run.status_code))
         .map_err(CommandError::from)
@@ -347,14 +347,14 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, CommandError> {
 
 fn download_to(url: &str, dest: &Path) -> Result<(), CommandError> {
     let curl =
-        git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
+        process::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let mut cmd = Command::new(&curl);
     cmd.args(curl_download_args(url, dest));
     let run =
-        git_cli::run_bounded_capped(cmd, "curl download", DOWNLOAD_DEADLINE, None, DOWNLOAD_CAP)?;
+        process::run_bounded_capped(cmd, "curl download", DOWNLOAD_DEADLINE, None, DOWNLOAD_CAP)?;
     if !run.success {
         let err = String::from_utf8_lossy(&run.stderr);
         return Err(format!(
@@ -417,20 +417,20 @@ pub fn bytes_sha256_hex(bytes: &[u8]) -> Result<String, CommandError> {
 fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, CommandError> {
     let try_cmd = |program: &str, args: &[&str]| -> Result<String, CommandError> {
         let bin =
-            git_cli::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
+            process::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
         let mut cmd = Command::new(&bin);
         cmd.args(args);
         if let Some(path) = path {
             cmd.arg(path);
         }
         let run =
-            git_cli::run_bounded_capped(cmd, program, Duration::from_secs(60), stdin, 64 * 1024)?;
+            process::run_bounded_capped(cmd, program, Duration::from_secs(60), stdin, 64 * 1024)?;
         digest_from_run(run, program)
     };
     try_cmd("shasum", &["-a", "256"]).or_else(|_| try_cmd("sha256sum", &[]))
 }
 
-fn digest_from_run(run: git_cli::BoundedRun, program: &str) -> Result<String, CommandError> {
+fn digest_from_run(run: process::BoundedRun, program: &str) -> Result<String, CommandError> {
     let run = run.require_complete(program)?;
     if !run.success {
         return Err(format!("{program} failed").into());
@@ -475,7 +475,7 @@ fn extract_binary_from_tar_gz(
     dest: &Path,
 ) -> Result<(), CommandError> {
     let tar =
-        git_cli::find_external_tool("tar").ok_or_else(|| "tar is not installed".to_string())?;
+        process::find_external_tool("tar").ok_or_else(|| "tar is not installed".to_string())?;
     let tmp = archive
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -489,7 +489,7 @@ fn extract_binary_from_tar_gz(
         "-C",
         &tmp.display().to_string(),
     ]);
-    let run = git_cli::run_bounded_capped(
+    let run = process::run_bounded_capped(
         cmd,
         "tar extract",
         Duration::from_secs(120),
@@ -613,14 +613,15 @@ mod tests {
             ("z".repeat(64), None),
             (
                 "a".repeat(64),
-                Some(crate::engine::git_cli::Incomplete::OverCap(64)),
+                Some(crate::engine::process::Incomplete::OverCap(64)),
             ),
         ] {
-            let run = crate::engine::git_cli::BoundedRun {
+            let run = crate::engine::process::BoundedRun {
                 stdout: digest.into_bytes(),
                 stderr: Vec::new(),
                 success: true,
                 status_code: 0,
+                signal: None,
                 incomplete,
                 stderr_incomplete: None,
                 cancelled: false,

@@ -219,6 +219,13 @@
   const shown = (id: string): boolean =>
     !unsupported.has(id) && (filter.all || matchedSettings.has(id));
 
+  /**
+   * Whether a group card has any row left to show. A card is a wrapper, not a
+   * setting: it carries no `data-setting` and hides only when every row it
+   * holds is hidden, so a search never leaves an empty card behind.
+   */
+  const any = (ids: readonly string[]): boolean => ids.some(shown);
+
   // A filter that leaves the open panel behind would show an empty pane and
   // read as "no results" while results sit one category away.
   $effect(() => {
@@ -323,6 +330,14 @@
   // same failure as a setting that does nothing.
   $effect(() => {
     if (isOpen) themePreference = themeStore.preference();
+  });
+
+  // And while it is open: applying a theme preset switches the window to the
+  // preset's own appearance from inside this modal, and the segment has to
+  // say so rather than keep showing the choice that preset replaced.
+  const storedThemePreference = themeStore.preferenceState;
+  $effect(() => {
+    themePreference = $storedThemePreference;
   });
 
   /**
@@ -566,23 +581,23 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-3xl h-136 max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
+      class="w-full max-w-5xl h-184 max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 flex items-center justify-between gap-3 shrink-0">
+      <div class="px-6 pt-5 pb-4 flex items-center justify-between gap-4 shrink-0">
         <div
           id="settings-modal-title"
-          class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0"
+          class="flex items-center gap-2.5 text-base font-semibold text-textPrimary shrink-0"
         >
-          <Settings size={16} class="text-accent" />
+          <Settings size={18} class="text-accent" />
           <span>Settings</span>
         </div>
 
         <!-- Search narrows the rail AND the rows inside each panel, so a hit
              is visible without hunting down the category it landed in. -->
-        <div class="relative min-w-0 flex-1 max-w-60">
+        <div class="relative min-w-0 flex-1 max-w-72">
           <Search
-            size={12}
-            class="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-textMuted"
+            size={13}
+            class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted"
           />
           <input
             type="search"
@@ -598,16 +613,16 @@
             }}
             placeholder="Search settings"
             aria-label="Search settings"
-            class="w-full rounded-lg border border-edge bg-surfaceHover/40 py-1 pl-6 pr-6 text-meta text-textPrimary placeholder:text-textMuted focus:border-(--field-focus-edge) focus:outline-hidden"
+            class="w-full rounded-lg border border-edge bg-surfaceHover/40 py-1.5 pl-8 pr-7 text-xs text-textPrimary placeholder:text-textMuted focus:border-(--field-focus-edge) focus:outline-hidden"
           />
           {#if query}
             <button
               type="button"
               onclick={() => (query = "")}
               aria-label="Clear settings search"
-              class="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-textMuted hover:text-textPrimary"
+              class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-textMuted hover:text-textPrimary"
             >
-              <X size={11} />
+              <X size={12} />
             </button>
           {/if}
         </div>
@@ -621,7 +636,7 @@
           role="tablist"
           aria-label="Settings sections"
           aria-orientation="vertical"
-          class="w-36 shrink-0 overflow-y-auto bg-surfaceHover/30 p-2 space-y-0.5"
+          class="w-52 shrink-0 overflow-y-auto bg-surfaceHover/30 px-3 py-3 flex flex-col gap-0.5"
         >
           {#each railSections as entry (entry.id)}
             {@const Icon = SECTION_ICONS[entry.id]}
@@ -635,22 +650,22 @@
               tabindex={active ? 0 : -1}
               onclick={() => (activeSection = entry.id)}
               onkeydown={onRailKeydown}
-              class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors {active
+              class="w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs transition-colors {active
                 ? 'bg-surface text-accent font-semibold shadow-xs'
                 : 'text-textMuted hover:text-textPrimary hover:bg-surface/60'}"
             >
-              <Icon size={13} class="shrink-0" />
+              <Icon size={14} class="shrink-0" />
               <span class="truncate">{entry.label}</span>
             </button>
           {/each}
           {#if noMatches}
-            <p class="px-2 py-1.5 text-micro text-textMuted">
+            <p class="px-3 py-2 text-micro text-textMuted">
               No setting matches that.
             </p>
           {/if}
         </div>
 
-        <div class="min-h-0 flex-1 overflow-y-auto min-w-0 p-4 scroll-py-8" data-dialog-body use:scrollEdgeFade>
+        <div class="min-h-0 flex-1 overflow-y-auto min-w-0 px-8 pt-6 pb-8 scroll-py-8" data-dialog-body use:scrollEdgeFade>
           {#if noMatches}
             <p class="text-textMuted text-meta" role="status">
               Nothing on this page matches <span class="text-textPrimary">“{query}”</span>.
@@ -664,8 +679,8 @@
               aria-labelledby="settings-tab-{entry.id}"
               hidden={noMatches || activeSection !== entry.id}
             >
-              <h2 class="text-textPrimary text-sm font-semibold">{entry.label}</h2>
-              <p class="text-textMuted text-micro mt-0.5 mb-3">{entry.summary}</p>
+              <h2 class="gp-surface-title">{entry.label}</h2>
+              <p class="text-textMuted text-xs mt-1 mb-6">{entry.summary}</p>
 
               {#if entry.id === "appearance"}
                 <AppearanceSettings
@@ -678,7 +693,12 @@
                   onReplayTour={replayWalkthrough}
                 />
               {:else if entry.id === "layout"}
-                <div class="space-y-4">
+                <div class="flex flex-col gap-4">
+                  <section
+                    class="gp-card p-4 flex flex-col gap-1"
+                    hidden={!any(["status-icon", "hide-dock", "status-icon-counts", "launch-at-login"])}
+                  >
+                    <h3 class="gp-label mb-1">Background and startup</h3>
                   <div data-setting="status-icon" hidden={!shown("status-icon")}>
                     <SettingToggle
                       label={statusIconSettingLabel($hostPlatform.os)}
@@ -688,7 +708,9 @@
                       onchange={(next) => interfaceStore.setShowStatusIcon(next)}
                     />
                   </div>
-                  <div class="space-y-3 pl-1">
+                  <!-- Both rows act only while the status icon is on, so they sit
+                       under it, indented. -->
+                  <div class="flex flex-col gap-1 pl-4">
                     <div data-setting="hide-dock" hidden={!shown("hide-dock")}>
                       <SettingToggle
                         label="Hide Dock icon while closed"
@@ -709,27 +731,64 @@
                         onchange={(next) => interfaceStore.setStatusIconCounts(next)}
                       />
                     </div>
-                    <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
-                      <SettingToggle
-                        label="Open at login"
-                        description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
-                        ariaLabel="Open GitPulse at login"
-                        checked={launchAtLogin.state === "on"}
-                        disabled={launchRow.disabled}
-                        onchange={(next) => void setLaunchAtLogin(next)}
-                      />
-                      {#if launchRow.note}
-                        <p
-                          class="mt-1 text-micro {launchRow.note.tone === 'warn' ? 'text-warn' : 'text-textMuted'}"
-                          role="status"
-                        >
-                          {launchRow.note.text}
-                        </p>
-                      {/if}
-                    </div>
                   </div>
-                  <div data-setting="status-bar" hidden={!shown("status-bar")}>
-                    <div class="text-textMuted text-micro mb-1.5">Status bar</div>
+                  <div data-setting="launch-at-login" hidden={!shown("launch-at-login")}>
+                    <SettingToggle
+                      label="Open at login"
+                      description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
+                      ariaLabel="Open GitPulse at login"
+                      checked={launchAtLogin.state === "on"}
+                      disabled={launchRow.disabled}
+                      onchange={(next) => void setLaunchAtLogin(next)}
+                    />
+                    {#if launchRow.note}
+                      <p
+                        class="mt-1 text-micro {launchRow.note.tone === 'warn' ? 'text-warn' : 'text-textMuted'}"
+                        role="status"
+                      >
+                        {launchRow.note.text}
+                      </p>
+                    {/if}
+                  </div>
+                  </section>
+
+                  <section
+                    class="gp-card p-4 flex flex-col gap-4"
+                    hidden={!any(["header-labels", "diagnostics-button"])}
+                  >
+                    <h3 class="gp-label">Header</h3>
+                  <div data-setting="header-labels" hidden={!shown("header-labels")}>
+                    <div class="text-textPrimary text-meta font-medium mb-2">Button labels</div>
+                    <SettingSegment
+                      ariaLabel="Header button labels"
+                      options={HEADER_LABEL_OPTIONS}
+                      value={$interfaceStore.headerLabels}
+                      onselect={(mode) => interfaceStore.setHeaderLabels(mode)}
+                    />
+                    <p class="text-textMuted text-micro mt-1.5">
+                      Automatic shows words on the header's buttons from 1100 px of window width
+                      and icons below it.
+                    </p>
+                  </div>
+
+                  <div data-setting="diagnostics-button" hidden={!shown("diagnostics-button")}>
+                    <div class="text-textPrimary text-meta font-medium mb-2">Diagnostics button</div>
+                    <SettingSegment
+                      ariaLabel="Diagnostics button visibility"
+                      options={DIAGNOSTICS_OPTIONS}
+                      value={$interfaceStore.diagnosticsButton}
+                      onselect={(mode) => interfaceStore.setDiagnosticsButton(mode)}
+                    />
+                  </div>
+                  </section>
+
+                  <section
+                    class="gp-card p-4 flex flex-col gap-1"
+                    hidden={!any(["status-bar", "language-bar", "harness-badges"])}
+                  >
+                    <h3 class="gp-label mb-1">Status bar</h3>
+                  <div data-setting="status-bar" hidden={!shown("status-bar")} class="pb-2">
+                    <div class="text-textPrimary text-meta font-medium mb-2">Detail</div>
                     <SettingSegment
                       ariaLabel="Status bar detail"
                       options={STATUS_BAR_OPTIONS}
@@ -742,33 +801,47 @@
                       warning.
                     </p>
                   </div>
+                    <div data-setting="language-bar" hidden={!shown("language-bar")}>
+                      <SettingToggle
+                        label="Language mix"
+                        description="Dominant language in the status bar; click it for the full breakdown."
+                        ariaLabel="Show the language mix in the status bar"
+                        checked={$interfaceStore.showLanguageBar}
+                        onchange={(next) => interfaceStore.setShowLanguageBar(next)}
+                      />
+                      {#if $interfaceStore.showLanguageBar}
+                        <div class="mt-1 mb-2 pl-4 flex flex-col gap-1.5">
+                          <div class="text-textPrimary text-meta font-medium">Code percentage basis</div>
+                          <SettingSegment
+                            ariaLabel="Code percentage calculation options"
+                            options={CODE_PERCENTAGE_OPTIONS}
+                            value={$interfaceStore.codePercentageMode}
+                            onselect={(mode) => interfaceStore.setCodePercentageMode(mode)}
+                          />
+                          <p class="text-textMuted text-micro">
+                            {$interfaceStore.codePercentageMode === "code-only"
+                              ? "Percentages reflect only programming code files; markdowns and notes are excluded."
+                              : "Note: Markdowns and note files are counted toward percentages with an explanatory note."}
+                          </p>
+                        </div>
+                      {/if}
+                    </div>
+                    <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
+                      <SettingToggle
+                        label="Manvi status"
+                        description="Policy and local-model status: in the status bar on a repository, in the title bar on Fleet, Agents and Tasks."
+                        ariaLabel="Show Manvi status"
+                        checked={$interfaceStore.showHarnessBadges}
+                        onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
+                      />
+                    </div>
+                  </section>
 
-                  <div data-setting="diagnostics-button" hidden={!shown("diagnostics-button")}>
-                    <div class="text-textMuted text-micro mb-1.5">Diagnostics button</div>
-                    <SettingSegment
-                      ariaLabel="Diagnostics button visibility"
-                      options={DIAGNOSTICS_OPTIONS}
-                      value={$interfaceStore.diagnosticsButton}
-                      onselect={(mode) => interfaceStore.setDiagnosticsButton(mode)}
-                    />
-                  </div>
-
-                  <div data-setting="header-labels" hidden={!shown("header-labels")}>
-                    <div class="text-textMuted text-micro mb-1.5">Header button labels</div>
-                    <SettingSegment
-                      ariaLabel="Header button labels"
-                      options={HEADER_LABEL_OPTIONS}
-                      value={$interfaceStore.headerLabels}
-                      onselect={(mode) => interfaceStore.setHeaderLabels(mode)}
-                    />
-                    <p class="text-meta text-faint mt-1.5">
-                      Automatic shows words on the header's buttons from 1100 px of window width
-                      and icons below it.
-                    </p>
-                  </div>
-
-                  <div class="gp-separator" aria-hidden="true"></div>
-                  <div class="space-y-0.5 pt-1">
+                  <section
+                    class="gp-card p-4 flex flex-col gap-1"
+                    hidden={!any(["repo-tabs", "stack-worktree-tabs", "collapse-inactive-group-tabs", "collapse-inactive-include-shells"])}
+                  >
+                    <h3 class="gp-label mb-1">Repository tabs</h3>
                     <div data-setting="repo-tabs" hidden={!shown("repo-tabs")}>
                       <SettingToggle
                         label="Hide repository tabs when alone"
@@ -805,45 +878,11 @@
                         onchange={(next) => interfaceStore.setCollapseInactiveIncludeShells(next)}
                       />
                     </div>
-                    <div data-setting="language-bar" hidden={!shown("language-bar")}>
-                      <SettingToggle
-                        label="Language mix"
-                        description="Dominant language in the status bar; click it for the full breakdown."
-                        ariaLabel="Show the language mix in the status bar"
-                        checked={$interfaceStore.showLanguageBar}
-                        onchange={(next) => interfaceStore.setShowLanguageBar(next)}
-                      />
-                      {#if $interfaceStore.showLanguageBar}
-                        <div class="mt-2 ml-4 pl-3 space-y-1.5">
-                          <div class="text-textMuted text-micro">Code percentage basis</div>
-                          <SettingSegment
-                            ariaLabel="Code percentage calculation options"
-                            options={CODE_PERCENTAGE_OPTIONS}
-                            value={$interfaceStore.codePercentageMode}
-                            onselect={(mode) => interfaceStore.setCodePercentageMode(mode)}
-                          />
-                          <p class="text-textMuted text-micro">
-                            {$interfaceStore.codePercentageMode === "code-only"
-                              ? "Percentages reflect only programming code files; markdowns and notes are excluded."
-                              : "Note: Markdowns and note files are counted toward percentages with an explanatory note."}
-                          </p>
-                        </div>
-                      {/if}
-                    </div>
-                    <div data-setting="harness-badges" hidden={!shown("harness-badges")}>
-                      <SettingToggle
-                        label="Manvi status in the title bar"
-                        description="Policy and local-model status in the title bar."
-                        ariaLabel="Show Manvi status in the title bar"
-                        checked={$interfaceStore.showHarnessBadges}
-                        onchange={(next) => interfaceStore.setShowHarnessBadges(next)}
-                      />
-                    </div>
-                  </div>
+                  </section>
                 </div>
               {:else if entry.id === "views"}
-                <div class="space-y-3" data-setting="view-visibility">
-                  <p class="text-textMuted text-micro">
+                <div class="gp-card p-4 flex flex-col gap-4" data-setting="view-visibility">
+                  <p class="text-textMuted text-micro leading-relaxed">
                     Unchecking a view removes it from the header only. It stays reachable from
                     the command palette ({shortcutTextLabel("⌘K", $hostPlatform.os)}) and the View menu, the view you are currently in
                     always shows, and Work reappears on its own while conflicts are
@@ -853,7 +892,7 @@
                   <!-- One flat list: the header is four tabs, so grouping
                        them under "header tabs" / "header menu" headings would
                        be describing a distinction that no longer exists. -->
-                  <div class="grid grid-cols-2 gap-x-3 gap-y-0.5">
+                  <div class="grid grid-cols-2 gap-x-6 gap-y-1">
                     {#each VIEW_NAV as item (item.id)}
                       {@const shown = !hiddenViews.includes(item.id)}
                       <Checkbox
@@ -865,8 +904,7 @@
                     {/each}
                   </div>
 
-                  <div class="gp-separator" aria-hidden="true"></div>
-                  <div class="flex items-center justify-between gap-3 pt-1">
+                  <div class="flex items-center justify-between gap-3">
                     <span class="text-textMuted text-micro">
                       {hiddenViews.length === 0
                         ? "Every view is listed in the header."
@@ -883,9 +921,11 @@
                   </div>
                 </div>
               {:else if entry.id === "graph"}
-                <div class="space-y-4">
+                <div class="flex flex-col gap-4">
+                  <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(["graph-width", "ref-scope"])}>
+                    <h3 class="gp-label">Graph</h3>
                   <div data-setting="graph-width" hidden={!shown("graph-width")}>
-                    <div class="text-textMuted text-micro mb-1.5">Graph width</div>
+                    <div class="text-textPrimary text-meta font-medium mb-2">Width</div>
                     <SettingSegment
                       ariaLabel="Graph width"
                       options={GRAPH_WIDTH_OPTIONS}
@@ -894,7 +934,7 @@
                     />
                   </div>
                   <div data-setting="ref-scope" hidden={!shown("ref-scope")}>
-                    <div class="text-textMuted text-micro mb-1.5">Refs drawn</div>
+                    <div class="text-textPrimary text-meta font-medium mb-2">Refs drawn</div>
                     <SettingSegment
                       ariaLabel="Refs drawn"
                       options={REF_SCOPE_OPTIONS}
@@ -909,12 +949,10 @@
                       silently dropped.
                     </p>
                   </div>
-                  <div
-                    data-setting="graph-avatars"
-                    hidden={!shown("graph-avatars")}
-                    class="pt-1"
-                  >
-                    <div class="gp-separator" aria-hidden="true"></div>
+                  </section>
+                  <section class="gp-card p-4 flex flex-col gap-1" hidden={!any(["graph-avatars", "github-avatars"])}>
+                    <h3 class="gp-label mb-1">Authors</h3>
+                  <div data-setting="graph-avatars" hidden={!shown("graph-avatars")}>
                     <SettingToggle
                       label="Author avatars"
                       description="Initial badges beside the branches in the graph."
@@ -923,17 +961,34 @@
                       onchange={(next) => interfaceStore.setShowGraphAvatars(next)}
                     />
                   </div>
+                  <div data-setting="github-avatars" hidden={!shown("github-avatars")}>
+                    <SettingToggle
+                      label="Show GitHub profile pictures"
+                      description="On by default. When a repository has a GitHub remote, GitPulse asks GitHub through the GitHub CLI which account each commit email belongs to, and loads profile pictures from avatars.githubusercontent.com. Commits made with a GitHub noreply address load their picture directly from there. Off shows initials only and makes no requests."
+                      ariaLabel="Show GitHub profile pictures for commit authors"
+                      checked={$interfaceStore.showGithubAvatars}
+                      onchange={(next) => interfaceStore.setShowGithubAvatars(next)}
+                    />
+                  </div>
+                  </section>
                 </div>
               {:else if entry.id === "diff"}
-                <div class="space-y-4">
-                  <p class="text-textMuted text-micro">
-                    The first three set what a diff <em>opens</em> as. The toolbar above
-                    each diff still switches the file in front of you; what changes here
-                    is where it starts, which used to reset on every file.
-                  </p>
+                <div class="flex flex-col gap-4">
+                  <section
+                    class="gp-card p-4 flex flex-col gap-3"
+                    hidden={!any(["diff-layout", "diff-wrap", "diff-syntax", "diff-whitespace"])}
+                  >
+                    <div>
+                      <h3 class="gp-label">Opening a diff</h3>
+                      <p class="text-textMuted text-micro mt-1">
+                        These set what a diff <em>opens</em> as. The toolbar above each diff
+                        still switches the file in front of you; what changes here is where it
+                        starts, which used to reset on every file.
+                      </p>
+                    </div>
 
-                  <div data-setting="diff-layout" hidden={!shown("diff-layout")}>
-                    <div class="text-textMuted text-micro mb-1.5">Default layout</div>
+                  <div data-setting="diff-layout" hidden={!shown("diff-layout")} class="pb-1">
+                    <div class="text-textPrimary text-meta font-medium mb-2">Default layout</div>
                     <SettingSegment
                       ariaLabel="Default diff layout"
                       options={DIFF_LAYOUT_OPTIONS}
@@ -942,7 +997,7 @@
                     />
                   </div>
 
-                  <div class="space-y-0.5">
+                  <div class="flex flex-col gap-1">
                     <div data-setting="diff-wrap" hidden={!shown("diff-wrap")}>
                       <SettingToggle
                         label="Wrap long lines"
@@ -955,7 +1010,7 @@
                     <div data-setting="diff-syntax" hidden={!shown("diff-syntax")}>
                       <SettingToggle
                         label="Syntax highlighting"
-                        description="Language colouring inside diff rows. Turning it off makes very large diffs cheaper to scroll."
+                        description="Language coloring inside diff rows. Turning it off makes very large diffs cheaper to scroll."
                         ariaLabel="Open diffs with syntax highlighting on"
                         checked={$interfaceStore.diffSyntaxHighlight}
                         onchange={(next) => interfaceStore.setDiffSyntaxHighlight(next)}
@@ -971,14 +1026,12 @@
                       />
                     </div>
                   </div>
+                  </section>
 
-                  <div
-                    data-setting="tab-width"
-                    hidden={!shown("tab-width")}
-                    class="pt-1"
-                  >
-                    <div class="gp-separator" aria-hidden="true"></div>
-                    <div class="text-textMuted text-micro mb-1.5">Tab width</div>
+                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["tab-width"])}>
+                    <h3 class="gp-label">Code display</h3>
+                  <div data-setting="tab-width" hidden={!shown("tab-width")}>
+                    <div class="text-textPrimary text-meta font-medium mb-2">Tab width</div>
                     <SettingSegment
                       ariaLabel="Tab width"
                       options={TAB_WIDTH_OPTIONS}
@@ -992,9 +1045,14 @@
                       rewrites the bytes in the file.
                     </p>
                   </div>
+                  </section>
                 </div>
               {:else if entry.id === "analysis"}
-                <div class="space-y-3">
+                <section
+                  class="gp-card p-4 flex flex-col gap-1"
+                  hidden={!any(["auto-github-alerts", "auto-coverage"])}
+                >
+                  <h3 class="gp-label mb-1">When a repository opens</h3>
                   <div data-setting="auto-github-alerts" hidden={!shown("auto-github-alerts")}>
                     <SettingToggle
                       label="Check GitHub alerts on launch"
@@ -1013,263 +1071,292 @@
                       onchange={(next) => interfaceStore.setAutoRunCoverage(next)}
                     />
                   </div>
-                </div>
+                </section>
               {:else if entry.id === "agents"}
-                <div data-setting="apple-intelligence" hidden={!shown("apple-intelligence")}>
-                  <div class="text-textMuted text-micro mb-1.5">Apple Intelligence</div>
-                  <p class="text-textMuted text-micro mb-2">
-                    Drafts task titles and descriptions with the on-device model. Nothing leaves
-                    this computer, and no local model server is needed. Choose it per task in
-                    the enhancement panel.
-                  </p>
-                  <div class="flex items-start gap-1.5 text-micro"
-                    class:text-warn={apple !== null && !appleReady(apple)}
-                    class:text-textMuted={apple === null || appleReady(apple)}>
-                    {#if apple !== null && !appleReady(apple)}
-                      <AlertTriangle size={12} class="shrink-0 mt-px" />
-                    {/if}
-                    <!-- Already specific to the cause. A build compiled without
-                         the bridge says exactly that, and never blames the Mac:
-                         this row is the only place that answer is ever shown,
-                         because the per-task control hides an option nothing in
-                         the app can enable. -->
-                    <span data-testid="apple-intelligence-status">
-                      {apple?.detail ?? "Checking whether Apple Intelligence is available…"}
-                    </span>
+                <div class="flex flex-col gap-4">
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["agent-defaults"])}>
+                  <div data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
+                    <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
                   </div>
-                  <button
-                    type="button"
-                    onclick={() => void loadApple()}
-                    class="gp-btn mt-2" data-size="sm"
-                  >
-                    Refresh
-                  </button>
-                </div>
-                <div class="mt-3 pt-3" data-setting="lappi" hidden={!shown("lappi")}>
-                  <LappiSettings active={isOpen && activeSection === "agents"} />
-                </div>
-                <div class="mt-3 pt-3" data-setting="host-load" hidden={!shown("host-load")}>
-                  <HostLoadSetting active={isOpen && activeSection === "agents"} />
-                </div>
-                <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
-                  <p class="text-textMuted text-micro mb-2">
-                    Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
-                    ships a manifest for each. The one read and copied below is the Codex manifest
-                    (<code class="font-mono">.codex-plugin/plugin.json</code> +
-                    <code class="font-mono">.mcp.json</code>); all of them speak MCP 2026-07-28. The
-                    surface is read-only: it never checks out a branch or writes a file.
-                  </p>
-                  {#if mcpError}
-                    <div
-                      class="flex items-start gap-1.5 text-warn text-micro mb-2"
-                    >
-                      <AlertTriangle size={12} class="shrink-0 mt-px" />
-                      <span>{mcpError}</span>
-                    </div>
-                  {:else if !mcpInfo}
-                    <p class="text-textMuted text-micro mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
-                  {:else}
-                    <div class="space-y-1.5 rounded-xl border border-edge bg-surfaceHover/40 p-2.5">
-                      <div class="flex items-start gap-2">
-                        <Plug size={13} class="text-accent shrink-0 mt-0.5" />
-                        <div class="min-w-0">
-                          <div class="text-textPrimary text-meta font-medium">
-                            {mcpInfo.server_name} · MCP {mcpInfo.protocol_version}
-                          </div>
-                          <div class="text-textMuted text-micro font-mono break-all">
-                            {#if mcpInfo.binary_found}
-                              {mcpInfo.binary_path}
-                            {:else}
-                              {mcpInfo.binary_error}
-                            {/if}
-                          </div>
-                          <div class="text-textMuted text-micro font-mono break-all" data-testid="hook-binary-status">
-                            gitpulse-hook:
-                            {#if mcpInfo.hook_found}
-                              {mcpInfo.hook_path}
-                            {:else}
-                              not reachable. {mcpInfo.hook_error}
-                            {/if}
-                          </div>
-                          {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
-                            <div class="text-warn text-micro mt-1" data-testid="path-status">
-                              {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
-                                <code class="font-mono">gitpulse-mcp</code> and <code class="font-mono">gitpulse-hook</code> are not on PATH, so the plugin's own manifests cannot start them.
-                              {:else if !mcpInfo.binary_on_path}
-                                <code class="font-mono">gitpulse-mcp</code> is not on PATH, so the plugin's own manifest cannot start it.
-                              {:else}
-                                <code class="font-mono">gitpulse-hook</code> is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
-                              {/if}
-                              Copy the manifests below instead: they name the binaries by absolute path.
-                            </div>
-                          {/if}
-                          <div class="text-textMuted text-micro mt-1">
-                            {#if mcpInfo.plugin_found}
-                              Plugin: {mcpInfo.plugin_path}
-                              {#if mcpInfo.plugin_error.trim()}
-                                <span class="text-warn break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
-                              {/if}
-                            {:else}
-                              {mcpInfo.plugin_error}
-                            {/if}
-                          </div>
-                        </div>
-                      </div>
-                      <div class="flex flex-wrap gap-1.5 pt-1">
-                        <button
-                          type="button"
-                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
-                          disabled={!mcpInfo.plugin_manifest_json}
-                          onclick={() => void copyMcp("plugin", mcpInfo?.plugin_manifest_json ?? "")}
-                        >
-                          {#if mcpCopied === "plugin"}<Check size={10} />{:else}<Copy size={10} />{/if}
-                          .codex-plugin/plugin.json
-                        </button>
-                        <button
-                          type="button"
-                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
-                          disabled={!mcpInfo.mcp_config_json}
-                          onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
-                        >
-                          {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
-                          .mcp.json
-                        </button>
-                        <button
-                          type="button"
-                          class="gp-btn inline-flex items-center gap-1" data-size="sm"
-                          disabled={!mcpInfo.hooks_config_json}
-                          onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
-                        >
-                          {#if mcpCopied === "hooks"}<Check size={10} />{:else}<Copy size={10} />{/if}
-                          hooks.json
-                        </button>
-                      </div>
-                      {#if mcpInfo.hooks_config_json}
-                        <p class="text-micro text-textMuted" data-testid="hooks-version-floor">
-                          On Windows the copied safety hooks block a call when gitpulse-hook cannot start only on Claude Code 2.1.295 or later; older versions let it through.
-                        </p>
-                      {/if}
-                      {#if mcpInfo.tools.length > 0}
-                        <details class="pt-1">
-                          <summary class="cursor-pointer text-micro text-textMuted">
-                            {mcpInfo.tools.length} tools (start with {FIRST_AGENT_TOOL})
-                          </summary>
-                          <ul class="mt-1 space-y-0.5 max-h-32 overflow-y-auto">
-                            {#each mcpInfo.tools as tool, i (`${tool.name}#${i}`)}
-                              <li class="font-mono text-micro text-textPrimary">
-                                {tool.name}
-                                <span class="text-textMuted font-sans"> — {tool.title}</span>
-                              </li>
-                            {/each}
-                          </ul>
-                        </details>
-                      {/if}
-                    </div>
-                  {/if}
-                </div>
-                <div class="mt-3" data-setting="manvi-policy" hidden={!shown("manvi-policy")}>
-                  <ManviConnection onNavigate={() => onClose?.()} />
-                </div>
-                <div class="mt-3" data-setting="local-model-servers" hidden={!shown("local-model-servers")}>
-                  <LocalModelServers />
-                </div>
-                <div data-setting="external-tools" hidden={!shown("external-tools")} class="mt-3 space-y-1.5">
-                  <h4 class="gp-label">
-                    External CLIs
-                  </h4>
-                  <p class="text-textMuted text-micro">
-                    Install or update <span class="font-mono">{CLI_NAMES.codeMap}</span> (the code map) and
-                    <span class="font-mono">{CLI_NAMES.policy}</span> (policy checks) via the install ladder:
-                    PATH → prebuilt release → cargo/go install → local checkout. Env vars still win
-                    over saved config.
-                  </p>
-                  <button
-                    type="button"
-                    class="gp-btn" data-size="sm"
-                    onclick={runToolsSetup}
-                  >
-                    Run setup
-                  </button>
-                  <ExternalToolsPanel onInstalled={(tool) => { if (tool === "manvi") void harnessStore.reconnect(); }} />
-                  <div class="mt-3 pt-3">
-                    <DevcouncilSuitePanel
-                      repoPath={$repoStore.currentPath}
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(["agent-live-runs", "terminal-sessions", "keep-terminals"])}>
+                  <h3 class="gp-label">Sessions and limits</h3>
+                  <div data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
+                    <AgentLimitSetting
+                      field={LIMIT_FIELDS.liveRuns}
+                      label="Agents running at once"
+                      testid="agent-live-runs"
+                      max={MAX_LIVE_RUNS}
+                      fallback={DEFAULT_LIVE_RUNS}
                       active={isOpen && activeSection === "agents"}
+                    >
+                      Task runs that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
+                      Each checkout still runs one at a time; a busy one gives the next run its own worktree.
+                      Terminal runs also need a free terminal session.
+                    </AgentLimitSetting>
+                  </div>
+                  <div data-setting="terminal-sessions" hidden={!shown("terminal-sessions")}>
+                    <AgentLimitSetting
+                      field={LIMIT_FIELDS.terminalSessions}
+                      label="Terminal sessions open at once"
+                      testid="terminal-sessions"
+                      max={MAX_TERMINAL_SESSIONS}
+                      fallback={DEFAULT_TERMINAL_SESSIONS}
+                      active={isOpen && activeSection === "agents"}
+                    >
+                      Shells, agent tabs and task terminals that may be open together, across every repository — up to {MAX_TERMINAL_SESSIONS}, {DEFAULT_TERMINAL_SESSIONS} unless you change it.
+                      Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
+                    </AgentLimitSetting>
+                  </div>
+                  <div data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
+                    <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["session-alerts", "bell-asks"])}>
+                  <!-- Siblings of the external-tools wrapper, never inside it:
+                       a search that matched one of these but not the CLIs hid
+                       its parent and so hid it too, leaving an empty panel. -->
+                  <div data-setting="session-alerts" hidden={!shown("session-alerts")}>
+                    <SessionAlertSettings active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="bell-asks" hidden={!shown("bell-asks")}>
+                    <SettingToggle
+                      label="Count a terminal bell as waiting for you"
+                      description="Off by default: turn this on so a terminal bell from an agent without hooks (Codex, Cursor, or a shell program) counts as waiting on the board, the task pane, the Agents view and the menu-bar count. While off, the Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
+                      ariaLabel="Count a terminal bell as waiting for you"
+                      checked={$interfaceStore.bellAsksForReader}
+                      onchange={(next) => interfaceStore.setBellAsksForReader(next)}
                     />
                   </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(["agent-setting-sources", "agent-models"])}>
+                  <h3 class="gp-label">Settings files and models</h3>
+                  <div data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
+                    <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="agent-models" hidden={!shown("agent-models")}>
+                    <AgentModelSettings active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <div data-setting="manvi-policy" hidden={!shown("manvi-policy")}>
+                  <ManviConnection onNavigate={() => onClose?.()} />
                 </div>
-                <!-- Siblings of the external-tools wrapper, never inside it:
-                     a search that matched one of these but not the CLIs hid
-                     its parent and so hid it too, leaving an empty panel. -->
-                <div class="mt-3 pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
-                  <SessionAlertSettings active={isOpen && activeSection === "agents"} />
+                <div data-setting="local-model-servers" hidden={!shown("local-model-servers")}>
+                  <LocalModelServers />
                 </div>
-                <div class="mt-3 pt-3" data-setting="bell-asks" hidden={!shown("bell-asks")}>
-                  <SettingToggle
-                    label="Count a terminal bell as waiting for you"
-                    description="On by default: an agent without hooks can only ask for you by ringing the bell, so turning this off stops those asks from counting on the board, the task pane, the Agents view and the menu-bar count. The Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
-                    ariaLabel="Count a terminal bell as waiting for you"
-                    checked={$interfaceStore.bellAsksForReader}
-                    onchange={(next) => interfaceStore.setBellAsksForReader(next)}
-                  />
-                </div>
-                <div class="mt-3 pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
-                  <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
-                </div>
-                <div class="mt-3 pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
-                  <AgentLimitSetting
-                    field={LIMIT_FIELDS.liveRuns}
-                    label="Agents running at once"
-                    testid="agent-live-runs"
-                    max={MAX_LIVE_RUNS}
-                    fallback={DEFAULT_LIVE_RUNS}
-                    active={isOpen && activeSection === "agents"}
-                  >
-                    Task runs that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
-                    Each checkout still runs one at a time; a busy one gives the next run its own worktree.
-                    Terminal runs also need a free terminal session.
-                  </AgentLimitSetting>
-                </div>
-                <div class="mt-3 pt-3" data-setting="terminal-sessions" hidden={!shown("terminal-sessions")}>
-                  <AgentLimitSetting
-                    field={LIMIT_FIELDS.terminalSessions}
-                    label="Terminal sessions open at once"
-                    testid="terminal-sessions"
-                    max={MAX_TERMINAL_SESSIONS}
-                    fallback={DEFAULT_TERMINAL_SESSIONS}
-                    active={isOpen && activeSection === "agents"}
-                  >
-                    Shells, agent tabs and task terminals that may be open together, across every repository — up to {MAX_TERMINAL_SESSIONS}, {DEFAULT_TERMINAL_SESSIONS} unless you change it.
-                    Applies to the next session. Lowering it closes nothing; new sessions wait until enough close.
-                  </AgentLimitSetting>
-                </div>
-                <div class="mt-3 pt-3" data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
-                  <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
-                </div>
-                <div class="mt-3 pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
-                  <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />
-                </div>
-                <div class="mt-3 pt-3" data-setting="agent-models" hidden={!shown("agent-models")}>
-                  <AgentModelSettings active={isOpen && activeSection === "agents"} />
-                </div>
-                <!-- Part of the external-tools entry (it has no catalog row of
-                     its own), so it follows that entry's visibility. -->
-                <div class="mt-3 pt-3" hidden={!shown("external-tools")}>
-                  <AgentIntegrationPanel
-                    repoPath={isOpen && activeSection === "agents"
-                      ? $repoStore.currentPath
-                      : null}
-                  />
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["apple-intelligence"])}>
+                  <h3 class="gp-label">Apple Intelligence</h3>
+                  <div data-setting="apple-intelligence" hidden={!shown("apple-intelligence")}>
+                    <p class="text-textMuted text-micro mb-2">
+                      Drafts task titles and descriptions with the on-device model. Nothing leaves
+                      this computer, and no local model server is needed. Choose it per task in
+                      the enhancement panel.
+                    </p>
+                    <div class="flex items-start gap-1.5 text-micro"
+                      class:text-warn={apple !== null && !appleReady(apple)}
+                      class:text-textMuted={apple === null || appleReady(apple)}>
+                      {#if apple !== null && !appleReady(apple)}
+                        <AlertTriangle size={12} class="shrink-0 mt-px" />
+                      {/if}
+                      <!-- Already specific to the cause. A build compiled without
+                           the bridge says exactly that, and never blames the Mac:
+                           this row is the only place that answer is ever shown,
+                           because the per-task control hides an option nothing in
+                           the app can enable. -->
+                      <span data-testid="apple-intelligence-status">
+                        {apple?.detail ?? "Checking whether Apple Intelligence is available…"}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onclick={() => void loadApple()}
+                      class="gp-btn mt-2" data-size="sm"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["lappi"])}>
+                  <div data-setting="lappi" hidden={!shown("lappi")}>
+                    <LappiSettings active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["host-load"])}>
+                  <div data-setting="host-load" hidden={!shown("host-load")}>
+                    <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["mcp-plugin"])}>
+                  <h3 class="gp-label">MCP plugin</h3>
+                  <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
+                    <p class="text-textMuted text-micro mb-2">
+                      Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
+                      ships a manifest for each. The one read and copied below is the Codex manifest
+                      (<code class="font-mono">.codex-plugin/plugin.json</code> +
+                      <code class="font-mono">.mcp.json</code>); all of them speak MCP 2026-07-28. The
+                      surface is read-only: it never checks out a branch or writes a file.
+                    </p>
+                    {#if mcpError}
+                      <div
+                        class="flex items-start gap-1.5 text-warn text-micro mb-2"
+                      >
+                        <AlertTriangle size={12} class="shrink-0 mt-px" />
+                        <span>{mcpError}</span>
+                      </div>
+                    {:else if !mcpInfo}
+                      <p class="text-textMuted text-micro mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
+                    {:else}
+                      <div class="space-y-1.5 rounded-xl border border-edge bg-surfaceHover/40 p-2.5">
+                        <div class="flex items-start gap-2">
+                          <Plug size={13} class="text-accent shrink-0 mt-0.5" />
+                          <div class="min-w-0">
+                            <div class="text-textPrimary text-meta font-medium">
+                              {mcpInfo.server_name} · MCP {mcpInfo.protocol_version}
+                            </div>
+                            <div class="text-textMuted text-micro font-mono break-all">
+                              {#if mcpInfo.binary_found}
+                                {mcpInfo.binary_path}
+                              {:else}
+                                {mcpInfo.binary_error}
+                              {/if}
+                            </div>
+                            <div class="text-textMuted text-micro font-mono break-all" data-testid="hook-binary-status">
+                              gitpulse-hook:
+                              {#if mcpInfo.hook_found}
+                                {mcpInfo.hook_path}
+                              {:else}
+                                not reachable. {mcpInfo.hook_error}
+                              {/if}
+                            </div>
+                            {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
+                              <div class="text-warn text-micro mt-1" data-testid="path-status">
+                                {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
+                                  <code class="font-mono">gitpulse-mcp</code> and <code class="font-mono">gitpulse-hook</code> are not on PATH, so the plugin's own manifests cannot start them.
+                                {:else if !mcpInfo.binary_on_path}
+                                  <code class="font-mono">gitpulse-mcp</code> is not on PATH, so the plugin's own manifest cannot start it.
+                                {:else}
+                                  <code class="font-mono">gitpulse-hook</code> is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                                {/if}
+                                Copy the manifests below instead: they name the binaries by absolute path.
+                              </div>
+                            {/if}
+                            <div class="text-textMuted text-micro mt-1">
+                              {#if mcpInfo.plugin_found}
+                                Plugin: {mcpInfo.plugin_path}
+                                {#if mcpInfo.plugin_error.trim()}
+                                  <span class="text-warn break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
+                                {/if}
+                              {:else}
+                                {mcpInfo.plugin_error}
+                              {/if}
+                            </div>
+                          </div>
+                        </div>
+                        <div class="flex flex-wrap gap-1.5 pt-1">
+                          <button
+                            type="button"
+                            class="gp-btn inline-flex items-center gap-1" data-size="sm"
+                            disabled={!mcpInfo.plugin_manifest_json}
+                            onclick={() => void copyMcp("plugin", mcpInfo?.plugin_manifest_json ?? "")}
+                          >
+                            {#if mcpCopied === "plugin"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                            .codex-plugin/plugin.json
+                          </button>
+                          <button
+                            type="button"
+                            class="gp-btn inline-flex items-center gap-1" data-size="sm"
+                            disabled={!mcpInfo.mcp_config_json}
+                            onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
+                          >
+                            {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                            .mcp.json
+                          </button>
+                          <button
+                            type="button"
+                            class="gp-btn inline-flex items-center gap-1" data-size="sm"
+                            disabled={!mcpInfo.hooks_config_json}
+                            onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
+                          >
+                            {#if mcpCopied === "hooks"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                            hooks.json
+                          </button>
+                        </div>
+                        {#if mcpInfo.hooks_config_json}
+                          <p class="text-micro text-textMuted" data-testid="hooks-version-floor">
+                            On Windows the copied safety hooks block a call when gitpulse-hook cannot start only on Claude Code 2.1.295 or later; older versions let it through.
+                          </p>
+                        {/if}
+                        {#if mcpInfo.tools.length > 0}
+                          <details class="pt-1">
+                            <summary class="cursor-pointer text-micro text-textMuted">
+                              {mcpInfo.tools.length} tools (start with {FIRST_AGENT_TOOL})
+                            </summary>
+                            <ul class="mt-1 space-y-0.5 max-h-32 overflow-y-auto">
+                              {#each mcpInfo.tools as tool, i (`${tool.name}#${i}`)}
+                                <li class="font-mono text-micro text-textPrimary">
+                                  {tool.name}
+                                  <span class="text-textMuted font-sans"> — {tool.title}</span>
+                                </li>
+                              {/each}
+                            </ul>
+                          </details>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["external-tools"])}>
+                  <div data-setting="external-tools" hidden={!shown("external-tools")} class="flex flex-col gap-2">
+                    <h4 class="gp-label">
+                      External CLIs
+                    </h4>
+                    <p class="text-textMuted text-micro">
+                      Install or update <span class="font-mono">{CLI_NAMES.codeMap}</span> (the code map) and
+                      <span class="font-mono">{CLI_NAMES.policy}</span> (policy checks) via the install ladder:
+                      PATH → prebuilt release → cargo/go install → local checkout. Env vars still win
+                      over saved config.
+                    </p>
+                    <button
+                      type="button"
+                      class="gp-btn" data-size="sm"
+                      onclick={runToolsSetup}
+                    >
+                      Run setup
+                    </button>
+                    <ExternalToolsPanel onInstalled={(tool) => { if (tool === "manvi") void harnessStore.reconnect(); }} />
+                    <div class="pt-3">
+                      <DevcouncilSuitePanel
+                        repoPath={$repoStore.currentPath}
+                        active={isOpen && activeSection === "agents"}
+                      />
+                    </div>
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["external-tools"])}>
+                  <!-- Part of the external-tools entry (it has no catalog row of
+                       its own), so it follows that entry's visibility. -->
+                  <div hidden={!shown("external-tools")}>
+                    <AgentIntegrationPanel
+                      repoPath={isOpen && activeSection === "agents"
+                        ? $repoStore.currentPath
+                        : null}
+                    />
+                  </div>
+                </section>
                 </div>
               {:else if entry.id === "hygiene"}
-                <div class="space-y-3">
-                  <div data-setting="hygiene-defaults" hidden={!shown("hygiene-defaults")}>
+                <div class="flex flex-col gap-4">
+                  <div class="gp-card p-4" data-setting="hygiene-defaults" hidden={!shown("hygiene-defaults")}>
                     {#if isOpen && activeSection === "hygiene"}<HygieneDefaultsPanel />{/if}
                   </div>
-                  <div class="pt-3" data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
+                  <div class="gp-card p-4" data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
                 </div>
               {:else if entry.id === "updates"}
-                <div class="space-y-3">
+                <section
+                  class="gp-card p-4 flex flex-col gap-2"
+                  hidden={!any(["update-check", "update-now"])}
+                >
+                  <h3 class="gp-label">Releases</h3>
                   <div data-setting="update-check" hidden={!shown("update-check")}>
                     <SettingToggle
                       label="Check for new releases"
@@ -1283,9 +1370,9 @@
                   <div
                     data-setting="update-now"
                     hidden={!shown("update-now")}
-                    class="pt-1 flex items-center justify-between gap-3"
+                    class="py-1.5 flex items-center justify-between gap-3"
                   >
-                    <span class="text-textMuted text-meta">Check now</span>
+                    <span class="text-textPrimary text-meta font-medium">Check now</span>
                     <button
                       type="button"
                       onclick={runManualUpdateCheck}
@@ -1318,7 +1405,7 @@
                       {/if}
                     </div>
                   {/if}
-                </div>
+                </section>
               {/if}
             </div>
           {/each}
@@ -1326,7 +1413,7 @@
       </div>
 
       <div
-        class="p-4 bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
+        class="px-6 py-3.5 bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
       >
         <button
           type="button"

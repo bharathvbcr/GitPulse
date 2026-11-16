@@ -227,7 +227,8 @@ fn adv_l1_plan_push_refuses_a_plus_branch() {
 /// the retry classifier reads it as `deferred_under_load`.
 #[test]
 fn adv_l1_the_force_refusal_cannot_tell_an_old_git_from_an_unprobed_one() {
-    use crate::engine::git_cli::{is_deferred_under_load, GitPreflight, GitPreflightStatus};
+    use crate::engine::git_cli::{GitPreflight, GitPreflightStatus};
+    use crate::engine::process::is_deferred_under_load;
     let answer = |status, message: &str| GitPreflight {
         status,
         version: None,

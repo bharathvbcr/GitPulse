@@ -9,7 +9,7 @@ const ciFailed = { ...item, id:"event-43",source_sequence:43,kind:"run_ci_failed
 beforeEach(() => native.mockReset());
 describe("CI notices from a host watcher", () => {
   it("decodes each CI kind with the exact title the store writes and the facts it carries", () => {
-    for (const [kind, title, kindOfSignal] of [["run_ci_passed","Coding agent branch passed CI","ci_passed"],["run_ci_failed","Coding agent branch failed CI","ci_failed"],["run_ci_cancelled","Coding agent branch CI was cancelled","ci_cancelled"]] as const) {
+    for (const [kind, title, kindOfSignal] of [["run_ci_passed","Coding agent branch passed CI","ci_passed"],["run_ci_failed","Coding agent branch failed CI","ci_failed"],["run_ci_cancelled","Coding agent branch CI was canceled","ci_cancelled"]] as const) {
       const notice = attention({ ...ciFailed, kind, title, signal: { ...signal, kind: kindOfSignal } });
       expect(notice.kind).toBe(kind);
       expect(notice.title).toBe(title);

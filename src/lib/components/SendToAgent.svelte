@@ -13,7 +13,7 @@
   import { onDestroy, untrack } from "svelte";
   import { Send } from "@lucide/svelte";
   import { getTaskRun, newID, previewAgentMessage, sendAgentMessage, WorkbenchError, type AgentSendPreview, type AttentionSignal } from "../workbench/client";
-  import { describeFailure } from "../ui/copy/describeFailure";
+  import { describeError, describeFailure } from "../ui/copy/describeFailure";
   import { AGENT_NOTE_MAX_CHARS, composeAgentMessage, confirmLabel, describeResume, describeSend, messageProblem, routeTitle, unknownOutcome } from "../workbench/sendToAgent";
   import { resumeTaskConversation } from "../workbench/taskTerminal";
 
@@ -154,7 +154,7 @@
     } catch (cause) {
       if (disposed) return;
       if (cause instanceof WorkbenchError && cause.code === "route_changed") {
-        outcome = { tone: "error", text: `${cause.message}` };
+        outcome = { tone: "error", text: describeError(cause, "send-to-agent") };
         void ask(sentText, id);
       } else {
         outcome = { tone: "error", text: `${failure("confirm", "the send", cause)} Press Confirm again to try the same message. It is not sent twice.` };
@@ -200,7 +200,7 @@
       </div>
       <div class="actions">
         <button type="button" class="gp-btn" data-variant="primary" data-size="sm" onclick={() => void send()} disabled={!settled || !confirm || !!problem || sending || done || closed} data-testid="send-to-agent-confirm">
-          {sending ? "Sending…" : done ? "Sent" : closed ? "Not sent again" : askAgain ? "Ask again (same message)" : confirm ?? "Cannot be sent"}
+          {sending ? "Sending…" : done ? "Sent" : closed ? "Not sent again" : askAgain ? "Ask again (same message)" : confirm ?? "Can't be sent"}
         </button>
         <button type="button" class="gp-btn" data-size="sm" onclick={toggle} disabled={sending} data-testid="send-to-agent-cancel">Cancel</button>
       </div>

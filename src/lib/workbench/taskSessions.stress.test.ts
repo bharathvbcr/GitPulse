@@ -17,7 +17,7 @@ import { mulberry32 } from "../__tests__/prng";
  */
 
 const RUNS = ["a", "b", "c", ""];
-const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to retry.", "x".repeat(400), "Still running — not shown in any tab"];
+const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to try again.", "x".repeat(400), "Still running — not shown in any tab"];
 const close = async () => {};
 
 describe("attemptTerminalView under arbitrary mixtures", () => {

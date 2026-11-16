@@ -10,12 +10,11 @@
  * constants is cheaper than a second hand-written copy of them.
  */
 
-export const STATUSES = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as const;
+export const STATUSES = ["backlog", "ready", "in_progress", "review", "done"] as const;
 
 export type TaskStatus = (typeof STATUSES)[number];
 
 export const STATUS_LABELS: Record<TaskStatus, string> = {
-  inbox: "Inbox",
   backlog: "Backlog",
   ready: "Ready",
   in_progress: "In progress",
@@ -23,9 +22,25 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   done: "Done",
 };
 
-/** A status from untrusted input (stored preference, wire payload), or null. */
+/**
+ * Names a status once had, and the column each one is read as. `inbox` was
+ * merged into `backlog`: an old agent's call, a saved search, a stored
+ * preference or a historical revision may still say it. This is the one place
+ * that reads it; nothing is written, shown or advertised under the old name.
+ * The Rust twin is `legacy_status` in `tasks/file_tasks.rs`.
+ */
+const LEGACY_STATUSES: Readonly<Record<string, TaskStatus>> = { inbox: "backlog" };
+
+/** A status from untrusted input (stored preference, wire payload), or null. A retired name reads as the column it became. */
 export function asTaskStatus(value: unknown): TaskStatus | null {
-  return STATUSES.find((status) => status === value) ?? null;
+  const current = STATUSES.find((status) => status === value);
+  if (current) return current;
+  return typeof value === "string" && Object.hasOwn(LEGACY_STATUSES, value) ? LEGACY_STATUSES[value] : null;
+}
+
+/** Whether `value` is a retired status name rather than a current one. */
+export function isLegacyStatus(value: unknown): boolean {
+  return typeof value === "string" && Object.hasOwn(LEGACY_STATUSES, value);
 }
 
 /**
@@ -107,7 +122,7 @@ export const DEFAULT_LIVE_RUNS = 8;
  * not a product limit. It also sizes the queue of terminals waiting to open:
  * there can never be more live attempts than this.
  *
- * `run-capacity-contract.test.ts` reads both from the vendored
+ * `documented-counts-contract.test.ts` reads both from the vendored
  * `dc-store/src/workbench/runs.rs` to keep them equal. One checkout holds
  * one attempt.
  */

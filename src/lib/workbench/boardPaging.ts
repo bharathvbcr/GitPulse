@@ -53,9 +53,11 @@ export async function reloadPaged<T extends { id: string }>(read: Read<T>, loade
  * The page size a reload reads `loaded` rows back at: `size` while
  * `MAX_RELOAD_PAGES` of it reach them, else `largest` (the store's page
  * maximum), so a column loaded past 600 cards is not cut back to 600.
+ * `past` moves that switch lower: the board passes one page, since a column it
+ * read on 200 at a time would otherwise take a request per 30 cards to reload.
  */
-export function reloadSize(loaded: number, size: number, largest: number): number {
-  return loaded > size * MAX_RELOAD_PAGES ? largest : size;
+export function reloadSize(loaded: number, size: number, largest: number, past = size * MAX_RELOAD_PAGES): number {
+  return loaded > past ? largest : size;
 }
 
 export interface ReadOn<T> { page: Page<T>; ended: boolean }
@@ -87,6 +89,68 @@ export async function readOn<T extends { id: string }>(
     if ((onPage && !onPage(folded())) || !advanced) break;
   }
   return { page: folded(), ended: cursor === null };
+}
+
+/**
+ * Why `fillColumns` ended: every column reached its end, the board holds its
+ * budget of cards (the rest stay behind each column's cursor), or it was
+ * stopped (the board moved on, a column changed under it, or a store handed a
+ * cursor back unadvanced) with pages still unread.
+ */
+export type FillOutcome = "complete" | "budget" | "stopped";
+
+export interface FillColumns<K extends string, T> {
+  keys: readonly K[];
+  /** The column as it stands now; asked again before every request and every apply. */
+  current(key: K): Page<T> | undefined;
+  /** One page of `key` after `cursor`. */
+  read(key: K, cursor: string): Promise<Page<T>>;
+  /** Shows the column with one more page folded in; false stops the fill. */
+  apply(key: K, page: Page<T>): boolean;
+  /** False once the board moved on; checked before each request. */
+  live(): boolean;
+  /** Cards across every column past which no further page is asked for. */
+  budget: number;
+  /** Requests at most, so a misbehaving store cannot spin the fill. */
+  maxPages?: number;
+}
+
+/**
+ * Every column read on to its end automatically, one request at a time, a page
+ * from each column in turn so one long column does not take the whole budget.
+ *
+ * Each page is folded into the column as it stands when the page lands, and
+ * only if that column still ends where the page was read from: a reload or a
+ * move that replaced the column meanwhile makes the page a continuation of a
+ * list no longer shown, and folding it in would bring back a card that moved
+ * or was deleted. The fill stops there instead; the caller starts again from
+ * the fresh column.
+ */
+export async function fillColumns<K extends string, T extends { id: string }>(options: FillColumns<K, T>): Promise<FillOutcome> {
+  const { keys, budget, maxPages = MAX_COLUMN_PAGES } = options;
+  const finished = new Set<K>();
+  const loaded = () => keys.reduce((sum, key) => sum + (options.current(key)?.items.length ?? 0), 0);
+  let pages = 0;
+  let stuck = false;
+  while (finished.size < keys.length) {
+    for (const key of keys) {
+      if (finished.has(key)) continue;
+      const cursor = options.current(key)?.next_cursor ?? null;
+      if (cursor === null) { finished.add(key); continue; }
+      if (!options.live() || pages >= maxPages) return "stopped";
+      if (loaded() >= budget) return "budget";
+      pages++;
+      const page = await options.read(key, cursor);
+      if (!options.live()) return "stopped";
+      const shown = options.current(key);
+      if (!shown || shown.next_cursor !== cursor) return "stopped";
+      const items = [...new Map([...shown.items, ...page.items].map((item) => [item.id, item])).values()];
+      // A store that hands back the cursor it was given would be read forever.
+      if (page.next_cursor === cursor) { stuck = true; finished.add(key); }
+      if (!options.apply(key, { ...page, items, shown: items.length, has_more: page.next_cursor !== null })) return "stopped";
+    }
+  }
+  return stuck ? "stopped" : "complete";
 }
 
 /**

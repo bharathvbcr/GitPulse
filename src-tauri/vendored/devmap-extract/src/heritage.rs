@@ -191,7 +191,7 @@ fn supertype_name(raw: &str) -> Option<String> {
     let mut name = raw.trim();
     // Drop an access specifier or `virtual` prefix (C++).
     for prefix in ["public ", "private ", "protected ", "virtual "] {
-        name = name.strip_prefix(prefix).unwrap_or(name).trim_start();
+        name = name.trim_prefix(prefix).trim_start();
     }
     // Drop a constructor call (Kotlin, Scala) and then type arguments.
     //

@@ -15,6 +15,16 @@
       <label class="block"><input id="offline" type="checkbox" /> Servers offline</label>
       <label class="block"><input id="fail" type="checkbox" /> Fail status requests</label>
       <label class="block"><input id="slow" type="checkbox" /> Delay status requests</label>
+      <label class="block"><input id="cloud" type="checkbox" /> Manvi on cloud (Claude)</label>
+      <label class="block">Claude credential
+        <select id="credential">
+          <option value="account">~/.anthropic-accounts account</option>
+          <option value="key">Key saved in GitPulse</option>
+          <option value="none">Neither</option>
+          <option value="broken">Registry unreadable</option>
+          <option value="throw">Status read fails</option>
+        </select>
+      </label>
       <pre id="preference" aria-label="Saved model preference"></pre>
       <pre id="probe" aria-label="Last model probe"></pre>
       <pre id="errors" role="alert"></pre>
@@ -35,6 +45,15 @@
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           if (command === "cmd_harness_status") return harness;
+          if (command === "cmd_claude_key_status") {
+            const credential = document.getElementById("credential").value;
+            if (credential === "throw") throw new Error("Fixture Keychain unavailable");
+            return {
+              key_saved: credential === "key",
+              account: credential === "account" ? { name: "main", workspace: "wrkspc_01Fixture", source: "default" } : null,
+              account_error: credential === "broken" ? "`anthropic-account` is not on PATH" : null,
+            };
+          }
           if (command !== "cmd_ai_status") throw new Error(`Unexpected fixture command: ${command}`);
           document.getElementById("probe").textContent = JSON.stringify(args);
           const offline = document.getElementById("offline").checked;
@@ -55,6 +74,11 @@
       harnessStore.subscribe((state) => {
         document.getElementById("preference").textContent = state.preferred
           ? `${state.preferred.model} at ${state.preferred.base_url}` : "Automatic";
+      });
+      const cloud = document.getElementById("cloud");
+      cloud.checked = Boolean((await import("svelte/store")).get(harnessStore).manviClaude);
+      cloud.addEventListener("change", () => {
+        harnessStore.selectManviClaude(cloud.checked ? { model: "claude-sonnet-5-5" } : null);
       });
       mount(HarnessBadge, { target: document.getElementById("app") });
     </script>

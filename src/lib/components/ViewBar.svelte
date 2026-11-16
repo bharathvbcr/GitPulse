@@ -13,8 +13,10 @@
    * content; the passive state sits at the edge.
    *
    * Under Fleet, Agents or Tasks the row stays mounted at the same height with
-   * the controls `inert` and hidden, and the surface's name in their place, so
-   * the workspace below never jumps. Widths are container queries on this
+   * the repository-only controls `inert` and hidden, and the surface's name in
+   * their place, so the workspace below never jumps. The search field stays,
+   * as the repository palette for the repository whose tab was last active
+   * (`PageSearch`). Widths are container queries on this
    * element, not the window, so a narrow stage behaves like a narrow window.
    */
   import { onMount, untrack } from "svelte";
@@ -83,26 +85,37 @@
       : `Agents${live}`;
   });
 
-  // Row 2's controls fade (opacity only) when a global surface takes over and
-  // when the repository comes back; `concealed` is the final `visibility`, set
-  // after the fade out and before the fade in, so the row is never half-hidden.
-  let controls: HTMLDivElement | undefined = $state();
+  // The repository-only controls (switcher, context slot, glance, pills,
+  // Refresh) fade (opacity only) when a global surface takes over and when the
+  // repository comes back; `concealed` is the final `hidden`, set after the
+  // fade out and before the fade in, so they are never half-hidden. The search
+  // field is not one of them: it stays, as the repository palette.
+  let switcher: HTMLDivElement | undefined = $state();
+  let trailing: HTMLDivElement | undefined = $state();
   let concealed = $state(!untrack(() => onRepository));
   let swapped: boolean | null = null;
-  let swapping: Animation | null = null;
+  let swapping: Animation[] = [];
   $effect(() => {
     const show = onRepository;
-    const el = controls;
-    if (!el || swapped === show) return;
+    const ready = switcher;
+    if (!ready || swapped === show) return;
     const first = swapped === null;
     swapped = show;
     if (first) return;
     // A swap interrupted by the next one settles first, so the last word is the newest.
-    swapping?.cancel();
+    for (const animation of swapping) animation.cancel();
     if (show) concealed = false;
-    swapping = swapRow(el, show, () => {
-      concealed = !show;
+    // The trailing cluster is `display: contents`, so its children fade, not it.
+    const targets = [ready, slot, ...(trailing ? Array.from(trailing.children) : [])];
+    swapping = targets.flatMap((el) => {
+      if (!(el instanceof HTMLElement)) return [];
+      const animation = swapRow(el, show, () => {
+        if (swapped === show) concealed = !show;
+      });
+      return animation ? [animation] : [];
     });
+    // Nothing animated (reduced motion): the state is final now.
+    if (swapping.length === 0) concealed = !show;
   });
 
   const dirty = $derived($repoStore.statuses.length);
@@ -164,13 +177,15 @@
     >{surfaceLabel}</span>
   {/if}
 
+  <!-- Under a global surface the repository-only groups below leave the
+       layout (after their fade) and the row pads past the surface's name, so
+       the search field takes their room; the row's height never changes. -->
   <div
-    bind:this={controls}
-    class="flex h-full min-w-0 flex-1 items-center gap-2 px-2 {concealed ? 'invisible' : ''}"
-    inert={!onRepository}
+    class="flex h-full min-w-0 flex-1 items-center gap-2 px-2"
+    style:padding-left={concealed ? "6rem" : undefined}
     data-viewbar-controls
   >
-    <div class="relative h-full min-w-0 shrink">
+    <div bind:this={switcher} class="relative h-full min-w-0 shrink" hidden={concealed} inert={!onRepository} data-viewbar-repo-only>
       <div bind:this={scroller} class="gp-header-scroll h-full min-w-0">
         <!-- Everything in this row is measured as overflow, so nothing may sit
              after the last control: the drag spacer is outside the scroller,
@@ -188,7 +203,10 @@
       bind:this={slot}
       class="flex min-w-0 items-center gap-3 empty:hidden"
       data-viewbar-context
+      data-viewbar-repo-only
       data-tauri-drag-region
+      hidden={concealed}
+      inert={!onRepository}
     ></div>
 
     <!-- The one search field, for whatever page is on screen
@@ -201,6 +219,10 @@
 
     <div class="h-full min-w-12 flex-1" data-tauri-drag-region></div>
 
+    <!-- The trailing cluster is one group so a global surface can hide it
+         whole; it takes no box of its own (`contents`), so its children stay
+         flex items of the row. -->
+    <div bind:this={trailing} class="contents" hidden={concealed} inert={!onRepository} data-viewbar-repo-only>
     <!-- The glance: overlap with other worktrees, the branch's pull request,
          the last fetch, the stash. Absent when there is nothing to say. -->
     {#if Glance}<Glance onOpenAgents={openAgents} />{/if}
@@ -256,5 +278,6 @@
     >
       <RefreshCw size={14} class={$repoStore.isLoading ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
     </button>
+    </div>
   </div>
 </nav>

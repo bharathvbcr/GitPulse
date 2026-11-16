@@ -1202,8 +1202,7 @@ fn parse_template_text(
     walk: &mut TemplateWalk,
     at: usize,
 ) {
-    let (source, file_path, language, deadline) =
-        (walk.source, walk.file_path, walk.language, walk.deadline);
+    let (file_path, language, deadline) = (walk.file_path, walk.language, walk.deadline);
     let node_range = TextRange {
         start_byte: node_span.start_byte,
         end_byte: node_span.end_byte,
@@ -1230,7 +1229,6 @@ fn parse_template_text(
     }
     // The wrapper's bytes are not in the file. Spans are rebased by its one
     // opening byte.
-    let outer_source = source;
     let wrapped = wrap.program(&expr.body);
     let program: &str = wrapped.as_deref().unwrap_or(expr.body.as_str());
     // Store reads: past the bound and the deadline above they are not read,
@@ -1261,9 +1259,7 @@ fn parse_template_text(
         expr.offset,
         expr.body.len(),
         node_range,
-        &mut walk.unparsed,
-        &mut walk.diagnostics,
-        outer_source,
+        walk,
     ) {
         walk.parsed += 1;
     }
@@ -1434,9 +1430,7 @@ fn record_template_parse(
     offset: usize,
     body_len: usize,
     node_range: TextRange,
-    unparsed: &mut Vec<TextRange>,
-    diagnostics: &mut Vec<String>,
-    source: &str,
+    walk: &mut TemplateWalk,
 ) -> bool {
     let body = TextRange {
         start_byte: offset,
@@ -1466,21 +1460,21 @@ fn record_template_parse(
             Fold::Partial(ranges)
         }
         ParseOutcome::Failed { reason } => {
-            diagnostics.push(format!(
+            walk.diagnostics.push(format!(
                 "template expression at bytes {}..{} failed to parse: {reason}",
                 node_range.start_byte, node_range.end_byte
             ));
             Fold::Drop
         }
         ParseOutcome::Fallback { reason } => {
-            diagnostics.push(format!(
+            walk.diagnostics.push(format!(
                 "template expression at bytes {}..{} was recovered by pattern: {reason}",
                 node_range.start_byte, node_range.end_byte
             ));
             Fold::Absorb
         }
         ParseOutcome::Skipped { reason } => {
-            diagnostics.push(format!(
+            walk.diagnostics.push(format!(
                 "template expression at bytes {}..{} was not parsed: {reason}",
                 node_range.start_byte, node_range.end_byte
             ));
@@ -1489,16 +1483,16 @@ fn record_template_parse(
     };
     match fold {
         Fold::Absorb => {
-            absorb(extraction, inner, offset, source);
+            absorb(extraction, inner, offset, walk.source);
             true
         }
         Fold::Drop => {
-            unparsed.push(node_range);
+            walk.unparsed.push(node_range);
             false
         }
         Fold::Partial(ranges) => {
-            unparsed.extend(ranges);
-            absorb(extraction, inner, offset, source);
+            walk.unparsed.extend(ranges);
+            absorb(extraction, inner, offset, walk.source);
             true
         }
     }

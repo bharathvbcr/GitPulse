@@ -12,7 +12,7 @@
   import type { GraphHitKind, VisualCommitRow } from "../canvas/GraphRenderer";
   import type { TooltipPlacement } from "../canvas/graphInteraction";
   import type { RefItem } from "../graph/graphDecorations";
-  import { authorColor, authorIdentity } from "../authors/authorIdentity";
+  import AuthorAvatar from "../authors/AuthorAvatar.svelte";
   import { getBranchColor } from "../canvas/Palette";
   import { formatRelativeTime } from "../format";
 
@@ -83,7 +83,6 @@
   const visibleRefs = $derived(refs.slice(0, 4));
   const hiddenRefCount = $derived(Math.max(0, refs.length - visibleRefs.length));
 
-  const identity = $derived(authorIdentity(row.author_name, row.author_email));
 
   function formatTimestamp(timestamp: number): string {
     const date = new Date(timestamp * 1000);
@@ -176,11 +175,12 @@
 
   {#if authorCommitCount !== null && Number.isFinite(authorCommitCount) && authorCommitCount > 0}
     <div class="flex items-center gap-2 bg-background px-3 py-2 text-meta">
-      <span
+      <AuthorAvatar
+        name={row.author_name}
+        email={row.author_email}
         class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-micro font-semibold text-white ring-1 ring-background"
-        style="background-color: {authorColor(identity.hue)}"
-        aria-hidden="true"
-      >{identity.initials}</span>
+        ariaHidden
+      />
       <span class="min-w-0 truncate text-textPrimary">
         {authorCommitCount}
         {authorCommitCount === 1 ? "commit" : "commits"} by {row.author_name || "Unknown"} in the
@@ -223,11 +223,12 @@
     <dt class="flex items-center gap-1.5 text-textMuted">
       <!-- Same identity module as the canvas avatars: hue and initials always
            agree between gutter column, rows and this card. -->
-      <span
+      <AuthorAvatar
+        name={row.author_name}
+        email={row.author_email}
         class="inline-flex h-5 w-5 items-center justify-center rounded-full text-micro font-semibold text-white ring-1 ring-background"
-        style="background-color: {authorColor(identity.hue)}"
-        aria-hidden="true"
-      >{identity.initials}</span>
+        ariaHidden
+      />
       Author
     </dt>
     <dd

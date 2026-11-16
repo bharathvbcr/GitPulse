@@ -61,7 +61,7 @@
 </script>
 
 <div class="space-y-1 text-meta" data-testid="lappi-settings">
-  <div class="text-textMuted text-micro mb-1.5">Lappi</div>
+  <h3 class="gp-label mb-1.5">Lappi</h3>
   <SettingToggle
     label="Ask Lappi on ambiguous commit types"
     description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket. This is separate from AI commit-message generation, which has its own consent. Its answer can only pre-select the type in the draft you edit."

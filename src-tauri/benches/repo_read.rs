@@ -34,7 +34,7 @@ struct Shape {
 }
 
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("repo_read");
     let temp = tempfile::tempdir().expect("temp dir");
 
@@ -358,7 +358,7 @@ fn main() {
         let (even, odd) = (text.clone(), format!("X{}", &text[1..]));
         let mut turn = false;
         cases.push(Case::new(format!("save_edited_text {label}"), move || {
-            turn = !turn;
+            turn.toggle();
             let content = if turn { &odd } else { &even };
             sandbox_write_edited_text(&save_root, &name, content).expect("save");
             Sample::default().counter("bytes", content.len() as u64)

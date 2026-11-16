@@ -54,6 +54,8 @@ mod merge_conflicts_tool_tests;
 pub mod page;
 pub mod prompts;
 pub mod resources;
+#[cfg(test)]
+mod turn_checkpoints_tool_tests;
 pub mod uri;
 pub mod validate;
 // Unix-only: its `devmap` stand-in is a shell script.
@@ -527,6 +529,17 @@ tool_args! {
 }
 
 tool_args! {
+    struct SessionsArgs {
+        repo_path: String = repo_spec(),
+        limit: Option<u32> = Spec::int(
+            "Maximum live sessions to return (default 64, max 256)",
+            1,
+            256,
+        ),
+    }
+}
+
+tool_args! {
     /// The code-intelligence tools that answer one budgeted question about a
     /// repository.
     struct BudgetArgs {
@@ -603,6 +616,27 @@ tool_args! {
 }
 
 tool_args! {
+    struct TurnCheckpointsArgs {
+        repo_path: String = repo_spec(),
+        id: Option<String> = Spec::bytes(
+            "A checkpoint id from the list (the digits of its stamp). With it, returns that checkpoint's patch instead of the list",
+            1,
+            20,
+        ),
+        against: Option<String> = Spec::bytes(
+            "With `id`: another of this worktree's checkpoint ids to compare against, instead of the checkpoint's parent commit",
+            1,
+            20,
+        ),
+        limit: Option<u32> = Spec::int(
+            "Maximum number of checkpoints listed (default 20, max 50)",
+            1,
+            crate::engine::turn_checkpoint::MAX_LIST_LIMIT as u64,
+        ),
+    }
+}
+
+tool_args! {
     struct TaskViewArgs {
         repo_path: String = repo_spec(),
         task_id: Option<String> = path_spec("Optional task id to filter evidence, gaps, and runs"),
@@ -623,7 +657,7 @@ tool_args! {
             1,
             ft::MAX_TASK_KEY,
         ),
-        status: Option<String> = Spec::one_of("Board column (default inbox)", &ft::STATUSES),
+        status: Option<String> = Spec::one_of("Board column (default backlog)", &ft::STATUSES),
         priority: Option<u8> = Spec::int(
             "Priority: 0 (urgent), 1 (high), 2 (normal, default), 3 (low)",
             0,
@@ -661,6 +695,9 @@ tool_args! {
         ),
         overwrite: Option<bool> = Spec::flag(
             "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours.",
+        ),
+        expected_revision: Option<i64> = revision_spec(
+            "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
         ),
         reviewed_related: Option<Vec<String>> = Spec::chars_array(
             "item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work",
@@ -798,6 +835,10 @@ tool_args! {
             256,
         ),
         zero_copy: Option<bool> = Spec::flag("Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite"),
+        layout: Option<String> = Spec::one_of(
+            "Worktree path layout: 'lane' (default, <repo>/.gitpulse/worktrees/<slug>) or 'sibling' (../<Repo>.<slug>)",
+            crate::engine::worktree::WorktreeLayout::VALUES,
+        ),
         execute_command: Option<String> = Spec::chars("Optional command to execute in worktree upon completion", 1, 1024),
     }
 }
@@ -1763,6 +1804,68 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
+            "gitpulse_sessions",
+            "Live agent sessions",
+            "List live agent sessions (Claude Code and Codex) running inside this repository's worktrees, without spawning git. Reads the OS process table, Claude Code session registries, CARD 11 file claims / worktree locks, ledger run bindings, and the running GitPulse desktop app's hook-report hub snapshot (`agent-session-state.json`). Marks `is_caller: true` on the nearest agent ancestor of this MCP server (`pid` + `start_us`), carries `run_id`, `tree`, and `task_id` when known, and reports `state` (`working` | `blocked` | `done` | `idle` | `unknown`), `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`. Codex sessions with no hub entry report `state: \"unknown\"` (never `\"idle\"`); sessions with no registry or hub entry report `state_source: \"none\"`. When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process table and registry. Results are sorted caller-first and bounded by `limit` (`cap`, `total`, `returned`, `truncated`).",
+            SessionsArgs::properties(),
+            &SessionsArgs::required(),
+            ok_error_output(
+                json!({
+                    "repo_path": { "type": "string" },
+                    "app_state": ok_error_output(
+                        json!({
+                            "updated_ms": { "type": "integer", "minimum": 0 }
+                        }),
+                        &[],
+                    ),
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "ok": { "type": "boolean" },
+                                "error": { "type": "string" },
+                                "sessions": { "type": "integer", "minimum": 0 },
+                                "unverified": { "type": "integer", "minimum": 0 },
+                                "truncated": { "type": "boolean" }
+                            },
+                            "required": ["kind", "ok", "error", "sessions", "unverified", "truncated"]
+                        }
+                    },
+                    "cap": { "type": "integer", "minimum": 1 },
+                    "total": { "type": "integer", "minimum": 0 },
+                    "returned": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "sessions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "pid": { "type": "integer", "minimum": 0 },
+                                "start_us": { "type": "integer", "minimum": 0 },
+                                "is_caller": { "type": "boolean" },
+                                "worktree": { "type": "string" },
+                                "cwd": { "type": "string" },
+                                "tree": { "type": "string" },
+                                "run_id": { "type": "string" },
+                                "task_id": { "type": "string" },
+                                "parent_pid": { "type": "integer", "minimum": 0 },
+                                "session_id": { "type": "string" },
+                                "entrypoint": { "type": "string" },
+                                "state": { "type": "string", "enum": ["working", "blocked", "done", "idle", "unknown"] },
+                                "state_source": { "type": "string", "enum": ["hub", "registry", "none", "unknown"] },
+                                "state_age_s": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": ["kind", "pid", "is_caller", "worktree", "cwd", "state", "state_source"]
+                        }
+                    }
+                }),
+                &["repo_path", "app_state", "kinds", "cap", "total", "returned", "truncated", "sessions"],
+            ),
+        ),
+        tool(
             "gitpulse_status",
             "Repository status",
             "Inspect repository status, worktrees, ledger, and code graph availability",
@@ -1954,6 +2057,26 @@ fn build_tools() -> Vec<Value> {
             }),
         ),
         tool(
+            "gitpulse_turn_checkpoints",
+            "Turn checkpoints",
+            "Read this worktree's turn checkpoints: commits under `refs/gitpulse/turns/<key>/<stamp>` holding the worktree's files at an agent turn boundary, when the person turned `turn_checkpoints.enabled` on. Without `id`, lists them newest first (`id`, `created_at`, `label`, `event` `turn_start` or `turn_end`, `session_id`, `branch`, and `files`, `additions`, `deletions` against the previous checkpoint, the oldest against its parent commit; `stats_complete` false when a count was cut), bounded by `limit` with `truncated` true when older ones are not shown. With `id`, returns that checkpoint's patch against its parent commit, or against `against` (another checkpoint of this worktree): at most 256 KiB, `truncated` says when it was cut, and a credential shape in the patch is redacted (`redacted`). A checkpoint can be PARTIAL: `omissions` says how many untracked files it left out and why (files whose name starts with `.env`, files the leak scanner flagged, unreadable or special files, nested repositories, GitPulse's own state), and `wholesale` names the reason when no untracked file was taken at all (`cap_exceeded` with the cap and the found counts, `scan_failed`, `scan_timeout`, `listing_failed`); never read a checkpoint with `untracked_omitted` above 0 as the whole worktree. Ignored files are never captured. Checkpoints are visible only to the worktree that took them: ids from another worktree of the same repository do not resolve. Read-only: nothing is restored, and no ref, index or working file is written. An empty list means no checkpoint was recorded (the setting is off, the app was not running, or none was taken yet), not that nothing changed.",
+            TurnCheckpointsArgs::properties(),
+            &TurnCheckpointsArgs::required(),
+            ok_error_output(
+                json!({
+                    "key": { "type": "string" },
+                    "total": { "type": "integer" },
+                    "truncated": { "type": "boolean" },
+                    "checkpoints": {
+                        "type": "array",
+                        "items": { "type": "object" }
+                    },
+                    "diff": { "type": "object" }
+                }),
+                &[],
+            ),
+        ),
+        tool(
             "gitpulse_task_view",
             "Task view",
             "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease. An evidence row's `data_json` and a gap's `evidence_json` over 16 KiB are cut without changing what kind of JSON they hold (an array loses its tail, with no marker element; a string is shortened; an object loses members): the row's `data_json_truncated` (`{kept, total, bytes}`: elements or members kept of how many, and the length before the cut) says so, and is null when the text is whole.",
@@ -1971,7 +2094,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_add_task",
             "Add task",
-            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
+            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. When you overwrite a task you read earlier, pass expected_revision (its revision from gitpulse_get_task or gitpulse_list_tasks): if the task changed since, nothing is written and revision_conflict names the current revision, so you re-read and merge instead of replacing someone else's edit. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
             AddTaskArgs::properties(),
             &AddTaskArgs::required(),
             json!({
@@ -2138,7 +2261,7 @@ fn build_tools() -> Vec<Value> {
         open_world(mutating_tool(
             "gitpulse_worktree_create",
             "Create worktree",
-            "Create a new git branch and linked worktree with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
+            "Create a new git branch and linked worktree under <repo>/.gitpulse/worktrees/<slug> by default (or ../<Repo>.<slug> with `layout: \"sibling\"`), with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
             WorktreeCreateArgs::properties(),
             &WorktreeCreateArgs::required(),
             json!({
@@ -3354,6 +3477,17 @@ fn open_task_profile(create: bool) -> Result<Option<dc_store::Store>, String> {
     open_shared_profile(dc_store::Store::open_existing(&path))
 }
 
+/// Opens the task board's profile read-only. A machine with no board yet answers
+/// `None` rather than creating one. Does not run DDL, WAL switch, schema migrations,
+/// or lease sweeps.
+fn open_task_profile_readonly() -> Result<Option<dc_store::Store>, String> {
+    let path = task_profile_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    open_shared_profile(dc_store::Store::open_readonly(&path))
+}
+
 /// The task profile is shared with the desktop app, which owns its schema.
 /// This server may be older or newer than the app, so its handle never
 /// upgrades: a request that needs the upgrade fails with
@@ -3364,6 +3498,39 @@ fn open_shared_profile(
     let mut store = opened.map_err(|e| e.to_string())?;
     store.refuse_workbench_upgrades();
     Ok(Some(store))
+}
+
+/// Fail-soft read-only lookup from `run_id` to board `task_id`.
+///
+/// Opens the shared profile store at most once per `gitpulse_sessions` call
+/// with `SQLITE_OPEN_READ_ONLY` and `refuse_workbench_upgrades`, returning
+/// `None` if the store is absent or requires a schema upgrade rather than
+/// failing a read-only session listing.
+fn with_sessions_run_lookup<T>(f: impl FnOnce(&dyn Fn(&str) -> Option<String>) -> T) -> T {
+    let store_cell: std::cell::OnceCell<Option<dc_store::Store>> = std::cell::OnceCell::new();
+    let lookup = |run_id: &str| -> Option<String> {
+        let store = store_cell
+            .get_or_init(|| {
+                let path = task_profile_path().ok()?;
+                if !path.exists() {
+                    return None;
+                }
+                let mut store = dc_store::Store::open_readonly(&path).ok()?;
+                store.refuse_workbench_upgrades();
+                Some(store)
+            })
+            .as_ref()?;
+        let raw = store
+            .workbench_request("runs.get", &json!({ "id": run_id }).to_string())
+            .ok()?;
+        let res: Value = serde_json::from_str(&raw).ok()?;
+        res.get("item")
+            .and_then(|item| item.get("task_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    f(&lookup)
 }
 
 #[cfg(not(test))]
@@ -3432,7 +3599,7 @@ const DEFERRAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_sec
 pub const WORST_CASE_DEFERRED_READ: std::time::Duration = std::time::Duration::from_secs(
     DEFERRAL_RETRY_WINDOW.as_secs()
         + 2 * (insights::SNAPSHOT_DEADLINE.as_secs()
-            + crate::engine::git_cli::SPAWN_QUEUE_BUDGET.as_secs()),
+            + crate::engine::process::SPAWN_QUEUE_BUDGET.as_secs()),
 );
 
 /// A value in `0..bound` that differs between processes and between calls.
@@ -3613,7 +3780,31 @@ fn ask_app_to_orchestrate(
     }
 }
 
+/// The tools whose `status` argument names a board column. An agent written
+/// before `inbox` was merged into `backlog` may still send the old name.
+const BOARD_STATUS_TOOLS: [&str; 2] = ["gitpulse_add_task", "gitpulse_list_tasks"];
+
+/// `arguments` with a retired board status read as the column it became.
+///
+/// The advertised enum no longer lists the old name, so the call is
+/// canonicalised before the schema looks at it, not loosened to accept it:
+/// nothing is advertised under the old name, and the handler never sees it.
+fn with_current_board_status<'a>(name: &str, arguments: &'a Value) -> std::borrow::Cow<'a, Value> {
+    if BOARD_STATUS_TOOLS.contains(&name) {
+        if let Some(status) = arguments.get("status").and_then(Value::as_str) {
+            let current = ft::current_status(status);
+            if current != status {
+                let mut canonical = arguments.clone();
+                canonical["status"] = json!(current);
+                return std::borrow::Cow::Owned(canonical);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(arguments)
+}
+
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
+    let arguments = &*with_current_board_status(name, arguments);
     // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
     // then reads the accepted call into the tool's struct, and refuses what the
     // schema cannot (a number that is not exactly an integer). Neither step
@@ -3625,6 +3816,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             Ok(with_production_retry(|retry| {
                 read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
+        }
+        "gitpulse_sessions" => {
+            let a: SessionsArgs = parse(name, arguments)?;
+            let report = with_sessions_run_lookup(|lookup| {
+                insights::sessions(&a.repo_path, a.limit, lookup)
+            })?;
+            serde_json::to_value(report).map_err(|e| format!("serialize sessions report: {e}"))
         }
         "gitpulse_status" => {
             let a: RepoArgs = parse(name, arguments)?;
@@ -3681,6 +3879,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }))
         }
         "gitpulse_ledger_events" => ledger_events(parse(name, arguments)?),
+        "gitpulse_turn_checkpoints" => Ok(turn_checkpoints(parse(name, arguments)?)),
         "gitpulse_task_view" => task_view(parse(name, arguments)?),
         "gitpulse_add_task" => {
             let a: AddTaskArgs = parse(name, arguments)?;
@@ -3708,12 +3907,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let reviewed = a.reviewed_related.unwrap_or_default();
             let store =
                 open_task_profile(true)?.ok_or("the GitPulse task profile could not be created")?;
-            let mut result = intake::add_task(
+            let mut result = intake::add_task_guarded(
                 &store,
                 &a.repo_path,
                 task,
                 a.overwrite.unwrap_or(false),
                 &reviewed,
+                a.expected_revision,
             )
             .map_err(workbench_message)?;
 
@@ -3777,7 +3977,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_list_tasks" => {
             let a: ListTasksArgs = parse(name, arguments)?;
-            let Some(store) = open_task_profile(false)? else {
+            let Some(store) = open_task_profile_readonly()? else {
                 return Ok(json!({
                     "ok": true, "repository": null, "returned": 0, "total": 0, "has_more": false,
                     "next_cursor": null, "tasks": [],
@@ -3796,7 +3996,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_get_task" => {
             let a: GetTaskArgs = parse(name, arguments)?;
-            let store = open_task_profile(false)?.ok_or(NO_BOARD)?;
+            let store = open_task_profile_readonly()?.ok_or(NO_BOARD)?;
             intake::get_task(&store, &a.repo_path, &a.task_id).map_err(workbench_message)
         }
         "gitpulse_complete_task" => {
@@ -3867,12 +4067,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }
             let share_cache = a.share_cache.unwrap_or(true);
             let zero_copy = a.zero_copy.unwrap_or(false);
-            let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
-                &a.repo_path,
-                &a.branch,
-                None,
-            )
-            .map_err(CommandError::into_message)?;
+            let layout = crate::engine::worktree::WorktreeLayout::parse(a.layout.as_deref())
+                .map_err(CommandError::into_message)?;
+            let target_path =
+                crate::engine::worktree::resolve_worktree_path_for_branch_with_layout(
+                    &a.repo_path,
+                    &a.branch,
+                    layout,
+                )
+                .map_err(CommandError::into_message)?;
             let target_str = target_path
                 .to_str()
                 .ok_or_else(|| "invalid target path".to_string())?;
@@ -3899,6 +4102,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             if let Some(argv) = command_argv.as_deref() {
                 crate::harness::guard_command(&a.repo_path, argv)?;
             }
+            if layout == crate::engine::worktree::WorktreeLayout::Lane {
+                crate::engine::worktree::ensure_gitpulse_lane_excluded(std::path::Path::new(
+                    &a.repo_path,
+                ))
+                .map_err(CommandError::into_message)?;
+            }
 
             let mut gate = |args: &[&str]| -> Result<(), CommandError> {
                 let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
@@ -3909,15 +4118,30 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let selection = crate::engine::cow_clone::CacheSelection::default();
             let (worktree_path, devmap, sparse_cone, cache_error, low_disk, hook_error) =
                 if let Some(ref sparse) = a.sparse_paths.filter(|p| !p.is_empty()) {
-                    let created = crate::engine::worktree::add_sparse_worktree_zero_copy(
-                        &a.repo_path,
-                        target_str,
-                        &a.branch,
-                        a.base.as_deref(),
-                        sparse,
-                        share_cache,
-                        &mut gate,
-                    )
+                    let created = match layout {
+                        crate::engine::worktree::WorktreeLayout::Lane => {
+                            crate::engine::worktree::add_sparse_worktree_zero_copy_for_lane(
+                                &a.repo_path,
+                                target_str,
+                                &a.branch,
+                                a.base.as_deref(),
+                                sparse,
+                                share_cache,
+                                &mut gate,
+                            )
+                        }
+                        crate::engine::worktree::WorktreeLayout::Sibling => {
+                            crate::engine::worktree::add_sparse_worktree_zero_copy(
+                                &a.repo_path,
+                                target_str,
+                                &a.branch,
+                                a.base.as_deref(),
+                                sparse,
+                                share_cache,
+                                &mut gate,
+                            )
+                        }
+                    }
                     .map_err(CommandError::into_message)?;
                     (
                         created.path,
@@ -3962,7 +4186,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let mut command_exit_code = None;
             let mut command_error = None;
             if let Some(argv) = command_argv.as_deref() {
-                match crate::engine::git_cli::capture_command(
+                match crate::engine::process::capture_command(
                     argv[0],
                     &argv[1..],
                     Some(std::path::Path::new(&worktree_path)),
@@ -4068,12 +4292,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     crate::engine::git_writer::validate_ref_name(base)
                         .map_err(CommandError::into_message)?;
                 }
-                let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
-                    &a.repo_path,
-                    &a.branch,
-                    None,
-                )
-                .map_err(CommandError::into_message)?;
+                let target_path =
+                    crate::engine::worktree::resolve_worktree_path_for_branch_with_layout(
+                        &a.repo_path,
+                        &a.branch,
+                        crate::engine::worktree::WorktreeLayout::Lane,
+                    )
+                    .map_err(CommandError::into_message)?;
                 let target_str = target_path
                     .to_str()
                     .ok_or_else(|| "invalid target path".to_string())?;
@@ -4085,6 +4310,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 );
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 crate::harness::guard_command(&a.repo_path, &argv_refs)?;
+                crate::engine::worktree::ensure_gitpulse_lane_excluded(std::path::Path::new(
+                    &a.repo_path,
+                ))
+                .map_err(CommandError::into_message)?;
                 let selection = crate::engine::cow_clone::CacheSelection::default();
                 let created = crate::engine::worktree::add_worktree_with_devmap(
                     &a.repo_path,
@@ -4854,6 +5083,36 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
 /// What a read or a write of a task that must already exist says when this
 /// machine has no board.
 const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
+
+/// `gitpulse_turn_checkpoints`: the worktree's checkpoint list, or one
+/// checkpoint's bounded patch. A read that could not run says `ok: false` and
+/// why; it is never an empty list.
+fn turn_checkpoints(a: TurnCheckpointsArgs) -> Value {
+    use crate::engine::turn_checkpoint as tc;
+    let refused = |error: String| json!({ "ok": false, "error": error, "checkpoints": [] });
+    match a.id.as_deref() {
+        Some(id) => match tc::diff_turn_checkpoint(&a.repo_path, id, a.against.as_deref()) {
+            Ok(diff) => json!({ "ok": true, "error": "", "diff": diff }),
+            Err(error) => refused(error),
+        },
+        None => {
+            if a.against.is_some() {
+                return refused("`against` needs an `id` to compare it with".into());
+            }
+            match tc::list_turn_checkpoints(&a.repo_path, a.limit.unwrap_or(20) as usize) {
+                Ok(list) => json!({
+                    "ok": true,
+                    "error": "",
+                    "key": list.key,
+                    "total": list.total,
+                    "truncated": list.truncated,
+                    "checkpoints": list.entries,
+                }),
+                Err(error) => refused(error),
+            }
+        }
+    }
+}
 
 fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
     let (address, caveat) = with_production_retry(|retry| read_target(&a.repo_path, retry))?;
@@ -6763,6 +7022,10 @@ mod tests {
             "the fixture ledger holds no events; page budgets are held by the ledger page tests",
         ),
         (
+            "gitpulse_turn_checkpoints",
+            "no fixture worktree holds a checkpoint; the list and patch bounds are held by the turn_checkpoint engine tests",
+        ),
+        (
             "gitpulse_import_tasks",
             "no briefs to import, so no imported list",
         ),
@@ -8215,6 +8478,213 @@ mod tests {
         );
     }
 
+    /// A reader tool (`gitpulse_list_tasks` or `gitpulse_get_task`) opens the task
+    /// profile strictly read-only: it does not create missing databases, does not
+    /// run DDL or schema migrations, does not switch to WAL, and succeeds even if
+    /// the database file is marked read-only on disk. Mutating tools, in contrast,
+    /// require writable access and fail when the file is read-only.
+    #[test]
+    fn task_list_and_get_open_read_only_and_do_not_run_writable_prepare() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let database = profile.path().join("workbench.sqlite");
+
+        // 1. Reading when no board exists answers empty/none and does NOT create the database file.
+        assert!(!database.exists(), "database must not exist initially");
+        let (error, listed_empty) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        assert!(!error, "{listed_empty}");
+        assert_eq!(listed_empty["returned"], 0, "{listed_empty}");
+        assert_eq!(listed_empty["tasks"], json!([]), "{listed_empty}");
+        assert!(
+            !database.exists(),
+            "gitpulse_list_tasks must not create workbench.sqlite on a machine with no board"
+        );
+
+        let (error, get_empty) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "nonexistent"}),
+        );
+        assert!(
+            error,
+            "getting a task when no board exists must return error"
+        );
+        assert_eq!(get_empty, json!(NO_BOARD));
+        assert!(
+            !database.exists(),
+            "gitpulse_get_task must not create workbench.sqlite on a machine with no board"
+        );
+
+        // 2. Create tasks via add_task to populate the database.
+        let (error, added1) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "gp-ro-test-task",
+                "title": "Task for read-only store test"
+            }),
+        );
+        assert!(!error, "{added1}");
+        let (error, added2) = tool_json(
+            "gitpulse_add_task",
+            json!({
+                "repo_path": repo,
+                "task_id": "gp-ro-source-task",
+                "title": "Source task for merge"
+            }),
+        );
+        assert!(!error, "{added2}");
+        assert!(
+            database.exists(),
+            "workbench.sqlite must exist after add_task"
+        );
+
+        // 3. Mark the database file as read-only.
+        struct ReadonlyGuard(std::path::PathBuf);
+        impl Drop for ReadonlyGuard {
+            fn drop(&mut self) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+                }
+                #[cfg(windows)]
+                if let Ok(meta) = std::fs::metadata(&self.0) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(&self.0, perms);
+                }
+            }
+        }
+        let _guard = ReadonlyGuard(database.clone());
+        let mut perms = std::fs::metadata(&database).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&database, perms).unwrap();
+
+        // 4. Verify reader tools succeed on the read-only database.
+        let (error, listed) = tool_json("gitpulse_list_tasks", json!({"repo_path": repo}));
+        assert!(
+            !error,
+            "gitpulse_list_tasks must succeed on read-only store: {listed}"
+        );
+        assert_eq!(listed["returned"], 2, "{listed}");
+        let titles: Vec<&str> = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"Task for read-only store test"));
+        assert!(titles.contains(&"Source task for merge"));
+
+        let (error, fetched) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task"}),
+        );
+        assert!(
+            !error,
+            "gitpulse_get_task must succeed on read-only store: {fetched}"
+        );
+        assert_eq!(fetched["task"]["title"], "Task for read-only store test");
+
+        // 5. Verify mutating tools fail when the store cannot be opened writeable.
+        let (error, complete_res) = tool_json(
+            "gitpulse_complete_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task", "status": "review"}),
+        );
+        assert!(
+            error,
+            "gitpulse_complete_task must fail when database is read-only: {complete_res}"
+        );
+
+        let (error, delete_res) = tool_json(
+            "gitpulse_delete_task",
+            json!({"repo_path": repo, "task_id": "gp-ro-test-task", "reason": "test"}),
+        );
+        assert!(
+            error,
+            "gitpulse_delete_task must fail when database is read-only: {delete_res}"
+        );
+
+        let (error, merge_res) = tool_json(
+            "gitpulse_merge_tasks",
+            json!({
+                "repo_path": repo,
+                "into_task_id": "gp-ro-test-task",
+                "sources": [{"task_id": "gp-ro-source-task"}],
+                "reason": "test"
+            }),
+        );
+        assert!(
+            error,
+            "gitpulse_merge_tasks must fail when database is read-only: {merge_res}"
+        );
+    }
+
+    /// `inbox` was merged into `backlog`. An agent written before that still
+    /// sends it, and a call that worked yesterday must not start failing: the
+    /// old name is read as the new one, but never advertised.
+    #[test]
+    fn a_retired_inbox_status_is_accepted_stored_as_backlog_and_not_advertised() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+
+        let catalog = tools();
+        for tool in ["gitpulse_add_task", "gitpulse_list_tasks"] {
+            let schema = catalog.iter().find(|t| t["name"] == tool).unwrap();
+            assert_eq!(
+                schema["inputSchema"]["properties"]["status"]["enum"],
+                json!(["backlog", "ready", "in_progress", "review", "done"]),
+                "{tool}"
+            );
+            assert!(
+                !schema["inputSchema"]["properties"]["status"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("inbox"),
+                "{tool}"
+            );
+        }
+
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "task_id": "gp-old-agent", "title": "Filed by an old agent", "status": "inbox"}),
+        );
+        assert!(!error, "{added}");
+        assert_eq!(added["status"], "backlog", "{added}");
+        let (error, defaulted) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "task_id": "gp-no-status", "title": "No column named"}),
+        );
+        assert!(!error, "{defaulted}");
+        assert_eq!(defaulted["status"], "backlog", "{defaulted}");
+
+        for status in ["inbox", "backlog"] {
+            let (error, listed) = tool_json(
+                "gitpulse_list_tasks",
+                json!({"repo_path": repo, "status": status}),
+            );
+            assert!(!error, "{status}: {listed}");
+            assert_eq!(listed["returned"], 2, "{status}: {listed}");
+            for task in listed["tasks"].as_array().unwrap() {
+                assert_eq!(task["status"], "backlog", "{status}: {listed}");
+            }
+        }
+        let (error, fetched) = tool_json(
+            "gitpulse_get_task",
+            json!({"repo_path": repo, "task_id": "gp-old-agent"}),
+        );
+        assert!(!error, "{fetched}");
+        assert_eq!(fetched["task"]["status"], "backlog", "{fetched}");
+
+        // The alias reads a name an agent once used; it does not loosen the enum.
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "title": "Nope", "status": "outbox"}),
+        );
+        assert!(error, "{refused}");
+    }
+
     /// The defect this replaced: `gitpulse_add_task` reported success and the
     /// task appeared on no board. So the assertion is made through the exact
     /// calls the board makes — `registerRepository`, then a repository-scoped
@@ -8713,7 +9183,7 @@ mod tests {
 
         for (arguments, expected) in [
             (
-                json!({"repo_path": repo, "task_id": id, "status": "inbox"}),
+                json!({"repo_path": repo, "task_id": id, "status": "backlog"}),
                 "status",
             ),
             (
@@ -9918,6 +10388,239 @@ mod tests {
         );
     }
 
+    /// A task filed through the tool, then edited by the person so it sits at
+    /// revision 2. Returns the board and the task's item_id.
+    fn filed_then_edited(
+        dir: &tempfile::TempDir,
+        profile: &tempfile::TempDir,
+        repo: &str,
+    ) -> (crate::workbench::WorkbenchState, String) {
+        crate::test_support::trust_repo(dir.path());
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Held card" }),
+        );
+        assert!(!error, "{added}");
+        assert_eq!(added["revision"], 1, "{added}");
+        let id = added["item_id"].as_str().unwrap().to_string();
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        person_edits(&board, &id);
+        assert_eq!(board_item(&board, &id)["revision"], 2);
+        (board, id)
+    }
+
+    /// What an overwrite did before `expected_revision` existed, and still does
+    /// when it is not passed: it replaces the content whatever revision the
+    /// card has reached, so a person's edit made after the agent last read it
+    /// is overwritten.
+    #[test]
+    fn add_task_overwrite_without_a_revision_replaces_a_card_edited_since_it_was_read() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, replaced) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite", "overwrite": true }),
+        );
+        assert!(!error, "{replaced}");
+        assert_eq!(replaced["outcome"], "updated", "{replaced}");
+        assert_eq!(replaced["revision"], 3, "{replaced}");
+        assert_eq!(board_item(&board, &id)["title"], "Agent rewrite");
+    }
+
+    #[test]
+    fn add_task_overwrite_held_to_a_stale_revision_is_refused_and_writes_nothing() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, stale) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        let message = stale.as_str().unwrap_or_default();
+        assert!(
+            error && message.contains("revision_conflict") && message.contains("revision 2"),
+            "{stale}"
+        );
+        let after = board_item(&board, &id);
+        assert_eq!(after["title"], "Edited by the person");
+        assert_eq!(after["revision"], 2, "nothing was written");
+    }
+
+    #[test]
+    fn add_task_overwrite_held_to_the_current_revision_goes_through() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, saved) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2.0 }),
+        );
+        assert!(!error, "{saved}");
+        assert_eq!(saved["outcome"], "updated", "{saved}");
+        assert_eq!(saved["revision"], 3, "{saved}");
+        assert_eq!(board_item(&board, &id)["title"], "Agent rewrite");
+    }
+
+    /// A revision names a card that exists, and only an overwrite can be held
+    /// to one: both other readings are refused instead of guessed at, so a
+    /// caller never believes a write was guarded when it was not.
+    #[test]
+    fn add_task_expected_revision_without_an_overwrite_or_without_a_card_is_refused() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "expected_revision": 2 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(error && message.contains("invalid_input"), "{refused}");
+        assert_eq!(board_item(&board, &id)["title"], "Edited by the person");
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-never-filed", "title": "Brand new card",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(error && message.contains("not_found"), "{refused}");
+        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert_eq!(listed["total"], 1, "no card was created: {listed}");
+    }
+
+    /// Folding into a card the person made on the board is an overwrite by its
+    /// board item_id, which takes a different path through the owner than a
+    /// card the tool filed; the held revision applies to it the same way.
+    #[test]
+    fn add_task_overwrite_by_board_item_id_is_held_to_the_revision_too() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, _) = board_task(profile.path(), &repo, "board-keep");
+        person_edits(&board, "board-keep");
+
+        let (error, stale) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 1 }),
+        );
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+        assert_eq!(
+            board_item(&board, "board-keep")["title"],
+            "Edited by the person"
+        );
+
+        let (error, saved) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "board-keep", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2 }),
+        );
+        assert!(!error, "{saved}");
+        assert_eq!(saved["outcome"], "updated", "{saved}");
+        assert_eq!(board_item(&board, "board-keep")["title"], "Agent rewrite");
+        assert_eq!(board_item(&board, "board-keep")["position"], 7);
+    }
+
+    /// A card deleted since the agent read it is named as deleted, with the
+    /// reason, as the other tools name it; it is not reported as never filed.
+    #[test]
+    fn add_task_overwrite_held_to_a_revision_names_a_card_deleted_since() {
+        let (dir, profile, repo) = task_fixture();
+        let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "reason": "Obsolete work." }),
+        );
+        assert!(!error, "{deleted}");
+
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                    "overwrite": true, "expected_revision": 2 }),
+        );
+        let message = refused.as_str().unwrap_or_default();
+        assert!(
+            error && message.contains("task_deleted") && message.contains("Obsolete work."),
+            "{refused}"
+        );
+    }
+
+    /// Deliberately stricter than complete and delete, which answer a retry
+    /// whose state already matches as `unchanged` before looking at the
+    /// revision: a held overwrite is refused at any revision but the one named,
+    /// even when its content equals what is stored, so a stale view is always
+    /// told to re-read.
+    #[test]
+    fn add_task_held_overwrite_at_a_stale_revision_is_refused_even_with_identical_content() {
+        let (dir, profile, repo) = task_fixture();
+        let (_board, _id) = filed_then_edited(&dir, &profile, &repo);
+        let identical = json!({ "repo_path": repo, "task_id": "gp-held",
+                                "title": "Edited by the person", "overwrite": true });
+        let (error, same) = tool_json("gitpulse_add_task", identical.clone());
+        assert!(!error, "{same}");
+        assert_eq!(same["outcome"], "unchanged", "{same}");
+
+        let mut held = identical;
+        held["expected_revision"] = json!(1);
+        let (error, stale) = tool_json("gitpulse_add_task", held);
+        assert!(
+            error && stale.as_str().unwrap().contains("revision_conflict"),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn add_task_expected_revision_is_held_to_the_same_bounds_as_the_other_tools() {
+        let (dir, profile, repo) = task_fixture();
+        let (board, id) = filed_then_edited(&dir, &profile, &repo);
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_add_task")
+            .expect("gitpulse_add_task is advertised")["inputSchema"]
+            .clone();
+        let property = &schema["properties"]["expected_revision"];
+        assert_eq!(property["type"], "integer", "{property}");
+        assert_eq!(
+            (property["minimum"].as_u64(), property["maximum"].as_u64()),
+            (Some(1), Some(MAX_REVISION)),
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "expected_revision"),
+            "the argument is optional"
+        );
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("2"),
+            json!(MAX_REVISION + 1),
+        ] {
+            let arguments = json!({ "repo_path": repo, "task_id": "gp-held", "title": "Agent rewrite",
+                                    "overwrite": true, "expected_revision": bad });
+            let (error, refused) = tool_json("gitpulse_add_task", arguments);
+            assert!(
+                error
+                    && refused
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("expected_revision"),
+                "{bad} was accepted: {refused}"
+            );
+        }
+        assert_eq!(board_item(&board, &id)["title"], "Edited by the person");
+    }
+
     fn ledger_repo_with_events(count: usize) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         crate::test_support::git_in(dir.path(), &["init", "-q"]);
@@ -10533,12 +11236,14 @@ mod tests {
         use devmap_parity as dm;
         rows![
             ("gitpulse_insights", RepoArgs),
+            ("gitpulse_sessions", SessionsArgs),
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
             ("gitpulse_collision_risk", CollisionRiskArgs),
             ("gitpulse_merge_conflicts", RepoArgs),
             ("gitpulse_change_context", ChangeContextArgs),
             ("gitpulse_ledger_events", LedgerEventsArgs),
+            ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
             ("gitpulse_task_view", TaskViewArgs),
             ("gitpulse_add_task", AddTaskArgs),
             ("gitpulse_import_tasks", ImportTasksArgs),
@@ -10664,12 +11369,14 @@ mod tests {
             use devmap_parity as dm;
             rows![
                 ("gitpulse_insights", RepoArgs),
+                ("gitpulse_sessions", SessionsArgs),
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
                 ("gitpulse_collision_risk", CollisionRiskArgs),
                 ("gitpulse_merge_conflicts", RepoArgs),
                 ("gitpulse_change_context", ChangeContextArgs),
                 ("gitpulse_ledger_events", LedgerEventsArgs),
+                ("gitpulse_turn_checkpoints", TurnCheckpointsArgs),
                 ("gitpulse_task_view", TaskViewArgs),
                 ("gitpulse_add_task", AddTaskArgs),
                 ("gitpulse_import_tasks", ImportTasksArgs),
@@ -11887,6 +12594,213 @@ mod tests {
     }
 
     #[test]
+    fn worktree_create_defaults_to_gitpulse_lane_and_allows_explicit_sibling() {
+        let (_sandbox, repo) = honesty_repo();
+        let canon_repo = std::path::Path::new(&repo).canonicalize().unwrap();
+
+        // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
+        //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
+        let (err, created) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/auth-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "create failed: {created}");
+        let actual = std::path::PathBuf::from(created["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let expected = canon_repo.join(".gitpulse/worktrees/feat-auth-lane");
+        assert_eq!(actual, expected, "{created}");
+        let resolved = crate::engine::worktree::resolve_worktree_path(
+            &canon_repo,
+            "feat-auth-lane",
+            crate::engine::worktree::WorktreeLayout::Lane,
+        )
+        .unwrap();
+        assert_eq!(actual, resolved);
+        assert_eq!(
+            crate::hooks::worktree::plan_create(&canon_repo, "feat-auth-slug")
+                .unwrap()
+                .target,
+            canon_repo.join(".gitpulse/worktrees/feat-auth-slug")
+        );
+        let lane_ignored = crate::engine::git_cli::git_captured(
+            &canon_repo,
+            &["check-ignore", "-q", ".gitpulse/worktrees/feat-auth-lane"],
+        )
+        .expect("check-ignore");
+        assert_eq!(lane_ignored.status_code, 0, "lane dir must be git-ignored");
+        let status =
+            crate::engine::git_cli::git_text(&canon_repo, &["status", "--porcelain"]).unwrap();
+        assert!(
+            !status.lines().any(|line| line.contains(".gitpulse")),
+            "lane must not dirty git status: {status}"
+        );
+
+        // 2. Creating from inside an existing linked lane still anchors at the main checkout.
+        let (err, nested) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": actual.to_str().unwrap(),
+                "branch": "feat/from-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "create from inside lane failed: {nested}");
+        let nested_actual = std::path::PathBuf::from(nested["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            nested_actual,
+            canon_repo.join(".gitpulse/worktrees/feat-from-lane"),
+            "{nested}"
+        );
+        assert!(!actual.join(".gitpulse").exists());
+
+        // 3. Sparse checkout without `layout` also lands inside <repo>/.gitpulse/worktrees/<slug>.
+        let sub_dir = canon_repo.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("b.txt"), "b\n").unwrap();
+        git_ok(&["-C", &repo, "add", "sub/b.txt"]);
+        git_ok(&[
+            "-C",
+            &repo,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "add sub",
+        ]);
+        let (err, sparse) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/sparse-lane",
+                "sparse_paths": ["sub"],
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sparse create failed: {sparse}");
+        let sparse_actual = std::path::PathBuf::from(sparse["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            sparse_actual,
+            canon_repo.join(".gitpulse/worktrees/feat-sparse-lane"),
+            "{sparse}"
+        );
+
+        // 4. Explicit `layout: "sibling"` places the worktree at ../<Repo>.<slug>.
+        let (err, sibling) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/sibling-opt",
+                "layout": "sibling",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sibling create failed: {sibling}");
+        let sibling_actual = std::path::PathBuf::from(sibling["worktree_path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let sibling_expected = crate::engine::worktree::resolve_worktree_path(
+            &canon_repo,
+            "feat-sibling-opt",
+            crate::engine::worktree::WorktreeLayout::Sibling,
+        )
+        .unwrap();
+        assert_eq!(sibling_actual, sibling_expected, "{sibling}");
+
+        // 5. Invalid layout values fail closed, and the schema change stays additive.
+        let (err, invalid) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/invalid-layout",
+                "layout": "elsewhere",
+                "share_cache": false
+            }),
+        );
+        assert!(err, "invalid layout must be rejected: {invalid}");
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == "gitpulse_worktree_create")
+            .unwrap();
+        assert_eq!(
+            schema["inputSchema"]["required"],
+            json!(["repo_path", "branch"])
+        );
+    }
+
+    #[test]
+    fn worktree_create_default_lane_is_writable_under_default_manvi_gate() {
+        let (_sandbox, repo) = honesty_repo();
+        let (err, created_lane) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/gate-lane",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "lane create failed: {created_lane}");
+        let lane_file = std::path::Path::new(created_lane["worktree_path"].as_str().unwrap())
+            .join("gate_probe.txt");
+
+        let (err, created_sibling) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/gate-sibling",
+                "layout": "sibling",
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "sibling create failed: {created_sibling}");
+        let sibling_file = std::path::Path::new(created_sibling["worktree_path"].as_str().unwrap())
+            .join("gate_probe.txt");
+
+        let lane_verdict =
+            crate::harness::policy::check_file(&repo, lane_file.to_str().unwrap(), "write", None);
+        assert!(
+            lane_verdict.checked,
+            "manvi gate did not run: {lane_verdict:?}"
+        );
+        assert!(
+            !lane_verdict.status.blocks(),
+            "default lane must be writable under default gate: {lane_verdict:?}"
+        );
+        std::fs::write(&lane_file, "allowed\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&lane_file).unwrap(), "allowed\n");
+
+        let sibling_verdict = crate::harness::policy::check_file(
+            &repo,
+            sibling_file.to_str().unwrap(),
+            "write",
+            None,
+        );
+        assert!(
+            sibling_verdict.checked,
+            "manvi gate did not run for sibling: {sibling_verdict:?}"
+        );
+        assert!(
+            sibling_verdict.status.blocks(),
+            "sibling layout must be blocked by default gate: {sibling_verdict:?}"
+        );
+        assert_eq!(
+            sibling_verdict.rule, "path.outside_root",
+            "{sibling_verdict:?}"
+        );
+    }
+
+    #[test]
     fn test_task_subtask_decomposition_and_inbox_mcp_lifecycle() {
         let (dir, _profile, repo) = task_fixture();
         crate::test_support::trust_repo(dir.path());
@@ -12225,7 +13139,7 @@ mod deferral_retry_tests {
         let repo = crate::test_support::git_repo();
         let path = repo.path().to_str().unwrap();
         for tool in ["gitpulse_collision_risk", "gitpulse_insights"] {
-            let answer = crate::engine::git_cli::with_forced_deferral(|| {
+            let answer = crate::engine::process::with_forced_deferral(|| {
                 handle_tool_call(tool, &json!({ "repo_path": path })).expect(tool)
             });
             assert!(!answer["ok"].as_bool().unwrap_or(false), "{tool}");
@@ -12340,7 +13254,7 @@ mod deferral_retry_tests {
     fn a_ledger_read_that_stays_shed_names_the_deferral_after_one_retry() {
         let repo = crate::test_support::git_repo();
         let harness = Harness::new(0, ROOMY);
-        let error = crate::engine::git_cli::with_forced_deferral(|| {
+        let error = crate::engine::process::with_forced_deferral(|| {
             harness.run(|retry| read_address(repo.path().to_str().unwrap(), retry))
         })
         .expect_err("a shed read cannot resolve");

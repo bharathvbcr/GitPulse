@@ -1083,10 +1083,7 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
             return true;
         }
     }
-    if is_default_index_excluded(&norm) {
-        return true;
-    }
-    false
+    is_default_index_excluded(&norm)
 }
 
 /// The runes Svelte 5 compiles, without the `$`: `$state`, `$derived`,

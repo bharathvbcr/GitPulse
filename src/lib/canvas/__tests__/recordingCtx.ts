@@ -40,6 +40,12 @@ export function makeRecordingCtx(height = 800) {
     fillText(text: string, x: number, y: number) {
       calls.push({ op: "fillText", text, x, y, font: ctx.font, style: ctx.fillStyle });
     },
+    clip() {
+      calls.push({ op: "clip" });
+    },
+    drawImage(image: unknown, x: number, y: number, w: number, h: number) {
+      calls.push({ op: "drawImage", image, x, y, w, h });
+    },
     setTransform() {},
     globalAlpha: 1,
     lineWidth: 1,

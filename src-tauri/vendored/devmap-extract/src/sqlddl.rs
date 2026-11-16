@@ -571,7 +571,7 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
     let timed_out = Cell::new(false);
     while i < bytes.len() {
         steps += 1;
-        if steps % DEADLINE_STRIDE == 0 && past(deadline) {
+        if steps.is_multiple_of(DEADLINE_STRIDE) && past(deadline) {
             return Err(Abandon::Deadline);
         }
         let ctx = Ctx {
@@ -1024,7 +1024,7 @@ fn statement_end(source: &str, start: usize, ctx: Ctx) -> Option<(usize, bool)> 
     let mut block = 0i32;
     while i < bytes.len() {
         steps += 1;
-        if steps % DEADLINE_STRIDE == 0 && past(ctx.deadline) {
+        if steps.is_multiple_of(DEADLINE_STRIDE) && past(ctx.deadline) {
             ctx.timed_out.set(true);
             return None;
         }
@@ -1083,15 +1083,11 @@ fn read_qualified_name(source: &str, start: usize) -> Option<(String, bool)> {
     let (mut name, mut cursor) = read_ident(source, start)?;
     let mut delimited = is_delimited_at(source, start);
     loop {
-        let Some(after) = skip_sep(source, cursor) else {
-            return None;
-        };
+        let after = skip_sep(source, cursor)?;
         if after >= source.len() || source.as_bytes()[after] != b'.' {
             break;
         }
-        let Some(after_dot) = skip_sep(source, after + 1) else {
-            return None;
-        };
+        let after_dot = skip_sep(source, after + 1)?;
         let (next, next_cursor) = read_ident(source, after_dot)?;
         name = next;
         delimited = is_delimited_at(source, after_dot);
@@ -1425,19 +1421,10 @@ fn keyword(source: &str, i: usize, word: &str) -> bool {
     if !rest[..word.len()].eq_ignore_ascii_case(word) {
         return false;
     }
-    if source[after..]
-        .chars()
-        .next()
-        .is_some_and(|ch| is_ident_char(ch))
-    {
+    if source[after..].chars().next().is_some_and(is_ident_char) {
         return false;
     }
-    if i > 0
-        && source[..i]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| is_ident_char(ch))
-    {
+    if i > 0 && source[..i].chars().next_back().is_some_and(is_ident_char) {
         return false;
     }
     true

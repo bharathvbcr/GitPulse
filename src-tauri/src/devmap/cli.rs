@@ -6,7 +6,8 @@
 //! — a path somebody typed is a statement, and quietly falling back hides the
 //! typo behind whatever else is installed.
 
-use crate::engine::git_cli::{self, validate_repo, BoundedRun};
+use crate::engine::git_cli::validate_repo;
+use crate::engine::process::{self, BoundedRun};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -478,7 +479,7 @@ pub fn resolve_binary_uncached() -> Result<ResolvedDevmap, String> {
             });
         }
     }
-    git_cli::find_external_tool(bin_name)
+    process::find_external_tool(bin_name)
         .map(|path| ResolvedDevmap {
             path,
             lookup: DevmapLookup::PathSearch,
@@ -583,13 +584,13 @@ fn run_devmap(
         limit_build_threads(&mut cmd);
     }
     let mut run = |cmd: &mut Command| {
-        git_cli::run_observed(cmd, "devmap", deadline, stdin, STDOUT_CAP, &mut diagnostic)
+        process::run_observed(cmd, "devmap", deadline, stdin, STDOUT_CAP, &mut diagnostic)
     };
     // An index build is background work whoever asked for it: it runs in the
     // OS background band (and with half the cores' worth of rayon threads, see
     // above) so it cannot take the machine from the UI.
     let result = if is_build {
-        git_cli::with_background_band(|| run(&mut cmd))
+        process::with_background_band(|| run(&mut cmd))
     } else {
         run(&mut cmd)
     };
@@ -668,12 +669,12 @@ pub(super) fn failure_detail(stdout: &str, stderr: &str, fallback: String) -> St
 /// ran past its deadline. A build refused at the slot wait, deferred under
 /// load, or that never spawned did not run out of time; it stays an `Err` so
 /// the caller can tell "never ran" from "hung" (see
-/// [`git_cli::RunError::classify`]).
+/// [`crate::engine::process::RunError::classify`]).
 fn timed_out_outcome(
     binary: &ResolvedDevmap,
     err: CommandError,
 ) -> Result<BuildOutcome, CommandError> {
-    if !git_cli::is_run_timeout(err.message()) {
+    if !process::is_run_timeout(err.message()) {
         return Err(err);
     }
     Ok(BuildOutcome {
@@ -1687,7 +1688,7 @@ mod tests {
             child_path, LAUNCHD_MINIMAL,
             "the child inherited the launch PATH unchanged"
         );
-        for fallback in crate::engine::git_cli::external_tool_fallback_dirs() {
+        for fallback in crate::engine::process::external_tool_fallback_dirs() {
             assert!(
                 entries.contains(&fallback),
                 "devmap cannot see {} — the directory it may have been resolved from: {entries:?}",
@@ -2073,13 +2074,9 @@ exit 2
         perms.set_mode(0o755);
         fs::set_permissions(&bin, perms).unwrap();
         let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                clear_preview_debounces();
-            }
-        }
-        let _reset = Reset;
+        let _reset = std::mem::DropGuard::new((), |()| {
+            clear_preview_debounces();
+        });
         let path = repo.path().to_string_lossy().into_owned();
         let mut available = 0u32;
         let mut debounced = 0u32;
@@ -2459,7 +2456,7 @@ exit 2
     #[test]
     #[cfg(unix)]
     fn live_refresh_reports_a_probe_shed_under_load_as_deferred() {
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let canonical = repo.path().canonicalize().unwrap();
@@ -2499,7 +2496,7 @@ exit 2
     /// path that spells "timeout") stays an error the caller can tell apart.
     #[test]
     fn only_a_build_that_ran_out_of_time_is_a_timed_out_outcome() {
-        use crate::engine::git_cli::{is_slot_wait_timeout, refusal_message, Refusal};
+        use crate::engine::process::{is_slot_wait_timeout, refusal_message, Refusal};
         let binary = ResolvedDevmap {
             path: "/bin/devmap".into(),
             lookup: DevmapLookup::PathSearch,
@@ -2666,7 +2663,7 @@ exit 2
                 let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
                 handles.push(std::thread::spawn(move || {
                     barrier.wait();
-                    crate::engine::git_cli::with_background_processes(|| {
+                    crate::engine::process::with_background_processes(|| {
                         crate::devmap::maybe_refresh(&path, true)
                     })
                 }));
@@ -2864,7 +2861,7 @@ printf '%s\n' '{"ok":true}'
         .unwrap();
         let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
         assert_eq!(
-            crate::engine::git_cli::current_admission_name(),
+            crate::engine::process::current_admission_name(),
             "reactive",
             "the caller is not a background one"
         );

@@ -111,7 +111,7 @@ struct Source {
 fn section(id: &str, item: &Value) -> String {
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut meta = vec![
-        format!("status {}", item["status"].as_str().unwrap_or("inbox")),
+        format!("status {}", item["status"].as_str().unwrap_or("backlog")),
         format!("priority {}", item["priority"].as_i64().unwrap_or(2)),
         one_line(item["kind"].as_str().unwrap_or("feature")),
     ];

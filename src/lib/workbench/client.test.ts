@@ -17,6 +17,10 @@ describe("workbench boundary", () => {
     expect(page(response, taskCard).total).toBe(100);
     for (const mutation of [{ ok: false }, { shown: 0 }, { total: 0 }, { next_cursor: null }, { items: null }, { total: Infinity }, { has_more: "true" }]) expect(() => page({ ...response, ...mutation }, taskCard)).toThrow();
   });
+  it("reads a task a store still holds as inbox as backlog", () => {
+    expect(taskCard({ ...full, status: "inbox" }).status).toBe("backlog");
+    expect(task({ ...full, status: "inbox" }).status).toBe("backlog");
+  });
   it("rejects malformed links, unknown state and non-versioned records", () => {
     for (const change of [{ revision: 0 }, { status: "probably_done" }, { priority: 5 }, { repository_ids: [] }, { repository_ids: ["r1", "r1"] }, { primary_repository_id: "other" }, { title: null }]) expect(() => taskCard({ ...full, ...change })).toThrow();
   });

@@ -11,7 +11,7 @@
  * decision follows the row's own width (a container query's rule), not the
  * window's, so a window wider than its stage does not fold into a narrow row.
  */
-import { derived, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable } from "svelte/store";
 
 /** The view bar width at which it has room for the context content. */
 export const FOLD_MIN_WIDTH = 1600;
@@ -30,7 +30,11 @@ export const contextSlot: Readable<HTMLElement | null> = { subscribe: slot.subsc
 export function registerContextSlot(node: HTMLElement): () => void {
   slot.set(node);
   return () => {
-    slot.update((current) => (current === node ? null : current));
+    // Only the live registration's disposer clears anything. A replaced bar
+    // torn down after its successor mounted must not reset the width the
+    // successor measured: nothing re-reports it until that bar resizes.
+    if (get(slot) !== node) return;
+    slot.set(null);
     wide.set(false);
   };
 }

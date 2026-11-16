@@ -102,7 +102,7 @@ for (const [id, name] of [["gitpulse", "GitPulse"], ["manvi", "Manvi"], ["docs",
   await seed("repositories.put", { request_id: id, id, expected_revision: 0, name, identity_key: `fixture:${id}` });
 }
 await seed("workspaces.put", { request_id: "workspace", id: "devtools", expected_revision: 0, name: "Developer tools", icon: "◈", pinned: true, repository_ids: ["gitpulse", "manvi"] });
-for (const [index, status] of ["inbox", "backlog", "ready", "in_progress", "review", "done"].entries()) {
+for (const [index, status] of ["backlog", "backlog", "ready", "in_progress", "review", "done"].entries()) {
   await seed("items.put", { request_id: `task-${index}`, id: `task-${index}`, expected_revision: 0, title: ["Capture repository evidence", "Reduce search latency", "Group related repositories", "Keep task details through edits", "Review agent changes", "Persist workspace membership"][index], status, kind: index === 1 ? "bug" : "feature", priority: index % 4, description: "Reproduce the behavior and preserve this detailed evidence through every board move.", acceptance_criteria: ["Verify persistence after restart", "Preserve unrelated task fields"], repository_ids: index === 4 ? ["gitpulse", "manvi"] : [index === 5 ? "docs" : "gitpulse"], primary_repository_id: index === 5 ? "docs" : "gitpulse", labels: ["agentic"], home_workspace_id: index === 5 ? "devtools" : null });
 }
 let allowedHost = "";

@@ -112,6 +112,9 @@ fn error_plan(sha: &str, headline: &str, record: Option<&Record>) -> Plan {
 
 /// Decides what to post, or why nothing may be.
 pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, CommandError> {
+    if !super::is_record_id(facts.item_id) {
+        return Err("invalid task id; nothing was posted".into());
+    }
     let head = facts.head.as_ref().map_err(|e| {
         format!(
             "the verified worktree's head could not be read, so nothing was posted: {e}",
@@ -145,6 +148,13 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, CommandError> {
         return Err("the verification record names no commit, so nothing was posted".into());
     }
     let sha = record.head.as_str();
+    if head != sha {
+        return Err(format!(
+            "verification was taken at {} but the worktree is now at {}; verify again. Nothing was posted",
+            &sha[..12],
+            &head[..12]
+        ).into());
+    }
     if record.state == STATE_COULD_NOT_RUN {
         return Ok(error_plan(sha, "verification could not run", Some(record)));
     }
@@ -154,13 +164,6 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, CommandError> {
             "verification has not finished",
             Some(record),
         ));
-    }
-    if head != sha {
-        return Err(format!(
-            "verification was taken at {} but the worktree is now at {}; verify again. Nothing was posted",
-            &sha[..12],
-            &head[..12]
-        ).into());
     }
     match facts.dirty {
         Err(ref e) => {
@@ -217,7 +220,7 @@ impl Gh for RealGh<'_> {
         argv.push("gh".into());
         argv.extend(args.iter().cloned());
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        crate::engine::git_cli::mark_user_action(repo);
+        crate::engine::process::mark_user_action(repo);
         crate::harness::guard_command(repo, &refs)?;
         if let Some(reason) = crate::github::gh_unavailable_reason(&crate::github::probe_gh_cli()) {
             return Err(reason);
@@ -372,6 +375,9 @@ pub(crate) fn post_for_task(
     dry_run: bool,
     gh: &dyn Gh,
 ) -> Result<PostedVerifyStatus, CommandError> {
+    if !super::is_record_id(item_id) {
+        return Err("invalid task id; nothing was posted".into());
+    }
     match consent {
         Ok(true) => {}
         Ok(false) => return Err(
@@ -388,7 +394,7 @@ pub(crate) fn post_for_task(
     let remote = crate::github::discover_github_remote(repo_path)?
         .ok_or_else(|| "No GitHub remote configured".to_string())?;
     let record = match store {
-        Ok(store) => super::verification_gate::latest(store, item_id),
+        Ok(store) => super::verification_gate::Memo::shared().latest(store, item_id),
         Err(e) => Err(e),
     };
     // The worktree the verdict was taken in when the record names one of this
@@ -425,6 +431,9 @@ pub(crate) fn post_via_app(
     with_comment: bool,
     dry_run: bool,
 ) -> Result<PostedVerifyStatus, CommandError> {
+    if !super::is_record_id(item_id) {
+        return Err("invalid task id; nothing was posted".into());
+    }
     let consent = enabled_for(repo_path).map_err(CommandError::into_message);
     let repo = crate::engine::git_cli::validate_repo(repo_path)?;
     let gh = RealGh { repo: &repo };
@@ -587,9 +596,18 @@ mod tests {
 
     #[test]
     fn a_verdict_that_cannot_be_tied_to_the_commit_posts_nothing() {
-        let mut moved = facts(Ok(Some(record("passed", "settled"))));
-        moved.head = Ok(OTHER.into());
-        assert!(plan(&moved).unwrap_err().contains("verify again"));
+        for (outcome, state) in [
+            ("passed", "settled"),
+            ("", "could_not_run"),
+            ("passed", "running"),
+        ] {
+            let mut moved = facts(Ok(Some(record(outcome, state))));
+            moved.head = Ok(OTHER.into());
+            assert!(
+                plan(&moved).unwrap_err().contains("verify again"),
+                "{outcome}/{state}"
+            );
+        }
         let mut unreadable_head = facts(Ok(Some(record("passed", "settled"))));
         unreadable_head.head = Err("not a repository".into());
         assert!(plan(&unreadable_head).is_err());
@@ -928,5 +946,260 @@ mod tests {
             serde_json::from_str(row.argv_json.as_deref().expect("argv recorded")).unwrap();
         assert_eq!(recorded.first().map(String::as_str), Some("gh"));
         assert_eq!(&recorded[1..], argv.as_slice());
+    }
+
+    fn with_temp_tool_config(f: impl FnOnce(&Path)) {
+        let serial = crate::test_support::env::env_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tools.json");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &path)
+            .invalidating(crate::tool_config::invalidate_cache);
+        f(&path);
+    }
+
+    #[test]
+    fn an_invalid_task_id_is_refused_before_any_store_or_github_call() {
+        let repo = repo_with_commit();
+        let repo_str = repo.path().to_str().unwrap();
+        let profile = tempfile::TempDir::new().unwrap();
+        let state =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        let too_long = "a".repeat(super::super::MAX_RECORD_ID_BYTES + 1);
+        for bad in [
+            "",
+            "   ",
+            "../task",
+            "task/1",
+            "task\0id",
+            too_long.as_str(),
+        ] {
+            let err = plan(&Facts {
+                item_id: bad,
+                record: Ok(None),
+                head: Ok(SHA.into()),
+                dirty: Ok(false),
+            })
+            .unwrap_err();
+            assert!(
+                err.contains("invalid task id"),
+                "{bad:?}: {err}",
+                err = err.message()
+            );
+
+            let gh = FakeGh::new("", &[]);
+            let err = post_for_task(
+                Ok(&dc_store::Store::open(profile.path().join("s.sqlite")).unwrap()),
+                repo_str,
+                bad,
+                Ok(true),
+                false,
+                false,
+                &gh,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("invalid task id"),
+                "{bad:?}: {err}",
+                err = err.message()
+            );
+            assert!(gh.calls.borrow().is_empty(), "{bad:?}");
+
+            let err = post_via_app(&state, repo_str, bad, false, true).unwrap_err();
+            assert!(
+                err.contains("invalid task id"),
+                "{bad:?}: {err}",
+                err = err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn opt_in_binds_the_common_git_directory_across_linked_worktrees_and_not_other_repositories() {
+        with_temp_tool_config(|_| {
+            let repo = repo_with_commit();
+            let other = repo_with_commit();
+            let linked_root = tempfile::TempDir::new().unwrap();
+            let linked = linked_root.path().join("wt");
+            crate::test_support::git_in(
+                repo.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "linked",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let repo_str = repo.path().to_str().unwrap();
+            let linked_str = linked.to_str().unwrap();
+            let other_str = other.path().to_str().unwrap();
+
+            assert!(!enabled_for(repo_str).unwrap());
+            assert!(!enabled_for(linked_str).unwrap());
+            set_enabled(repo_str, true).unwrap();
+            assert!(enabled_for(repo_str).unwrap());
+            assert!(enabled_for(linked_str).unwrap());
+            assert!(!enabled_for(other_str).unwrap());
+            set_enabled(linked_str, false).unwrap();
+            assert!(!enabled_for(repo_str).unwrap());
+            assert!(!enabled_for(linked_str).unwrap());
+        });
+    }
+
+    #[test]
+    fn post_via_app_refuses_an_untrusted_or_opted_out_repository() {
+        with_temp_tool_config(|_| {
+            let profile = tempfile::TempDir::new().unwrap();
+            let state = crate::workbench::WorkbenchState::for_profile(
+                &profile.path().join("workbench.sqlite"),
+            );
+            use crate::procguard::LockedSpawn;
+            let untrusted = tempfile::TempDir::new().unwrap();
+            let mut init = std::process::Command::new("git");
+            crate::test_support::pin_git(&mut init);
+            assert!(init
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(untrusted.path())
+                .status_locked()
+                .unwrap()
+                .success());
+            let untrusted_str = untrusted.path().to_str().unwrap();
+            set_enabled(untrusted_str, true).unwrap();
+            let err = post_via_app(&state, untrusted_str, "task", false, true).unwrap_err();
+            assert!(
+                crate::repository_trust::refused(err.message()),
+                "{err}",
+                err = err.message()
+            );
+
+            let trusted = repo_with_commit();
+            let trusted_str = trusted.path().to_str().unwrap();
+            let err = post_via_app(&state, trusted_str, "task", false, true).unwrap_err();
+            assert!(
+                err.contains("off for this repository"),
+                "{err}",
+                err = err.message()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_via_app_drives_the_real_gh_runner_and_keeps_secrets_out_of_its_argv() {
+        use crate::workbench::intake::gate_tests::{head_of, record as gate_record, store_record};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _sidecar = crate::harness::sidecar::test_serial();
+        let env_serial = crate::test_support::env::env_serial();
+        let bin_dir = tempfile::TempDir::new().unwrap();
+        let cfg_dir = tempfile::TempDir::new().unwrap();
+        let profile_dir = tempfile::TempDir::new().unwrap();
+        let log_path = bin_dir.path().join("calls.log");
+        let gh_path = bin_dir.path().join("gh");
+        {
+            let mut f = std::fs::File::create(&gh_path).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"gh version 2.99.0 (stub)\"; exit 0; fi\n{{\n  echo \"---\"\n  for a in \"$@\"; do printf 'ARG:%s\\n' \"$a\"; done\n}} >> \"{}\"\ncase \"$*\" in\n  *\"/pulls\"*) printf '42\\n' ;;\n  *) printf '{{\"state\":\"success\"}}\\n' ;;\nesac",
+                log_path.display()
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let joined_path = std::env::join_paths(
+            std::iter::once(bin_dir.path().to_path_buf())
+                .chain(std::env::split_paths(&existing_path)),
+        )
+        .unwrap();
+        let _env = crate::test_support::env::bind_env(&env_serial)
+            .set("PATH", &joined_path)
+            .set("AWS_SECRET_ACCESS_KEY", "abcd1234")
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                cfg_dir.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+
+        let repo = repo_with_commit();
+        std::fs::write(repo.path().join(".gitignore"), ".devcouncil/\n").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", ".gitignore"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "ignore devcouncil"]);
+        let repo_str = repo.path().to_str().unwrap();
+        let head = head_of(&repo);
+        let before = crate::ledger::latest_cursor(repo_str).unwrap();
+        let db_path = profile_dir.path().join("workbench.sqlite");
+        {
+            let store = dc_store::Store::open(&db_path).unwrap();
+            let mut val = gate_record("task", "passed", "settled", &repo, &head);
+            val["criteria"][0]["text"] = serde_json::json!(format!("exports csv {SECRET}"));
+            val["criteria"][0]["findings"] = serde_json::json!([SECRET]);
+            val["degraded"] = serde_json::json!([SECRET]);
+            val["critic_summary"] = serde_json::json!(SECRET);
+            store_record(&store, "task", &val);
+        }
+        let state = crate::workbench::WorkbenchState::for_profile(&db_path);
+        set_enabled(repo_str, true).unwrap();
+
+        let preview = post_via_app(&state, repo_str, "task", true, true).unwrap();
+        assert_eq!(preview.state, "success", "{preview:?}");
+        assert!(preview.dry_run);
+        assert!(!preview.status_posted);
+        assert_eq!(preview.would_run.len(), 2);
+        assert!(!log_path.exists(), "dry run must not invoke gh");
+
+        let posted = post_via_app(&state, repo_str, "task", true, false).unwrap();
+        assert_eq!(
+            (
+                posted.status_posted,
+                posted.state.as_str(),
+                posted.sha.as_str()
+            ),
+            (true, "success", head.as_str()),
+            "{posted:?}"
+        );
+        assert_eq!(posted.commented, vec![42]);
+        assert_eq!(posted.comment_note, None);
+
+        let recorded_calls = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            recorded_calls.contains(&format!("statuses/{head}")),
+            "{recorded_calls}"
+        );
+        assert!(
+            recorded_calls.contains(&format!("commits/{head}/pulls")),
+            "{recorded_calls}"
+        );
+        assert!(
+            recorded_calls.contains("issues/42/comments"),
+            "{recorded_calls}"
+        );
+        assert!(
+            recorded_calls.contains("context=devcouncil/verify"),
+            "{recorded_calls}"
+        );
+        assert!(recorded_calls.contains("state=success"), "{recorded_calls}");
+        assert!(
+            !recorded_calls.contains("AWS_SECRET_ACCESS_KEY"),
+            "{recorded_calls}"
+        );
+        assert!(!recorded_calls.contains("diff --git"), "{recorded_calls}");
+
+        let events = crate::ledger::tail(repo_str, before, 10).unwrap();
+        let gh_rows: Vec<_> = events
+            .iter()
+            .filter(|row| row.action == "command.run")
+            .collect();
+        assert_eq!(
+            gh_rows.len(),
+            3,
+            "status + pulls + comment gated via ledger"
+        );
     }
 }

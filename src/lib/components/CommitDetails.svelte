@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "../ipc/invoke";
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { resolveCurrentCommitId } from "../graph/currentCommit";
@@ -8,7 +8,6 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     GitCommit,
-    User,
     Calendar,
     Plus,
     Minus,
@@ -33,6 +32,7 @@
     evidenceTitle,
     hopsLabel,
   } from "../codeintel/suspectsQuery";
+  import AuthorAvatar from "../authors/AuthorAvatar.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
@@ -50,7 +50,76 @@
   import type { SelectedCommitDetails as CommitDetailsPayload } from "../stores/graphStore";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import type { ProvenanceFreshness } from "../provenance/types";
+  import { interfaceStore } from "../stores/interfaceStore";
+  import { observeResize } from "../dom/observeResize";
+  import {
+    COMMIT_PANE_BOUNDS,
+    COMMIT_PANE_MIN_VIEW_HEIGHT,
+    COMMIT_PANE_RESIZE_STEP,
+    fitPaneHeight,
+    nudgedPaneHeight,
+    startPaneDrag,
+  } from "../ui/paneHeight";
 
+  // The pane's height is the reader's: dragged on its top edge or nudged with
+  // the arrow keys, kept in the interface preferences, and capped against the
+  // column it shares with the commit list so that list keeps its room. The
+  // drag geometry is ui/paneHeight's, shared with the terminal dock.
+  let host: HTMLDivElement | undefined = $state();
+  let dragging = $state(false);
+  /** Height of the column the pane shares with the commit list, for the ceiling. */
+  let containerHeight = $state(0);
+  /** The height a drag is asking for, held until release: one store write per drag. */
+  let dragHeight = $state<number | null>(null);
+  let paneHeight = $derived(
+    fitPaneHeight(
+      dragHeight ?? $interfaceStore.commitPaneHeight,
+      containerHeight,
+      COMMIT_PANE_MIN_VIEW_HEIGHT,
+      COMMIT_PANE_BOUNDS,
+    ),
+  );
+  let paneCeiling = $derived(
+    fitPaneHeight(COMMIT_PANE_BOUNDS.max, containerHeight, COMMIT_PANE_MIN_VIEW_HEIGHT, COMMIT_PANE_BOUNDS),
+  );
+
+  $effect(() => {
+    const parent = host?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return;
+    return observeResize(parent, ([entry]) => {
+      containerHeight = entry.contentRect.height;
+    });
+  });
+
+  function commitDragHeight() {
+    if (dragHeight === null) return;
+    interfaceStore.setCommitPaneHeight(dragHeight);
+    dragHeight = null;
+  }
+
+  function startResize(event: PointerEvent) {
+    const started = startPaneDrag(event, paneHeight, COMMIT_PANE_BOUNDS, {
+      onHeight: (px) => (dragHeight = px),
+      onEnd: () => {
+        commitDragHeight();
+        dragging = false;
+      },
+    });
+    if (started) dragging = true;
+  }
+
+  function handleResizeKey(event: KeyboardEvent) {
+    const next = nudgedPaneHeight(event.key, paneHeight, COMMIT_PANE_RESIZE_STEP);
+    if (next === null) return;
+    event.preventDefault();
+    interfaceStore.setCommitPaneHeight(next);
+  }
+
+  onDestroy(() => {
+    // A pane torn down mid-drag still keeps the height the reader chose.
+    commitDragHeight();
+    dragging = false;
+  });
 
   // One id for the header, the details and the preview: the same resolution
   // the commit list uses for its highlight (graph/currentCommit.ts), so the
@@ -95,6 +164,9 @@
   );
   let headerAuthor = $derived(
     offGraph ? (readDetails?.author_name ?? "") : (selectedCommit?.author_name ?? ""),
+  );
+  let headerAuthorEmail = $derived(
+    offGraph ? (readDetails?.author_email ?? "") : (selectedCommit?.author_email ?? ""),
   );
 
   // The store's read status describes ITS selected commit; it only speaks for
@@ -320,7 +392,32 @@
 
 {#if selectedCommit}
   {@const sig = signatureLabel(details?.signature_check, details != null && details.signature_check === undefined)}
-  <div class="h-64 bg-background flex flex-col font-sans select-none overflow-hidden">
+  <div
+    bind:this={host}
+    class="shrink-0 bg-background flex flex-col font-sans select-none overflow-hidden"
+    style="height: {paneHeight}px;"
+    data-commit-pane
+  >
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <!-- Justified: the WAI-ARIA window-splitter pattern, as TerminalDock's
+         separator — a focusable `separator` carrying aria-valuenow/min/max,
+         which the spec defines as interactive because it is focusable. -->
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="Resize the commit details pane"
+      aria-valuenow={paneHeight}
+      aria-valuemin={COMMIT_PANE_BOUNDS.min}
+      aria-valuemax={paneCeiling}
+      title="Drag to resize · ↑/↓ to nudge"
+      tabindex="0"
+      onpointerdown={startResize}
+      onkeydown={handleResizeKey}
+      class="h-1.5 shrink-0 cursor-row-resize hover:bg-accent/40 focus-visible:bg-accent/50 focus-visible:outline-hidden transition-colors {dragging
+        ? 'bg-accent/50'
+        : ''}"
+    ></div>
     <div class="gp-header justify-between">
       <div class="flex items-center gap-3 min-w-0">
         <GitCommit size={16} class="text-accent shrink-0" />
@@ -375,7 +472,7 @@
         </div>
       </div>
       <div class="flex items-center gap-4 text-meta text-textMuted shrink-0">
-        <span class="flex items-center gap-1.5 select-text"><User size={13} /> {headerAuthor || "—"}</span>
+        <span class="flex items-center gap-1.5 select-text"><AuthorAvatar name={headerAuthor} email={headerAuthorEmail} class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-micro font-semibold text-white" ariaHidden /> {headerAuthor || "—"}</span>
         <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || (offGraph ? "—" : formatDate(selectedCommit.timestamp))}</span>
         <span class="flex items-center gap-1 {sig.ok ? 'text-ok' : 'text-textMuted'}">
           {#if sig.ok}

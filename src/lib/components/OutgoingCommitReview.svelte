@@ -21,7 +21,7 @@
     // A branch row already read is the best evidence there is; the listing's
     // own state only matters when there is no row to read.
     if (!branch) {
-      if (listing.error) return { kind: "unknown", reason: "The branch list could not be read." };
+      if (listing.error) return { kind: "unknown", reason: "The branch list couldn't be read." };
       if (listing.loading) return { kind: "unknown", reason: "Still reading the branch list." };
       return { kind: "unknown", reason: "No branch is checked out." };
     }
@@ -97,7 +97,7 @@
 </script>
 
 {#if outgoing.kind !== "none"}
-  <section class="gp-card mb-3 max-w-4xl p-4" aria-label="Outgoing commits" data-testid="outgoing-commits">
+  <section class="gp-card p-4" aria-label="Outgoing commits" data-testid="outgoing-commits">
     <div class="mb-3 flex items-start justify-between gap-3">
       <div class="min-w-0">
         <h3 class="font-semibold">Outgoing commits</h3>

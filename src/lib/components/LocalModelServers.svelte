@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Which model Manvi and GitPulse's own AI features run on: Claude through the
-   * Anthropic API (the key lives in `ManviClaudeModel`), or a model server on
+   * Anthropic API (credential shown in `ManviClaudeModel`), or a model server on
    * this machine, which this card discovers, lists and lets the reader pin.
    *
    * Distinct from Agent models above it in Settings → Agents: those are the

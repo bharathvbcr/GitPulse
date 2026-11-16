@@ -64,12 +64,12 @@ export type AttentionKind = "needs-you" | "finished" | "error" | "signalled";
 
 /**
  * Whether a bell or OSC notice counts as an ask (the "Count a terminal bell
- * as waiting for you" setting). On until the reader turns it off. This module
+ * as waiting for you" setting). Off until the reader turns it on. This module
  * owns the flag rather than importing the setting: `interfaceStore` imports
  * `tabs`, which imports this module, so reading the store here would close a
  * cycle that fails at load. The store pushes every change in.
  */
-let signalledAsks = true;
+let signalledAsks = false;
 
 export function setSignalledAsksForReader(on: boolean): void {
   signalledAsks = on;
@@ -77,13 +77,13 @@ export function setSignalledAsksForReader(on: boolean): void {
 
 /**
  * Whether a kind is the agent waiting on the reader rather than reporting
- * what it did. A bell counts while the setting above is on: it is how an
- * agent with no hooks says it is blocked, and with the setting off those asks
- * stop counting. Finished does not: it is worth showing, not worth chasing.
- * The one rule every surface — the task pane, the board chip, the Agents
- * view, the tray — counts by. The task pane and the board still show a bell
- * with the setting off and only stop counting it; the Agents view also drops
- * the bell as a reason, so a row there no longer shows that one rang.
+ * what it did. A bell counts only when the opt-in setting above is turned on:
+ * it is how an agent with no hooks says it is blocked, and while off (default)
+ * those asks do not count. Finished does not: it is worth showing, not worth
+ * chasing. The one rule every surface — the task pane, the board chip, the
+ * Agents view, the tray — counts by. The task pane and the board still show a
+ * bell while off and only stop counting it; the Agents view also drops the
+ * bell as a reason, so a row there no longer shows that one rang.
  */
 export function asksForReader(kind: AttentionKind | null | undefined): boolean {
   return kind === "needs-you" || kind === "error" || (kind === "signalled" && signalledAsks);

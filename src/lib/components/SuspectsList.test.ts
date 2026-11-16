@@ -116,7 +116,25 @@ describe("the list is one of Graph's lists", () => {
     expect(list).toContain("$graphStore.selectedCommit?.id");
   });
 
-  it("asks its question from the context bar, through the shared store", () => {
+  it("asks its question in its own header strip, outside the scroller, so it survives results", () => {
+    // The empty card disappears once there are results; the form must not.
+    const headerAt = list.indexOf("<SuspectsQueryBar />");
+    expect(headerAt).toBeGreaterThan(-1);
+    expect(list).toContain('import SuspectsQueryBar from "./SuspectsQueryBar.svelte"');
+    expect(headerAt).toBeLessThan(list.indexOf("{#if !answer}"));
+    expect(headerAt).toBeLessThan(list.indexOf('aria-label="Regression suspects"'));
+    expect(list).toContain("in the form above, then rank suspects");
+    expect(list).not.toContain("well at, above.");
+  });
+
+  it("words the submit as a verb action, with no search magnifier", () => {
+    expect(bar).toContain("<span>Rank suspects</span>");
+    expect(bar).toContain('data-variant="primary"');
+    expect(bar).not.toContain("Search");
+    expect(bar).not.toContain("<span>Find suspects</span>");
+  });
+
+  it("asks its question through the shared store", () => {
     expect(bar).toContain("suspectsQuery.run(repoPath)");
     expect(bar).toContain("disabled={!canRun}");
     expect(bar).toContain("canRunSuspects($suspectsQuery, repoPath)");

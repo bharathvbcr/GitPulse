@@ -852,8 +852,8 @@ mod tests {
     fn a_verdict_array_is_cut_from_the_end_and_stays_an_array_with_every_key() {
         let verdict = json!({
             "status": "blocked",
-            "findings": (0..4000).map(|n| json!({ "n": n, "why": "reason" })).collect::<Vec<_>>(),
-            "paths": (0..4000).map(|n| format!("src/file-{n}.rs")).collect::<Vec<_>>(),
+            "findings": Vec::from_fn(4000, |n| json!({ "n": n, "why": "reason" })),
+            "paths": Vec::from_fn(4000, |n| format!("src/file-{n}.rs")),
             "small": [1, 2],
         });
         let mut row = event();

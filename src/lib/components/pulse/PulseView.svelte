@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { pulseStore } from "../../pulse/pulseStore";
+  import PageHeader from "../PageHeader.svelte";
   import PulseHeatmap from "./PulseHeatmap.svelte";
   import PulseRhythm from "./PulseRhythm.svelte";
   import PulsePunchCard from "./PulsePunchCard.svelte";
@@ -23,7 +24,6 @@
   import { coverageMetric, locMetric, totalCodeLines } from "../../metrics/repoMetrics";
   import type { MetricSnapshot } from "../../metrics/freshness";
   import {
-    Activity,
     AlertCircle,
     Download,
     Flame,
@@ -255,15 +255,13 @@
   );
 </script>
 
-<div class="flex-1 flex flex-col min-h-0 bg-background overflow-y-auto">
-  <div class="px-6 py-4 bg-surface shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-    <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-xl bg-accent/10 flex items-center justify-center text-accent shadow-xs">
-        <Activity size={18} />
-      </div>
-      <div>
-        <div class="flex items-center gap-2">
-          <h1 class="text-sm font-semibold text-textPrimary tracking-tight">Repository pulse</h1>
+<div class="flex-1 flex flex-col min-h-0 bg-background">
+  <PageHeader
+    title="Repository pulse"
+    level={1}
+    description="Local cadence, churn, hotspots, knowledge concentration, and tag-based delivery. All branches, computed on this machine."
+  >
+    {#snippet meta()}
           {#if report}
             <span class="gp-chip font-mono" data-kind="label" data-tone="neutral">
               {report.total_commits_scanned.toLocaleString()} commits
@@ -289,14 +287,8 @@
               no .mailmap
             </span>
           {/if}
-        </div>
-        <p class="text-meta text-textMuted mt-0.5">
-          Local cadence, churn, hotspots, knowledge concentration, and tag-based delivery. All branches, computed on this machine.
-        </p>
-      </div>
-    </div>
-
-    <div class="flex items-center gap-2">
+    {/snippet}
+    {#snippet actions()}
       <div class="gp-segmented" role="group" aria-label="Pulse section">
         <button
           type="button"
@@ -363,9 +355,10 @@
         <RefreshCw size={12} class={loading ? 'animate-spin text-accent' : ''} />
         <span>{loading ? 'Refreshing…' : 'Refresh'}</span>
       </button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
+  <div class="gp-page flex flex-col">
   {#if report?.truncated}
     <div class="mx-6 mt-4">
       <div class="gp-notice" data-tone="warn" role="status">
@@ -377,10 +370,10 @@
             <span class="font-medium"
               >Log output {report.payload_truncation_reason ?? "is incomplete"}.</span
             >
-            <span class="text-textMuted hidden sm:inline">Tiles below are a prefix, not the full history. Raising the commit cap would make this worse.</span>
+            <span class="text-textMuted hidden @xl:inline">Tiles below are a prefix, not the full history. Raising the commit cap would make this worse.</span>
           {:else}
             <span class="font-medium">History bounded at {report.total_commits_scanned.toLocaleString()} commits.</span>
-            <span class="text-textMuted hidden sm:inline">Older commits exist in this repository. Longest-gap is only as old as this scan.</span>
+            <span class="text-textMuted hidden @xl:inline">Older commits exist in this repository. Longest-gap is only as old as this scan.</span>
           {/if}
         </div>
         {#if canDeepen}
@@ -435,7 +428,7 @@
     </div>
   {:else if loading && !report}
     <div class="p-6 space-y-4">
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div class="grid grid-cols-2 @xl:grid-cols-4 gap-3">
         {#each [1, 2, 3, 4] as n (n)}
           <Skeleton variant="rect" height="5rem" />
         {/each}
@@ -547,6 +540,7 @@
       {/if}
     </div>
   {/if}
+  </div>
 
   {#if report}
     <PulseExportModal

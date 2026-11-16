@@ -546,4 +546,12 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     expect(source).toContain('invoke<number[]>("cmd_terminal_listening_ports"');
     expect(source).toContain("`http://localhost:${ports[0]}`");
   });
+
+  it("threads fork-session launches through conversationForStart with a fresh sessionId and resumes forkedId on restart", () => {
+    expect(source).toContain("let forkedId: string | null = null;");
+    expect(source).toContain("const resumeId = resumeOverride ?? forkedId ?? resume?.sessionId ?? null;");
+    expect(source).toContain("const fork = Boolean(!hadResumeOverride && !forkedId && !attachTo && resume?.fork && resumeId);");
+    expect(source).toContain("sessionId: !spawnResume || spawnResume.fork ? hostedId : null,");
+    expect(source).toContain("if (resume?.fork && !forkedId) forkedId = hostedId;");
+  });
 });

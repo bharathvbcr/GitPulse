@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  calendarDaysBetween,
   computeCommitWindow,
   computeHeatmap,
   computeHotspotRisks,
@@ -12,6 +13,7 @@ import {
   formatLocalDayKey,
   isConventionalCommit,
 } from "./metrics";
+import { startOfLocalDay } from "../metrics/commitCadence";
 import type { PulseCommitSummary } from "./types";
 
 function createMockCommit(overrides: Partial<PulseCommitSummary> = {}): PulseCommitSummary {
@@ -448,16 +450,21 @@ function secondsAt(iso: string): number {
 
 describe("computeCommitWindow", () => {
   it("reports the population the caller handed it, not a trailing window", () => {
+    // Construct morning and evening commits in the active local timezone so
+    // non-UTC offsets (such as +05:30 or +13:00) do not split one local day into two.
+    const morningSec = Math.floor(new Date(2024, 2, 12, 9, 0, 0, 0).getTime() / 1000);
+    const eveningSec = Math.floor(new Date(2024, 2, 12, 21, 0, 0, 0).getTime() / 1000);
+    const laterSec = Math.floor(new Date(2026, 8, 2, 12, 0, 0, 0).getTime() / 1000);
     const window = computeCommitWindow([
-      createMockCommit({ timestamp: secondsAt("2024-03-12T09:00:00Z") }),
-      createMockCommit({ timestamp: secondsAt("2024-03-12T21:00:00Z") }),
-      createMockCommit({ timestamp: secondsAt("2026-09-02T12:00:00Z") }),
+      createMockCommit({ timestamp: morningSec }),
+      createMockCommit({ timestamp: eveningSec }),
+      createMockCommit({ timestamp: laterSec }),
     ]);
 
     expect(window.commits).toBe(3);
     expect(window.activeDays).toBe(2);
-    expect(window.firstDay).toBe(formatLocalDayKey(secondsAt("2024-03-12T09:00:00Z") * 1000));
-    expect(window.lastDay).toBe(formatLocalDayKey(secondsAt("2026-09-02T12:00:00Z") * 1000));
+    expect(window.firstDay).toBe("2024-03-12");
+    expect(window.lastDay).toBe("2026-09-02");
   });
 
   it("counts distinct local calendar days, not distinct commits", () => {
@@ -543,4 +550,83 @@ describe("computeHygiene signature adversarial cases", () => {
     const hygiene = computeHygiene(skewed);
     expect(hygiene.signedCount).toBe(0);
   });
+});
+
+describe("DST and non-UTC timezone bucketing", () => {
+  const activeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const localSec = (year: number, month: number, day: number, hour = 12, minute = 0) =>
+    Math.floor(new Date(year, month - 1, day, hour, minute, 0, 0).getTime() / 1000);
+
+  it("counts exclusive calendar days accurately across spring-forward and fall-back transitions", () => {
+    expect(calendarDaysBetween(localSec(2026, 3, 7) * 1000, localSec(2026, 3, 9) * 1000)).toBe(1);
+    expect(calendarDaysBetween(localSec(2026, 10, 31) * 1000, localSec(2026, 11, 2) * 1000)).toBe(1);
+    expect(calendarDaysBetween(localSec(2026, 4, 4) * 1000, localSec(2026, 4, 6) * 1000)).toBe(1);
+    expect(calendarDaysBetween(localSec(2026, 9, 26) * 1000, localSec(2026, 9, 28) * 1000)).toBe(1);
+  });
+
+  it("buckets heatmap days, streaks, and weekly line changes on exact local midnights across DST transitions", () => {
+    for (const [y, m, dBefore, dTrans, dAfter, endYear, endMonth, endDay] of [
+      [2026, 3, 7, 8, 9, 2026, 3, 14],     // 23h transition in US
+      [2026, 10, 31, 1, 2, 2026, 11, 7],   // Oct 31 .. Nov 2 (special-cased below)
+      [2026, 9, 26, 27, 28, 2026, 10, 3],  // 23h transition in NZ
+    ]) {
+      const prevMonth = dTrans === 1 ? 10 : m;
+      const transMonth = dTrans === 1 ? 11 : m;
+      const commits = [
+        createMockCommit({ timestamp: localSec(y, prevMonth, dBefore, 23, 30) }),
+        createMockCommit({ timestamp: localSec(y, transMonth, dTrans, 12, 0) }),
+        createMockCommit({ timestamp: localSec(y, transMonth, dAfter, 0, 30) }),
+      ];
+      const nowMs = new Date(endYear, endMonth - 1, endDay, 12, 0, 0, 0).getTime();
+      const weeks = computeHeatmap(commits, 3, nowMs);
+      const cells = weeks
+        .flatMap((w) => w.days)
+        .filter((c): c is NonNullable<typeof c> => c !== null);
+      expect(cells).toHaveLength(21);
+      expect(new Set(cells.map((c) => c.date)).size).toBe(21);
+      for (const cell of cells) {
+        expect(cell.timestamp).toBe(startOfLocalDay(cell.timestamp));
+        expect(cell.date).toBe(formatLocalDayKey(cell.timestamp));
+      }
+      const total = cells.reduce((sum, c) => sum + c.count, 0);
+      expect(total).toBe(3);
+
+      const rhythmNowMs = localSec(y, transMonth, dAfter, 12, 0) * 1000;
+      const rhythm = computeRhythm(commits, 10, rhythmNowMs);
+      expect(rhythm.currentStreak).toBe(3);
+      expect(rhythm.longestStreak).toBe(3);
+      expect(rhythm.activeDaysInWindow).toBe(3);
+
+      const lineBuckets = computeLineChanges(commits, 3, nowMs);
+      for (const bucket of lineBuckets) {
+        expect(bucket.timestamp).toBe(startOfLocalDay(bucket.timestamp));
+      }
+      expect(lineBuckets.reduce((sum, b) => sum + b.additions, 0)).toBe(60);
+    }
+  });
+
+  it.skipIf(activeZone !== "America/New_York")(
+    "places both 01:30 EDT and 01:30 EST commits into 2026-11-01 during fall-back overlap",
+    () => {
+      const first0130Edt = Math.floor(Date.UTC(2026, 10, 1, 5, 30, 0) / 1000);
+      const second0130Est = Math.floor(Date.UTC(2026, 10, 1, 6, 30, 0) / 1000);
+      const commits = [
+        createMockCommit({ timestamp: first0130Edt, additions: 10, deletions: 2 }),
+        createMockCommit({ timestamp: second0130Est, additions: 20, deletions: 3 }),
+      ];
+
+      const window = computeCommitWindow(commits);
+      expect(window.commits).toBe(2);
+      expect(window.activeDays).toBe(1);
+      expect(window.firstDay).toBe("2026-11-01");
+      expect(window.lastDay).toBe("2026-11-01");
+
+      const weeks = computeHeatmap(commits, 2, localSec(2026, 11, 2, 12, 0) * 1000);
+      const nov1 = weeks
+        .flatMap((w) => w.days)
+        .find((d) => d !== null && d.date === "2026-11-01");
+      expect(nov1?.count).toBe(2);
+      expect(nov1?.additions).toBe(30);
+    },
+  );
 });

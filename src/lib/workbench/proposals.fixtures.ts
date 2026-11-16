@@ -1,6 +1,6 @@
 import type { Task } from "./client";
 
-export const task: Task = { id: "t1", revision: 4, updated_at: 1, title: "Ship exporter", description: "d", acceptance_criteria: ["Existing"], kind: "feature", status: "inbox", priority: 2, severity: null,
+export const task: Task = { id: "t1", revision: 4, updated_at: 1, title: "Ship exporter", description: "d", acceptance_criteria: ["Existing"], kind: "feature", status: "backlog", priority: 2, severity: null,
   owner: null, due_at: null, labels: [], repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [] };
 export const refine = (over: Record<string, unknown> = {}) => ({ ok: true, applied: false, enhancement_id: "enh-1", task_id: "t1", request_id: "q1", source_revision: 4, provider: "local", model: "m",
   proposal: { acceptance_criteria: [{ text: "Existing", cites: [] }, { text: "Exports CSV", cites: ["devmap:Exporter"] }], split_into: [{ title: "Indexer", description: "part", cites: [] }], duplicate_of: [{ id: "t9", reason: "same", cites: [] }], rationale: "why" },

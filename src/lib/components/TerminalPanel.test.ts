@@ -324,4 +324,31 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).not.toContain('"cmd_add_worktree"');
     expect(source).toContain("openCheckoutTab(");
   });
+
+  it("renders the durable session ledger Reopen N agents banner with shell, corrupt, and per-row error handling (S2-03 & S2-05)", () => {
+    expect(source).toContain("subscribeSessionLedger()");
+    expect(source).toContain('data-testid="terminal-session-ledger-banner"');
+    expect(source).toContain("reopenBannerHeading(repoReopenableOffers.length)");
+    expect(source).toContain('data-testid="terminal-ledger-not-restorable"');
+    expect(source).toContain('data-testid="terminal-ledger-unreadable"');
+    expect(source).toContain('data-testid="terminal-ledger-row-error"');
+    expect(source).toContain("reopenSessionLedgerOffer(");
+    expect(source).toContain("reopenAllSessionLedgerOffers(");
+    expect(source).toContain("dismissSessionLedgerRow(");
+  });
+
+  it("reports open dock tab counts to panelTabCounts and offers all sessionTypes in the empty state", () => {
+    expect(source).toContain("panelTabCounts.report(");
+    expect(source).toContain("panelTabCounts.forget(");
+    const emptyStart = source.indexOf('{:else if tabState.tabs.length === 0}');
+    const emptyEnd = source.indexOf('tabState.tabs as tab', emptyStart);
+    expect(emptyStart).toBeGreaterThan(-1);
+    expect(emptyEnd).toBeGreaterThan(emptyStart);
+    const emptyState = source.slice(emptyStart, emptyEnd);
+    expect(emptyState).toContain("{#each sessionTypes as launcher (launcher.kind)}");
+    expect(emptyState).toContain("data-testid={`terminal-empty-launch-${launcher.kind}`}");
+    expect(emptyState).toContain("canCreateKind(launcher.kind)");
+    expect(emptyState).toContain("openBrowserFor(undefined)");
+    expect(emptyState).toContain("newTab(launcher.kind)");
+  });
 });

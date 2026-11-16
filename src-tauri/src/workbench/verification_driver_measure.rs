@@ -199,7 +199,7 @@ fn measure_driver_children_over_a_profile_copy() {
     let mut spawned = 0usize;
     let mut head_reads = 0usize;
     for dir in &dirs {
-        for argv in crate::engine::git_cli::spawn_log::spawns_in(dir) {
+        for argv in crate::engine::process::spawn_log::spawns_in(dir) {
             spawned += 1;
             if argv.iter().any(|arg| arg == "HEAD^{commit}") {
                 head_reads += 1;

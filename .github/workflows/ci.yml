@@ -115,6 +115,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: bun run test
 
+      # Run due-date, quick-add, pulse, and commit-cadence suites across
+      # non-UTC DST zones (TZ=America/New_York, TZ=Pacific/Auckland,
+      # TZ=Asia/Kolkata) so local-time gap/overlap handling is verified.
+      - name: Frontend Timezone & DST Tests (Vitest)
+        if: ${{ !cancelled() }}
+        run: bun run test:tz
+
       - name: Svelte Browser Regressions (Chrome)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: bun run test:browser:all
@@ -222,41 +229,32 @@ jobs:
   # `cargo test --test-threads=1`, the gate scripts/check-workflows.test.ts pins.
   # macOS cannot: in run 43351016929 it logged 6,623 of the lib suite's 7,474
   # tests in 52 minutes and hit the job limit. It runs the same suite as three
-  # `cargo nextest` shards instead, each one bucket of `--partition hash:M/3`,
-  # each serial (`--profile ci`, src-tauri/.config/nextest.toml), so a leg takes
-  # about a third of the suite rather than the whole of it. `rust-test-complete`
-  # then fails unless the three buckets between them ran every listed test once.
+  # `cargo nextest` shards instead (`rust-test-macos`), each one bucket of
+  # `--partition hash:M/3`, each serial (`--profile ci`,
+  # src-tauri/.config/nextest.toml), so a leg takes about a third of the suite
+  # rather than the whole of it. `rust-test-complete` then fails unless the three
+  # buckets between them ran every listed test once.
   #
   # What the shards do not see, ubuntu and windows still do: a test that fails
   # only beside another in the same process, which nextest's one-process-per-test
   # cannot show, and which ci-local's `cargo-tests` gate and test-parallel.yml
-  # also run. Doctests are not nextest's, so shard 1 runs them with `cargo test`.
+  # also run.
   #
-  # Three shards, because the macOS runner allowance is five concurrent jobs and
-  # the frontend and lint jobs hold two of them.
+  # These are separate jobs, not one matrix with `if: matrix.shard == 1` steps,
+  # because the release-gate rule (scripts/check-workflows.mjs) accepts a step
+  # condition only as `!cancelled()` or a platform selector over a matrix list:
+  # a check that can skip reads as a pass to release-state.mjs.
   rust-test:
-    name: Rust Tests (${{ matrix.os }}${{ matrix.shard && format(', shard {0}/3', matrix.shard) || '' }})
+    name: Rust Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # fec1e008: ubuntu reached the serial 6,099-test lib suite at 39 min and
-    # was cancelled; macOS reached it at 33 min (after the WKWebView harness)
-    # and was cancelled at 40. The same suite took 20 min at eight threads on
-    # the macOS runner, so serial it needs well over that. Nothing runs ahead of
-    # it now. In run 43351016929 macOS got through 6,623 of the lib suite's
-    # 7,474 tests in 52 minutes before the limit, and 51 tests that each took
-    # over 10 s were 25 of those minutes: debug-build stress and oracle cases.
+    # was cancelled. The same suite took 20 min at eight threads on a macOS
+    # runner, so serial it needs well over that.
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: windows-latest
-          - os: macos-latest
-            shard: 1
-          - os: macos-latest
-            shard: 2
-          - os: macos-latest
-            shard: 3
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -276,9 +274,6 @@ jobs:
         shell: bash
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
-      # `shared-key` names the cache for the OS alone, so the three macOS shards
-      # restore and save one cache. Without it the key carries the job id but no
-      # matrix value, which makes them collide the same way by accident.
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -288,15 +283,6 @@ jobs:
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
           shared-key: rust-test-${{ runner.os }}
           cache-on-failure: true
-
-      # Pinned to the version this was written against (and ci:local runs), so a
-      # nextest release cannot change the partition hash or the report between
-      # two pushes and move a test to a different shard.
-      - name: Install cargo-nextest
-        if: ${{ matrix.os == 'macos-latest' }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
-        with:
-          tool: cargo-nextest@0.9.150
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -320,7 +306,7 @@ jobs:
         run: bun run build
 
       - name: Rust Unit & Integration Tests
-        if: ${{ !cancelled() && matrix.os != 'macos-latest' }}
+        if: ${{ !cancelled() }}
         # --no-fail-fast: without it cargo stops at the first failing test
         # BINARY, so every later one -- the whole tests/ directory -- is
         # skipped and the job reports one failure when there may be several.
@@ -336,46 +322,8 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
 
-      # This shard's bucket of the suite. `--profile ci` is one test at a time
-      # and writes target/nextest/ci/junit.xml, which the completeness job reads.
-      - name: Rust Unit & Integration Tests (nextest shard)
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
-        run: cargo nextest run --manifest-path src-tauri/Cargo.toml --locked --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
-
-      # nextest does not run doctests. One shard does, serially like the gate.
-      - name: Rust Doctests
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' && matrix.shard == 1 }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --doc -- --test-threads=1
-
-      # The whole suite, unpartitioned, for the completeness job to hold the
-      # three reports against. Listing builds nothing new: the test binaries are
-      # the ones the shard just built.
-      - name: List the whole Rust suite
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' && matrix.shard == 1 }}
-        run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
-
-      - name: Upload the suite list
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' && matrix.shard == 1 }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: nextest-list
-          path: nextest-list.json
-          if-no-files-found: error
-
-      # `if-no-files-found: error`: a shard that wrote no report must turn this
-      # red, not leave the completeness job one report short without a word.
-      - name: Upload this shard's report
-        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: junit-shard-${{ matrix.shard }}
-          path: src-tauri/target/nextest/ci/junit.xml
-          if-no-files-found: error
-
-      # The worktree crate and the descriptor burst are one run each, not one per
-      # shard: on macOS shard 1 owns them.
       - name: Worktree Crate Tests
-        if: ${{ !cancelled() && runner.os != 'Windows' && (runner.os != 'macOS' || matrix.shard == 1) }}
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
 
       - name: Descriptor inheritance under concurrent spawns
@@ -385,7 +333,7 @@ jobs:
         # only opt-in tests and --exact keeps the run to the one named test,
         # so a rename fails on the "1 passed" check below instead of quietly
         # running nothing. The test is #[cfg(unix)], hence no Windows run.
-        if: ${{ !cancelled() && runner.os != 'Windows' && (runner.os != 'macOS' || matrix.shard == 1) }}
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -396,29 +344,179 @@ jobs:
           fi
           grep -q "test result: ok. 1 passed" <<<"$out"
 
-      - name: Terminal Suites Against the Terminal Host
-        # The same terminal suites, every session registry backed by a real
-        # gitpulse-ptyd rather than the engine in the test process
-        # (docs/TERMINAL_HOST.md, migration step 2). The host is Unix-only. On
-        # macOS shard 1 owns it, as it owns the worktree crate and the burst.
-        if: ${{ !cancelled() && runner.os != 'Windows' && (runner.os != 'macOS' || matrix.shard == 1) }}
+  # The macOS suite as three serial nextest shards. Three, because the macOS
+  # runner allowance is five concurrent jobs and the frontend, lint and extras
+  # jobs hold the rest.
+  rust-test-macos:
+    name: Rust Tests (macOS, shard ${{ matrix.shard }}/3)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      # `shared-key` names the cache for the OS alone, so the three shards and
+      # the extras job restore and save one cache. Without it the key carries the
+      # job id but no matrix value, which makes the shards collide the same way
+      # by accident.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      # Pinned to the version this was written against (and ci:local runs), so a
+      # nextest release cannot change the partition hash or the report between
+      # two pushes and move a test to a different shard.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # The Rust build embeds ../dist (see rust-test).
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # This shard's bucket of the suite. `--profile ci` is one test at a time
+      # and writes target/nextest/ci/junit.xml, which the completeness job reads.
+      - name: Rust Unit & Integration Tests (nextest shard)
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --manifest-path src-tauri/Cargo.toml --locked --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
+
+      # `if-no-files-found: error`: a shard that wrote no report must turn this
+      # red, not leave the completeness job one report short without a word.
+      - name: Upload this shard's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: junit-shard-${{ matrix.shard }}
+          path: src-tauri/target/nextest/ci/junit.xml
+          if-no-files-found: error
+
+  # What nextest does not run, once: doctests, the worktree crate and the
+  # descriptor burst, all serial like the gate, plus the whole suite listed
+  # unpartitioned for the completeness job to hold the shard reports against.
+  rust-test-macos-extras:
+    name: Rust Tests (macOS, doctests and one-off checks)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # nextest does not run doctests.
+      - name: Rust Doctests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --doc -- --test-threads=1
+
+      - name: Worktree Crate Tests
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
+
+      - name: Descriptor inheritance under concurrent spawns
+        # As in rust-test: the #[ignore]d burst, run by name, failing when it
+        # collects nothing.
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a dbus-run-session -- bun run test:terminal-host
-          else
-            bun run test:terminal-host
-          fi
+          set -euo pipefail
+          out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
+          grep -q "test result: ok. 1 passed" <<<"$out"
 
-  # Runs after the shards, red or green, and fails unless the macOS buckets
-  # between them ran every test in the suite exactly once. A green shard says
-  # only that its own bucket passed: a shard whose job was skipped, whose build
-  # broke, or whose report is missing leaves the others green and the suite
-  # short, and nothing else in the run would say so.
+      # Builds nothing new: the test binaries are the ones just built.
+      - name: List the whole Rust suite
+        if: ${{ !cancelled() }}
+        run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
+
+      - name: Upload the suite list
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-list
+          path: nextest-list.json
+          if-no-files-found: error
+
+  # Fails unless the macOS buckets between them ran every test in the suite
+  # exactly once. A green shard says only that its own bucket passed: a shard
+  # whose build broke or whose report is missing leaves the others green and the
+  # suite short, and nothing else in the run would say so.
+  #
+  # No job-level `if`: a skipped job leaves the run concluding success (see the
+  # release-gate rule). With `needs`, this job is skipped only when a shard
+  # failed or was cancelled, and then the run is red anyway; when every shard is
+  # green, it always runs.
   rust-test-complete:
     name: Rust Tests (macOS, every shard ran)
-    needs: rust-test
-    if: ${{ !cancelled() }}
+    needs: [rust-test-macos, rust-test-macos-extras]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

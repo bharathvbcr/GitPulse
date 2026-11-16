@@ -21,6 +21,7 @@
  */
 
 import type { TerminalExitPayload } from "./runResult";
+import { describeError } from "../ui/copy/describeFailure";
 export type TerminalExitEvent = TerminalExitPayload;
 
 /** What a session's channel delivers: raw bytes, or the marker `"end"` after the last. */
@@ -422,7 +423,7 @@ export function createPtyBus(listen: EventListen, makeChannel: ChannelFactory): 
     subscribe(id, session) {
       liveLoss.delete(id);
       handlers.set(id, session);
-      void attach().catch((error: unknown) => session.onError?.(String(error)));
+      void attach().catch((error: unknown) => session.onError?.(describeError(error, "terminal")));
       const held = pending.get(id) ?? null;
       const stone = tombstones.get(id) ?? null;
       const forgot = forgotten.get(id) ?? null;

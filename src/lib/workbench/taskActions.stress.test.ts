@@ -17,7 +17,7 @@ import { wallClockBudget } from "../testing/wallClock";
 function card(i: number): TaskCard {
   return {
     id: `t${i}`, revision: i + 1, updated_at: 1, title: `T${i}`, kind: i % 2 ? "bug" : "feature",
-    status: "inbox", priority: i % 4, severity: null, owner: i % 5 === 0 ? "Pat" : null,
+    status: "backlog", priority: i % 4, severity: null, owner: i % 5 === 0 ? "Pat" : null,
     due_at: i % 7 === 0 ? 1 : null, labels: i % 3 === 0 ? ["ui"] : [],
     repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: i, archived: false, completed_at: null,
   };
@@ -67,7 +67,7 @@ describe("adversarial stress", () => {
   });
 
   it("removeFromColumns on an empty and a full board never goes negative", () => {
-    const statuses = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as TaskStatus[];
+    const statuses = ["backlog", "ready", "in_progress", "review", "done"] as TaskStatus[];
     const columns = Object.fromEntries(statuses.map((status) => [status, {
       items: Array.from({ length: 30 }, (_, i) => card(i)).map((c) => ({ ...c, status })),
       total: 30, shown: 30, has_more: false, next_cursor: null,
@@ -83,14 +83,14 @@ describe("adversarial stress", () => {
 
   it("menu construction stays finite for a 200-card selection", () => {
     const cards = Array.from({ length: 200 }, (_, i) => card(i));
-    const items = taskMenuItems({ cards, column: "inbox", busy: false });
+    const items = taskMenuItems({ cards, column: "backlog", busy: false });
     expect(items.length).toBeGreaterThan(3);
     expect(items.length).toBeLessThan(60);
     expect(items.filter((item) => item.action.kind === "delete")).toHaveLength(1);
     // The menu is built from a fixed vocabulary, so its size is a function of
     // the *available* actions, never of how many cards are selected.
-    const one = taskMenuItems({ cards: [card(0)], column: "inbox", busy: false });
-    const many = taskMenuItems({ cards, column: "inbox", busy: false });
+    const one = taskMenuItems({ cards: [card(0)], column: "backlog", busy: false });
+    const many = taskMenuItems({ cards, column: "backlog", busy: false });
     expect(many.length).toBeLessThanOrEqual(one.length);
     expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
   });
@@ -101,7 +101,7 @@ describe("adversarial stress", () => {
       labels: Array.from({ length: 5_000 }, (_, i) => `label-${i}`),
     };
     const started = performance.now();
-    const items = taskMenuItems({ cards: [card(0)], column: "inbox", vocabulary });
+    const items = taskMenuItems({ cards: [card(0)], column: "backlog", vocabulary });
     expect(performance.now() - started).toBeLessThan(wallClockBudget(120));
     expect(items.length).toBeLessThan(80);
     expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
@@ -133,7 +133,7 @@ describe("adversarial stress", () => {
   it("range select and toggle never throw on garbage", () => {
     expect(() => rangeSelect(["a", "b"], "a", "b")).not.toThrow();
     expect(() => toggleSelection(new Set(["a"]), "b")).not.toThrow();
-    expect(flattenVisibleIds({}, ["inbox"], () => true)).toEqual([]);
+    expect(flattenVisibleIds({}, ["backlog"], () => true)).toEqual([]);
     expect(contextMenuAnchor({ clientX: Number.NEGATIVE_INFINITY, clientY: undefined }, {
       left: Number.NaN, top: 0, width: -4, height: 10,
     }).x).toBeGreaterThanOrEqual(0);

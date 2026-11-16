@@ -100,6 +100,94 @@ fn assert_failure_diagnostic(report: &SecretsReport) {
     );
 }
 
+/// The values that followed each `--exclude` in a recorded argv.
+fn excludes_in(argv_log: &Path) -> Vec<String> {
+    let argv = fs::read_to_string(argv_log).expect("argv recorded");
+    let args: Vec<&str> = argv.lines().collect();
+    args.windows(2)
+        .filter(|pair| pair[0] == "--exclude")
+        .map(|pair| pair[1].to_string())
+        .collect()
+}
+
+#[test]
+fn bulk_ignored_trees_and_nested_worktrees_are_left_out_and_reported() {
+    // Kingfisher ignores `.gitignore` and walks nested repositories. On the
+    // GitPulse checkout that was a 50 GB `src-tauri/target`, ~6.6 GB of agent
+    // worktrees and `tmp/`: 300 s deadlines missed, and 1,394 of 1,435
+    // findings were copies inside those trees.
+    let _serial = serial();
+    let (dir, root) = repo();
+    let work = dir.path();
+    fs::write(work.join(".gitignore"), "target/\ntmp/\n.env\n.lanes/\n").unwrap();
+    fs::create_dir_all(work.join("src/target")).unwrap();
+    fs::write(work.join("src/target/keep.rs"), "x").unwrap();
+    // Tracked despite the `target/` rule, so `src/target/` is not wholly
+    // ignored and must still be scanned.
+    common::run_git(work, &["add", "-f", ".gitignore", "src/target/keep.rs"]);
+    common::run_git(
+        work,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+    );
+    fs::create_dir_all(work.join("target/debug")).unwrap();
+    fs::write(work.join("target/debug/out"), "x").unwrap();
+    fs::create_dir_all(work.join("tmp")).unwrap();
+    fs::write(work.join("tmp/scratch"), "x").unwrap();
+    fs::write(work.join(".env"), "x").unwrap();
+    common::run_git(work, &["worktree", "add", "-q", "--detach", ".lanes/one"]);
+
+    let tools = TempDir::new().unwrap();
+    let argv_log = tools.path().join("argv");
+    let body = format!(
+        "printf '%s\\n' \"$@\" > '{}'\necho '{{\"findings\":[],{COMPLETE_AUDIT}}}'\nexit 0",
+        argv_log.display(),
+    );
+    let report = scan(&root, &stub(tools.path(), &body));
+    assert!(report.ok, "{:?}", report.error);
+
+    let canonical = root.canonicalize().unwrap();
+    let at = |rel: &str| canonical.join(rel).display().to_string();
+    let mut passed = excludes_in(&argv_log);
+    passed.sort();
+    let mut expected = vec![at(".lanes/one"), at("target"), at("tmp")];
+    expected.sort();
+    assert_eq!(passed, expected, "exactly these trees are left out");
+    assert_eq!(
+        report.excluded_paths,
+        vec![".lanes/one/", "target/", "tmp/"],
+        "the report names every tree it left out, and only those"
+    );
+}
+
+#[test]
+fn a_tree_whose_path_reads_as_a_glob_is_scanned_rather_than_misexcluded() {
+    // `--exclude` takes a glob. A directory whose absolute path holds a glob
+    // metacharacter could exclude something else, so it is scanned instead.
+    let _serial = serial();
+    let (dir, root) = repo();
+    let work = dir.path();
+    fs::create_dir_all(work.join("a[1]/target")).unwrap();
+    fs::write(work.join("a[1]/target/out"), "x").unwrap();
+    fs::create_dir_all(work.join("plain/target")).unwrap();
+    fs::write(work.join("plain/target/out"), "x").unwrap();
+    fs::write(work.join(".gitignore"), "target/\n").unwrap();
+
+    let tools = TempDir::new().unwrap();
+    let argv_log = tools.path().join("argv");
+    let body = format!(
+        "printf '%s\\n' \"$@\" > '{}'\necho '{{\"findings\":[],{COMPLETE_AUDIT}}}'\nexit 0",
+        argv_log.display(),
+    );
+    let report = scan(&root, &stub(tools.path(), &body));
+    assert!(report.ok, "{:?}", report.error);
+    let canonical = root.canonicalize().unwrap();
+    assert_eq!(
+        excludes_in(&argv_log),
+        vec![canonical.join("plain/target").display().to_string()]
+    );
+    assert_eq!(report.excluded_paths, vec!["plain/target/"]);
+}
+
 #[test]
 fn findings_are_located_through_real_git() {
     let _serial = serial();
@@ -206,7 +294,9 @@ fn malformed_and_failed_runs_fail_closed() {
         ("no output", "exit 0", "not valid JSON"),
         ("jsonl rows", "echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/x\"}}'; echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/y\"}}'; exit 200", "not"),
         ("bad flag", &format!("echo '{PLANTED}' >&2; exit 2"), "exited with status 2"),
-        ("signal", "kill -9 $$", "terminated before it finished"),
+        ("signal", "kill -9 $$", "stopped by SIGKILL before it finished"),
+        ("fault", "kill -s BUS $$", "kingfisher crashed (SIGBUS)"),
+        ("abort", "kill -s ABRT $$", "kingfisher crashed (SIGABRT)"),
         ("crash with output", &format!("echo '{{\"findings\":[]}}'; echo '{PLANTED}' >&2; exit 101"), "status 101"),
     ];
     for (name, body, expected) in cases {

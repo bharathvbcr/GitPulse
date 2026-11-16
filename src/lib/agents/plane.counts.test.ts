@@ -147,18 +147,22 @@ describe("the attention filter and the headline", () => {
 // board and the task pane say nobody is waiting while this headline says one
 // agent needs attention.
 describe("the bell setting and the Agents headline", () => {
-  afterEach(() => setSignalledAsksForReader(true));
+  afterEach(() => setSignalledAsksForReader(false));
 
-  it("does not count a bell as needing attention once the setting is off, as the tray does", () => {
+  it("does not count a bell as needing attention by default, and counts it when opted in", () => {
     const bell = { lastOutputAt: null, title: null, attention: { kind: "signalled", label: "Signalled", detail: null, at: 1 } } as const;
     const plane = () => project({ terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: "signalled" })] });
 
+    expect(countAgentsWaiting(new Map([["s1", bell]]))).toBe(0);
+    expect(plane().attention.needing).toBe(0);
+    expect(planeHeadline(plane(), plane().rows.length)).toContain("0 need attention");
+
+    setSignalledAsksForReader(true);
     expect(countAgentsWaiting(new Map([["s1", bell]]))).toBe(1);
     expect(plane().attention.needing).toBe(1);
 
     setSignalledAsksForReader(false);
     expect(countAgentsWaiting(new Map([["s1", bell]]))).toBe(0);
     expect(plane().attention.needing).toBe(0);
-    expect(planeHeadline(plane(), plane().rows.length)).toContain("0 need attention");
   });
 });

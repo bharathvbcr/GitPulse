@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack, type Snippet } from "svelte";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
   import { currentRepoPath, repoStore, type FileStatus } from "../../stores/repoStore";
@@ -30,6 +30,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
   import { formatError } from "../../ui/formatError";
+  import { describeError } from "../../ui/copy/describeFailure";
   import { describeFailure } from "../../ui/copy/describeFailure";
   import { highlightMatches } from "../../branches/groupBranches";
   import {
@@ -40,6 +41,9 @@
     type FileRow,
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
+  import { consumeSearchFocus, explorerLens, showExplorerRail, type ExplorerRail } from "../../files/explorerLens";
+  import { EXPLORER_SEARCH_MODES, fieldEscape, searchFieldLabel } from "../../files/explorerSearchField";
+  import SettingSegment from "../SettingSegment.svelte";
   import {
     classifyFileChange,
     hasUnstagedChanges,
@@ -76,6 +80,9 @@
     onPinFile,
     selectedFile = null,
     revealRequest = null,
+    contentQuery = $bindable(""),
+    onContentSubmit,
+    contents,
   }: {
     /** Optional checkout path override (e.g. a hosted worktree's `TerminalFilePane`). */
     repoPath?: string | null;
@@ -89,6 +96,12 @@
      * alone would swallow it.
      */
     revealRequest?: { path: string; nonce: number } | null;
+    /** What the field holds in Contents mode; the host's content search reads it. */
+    contentQuery?: string;
+    /** Enter in the field while in Contents mode. */
+    onContentSubmit?: () => void;
+    /** The content-search results, shown in place of the tree in Contents mode. */
+    contents?: Snippet;
   } = $props();
 
   const EMPTY_STATUSES: readonly FileStatus[] = [];
@@ -145,6 +158,72 @@
 
   let containerEl: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
+
+  // One field, two modes: Names narrows the tree (the rail is "files"),
+  // Contents searches inside files (the rail is "search").
+  const mode = $derived($explorerLens.rail);
+  const contentMode = $derived(mode === "search");
+  const fieldLabel = $derived(searchFieldLabel(mode));
+  const fieldValue = $derived(contentMode ? contentQuery : query);
+  let fieldEl: HTMLInputElement | undefined = $state();
+
+  function clearNames() {
+    query = "";
+    applyQuery.cancel();
+    debouncedQuery = "";
+  }
+
+  function handleFieldInput(e: Event & { currentTarget: HTMLInputElement }) {
+    const value = e.currentTarget.value;
+    if (contentMode) {
+      contentQuery = value;
+    } else {
+      query = value;
+      applyQuery(value);
+    }
+  }
+
+  function clearField() {
+    if (contentMode) contentQuery = "";
+    else clearNames();
+    fieldEl?.focus();
+  }
+
+  function selectMode(next: ExplorerRail) {
+    showExplorerRail(next);
+    void tick().then(() => fieldEl?.focus());
+  }
+
+  function handleFieldKeydown(e: KeyboardEvent) {
+    if (contentMode) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        onContentSubmit?.();
+        return;
+      }
+      if (e.key === "Escape") {
+        const action = fieldEscape(mode, contentQuery);
+        if (action === "none") return;
+        e.preventDefault();
+        if (action === "clear") contentQuery = "";
+        else selectMode("files");
+        return;
+      }
+    }
+    handleKeydown(e);
+  }
+
+  // The field takes focus when someone asked to search — the palette — and
+  // never merely because Explorer mounted in Contents mode, which would pull
+  // focus out of the editor. `tick` first: the request can arrive before the
+  // column is on screen.
+  $effect(() => {
+    if (!$explorerLens.searchFocusPending || !fieldEl) return;
+    untrack(() => {
+      if (!consumeSearchFocus()) return;
+      void tick().then(() => fieldEl?.focus());
+    });
+  });
 
   const applyQuery = debounce((value: string) => {
     debouncedQuery = value;
@@ -746,7 +825,7 @@
       try {
         await revealInFileManager(repo, filePath);
       } catch {
-        repoStore.setError(formatError(openErr));
+        repoStore.setError(describeError(openErr, "repo"));
       }
     }
   }
@@ -758,7 +837,7 @@
     try {
       await revealInFileManager(repo, filePath);
     } catch (err) {
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     }
   }
 
@@ -921,7 +1000,7 @@
 
 </script>
 
-<div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 overflow-hidden select-none">
+<div class="flex flex-col h-full font-sans text-xs min-h-0 overflow-hidden select-none">
   <!--
     Explorer chrome.
 
@@ -933,7 +1012,7 @@
     filter: `filtersOpen` is the toggle OR'd with "a filter is actually
     applied", so a narrowed listing always shows what narrowed it.
   -->
-  <div class="relative shrink-0 h-9 bg-surface/80" data-tip-place="above">
+  <div class="relative shrink-0 h-9" data-tip-place="above">
     <div bind:this={explorerChrome} class="gp-header-scroll h-full">
       <div class="flex items-center justify-between gap-1 px-2.5 h-9 min-w-max w-full">
     <div class="flex items-baseline gap-1.5 min-w-0">
@@ -998,36 +1077,53 @@
     <ScrollCue target={explorerChrome} axis="x" />
   </div>
 
-  <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain bg-surface/30 space-y-1.5">
+  <div class="@container px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain space-y-1.5">
     <!-- The pill is the field: its edge carries focus, the input inside it
          draws none. The clear button sits over the pill's right end so the
-         pill keeps one height whether or not there is a query. -->
-    <div class="file-tree-filter-pill relative flex items-center gap-1.5 bg-background border border-edge rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-(--field-focus-edge) transition-colors">
+         pill keeps one height whether or not there is a query. Where the rail
+         is too narrow for the text and the Names/Contents switch side by side
+         (the rail's own width, a container query), the switch drops to a
+         full-width second row inside the pill, so it never covers the text or
+         runs past the rail's edge. -->
+    <div class="file-tree-filter-pill relative flex flex-wrap items-center gap-x-1.5 gap-y-1 bg-background border border-edge rounded-full pl-2.5 pr-1.5 py-1 @max-[18rem]:rounded-2xl @max-[18rem]:pr-1 @max-[18rem]:pb-1 focus-within:border-(--field-focus-edge) transition-colors">
       <Search size={12} class="pointer-events-none text-textMuted shrink-0" />
-      <input
-        type="text"
-        bind:value={query}
-        oninput={(e) => applyQuery((e.target as HTMLInputElement).value)}
-        onkeydown={handleKeydown}
-        onfocus={() => (queryFocused = true)}
-        onblur={() => (queryFocused = false)}
-        placeholder="Filter files"
-        title={QUERY_SYNTAX}
-        spellcheck="false"
-        class="file-tree-filter w-full min-w-0 bg-transparent text-xs text-textPrimary placeholder:text-faint {query ? 'pr-5' : ''}"
-      />
-      {#if query}
-        <button
-          type="button"
-          onclick={() => { query = ""; applyQuery.cancel(); debouncedQuery = ""; }}
-          aria-label="Clear filter"
-          title="Clear filter"
-          class="gp-icon-btn absolute right-0.5 top-1/2 -translate-y-1/2"
-          data-size="sm"
-        >
-          <X size={11} />
-        </button>
-      {/if}
+      <div class="relative flex-1 min-w-0">
+        <input
+          bind:this={fieldEl}
+          type="text"
+          value={fieldValue}
+          oninput={handleFieldInput}
+          onkeydown={handleFieldKeydown}
+          onfocus={() => (queryFocused = true)}
+          onblur={() => (queryFocused = false)}
+          placeholder={fieldLabel}
+          aria-label={fieldLabel}
+          title={contentMode ? fieldLabel : QUERY_SYNTAX}
+          spellcheck="false"
+          class="file-tree-filter w-full min-w-0 bg-transparent text-xs text-textPrimary placeholder:text-faint {fieldValue ? 'pr-5' : ''} {contentMode ? 'font-mono' : ''}"
+        />
+        {#if fieldValue}
+          <button
+            type="button"
+            onclick={clearField}
+            aria-label={contentMode ? "Clear search" : "Clear filter"}
+            title={contentMode ? "Clear search" : "Clear filter"}
+            class="gp-icon-btn absolute right-0 top-1/2 -translate-y-1/2"
+            data-size="sm"
+          >
+            <X size={11} />
+          </button>
+        {/if}
+      </div>
+      <div class="shrink-0 @max-[18rem]:basis-full @max-[18rem]:[&>.gp-segmented]:flex @max-[18rem]:[&_.gp-seg-btn]:flex-1" data-explorer-search-modes>
+        <SettingSegment
+          ariaLabel="Search in"
+          options={EXPLORER_SEARCH_MODES}
+          value={mode}
+          onselect={selectMode}
+          size="sm"
+        />
+      </div>
     </div>
 
     <!--
@@ -1036,7 +1132,10 @@
       most users read once; as a placeholder before that, it was truncated
       mid-token and could not be read even once.
     -->
-    {#if parsedQuery.error}
+    {#if contentMode}
+      <!-- Contents mode: the query has no grammar to teach, and its options and
+           honesty notes sit with the results below. -->
+    {:else if parsedQuery.error}
       <p class="text-meta text-danger px-1">{parsedQuery.error}</p>
     {:else if filterTruncated}
       <p class="text-meta text-warn px-1">
@@ -1053,7 +1152,7 @@
       The name still reaches keyboard and screen-reader users through the
       accessible label, and the mouse through the tooltip.
     -->
-    {#if anyChanges}
+    {#if anyChanges && !contentMode}
       <div class="flex items-center gap-1" role="group" aria-label="Filter by working-tree status">
         <button
           type="button"
@@ -1087,7 +1186,7 @@
       </div>
     {/if}
 
-    {#if filtersOpen}
+    {#if filtersOpen && !contentMode}
       <div id="file-tree-filters" class="space-y-1.5 pt-0.5">
         <label class="flex items-center gap-1.5">
           <span class="text-meta text-textMuted shrink-0">Sort</span>
@@ -1117,6 +1216,10 @@
     {/if}
   </div>
 
+  <!-- Contents mode swaps the tree for the search results beneath the same
+       field. The tree is hidden, not unmounted, so its folds, filter and
+       scroll position survive a search. -->
+  <div class="flex-1 min-h-0 flex flex-col" class:hidden={contentMode}>
   {#if errorMsg && hasLoaded}
     <div
       role="status"
@@ -1319,6 +1422,11 @@
         </VirtualList>
       </div>
     {/if}
+  </div>
+  </div>
+
+  <div class="flex-1 min-h-0 flex flex-col" class:hidden={!contentMode}>
+    {@render contents?.()}
   </div>
 </div>
 

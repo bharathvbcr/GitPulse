@@ -87,5 +87,5 @@ scan age, loaded/total counts, and truncation notices before acting on a result.
 
 For help, use [Troubleshooting](../wiki/Troubleshooting.md) and include the app
 version, OS, exact error, and reproduction steps when reporting an issue. See
-[open qualification](QUALIFICATION.md) for platform and provider checks that
+[open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md) for platform and provider checks that
 remain separate from local tests.

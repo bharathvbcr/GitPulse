@@ -159,3 +159,84 @@ describe("createLiveLoader", () => {
     expect(gates).toHaveLength(0);
   });
 });
+
+/**
+ * GitPulse on screen but not focused — an agent filing tasks from another
+ * app's terminal while the board sits beside it — is the commonest time a
+ * change arrives. The loader used to treat lost focus as "in the background",
+ * so the change was dropped and the board only caught up on the next click
+ * into the window.
+ */
+describe("createLiveLoader on an unfocused but visible window", () => {
+  function fakeWindow() {
+    const handlers = new Map<string, Set<() => void>>();
+    const target = {
+      addEventListener: (type: string, fn: () => void) => { (handlers.get(type) ?? handlers.set(type, new Set()).get(type)!).add(fn); },
+      removeEventListener: (type: string, fn: () => void) => { handlers.get(type)?.delete(fn); },
+      fire: (type: string) => { for (const fn of [...(handlers.get(type) ?? [])]) fn(); },
+    };
+    return target;
+  }
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    (await import("../runtime/foreground")).resetForegroundFocus();
+  });
+
+  it("reports the window as visible after a blur and keeps reading changes", async () => {
+    vi.useFakeTimers();
+    const doc = { hidden: false, visibilityState: "visible", hasFocus: () => false, ...fakeWindow() };
+    const frame = fakeWindow();
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", frame);
+    const { liveOnScreen } = await import("./liveLoader");
+    let visible: boolean | null = null;
+    const { loader, gates } = setup({ canRun: () => visible !== false && liveOnScreen() });
+    const disconnect = loader.connect({ onVisibility: (next) => { visible = next; }, onUnavailable: () => {} });
+    frame.fire("blur");
+    expect(visible, "a blurred window that is still on screen is visible").toBe(true);
+    loader.schedule();
+    vi.advanceTimersByTime(1_000);
+    expect(gates, "the change is read while the window is unfocused").toHaveLength(1);
+    disconnect();
+  });
+
+  it("re-reads when the window takes focus or is shown again, and not on a blur that leaves it on screen", async () => {
+    vi.useFakeTimers();
+    const doc = { hidden: false, visibilityState: "visible", hasFocus: () => true, ...fakeWindow() };
+    const frame = fakeWindow();
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", frame);
+    const { liveOnScreen } = await import("./liveLoader");
+    const { loader, gates } = setup({ canRun: () => liveOnScreen() });
+    const disconnect = loader.connect({ onVisibility: () => {}, onUnavailable: () => {} });
+    frame.fire("blur");
+    vi.advanceTimersByTime(2_000);
+    expect(gates, "a blur on screen costs no read: changes still arrive as events").toHaveLength(0);
+    frame.fire("focus");
+    vi.advanceTimersByTime(2_000);
+    expect(gates, "taking focus back re-reads once").toHaveLength(1);
+    gates[0].resolve();
+    disconnect();
+  });
+
+  it("pauses only once the window is hidden, and reads again when it is shown", async () => {
+    vi.useFakeTimers();
+    const doc = { hidden: true, visibilityState: "hidden", hasFocus: () => false, ...fakeWindow() };
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", fakeWindow());
+    const { liveOnScreen } = await import("./liveLoader");
+    let visible: boolean | null = null;
+    const { loader, gates } = setup({ canRun: () => liveOnScreen() });
+    const disconnect = loader.connect({ onVisibility: (next) => { visible = next; }, onUnavailable: () => {} });
+    loader.schedule();
+    vi.advanceTimersByTime(1_000);
+    expect(gates).toHaveLength(0);
+    doc.hidden = false; doc.visibilityState = "visible";
+    doc.fire("visibilitychange");
+    expect(visible).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(gates, "showing the window reads what changed while it was hidden").toHaveLength(1);
+    disconnect();
+  });
+});

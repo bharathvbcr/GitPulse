@@ -124,6 +124,9 @@ describe("where the header uses it", () => {
   it("fades row 2's controls under a global surface", () => {
     const bar = read("lib/components/ViewBar.svelte");
     expect(bar).toContain("swapRow(el, show");
-    expect(bar).toContain("bind:this={controls}");
+    // The fade moved from the whole row to the repository-only groups: the
+    // search field stays on screen under a global surface.
+    expect(bar).toContain("bind:this={switcher}");
+    expect(bar).toContain("bind:this={trailing}");
   });
 });

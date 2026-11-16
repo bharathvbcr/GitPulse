@@ -233,7 +233,7 @@ contract test. The macOS calls themselves (`getDeliveredNotifications`,
 pass Clippy. **Nobody has watched them run in an installed bundle.**
 
 The full verification checkpoint is recorded in
-[the implementation plan](AGENTIC_WORKSPACES_PLAN.md). Remaining work is
+[the implementation plan](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md). Remaining work is
 installed-bundle qualification and the other platforms. Installed-bundle
 qualification covers bundle identity and permission/Focus tests, physical
 banner/action delivery (now including Snooze and withdrawal), click-after-quit
@@ -267,7 +267,7 @@ The first four rows are verified. `decisions.create` accepts exactly
 `every_managed_callback_kind_produces_a_bannerable_notice` drives both through
 a live run and finds each in `notifications.pending.list` with its own title.
 The refused row is traced in code and adapter-tested, but it has not been
-driven through `serve`. That remains in [QUALIFICATION.md](QUALIFICATION.md)
+driven through `serve`. That remains in [QUALIFICATION.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md)
 under Agent supervision.
 
 ### Other producers

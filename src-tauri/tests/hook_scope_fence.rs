@@ -143,7 +143,7 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     // same call in `hook_protocol_stress`, since this test is ignored without a
     // manvi binary). The trust read does not: it reads the filesystem. The hook
     // processes this test drives have gates of their own.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
     let db = gitpulse_lib::tasks::store_path(repo);
@@ -250,4 +250,194 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
         !denied(&answer),
         "an Edit of the planned file was refused: {answer:?}"
     );
+}
+
+#[test]
+#[ignore = "live contract against an installed manvi binary; run in CI with --ignored"]
+fn sibling_worktree_and_outside_reads_are_judged_end_to_end() {
+    let home = tempfile::tempdir().expect("home");
+    let logs = tempfile::tempdir().expect("logs");
+    let serial = hermetic_env::env_serial();
+    let _home = hermetic_env::bind_env(&serial).set("HOME", home.path());
+
+    let base_raw = tempfile::tempdir().expect("base");
+    let base = base_raw.path().canonicalize().expect("canonical base");
+    let main_dir = base.join("main");
+    let wt_b_dir = base.join("wt-b");
+    let plain_dir = base.join("plain");
+    let outside_dir = base.join("outside");
+    std::fs::create_dir_all(&main_dir).unwrap();
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    git(&main_dir, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(main_dir.join("src")).unwrap();
+    std::fs::create_dir_all(main_dir.join("sub")).unwrap();
+    std::fs::write(main_dir.join("src/planned.rs"), "main\n").unwrap();
+    std::fs::write(main_dir.join("src/sibling.rs"), "sib\n").unwrap();
+    std::fs::write(main_dir.join("unplanned.txt"), "unplanned\n").unwrap();
+    git(&main_dir, &["add", "."]);
+    git(&main_dir, &["commit", "-q", "-m", "seed"]);
+    git(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            wt_b_dir.to_str().unwrap(),
+        ],
+    );
+
+    let scratch = outside_dir.join("scratch.json");
+    let outside_env = outside_dir.join(".env");
+    std::fs::write(&scratch, "{\"ok\":true}\n").unwrap();
+    std::fs::write(&outside_env, "SECRET=1\n").unwrap();
+
+    let main_repo = main_dir.to_str().expect("utf8 main");
+    let wt_b_repo = wt_b_dir.to_str().expect("utf8 wt_b");
+
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
+    let main_preview = gitpulse_lib::repository_trust::inspect(main_repo).expect("inspect main");
+    gitpulse_lib::repository_trust::grant(main_repo, &main_preview.identity, true)
+        .expect("trust main");
+    let wt_b_preview = gitpulse_lib::repository_trust::inspect(wt_b_repo).expect("inspect wt_b");
+    gitpulse_lib::repository_trust::grant(wt_b_repo, &wt_b_preview.identity, true)
+        .expect("trust wt_b");
+
+    let db = gitpulse_lib::tasks::store_path(main_repo);
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let store = dc_store::Store::open(&db).expect("task store");
+    plant_task::plant(
+        &store,
+        "TASK-MAIN",
+        "in_progress",
+        r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}],"allowed_commands":["git *","jq *","cat *","head *","sed *","mytool *","ls *"]}"#,
+    );
+    plant_task::plant(
+        &store,
+        "TASK-WTB",
+        "in_progress",
+        r#"{"planned_files":[{"path":"src/sibling.rs","allowed_change":"modify"}],"allowed_commands":["git *"]}"#,
+    );
+    gitpulse_lib::ledger::bindings::bind(main_repo, main_repo, "TASK-MAIN").expect("bind main");
+    gitpulse_lib::ledger::bindings::bind(main_repo, wt_b_repo, "TASK-WTB").expect("bind wt_b");
+
+    let bash = |command: &str| {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse", "session_id": "fence-wt", "cwd": main_repo,
+            "tool_name": "Bash", "tool_input": { "command": command },
+        })
+    };
+    let reason_of = |answer: &Option<serde_json::Value>| {
+        answer.as_ref().unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // AC1: git -C <registered sibling worktree> is judged against sibling scope.
+    for allowed_cmd in [
+        "git -C ../wt-b status",
+        "git -C ../wt-b checkout -- src/sibling.rs",
+    ] {
+        let answer = ask("command-gate", &bash(allowed_cmd), home.path(), logs.path());
+        assert!(
+            !denied(&answer),
+            "{allowed_cmd} was unexpectedly refused: {answer:?}"
+        );
+    }
+
+    for (cmd, want_substrings) in [
+        (
+            "git -C ../wt-b checkout -- unplanned.txt",
+            vec!["scope.unplanned", "TASK-WTB"],
+        ),
+        ("git -C ../wt-b checkout -- .env", vec!["path.secret"]),
+        (
+            "git -C ../wt-b status > ../wt-b/out.txt",
+            vec!["path.outside_root"],
+        ),
+    ] {
+        let answer = ask("command-gate", &bash(cmd), home.path(), logs.path());
+        assert!(denied(&answer), "{cmd} was not refused: {answer:?}");
+        let reason = reason_of(&answer);
+        for sub in want_substrings {
+            assert!(
+                reason.contains(sub),
+                "{cmd}: missing {sub:?} in reason: {reason}"
+            );
+        }
+    }
+
+    // AC2: read-only programs on outside paths are allowed, while outside secret reads refuse.
+    for cmd in [
+        format!("jq . {}", scratch.display()),
+        format!("cat {}", scratch.display()),
+        format!("head -n 1 {}", scratch.display()),
+        format!("sed -n '1p' {}", scratch.display()),
+    ] {
+        let answer = ask("command-gate", &bash(&cmd), home.path(), logs.path());
+        assert!(!denied(&answer), "read-only {cmd} was refused: {answer:?}");
+    }
+    let secret_read = format!("jq . {}", outside_env.display());
+    let answer = ask(
+        "command-gate",
+        &bash(&secret_read),
+        home.path(),
+        logs.path(),
+    );
+    assert!(denied(&answer), "{secret_read} was not refused: {answer:?}");
+    assert!(
+        reason_of(&answer).contains("command.secret_read"),
+        "{secret_read}: {:?}",
+        answer
+    );
+
+    // AC3: under blocking posture, refusal texts name the judged alternative with no "..".
+    for (cmd, rule, hints) in [
+        (
+            "cd sub && ls".to_string(),
+            "command.directory_change",
+            vec!["git -c", "repository root"],
+        ),
+        (
+            format!("git -C {} status", plain_dir.display()),
+            "command.directory_change",
+            vec!["registered", "repository root"],
+        ),
+        (
+            "git -C ../plain status".to_string(),
+            "command.directory_change",
+            vec!["registered", "repository root"],
+        ),
+        (
+            "cat <<EOF\nhi\nEOF".to_string(),
+            "command.heredoc",
+            vec!["file", "edit"],
+        ),
+        (
+            format!("mytool {}", scratch.display()),
+            "command.operand.unverifiable",
+            vec!["cat", "jq", "sed -n"],
+        ),
+    ] {
+        let answer = ask("command-gate", &bash(&cmd), home.path(), logs.path());
+        assert!(denied(&answer), "{cmd} was not refused: {answer:?}");
+        let reason = reason_of(&answer);
+        assert!(reason.contains(rule), "{cmd}: missing {rule} in {reason}");
+        let msg = reason.split("\n  target:").next().unwrap_or(&reason);
+        assert!(
+            !msg.contains(".."),
+            "{cmd}: reason message must not contain '..': {reason}"
+        );
+        let lower = reason.to_lowercase();
+        for hint in hints {
+            assert!(
+                lower.contains(&hint.to_lowercase()),
+                "{cmd}: missing alternative {hint:?} in {reason}"
+            );
+        }
+    }
 }

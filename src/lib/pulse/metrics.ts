@@ -102,6 +102,7 @@ export function computeHeatmap(
   const startSunday = new Date(endSaturday);
   startSunday.setDate(endSaturday.getDate() - totalDays + 1);
   startSunday.setHours(0, 0, 0, 0);
+  startSunday.setTime(startOfLocalDay(startSunday.getTime()));
 
   const startMs = startSunday.getTime();
   const endMs = endSaturday.getTime();
@@ -170,7 +171,7 @@ export function computeHeatmap(
         level: calculateLevel(val),
       });
 
-      currentCursor.setDate(currentCursor.getDate() + 1);
+      currentCursor = new Date(nextLocalDay(curMs));
     }
     weeks.push({ weekIndex: w, days });
   }
@@ -361,6 +362,7 @@ export function computeLineChanges(
   for (let i = weeksCount - 1; i >= 0; i--) {
     const s = new Date(currentSunday);
     s.setDate(currentSunday.getDate() - i * 7);
+    s.setHours(0, 0, 0, 0);
     weekStarts.push(s.getTime());
   }
 

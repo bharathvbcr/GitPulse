@@ -1,28 +1,36 @@
 <script lang="ts">
   /**
    * Chooses whether Manvi runs on a local model or on Claude through the
-   * Anthropic API, and holds the Claude key. GitPulse's own AI features
-   * (commit messages, explanations) stay on the local model either way.
+   * Anthropic API, and shows which credential Claude bills: the machine's
+   * `~/.anthropic-accounts` account (key and workspace from one organisation,
+   * set up with Manvi's `anthropic-account`) when there is one, else a key
+   * saved here. GitPulse's own AI features (commit messages, explanations)
+   * stay on the local model either way.
    */
   import { onMount } from "svelte";
   import { harnessStore } from "../stores/harnessStore";
   import { CLAUDE_MODELS } from "../workbench/taskModel";
-  import { claudeKey, claudeKeyProblem } from "../workbench/claudeKey";
-  import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
+  import { claudeKey, claudeKeyProblem, type ClaudeCredentialStatus } from "../workbench/claudeKey";
+  import { formatDisplayFailure } from "../diagnostics/report";
 
   let choice = $derived($harnessStore.manviClaude);
-  /** null until the Keychain has answered. */
-  let keySaved = $state<boolean | null>(null);
+  /** null until the backend has answered. */
+  let status = $state<ClaudeCredentialStatus | null>(null);
+  let keySaved = $derived(status?.keySaved ?? null);
+  let account = $derived(status?.account ?? null);
+  let accountError = $derived(status?.accountError ?? null);
+  /** The registry decides; a key saved here is not used while it exists. */
+  let registryInUse = $derived(Boolean(account || accountError));
   let draft = $state("");
   let working = $state(false);
   let error = $state<string | null>(null);
 
   async function refresh() {
     try {
-      keySaved = await claudeKey.status();
+      status = await claudeKey.status();
       error = null;
     } catch (err: unknown) {
-      error = formatDiagnosticFailure(err);
+      error = formatDisplayFailure(err, "manvi");
     }
   }
 
@@ -37,7 +45,7 @@
       await action();
       await refresh();
     } catch (err: unknown) {
-      error = formatDiagnosticFailure(err);
+      error = formatDisplayFailure(err, "manvi");
     } finally {
       working = false;
     }
@@ -101,14 +109,46 @@
       </select>
     </label>
     <p class="text-meta text-textMuted">
-      Task suggestions and Manvi's own model calls are billed to this key. Claude Code agents Manvi
-      launches keep their own login. Manvi keeps the key from every program it starts.
+      Task suggestions and Manvi's own model calls are billed to {account ? "this account" : "this key"}.
+      Claude Code agents Manvi launches keep their own login. Manvi keeps the key from every program it
+      starts.
     </p>
   {/if}
 
   <div class="space-y-1 text-meta">
-    {#if keySaved === null}
-      <span class="text-textMuted">Checking the Keychain…</span>
+    {#if status === null && !error}
+      <span class="text-textMuted">Checking for an Anthropic account…</span>
+    {:else if account}
+      <div class="space-y-0.5" data-testid="manvi-claude-account">
+        <div>
+          Using Anthropic account <span class="font-mono">{account.name}</span>
+          from <span class="font-mono">~/.anthropic-accounts</span>{account.source === "default" ? " (its default)" : ` (${account.source})`}.
+        </div>
+        <div class="text-textMuted">
+          {#if account.workspace}
+            Workspace <span class="font-mono">{account.workspace}</span>, sent with that organisation's key.
+          {:else}
+            No workspace id is recorded for this account; requests use the organisation's default workspace.
+          {/if}
+        </div>
+        <div class="text-textMuted">Change it with <span class="font-mono">anthropic-account</span>; GitPulse never reads the key.</div>
+        {#if keySaved}
+          <div class="flex items-center gap-2 text-textMuted" data-testid="manvi-claude-unused-key">
+            <span>A key is also saved in GitPulse's Keychain entry; it is not used while this account is.</span>
+            <button
+              class="hover:text-textPrimary underline disabled:opacity-50"
+              disabled={working}
+              onclick={() => void run(() => claudeKey.remove())}
+            >
+              Remove
+            </button>
+          </div>
+        {/if}
+      </div>
+    {:else if accountError}
+      <p class="text-danger" data-testid="manvi-claude-account-error">
+        ~/.anthropic-accounts exists but could not be read, so Manvi will not start on Claude: {accountError}
+      </p>
     {:else if keySaved}
       <div class="flex items-center gap-2">
         <span>Claude API key saved in the Keychain.</span>
@@ -120,9 +160,12 @@
           Remove
         </button>
       </div>
-    {:else if choice}
-      <span class="text-warn">No Claude API key saved: Manvi cannot run until you add one.</span>
+    {:else if choice && status}
+      <span class="text-warn">
+        No Claude API key saved and no ~/.anthropic-accounts registry: Manvi cannot run until you add one.
+      </span>
     {/if}
+    {#if status && !registryInUse}
     <form
       class="flex items-center gap-2"
       onsubmit={(event) => {
@@ -147,6 +190,7 @@
         {working ? "Saving…" : "Save key"}
       </button>
     </form>
+    {/if}
     {#if error}
       <p class="text-danger">{error}</p>
     {/if}

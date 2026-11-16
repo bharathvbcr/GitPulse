@@ -65,7 +65,12 @@ describe("planAppearance: defaults", () => {
     expect(plan.vars).toEqual({});
     expect(plan.accentOverride).toBeNull();
     expect(plan.transparencyReduced).toBe(false);
-    expect(plan.attributes).toEqual({ "data-density": "comfortable", "data-radius-scale": null, "data-float-blur": null });
+    expect(plan.attributes).toEqual({
+      "data-density": "comfortable",
+      "data-radius-scale": null,
+      "data-float-blur": null,
+      "data-backdrop": null,
+    });
   });
 });
 
@@ -416,5 +421,104 @@ describe("installAppearance", () => {
     stop();
     store.set(prefs({ density: "compact" }));
     expect(root.attributes.get("data-density")).toBe("comfortable");
+  });
+});
+
+describe("the wallpaper", () => {
+  it("writes the input variable and attribute only where the window material exists", () => {
+    const plan = planAppearance(prefs({ backdrop: "neural" }), mac);
+    expect(plan.vars["--gp-backdrop"]).toMatch(/^url\("data:image\/svg\+xml,/);
+    expect(plan.attributes["data-backdrop"]).toBe("neural");
+    const other = planAppearance(prefs({ backdrop: "neural" }), elsewhere);
+    expect(other.vars["--gp-backdrop"]).toBeUndefined();
+    expect(other.attributes["data-backdrop"]).toBeNull();
+    expect(other.notes.map((note) => note.id)).toContain("backdrop-host");
+  });
+
+  it("clears both when the wallpaper goes back to none", () => {
+    const root = new FakeRoot();
+    writeAppearance(planAppearance(prefs({ backdrop: "hex" }), mac), root);
+    expect(root.values.has("--gp-backdrop")).toBe(true);
+    writeAppearance(planAppearance(prefs(), mac), root);
+    expect(root.values.has("--gp-backdrop")).toBe(false);
+    expect(root.attributes.has("data-backdrop")).toBe(false);
+    expect(MANAGED_VARS).toContain("--gp-backdrop");
+    expect(MANAGED_ATTRIBUTES).toContain("data-backdrop");
+  });
+
+  it("draws the reader's image only once it is ready, and says so when it is gone", () => {
+    const loading = planAppearance(prefs({ backdrop: "custom" }), { ...mac, customBackdrop: { status: "loading" } });
+    expect(loading.vars["--gp-backdrop"]).toBeUndefined();
+    expect(loading.notes).toEqual([]);
+    const ready = planAppearance(prefs({ backdrop: "custom" }), {
+      ...mac,
+      customBackdrop: { status: "ready", url: "blob:http://localhost/abc-123" },
+    });
+    expect(ready.vars["--gp-backdrop"]).toBe('url("blob:http://localhost/abc-123")');
+    expect(ready.attributes["data-backdrop"]).toBe("custom");
+    for (const status of ["none", "unavailable"] as const) {
+      const gone = planAppearance(prefs({ backdrop: "custom" }), { ...mac, customBackdrop: { status } });
+      expect(gone.vars["--gp-backdrop"]).toBeUndefined();
+      expect(gone.notes.map((note) => note.id)).toContain("backdrop-missing");
+    }
+  });
+
+  it("never writes a URL that could break out of url(\"…\")", () => {
+    const plan = planAppearance(prefs({ backdrop: "custom" }), {
+      ...mac,
+      customBackdrop: { status: "ready", url: 'blob:x") ; background: red' },
+    });
+    expect(plan.vars["--gp-backdrop"]).toBeUndefined();
+  });
+
+  it("tells the reader when reduced transparency or an opaque material hides it", () => {
+    expect(
+      planAppearance(prefs({ backdrop: "neural", reduceTransparency: true }), mac).notes.map((note) => note.id),
+    ).toContain("backdrop-hidden");
+    expect(
+      planAppearance(prefs({ backdrop: "neural", materialIntensity: both(1) }), mac).notes.map((note) => note.id),
+    ).toContain("backdrop-hidden");
+    expect(planAppearance(prefs({ backdrop: "neural" }), mac).notes.map((note) => note.id)).not.toContain(
+      "backdrop-hidden",
+    );
+  });
+
+  it("reads a stored choice it does not know as none, and keeps saved themes validated", () => {
+    expect(sanitizeAppearance({ backdrop: "url(evil)" }).backdrop).toBe("none");
+    expect(sanitizeAppearance({ backdrop: "reactor" }).backdrop).toBe("reactor");
+    expect(sanitizeAppearance({ savedThemes: [{ name: "x" }] }).savedThemes).toEqual([]);
+  });
+
+  it("is painted on body beneath the shell veil, and solid surfaces remove it", () => {
+    // Beneath the veil is the contrast argument: the material model's
+    // white/black-desktop proof covers a picture only from below the veil.
+    const selector = "html.macos[data-backdrop] body {";
+    const draw = css.indexOf(`${selector}\n  background-image: var(--gp-backdrop);`);
+    expect(draw).toBeGreaterThan(-1);
+    expect(css).not.toMatch(/\.gp-shell[^{]*\{[^}]*--gp-backdrop/);
+    // The solid-surface preferences remove it with the same selector, later in the cascade.
+    const media = css.indexOf("@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {");
+    const hide = css.indexOf(`  ${selector}\n    background-image: none;`, media);
+    expect(media).toBeGreaterThan(draw);
+    expect(hide).toBeGreaterThan(media);
+    // And the in-app choice, keyed on the attribute (more specific, so it wins anywhere).
+    expect(css).toContain('html.macos[data-transparency="reduced"][data-backdrop] body {\n  background-image: none;');
+  });
+});
+
+describe("the material floor follows the palette in force", () => {
+  it("uses the shipped floor with no theme, and a measured one with a theme", () => {
+    expect(planAppearance(prefs(), mac).materialFloor).toBe(MATERIAL_FLOOR.dark);
+    expect(planAppearance(prefs(), macLight).materialFloor).toBe(MATERIAL_FLOOR.light);
+    // A pure black palette: its veil and plates are black, so over a white
+    // desktop the thin glass lifts the ground toward its muted ink. The
+    // shipped dark floor (0) would let the slider reach a stack that fails AA.
+    const black = exportTheme({ name: "Black", appearance: "dark", colors: { base: "#000000", accent: "#d4d4d8" } });
+    if (!black.ok) throw new Error("fixture invalid");
+    const plan = planAppearance(prefs({ customTheme: black.theme, materialIntensity: both(0) }), mac);
+    expect(plan.materialFloor).toBeGreaterThan(MATERIAL_FLOOR.dark);
+    // And the window is held there, with the note the reader is owed.
+    expect(Number(plan.vars["--gp-material"])).toBe(plan.materialFloor);
+    expect(plan.notes.map((note) => note.id)).toContain("material-floor");
   });
 });

@@ -51,9 +51,8 @@
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
-  import { createLiveLoader } from "../workbench/liveLoader";
+  import { createLiveLoader, liveOnScreen } from "../workbench/liveLoader";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
-  import { readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
@@ -99,7 +98,7 @@
   let pages = 0;
   let query = $state("");
   let selected = $state<Set<string>>(new Set());
-  let error = $state(""), notice = $state(""), visible = $state(!readBackgroundDocument()), working = $state(false);
+  let error = $state(""), notice = $state(""), visible = $state(liveOnScreen()), working = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
 
   /**

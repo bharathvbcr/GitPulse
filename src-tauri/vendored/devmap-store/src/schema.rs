@@ -1894,7 +1894,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
 /// The name in the body of a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ...`
 /// chunk, where `body` starts at `INDEX `.
 fn index_name_of(body: &str) -> &str {
-    let rest = body.strip_prefix("INDEX ").unwrap_or(body).trim_start();
+    let rest = body.trim_prefix("INDEX ").trim_start();
     let rest = rest
         .strip_prefix("IF NOT EXISTS ")
         .unwrap_or(rest)
@@ -1969,7 +1969,7 @@ pub fn declared_index_statements() -> Vec<String> {
     for batch in FRESH_SCHEMA_BATCHES {
         let sql = without_sql_comments(batch);
         for chunk in sql.split("CREATE ").skip(1) {
-            let body = chunk.strip_prefix("UNIQUE ").unwrap_or(chunk);
+            let body = chunk.trim_prefix("UNIQUE ");
             if !body.starts_with("INDEX ") {
                 continue;
             }
@@ -2004,7 +2004,7 @@ pub fn declared_index_names() -> Vec<String> {
                 continue;
             };
             let rest = rest.trim_start();
-            let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+            let rest = rest.trim_prefix("IF NOT EXISTS ");
             let name: String = rest
                 .trim_start()
                 .chars()

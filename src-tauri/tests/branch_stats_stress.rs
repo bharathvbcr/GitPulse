@@ -26,7 +26,7 @@ fn init_repo() -> TempDir {
     // production spawn rate. Every test starts here and the suite shares one
     // process gate, so the stats walk otherwise waits on the rate instead of
     // measuring the code under test.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = TempDir::new().expect("tempdir");
     run_git(dir.path(), &["init", "-q", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "stress@gitpulse.dev"]);

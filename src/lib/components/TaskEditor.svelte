@@ -45,7 +45,7 @@
     { value: "critical", label: "Critical" },
   ] as const;
 
-  let { value, seed = null, repositories, workspaces, openTabs = [], primary = "", home = null, active = true, initialStatus = "inbox", onSaved, onClose }: {
+  let { value, seed = null, repositories, workspaces, openTabs = [], primary = "", home = null, active = true, initialStatus = "backlog", onSaved, onClose }: {
     value: Task | null; seed?: Partial<TaskDraft> | null; repositories: Repository[]; workspaces: WorkspaceCard[]; openTabs?: OpenTabRef[];
     primary?: string; home?: string | null; active?: boolean; initialStatus?: TaskStatus;
     onSaved: (task: Task) => void; onClose: () => void;

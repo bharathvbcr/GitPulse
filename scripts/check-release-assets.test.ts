@@ -1,4 +1,4 @@
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,6 +18,7 @@ import {
   extractWithSevenZip,
   expectedAssetNames,
   expectedInstallerNames,
+  inspectAppBundle,
   inspectBundleContents,
   inspectBundles,
   inspectReleaseAssets,
@@ -808,6 +809,64 @@ describe("bundle contents", () => {
     });
   });
 
+  describe("source maps", () => {
+    it("fails .app.tar.gz when a .map file (lowercase, uppercase, symlinked, or pax-renamed) or sourceMappingURL is present", async () => {
+      const leaky = await bundles({
+        [MAC]: macTar(
+          ...allMacBins(),
+          tarEntry("GitPulse.app/Contents/Resources/assets/main.js.map", Buffer.from("{}"), { mode: 0o644 }),
+          tarEntry("GitPulse.app/Contents/Resources/assets/MAIN.JS.MAP", Buffer.from("{}"), { mode: 0o644 }),
+          tarEntry("GitPulse.app/Contents/Resources/assets/link.js.map", Buffer.alloc(0), { type: "2", mode: 0o777 }),
+          paxEntry({ path: "GitPulse.app/Contents/Resources/leak.js.map" }, "decoy.txt", Buffer.from("{}"), 0o644),
+          tarEntry("GitPulse.app/Contents/Resources/assets/main.js", Buffer.from("console.log(1);\n//# sourceMappingURL=main.js.map\n"), { mode: 0o644 }),
+          tarEntry("GitPulse.app/Contents/Resources/assets/app.css", Buffer.from("body{}\n/*# sourceMappingURL=app.css.map */"), { mode: 0o644 }),
+        ),
+      });
+      const result = check(leaky);
+      expect(result.ok).toBe(false);
+      expect(result.invalid).toBe(false);
+      expect(result.violations).toEqual([
+        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/main.js.map`,
+        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/MAIN.JS.MAP`,
+        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/assets/link.js.map`,
+        `${MAC}: sourcemap: GitPulse.app/Contents/Resources/leak.js.map`,
+        `${MAC}: sourcemap-ref: GitPulse.app/Contents/Resources/assets/main.js`,
+        `${MAC}: sourcemap-ref: GitPulse.app/Contents/Resources/assets/app.css`,
+      ]);
+    });
+
+    it("fails .deb, NSIS, and MSI (including WiX PathFile_I* source-map JSON payloads), while passing benign MSI resources", async () => {
+      const wixMapId = "PathFile_I0123456789abcdef0123456789abcdef";
+      const wixBenignId = "PathFile_Ifedcba9876543210fedcba9876543210";
+      const result = check(await bundles({
+        [DEB]: debOf("data.tar.gz", gzipSync(tarball(
+          ...BINS.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e))),
+          tarEntry("./usr/lib/gitpulse/leak.js.map", Buffer.from("{}"), { mode: 0o644 }),
+        ))),
+        [NSIS]: {
+          ...Object.fromEntries(BINS.map((bin) => [`${bin}.exe`, pe(0x8664)])),
+          "plugin/leak.js.map": Buffer.from("{}"),
+          "plugin/app.js": Buffer.from("export {};\n//# sourceMappingURL=app.js.map\n"),
+        },
+        [MSI]: {
+          ...Object.fromEntries(BINS.map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
+          "leak.js.map": Buffer.from("{}"),
+          [wixMapId]: Buffer.from(JSON.stringify({ version: 3, sources: ["src/App.svelte"], mappings: "AAAA" })),
+          [wixBenignId]: Buffer.from(JSON.stringify({ name: "gitpulse", version: "1.99.0" })),
+        },
+      }));
+      expect(result.ok).toBe(false);
+      expect(result.invalid).toBe(false);
+      expect(result.violations).toEqual([
+        `${DEB}: sourcemap: usr/lib/gitpulse/leak.js.map`,
+        `${NSIS}: sourcemap-ref: plugin/app.js`,
+        `${NSIS}: sourcemap: plugin/leak.js.map`,
+        `${MSI}: sourcemap: ${wixMapId}`,
+        `${MSI}: sourcemap: leak.js.map`,
+      ]);
+    });
+  });
+
   it("exits 2 from the CLI when the extraction tool is absent, and 1 when installers are not there", async () => {
     const made = await bundles();
     const env = { ...process.env, PATH: path.join(made.dir, "no-tools") };
@@ -995,5 +1054,119 @@ describe("bundle contents: adversarial bundles", () => {
       }
       expect(readdirSync(scratch)).toEqual([]);
     });
+  });
+});
+
+describe("app bundle on disk", () => {
+  function thinMachO(cpu = ARM64): Buffer {
+    const out = Buffer.alloc(32);
+    out.writeUInt32LE(0xfeedfacf, 0);
+    out.writeUInt32LE(cpu, 4);
+    out.writeUInt32LE(2, 12);
+    return out;
+  }
+
+  function makeApp(mutate?: (appDir: string) => void, bins = BINS, machO: () => Buffer = thinMachO): string {
+    const parent = mkdtempSync(path.join(tmpdir(), "gitpulse-app-"));
+    tempDirs.push(parent);
+    const appDir = path.join(parent, "GitPulse.app");
+    mkdirSync(path.join(appDir, "Contents", "MacOS"), { recursive: true });
+    mkdirSync(path.join(appDir, "Contents", "Resources", "plugin"), { recursive: true });
+    writeFileSync(path.join(appDir, "Contents", "Info.plist"), "<plist/>");
+    writeFileSync(path.join(appDir, "Contents", "Resources", "plugin", "plugin.json"), '{"name":"gitpulse"}');
+    for (const bin of bins) {
+      writeFileSync(path.join(appDir, "Contents", "MacOS", bin), machO(), { mode: 0o755 });
+    }
+    mutate?.(appDir);
+    return appDir;
+  }
+
+  it("passes on a clean thin or universal .app bundle and checks universal mode when requested", () => {
+    const thinApp = makeApp(undefined, BINS, () => thinMachO(ARM64));
+    expect(inspectAppBundle({ appPath: thinApp, binaries: BINS })).toEqual({ ok: true, invalid: false, violations: [] });
+    const thinAsUniversal = inspectAppBundle({ appPath: thinApp, binaries: BINS, universal: true });
+    expect(thinAsUniversal.ok).toBe(false);
+    expect(thinAsUniversal.violations).toEqual(BINS.map((bin) => `wrong-arch: ${bin}`));
+
+    const fatApp = makeApp(undefined, BINS, universal);
+    expect(inspectAppBundle({ appPath: fatApp, binaries: BINS, universal: true })).toEqual({ ok: true, invalid: false, violations: [] });
+  });
+
+  it("fails on .map files, uppercase .MAP files, symlinked .map entries, .map directories, and sourceMappingURL comments", () => {
+    const leaky = makeApp((appDir) => {
+      mkdirSync(path.join(appDir, "Contents", "Resources", "assets"), { recursive: true });
+      mkdirSync(path.join(appDir, "Contents", "Resources", "bad.map"), { recursive: true });
+      writeFileSync(path.join(appDir, "Contents", "Resources", "assets", "index.js.map"), "{}");
+      writeFileSync(path.join(appDir, "Contents", "Resources", "assets", "UPPER.MAP"), "{}");
+      symlinkSync("../bad.map", path.join(appDir, "Contents", "Resources", "assets", "link.map"));
+      writeFileSync(path.join(appDir, "Contents", "Resources", "script.js"), "console.log(1);\n//# sourceMappingURL=script.js.map\n");
+    });
+    const result = inspectAppBundle({ appPath: leaky, binaries: BINS });
+    expect(result.ok).toBe(false);
+    expect(result.invalid).toBe(false);
+    expect(result.violations).toEqual([
+      "sourcemap: Contents/Resources/assets/UPPER.MAP",
+      "sourcemap: Contents/Resources/assets/index.js.map",
+      "sourcemap: Contents/Resources/assets/link.map",
+      "sourcemap: Contents/Resources/bad.map",
+      "sourcemap-ref: Contents/Resources/script.js",
+    ]);
+  });
+
+  it("allows internal framework symlinks but fails escaping symlinks, missing/empty/non-exec/hardlinked binaries, and missing Info.plist", () => {
+    const frameworkOk = makeApp((appDir) => {
+      const vers = path.join(appDir, "Contents", "Frameworks", "Example.framework", "Versions");
+      mkdirSync(path.join(vers, "A"), { recursive: true });
+      symlinkSync("A", path.join(vers, "Current"));
+    });
+    expect(inspectAppBundle({ appPath: frameworkOk, binaries: BINS })).toEqual({ ok: true, invalid: false, violations: [] });
+
+    const escape = makeApp((appDir) => {
+      symlinkSync("/etc", path.join(appDir, "Contents", "Resources", "escape"));
+    });
+    const escapeResult = inspectAppBundle({ appPath: escape, binaries: BINS });
+    expect(escapeResult.invalid).toBe(true);
+    expect(escapeResult.ok).toBe(false);
+    expect(escapeResult.violations[0]).toContain("cannot be opened:");
+
+    const broken = makeApp((appDir) => {
+      rmSync(path.join(appDir, "Contents", "Info.plist"));
+      rmSync(path.join(appDir, "Contents", "MacOS", "gitpulse-hook"));
+      chmodSync(path.join(appDir, "Contents", "MacOS", "gitpulse-mcp"), 0o644);
+      writeFileSync(path.join(appDir, "Contents", "MacOS", "gitpulse-ptyd"), Buffer.alloc(0), { mode: 0o755 });
+      writeFileSync(path.join(appDir, "Contents", "MacOS", "gitpulsed"), elf(0x3e), { mode: 0o755 });
+    });
+    const brokenResult = inspectAppBundle({ appPath: broken, binaries: BINS });
+    expect(brokenResult.ok).toBe(false);
+    expect(brokenResult.invalid).toBe(false);
+    expect(brokenResult.violations).toEqual([
+      "missing: Contents/Info.plist",
+      "missing: gitpulse-hook",
+      "not-executable: gitpulse-mcp",
+      "empty: gitpulse-ptyd",
+      "wrong-arch: gitpulsed",
+    ]);
+  });
+
+  it("drives --app through the CLI with exit codes 0 (clean), 1 (sourcemap leak), and 2 (bad path or invalid flag combinations)", async () => {
+    const cleanApp = makeApp();
+    const ok = await execFileAsync(process.execPath, [scriptPath, "--app", cleanApp]);
+    expect(ok.stdout).toContain("OK: GitPulse.app holds every declared binary and no source maps");
+
+    const leakyApp = makeApp((appDir) => {
+      writeFileSync(path.join(appDir, "Contents", "Resources", "leak.js.map"), "{}");
+    });
+    const leakErr = await execFileAsync(process.execPath, [scriptPath, "--app", leakyApp]).catch((error) => error);
+    expect(leakErr.code).toBe(1);
+    expect(String(leakErr.stderr)).toContain("FAIL: app bundle sourcemap: Contents/Resources/leak.js.map");
+
+    const missingErr = await execFileAsync(process.execPath, [scriptPath, "--app", path.join(cleanApp, "missing.app")]).catch((error) => error);
+    expect(missingErr.code).toBe(2);
+
+    const combinedErr = await execFileAsync(process.execPath, [scriptPath, "--app", cleanApp, "--tag", "v1.2.3"]).catch((error) => error);
+    expect(combinedErr.code).toBe(2);
+
+    const universalOnlyErr = await execFileAsync(process.execPath, [scriptPath, "--universal"]).catch((error) => error);
+    expect(universalOnlyErr.code).toBe(2);
   });
 });

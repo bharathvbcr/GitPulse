@@ -6,7 +6,7 @@ import { writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { build, type Plugin } from "vite";
 import { describe, expect, it } from "vitest";
-import { privateSourceMaps, pruneEvidence, shippedSourceMaps } from "./build-evidence.mjs";
+import { isSourceMapDocument, privateSourceMaps, pruneEvidence, shippedSourceMaps } from "./build-evidence.mjs";
 import { appBuild, releaseRevisions } from "./app-version.mjs";
 
 describe("exact build evidence", () => {
@@ -142,13 +142,25 @@ describe("source maps never ship in the frontend bundle", () => {
       await mkdir(path.join(root, "assets", "deep"), { recursive: true });
       await writeFile(path.join(root, "assets", "main.js"), "export {};\n//# sourceMappingURL=main.js.map\n");
       await writeFile(path.join(root, "assets", "main.js.map"), "{}");
+      await writeFile(path.join(root, "assets", "UPPER.JS.MAP"), "{}");
       await writeFile(path.join(root, "assets", "deep", "style.css"), "a{}\n/*# sourceMappingURL=style.css.map */");
       await writeFile(path.join(root, "assets", "old.mjs"), "x()\n//@ sourceMappingURL=old.mjs.map");
       await writeFile(path.join(root, "assets", "deep", "orphan.css.map"), "{}");
       expect(shippedSourceMaps(root)).toEqual([
-        "assets/deep/orphan.css.map", "assets/deep/style.css", "assets/main.js", "assets/main.js.map", "assets/old.mjs",
+        "assets/UPPER.JS.MAP", "assets/deep/orphan.css.map", "assets/deep/style.css", "assets/main.js", "assets/main.js.map", "assets/old.mjs",
       ]);
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("identifies Source Map v3 JSON payloads even without a .map extension", () => {
+    const standard = Buffer.from(JSON.stringify({ version: 3, sources: ["src/main.ts"], mappings: "AAAA" }));
+    const indexed = Buffer.from(`\uFEFF  \n${JSON.stringify({ version: 3, sections: [{ offset: { line: 0, column: 0 }, map: { version: 3, sources: [], mappings: "" } }] })}`);
+    const benignConfig = Buffer.from(JSON.stringify({ version: 3, name: "plugin", description: "not a source map" }));
+    const binary = Buffer.from([0x4d, 0x5a, 0x00, 0x03]);
+    expect(isSourceMapDocument(standard)).toBe(true);
+    expect(isSourceMapDocument(indexed)).toBe(true);
+    expect(isSourceMapDocument(benignConfig)).toBe(false);
+    expect(isSourceMapDocument(binary)).toBe(false);
   });
 
   it("passes a bundle that only mentions the word, and an empty one", async () => {

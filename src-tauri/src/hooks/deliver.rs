@@ -271,6 +271,15 @@ fn antigravity_stop(
 
 /// The handler. See the module documentation.
 pub(super) fn run(input: &HookInput) -> Result<HookOutput, HookError> {
+    // Claude Code's `Stop` reaches the app only through here (`stop-or-notify`
+    // is Antigravity's). This hook is async: the turn has already ended and
+    // nothing here continues it, so the turn-end checkpoint is taken before
+    // the wait for a peer message that may start the next one, and for every
+    // session, not only those that opted in to peer waking: the checkpoint has
+    // its own setting and its own trust check.
+    if !input.is_antigravity() {
+        let _ = super::turn_checkpoint::at_turn_end(input);
+    }
     let Some((pool, trusted_root)) = recognized_pool(input) else {
         return Ok(HookOutput::silent());
     };

@@ -353,7 +353,7 @@ fn sixty_four_concurrent_hooks_read_a_live_ledger() {
     // list` (one metered spawn, seen with the gate instrumented). The trust
     // read does not: it reads the filesystem. The hook processes this test
     // drives have gates of their own.
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(&repo, &preview.identity, false).expect("trust");
     let home = dir.path().join("home");

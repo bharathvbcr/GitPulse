@@ -376,6 +376,22 @@ describe("harness error retention", () => {
     expect(get(store).harness?.error).not.toContain("opaque-status-secret");
     expect(get(store).error).toContain("transport unavailable");
   });
+
+  it("never stores a JavaScript runtime fault as the Manvi status reason", async () => {
+    const raw = "Cannot read properties of undefined (reading 'invoke')";
+    const store = createHarnessStore({
+      invoke: (async () => {
+        throw new TypeError(raw);
+      }) as never,
+    });
+
+    await store.refresh();
+
+    expect(get(store).harness?.available).toBe(false);
+    expect(get(store).harness?.error).toBe("Something went wrong inside GitPulse. Details are in Diagnostics.");
+    expect(get(store).error).toBe("Something went wrong inside GitPulse. Details are in Diagnostics.");
+    expect(JSON.stringify(get(store))).not.toContain("reading 'invoke'");
+  });
 });
 
 describe("repository-scoped ledger projection", () => {

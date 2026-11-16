@@ -26,7 +26,7 @@
 
 use devmap_query::{blake3_hash, write_atomic};
 use gitpulse_lib::engine::cow_clone::reflink_copy_file;
-use gitpulse_lib::engine::git_cli::capture_command;
+use gitpulse_lib::engine::process::capture_command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -913,7 +913,7 @@ fn is_proc_macro_dylib_ext(ext: &str) -> bool {
 
 fn extract_crate_stem_from_artifact(path: &Path) -> Option<String> {
     let file_stem = path.file_stem()?.to_str()?;
-    let without_lib = file_stem.strip_prefix("lib").unwrap_or(file_stem);
+    let without_lib = file_stem.trim_prefix("lib");
     let crate_part = match without_lib.rsplit_once('-') {
         Some((stem, suffix))
             if !stem.is_empty()
@@ -1122,7 +1122,7 @@ fn expand_rustc_response_files_iter<'a>(
                 return Err(());
             }
             let text = std::str::from_utf8(&raw).map_err(|_| ())?;
-            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+            let text = text.trim_prefix('\u{feff}');
             expand_rustc_response_files_iter(text.lines(), cwd, depth + 1, out)?;
         } else {
             if out.len() >= MAX_EXPANDED_ARGS {
@@ -3221,23 +3221,42 @@ pub fn resolve_gitpulse_rustc_bin() -> Result<PathBuf, String> {
         "gitpulse-rustc"
     };
     if let Ok(cur_exe) = std::env::current_exe() {
-        if let Some(dir) = cur_exe.parent() {
-            let direct = dir.join(exe_name);
-            if direct.is_file() {
-                return Ok(direct);
-            }
-            // When `cur_exe` is inside `target/debug/deps/<test-bin>`, check parent `target/debug/`.
-            if let Some(parent_dir) = dir.parent() {
-                let sibling = parent_dir.join(exe_name);
-                if sibling.is_file() {
-                    return Ok(sibling);
-                }
-            }
+        if let Some(found) = cur_exe
+            .parent()
+            .and_then(|dir| find_uplifted_bin(dir, exe_name))
+        {
+            return Ok(found);
         }
     }
     Err(format!(
         "cannot locate `{exe_name}` binary beside current executable (build `{exe_name}` or set GITPULSE_RUSTC_BIN)"
     ))
+}
+
+/// Finds `exe_name` beside the executable's directory `start`, or in the profile
+/// directory a cargo test or bench binary lives under. Cargo uplifts final binaries to
+/// `target/<profile>/`, while a test binary sits either in `target/<profile>/deps/`
+/// (cargo <= 1.99) or in `target/<profile>/build/<pkg>/<hash>/out/` (cargo >= 1.100).
+///
+/// The search climbs only along those two shapes (plus the one parent the function has
+/// always checked). An installed binary such as `~/.cargo/bin/gitpulse-worktree` must
+/// not wander up through `~` and `/` looking for something named `gitpulse-rustc`, because
+/// whatever it finds is run as the compiler wrapper.
+fn find_uplifted_bin(start: &Path, exe_name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<&Path> = vec![start];
+    dirs.extend(start.parent());
+    if start.file_name().is_some_and(|name| name == "out") {
+        // `build/<pkg>/<hash>/out`: three directories up is `build`, four is the profile.
+        let build = start
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .filter(|dir| dir.file_name().is_some_and(|name| name == "build"));
+        dirs.extend(build.and_then(Path::parent));
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(exe_name))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -3810,5 +3829,307 @@ mod tests {
             sub_key_a, sub_key_b,
             "submodule referencing CARGO_MANIFEST_DIR must isolate Stage-1 key per worktree"
         );
+    }
+
+    // ---- Cargo build-dir layouts -------------------------------------------------------
+    //
+    // `gitpulse-rustc` wraps the builds of *other* repositories, which may be built by
+    // cargo <= 1.99 (`target/<p>/deps/<name>-<hash>`) or by cargo >= 1.100
+    // (`target/<p>/build/<pkg>/<hash>/out/<name>-<hash>`; build-script OUT_DIR is
+    // `build/<pkg>/<hash>/out` too, with its own hash). Everything below is driven by
+    // rustc's arguments, never by a hard-coded directory name, and these fixtures hold
+    // both shapes to the same behaviour. The real-build evidence is in
+    // `tests/build_cache_integration.rs`.
+
+    /// The two layouts for one worktree's `target/debug`, as the paths cargo hands rustc.
+    struct LayoutPaths {
+        /// `--out-dir` of the crate under compilation (`demo`).
+        demo_out: PathBuf,
+        /// `-L dependency=` directories, one per layout rule.
+        dep_dirs: Vec<PathBuf>,
+        /// The rlib of the `dep` crate, as `--extern dep=` names it.
+        dep_rmeta: PathBuf,
+        /// A build script's OUT_DIR for a package.
+        script_out: PathBuf,
+    }
+
+    fn legacy_layout(wt: &Path) -> LayoutPaths {
+        let deps = wt.join("target/debug/deps");
+        LayoutPaths {
+            demo_out: deps.clone(),
+            dep_dirs: vec![deps.clone()],
+            dep_rmeta: deps.join("libdep-0a1b2c3d.rmeta"),
+            script_out: wt.join("target/debug/build/demo-5e6f7a8b/out"),
+        }
+    }
+
+    fn cargo_1_100_layout(wt: &Path) -> LayoutPaths {
+        let build = wt.join("target/debug/build");
+        let dep_out = build.join("dep/0a1b2c3d/out");
+        LayoutPaths {
+            demo_out: build.join("demo/9c8d7e6f/out"),
+            dep_dirs: vec![dep_out.clone(), build.join("other/11223344/out")],
+            dep_rmeta: dep_out.join("libdep-0a1b2c3d.rmeta"),
+            // The build script's run unit has its own hash, distinct from the library's.
+            script_out: build.join("demo/5e6f7a8b/out"),
+        }
+    }
+
+    fn materialize(layout: &LayoutPaths) {
+        for dir in layout
+            .dep_dirs
+            .iter()
+            .chain([&layout.demo_out, &layout.script_out])
+        {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&layout.dep_rmeta, b"dep-rmeta-bytes").unwrap();
+    }
+
+    #[test]
+    fn rustc_args_are_cacheable_and_key_equal_across_worktrees_in_both_build_dir_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for (label, layout_of) in [
+            ("cargo<=1.99", legacy_layout as fn(&Path) -> LayoutPaths),
+            ("cargo>=1.100", cargo_1_100_layout),
+        ] {
+            let mut keys = Vec::new();
+            let mut out_dirs = Vec::new();
+            for side in ["a", "b"] {
+                let wt = root.join(format!("{label}-{side}"));
+                fs::create_dir_all(wt.join("crates/demo/src")).unwrap();
+                fs::write(wt.join("crates/demo/src/lib.rs"), "pub fn f() {}\n").unwrap();
+                let layout = layout_of(&wt);
+                materialize(&layout);
+                let mut args = vec![
+                    "--crate-name".to_string(),
+                    "demo".to_string(),
+                    "--crate-type".to_string(),
+                    "rlib".to_string(),
+                    "--emit=dep-info,metadata,link".to_string(),
+                    "--out-dir".to_string(),
+                    layout.demo_out.to_string_lossy().into_owned(),
+                ];
+                for dir in &layout.dep_dirs {
+                    args.push("-L".to_string());
+                    args.push(format!("dependency={}", dir.display()));
+                }
+                args.push("--extern".to_string());
+                args.push(format!("dep={}", layout.dep_rmeta.display()));
+                args.push("crates/demo/src/lib.rs".to_string());
+                let inv = match classify_rustc_args(&args, &wt) {
+                    Classification::Cacheable(c) => *c,
+                    other => panic!("{label}: expected Cacheable, got {other:?}"),
+                };
+                assert_eq!(inv.out_dir, layout.demo_out, "{label}");
+                assert_eq!(inv.dep_search_dirs, layout.dep_dirs, "{label}");
+                assert_eq!(
+                    inv.extern_files,
+                    vec![("dep".to_string(), layout.dep_rmeta.clone())],
+                    "{label}"
+                );
+                let mdir = wt.join("crates/demo").to_string_lossy().into_owned();
+                keys.push(
+                    compute_stage1_direct_key("rustc-vv", &inv, Some(&wt), Some(&wt), Some(&mdir))
+                        .unwrap(),
+                );
+                out_dirs.push(inv.out_dir);
+            }
+            assert_eq!(
+                keys[0], keys[1],
+                "{label}: sibling worktrees must share a Stage 1 key whatever the layout"
+            );
+            assert_ne!(
+                out_dirs[0], out_dirs[1],
+                "{label}: out dirs are per worktree"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_externs_resolve_through_every_dependency_dir_in_both_build_dir_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+
+        // cargo <= 1.99: one flat `deps/` holds every crate.
+        let deps = root.join("legacy/target/debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(deps.join("libserde-aa11.rlib"), b"r").unwrap();
+        fs::write(deps.join("libserde_derive-bb22.dylib"), b"d").unwrap();
+        let legacy = resolve_bare_extern_candidates("serde", std::slice::from_ref(&deps));
+        assert_eq!(legacy, vec![deps.join("libserde-aa11.rlib")]);
+
+        // cargo >= 1.100: one `-L dependency=` directory per unit, none of them `deps/`.
+        let build = root.join("new/target/debug/build");
+        let serde_out = build.join("serde/aa11/out");
+        let derive_out = build.join("serde_derive/bb22/out");
+        fs::create_dir_all(&serde_out).unwrap();
+        fs::create_dir_all(&derive_out).unwrap();
+        fs::write(serde_out.join("libserde-aa11.rlib"), b"r").unwrap();
+        fs::write(serde_out.join("libserde-aa11.rmeta"), b"m").unwrap();
+        fs::write(derive_out.join("libserde_derive-bb22.dylib"), b"d").unwrap();
+        let dirs = vec![serde_out.clone(), derive_out.clone()];
+        assert_eq!(
+            resolve_bare_extern_candidates("serde", &dirs),
+            vec![
+                serde_out.join("libserde-aa11.rlib"),
+                serde_out.join("libserde-aa11.rmeta")
+            ]
+        );
+        assert_eq!(
+            resolve_bare_extern_candidates("serde_derive", &dirs),
+            vec![derive_out.join("libserde_derive-bb22.dylib")]
+        );
+    }
+
+    #[test]
+    fn dep_scope_separates_build_script_out_dir_from_own_out_dir_in_both_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for (label, layout_of) in [
+            ("cargo<=1.99", legacy_layout as fn(&Path) -> LayoutPaths),
+            ("cargo>=1.100", cargo_1_100_layout),
+        ] {
+            let wt = root.join(label);
+            fs::create_dir_all(wt.join("src")).unwrap();
+            let layout = layout_of(&wt);
+            materialize(&layout);
+            fs::write(layout.script_out.join("gen.rs"), "pub const X: u32 = 1;").unwrap();
+            fs::write(layout.demo_out.join("demo-9c8d7e6f.d"), "x").unwrap();
+            fs::write(wt.join("src/lib.rs"), "").unwrap();
+
+            let classify = |dep: &Path| {
+                classify_dep_scope(
+                    dep.to_str().unwrap(),
+                    &wt,
+                    &layout.demo_out,
+                    Some(&layout.script_out),
+                    Some(&wt),
+                )
+                .map(|(_, scope)| scope)
+            };
+            // The build script's generated file is OUT_DIR-relative, not worktree-relative,
+            // even though both live under `target/`.
+            assert_eq!(
+                classify(&layout.script_out.join("gen.rs")),
+                Some(DepPathScope::CargoBuildOutRel("gen.rs".to_string())),
+                "{label}"
+            );
+            // Files in the unit's own `--out-dir` are outputs, never dependencies.
+            assert_eq!(
+                classify(&layout.demo_out.join("demo-9c8d7e6f.d")),
+                None,
+                "{label}"
+            );
+            assert_eq!(
+                classify(&wt.join("src/lib.rs")),
+                Some(DepPathScope::WorktreeRel("src/lib.rs".to_string())),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn dep_info_and_artifact_stderr_rewrite_for_both_layouts() {
+        // cargo >= 1.100: the unit hash in the directory can differ between worktrees, and
+        // every path under it (dep-info targets, JSON artifact notices) must follow.
+        let sample = "\
+/tmp/wt-a/target/debug/build/demo/9c8d7e6f/out/libdemo-1.rmeta: /tmp/wt-a/src/lib.rs
+/tmp/wt-a/src/lib.rs:
+";
+        let parsed = parse_dep_info(sample);
+        assert_eq!(parsed.files, vec!["/tmp/wt-a/src/lib.rs".to_string()]);
+
+        let pairs = [
+            (
+                "/tmp/wt-a/target/debug/build/demo/9c8d7e6f/out",
+                "/tmp/wt-b/target/debug/build/demo/0f1e2d3c/out",
+            ),
+            ("/tmp/wt-a", "/tmp/wt-b"),
+        ];
+        let rewritten = rewrite_path_prefixes_in_str(sample, &pairs);
+        assert!(
+            rewritten.contains("/tmp/wt-b/target/debug/build/demo/0f1e2d3c/out/libdemo-1.rmeta:"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("wt-a"), "{rewritten}");
+
+        let stderr = br#"{"$message_type":"artifact","artifact":"/tmp/wt-a/target/debug/build/demo/9c8d7e6f/out/libdemo-1.rmeta","emit":"metadata"}
+"#;
+        let text = String::from_utf8(rewrite_stderr_for_worktree(stderr, &pairs)).unwrap();
+        assert!(
+            text.contains("/tmp/wt-b/target/debug/build/demo/0f1e2d3c/out/libdemo-1.rmeta"),
+            "{text}"
+        );
+        assert!(!text.contains("wt-a"), "{text}");
+    }
+
+    #[test]
+    fn collect_emitted_artifacts_reads_a_cargo_1_100_unit_out_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("target/debug/build/demo/9c8d7e6f/out");
+        fs::create_dir_all(&out).unwrap();
+        for name in [
+            "demo-9c8d7e6f.d",
+            "libdemo-9c8d7e6f.rlib",
+            "libdemo-9c8d7e6f.rmeta",
+        ] {
+            fs::write(out.join(name), b"x").unwrap();
+        }
+        let (dep, artifacts) = collect_emitted_artifacts(&out, "demo", "-9c8d7e6f", b"").unwrap();
+        assert_eq!(
+            dep.map(|(name, _)| name),
+            Some("demo-9c8d7e6f.d".to_string())
+        );
+        let names: Vec<_> = artifacts.into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["libdemo-9c8d7e6f.rlib", "libdemo-9c8d7e6f.rmeta"]);
+    }
+
+    #[test]
+    fn the_rustc_wrapper_is_found_from_test_binaries_in_both_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let debug = fs::canonicalize(tmp.path()).unwrap().join("target/debug");
+        let legacy_dir = debug.join("deps");
+        let new_dir = debug.join("build/demo/9c8d7e6f/out");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+
+        assert_eq!(find_uplifted_bin(&new_dir, "gitpulse-rustc"), None);
+        let bin = debug.join("gitpulse-rustc");
+        fs::write(&bin, b"bin").unwrap();
+        // `deps/<test-bin>` (<= 1.99), `build/<pkg>/<hash>/out/<test-bin>` (>= 1.100), and
+        // the uplifted directory itself all resolve to the same binary.
+        assert_eq!(
+            find_uplifted_bin(&legacy_dir, "gitpulse-rustc"),
+            Some(bin.clone())
+        );
+        assert_eq!(
+            find_uplifted_bin(&new_dir, "gitpulse-rustc"),
+            Some(bin.clone())
+        );
+        assert_eq!(
+            find_uplifted_bin(&debug, "gitpulse-rustc"),
+            Some(bin.clone())
+        );
+        // The climb follows only those two shapes: a directory deeper than the 1.100
+        // layout does not wander up to an unrelated `target/`...
+        let too_deep = new_dir.join("nested");
+        fs::create_dir_all(&too_deep).unwrap();
+        assert_eq!(find_uplifted_bin(&too_deep, "gitpulse-rustc"), None);
+        // ...and an installed binary (`<home>/.cargo/bin`) never finds a
+        // `gitpulse-rustc` sitting further up, in `<home>`.
+        let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+        let installed = home.join(".cargo/bin");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(home.join("gitpulse-rustc"), b"stray").unwrap();
+        assert_eq!(find_uplifted_bin(&installed, "gitpulse-rustc"), None);
+        // A directory merely named `out`, not under `build/<pkg>/<hash>/`, is no layout.
+        let stray_out = home.join("a/b/out");
+        fs::create_dir_all(&stray_out).unwrap();
+        fs::write(home.join("gitpulse-rustc"), b"stray").unwrap();
+        assert_eq!(find_uplifted_bin(&stray_out, "gitpulse-rustc"), None);
     }
 }

@@ -15,9 +15,21 @@ import { describe, expect, it } from "vitest";
  */
 const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
+/** The text of one top-level job. */
+function jobText(ci: string, id: string): string {
+  return new RegExp(`\\n  ${id}:\\n([\\s\\S]*?)(?=\\n  [a-z][a-z-]*:\\n|$)`).exec(ci)?.[1] ?? "";
+}
+
 /** What ci.yml says about the shards, or why it says nothing usable. */
 export function shardProblems(ci: string, nextest: string): string[] {
   const problems: string[] = [];
+  const shards = jobText(ci, "rust-test-macos");
+  const extras = jobText(ci, "rust-test-macos-extras");
+  const complete = jobText(ci, "rust-test-complete");
+  const gate = jobText(ci, "rust-test");
+  for (const [name, text] of [["rust-test-macos", shards], ["rust-test-macos-extras", extras], ["rust-test-complete", complete], ["rust-test", gate]] as const) {
+    if (!text) problems.push(`ci.yml has no \`${name}\` job`);
+  }
 
   const runs = ci.split("\n").filter((line) => /\bcargo nextest run\b/.test(line));
   if (runs.length !== 1) problems.push(`expected exactly one \`cargo nextest run\` line in ci.yml, found ${runs.length}`);
@@ -26,34 +38,43 @@ export function shardProblems(ci: string, nextest: string): string[] {
   if (!denominator) problems.push("the nextest run is not `--partition hash:${{ matrix.shard }}/N`, so one job would run the whole suite");
   if (!/--profile ci\b/.test(run)) problems.push("the nextest run does not use `--profile ci`, which is what keeps a shard serial");
   if (!run.includes("--no-fail-fast")) problems.push("the nextest run can stop at its first failure");
+  if (!shards.includes("cargo nextest run")) problems.push("the nextest run is not in rust-test-macos");
 
-  // The matrix: the macOS entries' `shard:` values.
-  const matrix = ci.match(/- os: macos-latest\n\s+shard: (\d+)/g) ?? [];
-  const shards = matrix.map((entry) => Number(/shard: (\d+)/.exec(entry)![1])).sort((a, b) => a - b);
+  // The matrix axis: a plain list, so the release-gate rule can read it.
+  const axis = /\n\s+shard: \[([^\]]*)\]/.exec(shards)?.[1];
+  const listed = (axis ?? "").split(",").map((v) => Number(v.trim())).filter((n) => Number.isInteger(n)).sort((a, b) => a - b);
   const count = Number(denominator);
-  if (!denominator || shards.join(",") !== Array.from({ length: count }, (_, i) => i + 1).join(",")) {
-    problems.push(`the macOS matrix shards [${shards}] are not exactly 1..${denominator ?? "N"}`);
+  if (axis === undefined || !denominator || listed.join(",") !== Array.from({ length: count }, (_, i) => i + 1).join(",")) {
+    problems.push(`the shard axis [${listed}] is not exactly 1..${denominator ?? "N"}`);
   }
 
   // Every other spelling of the count.
-  const named = /format\(', shard \{0\}\/(\d+)', matrix\.shard\)/.exec(ci)?.[1];
+  const named = /name: Rust Tests \(macOS, shard \$\{\{ matrix\.shard \}\}\/(\d+)\)/.exec(shards)?.[1];
   if (named !== denominator) problems.push(`the job name says /${named}, the partition /${denominator}`);
   const check = ci.split("\n").find((line) => line.includes("scripts/check-shard-coverage.mjs")) ?? "";
   if (!check) problems.push("no step runs scripts/check-shard-coverage.mjs");
   const checked = /--shards (\d+)/.exec(check)?.[1];
   if (checked !== denominator) problems.push(`the completeness check expects ${checked} shards, the partition has ${denominator}`);
   const reports = [...check.matchAll(/junit-shard-(\d+)\/junit\.xml/g)].map((m) => Number(m[1])).sort((a, b) => a - b);
-  if (reports.join(",") !== shards.join(",")) problems.push(`the completeness check reads reports [${reports}], the matrix runs shards [${shards}]`);
-  const uploads = (ci.match(/name: junit-shard-\$\{\{ matrix\.shard \}\}/g) ?? []).length;
-  if (uploads !== 1) problems.push("the shards do not each upload a `junit-shard-<n>` report");
+  if (reports.join(",") !== listed.join(",")) problems.push(`the completeness check reads reports [${reports}], the matrix runs shards [${listed}]`);
+  if ((shards.match(/name: junit-shard-\$\{\{ matrix\.shard \}\}/g) ?? []).length !== 1) problems.push("the shards do not each upload a `junit-shard-<n>` report");
 
-  // The completeness job has to run after a red shard, not only a green one.
-  const job = /\n  rust-test-complete:\n([\s\S]*?)(?:\n  [a-z-]+:\n|$)/.exec(ci)?.[1] ?? "";
-  if (!/needs: rust-test\b/.test(job)) problems.push("rust-test-complete does not need rust-test");
-  if (!/if: \$\{\{ !cancelled\(\) \}\}/.test(job)) problems.push("rust-test-complete is skipped after a failed shard, so a red shard could hide a missing one");
+  // The completeness job waits for every job that feeds it and never skips on
+  // its own: a skipped job reads as a pass to release-state.mjs.
+  if (!/needs: \[[^\]]*rust-test-macos\b[^\]]*\]/.test(complete) || !/needs: \[[^\]]*rust-test-macos-extras\b[^\]]*\]/.test(complete)) {
+    problems.push("rust-test-complete does not need both rust-test-macos and rust-test-macos-extras");
+  }
+  if (/^    if:/m.test(complete)) problems.push("rust-test-complete has a job-level `if`, which can skip it and leave the run green");
+  if (!extras.includes("name: nextest-list")) problems.push("rust-test-macos-extras does not upload the suite list the check reads");
+
+  // Linux and Windows keep the in-process serial gate and never shard.
+  if (/macos/i.test(/\n\s+os: \[([^\]]*)\]/.exec(gate)?.[1] ?? "")) problems.push("rust-test lists macOS, which belongs to the sharded jobs");
+  for (const line of ci.split("\n").filter((l) => /\bcargo test --manifest-path src-tauri\/Cargo\.toml --locked --no-fail-fast/.test(l))) {
+    if (!line.includes("--test-threads=1")) problems.push("a `cargo test` gate line lost `--test-threads=1`");
+  }
 
   // nextest pinned, and the profile a shard runs under is serial with a report.
-  if (!/tool: cargo-nextest@\d+\.\d+\.\d+/.test(ci)) problems.push("cargo-nextest is not pinned to a version");
+  if (!/tool: cargo-nextest@\d+\.\d+\.\d+/.test(shards) || !/tool: cargo-nextest@\d+\.\d+\.\d+/.test(extras)) problems.push("cargo-nextest is not pinned to a version in both macOS jobs");
   const profile = /\n\[profile\.ci\]\n([^[]*)/.exec(nextest)?.[1] ?? "";
   if (!/^test-threads\s*=\s*1\s*$/m.test(profile)) problems.push("[profile.ci] is not `test-threads = 1`");
   if (!/^fail-fast\s*=\s*false\s*$/m.test(profile)) problems.push("[profile.ci] does not run past a failure");
@@ -69,41 +90,37 @@ describe("ci shards contract", () => {
     expect(shardProblems(ci, nextest)).toEqual([]);
   });
 
-  it("macOS is the only leg that shards, so Linux and Windows keep the in-process serial gate", () => {
-    const runs = ci.split("\n").filter((line) => /\bcargo test --manifest-path src-tauri\/Cargo\.toml --locked --no-fail-fast/.test(line));
-    expect(runs.length).toBeGreaterThan(0);
-    for (const line of runs) expect(line).toContain("--test-threads=1");
-    expect(ci).toMatch(/Rust Unit & Integration Tests\n\s+if: \$\{\{ !cancelled\(\) && matrix\.os != 'macos-latest' \}\}/);
-  });
-
   describe("the rules fail on the shapes they are for", () => {
     const broken = (from: string | RegExp, to: string) => {
       const mutated = ci.replace(from, to);
       expect(mutated, `the mutation ${String(from)} matched nothing`).not.toBe(ci);
       return shardProblems(mutated, nextest);
     };
+    const has = (problems: string[], text: string) => expect(problems).toEqual(expect.arrayContaining([expect.stringContaining(text)]));
 
-    it("a matrix shorter than the denominator", () => {
-      expect(broken(/- os: macos-latest\n\s+shard: 3\n/, "")).toEqual(expect.arrayContaining([expect.stringContaining("not exactly 1..3")]));
+    it("an axis shorter than the denominator", () => {
+      has(broken("shard: [1, 2, 3]", "shard: [1, 2]"), "not exactly 1..3");
     });
-    it("a denominator that grew without the matrix", () => {
+    it("a denominator that grew without the axis", () => {
       expect(broken("hash:${{ matrix.shard }}/3", "hash:${{ matrix.shard }}/4").length).toBeGreaterThan(0);
     });
     it("a completeness check that expects fewer shards", () => {
-      expect(broken("--shards 3", "--shards 2")).toEqual(expect.arrayContaining([expect.stringContaining("expects 2 shards")]));
+      has(broken("--shards 3", "--shards 2"), "expects 2 shards");
     });
     it("a run that is not partitioned", () => {
-      expect(broken(/ --partition hash:\$\{\{ matrix\.shard \}\}\/3/, "")).toEqual(expect.arrayContaining([expect.stringContaining("whole suite")]));
+      has(broken(/ --partition hash:\$\{\{ matrix\.shard \}\}\/3/, ""), "whole suite");
     });
-    it("a completeness job that waits for green", () => {
-      expect(broken(/(rust-test-complete:[\s\S]*?)if: \$\{\{ !cancelled\(\) \}\}/, "$1if: ${{ success() }}")).toEqual(
-        expect.arrayContaining([expect.stringContaining("skipped after a failed shard")]),
-      );
+    it("a completeness job that can skip itself", () => {
+      has(broken("  rust-test-complete:\n    name:", "  rust-test-complete:\n    if: ${{ !cancelled() }}\n    name:"), "job-level `if`");
+    });
+    it("a completeness job that no longer waits for the extras", () => {
+      has(broken("needs: [rust-test-macos, rust-test-macos-extras]", "needs: [rust-test-macos]"), "does not need both");
+    });
+    it("macOS back in the serial gate", () => {
+      has(broken("os: [ubuntu-latest, windows-latest]", "os: [ubuntu-latest, macos-latest, windows-latest]"), "lists macOS");
     });
     it("a profile that is no longer serial", () => {
-      expect(shardProblems(ci, nextest.replace(/(\[profile\.ci\]\ntest-threads = )1/, "$14"))).toEqual(
-        expect.arrayContaining([expect.stringContaining("test-threads = 1")]),
-      );
+      has(shardProblems(ci, nextest.replace(/(\[profile\.ci\]\ntest-threads = )1/, "$14")), "test-threads = 1");
     });
   });
 });

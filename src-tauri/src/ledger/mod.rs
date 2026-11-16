@@ -4526,8 +4526,9 @@ fn prune_with_policy(
     report
 }
 
-/// The first sibling ledger holding rows [`consolidate_worktree_ledgers`] has
-/// not imported into `anchor`, found without importing them.
+/// The first sibling ledger holding a row [`consolidate_worktree_ledgers`] has
+/// not imported into `anchor` *and* would import as a binding, found without
+/// importing anything.
 ///
 /// The read-only twin of consolidation's steady-state check, for a lookup
 /// that must fail closed on unmigrated history rather than run the migration:
@@ -4535,8 +4536,15 @@ fn prune_with_policy(
 /// Sources persist after import, so existence proves nothing; a source is
 /// consolidated when it is empty or the anchor's marker for it has reached its
 /// newest row — exactly where a completed import leaves the marker. A source
-/// that shrank below its marker was replaced, and consolidation re-reads it,
-/// so it counts as unimported until then.
+/// that shrank below its marker was replaced, and consolidation re-reads it
+/// from the start, so its rows count as unimported until then.
+///
+/// Only rows that could set a binding are a reason to refuse: a bind or
+/// unbind that [`SourceAuthority`] — the rule the import itself applies —
+/// would keep as one. Every other unimported row (a commit, a push, a bind
+/// imported as history only because the family's initial pass is over) leaves
+/// the binding exactly where the anchor already has it, so answering from the
+/// anchor is the answer consolidation would give.
 pub(crate) fn unconsolidated_legacy_ledger(
     anchor: &str,
     members: &[PathBuf],
@@ -4547,7 +4555,15 @@ pub(crate) fn unconsolidated_legacy_ledger(
             format!("could not resolve family ledger anchor: {error}"),
         )
     })?;
-    let mut anchor_conn: Option<Option<Connection>> = None;
+    let read_failed = |source_db: &Path, error: rusqlite::Error| {
+        LedgerError::new(
+            "legacy_read_failed",
+            format!("could not read {}: {error}", source_db.display()),
+        )
+    };
+    // The anchor, opened once a sibling with rows needs it: `Some(None)` when
+    // it has no import table (no pass has run, so the epoch is `Initial`).
+    let mut anchor_imports: Option<Option<(Connection, FamilyEpoch)>> = None;
     for source in members {
         if source == &anchor_path {
             continue;
@@ -4561,36 +4577,69 @@ pub(crate) fn unconsolidated_legacy_ledger(
                 .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
                     row.get(0)
                 })
-                .map_err(|error| {
-                    LedgerError::new(
-                        "legacy_read_failed",
-                        format!("could not read {}: {error}", source_db.display()),
-                    )
-                })?
+                .map_err(|error| read_failed(&source_db, error))?
         } else {
             0
         };
         if source_max == 0 {
             continue;
         }
-        if anchor_conn.is_none() {
-            anchor_conn = Some(open_readonly(&ledger_path(anchor))?);
+        if anchor_imports.is_none() {
+            let opened = match open_readonly(&ledger_path(anchor))? {
+                Some(conn) if has_table(&conn, "ledger_family_imports")? => {
+                    let (epoch, _) = read_family_epoch(&conn)?;
+                    Some((conn, epoch))
+                }
+                _ => None,
+            };
+            anchor_imports = Some(opened);
         }
-        let marker = match anchor_conn.as_ref().and_then(Option::as_ref) {
-            Some(conn) if has_table(conn, "ledger_family_imports")? => {
+        let (stored, epoch) = match anchor_imports.as_ref().and_then(Option::as_ref) {
+            Some((conn, epoch)) => {
                 let key = family_source_key(&anchor_path, &source.to_string_lossy())?;
-                conn.query_row(
-                    "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
-                    params![key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?
-                .unwrap_or(0)
+                let stored = conn
+                    .query_row(
+                        "SELECT source_cursor, source_label FROM ledger_family_imports
+                         WHERE source_key = ?1",
+                        params![key],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?;
+                (stored, *epoch)
             }
-            _ => 0,
+            None => (None, FamilyEpoch::Initial),
         };
-        if marker != source_max {
+        let marker = stored.as_ref().map_or(0, |(cursor, _)| *cursor);
+        if marker == source_max {
+            continue;
+        }
+        // Where the import would resume: a source that shrank below its
+        // marker was replaced and is re-read from the start.
+        let from = if source_max < marker { 0 } else { marker };
+        let authority = SourceAuthority::of(
+            epoch,
+            stored.as_ref().map(|(_, label)| label.as_str()),
+            source_max,
+        );
+        // No row of this source may set a binding any more: every unimported
+        // row is history only.
+        let Some(bound) = authority.legacy_bound else {
+            continue;
+        };
+        let upto = bound.min(source_max);
+        if upto <= from {
+            continue;
+        }
+        let could_bind: bool = source_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+                 WHERE id > ?1 AND id <= ?2 AND action IN (?3, ?4))",
+                params![from, upto, bindings::BIND, bindings::UNBIND],
+                |row| row.get(0),
+            )
+            .map_err(|error| read_failed(&source_db, error))?;
+        if could_bind {
             return Ok(Some(source.clone()));
         }
     }
@@ -5458,6 +5507,714 @@ fn read_fleet_languages(
     Ok(out)
 }
 
+pub const OP_UNDO_ACTION: &str = "git.op.undo";
+pub const OP_SNAPSHOT_OK: &str = "snapshotted";
+pub const OP_UNSNAPSHOTTED: &str = "unsnapshotted";
+/// The hook sent its snapshot request and no usable answer came back: the app
+/// may or may not have recorded a snapshot. Distinct from [`OP_UNSNAPSHOTTED`],
+/// which says none was taken. Carried in the row's detail and object; it is not
+/// an [`Outcome`] variant, so nothing that crosses the IPC boundary changes.
+pub const OP_SNAPSHOT_UNKNOWN: &str = "unknown";
+
+fn split_shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(c) = chars.next() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            current.push(c);
+            continue;
+        }
+        if c == '\\' {
+            current.push(c);
+            escaped = true;
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            current.push(c);
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                current.push(c);
+            }
+            '"' => {
+                in_double = true;
+                current.push(c);
+            }
+            ';' | '|' | '\n' => {
+                if c == '|' && chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+                if !current.trim().is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                if !current.trim().is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn tokenize_shell_segment(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for c in segment.chars() {
+        if escaped {
+            current.push(c);
+            in_token = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                current.push(c);
+            }
+            in_token = true;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            in_token = true;
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            } else {
+                current.push(c);
+            }
+            in_token = true;
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                in_token = true;
+            }
+            '"' => {
+                in_double = true;
+                in_token = true;
+            }
+            '(' | ')' if !in_token => {}
+            c if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            _ => {
+                current.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_git_executable(token: &str) -> bool {
+    let clean = token.trim_matches(|c| matches!(c, '(' | ')'));
+    clean == "git"
+        || clean == "git.exe"
+        || clean.ends_with("/git")
+        || clean.ends_with("\\git")
+        || clean.ends_with("\\git.exe")
+}
+
+fn extract_git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let tok = tokens[idx].as_str();
+        if is_env_assignment(tok)
+            || matches!(tok, "command" | "nohup" | "nice" | "time" | "builtin" | "(")
+        {
+            idx += 1;
+            continue;
+        }
+        if tok == "env" {
+            idx += 1;
+            while idx < tokens.len() {
+                let arg = tokens[idx].as_str();
+                if arg == "-u" && idx + 1 < tokens.len() {
+                    idx += 2;
+                } else if arg.starts_with('-') || is_env_assignment(arg) {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    let exe = tokens.get(idx)?.as_str();
+    if !is_git_executable(exe) {
+        return None;
+    }
+    idx += 1;
+    while idx < tokens.len() {
+        let arg = tokens[idx].as_str();
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if matches!(arg, "--version" | "--help") {
+            return Some((arg, &tokens[idx + 1..]));
+        }
+        if matches!(
+            arg,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--config-env"
+                | "--exec-path"
+                | "--attr-source"
+        ) {
+            idx += if idx + 1 < tokens.len() { 2 } else { 1 };
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return Some((arg, &tokens[idx + 1..]));
+    }
+    tokens
+        .get(idx)
+        .map(|sub| (sub.as_str(), &tokens[idx + 1..]))
+}
+
+fn is_git_write_subcommand(sub: &str, rest: &[String]) -> bool {
+    if matches!(
+        sub,
+        "status"
+            | "log"
+            | "diff"
+            | "diff-files"
+            | "diff-index"
+            | "diff-tree"
+            | "show"
+            | "show-ref"
+            | "show-branch"
+            | "rev-parse"
+            | "rev-list"
+            | "for-each-ref"
+            | "ls-files"
+            | "ls-tree"
+            | "ls-remote"
+            | "cat-file"
+            | "describe"
+            | "shortlog"
+            | "blame"
+            | "annotate"
+            | "grep"
+            | "name-rev"
+            | "merge-base"
+            | "merge-tree"
+            | "check-ignore"
+            | "check-attr"
+            | "check-ref-format"
+            | "verify-commit"
+            | "verify-tag"
+            | "version"
+            | "help"
+            | "var"
+            | "whatchanged"
+            | "range-diff"
+            | "cherry"
+            | "count-objects"
+            | "fsck"
+            | "--version"
+            | "--help"
+            | "-v"
+            | "-h"
+    ) {
+        return false;
+    }
+
+    match sub {
+        "reflog" => !matches!(
+            rest.first().map(String::as_str),
+            None | Some("show" | "exists")
+        ),
+        "stash" => !matches!(rest.first().map(String::as_str), Some("list" | "show")),
+        "worktree" => !matches!(rest.first().map(String::as_str), Some("list")),
+        "remote" => !matches!(
+            rest.first().map(String::as_str),
+            None | Some("-v" | "--verbose" | "show" | "get-url")
+        ),
+        "tag" => {
+            if rest.is_empty() {
+                return false;
+            }
+            let has_read_flag = rest
+                .iter()
+                .any(|a| matches!(a.as_str(), "-l" | "--list" | "-v" | "--verify"));
+            let has_write_flag = rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-d" | "--delete" | "-a" | "-s" | "-u" | "-f" | "--force" | "-m"
+                )
+            });
+            !(has_read_flag && !has_write_flag)
+        }
+        "branch" => {
+            if rest.is_empty() {
+                return false;
+            }
+            let has_write_flag = rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-d" | "-D"
+                        | "--delete"
+                        | "-m"
+                        | "-M"
+                        | "--move"
+                        | "-c"
+                        | "-C"
+                        | "--copy"
+                        | "-u"
+                        | "--set-upstream-to"
+                        | "--unset-upstream"
+                        | "--edit-description"
+                ) || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.chars()
+                        .skip(1)
+                        .any(|ch| matches!(ch, 'd' | 'D' | 'm' | 'M' | 'c' | 'C')))
+            });
+            if has_write_flag {
+                return true;
+            }
+            let has_list_mode = rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-l" | "--list"
+                        | "--show-current"
+                        | "--contains"
+                        | "--no-contains"
+                        | "--merged"
+                        | "--no-merged"
+                )
+            });
+            if has_list_mode {
+                return false;
+            }
+            // No list flag: only pure flags like `-a`/`-r`/`-v` are read-only;
+            // a positional branch name creates a branch.
+            rest.iter().any(|a| !a.starts_with('-'))
+        }
+        "config" => {
+            let has_read = rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-l" | "--list"
+                        | "--get"
+                        | "--get-all"
+                        | "--get-regexp"
+                        | "--get-urlmatch"
+                        | "--get-color"
+                        | "--get-colorbool"
+                )
+            });
+            let has_write = rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--unset"
+                        | "--unset-all"
+                        | "--replace-all"
+                        | "--add"
+                        | "--remove-section"
+                        | "--rename-section"
+                )
+            });
+            !(has_read && !has_write)
+        }
+        "symbolic-ref" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "-d" | "--delete")) {
+                return true;
+            }
+            let positionals = rest.iter().filter(|a| !a.starts_with('-')).count();
+            positionals >= 2
+        }
+        _ => true,
+    }
+}
+
+/// True when `command` invokes `git` with a potentially ref- or tree-mutating
+/// subcommand. Pure read-only invocations (`git status`, `git log`, `git diff`,
+/// `git stash list`, `git branch -a`, etc.) return `false` so command-gate does
+/// not snapshot on read-only checks.
+pub fn is_git_write_command(command: &str) -> bool {
+    for segment in split_shell_segments(command) {
+        let tokens = tokenize_shell_segment(&segment);
+        if let Some((sub, rest)) = extract_git_subcommand(&tokens) {
+            if is_git_write_subcommand(sub, rest) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Derives the ledger `action` for a gated git shell command (e.g. `git.rebase`).
+pub fn action_for_git_command(command: &str) -> String {
+    let mut fallback: Option<String> = None;
+    for segment in split_shell_segments(command) {
+        let tokens = tokenize_shell_segment(&segment);
+        if let Some((sub, rest)) = extract_git_subcommand(&tokens) {
+            let derived = action_for_argv(&["git", sub]);
+            let action = if derived == "command.run" {
+                "git.op".to_string()
+            } else {
+                derived
+            };
+            if is_git_write_subcommand(sub, rest) {
+                return action;
+            }
+            if fallback.is_none() {
+                fallback = Some(action);
+            }
+        }
+    }
+    fallback.unwrap_or_else(|| "command.run".to_string())
+}
+
+fn op_log_context(
+    repo_path: &str,
+    explicit_task_id: Option<&str>,
+    now_ms: u64,
+) -> (String, Option<String>, Option<String>, EventStamp) {
+    let address = bindings::repository_address(repo_path).ok();
+    let anchor = address
+        .as_ref()
+        .map(|a| a.anchor.clone())
+        .unwrap_or_else(|| repo_path.to_string());
+    let worktree = address.and_then(|a| (a.worktree != a.anchor).then_some(a.worktree));
+    let (task_id, task_basis) = match explicit_task_id.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => (Some(t.to_string()), "bound".to_string()),
+        None => match bindings::resolve_binding_readonly(repo_path, repo_path) {
+            Ok(Some(bound)) => (Some(bound.task_id), "bound".to_string()),
+            Ok(None) => (None, "unbound".to_string()),
+            Err(_) => (None, "unresolved".to_string()),
+        },
+    };
+    let stamp = EventStamp {
+        occurred_at: ids::iso8601_utc(now_ms),
+        occurred_at_basis: "ingest".to_string(),
+        task_basis,
+    };
+    (anchor, worktree, task_id, stamp)
+}
+
+/// Appends the ledger row when a gated agent git write snapshot succeeds under
+/// `op_ref`, carrying `before_ref`/`after_ref` and `occurred_at`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_op_snapshot_event(
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    op_ref: &str,
+    seq: u64,
+    stash_oid: Option<&str>,
+    ref_count: usize,
+    prune_error: Option<&str>,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
+    let mut detail = serde_json::json!({
+        "source": "op_log",
+        "snapshot": OP_SNAPSHOT_OK,
+        "seq": seq,
+        "op_ref": op_ref,
+        "stash_oid": stash_oid,
+        "ref_count": ref_count,
+    });
+    // The snapshot is real; only retention failed. Present only when it did.
+    if let (Some(error), Some(fields)) = (prune_error, detail.as_object_mut()) {
+        fields.insert("prune_error".to_string(), error.into());
+    }
+    // Ties this row to the hook's own row for the same write.
+    if let (Some(id), Some(fields)) = (request_id, detail.as_object_mut()) {
+        fields.insert("request_id".to_string(), id.into());
+    }
+    let detail_json = serde_json::to_string(&detail).ok();
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("gitpulse-op-log".to_string()),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        task_id: resolved_task,
+        action: action_for_git_command(command),
+        object: Some(op_ref.to_string()),
+        argv_json: serde_json::to_string(&[command]).ok(),
+        outcome: Some(Outcome::Ok),
+        before_ref: before_ref.map(str::to_string),
+        after_ref: Some(op_ref.to_string()),
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
+/// Appends the command's ledger row when taking the pre-op snapshot failed or
+/// could not reach the app recorder, recording `"unsnapshotted"` so the loss
+/// is never silent. `request_id` is the mailbox request's id, shared by the
+/// app's and the hook's rows for the same write.
+#[allow(clippy::too_many_arguments)]
+pub fn record_unsnapshotted_git_op(
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    error: &str,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    record_op_failure_row(
+        OP_UNSNAPSHOTTED,
+        repo_path,
+        command,
+        session_id,
+        task_id,
+        before_ref,
+        error,
+        request_id,
+        now_ms,
+    )
+}
+
+/// Appends the hook's row when its snapshot request was sent and no usable
+/// answer came back: `"unknown"`, never `"unsnapshotted"`, because the app may
+/// have recorded a snapshot (one captured before the asker's deadline). The
+/// app's own row for the same `request_id` settles it either way.
+#[allow(clippy::too_many_arguments)]
+pub fn record_unknown_snapshot_git_op(
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    reason: &str,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    record_op_failure_row(
+        OP_SNAPSHOT_UNKNOWN,
+        repo_path,
+        command,
+        session_id,
+        task_id,
+        before_ref,
+        reason,
+        request_id,
+        now_ms,
+    )
+}
+
+/// The one body of the op log's rows that confirm no snapshot. `state` is both
+/// the row's `object` and its detail's `snapshot`. The outcome stays `failed`
+/// for both: `Outcome` crosses the IPC boundary, so "unknown" lives in the
+/// detail, and a row that confirms nothing must not read as a success.
+#[allow(clippy::too_many_arguments)]
+fn record_op_failure_row(
+    state: &str,
+    repo_path: &str,
+    command: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    before_ref: Option<&str>,
+    error: &str,
+    request_id: Option<&str>,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, task_id, now_ms);
+    let mut detail = serde_json::json!({
+        "source": "op_log",
+        "snapshot": state,
+        "snapshot_error": error,
+    });
+    if let (Some(id), Some(fields)) = (request_id, detail.as_object_mut()) {
+        fields.insert("request_id".to_string(), id.into());
+    }
+    let detail_json = serde_json::to_string(&detail).ok();
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("gitpulse-op-log".to_string()),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        task_id: resolved_task,
+        action: action_for_git_command(command),
+        object: Some(state.to_string()),
+        argv_json: serde_json::to_string(&[command]).ok(),
+        outcome: Some(Outcome::Failed),
+        before_ref: before_ref.map(str::to_string),
+        after_ref: None,
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
+/// Ledger action of a turn checkpoint attempt.
+pub const TURN_CHECKPOINT_ACTION: &str = "turn.checkpoint";
+
+/// Appends one row for a turn checkpoint attempt that reached the app:
+/// `checkpoint` is `captured`, `unchanged`, `coalesced`, `skipped` or `failed`.
+/// Only `captured` and `unchanged` are `ok`; an attempt that produced no
+/// checkpoint never reads as one that did. `omissions` carries the untracked
+/// files left out and why, so a partial snapshot is not mistaken for a whole one.
+#[allow(clippy::too_many_arguments)]
+pub fn record_turn_checkpoint_event(
+    repo_path: &str,
+    session_id: Option<&str>,
+    event: &str,
+    checkpoint: &str,
+    reason: Option<&str>,
+    ref_name: Option<&str>,
+    head: Option<&str>,
+    omissions: &serde_json::Value,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, None, now_ms);
+    let detail_json = serde_json::to_string(&serde_json::json!({
+        "source": "turn_checkpoint",
+        "event": event,
+        "checkpoint": checkpoint,
+        "reason": reason,
+        "ref": ref_name,
+        "omissions": omissions,
+    }))
+    .ok();
+    let produced = matches!(checkpoint, "captured" | "unchanged");
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Agent),
+        actor_id: Some("gitpulse-turn-checkpoint".to_string()),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        task_id: resolved_task,
+        action: TURN_CHECKPOINT_ACTION.to_string(),
+        object: Some(ref_name.map_or_else(|| checkpoint.to_string(), str::to_string)),
+        outcome: Some(if produced {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        }),
+        before_ref: head.map(str::to_string),
+        after_ref: ref_name
+            .filter(|_| checkpoint == "captured")
+            .map(str::to_string),
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
+/// Appends the restore row when snapshot `seq` is restored via CAS `update-ref`,
+/// recording `before_ref` and `after_ref` beside `occurred_at`.
+pub fn record_op_undo_event(
+    repo_path: &str,
+    seq: u64,
+    op_ref: &str,
+    before_ref: Option<&str>,
+    after_ref: Option<&str>,
+    restored_count: usize,
+    now_ms: u64,
+) -> Option<i64> {
+    let (anchor, worktree, resolved_task, stamp) = op_log_context(repo_path, None, now_ms);
+    let detail_json = serde_json::to_string(&serde_json::json!({
+        "source": "op_log",
+        "kind": "undo",
+        "seq": seq,
+        "op_ref": op_ref,
+        "restored_refs": restored_count,
+    }))
+    .ok();
+    record(Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(ActorKind::Human),
+        actor_id: Some("gitpulse-op-undo".to_string()),
+        task_id: resolved_task,
+        action: OP_UNDO_ACTION.to_string(),
+        object: Some(op_ref.to_string()),
+        outcome: Some(Outcome::Ok),
+        before_ref: before_ref.map(str::to_string),
+        after_ref: after_ref.map(str::to_string),
+        detail_json,
+        event_stamp: Some(stamp),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod contract_tests;
 
@@ -5516,6 +6273,36 @@ mod tests {
         assert_eq!(action_segment("é!"), "__");
         assert_eq!(action_for_argv(&["git", "Cherry-Pick"]), "git.cherry_pick");
         assert_eq!(action_for_argv(&["git", "9lives"]), "command.run");
+    }
+
+    #[test]
+    fn op_log_git_write_classifier_separates_reads_from_writes() {
+        assert!(is_git_write_command("git rebase main"));
+        assert!(is_git_write_command("FOO=bar git -C repo commit -m 'msg'"));
+        assert!(is_git_write_command("git status && git branch -D old"));
+        assert!(is_git_write_command("git stash push -u"));
+        assert!(is_git_write_command("git stash"));
+        assert!(is_git_write_command("git branch feature/new"));
+        assert!(is_git_write_command("git tag v1.0.0"));
+        assert!(is_git_write_command("git config user.name Alice"));
+
+        assert!(!is_git_write_command("git status"));
+        assert!(!is_git_write_command("git -C repo log --oneline -n 10"));
+        assert!(!is_git_write_command("git diff HEAD~1"));
+        assert!(!is_git_write_command("git branch -vv -a"));
+        assert!(!is_git_write_command("git branch --list"));
+        assert!(!is_git_write_command("git tag -l"));
+        assert!(!is_git_write_command("git stash list"));
+        assert!(!is_git_write_command("git worktree list --porcelain"));
+        assert!(!is_git_write_command("git config --get user.name"));
+        assert!(!is_git_write_command("git symbolic-ref --short HEAD"));
+        assert!(!is_git_write_command("ls -la && echo 'git commit'"));
+
+        assert_eq!(action_for_git_command("git -C x rebase main"), "git.rebase");
+        assert_eq!(
+            action_for_git_command("git cherry-pick abc123"),
+            "git.cherry_pick"
+        );
     }
 
     use super::*;

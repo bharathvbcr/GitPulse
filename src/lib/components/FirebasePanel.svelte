@@ -42,7 +42,7 @@
 </script>
 
 <script lang="ts">
-  import { Flame, LoaderCircle, RefreshCw, Rocket, Server } from "@lucide/svelte";
+  import { Copy, Flame, LoaderCircle, RefreshCw, Rocket, Server } from "@lucide/svelte";
   import { keyedList } from "../ui/eachKeys";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { harnessStore, verdictLabel, type PolicyVerdict } from "../stores/harnessStore";
@@ -52,7 +52,15 @@
     listFirebaseBackends,
     listFirebaseRollouts,
   } from "../firebase/client";
-  import type { RolloutCreateOutcome } from "../firebase/types";
+  import type { FirebaseAccount, FirebaseFailure, RolloutCreateOutcome } from "../firebase/types";
+  import {
+    FAILURE_KIND_LABEL,
+    describeAccount,
+    formatFirebaseDiagnostics,
+    type FirebaseDiagnosticsInput,
+  } from "../firebase/diagnostics";
+  import { APP_VERSION } from "../diagnostics/diagnostics";
+  import { createCopyFlash } from "../desktop/clipboard";
   import {
     commitShaProblem,
     currentRollout,
@@ -130,8 +138,11 @@
   let rolloutsGuard: AsyncGuard | null = null;
   let deployGuard: AsyncGuard | null = null;
 
+  // `?.` on `projects` too: the diagnostics view reads this in every state,
+  // including a status too partial to carry a project list, and a throw here
+  // takes the whole panel down with it.
   const selectedProjectId = $derived(
-    status?.projects.find((p) => p.alias === selectedAlias)?.project_id ?? "",
+    status?.projects?.find((p) => p.alias === selectedAlias)?.project_id ?? "",
   );
   const live = $derived(rollouts ? currentRollout(rollouts.rollouts) : null);
   /** The listed rollouts as timeline rows, for the shared visualization. */
@@ -191,6 +202,43 @@
 
   /** Why the typed SHA cannot be deployed, or null when it can. */
   const deployProblem = $derived(commitShaProblem(deploySha));
+
+  /**
+   * Everything the panel knows about its Firebase calls, for the debug view
+   * and "Copy diagnostics". One builder feeds both, so what is copied is what
+   * was shown.
+   */
+  function diagnosticsInput(generatedAt: number | null): FirebaseDiagnosticsInput {
+    return {
+      repoPath,
+      appVersion: APP_VERSION,
+      generatedAt,
+      status,
+      statusError,
+      projectAlias: selectedAlias,
+      projectId: selectedProjectId,
+      backendId: selectedBackend,
+      backends,
+      backendsError,
+      rollouts,
+      rolloutsError,
+      deployError,
+      deploy: deployOutcome,
+    };
+  }
+  const diagnosticsPreview = $derived(formatFirebaseDiagnostics(diagnosticsInput(null)));
+  let diagnosticsCopied = $state(false);
+  let diagnosticsCopyFailed = $state(false);
+  const diagnosticsFlash = createCopyFlash((copied) => (diagnosticsCopied = copied));
+
+  /** Copies the diagnostics, stamped with the moment of copying. */
+  async function copyDiagnostics(): Promise<void> {
+    diagnosticsCopyFailed = false;
+    const copied = await diagnosticsFlash.copy(formatFirebaseDiagnostics(diagnosticsInput(Date.now())));
+    // A copy that did not happen must not look like one that did: the reader
+    // would paste whatever was on the clipboard before into a bug report.
+    diagnosticsCopyFailed = !copied;
+  }
 
   async function loadStatus(repo: string): Promise<void> {
     statusGuard?.cancel();
@@ -464,11 +512,16 @@
       harnessStore.recordVerdict(result?.policy ?? null, repoPath);
       lastVerdict = result?.policy ?? null;
       lastVerdictAction = "deploy";
+      // A refusal comes back as an outcome with `created: false` and a
+      // classified reason, so it can be shown and copied like a listing.
       deployOutcome = result.output;
       deployError = null;
-      // Disarmed on success so a second click cannot deploy again. Upstream
-      // allocates a new rollout id per call, so a repeat is a second
-      // deployment rather than a no-op.
+      if (!result.output.created) {
+        reportPanelError("firebase", result.output.error ?? "Rollout was not created", { severity: "error" });
+      }
+      // Disarmed either way. On success a second click would deploy again —
+      // upstream allocates a new rollout id per call — and on a refusal the
+      // reason must be read before anything is retried.
       deployArmed = false;
     } catch (err) {
       if (!guard.isLive()) return;
@@ -516,6 +569,7 @@
     backendsGuard?.cancel();
     rolloutsGuard?.cancel();
     deployGuard?.cancel();
+    diagnosticsFlash.dispose();
   });
 </script>
 
@@ -532,7 +586,7 @@
 {#snippet qualification(walkIncomplete: string, what: string)}
   {@const folded = summarizeWalkIncomplete([walkIncomplete]) ?? walkIncomplete}
   {@const lead = firstClause(walkIncomplete)}
-  <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
+  <div class="gp-notice mb-2 text-meta" data-tone="warn">
     <div class="min-w-0 flex-1">
       <span class="font-medium">{what} is incomplete</span>
       {#if lead}<span class="opacity-90"> — {lead}</span>{/if}
@@ -542,6 +596,46 @@
         </summary>
         <p class="mt-1 font-mono text-micro leading-relaxed opacity-90">{folded}</p>
       </details>
+    </div>
+  </div>
+{/snippet}
+
+<!--
+  A classified Firebase failure: what happened, in one line, and the next step.
+
+  The raw CLI text stays one disclosure away rather than replacing the
+  classification — a reader who disagrees with the label can check it, and a
+  label GitPulse got wrong is still debuggable from what the CLI really said.
+-->
+{#snippet failureNotice(
+  lead: string,
+  failure: FirebaseFailure,
+  account: FirebaseAccount | null,
+  raw: string | null,
+)}
+  <div class="gp-notice mb-2 text-meta" data-tone={failure.kind === "unknown" ? "unknown" : "warn"} data-failure-kind={failure.kind}>
+    <div class="min-w-0 flex-1">
+      <div>
+        <span class="font-medium">{lead}: {failure.title}</span>
+        <span class="text-micro opacity-70"> · {FAILURE_KIND_LABEL[failure.kind] ?? failure.kind}</span>
+      </div>
+      <p class="mt-0.5">{failure.next_step}</p>
+      {#if failure.permission || failure.role || failure.api}
+        <p class="mt-0.5 text-micro">
+          {#if failure.permission}Permission <span class="font-mono">{failure.permission}</span>{/if}
+          {#if failure.role} · Role <span class="font-mono">{failure.role}</span>{/if}
+          {#if failure.api} · API <span class="font-mono">{failure.api}</span>{/if}
+        </p>
+      {/if}
+      {#if account}
+        <p class="mt-0.5 text-micro opacity-80">Firebase CLI account: {describeAccount(account)}</p>
+      {/if}
+      {#if raw}
+        <details class="mt-0.5">
+          <summary class="cursor-pointer text-micro opacity-70 hover:opacity-100">What the CLI said</summary>
+          <p class="mt-1 font-mono text-micro leading-relaxed whitespace-pre-wrap wrap-break-word opacity-90">{raw}</p>
+        </details>
+      {/if}
     </div>
   </div>
 {/snippet}
@@ -584,12 +678,18 @@
     {#if !status.cli.present}
       <!-- Amber: a missing CLI is a configuration gap, not a fault. The reason
            distinguishes "not installed" from "installed where a windowed launch
-           cannot see it", because those have different remedies. -->
-      <div class="gp-notice max-w-xl" data-tone="warn">
-        {status.cli.reason ?? "The Firebase CLI is not available."}
-      </div>
+           cannot see it", because those have different remedies — and the
+           classification separates both from a CLI that crashed at startup,
+           which the 2.0 beta rendered as an unexplained "permissions" error. -->
+      {#if status.cli.failure}
+        {@render failureNotice("Firebase CLI unavailable", status.cli.failure, null, status.cli.reason)}
+      {:else}
+        <div class="gp-notice" data-tone="warn">
+          {status.cli.reason ?? "The Firebase CLI is not available."}
+        </div>
+      {/if}
     {:else if status.projects.length === 0}
-      <div class="gp-notice max-w-xl" data-tone="warn">
+      <div class="gp-notice" data-tone="warn">
         No project alias is configured in .firebaserc, so there is nothing to query.
       </div>
     {:else}
@@ -597,7 +697,7 @@
         <!-- `.firebaserc` is repository content, so its alias count is not
              ours to assume. A capped picker that looks complete would hide the
              very project the reader came to select. -->
-        <div class="gp-notice mb-2 max-w-xl text-meta" data-tone="warn">
+        <div class="gp-notice mb-2 text-meta" data-tone="warn">
           .firebaserc names more project aliases than are listed here. This is not complete
           coverage of the file.
         </div>
@@ -608,7 +708,7 @@
              this checkout is wired to deploy to them, and the backends listing
              below still answers. Said plainly so an empty listing is not read as
              a broken panel. -->
-        <div class="mb-2 text-meta text-textMuted max-w-xl">
+        <div class="gp-prose mb-2 text-meta text-textMuted">
           firebase.json carries no <span class="font-mono">apphosting</span> key, so this
           checkout is not configured to deploy to App Hosting. Backends that already exist
           on the project are still listed below.
@@ -684,7 +784,7 @@
       <!-- Said before either button is pressed, not after. The CLI enables the
            App Hosting API when it is off, and that is a change to the user's
            Google Cloud project, not a read. -->
-      <p class="mb-3 text-meta text-textMuted max-w-xl">
+      <p class="gp-prose mb-3 text-meta text-textMuted">
         Listing backends or rollouts runs the Firebase CLI as your signed-in Google account.
         If the App Hosting API is not enabled on
         <span class="font-mono">{selectedProjectId || "the project"}</span>,
@@ -695,17 +795,19 @@
         <!-- Amber, and never silence. Without this the panel would simply have
              no rollout button and no reason, which reads as a feature nobody
              built rather than one this CLI does not expose. -->
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           {rolloutListing.reason ?? "This Firebase CLI does not expose rollout listing."}
         </div>
       {/if}
 
       {#if backendsError}
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           Backend listing unavailable: {backendsError}
         </div>
+      {:else if backends && !backends.checked && backends.failure}
+        {@render failureNotice("Backend listing did not run", backends.failure, backends.account, backends.error)}
       {:else if backends && !backends.checked}
-        <div class="gp-notice mb-2 max-w-xl" data-tone="warn">
+        <div class="gp-notice mb-2" data-tone="warn">
           Backend listing did not run: {backends.error ?? "no reason was reported"}
         </div>
       {:else if backendsLoading && !backends}
@@ -732,14 +834,17 @@
       {/if}
 
       {#if rolloutsError}
-        <div class="gp-notice max-w-xl" data-tone="warn">
+        <div class="gp-notice" data-tone="warn">
           Rollout listing unavailable: {rolloutsError}
         </div>
+      {:else if rollouts && !rollouts.checked && rollouts.failure}
+        {@render failureNotice("Rollout listing did not run", rollouts.failure, rollouts.account, rollouts.error)}
+        <button type="button" class="gp-btn mb-2" data-size="sm" disabled={rolloutsLoading} onclick={() => void loadRollouts()}>Rescan</button>
       {:else if rollouts && !rollouts.checked}
         <!-- `checked` is what separates "we could not ask" from "we asked and
              this backend has never deployed". Only the second may render as an
              empty listing. -->
-        <div class="gp-notice max-w-xl" data-tone="unknown">
+        <div class="gp-notice" data-tone="unknown">
           <div class="min-w-0 flex-1">Rollout listing did not run: {rollouts.error ?? "no reason was reported"}</div>
           <button type="button" class="gp-btn shrink-0" data-size="sm" disabled={rolloutsLoading} onclick={() => void loadRollouts()}>Rescan</button>
         </div>
@@ -910,13 +1015,13 @@
           {#if deployProblem && deploySha.trim().length > 0}
             <!-- The reason, not just a disabled button: an unexplained refusal
                  is the kind people work around by pasting something else. -->
-            <p class="mt-2 text-meta text-warn max-w-xl">
+            <p class="gp-prose mt-2 text-meta text-warn">
               {deployProblem}
             </p>
           {/if}
 
           {#if deployArmed}
-            <div class="gp-notice mt-2 max-w-xl text-meta" data-tone="danger">
+            <div class="gp-notice mt-2 text-meta" data-tone="danger">
               <div class="min-w-0 flex-1">
                 This starts a build of <span class="font-mono">{shortSha(deploySha.trim())}</span>
                 and moves production traffic on
@@ -930,11 +1035,35 @@
           {/if}
 
           {#if deployError}
-            <div class="gp-notice mt-2 max-w-xl" data-tone="danger">
+            <div class="gp-notice mt-2" data-tone="danger">
               Rollout was not created: {deployError}
             </div>
+          {:else if deployOutcome && !deployOutcome.created}
+            <!-- `created` is the CLI's exit status. A refusal is never shown as
+                 a started rollout, whatever else the outcome carries — and a
+                 CLI that never reported an outcome (killed at the deadline,
+                 network lost) is never shown as a refusal either: it may have
+                 deployed, and "try again" would deploy twice. -->
+            <div class="mt-2">
+              {#if deployOutcome.failure}
+                {@render failureNotice(
+                  deployOutcome.unconfirmed ? "Rollout outcome unknown" : "Rollout was not created",
+                  deployOutcome.failure,
+                  deployOutcome.account ?? null,
+                  deployOutcome.error,
+                )}
+              {:else if deployOutcome.unconfirmed}
+                <div class="gp-notice" data-tone="warn">
+                  Rollout outcome unknown: {deployOutcome.unconfirmed}
+                </div>
+              {:else}
+                <div class="gp-notice" data-tone="danger">
+                  Rollout was not created: {deployOutcome.error ?? "the Firebase CLI gave no reason"}
+                </div>
+              {/if}
+            </div>
           {:else if deployOutcome}
-            <div class="gp-notice mt-2 max-w-xl" data-tone="ok">
+            <div class="gp-notice mt-2" data-tone="ok">
               <div class="min-w-0 flex-1">
                 Rollout started for <span class="font-mono">{shortSha(deployOutcome.git_commit)}</span>
                 on <span class="font-mono">{deployOutcome.backend_id}</span>.
@@ -958,5 +1087,27 @@
         </div>
       {/if}
     {/if}
+  {/if}
+
+  {#if status || statusError}
+    <!-- The debug view and the copy action read one formatter, so the text a
+         reader pastes into a report is the text they can see here. Shown in
+         every state, including the ones where nothing else renders — a panel
+         that only says "unavailable" is the thing this replaces. -->
+    <div class="mt-3 flex flex-wrap items-center gap-2" data-firebase-diagnostics>
+      <button type="button" class="gp-btn" data-size="sm" onclick={() => void copyDiagnostics()}>
+        <Copy size={12} />
+        Copy diagnostics
+      </button>
+      {#if diagnosticsCopied}
+        <span class="text-micro text-textMuted" role="status">Copied</span>
+      {:else if diagnosticsCopyFailed}
+        <span class="text-micro text-warn" role="status">Couldn't copy — select the text under Diagnostics instead.</span>
+      {/if}
+    </div>
+    <details class="mt-1">
+      <summary class="cursor-pointer text-micro text-textMuted">Diagnostics</summary>
+      <pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap wrap-break-word rounded-lg bg-background p-2 font-mono text-micro leading-relaxed text-textPrimary select-text gp-scroll">{diagnosticsPreview}</pre>
+    </details>
   {/if}
 </section>

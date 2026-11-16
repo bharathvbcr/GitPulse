@@ -651,7 +651,7 @@ fn html_block_opening(line: &str) -> Option<&'static str> {
 /// whitespace.
 fn is_marker_line(line: &str, marker: &str) -> bool {
     // A byte-order mark an editor left at the head of the file is not text.
-    let (cols, rest) = indentation(line.strip_prefix('\u{feff}').unwrap_or(line));
+    let (cols, rest) = indentation(line.trim_prefix('\u{feff}'));
     cols <= 3 && rest.trim_end() == marker
 }
 
@@ -866,7 +866,7 @@ fn linked_sibling(repo_root: &Path, path: &Path) -> Option<String> {
     }
     let target = std::fs::read_link(path).ok()?;
     let name = target.to_str()?;
-    let name = name.strip_prefix("./").unwrap_or(name);
+    let name = name.trim_prefix("./");
     let own = path.file_name()?.to_str()?;
     if name == own || !GUIDE_FILENAMES.contains(&name) {
         return None;

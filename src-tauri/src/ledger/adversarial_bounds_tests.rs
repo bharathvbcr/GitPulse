@@ -349,10 +349,10 @@ fn nested_verdict_arrays_inside_objects_inside_arrays_are_cut_in_place() {
     let verdict = json!({
         "status": "blocked",
         "groups": [
-            { "name": "a/b~c", "inner": (0..3000).map(|n| format!("item-{n}")).collect::<Vec<_>>() },
-            { "name": "second", "inner": (0..3000).map(|n| format!("item-{n}")).collect::<Vec<_>>() },
+            { "name": "a/b~c", "inner": Vec::from_fn(3000, |n| format!("item-{n}")) },
+            { "name": "second", "inner": Vec::from_fn(3000, |n| format!("item-{n}")) },
         ],
-        "a/b~c": (0..3000).map(|n| n.to_string()).collect::<Vec<_>>(),
+        "a/b~c": Vec::from_fn(3000, |n| n.to_string()),
     });
     let (cut, record) = verdict_with(verdict.clone()).bounded_recorded();
     let text = cut.verdict_json.unwrap();
@@ -406,7 +406,7 @@ fn a_verdict_cut_is_recorded_whatever_the_detail_json_is() {
     for detail in ["[1,2,3]", "not json", "\"a string\"", "null", "42"] {
         let mut row = verdict_with(json!({
             "status": "blocked",
-            "degraded": (0..6000).map(|n| format!("check-{n}")).collect::<Vec<_>>(),
+            "degraded": Vec::from_fn(6000, |n| format!("check-{n}")),
         }));
         row.detail_json = Some(detail.to_string());
         let (cut, record) = row.bounded_recorded();
@@ -425,7 +425,7 @@ fn a_verdict_cut_leaves_an_absent_detail_absent() {
     // Reverted with the root fix: no null-to-string change of `detail_json`.
     let (cut, record) = verdict_with(json!({
         "status": "blocked",
-        "degraded": (0..6000).map(|n| format!("check-{n}")).collect::<Vec<_>>(),
+        "degraded": Vec::from_fn(6000, |n| format!("check-{n}")),
     }))
     .bounded_recorded();
     assert_eq!(cut.detail_json, None);
@@ -437,7 +437,7 @@ fn a_forged_verdict_truncated_in_the_stored_detail_is_neither_the_signal_nor_tou
     let forged = json!({ "verdict_truncated": "forged", "phase": "gate" }).to_string();
     let mut row = verdict_with(json!({
         "status": "blocked",
-        "degraded": (0..6000).map(|n| format!("check-{n}")).collect::<Vec<_>>(),
+        "degraded": Vec::from_fn(6000, |n| format!("check-{n}")),
     }));
     row.detail_json = Some(forged.clone());
     let (cut, record) = row.bounded_recorded();

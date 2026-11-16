@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(saved["item"]["exit_code"], 37);
         assert_eq!(
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["status"],
-            "inbox"
+            "backlog"
         );
         assert_eq!(
             spawn(
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(saved["item"]["outcome_uncertain"], false);
         assert_eq!(
             reopened.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["status"],
-            "inbox"
+            "backlog"
         );
     }
 

@@ -82,6 +82,13 @@ let workspaceGets = 0, failWorkspaceGet = false;
 let attentionRows = [];
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 /** Hold the catalog read a background refresh starts with, and any next-page task read, to open the gap between them. */
+// The board's automatic read of the rest of its tasks asks 200 at a time from
+// a cursor; a reload asks 30 at a time. These hold or fail only the former.
+// failFill counts pages to fail, once each. A reload reads 200 at a time too,
+// but only past its first page, so a column that fits one page is never hit.
+let holdFill = false, heldFill = [], failFill = 0;
+// Holds the catalog read a background refresh begins with, and any page read
+// from a cursor, to stage a Load more clicked as a refresh starts.
 let holdCatalog = false, heldCatalog = [], holdPages = false, heldPages = [];
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
 // Manvi's refinements, and the host write that accepts one (`proposals.apply`).
@@ -102,6 +109,7 @@ const parentOf = new Map(), lineageReads = [];
 let failLineage = false;
 let verifyOptIn = false;
 const verifyPosts = [];
+const verifySaveCalls = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
@@ -113,6 +121,7 @@ let uncheckableProbes = 0;
 const fixtureRepoCommands = {
   cmd_note_tab_activated: () => null,
   cmd_verify_status_enabled: () => verifyOptIn,
+  cmd_verify_status_save: a => { verifySaveCalls.push(a); verifyOptIn = Boolean(a.enabled); return null; },
   cmd_verify_status_post: a => { verifyPosts.push(a); return { sha: "0123456789abcdef0123456789abcdef01234567", state: "success", description: "", dry_run: false, status_posted: true, commented: [], comment_note: null, would_run: [] }; },
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
   // A task terminal opens the checkout holding the attempt's directory; the
@@ -390,6 +399,8 @@ mockIPCWithEvents(async (cmd, args) => {
       const result = JSON.stringify(page(matching, Number(input.cursor ?? 0), input.limit));
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       if (holdPages && input.cursor) return new Promise(resolve => heldPages.push(() => resolve(result)));
+      if (input.cursor && input.limit === 200 && failFill > 0) { failFill--; throw {code: "store_error", message: "Fixture lost a page"}; }
+      if (input.cursor && input.limit === 200 && holdFill) return new Promise(resolve => heldFill.push(() => resolve(result)));
       return result;
     }
     case "items.get": { if (failGetTaskId === input.id) throw {code: "transport_error", message: "Lost task read"}; const found = tasks.find(task => task.id === input.id); const result = JSON.stringify({ok: true, item: found ? { logs: "", ...found } : found}); if (holdGet) return new Promise(resolve => { releaseGet = () => resolve(result); }); return result; }
@@ -599,6 +610,30 @@ const moveThroughMenu = async (id, status) => {
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
+    // ---- The header lays its tools out in two deliberate rows -------------
+    // Thirteen controls in one right-aligned strip were wider than the bar,
+    // so they wrapped under a near-empty title row, at four different
+    // heights (24, 26, 28 and 34px). The title row keeps search, Inbox,
+    // Archive, Refresh and New task; the toolbar row holds the layout and
+    // view controls on the left and Manvi's tools on the right. Every control
+    // sits on its row's centre line and none is taller than 28px.
+    {
+      const header = root.querySelector('[data-testid="task-board"] .board-main > header[data-page-header]');
+      const actionsRow = header?.querySelector(":scope > .gp-header-actions");
+      const toolbar = header?.querySelector(":scope > [data-page-header-toolbar]");
+      const named = (row, label) => Boolean(row && button(label, row));
+      check("the title row holds search, Inbox, Archive, Refresh and New task",
+        Boolean(actionsRow?.querySelector("#task-search")) && ["Inbox", "Archive", "Refresh", "New task"].every(label => named(actionsRow, label)));
+      check("the toolbar row is inside the header and holds the layout, view and Manvi tools",
+        ["Board", "List", "Filters", "Suggest next", "Organize"].every(label => named(toolbar, label)) && Boolean(toolbar?.querySelector("[data-task-views-toggle]")));
+      const controlsIn = row => row ? [...row.querySelectorAll("button, .gp-segmented")].filter(el => el.getClientRects().length && !el.parentElement.closest(".gp-segmented")) : [];
+      const geometry = row => controlsIn(row).map(el => { const box = el.getBoundingClientRect(); return { label: el.getAttribute("aria-label") ?? el.textContent.trim(), height: box.height, centre: box.top + box.height / 2 }; });
+      const level = rows => { const centres = rows.map(row => row.centre); return rows.length > 0 && Math.max(...centres) - Math.min(...centres) <= 2 && rows.every(row => row.height <= 28); };
+      const top = geometry(actionsRow), bottom = geometry(toolbar);
+      check(`every header control is at most 28px and on its row's centre line (title row: ${top.map(row => `${row.label} ${Math.round(row.height)}`).join(", ")}; toolbar: ${bottom.map(row => `${row.label} ${Math.round(row.height)}`).join(", ")})`,
+        level(top) && level(bottom));
+    }
+
     // ---- The drag preview sits under the pointer ----------------------------
     // The board lives in a `.gp-pane`, whose `contain: layout paint` is the
     // containing block of any `position: fixed` inside it. A ghost rendered
@@ -733,10 +768,15 @@ if (params.has("check")) {
     check("Post verify result is disabled while the repository has not opted in", Boolean(postButton()) && postButton().disabled === true && verifyPosts.length === 0);
     // The sheet posts for the repository tab the person has open.
     await click("Close task details"); await settle();
-    await repoStore.openRepo("/fixture/GitPulse", { activate: true }); verifyOptIn = true;
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true });
     card("task-1").click(); await wait(editor);
+    const optInSwitch = () => editor().querySelector("#task-verify-opt-in");
+    const commentSwitch = () => editor().querySelector("#task-verify-comment");
+    await wait(() => optInSwitch() && optInSwitch().disabled === false);
+    check("Post verify result stays disabled until opted in while the opt-in switch is offered", postButton().disabled === true && !commentSwitch());
+    optInSwitch().click();
     await wait(() => postButton() && postButton().disabled === false);
-    check("Post verify result is enabled once the repository opted in", postButton().disabled === false);
+    check("Post verify result is enabled once the repository opted in via the switch", verifySaveCalls.length === 1 && verifySaveCalls[0].repoPath === "/fixture/GitPulse" && verifySaveCalls[0].enabled === true && postButton().disabled === false);
     postButton().click(); await settle();
     const postPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
     check("posting asks for confirmation and sends nothing before the answer", Boolean(postPrompt) && verifyPosts.length === 0);
@@ -744,8 +784,21 @@ if (params.has("check")) {
     check("cancelling the confirmation posts nothing", verifyPosts.length === 0);
     postButton().click(); await settle();
     button("Post to GitHub", [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?"))?.click(); await settle(100);
-    check("confirming posts that task once, not as a dry run", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false);
-    verifyOptIn = false;
+    check("confirming posts that task once, not as a dry run and without commenting by default", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false && verifyPosts[0].comment === false);
+    commentSwitch().click(); await settle();
+    postButton().click(); await settle();
+    const commentPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
+    check("confirming with PR comments enabled names open pull requests before sending", Boolean(commentPrompt) && /open pull requests/.test(commentPrompt.textContent));
+    button("Post to GitHub", commentPrompt)?.click(); await settle(100);
+    check("confirming with PR comments enabled sends comment: true", verifyPosts.length === 2 && verifyPosts[1].taskId === "task-1" && verifyPosts[1].dryRun === false && verifyPosts[1].comment === true);
+    await repoStore.removeRepo("/fixture/GitPulse"); await settle();
+    check("closing the repository tab clears the posted notice from the task sheet", !editor().querySelector('[data-testid="task-verify-posted"]'));
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true });
+    await wait(() => optInSwitch() && optInSwitch().disabled === false);
+    check("switching repositories resets the pull-request comment toggle to off", Boolean(commentSwitch()) && commentSwitch().getAttribute("aria-checked") === "false");
+    optInSwitch().click();
+    await wait(() => postButton() && postButton().disabled === true);
+    check("toggling opt-in back off disables Post verify result and hides comment toggle", postButton().disabled === true && !commentSwitch() && verifyOptIn === false);
     await repoStore.removeRepo("/fixture/GitPulse");
     verdicts.delete("task-1");
     parentOf.clear();
@@ -765,8 +818,9 @@ if (params.has("check")) {
     holdSave = false; releaseSave(); await wait(() => !button("Save task")?.disabled);
     await click("Close task details");
     const ready = root.querySelector('[data-task-column="ready"]');
-    (button("Load more Ready tasks", ready) ?? button("Next", ready)).click(); await settle(150);
-    check("loading more tasks keeps already loaded cards", ready.querySelectorAll("[data-task-card]").length === 32 && Boolean(card("task-10")));
+    await wait(() => ready.querySelectorAll("[data-task-card]").length === 32);
+    check("the board reads a column past its first page on its own, keeping the cards it had",
+      ready.querySelectorAll("[data-task-card]").length === 32 && Boolean(card("task-10")) && !button("Load more Ready tasks", ready) && !ready.querySelector("[data-task-paging]"));
     await click("New workspace");
     await change(root.querySelector('.workspace-editor input'), "Unsaved workspace");
     confirmations = 0; confirmAnswer = false;
@@ -1934,7 +1988,7 @@ if (params.has("check")) {
     const columnEl = status => root.querySelector(`[data-task-column="${status}"]`);
     viewToggle().click(); await settle();
     check("the view menu offers every column and card field",
-      [...viewMenu().querySelectorAll("[data-task-column-toggle]")].length === 6
+      [...viewMenu().querySelectorAll("[data-task-column-toggle]")].length === 5
       && [...viewMenu().querySelectorAll("[data-task-field-toggle]")].length === 5);
     const backlogCount = root.querySelectorAll('[data-task-column="backlog"] [data-task-card]').length;
     columnToggle("backlog").click(); await settle();
@@ -1949,7 +2003,7 @@ if (params.has("check")) {
     check("a hidden column reports the work it is hiding, with an exact count",
       Boolean(hiddenNote()) && hiddenNote().textContent.includes("hidden from this board")
       && backlogCount > 0 && hiddenCount === backlogCount);
-    for (const status of ["inbox","ready","in_progress","review","done"]) { columnToggle(status).click(); await settle(); }
+    for (const status of ["ready","in_progress","review","done"]) { columnToggle(status).click(); await settle(); }
     // `>= 1` passed whether the toggle refused or reset every column back on,
     // which is why the reset survived: exactly one column may still stand, and
     // the control that would remove it has to be visibly closed, not merely inert.
@@ -1960,20 +2014,20 @@ if (params.has("check")) {
       && Boolean(columnToggle("done").title)
       && root.querySelectorAll("[data-task-column]").length >= 1);
     check("every other column is still free to come back",
-      ["inbox","backlog","ready","in_progress","review"].every(status => columnToggle(status).disabled === false));
+      ["backlog","ready","in_progress","review"].every(status => columnToggle(status).disabled === false));
     viewMenu().querySelector('[data-task-field-toggle="repo"]').click(); await settle();
     check("card fields are a choice the card obeys",
       viewMenu().querySelector('[data-task-field-toggle="repo"]').getAttribute("aria-checked") === "false");
     button("Reset board view", viewMenu()).click(); await settle();
     check("reset restores every column and field",
-      root.querySelectorAll("[data-task-column]").length === 6 && !hiddenNote()
+      root.querySelectorAll("[data-task-column]").length === 5 && !hiddenNote()
       && [...viewMenu().querySelectorAll('[data-task-field-toggle][aria-checked="true"]')].length === 5);
     check("reset puts the board back to most urgent first",
       viewMenu().querySelector('[data-task-order-option="priority"]')?.getAttribute("aria-checked") === "true");
     // The keyboard and drag checks below move cards within a column.
     viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle();
     viewToggle().click(); await settle(); await untilGone(viewMenu);
-    check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
+    check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 5);
 
     // ---- The archive, and what it is willing to claim --------------------
     const archive = () => root.querySelector('[data-testid="task-archive"]');
@@ -2182,7 +2236,7 @@ if (params.has("check")) {
 
     archiveToggle().click(); await settle();
     check("the archive closes and leaves the board as it was",
-      !archive() && root.querySelectorAll("[data-task-column]").length === 6);
+      !archive() && root.querySelectorAll("[data-task-column]").length === 5);
 
     // ---- Archiving a task -------------------------------------------------
     // The report this block exists for: a panel called Archive, a Restore
@@ -3135,25 +3189,56 @@ if (params.has("check")) {
     try {
       guardStep = "paging";
       for (let i = 0; i < 35; i++) tasks.push(makeTask(`task-${300 + i}`, `Paged review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"));
+      // The rest of the column is read on its own; held here, the list shows
+      // what is loaded and that the rest is coming, and offers no button for it.
+      holdFill = true;
       await refreshBoard();
       button("List").click();
-      await wait(() => root.querySelector('[data-task-list] [data-task-paging="review"]'));
+      await wait(() => heldFill.length > 0 && root.querySelector('[data-task-list] [data-task-paging="review"]'));
       const paging = () => root.querySelector('[data-task-list] [data-task-paging="review"]');
       const pagedRows = () => [...root.querySelectorAll("[data-task-list] [data-task-card]")].filter(el => el.textContent.includes("Paged review")).length;
-      const before = pagedRows();
-      check("the list layout pages a column too, and says how much of it is loaded", /^Review: 30 of \d+/.test(paging().querySelector(".paging-count").textContent.trim()) && before < 35);
-      button("Load more Review tasks").click();
+      check("while the rest of a column loads, the list says how much is loaded and that the rest is coming",
+        /^Review: 30 of \d+/.test(paging().querySelector(".paging-count").textContent.trim()) && paging().textContent.includes("Loading the rest") && !button("Load more Review tasks") && pagedRows() < 35);
+      heldFill.forEach(release => release()); heldFill = []; holdFill = false;
       await wait(() => pagedRows() === 35);
-      check("Load more in the list reaches every task in the column", !button("Load more Review tasks") && pagedRows() === 35);
-      button("Show only the first Review page").click();
-      await wait(() => pagedRows() === before);
-      check("First page goes back to one page", pagedRows() === before);
+      check("the list layout reaches every task in the column without a click", pagedRows() === 35 && !paging() && !button("Load more Review tasks"));
+      // Where the automatic read cannot go on (here a page fails), the column
+      // keeps its own controls, named for what they do, and says how much it
+      // holds. A refresh reads a column it had filled back 200 at a time, so
+      // the column has to pass 200 cards for the fill to be needed at all.
+      failFill = 1;
+      for (let i = 35; i < 240; i++) tasks.push(makeTask(`task-${2300 + i}`, `Paged review ${String(i + 1).padStart(3, "0")}`, "repo-0", "review"));
       button("Board").click(); await settle(200);
+      await refreshBoard();
       const review = () => root.querySelector('[data-task-column="review"]');
-      check("the board's column names its control for what it does", Boolean(button("Load more Review tasks", review())) && !button("Next", review()));
+      const reviewPaged = () => [...(review()?.querySelectorAll("[data-task-card]") ?? [])].filter(el => el.textContent.includes("Paged review")).length;
+      await wait(() => button("Load more Review tasks", review()));
+      const fillBanner = () => [...root.querySelectorAll('[role="alert"]')].find(el => /all tasks/i.test(el.textContent));
+      check("where the board cannot read the rest on its own, it says so, and the column offers Load more and Load all, named for what they do",
+        Boolean(fillBanner()) && Boolean(button("Load all Review tasks", review())) && !button("Next", review()) && !review().querySelector('[data-testid="task-column-filling"]') && reviewPaged() < 240);
+      // The next change re-reads, the rest arrives, and the board's own
+      // failure clears with it: it was never the reader's to dismiss.
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      await wait(() => reviewPaged() === 240); await settle(300);
+      check("once a later read reaches the end, the failed read's banner clears on its own", !fillBanner() && !review().querySelector("[data-task-paging]"));
+      // Load more continues a column by hand where the read stopped, 200 at a time.
       tasks = tasks.filter(task => !task.title.startsWith("Paged review"));
+      for (let i = 0; i < 260; i++) tasks.push(makeTask(`task-${2600 + i}`, `Paged backlog ${String(i + 1).padStart(3, "0")}`, "repo-0", "backlog"));
+      failFill = 1;
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      const backlogCol = () => root.querySelector('[data-task-column="backlog"]');
+      const backlogPaged = () => [...(backlogCol()?.querySelectorAll("[data-task-card]") ?? [])].filter(el => el.textContent.includes("Paged backlog")).length;
+      await wait(() => button("Load more Backlog tasks", backlogCol()));
+      const shortBy = 260 - backlogPaged();
+      for (let clicks = 0; clicks < 3 && button("Load more Backlog tasks", backlogCol()); clicks++) {
+        button("Load more Backlog tasks", backlogCol()).click();
+        await wait(() => !button("Load more Backlog tasks", backlogCol())?.disabled); await settle(200);
+      }
+      check(`and Load more continues the column from where it stopped (${shortBy} were short)`, shortBy > 0 && backlogPaged() === 260 && !backlogCol().querySelector("[data-task-paging]"));
+      tasks = tasks.filter(task => !task.title.startsWith("Paged backlog"));
       await refreshBoard(); await settle(200);
     } catch (error) { check(`the paging checks ran to the end (${error.message} at ${guardStep})`, false); }
+    finally { failFill = 0; holdFill = false; heldFill.splice(0).forEach(release => release()); }
 
     // ---- ft-1259cd60 / ft-608b881a: what a refresh keeps, where a move lands, one event once -----
     try {
@@ -3162,23 +3247,40 @@ if (params.has("check")) {
       boardRuns = []; boardDecisions = [];
       root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
       const review = () => root.querySelector('[data-task-column="review"]');
-      const reviewCards = () => review().querySelectorAll("[data-task-card]").length;
-      await wait(() => button("Load more Review tasks", review()));
-      button("Load more Review tasks", review()).click();
-      await wait(() => reviewCards() === 60);
+      const waveCards = () => [...review().querySelectorAll("[data-task-card]")].filter(el => el.textContent.includes("Wave4 review")).length;
+      const reviewWhole = () => waveCards() === 65 && !review().querySelector("[data-task-paging]");
+      await wait(reviewWhole);
       const refreshes = () => ipcMethods.filter(method => method === "repositories.list").length;
       let reads = refreshes();
+      const listsBefore = ipcMethods.filter(method => method === "items.list").length;
       await emit("workbench-changed", { sequence: 100 });
       await wait(() => refreshes() > reads); await settle(500);
-      check("a workbench change after Load more keeps the 60 cards that were loaded", reviewCards() === 60 && Boolean(button("Load more Review tasks", review())));
+      check("a workbench change after the board read every page keeps every card loaded", reviewWhole());
+      // A column the board read on 200 at a time is read back that way: one
+      // request per column (Review holds more than 60 here) and one for the
+      // archive's count, not one per 30 cards.
+      const listsPerChange = ipcMethods.filter(method => method === "items.list").length - listsBefore;
+      check(`one change re-reads each column in as few requests as it holds pages of 200 (${listsPerChange} reads)`, listsPerChange === 6);
       // One write is announced twice by the host (the command, then the
-      // data_version poll). It must cost one refresh, not two.
+      // data_version poll), and the poll cannot say whether an agent's write
+      // landed in the same tick. Here one did, after the local write's refresh
+      // had already read the board: dropping the poll as an echo lost it.
+      // The local write's own refresh finishes first, so only the poll can
+      // bring the agent's task in; it comes well inside the watcher's tick
+      // window after the local write (the old echo window was 3 s).
       reads = refreshes();
+      const localAt = Date.now();
       await emit("workbench-changed", { sequence: 101 });
-      await settle(450);
+      await wait(() => refreshes() > reads); await settle(150);
+      tasks.push(makeTask("task-4990", "Filed by an agent in the same tick", "repo-0", "review"));
       await emit("workbench-changed", { sequence: null, source: "external" });
+      const pollAfterMs = Date.now() - localAt;
+      let arrived = true;
+      try { await wait(() => Boolean(card("task-4990"))); } catch { arrived = false; }
       await settle(900);
-      check("one write and its external echo refresh the board once", refreshes() - reads === 1);
+      check(`an agent's write in the same poll tick as a local one still reaches the board (poll ${pollAfterMs} ms after the write; ${refreshes() - reads} refreshes)`, arrived && pollAfterMs < 3_000);
+      check(`and one write with its poll costs at most two refreshes (${refreshes() - reads})`, refreshes() - reads <= 2);
+      tasks = tasks.filter(task => task.id !== "task-4990");
       reads = refreshes();
       await emit("workbench-changed", { sequence: null, source: "external" });
       await wait(() => refreshes() > reads);
@@ -3197,7 +3299,7 @@ if (params.has("check")) {
       await click("Clear task search"); await settle(500);
       // Keyboard move to the bottom of a column with more behind it.
       guardStep = "move to the end of a paged column";
-      await wait(() => button("Load more Review tasks", review()));
+      await wait(reviewWhole);
       const lastReview = () => Math.max(...tasks.filter(task => task.status === "review" && task.id !== "task-1").map(task => task.position));
       const inProgressOf1 = tasks.find(task => task.id === "task-1").status;
       card("task-1").focus(); card("task-1").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
@@ -3225,55 +3327,86 @@ if (params.has("check")) {
       const searchBox = root.querySelector('[aria-label="Search tasks"]');
       const coverage = () => root.querySelector('[data-testid="task-query-coverage"]')?.textContent ?? "";
       const bulkCards = () => [...root.querySelectorAll("[data-task-card]")].filter(el => el.textContent.includes("Bulkload item")).length;
-      await change(searchBox, "is:feature"); await wait(() => button("Load all tasks"));
-      check(`a search over more tasks than one page says it is partial and offers Load all (${coverage()})`,
-        /in 200 of \d+ tasks/.test(coverage()) && Boolean(button("Load more tasks")));
-      // A background refresh checks the board is idle, then reads the catalog.
-      // A Load more clicked in that gap used to have its page thrown away by
-      // the refresh's revision bump, and the board stayed loading.
-      guardStep = "load more during a background refresh";
+      // A search over more tasks than one page reads the rest on its own,
+      // 200 at a time. Held here, it says it is partial and that the rest is
+      // coming; it never reads as everything that matches.
       const refreshes = () => ipcMethods.filter(method => method === "repositories.list").length;
-      holdCatalog = true;
+      // The Refresh above set the backlog column filling; let it finish so
+      // what is held below is the search's own read, not the column's.
+      const pagingLeft = () => [...root.querySelectorAll("[data-task-paging]")].map(el => `${el.dataset.taskPaging}: ${el.textContent.replace(/\s+/g, " ").trim()}`).join(" | ");
+      try { await wait(() => !root.querySelector('[data-testid="task-column-filling"]') && !root.querySelector("[data-task-paging]")); }
+      catch (error) { throw Error(`${error.message}; columns still paging: ${pagingLeft()}; banner: ${root.querySelector('[role="alert"]')?.textContent ?? "none"}`); }
+      holdFill = true;
+      await change(searchBox, "is:feature");
+      await wait(() => heldFill.length > 0 && root.querySelector('[data-testid="task-search-filling"]'));
+      check(`a search over more tasks than one page says it is partial while it reads the rest (${coverage()})`,
+        /in 200 of \d+ tasks/.test(coverage()) && Boolean(root.querySelector('[data-testid="task-search-filling"]')) && !button("Load more tasks") && !button("Load all tasks"));
+      const total = Number(/in [\d,]+ of ([\d,]+) tasks/.exec(coverage())?.[1]?.replaceAll(",", "") ?? 0);
+      // A background refresh that lands while that read is under way replaces
+      // the set it was reading on from; the read gives way and starts again
+      // from the fresh set, so no page is lost or shown twice and the board is
+      // not left loading.
+      guardStep = "a background refresh during the automatic read";
+      const deferred = refreshes();
       await emit("workbench-changed", { sequence: 199 });
+      await wait(() => refreshes() > deferred && heldFill.length > 1);
+      heldFill.forEach(release => release()); heldFill = []; holdFill = false;
+      await wait(() => coverage().includes("in all"));
+      check(`a background refresh during the automatic read neither loses nor repeats a task, and leaves nothing loading (${coverage()})`,
+        bulkCards() === 450 && new Set([...root.querySelectorAll("[data-task-card]")].map(el => el.dataset.cardId)).size === root.querySelectorAll("[data-task-card]").length
+        && !button("Load all tasks") && !button("Load more tasks") && !root.querySelector('[data-testid="task-search-filling"]'));
+      guardStep = "load all";
+      await click("Clear task search");
+      await wait(() => !root.querySelector('[data-testid="task-column-filling"]') && !root.querySelector("[data-task-paging]")); await settle(400);
+      const listed = ipcMethods.filter(method => method === "items.list").length;
+      await change(searchBox, "is:feature");
+      await wait(() => coverage().includes("in all")); await settle(300);
+      const pages = ipcMethods.filter(method => method === "items.list").length - listed;
+      // One read of the archive's count, then each page of 200 once.
+      check(`the automatic read reads every page once (${pages} reads for ${total} tasks: ${coverage()})`, bulkCards() === 450 && total > 400 && pages === 1 + Math.ceil(total / 200));
+      const reads = refreshes();
+      await emit("workbench-changed", { sequence: 200 });
+      await wait(() => refreshes() > reads); await settle(500);
+      check(`a workbench change after the search read everything keeps every task loaded (${coverage()})`, coverage().includes("in all") && bulkCards() === 450);
+      // Where the search's own read stops (here a page fails) it offers Load
+      // more. A background refresh checks the board is idle, then reads the
+      // catalog; a Load more clicked in that gap used to have its page thrown
+      // away by the refresh's revision bump, and the board stayed loading.
+      guardStep = "load more during a background refresh";
+      await click("Clear task search");
+      await wait(() => !root.querySelector('[data-testid="task-column-filling"]') && !root.querySelector("[data-task-paging]")); await settle(300);
+      failFill = 1;
+      await change(searchBox, "is:feature");
+      await wait(() => button("Load more tasks"));
+      check(`where the search cannot read the rest on its own it says it is partial and offers Load more (${coverage()})`, /in 200 of \d+ tasks/.test(coverage()) && Boolean(button("Load all tasks")));
+      holdCatalog = true;
+      await emit("workbench-changed", { sequence: 198 });
       await wait(() => heldCatalog.length > 0);
       holdPages = true;
       button("Load more tasks").click();
       await wait(() => heldPages.length > 0);
-      heldCatalog.forEach(release => release()); heldCatalog = []; holdCatalog = false; await settle(200);
-      const deferred = refreshes();
-      heldPages.forEach(release => release()); heldPages = []; holdPages = false; await settle(400);
+      heldCatalog.splice(0).forEach(release => release()); holdCatalog = false; await settle(200);
+      const gaveWay = refreshes();
+      heldPages.splice(0).forEach(release => release()); holdPages = false; await settle(400);
       check(`a Load more clicked while a background refresh starts still lands, and the board is not left loading (${coverage()})`,
         /in 400 of \d+ tasks/.test(coverage()) && Boolean(button("Load all tasks")) && !button("Load all tasks").disabled);
-      // The refresh that gave way runs once the board is idle, and keeps both pages.
-      await wait(() => refreshes() > deferred); await settle(500);
-      check(`the refresh that gave way to Load more keeps both pages (${coverage()})`, /in 400 of \d+ tasks/.test(coverage()));
-      guardStep = "load all";
-      const total = Number(/in [\d,]+ of ([\d,]+) tasks/.exec(coverage())?.[1]?.replaceAll(",", "") ?? 0);
-      const listed = ipcMethods.filter(method => method === "items.list").length;
-      button("Load all tasks").click();
-      await wait(() => coverage().includes("in all"));
-      const pages = ipcMethods.filter(method => method === "items.list").length - listed;
-      check(`Load all reads every remaining page once (${pages} reads for ${total} tasks: ${coverage()})`, bulkCards() === 450 && !button("Load all tasks") && !button("Load more tasks")
-        && total > 400 && pages === Math.ceil(total / 200) - 2);
-      const reads = refreshes();
-      await emit("workbench-changed", { sequence: 200 });
-      await wait(() => refreshes() > reads); await settle(500);
-      check(`a workbench change after Load all keeps every task loaded (${coverage()})`, coverage().includes("in all") && bulkCards() === 450);
+      await wait(() => refreshes() > gaveWay);
+      await wait(() => coverage().includes("in all")); await settle(300);
+      check(`the refresh that gave way runs once the board is idle, keeps both pages, and the read goes on to the end (${coverage()})`, bulkCards() === 450);
       await click("Clear task search"); await settle(400);
-      // Browsing, a column pages 30 at a time; Load all reads the rest 200 at
-      // a time. Past 600 cards a refresh used to cut it to 600 (20 pages of
-      // 30), and past 256 the verdict read refused the board outright.
+      // Browsing, a column's first page is 30 cards and the board reads the
+      // rest 200 at a time on its own. Past 600 cards a refresh used to cut it
+      // to 600 (20 pages of 30), and past 256 the verdict read refused the
+      // board outright.
       guardStep = "load all in a column";
       for (let i = 450; i < 650; i++) tasks.push(makeTask(`task-${700 + i}`, `Bulkload item ${String(i + 1).padStart(3, "0")}`, "repo-0", "backlog"));
+      verdictReads.length = 0;
       root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
       const backlog = () => root.querySelector('[data-task-column="backlog"]');
       const backlogCards = () => backlog()?.querySelectorAll("[data-task-card]").length ?? 0;
       const backlogTotal = tasks.filter(task => task.status === "backlog" && !task.archived && !deleted.has(task.id)).length;
-      await wait(() => button("Load all Backlog tasks", backlog()));
-      verdictReads.length = 0;
-      button("Load all Backlog tasks", backlog()).click();
       await wait(() => backlogCards() === backlogTotal); await settle(300);
-      check(`Load all reads a column to its end (${backlogCards()} of ${backlogTotal})`, backlogTotal > 600 && !button("Load more Backlog tasks", backlog()) && !button("Load all Backlog tasks", backlog()));
+      check(`the board reads a column past 600 cards to its end on its own (${backlogCards()} of ${backlogTotal})`, backlogTotal > 600 && !backlog().querySelector("[data-task-paging]"));
       check(`a board past one verdict read reads its verdicts in parts (${verdictReads.map(ids => ids.length).join(",")})`,
         verdictReads.length > 1 && verdictReads.every(ids => ids.length <= 256) && !root.querySelector('[data-testid="board-verdicts-error"]'));
       const columnReads = refreshes();
@@ -3283,6 +3416,10 @@ if (params.has("check")) {
       tasks = tasks.filter(task => !task.title.startsWith("Bulkload item"));
       root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
     } catch (error) { check(`the load-all checks ran to the end (${error.message} at ${guardStep})`, false); }
+    finally {
+      holdFill = false; heldFill.splice(0).forEach(release => release()); failFill = 0;
+      holdCatalog = false; heldCatalog.splice(0).forEach(release => release()); holdPages = false; heldPages.splice(0).forEach(release => release());
+    }
 
     // ---- Work-in-progress limits, lanes and saved views, per board --------
     try {
@@ -3338,7 +3475,7 @@ if (params.has("check")) {
       check("the column heads, with counts and limits, are drawn once above the lanes",
         heads > 0 && lanes().every(lane => lane.querySelectorAll("[data-task-column]").length === heads));
       guardStep = `views: lane move from ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn}`;
-      const order = ["inbox", "backlog", "ready", "in_progress", "review", "done"];
+      const order = ["backlog", "ready", "in_progress", "review", "done"];
       const from = card("task-2").closest("[data-task-column]").dataset.taskColumn, to = order[order.indexOf(from) - 1];
       const before = writes.length;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
@@ -3468,7 +3605,7 @@ if (params.has("check")) {
           notice(51, "run_ci_passed", "Coding agent branch passed CI", { signal: { ...facts, source: "ci_local", kind: "ci_passed", conclusion: "success", workflow: "ci.local", url: null } }),
           notice(50, "run_quarantined", "Coding agent was quarantined"),
         ];
-        // (The board's Inbox *column* is also a section labelled "Inbox"; this is the notification inbox.)
+        // (This is the notification inbox, not a board column.)
         const toggle = root.querySelector('.gp-icon-btn[aria-label="Inbox"]');
         const inbox = () => root.querySelector('section.inbox[aria-label="Inbox"]');
         if (!inbox()) toggle.click();
@@ -3565,9 +3702,7 @@ if (params.has("check")) {
         tasks.push(...longTasks, ...movers);
         await refreshLong();
         const loadAll = () => [...(root.querySelector('[data-task-column="review"]')?.querySelectorAll("button") ?? [])].find(el => /^Load all .* tasks$/.test(el.getAttribute("aria-label") ?? ""));
-        await wait(() => loadAll());
-        loadAll().click();
-        await wait(() => !loadAll()); await settle(300);
+        await wait(() => !loadAll() && !root.querySelector('[data-task-column="review"] [data-task-paging]') && reviewIds().length === fixtureOrder().length); await settle(300);
         const order = fixtureOrder();
         check(`a column past 35 cards draws every one of them (${reviewIds().length} drawn of ${order.length})`, order.length > 35 && reviewIds().length === order.length);
         check("and draws them in the column's order", reviewIds().join() === order.join());
@@ -3849,7 +3984,7 @@ if (params.has("check")) {
         const fromInput = () => root.querySelector('[data-testid="task-filter-due-from"]'), toInput = () => root.querySelector('[data-testid="task-filter-due-to"]');
         const searchText = () => root.querySelector("input#task-search")?.value ?? "";
         const names = () => [card("task-1"), card("task-2"), card("task-3"), card(plain)].map(Boolean);
-        check("the status select offers Any, Not done and every column", same([...statusPick().options].map(option => option.value), ["", "open", "inbox", "backlog", "ready", "in_progress", "review", "done"]) && statusPick().value === "");
+        check("the status select offers Any, Not done and every column", same([...statusPick().options].map(option => option.value), ["", "open", "backlog", "ready", "in_progress", "review", "done"]) && statusPick().value === "");
         // The first filter switches the board to the candidate set, which is read before it can draw.
         // Earlier checks have moved cards between columns: pick the column task-2 is in now.
         const column = tasks.find(task => task.id === "task-2").status;
@@ -3912,15 +4047,17 @@ if (params.has("check")) {
         }
       } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
 
-      // The navigator is a docked rail (a tonal step, no outline, no glass), moves by keyboard,
+      // The navigator is a floating card beside the board (a hairline, the pane radius, no
+      // band fill, no glass), moves by keyboard,
       // and gives the board its width back — collapsed or narrow — as an overlay opened from the toolbar.
       const appBox = document.getElementById("app");
       try {
         step = "navigator rail";
         const nav = scopesNav();
         const style = getComputedStyle(nav);
-        check("the docked navigator is a rail: no outline, no corner radius, no glass",
-          style.borderTopWidth === "0px" && style.borderTopLeftRadius === "0px" && !nav.classList.contains("gp-glass"));
+        check("the docked navigator is a floating card: a hairline, the pane radius, no band fill, no glass",
+          style.borderTopWidth === "1px" && parseFloat(style.borderTopLeftRadius) >= 8
+            && style.backgroundColor === "rgba(0, 0, 0, 0)" && !nav.classList.contains("gp-glass"));
         const toggle = () => root.querySelector('[data-testid="task-nav-toggle"]');
         const settled = async predicate => { try { await wait(predicate); return true; } catch { return false; } };
         const press = (el, key, init = {}) => el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));

@@ -26,6 +26,7 @@
 
 import { invoke } from "../ipc/invoke";
 import { terminalDeadline } from "./inputQueue";
+import { describeError } from "../ui/copy/describeFailure";
 
 /** The most the host returns in one read; asking for more is clamped there. */
 export const TRANSCRIPT_TAIL_BYTES = 128 * 1024;
@@ -120,7 +121,7 @@ export async function readSavedTranscript(
     );
     return parseSavedTranscript(raw);
   } catch (error) {
-    return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
+    return { kind: "failed", reason: describeError(error, "terminal") };
   }
 }
 

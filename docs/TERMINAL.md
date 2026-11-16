@@ -122,8 +122,8 @@ terminal's own automatic replies (focus, cursor reports, mouse) answer
 nothing. A bell rung for the same moment as a hook report is folded into it
 rather than becoming a second, reasonless banner, and the rate limit delays a
 banner rather than discarding it, most urgent first. The setting **Count a terminal
-bell as waiting for you** in **Settings → Agents** (default on, `asksForReader`)
-controls whether bells count as waiting prompts; when disabled, terminal bells ring
+bell as waiting for you** in **Settings → Agents** (default off, `asksForReader`)
+controls whether bells count as waiting prompts; when enabled, terminal bells from hook-less agents count as waiting prompts, and while off (default), terminal bells ring
 without updating the attention badge. A window that reloads
 reads what stood while it was not listening, with its real age. The tray shows
 the attention mark while an agent is waiting on you. Which of Claude Code's settings files an
@@ -271,13 +271,14 @@ message. Invalid Unicode is also refused before any portion is sent. Failed or
 timed-out writes are not retried, since part of a command may already have arrived;
 restart the session before entering more input.
 
-Sessions live in the app unless Settings → Agents → "Keep terminals running when
-GitPulse quits" is on; then they live in `gitpulse-ptyd`, survive a quit or a crash,
-and a quit with sessions running asks whether to leave them or stop them. A session
-taken over by a new view — after a reload, a crash, or from Sessions — is first shown
-its newest 512 KiB of output, kept whether or not anything was showing it, and is told
-when output printed while it was detached is no longer kept. See
-[Terminal host](TERMINAL_HOST.md).
+On Unix (`#[cfg(unix)]`), PTY sessions live in `gitpulse-ptyd`, survive a quit or a crash,
+and a quit with sessions running asks whether to leave them or stop them. **Settings →
+Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`,
+on by default) governs the detached `manvi serve --listen` process that hosts managed
+Codex and Claude runs. A session taken over by a new view — after a reload, a crash, or
+from Sessions — is first shown its newest 512 KiB of output, kept whether or not anything
+was showing it, and is told when output printed while it was detached is no longer kept.
+See [Terminal host](TERMINAL_HOST.md).
 
 The native PTY pauses after 512 KiB of output awaiting renderer acknowledgements.
 If the renderer stops acknowledging for 30 seconds, the session closes with a

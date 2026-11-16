@@ -22,10 +22,12 @@
   import { harnessStore } from "./lib/stores/harnessStore";
   import { applyPlatformClass, isMacOS, isTauri } from "./lib/platform";
   import { displayName } from "./lib/repos/paths";
-  import { formatError } from "./lib/ui/formatError";
+  import { formatError, formatErrorRaw } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
   import { diagnostics } from "./lib/diagnostics/diagnostics";
   import { formatDiagnosticFailure } from "./lib/diagnostics/diagnostics";
+  import { INTERNAL_ERROR_COPY, mirrorUserFacingError } from "./lib/ui/copy/describeFailure";
+  import { isProgrammingError } from "./lib/ui/formatError";
   import { createPaneCrashReporter } from "./lib/diagnostics/paneCrash";
   import { activity } from "./lib/diagnostics/activity";
   import { get } from "svelte/store";
@@ -250,6 +252,14 @@
   // the terminal or take focus behind it.
   const viewCoveredByTerminal = $derived(terminalDockOpen && terminalDockExpanded);
 
+  // The Manvi pill lives in the status bar while that bar is on screen: on the
+  // repository surface, with the bar not hidden by its setting. Everywhere else
+  // (Fleet, Agents, Tasks, the welcome screen, a hidden bar) the title bar keeps
+  // the compact chip, so a failing gate is never out of sight. The bar stays
+  // mounted, but 0 high, under the other surfaces, hence the surface term.
+  let statusBarShown = $state(false);
+  const manviInStatusBar = $derived($interfaceStore.globalSurface === "repository" && statusBarShown);
+
   // --- fleet keep-alive -----------------------------------------------------
   // Fleet is workspace-scoped, so it sits BESIDE the repository pane rather
   // than inside it, and the two are swapped by hiding — never by unmounting.
@@ -279,7 +289,7 @@
     const err = repoError;
     if (err) {
       untrack(() => {
-        diagnostics.error("repo:operation", err);
+        mirrorUserFacingError("repo:operation", err);
         toastStore.error(err);
         repoStore.setError(null);
       });
@@ -407,7 +417,7 @@
       hosted: async () => (await readTerminalBackend()).managed?.hosted === true,
       listRuns: listAllLiveRuns,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatErrorRaw(error)}`),
     });
     if (managedRuns.cancelled) { cancelNativeExitRequest(); return; }
     // With the terminal host, sessions can outlive this app: a quit with any
@@ -417,12 +427,12 @@
     const decision = await decideQuitTerminals({
       ask: askChoice,
       displayName,
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatErrorRaw(error)}`),
     });
     if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
     const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
     const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
-      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatError(error)}`),
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatErrorRaw(error)}`),
     });
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
@@ -679,7 +689,6 @@
         !isImeComposition(e) &&
         fieldOwnsFindChord({
           hasRepository: Boolean($repoStore.currentPath),
-          onRepositorySurface: $interfaceStore.globalSurface === "repository",
           defaultPrevented: e.defaultPrevented,
         })
       ) {
@@ -1105,8 +1114,8 @@
 
   {#snippet paneFailed(error: unknown, reset: () => void)}
     <!-- Minimal crash isolation: a broken pane never takes down the window. -->
-    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatDiagnosticFailure(error)}>
-      <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
+    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={isProgrammingError(error) ? INTERNAL_ERROR_COPY : formatDiagnosticFailure(error)}>
+      <span class="text-xs text-textMuted font-sans">Couldn't render this pane.</span>
       <span class="text-meta text-textMuted">See Diagnostics for crash details</span>
       <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
     </div>
@@ -1135,7 +1144,7 @@
          lives on the row inside it: the tiers (1100, 1280, 1440, 1600) are then
          the window's own width, as HEADER_SPEC section 4 states them. -->
     <header
-    class="@container gp-glass gp-repo-tabs relative bg-surface shrink-0 select-none min-w-0 {macos
+    class="@container gp-glass gp-repo-tabs relative bg-background shrink-0 select-none min-w-0 {macos
       ? 'h-12'
       : 'h-10'}"
     style:z-index={LAYERS.SCROLL_CUE}
@@ -1156,8 +1165,8 @@
 
     <!-- Host-wide chips, last so the Diagnostics badge sits at the window corner. -->
     <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 pl-2 h-full">
-      {#if $interfaceStore.showHarnessBadges}
-        <HarnessBadge />
+      {#if $interfaceStore.showHarnessBadges && !manviInStatusBar}
+        <HarnessBadge variant="compact" />
       {/if}
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
@@ -1221,7 +1230,7 @@
             class="gp-btn-primary flex-1 py-2.5! px-4! text-xs!"
           >
             <FolderOpen size={15} />
-            <span>Open Repository</span>
+            <span>Open repository</span>
           </button>
           <button onclick={openCloneDialog} class="gp-btn flex-1 py-2.5! px-4!">
             <Download size={15} />
@@ -1233,7 +1242,7 @@
           <div class="w-full text-left pt-4">
             <div class="flex items-center gap-1.5 gp-label mb-2">
               <Clock size={12} />
-              <span>Recent Repositories</span>
+              <span>Recent repositories</span>
             </div>
             <div class="space-y-1.5">
               {#each $repoStore.recentRepos as repo}
@@ -1312,13 +1321,13 @@
 
       <!-- Bottom Ambient Status Bar -->
       <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("status", error)}>
-      <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
+      <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} bind:shown={statusBarShown} />
       </svelte:boundary>
 
     <!-- First-run coach mark onboarding tip -->
     <CoachMark
       id="coach-palette"
-      title="Command Palette"
+      title="Command palette"
       description="Press ⌘K anytime to search files, switch branches, run git commands, or jump to commits."
       shortcut="⌘K"
       class="bottom-10 right-6"

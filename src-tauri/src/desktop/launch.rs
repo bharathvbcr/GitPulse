@@ -109,6 +109,16 @@ pub fn establish() -> Launch {
                 primary.attach_insights(std::sync::Arc::new(|repo| {
                     crate::hooks::serve_insights(repo)
                 }));
+                // App-side git operation log snapshots (`refs/gitpulse/ops/*`)
+                // requested over the mailbox by the decide-only command-gate hook.
+                primary.attach_op_recorder(std::sync::Arc::new(|request, received| {
+                    crate::engine::GitWriter::serve_op_record(request, received)
+                }));
+                // Turn checkpoints (`refs/gitpulse/turns/*`) requested by the
+                // decide-only hook at turn boundaries, when the user enabled them.
+                primary.attach_turn_checkpointer(std::sync::Arc::new(|request| {
+                    crate::engine::turn_checkpoint::serve_turn_checkpoint(request)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch

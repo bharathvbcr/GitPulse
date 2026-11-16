@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { describeError } from "../ui/copy/describeFailure";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { LAYERS } from "../ui/layers";
@@ -38,7 +39,7 @@
       ]);
       if (disposed) return;
       task = value; repositories = repos; workspaces = workspace ? [{ ...workspace, repository_count: workspace.repository_ids.length }] : []; Editor = editor.default;
-    } catch (cause) { if (!disposed) error = cause instanceof Error ? cause.message : "Cannot open the saved notification. Open the activity inbox."; }
+    } catch (cause) { if (!disposed) error = cause instanceof Error ? describeError(cause, "notification-bridge") : "Couldn't open the saved notification. Open the activity inbox."; }
     finally { loading = false; if (again) { again = false; void receive(); } }
   }
   async function close() {
@@ -49,7 +50,7 @@
       if (disposed) return;
       current = null; task = null; notice = null; Editor = null;
       await receive();
-    } catch (cause) { if (!disposed) error = cause instanceof Error ? cause.message : "Couldn't acknowledge this notification. Try closing again."; }
+    } catch (cause) { if (!disposed) error = cause instanceof Error ? describeError(cause, "notification-bridge") : "Couldn't acknowledge this notification. Try closing again."; }
     finally { if (!disposed) busy = false; }
   }
   onMount(() => {

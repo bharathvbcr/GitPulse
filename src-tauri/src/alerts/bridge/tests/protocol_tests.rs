@@ -87,6 +87,11 @@ fn refusals() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             br#"{"v":1,"event":"tool_finished"}"#.to_vec(),
             "state_outside_session",
         ),
+        (
+            "argv in hook report",
+            br#"{"v":1,"event":"error","resume_argv":["claude","--resume","x"]}"#.to_vec(),
+            "forbidden_argv_field",
+        ),
         ("too big", big, "oversized"),
     ]
 }
@@ -285,6 +290,35 @@ fn the_reason_tokens_are_distinct_and_round_trip() {
         assert!(!reason.message().is_empty());
     }
     assert_eq!(Reason::from_token("not a reason"), None);
+}
+
+/// Hooks may report validated session ids, never argv or command instructions.
+#[test]
+fn argv_like_fields_in_hook_reports_are_refused() {
+    for payload in [
+        br#"{"v":1,"event":"error","argv":["claude"]}"#.as_slice(),
+        br#"{"v":1,"event":"error","resume_argv":["claude","--resume","x"]}"#.as_slice(),
+        br#"{"v":1,"event":"error","args":["--resume","x"]}"#.as_slice(),
+        br#"{"v":1,"event":"error","resume_args":["--resume","x"]}"#.as_slice(),
+        br#"{"v":1,"event":"error","command":"claude --resume x"}"#.as_slice(),
+        br#"{"v":1,"event":"error","cmd":"claude"}"#.as_slice(),
+        br#"{"v":1,"event":"error","meta":{"resume_argv":["claude"]}}"#.as_slice(),
+    ] {
+        let err = super::super::parse_report_stamped(payload).unwrap_err();
+        assert_eq!(
+            err,
+            Reason::ForbiddenArgvField,
+            "payload must be refused: {}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    // Valid id-only report continues to succeed.
+    let valid = br#"{"v":1,"event":"session_ended","agent":"claude","session":"term-1","provider_session_id":"6f0a6d1e-1111-4222-8333-444455556666"}"#;
+    let (notice, _) = super::super::parse_report_stamped(valid).expect("valid id-only report");
+    assert_eq!(
+        notice.provider_session_id.as_deref(),
+        Some("6f0a6d1e-1111-4222-8333-444455556666")
+    );
 }
 
 /// `parse_report` keeps the strings it has always returned.

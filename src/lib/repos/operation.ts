@@ -268,7 +268,7 @@ export function blockedReason(state: OperationState, verb: string): string | nul
   if (!blocksOtherMutations(state)) return null;
   const op = state.operation;
   if (!op) return null;
-  return `Cannot ${verb} while a ${kindLabel(op.kind)} is in progress. Finish or abort it first.`;
+  return `Can't ${verb} while a ${kindLabel(op.kind)} is in progress. Finish or abort it first.`;
 }
 
 /**

@@ -37,6 +37,12 @@ struct Preparation {
     /// the result is recorded on the attempt and is what its launch applies.
     #[serde(default)]
     model_choice: Option<crate::tool_config::ModelChoice>,
+    #[serde(default)]
+    require_subtasks_done: bool,
+    #[serde(default)]
+    queue_id: Option<String>,
+    #[serde(default)]
+    member_id: Option<String>,
 }
 
 fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
@@ -56,6 +62,21 @@ fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
         &request.task_id,
         &request.repository_id,
     ];
+    let bad_queue_lease = request.queue_id.is_some() != request.member_id.is_some()
+        || request
+            .queue_id
+            .as_ref()
+            .is_some_and(|id| !super::is_record_id(id))
+        || request
+            .member_id
+            .as_ref()
+            .is_some_and(|id| !super::is_record_id(id));
+    if bad_queue_lease {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "queue_id and member_id must be provided together as valid identifiers.",
+        ));
+    }
     if ids.iter().any(|id| !super::is_record_id(id))
         || [request.source_revision, request.repository_revision]
             .iter()
@@ -131,19 +152,19 @@ fn head(repo: &Path) -> Result<Option<String>, WorkbenchError> {
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq)]
-struct Checkout {
-    cwd: String,
-    git_dir: String,
-    git_common_dir: String,
-    head_oid: Option<String>,
-    head_ref: Option<String>,
+pub(super) struct Checkout {
+    pub(super) cwd: String,
+    pub(super) git_dir: String,
+    pub(super) git_common_dir: String,
+    pub(super) head_oid: Option<String>,
+    pub(super) head_ref: Option<String>,
 }
 
 /// The observed identity of the checkout holding `repo_path`, which may be
 /// the checkout's root or a directory inside it. Everything Git is asked is
 /// asked of the root, and the root is what must be trusted; `cwd` is the
 /// directory itself, canonical, where the agent will start.
-fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
+pub(super) fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
     let (dir, root, _) = crate::terminal::checkout_root(repo_path).map_err(unavailable)?;
     let resolved = resolve_repo(&native_path(&root)?).map_err(|e| unavailable(e.into_message()))?;
     if resolved.is_bare {
@@ -286,6 +307,61 @@ fn managed_adapter_gate(state: &WorkbenchState, provider: &str) -> Result<(), Wo
     }
 }
 
+fn check_task_readiness(
+    state: &WorkbenchState,
+    task_id: &str,
+    require_subtasks_done: bool,
+) -> Result<(), WorkbenchError> {
+    let readiness = state.with_store(|store| {
+        query(
+            store,
+            "items.readiness",
+            &json!({"id": task_id}).to_string(),
+        )
+    })?;
+    let item = &readiness["item"];
+    if !item["ready"].as_bool().unwrap_or(false) {
+        let blockers: Vec<String> = item["blocked_by"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row["status"].as_str() != Some("done"))
+                    .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let detail = if blockers.is_empty() {
+            "Task has open blocking dependencies.".to_string()
+        } else {
+            format!(
+                "Task is blocked by open dependencies: {}.",
+                blockers.join(", ")
+            )
+        };
+        return Err(WorkbenchError::new("task_blocked", detail));
+    }
+    if require_subtasks_done && !item["ready_with_subtasks"].as_bool().unwrap_or(false) {
+        let open_subs: Vec<String> = item["open_subtasks"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let detail = if open_subs.is_empty() {
+            "Task has incomplete child subtasks.".to_string()
+        } else {
+            format!(
+                "Task requires subtasks to be done before launching: {}.",
+                open_subs.join(", ")
+            )
+        };
+        return Err(WorkbenchError::new("subtasks_incomplete", detail));
+    }
+    Ok(())
+}
+
 fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value, WorkbenchError> {
     let input = parse(input)?;
     if kind == "managed"
@@ -317,6 +393,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     if let Some(prepared) = own_prepared(state, &input, kind)? {
         return Ok(prepared);
     }
+    check_task_readiness(state, &input.task_id, input.require_subtasks_done)?;
     if kind == "managed" {
         managed_adapter_gate(state, &input.provider)?;
     }
@@ -603,6 +680,9 @@ fn prepare_in(
         "acknowledge_bypass":input.acknowledge_bypass, "cwd":checkout.cwd,
         "git_dir":checkout.git_dir, "git_common_dir":checkout.git_common_dir,
         "head_oid":checkout.head_oid, "head_ref":checkout.head_ref,
+        "require_subtasks_done": input.require_subtasks_done,
+        "queue_id": input.queue_id,
+        "member_id": input.member_id,
         // The user's choice, read at each launch so a change in Settings
         // applies to the next one. The store owns the bound and the count.
         "max_active_runs": state.live_runs(),
@@ -2541,5 +2621,209 @@ mod tests {
             "invalid_input"
         );
         assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 1);
+    }
+
+    #[test]
+    fn blocked_task_is_refused_before_provisioning_a_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        // Task `task` is blocked by `blocker`.
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "blocker",
+                    "request_id": "put-blocker",
+                    "expected_revision": 0,
+                    "title": "Blocker",
+                    "description": "Finish me first",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "task",
+                    "request_id": "put-task-link",
+                    "expected_revision": 1,
+                    "title": "Preserve E42",
+                    "description": "Exact saved instructions",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo",
+                    "links": [{"item_id": "task", "kind": "blocks"}]
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "blocker",
+                    "request_id": "put-blocker-links-task",
+                    "expected_revision": 1,
+                    "title": "Blocker",
+                    "description": "Finish me first",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo",
+                    "links": [{"item_id": "task", "kind": "blocks"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let mut blocked = prepare(&root);
+        blocked["worktree"] = json!(true);
+        let refused = state
+            .request("runs.prepare_terminal", &blocked.to_string())
+            .unwrap_err();
+        assert_eq!(refused.code, "task_blocked", "{}", refused.message);
+        assert!(refused.message.contains("blocker"), "{}", refused.message);
+        let wt_dir = root.join(".git").join("worktrees");
+        assert!(
+            !wt_dir.exists(),
+            "blocked launch must not provision a worktree"
+        );
+
+        // Completing the blocker unblocks `task`.
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "blocker",
+                    "request_id": "put-blocker-done",
+                    "expected_revision": 2,
+                    "status": "done",
+                    "title": "Blocker",
+                    "description": "Finish me first",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo",
+                    "links": [{"item_id": "task", "kind": "blocks"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let unblocked = state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        assert_eq!(unblocked["item"]["state"], "prepared");
+    }
+
+    #[test]
+    fn require_subtasks_done_gates_launch_and_queue_lease_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "child-1",
+                    "request_id": "put-child",
+                    "expected_revision": 0,
+                    "title": "Child subtask",
+                    "description": "Subtask work",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo",
+                    "links": [{"item_id": "task", "kind": "parent"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let mut sub_gated = prepare(&root);
+        sub_gated["require_subtasks_done"] = json!(true);
+        let refused = state
+            .request("runs.prepare_terminal", &sub_gated.to_string())
+            .unwrap_err();
+        assert_eq!(refused.code, "subtasks_incomplete", "{}", refused.message);
+
+        state
+            .request(
+                "items.put",
+                &json!({
+                    "id": "child-1",
+                    "request_id": "put-child-done",
+                    "expected_revision": 1,
+                    "status": "done",
+                    "title": "Child subtask",
+                    "description": "Subtask work",
+                    "repository_ids": ["repo"],
+                    "primary_repository_id": "repo",
+                    "links": [{"item_id": "task", "kind": "parent"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        // Queue lease attachment: unacquired member is refused with `queue_lease_required`,
+        // acquired member succeeds and records `queue_id` + `member_id`.
+        let co = super::checkout(root.to_str().unwrap()).unwrap();
+        state
+            .with_store(|store| {
+                super::query(
+                    store,
+                    "queue.enqueue",
+                    &json!({
+                        "id": "q-1",
+                        "request_id": "q-enq-1",
+                        "expected_revision": 0,
+                        "title": "Cross-repo batch",
+                        "members": [{
+                            "member_id": "m-1",
+                            "repository_id": "repo",
+                            "git_dir": co.git_dir,
+                            "base_oid": co.head_oid.unwrap(),
+                            "task_id": "task"
+                        }]
+                    })
+                    .to_string(),
+                )
+            })
+            .unwrap();
+
+        sub_gated["queue_id"] = json!("q-1");
+        sub_gated["member_id"] = json!("m-1");
+        let no_lease = state
+            .request("runs.prepare_terminal", &sub_gated.to_string())
+            .unwrap_err();
+        assert_eq!(
+            no_lease.code, "queue_lease_required",
+            "{}",
+            no_lease.message
+        );
+
+        state
+            .request(
+                "queue.acquire",
+                &json!({"id": "q-1", "request_id": "q-acq-1", "expected_revision": 1}).to_string(),
+            )
+            .unwrap();
+        let mut with_lease = prepare(&root);
+        with_lease["id"] = json!("run-leased");
+        with_lease["request_id"] = json!("prepare-leased");
+        with_lease["require_subtasks_done"] = json!(true);
+        with_lease["queue_id"] = json!("q-1");
+        with_lease["member_id"] = json!("m-1");
+        let run = state
+            .request("runs.prepare_terminal", &with_lease.to_string())
+            .unwrap();
+        assert_eq!(run["item"]["state"], "prepared");
+        let queue = state
+            .request("queue.get", &json!({"id": "q-1"}).to_string())
+            .unwrap();
+        assert_eq!(queue["item"]["members"][0]["run_id"], "run-leased");
     }
 }

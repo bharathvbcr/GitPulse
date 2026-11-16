@@ -9,7 +9,7 @@
   import { offerBranchUndo } from "../repos/branchUndo";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
-  import { formatError } from "../ui/formatError";
+  import { describeError } from "../ui/copy/describeFailure";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import LazyMount from "./LazyMount.svelte";
@@ -499,7 +499,7 @@
       if (raw) createName = raw.replace(/^[#`]+/, "").replace(/[`]+$/, "");
     } catch (err) {
       if (!tabScope.isCurrent(epoch)) return;
-      repoStore.setError(formatError(err));
+      repoStore.setError(describeError(err, "repo"));
     } finally {
       // A switch already cleared the flag; a stale request must not clear the
       // new repository's own in-flight one.
@@ -1011,15 +1011,15 @@
     !branch.is_current &&
     !branch.is_default}
   <div
-    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none {multiLine
+    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {multiLine
       ? 'rounded-2xl'
       : 'rounded-full pr-1'} {branch.is_current
-      ? 'bg-accent/15 text-accent font-semibold ring-1 ring-accent/40'
+      ? 'bg-accent/15 text-accent font-semibold ring-accent/40'
       : selected
-        ? 'bg-accent/10 text-textPrimary ring-1 ring-accent/20'
+        ? 'bg-accent/10 text-textPrimary ring-accent/20'
         : isRowSelected
-          ? 'bg-surfaceHover text-textPrimary ring-1 ring-border'
-          : 'text-textPrimary hover:bg-surfaceHover'}"
+          ? 'bg-surfaceHover text-textPrimary ring-border'
+          : 'text-textPrimary ring-border/60 hover:bg-surfaceHover hover:ring-border'}"
     style="height: {BRANCH_HEIGHT}px; contain-intrinsic-size: auto {BRANCH_HEIGHT}px; padding-left: {8 +
       depth * 12}px;"
   >
@@ -1116,8 +1116,10 @@
            button drops to the menu button's p-0.5 here) centred on the name,
            y 5–21, above line two's top at ~21.5 (~24.5 on three lines). At rest the status dots sit
            at the row's right edge; on hover or focus they fade and the actions
-           take their place, so neither ever pushes the name. -->
-      <div class="absolute right-1 top-[5px] h-4 flex items-center">
+           take their place, so neither ever pushes the name. `top` is
+           measured inside the row's 1px transparent border (the gap that
+           keeps neighbouring outlines apart), so 4px here is y 5. -->
+      <div class="absolute right-1 top-[4px] h-4 flex items-center">
         <span
           class="absolute right-1.5 flex items-center gap-1 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0"
         >
@@ -1150,11 +1152,11 @@
     onclick={() => selectRef(row.tag.name)}
     oncontextmenu={(e) => openTagMenu(e, row.tag)}
     title={tagTooltip(row.tag)}
-    class="gp-cv-row w-full px-2 rounded-full flex items-center gap-1.5 text-left transition-colors select-none {$filterStore.selectedBranch === row.tag.name
-      ? 'bg-accent/10 text-accent ring-1 ring-accent/20'
+    class="gp-cv-row w-full px-2 rounded-full flex items-center gap-1.5 text-left transition-colors select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {$filterStore.selectedBranch === row.tag.name
+      ? 'bg-accent/10 text-accent ring-accent/20'
       : isRowSelected
-        ? 'bg-surfaceHover text-textPrimary ring-1 ring-border'
-        : 'text-textPrimary hover:bg-surfaceHover'}"
+        ? 'bg-surfaceHover text-textPrimary ring-border'
+        : 'text-textPrimary ring-border/60 hover:bg-surfaceHover hover:ring-border'}"
     style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px;"
   >
     <Tag size={12} class="text-textMuted shrink-0" />

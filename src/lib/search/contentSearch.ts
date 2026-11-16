@@ -16,7 +16,7 @@ const TRUNCATION_REASON = {
   match_limit: "the match limit was reached",
   output_cap: "the output budget was reached",
   deadline: "the search hit its time limit",
-  cancelled: "the search was cancelled",
+  cancelled: "the search was canceled",
 } as const;
 
 /** Narrows the wire's free-form reason to one this build can name. */

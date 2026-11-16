@@ -8,6 +8,8 @@
   import { themeStore } from "../stores/themeStore";
   import { densityStore } from "../stores/densityStore";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { avatarUrlFor, githubAvatarsVersion, requestAuthorAvatars } from "../authors/githubAvatars";
+  import { avatarImage, onAvatarImagesLoaded } from "../authors/avatarImages";
   import {
     AVATAR_STYLES,
     DENSITY_CONFIGS,
@@ -367,6 +369,16 @@
   let visibleRows = $derived(filteredRows.slice(startIndex, endIndex));
 
   /**
+   * The loaded GitHub picture for a row's author, or null for the initials
+   * disc. Never waits on the network: an image still loading answers null and
+   * the load callback below repaints when it lands.
+   */
+  function avatarImageFor(row: VisualCommitRow): HTMLImageElement | null {
+    const url = avatarUrlFor(row.author_email);
+    return url === null ? null : avatarImage(url);
+  }
+
+  /**
    * Offscreen static layer: connectors, nodes and decorations are tile-rendered
    * once per data/width/density/theme/dpr change; scroll frames just blit the
    * visible strips and stroke the live emphasis rings on top.
@@ -392,6 +404,7 @@
           skipLongConnectors: true,
           showAvatars,
           avatarX: avatarCenterX,
+          avatarImageFor,
         },
         null,
       );
@@ -473,6 +486,7 @@
       selectionStrength: paintState.selectionStrength,
       showAvatars,
       avatarX: avatarCenterX,
+      avatarImageFor,
     });
   }
 
@@ -832,7 +846,34 @@
     schedulePaint();
   });
 
+  // Avatars are baked into the cached strips, so a new URL, the setting
+  // flipping, or an image finishing its load must drop them. Read the setting
+  // through a strictly-equal derived (see graphAccent above): a bare
+  // `$interfaceStore.showGithubAvatars` here would re-run on every unrelated
+  // preference write and throw away every cached graph tile.
+  const showGithubAvatars = $derived($interfaceStore.showGithubAvatars);
+  $effect(() => {
+    $githubAvatarsVersion;
+    showGithubAvatars;
+    graphCache.invalidate();
+    schedulePaint();
+  });
+
+  // Ask GitHub who the loaded authors are: debounced, and only when the rows,
+  // the repository or the setting change, never per paint.
+  $effect(() => {
+    const rows = filteredRows;
+    const path = $currentRepoPath;
+    if (!showGithubAvatars || !path || rows.length === 0) return;
+    const timer = setTimeout(() => void requestAuthorAvatars(path, rows), 400);
+    return () => clearTimeout(timer);
+  });
+
   onMount(() => {
+    const stopAvatarImages = onAvatarImagesLoaded(() => {
+      graphCache.invalidate();
+      schedulePaint();
+    });
     const stopResize = observeResize(
       [container, root].filter((el): el is HTMLDivElement => el != null),
       (entries) => {
@@ -883,6 +924,7 @@
       canvas?.removeEventListener("contextlost", onContextLost);
       canvas?.removeEventListener("contextrestored", onContextRestored);
       stopResize();
+      stopAvatarImages();
       scheduler.cancel();
       graphCache.dispose();
     };

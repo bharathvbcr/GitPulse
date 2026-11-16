@@ -1,8 +1,19 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { devNull, tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { GATES, commandLine, runGates, skipReason, summarize } from "./ci-local.mjs";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  EXIT_TREE_UNSTABLE,
+  GATES,
+  commandLine,
+  execute,
+  main,
+  runGates,
+  skipReason,
+  summarize,
+  workingTreeId,
+} from "./ci-local.mjs";
 
 /**
  * The local gate has to be told what actually runs remotely, or it drifts into
@@ -291,5 +302,337 @@ describe("a report left by an earlier run is not read as this run's", () => {
       runGates(GATES, { platform: "darwin", log: () => {}, run: () => ({ ok: true, detail: "exit 0", ms: 1 }) });
       expect(existsSync(join(root, "lcov.info"))).toBe(true);
     });
+  });
+});
+
+/**
+ * Real throwaway repositories, with Git isolated from this machine's config and
+ * from any GIT_* variables the test runner inherited (a hook would set GIT_DIR).
+ */
+const sandboxes: string[] = [];
+afterEach(() => {
+  for (const dir of sandboxes.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+const sandbox = () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-local-tree-test-"));
+  sandboxes.push(dir);
+  return dir;
+};
+const isolatedEnv = (): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith("GIT_")) env[key] = value;
+  }
+  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull };
+};
+const git = (cwd: string, ...args: string[]): string => {
+  const result = spawnSync(
+    "git",
+    ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args],
+    { cwd, env: isolatedEnv(), encoding: "utf8" },
+  );
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout;
+};
+const makeRepo = () => {
+  const repo = join(sandbox(), "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q");
+  writeFileSync(join(repo, "tracked.txt"), "one\n");
+  writeFileSync(join(repo, ".gitignore"), "ignored.log\n");
+  git(repo, "add", "tracked.txt", ".gitignore");
+  git(repo, "commit", "-q", "-m", "first");
+  return repo;
+};
+const readTree = (repo: string, extra: { tmpRoot?: string; run?: never } = {}) =>
+  workingTreeId(repo, { env: isolatedEnv(), ...extra });
+const idOf = (repo: string): string => {
+  const reading = readTree(repo);
+  if (!reading.ok) throw new Error(reading.reason);
+  return reading.id;
+};
+
+describe("workingTreeId reads the tree that is on disk", () => {
+  it("is the same on two calls when nothing changed", () => {
+    const repo = makeRepo();
+    expect(idOf(repo)).toBe(idOf(repo));
+    expect(idOf(repo)).toMatch(/^[0-9a-f]{40,64}$/);
+  });
+
+  it("equals HEAD's tree on a clean checkout", () => {
+    const repo = makeRepo();
+    expect(idOf(repo)).toBe(git(repo, "rev-parse", "HEAD^{tree}").trim());
+  });
+
+  it("changes when a tracked file is edited", () => {
+    const repo = makeRepo();
+    const before = idOf(repo);
+    writeFileSync(join(repo, "tracked.txt"), "two\n");
+    expect(idOf(repo)).not.toBe(before);
+  });
+
+  it("changes when an untracked file appears", () => {
+    const repo = makeRepo();
+    const before = idOf(repo);
+    writeFileSync(join(repo, "new.txt"), "x\n");
+    expect(idOf(repo)).not.toBe(before);
+  });
+
+  it("does not change when only an ignored file appears", () => {
+    const repo = makeRepo();
+    const before = idOf(repo);
+    writeFileSync(join(repo, "ignored.log"), "noise\n");
+    expect(idOf(repo)).toBe(before);
+  });
+
+  it("works with no index to copy, building one from the files", () => {
+    const repo = join(sandbox(), "fresh");
+    mkdirSync(repo);
+    git(repo, "init", "-q");
+    writeFileSync(join(repo, "a.txt"), "a\n");
+    expect(existsSync(join(repo, ".git", "index"))).toBe(false);
+    const first = idOf(repo);
+    expect(first).toMatch(/^[0-9a-f]{40,64}$/);
+    expect(existsSync(join(repo, ".git", "index"))).toBe(false);
+    writeFileSync(join(repo, "a.txt"), "b\n");
+    expect(idOf(repo)).not.toBe(first);
+  });
+
+  it("leaves the real index and git status exactly as they were", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "tracked.txt"), "edited\n");
+    writeFileSync(join(repo, "new.txt"), "x\n");
+    git(repo, "add", "new.txt");
+    writeFileSync(join(repo, "untracked.txt"), "u\n");
+    const status = () => git(repo, "status", "--porcelain=v2", "--untracked-files=all");
+    status(); // let git refresh its own stat cache once, so the next two reads are comparable
+    const indexBefore = readFileSync(join(repo, ".git", "index"));
+    const headBefore = git(repo, "rev-parse", "HEAD");
+    const statusBefore = status();
+    idOf(repo);
+    expect(readFileSync(join(repo, ".git", "index")).equals(indexBefore)).toBe(true);
+    expect(status()).toBe(statusBefore);
+    expect(git(repo, "rev-parse", "HEAD")).toBe(headBefore);
+  });
+
+  it("removes its temporary index afterwards", () => {
+    const repo = makeRepo();
+    const scratch = sandbox();
+    expect(readTree(repo, { tmpRoot: scratch }).ok).toBe(true);
+    expect(readdirSync(scratch)).toEqual([]);
+  });
+
+  it("removes its temporary index when a step fails, and reports unknown", () => {
+    const repo = makeRepo();
+    const scratch = sandbox();
+    const reading = workingTreeId(repo, {
+      env: isolatedEnv(),
+      tmpRoot: scratch,
+      run: (args: string[], where: { cwd: string; env: NodeJS.ProcessEnv }) => {
+        if (args.includes("write-tree")) {
+          // The private index exists by now; the failure must not leave it behind.
+          expect(readdirSync(scratch)).toHaveLength(1);
+          return { status: 128, stdout: "", stderr: "fatal: forced\n", error: undefined };
+        }
+        const real = spawnSync("git", args, { cwd: where.cwd, env: where.env, encoding: "utf8" });
+        return { status: real.status, stdout: real.stdout, stderr: real.stderr, error: undefined };
+      },
+    });
+    expect(reading.ok).toBe(false);
+    expect(reading.ok === false && reading.reason).toContain("write-tree");
+    expect(readdirSync(scratch)).toEqual([]);
+  });
+
+  it("removes its temporary index when the program cannot be started", () => {
+    const repo = makeRepo();
+    const scratch = sandbox();
+    const reading = workingTreeId(repo, {
+      env: isolatedEnv(),
+      tmpRoot: scratch,
+      run: (args: string[], where: { cwd: string; env: NodeJS.ProcessEnv }) => {
+        if (args.includes("add")) throw new Error("spawn exploded");
+        const real = spawnSync("git", args, { cwd: where.cwd, env: where.env, encoding: "utf8" });
+        return { status: real.status, stdout: real.stdout, stderr: real.stderr, error: undefined };
+      },
+    });
+    expect(reading).toEqual({ ok: false, reason: "spawn exploded" });
+    expect(readdirSync(scratch)).toEqual([]);
+  });
+
+  it("is unknown outside a repository, never an id", () => {
+    const outside = sandbox();
+    const scratch = sandbox();
+    const reading = workingTreeId(outside, {
+      env: { ...isolatedEnv(), GIT_CEILING_DIRECTORIES: tmpdir() },
+      tmpRoot: scratch,
+    });
+    expect(reading.ok).toBe(false);
+    expect("id" in reading).toBe(false);
+    expect(readdirSync(scratch)).toEqual([]);
+  });
+
+  it("is unknown for a directory that does not exist", () => {
+    const missing = join(sandbox(), "nope");
+    expect(workingTreeId(missing, { env: isolatedEnv() }).ok).toBe(false);
+  });
+});
+
+describe("the summary says which tree was tested", () => {
+  const good = (id: string) => ({ ok: true as const, id });
+  const bad = (reason: string) => ({ ok: false as const, reason });
+  const readings = (...all: Array<ReturnType<typeof good> | ReturnType<typeof bad>>) => {
+    let next = 0;
+    return () => all[next++];
+  };
+  const passing = () => ({ ok: true, detail: "exit 0", ms: 1 });
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const run = (options: Parameters<typeof execute>[0]) => {
+    const lines: string[] = [];
+    const code = execute({ platform: "darwin", run: passing, log: (line: string) => lines.push(line), ...options });
+    const text = lines.join("\n");
+    const last = text.split("\n").filter((line) => line.trim() !== "").at(-1);
+    return { code, text, last };
+  };
+
+  it("names the tree when both readings agree", () => {
+    const { text, code } = run({ readTree: readings(good(A), good(A)) });
+    expect(code).toBe(0);
+    expect(text).toContain(`tested tree: ${A}`);
+    expect(text).not.toContain("CHANGED");
+  });
+
+  it("gives both ids and says the result describes neither tree when the tree moved", () => {
+    const { text, last } = run({ readTree: readings(good(A), good(B)) });
+    expect(text).toContain("TREE CHANGED DURING THE RUN");
+    expect(text).toContain(`at start: ${A}`);
+    expect(text).toContain(`at end:   ${B}`);
+    expect(text).toContain("The working tree changed while the gates ran, so this result does not describe either tree.");
+    expect(text).not.toContain("tested tree:");
+    // A reader who sees only the last line cannot take it for a clean pass.
+    expect(last).toMatch(/INCONCLUSIVE, not a clean pass/);
+  });
+
+  it("says the tree could not be read, and why, rather than omitting the line", () => {
+    const first = run({ readTree: readings(bad("not a git repository"), good(A)) });
+    expect(first.text).toContain("tree: could not be read");
+    expect(first.text).toContain("before the first gate: not a git repository");
+    const second = run({ readTree: readings(good(A), bad("git add failed: boom")) });
+    expect(second.text).toContain("after the last gate: git add failed: boom");
+    const both = run({ readTree: readings(bad("x"), bad("y")) });
+    expect(both.text).toContain("before the first gate: x");
+    expect(both.text).toContain("after the last gate: y");
+  });
+
+  it("keeps summarize(outcomes) alone free of tree lines", () => {
+    const outcomes = runGates(GATES, { platform: "darwin", log: () => {}, run: passing });
+    expect(summarize(outcomes)).not.toMatch(/tested tree|TREE CHANGED|tree: could not/);
+  });
+});
+
+describe("exit codes with and without --strict-tree", () => {
+  const good = (id: string) => ({ ok: true as const, id });
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const pass = () => ({ ok: true, detail: "exit 0", ms: 1 });
+  const failing = (id: string) => (gate: { id: string }) => ({ ok: gate.id !== id, detail: "exit 1", ms: 1 });
+  const seq = (...all: Array<{ ok: boolean; id?: string; reason?: string }>) => {
+    let next = 0;
+    return () => all[next++] as ReturnType<typeof good>;
+  };
+  const base = { platform: "darwin" as const, log: () => {} };
+
+  it("default: 0 on a pass and 1 on a failure, whatever the tree did", () => {
+    for (const trees of [
+      [good(A), good(A)],
+      [good(A), good(B)],
+      [{ ok: false, reason: "no" }, good(A)],
+    ]) {
+      expect(execute({ ...base, run: pass, readTree: seq(...trees) })).toBe(0);
+      expect(execute({ ...base, run: failing("build"), readTree: seq(...trees) })).toBe(1);
+    }
+  });
+
+  it("--strict-tree: unchanged tree keeps 0 and 1", () => {
+    expect(execute({ ...base, strictTree: true, run: pass, readTree: seq(good(A), good(A)) })).toBe(0);
+    expect(execute({ ...base, strictTree: true, run: failing("build"), readTree: seq(good(A), good(A)) })).toBe(1);
+  });
+
+  it("--strict-tree: a changed or unreadable tree exits with a code distinct from a gate failure", () => {
+    expect(EXIT_TREE_UNSTABLE).not.toBe(0);
+    expect(EXIT_TREE_UNSTABLE).not.toBe(1);
+    expect(EXIT_TREE_UNSTABLE).not.toBe(2);
+    expect(execute({ ...base, strictTree: true, run: pass, readTree: seq(good(A), good(B)) })).toBe(EXIT_TREE_UNSTABLE);
+    expect(
+      execute({ ...base, strictTree: true, run: pass, readTree: seq({ ok: false, reason: "no" }, good(A)) }),
+    ).toBe(EXIT_TREE_UNSTABLE);
+    expect(
+      execute({ ...base, strictTree: true, run: pass, readTree: seq(good(A), { ok: false, reason: "no" }) }),
+    ).toBe(EXIT_TREE_UNSTABLE);
+  });
+
+  it("--strict-tree: a gate failure still exits 1 when the tree also moved", () => {
+    expect(execute({ ...base, strictTree: true, run: failing("build"), readTree: seq(good(A), good(B)) })).toBe(1);
+  });
+
+  it("main accepts --strict-tree, documents it, and still rejects other options", () => {
+    const logged: string[] = [];
+    const realLog = console.log;
+    const realError = console.error;
+    console.log = (line: string) => logged.push(String(line));
+    console.error = () => {};
+    try {
+      expect(main(["--help"])).toBe(0);
+      expect(main(["--bogus"])).toBe(2);
+    } finally {
+      console.log = realLog;
+      console.error = realError;
+    }
+    const help = logged.join("\n");
+    expect(help).toContain("--strict-tree");
+    expect(help).toMatch(/Exit codes:.*3/);
+    const header = readFileSync(new URL("./ci-local.mjs", import.meta.url), "utf8").split("*/")[0];
+    expect(header).toContain("--strict-tree");
+    expect(header).toMatch(/Exit codes:.*3/s);
+  });
+});
+
+describe("Tested-tree: appears only for a complete, passing, stable run", () => {
+  const A = "c".repeat(40);
+  const B = "d".repeat(40);
+  const stable = () => ({ ok: true as const, id: A });
+  const pass = () => ({ ok: true, detail: "exit 0", ms: 1 });
+  const capture = (options: Parameters<typeof execute>[0]) => {
+    const lines: string[] = [];
+    execute({ platform: "darwin", run: pass, log: (line: string) => lines.push(line), ...options });
+    return lines.join("\n");
+  };
+  const evidence = /^Tested-tree: /m;
+
+  it("is the last line, with the tree id, when every gate ran and passed on a stable tree", () => {
+    const text = capture({ readTree: stable });
+    expect(text).toMatch(evidence);
+    expect(text.trimEnd().split("\n").at(-1)).toBe(`Tested-tree: ${A}`);
+  });
+
+  it("is absent when a gate failed", () => {
+    expect(capture({ readTree: stable, run: (g: { id: string }) => ({ ok: g.id !== "build", detail: "exit 1", ms: 1 }) })).not.toMatch(evidence);
+  });
+
+  it("is absent when a gate was skipped", () => {
+    expect(capture({ readTree: stable, platform: "linux" })).not.toMatch(evidence);
+  });
+
+  it("is absent when only some of the gates were given", () => {
+    expect(capture({ readTree: stable, gates: GATES.slice(0, 3) })).not.toMatch(evidence);
+  });
+
+  it("is absent when the tree changed or could not be read", () => {
+    let n = 0;
+    expect(capture({ readTree: () => ({ ok: true as const, id: n++ === 0 ? A : B }) })).not.toMatch(evidence);
+    let m = 0;
+    expect(
+      capture({ readTree: () => (m++ === 0 ? { ok: true as const, id: A } : { ok: false as const, reason: "x" }) }),
+    ).not.toMatch(evidence);
   });
 });
