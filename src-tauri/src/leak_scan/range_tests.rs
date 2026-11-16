@@ -419,6 +419,77 @@ fn pushing_the_current_branch_does_not_read_other_branches_unless_git_would_send
 }
 
 #[test]
+fn a_mirror_or_a_configured_refspec_is_read_beyond_branches_and_tags() {
+    // A backup or snapshot ref is neither a branch nor a tag, and git pushes
+    // it all the same under `--mirror` or a refspec such as `refs/*:refs/*`.
+    let pair = Pair::new();
+    git_in(pair.work.path(), &["checkout", "-q", "-b", "scratch"]);
+    pair.commit("k.env", &format!("AWS={}\n", aws_key_id()), "key");
+    git_in(
+        pair.work.path(),
+        &["update-ref", "refs/backup/keep", "HEAD"],
+    );
+    git_in(pair.work.path(), &["checkout", "-q", "main"]);
+    git_in(pair.work.path(), &["branch", "-q", "-D", "scratch"]);
+    let guard = || {
+        guard_push_within(
+            pair.work.path(),
+            None,
+            PushRefs::Branch(None),
+            ENFORCE,
+            RangeLimits::DEFAULT,
+        )
+    };
+    guard().expect("a plain push sends only main");
+
+    git_in(
+        pair.work.path(),
+        &["config", "remote.origin.mirror", "true"],
+    );
+    let sent = out(
+        pair.work.path(),
+        &["push", "--dry-run", "--porcelain", "origin"],
+    );
+    assert!(sent.contains("refs/backup/keep"), "git sends it: {sent}");
+    let err = guard().expect_err("a mirror push sends the backup ref");
+    assert_eq!(err.kind(), IpcErrorKind::SecretScanBlocked);
+
+    git_in(
+        pair.work.path(),
+        &["config", "--unset", "remote.origin.mirror"],
+    );
+    git_in(
+        pair.work.path(),
+        &["config", "remote.origin.push", "refs/*:refs/*"],
+    );
+    let sent = out(
+        pair.work.path(),
+        &["push", "--dry-run", "--porcelain", "origin"],
+    );
+    assert!(sent.contains("refs/backup/keep"), "git sends it: {sent}");
+    let err = guard().expect_err("refs/*:refs/* sends the backup ref");
+    assert_eq!(err.kind(), IpcErrorKind::SecretScanBlocked);
+
+    // A refspec that names one branch reads that branch, not every ref: the
+    // snapshot refs GitPulse keeps must not block a push that leaves them.
+    git_in(
+        pair.work.path(),
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.push",
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    let sent = out(
+        pair.work.path(),
+        &["push", "--dry-run", "--porcelain", "origin"],
+    );
+    assert!(!sent.contains("refs/backup/keep"), "git leaves it: {sent}");
+    guard().expect("a one-branch refspec does not send the backup ref");
+}
+
+#[test]
 fn a_remote_nested_under_another_name_does_not_lend_it_its_refs() {
     let pair = Pair::new();
     let fork = TempDir::new().unwrap();

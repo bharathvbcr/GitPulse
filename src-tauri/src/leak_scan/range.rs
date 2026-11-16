@@ -22,11 +22,17 @@
 //! tracking ref was never pruned still counts as the remote's. A stale ref in
 //! the other direction (the remote moved on) only makes the scan read more.
 //!
-//! **Which refs.** The branch the push names; otherwise the current branch,
-//! unless `remote.<name>.push` or `remote.<name>.mirror` is configured or
-//! `push.default` is `matching`, in which case every local branch and tag —
-//! more than git may send, never less. A tag pointing at a tree or blob
-//! rather than a commit is counted as a skip.
+//! **Which refs.** The branch the push names; otherwise what git would push
+//! with no arguments, always read as a superset of what it sends:
+//! - `remote.<name>.mirror`: every ref under `refs/`. A mirror sends
+//!   backups, snapshots and notes too, not only branches and tags.
+//! - `remote.<name>.push` refspecs: each one's source. A glob reads every ref
+//!   under its prefix, `:` reads every branch and tag, and a plain source
+//!   reads the revision it names.
+//! - `push.default=matching`: every local branch and tag.
+//! - Otherwise: the current branch.
+//!
+//! A ref pointing at a tree or blob rather than a commit is counted as a skip.
 //!
 //! **Merges.** A merge is read with `--remerge-diff`: its diff against what
 //! git's own merge of its parents would have produced, so the lines a person
@@ -175,6 +181,59 @@ fn ref_commits(
     Ok(())
 }
 
+/// The commit a pushed name resolves to. Git resolves it the way it resolves
+/// any revision, so a name with no branch behind it can still push a tag.
+fn named_commit(
+    repo: &Path,
+    name: &str,
+    include: &mut Vec<String>,
+    non_commits: &mut Vec<String>,
+) -> Result<(), ScanFailure> {
+    if let Some(oid) = optional(repo, &["rev-parse", "--verify", "--quiet", name])? {
+        let peeled = format!("{oid}^{{commit}}");
+        match optional(repo, &["rev-parse", "--verify", "--quiet", &peeled])? {
+            Some(commit) => include.push(commit),
+            None => non_commits.push(name.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// What one configured `remote.<name>.push` refspec sends, read as a
+/// superset: a glob source reads every ref under its prefix, `:` (matching)
+/// every branch and tag, and a plain source the revision it names. A refspec
+/// with no source deletes a remote ref and sends nothing.
+fn refspec_commits(
+    repo: &Path,
+    refspec: &str,
+    include: &mut Vec<String>,
+    non_commits: &mut Vec<String>,
+) -> Result<(), ScanFailure> {
+    let spec = refspec.trim_start_matches('+');
+    if spec.starts_with('^') {
+        // A negative refspec only narrows the others; reading more is safe.
+        return Ok(());
+    }
+    if spec == ":" {
+        return ref_commits(repo, &["refs/heads/", "refs/tags/"], include, non_commits);
+    }
+    let source = spec.split_once(':').map_or(spec, |(source, _)| source);
+    if source.is_empty() {
+        return Ok(());
+    }
+    match source.split_once('*') {
+        Some((prefix, _)) => {
+            // `for-each-ref` matches a pattern ending in `/` as a prefix.
+            let prefix = match prefix.rfind('/') {
+                Some(slash) => &prefix[..=slash],
+                None => "refs/",
+            };
+            ref_commits(repo, &[prefix], include, non_commits)
+        }
+        None => named_commit(repo, source, include, non_commits),
+    }
+}
+
 /// Resolve what a push of `refs` to `remote` (or the remote git would push
 /// to) sends. See the module documentation for the rules.
 pub fn resolve_push(
@@ -217,15 +276,7 @@ pub fn resolve_push(
             ref_commits(repo, &[&pattern], &mut include, &mut non_commits)?;
         }
         PushRefs::Branch(Some(branch)) => {
-            // Git resolves a pushed name the way it resolves any revision, so
-            // a name with no branch behind it can still push a tag.
-            if let Some(oid) = optional(repo, &["rev-parse", "--verify", "--quiet", branch])? {
-                let peeled = format!("{oid}^{{commit}}");
-                match optional(repo, &["rev-parse", "--verify", "--quiet", &peeled])? {
-                    Some(commit) => include.push(commit),
-                    None => non_commits.push(branch.to_string()),
-                }
-            }
+            named_commit(repo, branch, &mut include, &mut non_commits)?;
         }
         PushRefs::Branch(None) => {
             let refspecs = optional(
@@ -242,10 +293,16 @@ pub fn resolve_push(
                 ],
             )?;
             let default = optional(repo, &["config", "--get", "push.default"])?;
-            if refspecs.is_some_and(|r| !r.is_empty())
-                || mirror.as_deref() == Some("true")
-                || default.as_deref() == Some("matching")
-            {
+            let refspecs = refspecs.filter(|r| !r.trim().is_empty());
+            if mirror.as_deref() == Some("true") {
+                // `--mirror` sends every ref under refs/, not only branches
+                // and tags: backups, snapshots, notes, other remotes' refs.
+                ref_commits(repo, &["refs/"], &mut include, &mut non_commits)?;
+            } else if let Some(refspecs) = refspecs {
+                for refspec in refspecs.lines().map(str::trim).filter(|r| !r.is_empty()) {
+                    refspec_commits(repo, refspec, &mut include, &mut non_commits)?;
+                }
+            } else if default.as_deref() == Some("matching") {
                 ref_commits(
                     repo,
                     &["refs/heads/", "refs/tags/"],
