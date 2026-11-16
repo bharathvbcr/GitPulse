@@ -2,7 +2,7 @@
 //! default, Kingfisher only when asked, and a scan with holes never clean.
 
 use super::primary::{scan_primary, scan_working_tree_with};
-use super::{ScanCompleteness, SecretLocation, SecretsReport};
+use super::{ScanCompleteness, SecretLocation};
 use crate::leak_scan::worktree::WorktreeLimits;
 use crate::leak_scan::ENGINE;
 use crate::test_support::{git_in, git_repo, write};
