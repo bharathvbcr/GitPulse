@@ -160,6 +160,9 @@ struct Finished {
 struct Slot {
     running: Option<Arc<Flight>>,
     last: Option<Finished>,
+    /// Passes in a row that ended cut short or failed, ending at `last`.
+    /// Zero after a pass that covered everything.
+    incomplete_streak: u32,
 }
 
 type Slots = Arc<Mutex<HashMap<String, Slot>>>;
@@ -169,27 +172,61 @@ type Slots = Arc<Mutex<HashMap<String, Slot>>>;
 pub(crate) struct Intervals {
     /// After a pass that covered everything and reported no error.
     pub complete: Duration,
-    /// After one that was cut short or failed, which has work still owed.
+    /// After the first pass in a row that was cut short or failed, which has
+    /// work still owed. Each further one in a row doubles it, up to
+    /// `incomplete_cap`.
     pub incomplete: Duration,
+    /// The longest the wait after a cut-short pass grows to.
+    pub incomplete_cap: Duration,
 }
 
-/// The default: a tab switch inside a minute is answered by the last pass.
+impl Intervals {
+    /// How long the last pass answers for, given how many passes in a row
+    /// (`streak`, at least one for an incomplete result) ended incomplete.
+    ///
+    /// A pass that is always cut short is retried at this pace, not at the
+    /// first interval for ever: each retry kills the git child the previous
+    /// pass left running, so a fixed short interval is a loop that never
+    /// finishes anything.
+    fn after(&self, last: &CatchUp, streak: u32) -> Duration {
+        if !(last.truncated || !last.error.is_empty()) {
+            return self.complete;
+        }
+        let doublings = streak.saturating_sub(1).min(32);
+        self.incomplete
+            .saturating_mul(1u32 << doublings)
+            .min(self.incomplete_cap.max(self.incomplete))
+    }
+}
+
+/// The default: a tab switch inside a minute is answered by the last pass, and
+/// a pass that keeps being cut short is retried after 10 s, 20 s, 40 s and so
+/// on up to five minutes.
 pub(crate) const INTERVALS: Intervals = Intervals {
     complete: Duration::from_secs(60),
     incomplete: Duration::from_secs(10),
+    incomplete_cap: Duration::from_secs(300),
 };
 
 /// Single-flight and minimum-interval bookkeeping, per key.
 pub(crate) struct Gate {
     slots: Slots,
     intervals: Intervals,
+    clock: Clock,
 }
 
 impl Gate {
     pub fn new(intervals: Intervals) -> Self {
+        Self::with_clock(intervals, Arc::new(Instant::now))
+    }
+
+    /// A gate whose intervals are measured on `clock`, so a test can move time
+    /// without sleeping.
+    pub fn with_clock(intervals: Intervals, clock: Clock) -> Self {
         Self {
             slots: Arc::new(Mutex::new(HashMap::new())),
             intervals,
+            clock,
         }
     }
 
@@ -209,12 +246,8 @@ impl Gate {
             let slot = slots.entry(key.to_string()).or_default();
             if slot.running.is_none() {
                 if let Some(last) = &slot.last {
-                    let interval = if last.result.truncated || !last.result.error.is_empty() {
-                        self.intervals.incomplete
-                    } else {
-                        self.intervals.complete
-                    };
-                    if last.at.elapsed() < interval {
+                    let interval = self.intervals.after(&last.result, slot.incomplete_streak);
+                    if (self.clock)().saturating_duration_since(last.at) < interval {
                         return last.result.clone();
                     }
                 }
@@ -227,7 +260,7 @@ impl Gate {
                         ready: Condvar::new(),
                         progress: Progress::default(),
                     });
-                    if let Err(error) = spawn(&self.slots, key, &flight, wait, work) {
+                    if let Err(error) = spawn(&self.slots, &self.clock, key, &flight, wait, work) {
                         return CatchUp {
                             truncated: true,
                             error: format!("catch-up could not start: {error}"),
@@ -247,6 +280,7 @@ impl Gate {
 /// whether or not anyone is still waiting.
 fn spawn<F>(
     slots: &Slots,
+    clock: &Clock,
     key: &str,
     flight: &Arc<Flight>,
     wait: Duration,
@@ -256,6 +290,7 @@ where
     F: FnOnce(&Budget, &Progress) -> CatchUp + Send + 'static,
 {
     let slots = Arc::clone(slots);
+    let clock = Arc::clone(clock);
     let flight = Arc::clone(flight);
     let key = key.to_string();
     // The worker catches its own panic and turns it into the pass's reported
@@ -284,8 +319,13 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let slot = slots.entry(key).or_default();
             slot.running = None;
+            slot.incomplete_streak = if result.truncated || !result.error.is_empty() {
+                slot.incomplete_streak.saturating_add(1)
+            } else {
+                0
+            };
             slot.last = Some(Finished {
-                at: Instant::now(),
+                at: clock(),
                 result: result.clone(),
             });
         }
@@ -322,6 +362,7 @@ where
     Gate::new(Intervals {
         complete: Duration::ZERO,
         incomplete: Duration::ZERO,
+        incomplete_cap: Duration::ZERO,
     })
     .run("bounded", wait, work)
 }
@@ -341,6 +382,7 @@ mod tests {
         Intervals {
             complete: Duration::from_secs(60),
             incomplete: Duration::from_secs(1),
+            incomplete_cap: Duration::from_secs(1),
         }
     }
 
@@ -475,6 +517,7 @@ mod tests {
         let gate = Gate::new(Intervals {
             complete: Duration::from_secs(60),
             incomplete: Duration::from_secs(60),
+            incomplete_cap: Duration::from_secs(60),
         });
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let first = gate.run("/repo", Duration::from_millis(50), move |_, _| {
@@ -528,5 +571,100 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
         pass(&runs);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// One pass through `gate` on the manual clock's key `/repo`, counting runs
+    /// and ending as `truncated` says.
+    fn timed_pass(gate: &Gate, runs: &Arc<AtomicUsize>, truncated: bool) -> CatchUp {
+        let counted = Arc::clone(runs);
+        gate.run("/repo", Duration::from_secs(5), move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            CatchUp {
+                truncated,
+                error: if truncated {
+                    "catch-up truncated".into()
+                } else {
+                    String::new()
+                },
+                ..CatchUp::default()
+            }
+        })
+    }
+
+    /// A pass that is cut short every time was retried every ten seconds for
+    /// ever, and each retry killed the git child the last one left running.
+    /// The wait doubles with each consecutive incomplete pass up to the cap,
+    /// and a call inside it is answered from the last pass without a new one.
+    #[test]
+    fn consecutive_incomplete_passes_back_off_up_to_the_cap() {
+        let (clock, offset) = manual_clock();
+        let gate = Gate::with_clock(
+            Intervals {
+                complete: Duration::from_secs(60),
+                incomplete: Duration::from_secs(10),
+                incomplete_cap: Duration::from_secs(40),
+            },
+            clock,
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+        let advance = |seconds: u64| {
+            *offset.lock().unwrap() += Duration::from_secs(seconds);
+        };
+        let count = || runs.load(Ordering::SeqCst);
+
+        timed_pass(&gate, &runs, true);
+        assert_eq!(count(), 1);
+        // Waits after the first, second, third and fourth incomplete pass:
+        // 10 s, 20 s, 40 s, then held at the cap of 40 s.
+        for (pass, wait) in [(2, 10), (3, 20), (4, 40), (5, 40)] {
+            advance(wait - 1);
+            let answered = timed_pass(&gate, &runs, true);
+            assert!(answered.truncated);
+            assert_eq!(count(), pass - 1, "pass {pass} started {wait} s early");
+            advance(1);
+            timed_pass(&gate, &runs, true);
+            assert_eq!(count(), pass, "pass {pass} did not start after {wait} s");
+        }
+    }
+
+    /// The backoff is owed to the work, so a pass that finishes ends it: the
+    /// next incomplete pass is retried after the first interval again.
+    #[test]
+    fn a_completed_pass_resets_the_backoff() {
+        let (clock, offset) = manual_clock();
+        let gate = Gate::with_clock(
+            Intervals {
+                complete: Duration::from_secs(60),
+                incomplete: Duration::from_secs(10),
+                incomplete_cap: Duration::from_secs(300),
+            },
+            clock,
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+        let advance = |seconds: u64| {
+            *offset.lock().unwrap() += Duration::from_secs(seconds);
+        };
+        let count = || runs.load(Ordering::SeqCst);
+
+        timed_pass(&gate, &runs, true);
+        advance(10);
+        timed_pass(&gate, &runs, true);
+        advance(20);
+        let done = timed_pass(&gate, &runs, false);
+        assert!(!done.truncated);
+        assert_eq!(count(), 3);
+        // A complete pass answers for a minute.
+        advance(59);
+        timed_pass(&gate, &runs, true);
+        assert_eq!(count(), 3);
+        advance(1);
+        let cut = timed_pass(&gate, &runs, true);
+        assert!(cut.truncated);
+        assert_eq!(count(), 4);
+        // The streak began again: ten seconds, not the forty the earlier two
+        // incomplete passes would have owed.
+        advance(10);
+        timed_pass(&gate, &runs, true);
+        assert_eq!(count(), 5, "the backoff survived a completed pass");
     }
 }
