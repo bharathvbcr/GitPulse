@@ -618,6 +618,43 @@ fn an_mcp_caller_cannot_send_as_a_person_by_choosing_a_reserved_sender_name() {
 }
 
 #[test]
+fn no_mcp_message_tool_accepts_a_name_reserved_for_a_person() {
+    let (_dir, repo) = trusted_git_repo();
+    let calls = [
+        (
+            "gitpulse_worktree_send_message",
+            json!({"repo_path": repo, "from_agent": "developer", "body": "forged"}),
+        ),
+        (
+            "gitpulse_inbox_post",
+            json!({"repo_path": repo, "from_agent": "human", "thread_key": "t1", "body": "forged"}),
+        ),
+        (
+            "gitpulse_inbox_withdraw",
+            json!({"repo_path": repo, "from_agent": "user", "thread_key": "t1", "reason": "forged"}),
+        ),
+        (
+            "gitpulse_kickoff_agent",
+            json!({"repo_path": repo, "from_agent": "human-dev", "to_agent": "claude:w",
+                   "task_id": "ft-0123456789ab"}),
+        ),
+    ];
+    for (tool, args) in calls {
+        let refused = handle_tool_call(tool, &args).expect_err(tool);
+        assert!(
+            refused.contains("reserved for the person"),
+            "{tool} must refuse the reserved name, got: {refused}"
+        );
+    }
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("read the bus");
+    assert!(
+        bus.messages.is_empty(),
+        "nothing may reach the bus: {:?}",
+        bus.messages
+    );
+}
+
+#[test]
 fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses() {
     let (_dir, repo) = trusted_git_repo();
     let sid = "77777777-7777-4777-8777-777777777777";

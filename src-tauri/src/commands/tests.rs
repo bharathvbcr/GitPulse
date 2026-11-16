@@ -2086,3 +2086,38 @@ fn every_off_thread_body_is_written_inside_its_command() {
         "off_thread bodies outside their cmd_* function lose the command's name; use off_thread_for: {strays:?}"
     );
 }
+
+/// The app UI sends as `developer` through these Tauri commands, and that is the one
+/// entry point that may: the message is a person's (hop 0). The same name from an agent
+/// entry point is refused (see `mcp::a2a_tests`).
+#[test]
+fn the_app_ui_commands_still_post_as_a_person_at_hop_zero() {
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+
+    let sent = tauri::async_runtime::block_on(worktrees::cmd_worktree_send_message(
+        root.clone(),
+        "developer".into(),
+        Some("claude:peer".into()),
+        None,
+        Some("note".into()),
+        "from the app".into(),
+        None,
+    ))
+    .expect("the UI command accepts the person's name");
+    assert_eq!(sent.message.from_agent, "developer");
+    assert_eq!(sent.message.hop, Some(0));
+
+    let posted = tauri::async_runtime::block_on(worktrees::cmd_inbox_post(
+        root,
+        "developer".into(),
+        Some("claude:peer".into()),
+        "ui-thread".into(),
+        Some("reply".into()),
+        None,
+        "answer from the app".into(),
+        None,
+    ))
+    .expect("the inbox command accepts the person's name");
+    assert_eq!(posted.message.hop, Some(0));
+}

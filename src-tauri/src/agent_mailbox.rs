@@ -692,17 +692,10 @@ impl Mailbox {
         session: &str,
         now: SystemTime,
     ) -> Result<Option<Claim>, MailboxError> {
-        Ok(self.claim_envelope_next(session, now)?.map(|env| env.claim))
-    }
-
-    /// Takes the oldest pending envelope along with its [`EnvelopeProvenance`].
-    pub(crate) fn claim_envelope_next(
-        &self,
-        session: &str,
-        now: SystemTime,
-    ) -> Result<Option<ClaimedEnvelope>, MailboxError> {
-        let mut batch = self.try_claim_batch(session, 1, now)?;
-        Ok(batch.pop())
+        Ok(self
+            .try_claim_batch(session, 1, now)?
+            .pop()
+            .map(|env| env.claim))
     }
 
     /// Non-blocking batch claim of up to `max_items` oldest pending envelopes
@@ -1162,7 +1155,11 @@ impl Mailbox {
             if let Some(reason) = self.peek_rejected_by(&key, &dir, SystemTime::now(), &accept)? {
                 return Ok(EnvelopeWait::Declined(reason));
             }
-            if let Some(envelope) = self.claim_envelope_next(&key, SystemTime::now())? {
+            // Claim through the filter the peek used: another consumer may have taken what
+            // was peeked, and an unfiltered claim would then hand over the next message even
+            // when it is a peer message at its hop limit.
+            let mut claimed = self.try_claim_batch_filtered(&key, 1, SystemTime::now(), &accept)?;
+            if let Some(envelope) = claimed.pop() {
                 return Ok(EnvelopeWait::Message(envelope));
             }
             let spent = started.elapsed();

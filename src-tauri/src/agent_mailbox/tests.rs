@@ -825,6 +825,50 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
 }
 
 #[test]
+fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_stays_pending() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    let peer = |id: &str, hop: u32| EnvelopeProvenance::PeerAgent {
+        msg_id: id.into(),
+        from_peer: "claude:coder".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop,
+        max_hops: 6,
+        truncated_in_bus: false,
+        repo_root: "/tmp/repo".into(),
+    };
+    // The oldest envelope has lost its sidecar, so the peek lets it through and the claim
+    // drops it; the next one is a peer message at its hop limit.
+    mailbox
+        .deposit_with_provenance(SESSION, "lost-2", "no provenance", peer("lost-2", 1), now)
+        .unwrap();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer("at-limit", 6),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let key = session_key(SESSION).unwrap();
+    std::fs::remove_file(mailbox.meta_path(&key, "lost-2")).unwrap();
+
+    let outcome = mailbox
+        .wait_in_pool_filtered(SESSION, Duration::from_secs(2), WaitPool::Hosted, |prov| {
+            !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
+        })
+        .unwrap();
+    assert!(
+        matches!(outcome, EnvelopeWait::Declined(_)),
+        "a hop-limited peer message must not be handed to the waiter: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+}
+
+#[test]
 fn the_app_ui_deposit_still_arrives_as_human_confirmed_with_a_sidecar() {
     let (_dir, mailbox) = mailbox();
     let now = SystemTime::now();

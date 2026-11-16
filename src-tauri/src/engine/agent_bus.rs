@@ -850,6 +850,17 @@ fn is_reserved_person_name(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
+/// Refuses a sender name reserved for a person. Every agent entry point calls this before it
+/// acts on the name, and [`post_peer_message`] calls it again for the posts it owns.
+pub fn require_agent_sender(from_agent: &str) -> Result<(), CommandError> {
+    if is_reserved_person_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is a name reserved for the person using GitPulse; an agent must send as its own peer id",
+        ));
+    }
+    Ok(())
+}
+
 /// Posts a bounded agent-to-agent coordination message with an optional thread key.
 #[allow(clippy::too_many_arguments)]
 pub fn post_thread_message(
@@ -895,10 +906,8 @@ pub fn post_peer_message(
     hop: u32,
     max_hops: u32,
 ) -> Result<AgentBusMessage, CommandError> {
-    if origin == MessageOrigin::Agent && is_reserved_person_name(from_agent) {
-        return Err(CommandError::from(
-            "from_agent is a name reserved for the person using GitPulse; an agent must send as its own peer id",
-        ));
+    if origin == MessageOrigin::Agent {
+        require_agent_sender(from_agent)?;
     }
     let hop = origin.effective_hop(hop);
     let from = sanitize_token("from_agent", from_agent, 128)?;
