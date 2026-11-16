@@ -599,3 +599,32 @@ fn the_claude_registration_says_which_profile_it_writes() {
     assert!(reg.detail.contains("CLAUDE_CONFIG_DIR"), "{}", reg.detail);
     assert!(reg.detail.contains("Copy setup prompt"), "{}", reg.detail);
 }
+
+#[test]
+fn json_answers_are_read_through_a_wrapper_notice_and_trailing_hook_noise() {
+    // What a real `claude` prints here, stdout and stderr merged: a shell
+    // wrapper's notice before the JSON and a SessionEnd hook line after it.
+    let fx = fixture();
+    let noisy = format!(
+        "claude: ignoring CLAUDE_CONFIG_DIR from the shell; this directory has no seat pin\n{}\nSessionEnd hook [/x/hook.sh] failed: Hook cancelled\n",
+        gitpulse_plugin(true)
+    );
+    let runner =
+        FakeRunner::new(vec![("/fake/bin/claude", false, NOT_FOUND)]).with_plugins(true, &noisy);
+    let plan = build_plan(&env(&fx, &runner, &only_claude));
+    let reg = action(&plan, "register:claude");
+    assert_eq!(reg.state, ConnectActionState::Done, "{}", reg.detail);
+
+    let mcp = fx.bundle.join("gitpulse-mcp");
+    let json = format!(
+        "warning: something\n{{\"name\":\"gitpulse\",\"transport\":{{\"type\":\"stdio\",\"command\":\"{}\"}}}}\ntrailing\n",
+        mcp.display()
+    );
+    let runner = FakeRunner::new(vec![("/fake/bin/codex", true, json.as_str())]);
+    let only_codex = |n: &str| (n == "codex").then(|| "/fake/bin/codex".to_string());
+    let plan = build_plan(&env(&fx, &runner, &only_codex));
+    assert_eq!(
+        action(&plan, "register:codex").state,
+        ConnectActionState::Done
+    );
+}

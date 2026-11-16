@@ -382,7 +382,7 @@ fn claude_plugin_server(program: &str, runner: &dyn CliRunner) -> PluginServer {
     if !run.success {
         return PluginServer::Unknown(cap(&run.output));
     }
-    let Ok(serde_json::Value::Array(plugins)) = serde_json::from_str(run.output.trim()) else {
+    let Some(serde_json::Value::Array(plugins)) = json_value(&run.output) else {
         return PluginServer::Unknown("its plugin list was not readable".into());
     };
     let serves_gitpulse = |servers: &serde_json::Map<String, serde_json::Value>| {
@@ -422,9 +422,30 @@ fn claude_command(output: &str) -> Option<String> {
         .map(|c| c.trim().to_string())
 }
 
+/// The first JSON value in a CLI's merged stdout and stderr. A wrapper can
+/// print a notice before it (a shell function around `claude` does here) and
+/// a hook can print a line after it, so the value is found at the first line
+/// that starts one and read alone, ignoring what follows.
+fn json_value(output: &str) -> Option<serde_json::Value> {
+    let mut offset = 0;
+    for line in output.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            let start = offset + (line.len() - trimmed.len());
+            let mut values = serde_json::Deserializer::from_str(&output[start..])
+                .into_iter::<serde_json::Value>();
+            if let Some(Ok(value)) = values.next() {
+                return Some(value);
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// The registered command out of `codex mcp get --json`.
 fn codex_command(output: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    let value = json_value(output)?;
     value
         .get("transport")?
         .get("command")?
