@@ -407,7 +407,7 @@ instead of leaving an unbounded buffer behind an apparently idle connection.
 4. Refresh the installed devmap/Manvi binaries from those validated sources.
    Run `bun run check:vendor-schema`, then `bun run ci:local` against the final
    GitPulse snapshot.
-5. Rebuild the native app and refresh MCP with `bun run mcp:install`. Verify
+5. Rebuild the native app and, for a source checkout, refresh MCP with `bun run mcp:install` (an app install picks up the bundled binaries it links through Connect). Verify
    `bun run mcp:doctor`, installed file hashes and a real code-intelligence
    query. Restart long-lived host processes to load the replacement binaries.
 
