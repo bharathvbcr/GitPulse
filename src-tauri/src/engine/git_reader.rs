@@ -15,7 +15,7 @@ use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -3852,18 +3852,29 @@ pub(crate) fn parse_pulse_stream(
 /// upstream remote, a lone configured remote, else "origin".
 #[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
-    default_remote_reads(repo, Reads::Cached).0
+    default_remote_from(
+        repo,
+        Reads::Cached,
+        config_snapshot_with(repo, Reads::Cached),
+    )
+    .0
 }
 
 /// [`resolve_default_remote`] plus the reason, when a read it depends on
 /// produced no answer (config, the current branch, the remote list). The name
 /// is then a guess built from "not set"; a caller guarding a destructive
-/// action refuses on the reason instead of trusting the guess.
-fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<CommandError>) {
+/// action refuses on the reason instead of trusting the guess. It takes a
+/// config the caller already read, so a caller that needed the config first
+/// (to name what it stamps) does not ask git for it a second time.
+fn default_remote_from(
+    repo: &Path,
+    reads: Reads,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> (String, Option<CommandError>) {
     let mut unread: Option<CommandError> = None;
     // One read of the effective config answers what used to be two
     // `config --get` processes and, usually, `git remote` too.
-    let config = match config_snapshot_with(repo, reads) {
+    let config = match config {
         Ok(config) => config,
         Err(error) => {
             unread = Some(error);
@@ -4186,6 +4197,107 @@ const DEFAULT_BASE_KEY: &str = "\0gitpulse:default-base";
 /// packed-ref files [`ref_cache`] always stamps.
 const DEFAULT_BASE_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
 
+/// The ref files [`default_base`] is a function of, named exactly, so that a
+/// branch another worktree commits on or a fetch of an unrelated remote branch
+/// does not move the stamp. Computing the answer reads the config, HEAD, the
+/// remote HEAD symref of whichever remote it settles on, and the oids of the
+/// candidate branches: `main`, `master`, `trunk` and `develop`, and the branch
+/// the remote HEAD names (as a local head and as a remote-tracking ref). With
+/// dozens of agents moving refs, the whole-namespace stamp was rarely three
+/// seconds old, so the answer was rarely kept and every catch-up pass paid the
+/// five-child lookup again.
+///
+/// The remote is a function of the config and HEAD's branch, so the candidates
+/// are every remote the config names, `origin` (the fallback), the configured
+/// default remote and the HEAD branch's remote. `None`, which makes the caller
+/// stamp the whole of [`DEFAULT_BASE_NAMESPACES`], when the files cannot name
+/// the inputs exactly: a reftable store, a legacy `.git/remotes` entry (no
+/// config key names it), a config that cannot be read, a name that is not a
+/// plain path, or a candidate that is itself a symref (it moves with another
+/// ref the single path does not see).
+fn narrow_default_base_namespaces(
+    repo: &Path,
+    config: Option<&HashMap<String, String>>,
+) -> Option<Vec<String>> {
+    let (private, common) = crate::repository_trust::git_directories(repo).ok()?;
+    if common.join("reftable").exists() || has_legacy_remotes(repo) {
+        return None;
+    }
+    let config = config?;
+    let mut remotes: BTreeSet<String> = configured_remotes(config).into_iter().collect();
+    remotes.insert("origin".to_string());
+    if let Some(default) = config.get("checkout.defaultremote") {
+        let default = default.trim();
+        if !default.is_empty() {
+            remotes.insert(default.to_string());
+        }
+    }
+    // HEAD is stamped on its own, so reading it here cannot go stale unseen.
+    let head = std::fs::read_to_string(private.join("HEAD")).ok();
+    let branch = head
+        .as_deref()
+        .and_then(|text| text.trim().strip_prefix("ref:"))
+        .and_then(|target| target.trim().strip_prefix("refs/heads/"));
+    if let Some(upstream) = branch.and_then(|branch| config.get(&format!("branch.{branch}.remote")))
+    {
+        let upstream = upstream.trim();
+        if !upstream.is_empty() {
+            remotes.insert(upstream.to_string());
+        }
+    }
+    let plain = |path: &str| {
+        Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    };
+    let read_ref = |path: &str| {
+        [&private, &common]
+            .into_iter()
+            .find_map(|dir| std::fs::read_to_string(dir.join(path)).ok())
+    };
+    let mut candidates: BTreeSet<String> = ["main", "master", "trunk", "develop"]
+        .iter()
+        .map(|name| format!("refs/heads/{name}"))
+        .collect();
+    let mut heads: BTreeSet<String> = BTreeSet::new();
+    for remote in &remotes {
+        let head_ref = remote_head_ref(remote);
+        if !plain(&head_ref) {
+            return None;
+        }
+        if let Some(content) = read_ref(&head_ref) {
+            if let Some(target) = content.trim().strip_prefix("ref:").map(str::trim) {
+                if let Some(short) = strip_remote_tracking(target, remote) {
+                    if !plain(target) || !plain(short) {
+                        return None;
+                    }
+                    candidates.insert(format!("refs/heads/{short}"));
+                    candidates.insert(target.to_string());
+                }
+            }
+        }
+        heads.insert(head_ref);
+    }
+    if candidates
+        .iter()
+        .any(|path| read_ref(path).is_some_and(|content| content.trim_start().starts_with("ref:")))
+    {
+        return None;
+    }
+    Some(candidates.into_iter().chain(heads).collect())
+}
+
+/// What [`default_base`] stamps: [`narrow_default_base_namespaces`], or the
+/// whole of [`DEFAULT_BASE_NAMESPACES`] when that cannot be said exactly.
+fn default_base_namespaces(repo: &Path, config: Option<&HashMap<String, String>>) -> Vec<String> {
+    narrow_default_base_namespaces(repo, config).unwrap_or_else(|| {
+        DEFAULT_BASE_NAMESPACES
+            .iter()
+            .map(|namespace| (*namespace).to_string())
+            .collect()
+    })
+}
+
 /// A complete answer's text, for the ref cache: six NUL-separated fields (the
 /// remote, then the remote HEAD and the base each as a presence flag followed
 /// by its value). Refnames, remote names and oids contain no NUL. An
@@ -4234,10 +4346,14 @@ fn decode_default_base(text: &str) -> Option<DefaultBase> {
 /// `refs/remotes` is seen at once, a stamp younger than the racy window is not
 /// trusted, and nothing is served past the cache's TTL. Never kept: an answer
 /// computed while any lookup was refused (it reads a refusal as "not set").
-fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> DefaultBase {
+fn default_base_cached(
+    repo: &Path,
+    stamp: Option<&ref_cache::Stamp>,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> DefaultBase {
     let mut computed = None;
     let answered = ref_cache::through_stamped(repo, &[DEFAULT_BASE_KEY], stamp, || {
-        let value = compute_default_base_with(repo, Reads::Cached);
+        let value = compute_default_base_from(repo, Reads::Cached, config);
         let keep = value.incomplete.is_none();
         let text = if keep {
             encode_default_base(&value)
@@ -4268,6 +4384,8 @@ fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> Default
 struct SharedBase {
     generation: u64,
     stamp: ref_cache::Stamp,
+    /// What `stamp` was read over, so a queued caller stamps the same files.
+    namespaces: Vec<String>,
     value: DefaultBase,
 }
 
@@ -4325,21 +4443,46 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         std::sync::Arc::clone(turns.entry(repo.to_path_buf()).or_default())
     };
     let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-    let stamp = ref_cache::stamp(repo, DEFAULT_BASE_NAMESPACES);
-    if let Some(stamp) = &stamp {
-        let shared = last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(repo)
-            .filter(|entry| entry.generation > arrived && &entry.stamp == stamp)
-            .map(|entry| entry.value.clone());
-        if let Some(value) = shared {
-            return value;
+    // The namespaces are read before the stamp and again after it, as
+    // `ref_cache::git_text_head` does for HEAD: if what they name moved in
+    // between, the stamp may not cover what the lookup reads, so nothing is
+    // kept under it.
+    //
+    // A caller that queued behind a leader first asks whether anything the
+    // leader stamped moved, over the leader's own namespaces: deriving its own
+    // could differ for a reason that is not a change (the leader's config read
+    // was refused and it stamped the whole namespaces; the follower's was not).
+    let led = last
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(repo)
+        .filter(|entry| entry.generation > arrived)
+        .cloned();
+    if let Some(led) = led {
+        let named: Vec<&str> = led.namespaces.iter().map(String::as_str).collect();
+        if ref_cache::stamp(repo, &named).is_some_and(|stamp| stamp == led.stamp) {
+            return led.value;
         }
     }
+    //
+    // The config is read once, to name the remotes, and handed to the lookup
+    // so a repository whose config is too young to be kept does not pay for
+    // the listing twice. Two stamps of the config files and HEAD alone bracket
+    // that read: if either moved across it, the lookup's config is not the one
+    // the stamp describes, and nothing is kept.
+    let bracket = ref_cache::stamp(repo, &[]);
+    let config = config_snapshot_with(repo, Reads::Cached);
+    let known = config.as_ref().ok();
+    let namespaces = default_base_namespaces(repo, known);
+    let named: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    let stamp = ref_cache::stamp(repo, &named);
+    let steady = default_base_namespaces(repo, known) == namespaces
+        && bracket
+            .is_some_and(|before| ref_cache::stamp(repo, &[]).is_some_and(|after| after == before));
+    let stamp = stamp.filter(|_| steady);
     // Stamped before the lookup: a write that races it leaves a stamp that no
     // longer matches, so a later caller does not take this answer.
-    let value = default_base_cached(repo, stamp.as_ref());
+    let value = default_base_cached(repo, stamp.as_ref(), config);
     if let Some(stamp) = stamp {
         let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
         if last.len() >= MAX_MEMOIZED_REPOS && !last.contains_key(repo) {
@@ -4350,6 +4493,7 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
             SharedBase {
                 generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 stamp,
+                namespaces,
                 value: value.clone(),
             },
         );
@@ -4374,8 +4518,18 @@ pub fn compute_default_base(repo: &Path) -> DefaultBase {
 /// [`default_base`] computes with [`Reads::Cached`] because its own answer is
 /// already bounded by the ref cache's stamp and TTL.
 fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
+    compute_default_base_from(repo, reads, config_snapshot_with(repo, reads))
+}
+
+/// [`compute_default_base_with`] over a config the caller already read. A
+/// refused read arrives as its `Err`, so it still sets `incomplete`.
+fn compute_default_base_from(
+    repo: &Path,
+    reads: Reads,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> DefaultBase {
     let failures_before = process::process_failures();
-    let (remote, mut unread) = default_remote_reads(repo, reads);
+    let (remote, mut unread) = default_remote_from(repo, reads, config);
     let head_ref = remote_head_ref(&remote);
     let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
         Ok(target) => target,
@@ -9519,6 +9673,109 @@ mod tests {
             crate::test_support::trust_repo(&link);
             let (_, _, spawned) = second_ask_over_unchanged_repo(&link);
             assert_eq!(spawned, 0, "symlinked spelling of the repository");
+        });
+    }
+
+    /// What an agent fleet does to a repository all day: commits on its own
+    /// branches in other worktrees and fetches of remote branches the default
+    /// base never reads. None of it changes the answer, so none of it may cost
+    /// a recompute once the stamp has settled.
+    #[test]
+    fn refs_the_default_base_does_not_read_do_not_cause_a_recompute() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let lane_parent = tempfile::TempDir::new().unwrap();
+            let lane = lane_parent.path().canonicalize().unwrap().join("lane");
+            let clock = ref_cache::ManualClock::install();
+            let _ = default_base(&repo);
+            clock.advance(std::time::Duration::from_secs(4));
+            let answer = default_base(&repo);
+            let children = || children_in(&repo);
+
+            let quiet = |what: &str, change: &dyn Fn()| {
+                change();
+                clock.advance(std::time::Duration::from_secs(4));
+                let before = children();
+                let seen = default_base(&repo);
+                // The first look after a change that did not move the stamp's
+                // inputs is a cache hit; a stamp that saw it recomputes (five
+                // children) and the next look hits.
+                assert_eq!(children() - before, 0, "{what} caused a recompute");
+                assert_eq!(seen, answer, "{what} changed the answer");
+            };
+
+            quiet("a new branch", &|| {
+                git_in(&repo, &["branch", "feature-x"]);
+            });
+            quiet("a commit in another worktree", &|| {
+                git_in(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "feature-y",
+                        lane.to_str().unwrap(),
+                    ],
+                );
+                git_in(&lane, &["commit", "--allow-empty", "-m", "elsewhere"]);
+            });
+            quiet("a fetch of an unrelated remote branch", &|| {
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/feature-x", "HEAD"],
+                );
+            });
+            quiet("a fetch from an unrelated remote", &|| {
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/fork/feature-x", "HEAD"],
+                );
+            });
+        });
+    }
+
+    /// The stamp names the candidate branches and each remote's HEAD, and falls
+    /// back to the whole ref namespaces for the inputs it cannot name exactly:
+    /// a candidate that is a symref moves with a ref the stamp would not see.
+    #[test]
+    fn the_default_base_stamp_is_narrow_and_falls_back_when_it_cannot_name_its_inputs() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let config = config_snapshot_with(&repo, Reads::Cached).ok();
+            let narrow =
+                narrow_default_base_namespaces(&repo, config.as_ref()).expect("a plain repository");
+            for named in [
+                "refs/heads/main",
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/HEAD",
+            ] {
+                assert!(
+                    narrow.iter().any(|path| path == named),
+                    "{named}: {narrow:?}"
+                );
+            }
+            assert!(
+                !narrow
+                    .iter()
+                    .any(|path| path == "refs/heads" || path == "refs/remotes"),
+                "{narrow:?}"
+            );
+
+            git_in(
+                &repo,
+                &["symbolic-ref", "refs/heads/master", "refs/heads/main"],
+            );
+            assert_eq!(narrow_default_base_namespaces(&repo, config.as_ref()), None);
+            let whole = default_base_namespaces(&repo, config.as_ref());
+            assert_eq!(whole, ["refs/heads", "refs/remotes"]);
         });
     }
 
