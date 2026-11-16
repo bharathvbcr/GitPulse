@@ -382,6 +382,12 @@ pub(super) fn classify(command: &str) -> Classified {
         return out;
     }
     scan(command, 0, &mut out);
+    // Only a directory the line spells out: the lexer expands `~` and
+    // `$HOME`, `$USER`, `$LOGNAME` from this process's environment, which for an
+    // orchestrated terminal is the app's, not the session's. A path that is not
+    // in the raw text as written is one of those, and is not seen.
+    out.build_dirs
+        .retain(|dir| !dir.contains(['$', '`', '~']) && command.contains(dir.as_str()));
     out
 }
 
@@ -452,7 +458,10 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
         let Some(word) = words.get(at) else { return };
         if is_assignment(word) || KEYWORDS.contains(&word.as_str()) {
             if let Some(("RUSTFLAGS", flags)) = word.split_once('=') {
-                instrumented |= flags.replace(' ', "").contains("-Cinstrument-coverage");
+                instrumented |= flags
+                    .replace([' ', '_'], "-")
+                    .replace("-C-", "-C")
+                    .contains("-Cinstrument-coverage");
             }
             if let Some(("CARGO_TARGET_DIR", dir)) = word.split_once('=') {
                 out.note_build_dir(dir);
@@ -475,7 +484,9 @@ fn classify_words(words: &[String], depth: usize, out: &mut Classified) {
             Some(w) => {
                 at = skip_options(words, at + 1, w.value_flags);
                 if !w.verbs.is_empty() {
-                    at += 1;
+                    // Options of the verb come before its operands:
+                    // `rustup run --install stable cargo test`.
+                    at = skip_options(words, at + 1, w.value_flags);
                 }
                 at += w.operands;
             }

@@ -437,3 +437,27 @@ fn literal_absolute_build_directories_are_named_and_relative_ones_are_not() {
     // After a bare `--` the words are the test binary's.
     assert!(dirs("cargo test -- --target-dir /small/t").is_empty());
 }
+
+#[test]
+fn the_underscore_spelling_of_instrument_coverage_counts_and_rustup_run_options_are_skipped() {
+    for command in [
+        "RUSTFLAGS=-Cinstrument_coverage cargo test",
+        "RUSTFLAGS=\"-C instrument_coverage\" cargo build",
+        "rustup run --install nightly cargo test",
+    ] {
+        assert!(heavy(command).is_some(), "{command}");
+    }
+    assert_eq!(
+        coverage("RUSTFLAGS=-Cinstrument_coverage cargo test"),
+        Some(true)
+    );
+    assert_eq!(
+        coverage("RUSTFLAGS=\"-C instrument_coverage\" cargo build"),
+        Some(true)
+    );
+    assert_eq!(
+        coverage("rustup run --install nightly cargo test"),
+        Some(false)
+    );
+    assert_eq!(heavy("rustup run --install nightly rustc -V"), None);
+}

@@ -39,7 +39,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         state_dir: dir.join("state"),
         now: SystemTime::now(),
         disk: plenty_of_disk(),
-        read_free: |_| None,
+        read_free: |_| Free::Missing,
     }
 }
 
@@ -1293,11 +1293,13 @@ fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_vol
     let here = PathBuf::from("/volumes/big/hook");
     let read = |path: &Path| {
         if path == there {
-            Some(5 * GIB)
+            Free::Bytes(5 * GIB)
         } else if path == here {
-            Some(500 * GIB)
+            Free::Bytes(500 * GIB)
+        } else if path == Path::new("/denied") {
+            Free::Unreadable
         } else {
-            None
+            Free::Missing
         }
     };
     assert_eq!(
@@ -1311,7 +1313,7 @@ fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_vol
         "no cwd was given: the process's directory is the best guess"
     );
     // A cwd that was given and cannot be read is not "has room".
-    for cwd in ["/gone", "relative/dir", "."] {
+    for cwd in ["/gone", "/denied", "relative/dir", "."] {
         assert_eq!(
             live_free_bytes(cwd, Some(here.clone()), read),
             None,
@@ -1319,18 +1321,24 @@ fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_vol
         );
     }
     assert_eq!(live_free_bytes("", None, read), None);
-    assert_eq!(live_free_bytes("", Some(here), |_| None), None);
+    assert_eq!(live_free_bytes("", Some(here), |_| Free::Unreadable), None);
 }
 
-/// A reader for the build-directory tests: `/small` is 5 GiB free, `/big` is
-/// 500, anything else (a directory that does not exist yet) cannot be read.
-fn volumes(path: &Path) -> Option<u64> {
+/// A reader for the build-directory tests. `/` is 200 GiB (a reader that
+/// returned nothing for it would hide the walk-up), `/small` 5 GiB, `/big`
+/// 500; `/denied` and below exist and cannot be read; anything else does not
+/// exist.
+fn volumes(path: &Path) -> Free {
     if path == Path::new("/small") {
-        Some(5 * GIB)
+        Free::Bytes(5 * GIB)
     } else if path == Path::new("/big") {
-        Some(500 * GIB)
+        Free::Bytes(500 * GIB)
+    } else if path == Path::new("/") {
+        Free::Bytes(200 * GIB)
+    } else if path.starts_with("/denied") && path != Path::new("/denied/new") {
+        Free::Unreadable
     } else {
-        None
+        Free::Missing
     }
 }
 
@@ -1376,19 +1384,91 @@ fn a_literal_absolute_build_directory_is_read_too_and_the_stricter_answer_wins()
         &on_volumes(dir.path(), 200)
     )
     .is_silent());
-    // A relative or computed directory is not read: the working directory's
-    // answer stands.
+    // A directory that does not exist yet reads its nearest existing ancestor,
+    // and `/` is a real volume here: this is the walk-up, not a miss.
     assert!(judged(
-        "cargo build --target-dir target",
+        "cargo build --target-dir /nowhere/new/t",
         &on_volumes(dir.path(), 200)
     )
     .is_silent());
-    // An unreadable target volume adds nothing; the working directory decides.
-    assert!(judged(
-        "cargo build --target-dir /nowhere/t",
-        &on_volumes(dir.path(), 200)
-    )
-    .is_silent());
+}
+
+#[test]
+fn has_room_needs_every_location_read_and_a_short_one_still_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    // The cwd could not be read, the target directory can and has room: not
+    // "has room" (advice that it could not check), and never a refusal.
+    let mut g = on_volumes(dir.path(), 200);
+    g.disk.free_bytes = None;
+    let out = judged("cargo build --target-dir /big/t", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+    // The same with the target directory the one that is short: its own
+    // number refuses, whatever the cwd did.
+    let out = judged("cargo build --target-dir /small/t", &g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(reason(&out).contains("5.0 GiB"), "{}", reason(&out));
+    // The cwd was read and has room; the target directory is unreadable. A
+    // fresh state directory: the first block already said so once this session.
+    let fresh = tempfile::tempdir().unwrap();
+    let g = on_volumes(fresh.path(), 200);
+    let out = judged("cargo build --target-dir /denied/t", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+}
+
+#[test]
+fn an_unreadable_directory_is_not_replaced_by_its_ancestors_volume() {
+    // `/denied/t` exists and cannot be read; `/` could be, and has room.
+    assert_eq!(free_at_or_above(Path::new("/denied/t"), volumes), None);
+    // `/denied/new` is missing, and `/denied` above it is unreadable: stop.
+    assert_eq!(free_at_or_above(Path::new("/denied/new/t"), volumes), None);
+    // Missing all the way up reads the first volume that exists.
+    assert_eq!(
+        free_at_or_above(Path::new("/nowhere/a/b"), volumes),
+        Some(200 * GIB)
+    );
+    assert_eq!(
+        free_at_or_above(Path::new("/small/a/b"), volumes),
+        Some(5 * GIB)
+    );
+}
+
+#[test]
+fn only_a_literal_absolute_directory_is_seen_never_one_the_hook_expands() {
+    let dir = tempfile::tempdir().unwrap();
+    // The lexer would expand these from this process's environment, which for
+    // an orchestrated terminal is the app's: they are not seen, so the working
+    // directory decides alone.
+    for command in [
+        "cargo build --target-dir ~/target",
+        "cargo build --target-dir=~/target",
+        "CARGO_TARGET_DIR=~/target cargo build",
+        "cargo build --target-dir $HOME/target",
+        "cargo build --target-dir \"$HOME/target\"",
+        "cargo build --target-dir ${HOME}/target",
+        "CARGO_TARGET_DIR=$TMPDIR/t cargo build",
+        "cargo build --target-dir /small/$X",
+    ] {
+        assert!(
+            classify(command).build_dirs.is_empty(),
+            "{command}: {:?}",
+            classify(command).build_dirs
+        );
+    }
+    assert_eq!(
+        classify("cargo build --target-dir /small/t").build_dirs,
+        ["/small/t"]
+    );
+    assert!(judged("cargo build --target-dir ~/t", &on_volumes(dir.path(), 200)).is_silent());
 }
 
 #[test]
@@ -1398,10 +1478,18 @@ fn a_directory_changed_into_by_the_line_is_not_covered_and_the_docs_say_so() {
     // without evaluating the shell: only the cwd it was given is read.
     assert!(judged("cd /small && cargo build", &on_volumes(dir.path(), 200)).is_silent());
     let docs = include_str!("../../../docs/LOAD_GOVERNOR.md");
-    assert!(
-        docs.contains("cd /elsewhere && cargo build"),
-        "the uncovered case is named"
-    );
+    for named in [
+        "cd /elsewhere && cargo build",
+        "export CARGO_TARGET_DIR",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "build.target-dir",
+        "--target-dir=~/x",
+    ] {
+        assert!(
+            docs.contains(named),
+            "the uncovered case {named:?} is named"
+        );
+    }
 }
 
 #[test]

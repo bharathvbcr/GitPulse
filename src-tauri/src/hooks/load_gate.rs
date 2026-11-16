@@ -120,7 +120,18 @@ pub(super) struct Gathered {
     /// the real reader, or a stand-in a test injects. It reads the volumes a
     /// line names as its build directory, which are known only once the line
     /// has been classified.
-    pub read_free: fn(&Path) -> Option<u64>,
+    pub read_free: fn(&Path) -> Free,
+}
+
+/// What reading one location's free space found. A missing path is told from
+/// an unreadable one because only a missing path says nothing about the volume:
+/// the nearest ancestor that exists is read in its place, while an unreadable
+/// one is "could not read" and is never replaced by its ancestor's volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Free {
+    Bytes(u64),
+    Missing,
+    Unreadable,
 }
 
 /// What the disk checks need, read once per heavy command.
@@ -258,8 +269,14 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
 }
 
 /// The real reader of [`Gathered::read_free`].
-fn real_free(path: &Path) -> Option<u64> {
-    crate::sysload::free_bytes(path).value()
+fn real_free(path: &Path) -> Free {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Free::Missing,
+        Err(_) => Free::Unreadable,
+        Ok(_) => crate::sysload::free_bytes(path)
+            .value()
+            .map_or(Free::Unreadable, Free::Bytes),
+    }
 }
 
 /// Free bytes on the volume the command writes to, read now: the working
@@ -275,31 +292,57 @@ fn real_free(path: &Path) -> Option<u64> {
 fn live_free_bytes(
     cwd: &str,
     process_dir: Option<PathBuf>,
-    read: impl Fn(&Path) -> Option<u64>,
+    read: impl Fn(&Path) -> Free,
 ) -> Option<u64> {
-    if cwd.is_empty() {
-        return process_dir.and_then(|dir| read(&dir));
+    let dir = if cwd.is_empty() {
+        process_dir?
+    } else if Path::new(cwd).is_absolute() {
+        PathBuf::from(cwd)
+    } else {
+        return None;
+    };
+    match read(&dir) {
+        Free::Bytes(bytes) => Some(bytes),
+        Free::Missing | Free::Unreadable => None,
     }
-    let dir = Path::new(cwd);
-    dir.is_absolute().then(|| read(dir)).flatten()
 }
 
-/// Free space on a build directory's volume: that of its nearest ancestor
-/// that can be read, since the directory itself may not exist yet.
-fn free_at_or_above(dir: &Path, read: impl Fn(&Path) -> Option<u64>) -> Option<u64> {
-    dir.ancestors().find_map(read)
+/// Free space on a build directory's volume: that of the nearest ancestor
+/// that exists, since the directory itself may not yet. An ancestor that exists
+/// and cannot be read stops the walk: that is "could not read", not the
+/// volume of a directory above it.
+fn free_at_or_above(dir: &Path, read: impl Fn(&Path) -> Free) -> Option<u64> {
+    for ancestor in dir.ancestors() {
+        match read(ancestor) {
+            Free::Bytes(bytes) => return Some(bytes),
+            Free::Missing => continue,
+            Free::Unreadable => return None,
+        }
+    }
+    None
 }
 
-/// The free space a heavy line is judged on: the smallest reading among the
-/// volume it runs in and the build directories it names literally. A volume
-/// that cannot be read adds nothing; none readable is `None`.
-fn effective_free(cwd_free: Option<u64>, classified: &Classified, g: &Gathered) -> Option<u64> {
-    classified
+/// What the free space of every location a heavy line writes to came to.
+struct Room {
+    /// The smallest reading among the locations that could be read.
+    lowest: Option<u64>,
+    /// Every location was read. "Has room" needs this; a location that was
+    /// read and is short may still refuse on its own number without it.
+    complete: bool,
+}
+
+/// The volume the line runs in and the build directories it names literally.
+fn room(cwd_free: Option<u64>, classified: &Classified, g: &Gathered) -> Room {
+    let mut readings: Vec<Option<u64>> = classified
         .build_dirs
         .iter()
-        .filter_map(|dir| free_at_or_above(Path::new(dir), g.read_free))
-        .chain(cwd_free)
-        .min()
+        .map(|dir| free_at_or_above(Path::new(dir), g.read_free))
+        .collect();
+    readings.push(cwd_free);
+    Room {
+        lowest: readings.iter().flatten().copied().min(),
+        complete: readings.iter().all(Option::is_some),
+    }
 }
 
 /// What a sensor report and its snapshot allow the hook to act on.
@@ -408,17 +451,21 @@ fn disk_check(input: &HookInput, classified: &Classified, heavy: &Hit, g: &Gathe
         return DiskCall::Nothing;
     }
     let refuses = |mode: InputMode| d.refusing && mode == InputMode::Refuse;
-    let Some(free) = effective_free(d.free_bytes, classified, g) else {
+    let room = room(d.free_bytes, classified, g);
+    let unread = || {
         let why = "free disk space could not be read";
-        return match first_notice(g, input, why) {
+        match first_notice(g, input, why) {
             Notice::Repeat => DiskCall::Nothing,
             notice => DiskCall::Say(format!(
-                "GitPulse did NOT check free disk space for this heavy command ({}): it could not be read. \
+                "GitPulse did NOT check free disk space for this heavy command ({}): it could not be read for every place it writes to. \
                  A full disk can hang this Mac; check df before a build that writes a lot.{}",
                 heavy.label,
                 notice.suffix()
             )),
-        };
+        }
+    };
+    let Some(free) = room.lowest else {
+        return unread();
     };
     let mut reasons = Vec::new();
     let mut refuse = false;
@@ -439,7 +486,12 @@ fn disk_check(input: &HookInput, classified: &Classified, heavy: &Hit, g: &Gathe
         refuse |= refuses(d.floor_mode);
     }
     if reasons.is_empty() {
-        return DiskCall::Nothing;
+        // "Has room" is said only when every location was read.
+        return if room.complete {
+            DiskCall::Nothing
+        } else {
+            unread()
+        };
     }
     let why = reasons.join("; and ");
     if refuse {
