@@ -5,7 +5,7 @@ use crate::sysload::Binding;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,7 +79,7 @@ fn decoding_invalid_captured_output_replaces_the_bad_bytes() {
 
 #[test]
 fn background_priority_restores_after_nested_work_errors_and_panic() {
-    use super::{Admission, current_admission};
+    use super::{current_admission, Admission};
     assert_eq!(current_admission(), Admission::Reactive);
     let result = std::panic::catch_unwind(|| {
         super::with_background_processes(|| {
@@ -105,7 +105,7 @@ fn background_priority_restores_after_nested_work_errors_and_panic() {
 /// a pooled thread never carries a user-action class into the next task.
 #[test]
 fn a_guarded_mutation_is_interactive_until_its_command_scope_ends() {
-    use super::{Admission, current_admission, mark_interactive, with_admission};
+    use super::{current_admission, mark_interactive, with_admission, Admission};
     with_admission(Admission::Reactive, || {
         assert_eq!(current_admission(), Admission::Reactive);
         mark_interactive();
@@ -128,7 +128,7 @@ fn a_guarded_mutation_is_interactive_until_its_command_scope_ends() {
 /// would need.
 #[test]
 fn a_user_action_is_admitted_after_refreshes_spend_every_token() {
-    use super::{Admission, with_admission};
+    use super::{with_admission, Admission};
     let gate = super::SpawnGate::with_rate(8, 2, 1);
     let quick = || Instant::now() + std::time::Duration::from_millis(30);
     let burst: Vec<_> = (0..2)
@@ -167,7 +167,7 @@ fn a_user_action_is_admitted_after_refreshes_spend_every_token() {
 /// is still admitted from the reserve.
 #[test]
 fn background_is_shed_at_the_reserve_while_a_refresh_still_runs() {
-    use super::{Admission, Refusal, with_admission, with_background_processes};
+    use super::{with_admission, with_background_processes, Admission, Refusal};
     let gate = super::SpawnGate::with_rate(16, 8, 1);
     assert_eq!(gate.background_reserve(), 2);
     let far = || Instant::now() + std::time::Duration::from_secs(10);
@@ -196,7 +196,7 @@ fn background_is_shed_at_the_reserve_while_a_refresh_still_runs() {
 /// daemon) is the control, in the same gate and state.
 #[test]
 fn awaiting_background_work_is_paced_by_the_refill_where_shed_work_is_refused() {
-    use super::{Admission, Refusal, with_background_budget_wait, with_background_processes};
+    use super::{with_background_budget_wait, with_background_processes, Admission, Refusal};
     let gate = super::SpawnGate::with_rate(16, 8, 8);
     assert_eq!(gate.background_reserve(), 2);
     let far = || Instant::now() + std::time::Duration::from_secs(10);
@@ -232,8 +232,8 @@ fn awaiting_background_work_is_paced_by_the_refill_where_shed_work_is_refused() 
 /// reactive read still has its token.
 #[test]
 fn awaiting_background_work_waits_a_bounded_time_and_leaves_the_reserve() {
-    use super::{Admission, Refusal};
     use super::{with_admission, with_background_budget_wait, with_background_processes};
+    use super::{Admission, Refusal};
     let gate = super::SpawnGate::with_rate(16, 64, 1);
     assert_eq!(gate.background_reserve(), 16);
     let far = || Instant::now() + std::time::Duration::from_secs(30);
@@ -267,7 +267,7 @@ fn awaiting_background_work_waits_a_bounded_time_and_leaves_the_reserve() {
 /// clears. No spawn budget is spent on a shed spawn.
 #[test]
 fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resumes() {
-    use super::{Admission, Refusal, with_admission, with_background_processes};
+    use super::{with_admission, with_background_processes, Admission, Refusal};
     use crate::sysload::{GovernorInput, Level};
     let gate = super::SpawnGate::new(8);
     let far = || Instant::now() + std::time::Duration::from_secs(10);
@@ -391,7 +391,7 @@ fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resume
 /// run started because the disk is full would examine nothing.
 #[test]
 fn disk_relief_admits_checks_for_a_disk_cause_only() {
-    use super::{Admission, Refusal, with_admission, with_background_processes, with_disk_relief};
+    use super::{with_admission, with_background_processes, with_disk_relief, Admission, Refusal};
     use crate::sysload::{GovernorInput, Level, Reading, Readings};
     let gate = super::SpawnGate::new(8);
     let far = || Instant::now() + Duration::from_secs(10);
@@ -418,14 +418,43 @@ fn disk_relief_admits_checks_for_a_disk_cause_only() {
         matches!(reactive(), Some(Refusal::Pressure { reactive: true, .. })),
         "without relief the check is shed under a full disk"
     );
+    // Admission needs both: this thread asked for relief, and the governor says
+    // the disk is the only thing wrong. The injected governor has no history
+    // and answers false, so the governor's answer is forced here; its own
+    // answer is tested with the governor.
+    use super::with_disk_only_answer;
     assert_eq!(
-        with_disk_relief(reactive),
+        with_disk_only_answer(true, || with_disk_relief(reactive)),
         None,
-        "a disk-only cause admits the cleaner's checks"
+        "relief asked and disk-only: admitted"
     );
-    assert_eq!(with_disk_relief(background), None);
+    assert_eq!(
+        with_disk_only_answer(true, || with_disk_relief(background)),
+        None
+    );
     assert!(
-        reactive().is_some(),
+        matches!(
+            with_disk_only_answer(false, || with_disk_relief(reactive)),
+            Some(Refusal::Pressure { reactive: true, .. })
+        ),
+        "relief asked, but another input is not clear (or there is no governor): shed"
+    );
+    assert!(
+        matches!(
+            with_disk_only_answer(true, reactive),
+            Some(Refusal::Pressure { reactive: true, .. })
+        ),
+        "disk-only, but the thread never asked for relief: shed"
+    );
+    assert!(
+        matches!(
+            with_disk_relief(reactive),
+            Some(Refusal::Pressure { reactive: true, .. })
+        ),
+        "relief asked and the real accessor, which has no history here: shed"
+    );
+    assert!(
+        with_disk_only_answer(true, reactive).is_some(),
         "relief ends with its scope, on this thread"
     );
     drop(_disk);
@@ -462,7 +491,7 @@ fn disk_relief_admits_checks_for_a_disk_cause_only() {
 /// queued ahead of it.
 #[test]
 fn a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh() {
-    use super::{Admission, with_admission};
+    use super::{with_admission, Admission};
     use std::sync::Arc;
     let gate = Arc::new(super::SpawnGate::new(1));
     let held = gate
@@ -510,7 +539,7 @@ fn a_waiting_user_action_takes_the_next_slot_before_a_queued_refresh() {
 /// in a path or a verdict, is not one.
 #[test]
 fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
-    use super::{Refusal, is_deferred_under_load, refusal_message};
+    use super::{is_deferred_under_load, refusal_message, Refusal};
     let waited = std::time::Duration::from_millis(1_500);
     for label in [
         "git worktree",
@@ -566,7 +595,7 @@ fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
 #[test]
 fn every_refusal_formats_to_the_one_cause_its_classifiers_name() {
     use super::{
-        Refusal, is_deferred_under_load, is_slot_wait_timeout, is_timeout_error, refusal_message,
+        is_deferred_under_load, is_slot_wait_timeout, is_timeout_error, refusal_message, Refusal,
     };
     let waited = std::time::Duration::from_millis(2_013);
     let deferred = refusal_message("git status", Refusal::Refused { waited });
@@ -956,8 +985,8 @@ fn excess_waiters_fail_at_the_queue_budget_instead_of_the_git_deadline() {
 
 #[test]
 fn spawn_rate_cap_bounds_a_concurrent_storm() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     let gate = Arc::new(super::SpawnGate::with_rate(64, 8, 4));
     let admitted = Arc::new(AtomicU32::new(0));
     let started = std::time::Instant::now();
@@ -1033,27 +1062,23 @@ fn background_waiter_gets_capacity_and_timeout_releases_its_reservation() {
     acquired_rx
         .recv_timeout(std::time::Duration::from_secs(3))
         .unwrap();
-    assert!(
-        gate.acquire(Instant::now() + std::time::Duration::from_millis(20))
-            .is_none()
-    );
+    assert!(gate
+        .acquire(Instant::now() + std::time::Duration::from_millis(20))
+        .is_none());
     release_tx.send(()).unwrap();
     worker.join().unwrap();
     let last = gate
         .acquire(Instant::now() + std::time::Duration::from_secs(1))
         .unwrap();
-    assert!(
-        super::with_background_processes(
-            || gate.acquire(Instant::now() + std::time::Duration::from_millis(20))
-        )
-        .is_none()
-    );
+    assert!(super::with_background_processes(
+        || gate.acquire(Instant::now() + std::time::Duration::from_millis(20))
+    )
+    .is_none());
     assert_eq!(gate.state.lock().unwrap().waiting_background, 0);
     drop(last);
-    assert!(
-        gate.acquire(Instant::now() + std::time::Duration::from_secs(1))
-            .is_some()
-    );
+    assert!(gate
+        .acquire(Instant::now() + std::time::Duration::from_secs(1))
+        .is_some());
 }
 
 #[test]
@@ -3047,11 +3072,9 @@ fn an_over_cap_stream_still_reports_its_budget() {
     );
     // A sub-megabyte budget must not round to "exceeded 0 MB".
     assert_eq!(Incomplete::OverCap(8_192).describe(), "exceeded 8192 bytes");
-    assert!(
-        Incomplete::Unread("reader did not finish".into())
-            .describe()
-            .contains("could not be read to the end")
-    );
+    assert!(Incomplete::Unread("reader did not finish".into())
+        .describe()
+        .contains("could not be read to the end"));
     // The clause carries no subject of its own, so a caller that names one
     // cannot end up saying "output output exceeded 64 MB".
     assert!(
@@ -3248,7 +3271,7 @@ impl Lcg {
 /// reservation makes every later refresh ineligible for good.
 #[test]
 fn a_panicking_cancel_check_does_not_strand_its_reservation() {
-    use super::{Admission, with_admission};
+    use super::{with_admission, Admission};
     for class in [Admission::Interactive, Admission::Background] {
         let gate = Arc::new(SpawnGate::new(1));
         let held = gate
@@ -3327,7 +3350,7 @@ fn the_cancel_check_runs_without_the_gate_lock() {
 /// loosens the rate bound.
 #[test]
 fn mixed_class_stress_holds_every_gate_invariant() {
-    use super::{Admission, with_admission};
+    use super::{with_admission, Admission};
     use std::sync::atomic::{AtomicU64, Ordering};
     const THREADS: u64 = 24;
     const ROUNDS: usize = 40;
@@ -5238,7 +5261,7 @@ mod qos_band_tests {
 
     #[test]
     fn background_scopes_run_the_thread_at_utility_and_give_it_back() {
-        use crate::pools::{QOS_UTILITY, current_thread_qos};
+        use crate::pools::{current_thread_qos, QOS_UTILITY};
         std::thread::spawn(|| {
             let class = || current_thread_qos().expect("qos").0;
             assert_ne!(class(), QOS_UTILITY);

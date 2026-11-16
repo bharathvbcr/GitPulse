@@ -2502,7 +2502,6 @@ fn a_process_naming_a_worktree_refuses_the_worktree_veto() {
 /// and checks are those the saved policy already names.
 #[test]
 fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
-    use crate::sysload::Binding;
     let (_temp, cleaner, root) = fixture();
     let later = super::current_time() + 86_400;
     cleaner
@@ -2515,15 +2514,17 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
         .unwrap();
     let now = super::current_time();
     let next = |c: &Cleaner| c.state().unwrap().config.next_run_at;
-    for cause in [None, Some(Binding::Swap), Some(Binding::Thermal)] {
-        assert_eq!(cleaner.bring_forward_for_disk(cause, now).unwrap(), None);
-        assert_eq!(next(&cleaner), later, "{cause:?} is not the disk");
-    }
+    // The argument is `shed_is_disk_only()`: false for any other cause, for a
+    // disk shed with something else not clear, and with no governor.
+    assert_eq!(cleaner.bring_forward_for_disk(false, now).unwrap(), None);
+    assert_eq!(next(&cleaner), later, "not disk-only");
+    assert!(
+        !crate::sysload::shed_is_disk_only(),
+        "this process has no governor, so the scheduler's own call is false"
+    );
     let before = cleaner.state().unwrap().config.revision;
     assert_eq!(
-        cleaner
-            .bring_forward_for_disk(Some(Binding::DiskFilling), now)
-            .unwrap(),
+        cleaner.bring_forward_for_disk(true, now).unwrap(),
         Some(now)
     );
     assert_eq!(next(&cleaner), now);
@@ -2544,18 +2545,13 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
         })
         .unwrap();
     assert_eq!(
-        cleaner
-            .bring_forward_for_disk(Some(Binding::LowDisk), now + 60)
-            .unwrap(),
+        cleaner.bring_forward_for_disk(true, now + 60).unwrap(),
         None,
         "bounded: once per gap"
     );
     assert_eq!(
         cleaner
-            .bring_forward_for_disk(
-                Some(Binding::LowDisk),
-                now + super::DISK_FORWARD_MIN_GAP_SECS
-            )
+            .bring_forward_for_disk(true, now + super::DISK_FORWARD_MIN_GAP_SECS)
             .unwrap(),
         Some(now + super::DISK_FORWARD_MIN_GAP_SECS)
     );
@@ -2567,12 +2563,7 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        cleaner
-            .bring_forward_for_disk(Some(Binding::LowDisk), later)
-            .unwrap(),
-        None
-    );
+    assert_eq!(cleaner.bring_forward_for_disk(true, later).unwrap(), None);
     assert_eq!(next(&cleaner), later);
 }
 
@@ -2697,7 +2688,6 @@ impl ParentSaved {
 /// refuses the state, which the docs say.
 #[test]
 fn state_written_with_the_new_scope_off_is_readable_by_the_parents_reader() {
-    use crate::sysload::Binding;
     let (_temp, cleaner, root) = fixture();
     let read = |cleaner: &Cleaner| -> Result<ParentSaved, String> {
         let bytes = fs::read(cleaner.dir.join("state.json")).map_err(|e| e.to_string())?;
@@ -2719,15 +2709,13 @@ fn state_written_with_the_new_scope_off_is_readable_by_the_parents_reader() {
     read(&cleaner).expect("old scopes on, new scope off");
     // One bring-forward writes its stamp; it is not written once the gap passed.
     let now = super::current_time();
-    cleaner
-        .bring_forward_for_disk(Some(Binding::LowDisk), now)
-        .unwrap();
+    cleaner.bring_forward_for_disk(true, now).unwrap();
     assert!(
         read(&cleaner).is_err(),
         "a pending bring-forward is written"
     );
     cleaner
-        .bring_forward_for_disk(None, now + super::DISK_FORWARD_MIN_GAP_SECS)
+        .bring_forward_for_disk(false, now + super::DISK_FORWARD_MIN_GAP_SECS)
         .unwrap();
     read(&cleaner).expect("the stamp is dropped once its gap has passed");
     // The new scope on writes its fields.
@@ -2742,6 +2730,28 @@ fn state_written_with_the_new_scope_off_is_readable_by_the_parents_reader() {
 }
 
 /// The agent scratch approval is bound to what it was shown, and lapses.
+#[test]
+fn a_preview_dated_in_the_future_or_never_taken_lapses_like_an_old_one() {
+    let scopes = super::ReclaimScopes {
+        agent_scratch_builds: true,
+        ..super::ReclaimScopes::default()
+    };
+    let now = 1_800_000_000u64;
+    let used = |at: u64| scopes.effective(Some(scopes), at, now).agent_scratch_builds;
+    assert!(used(now), "taken now");
+    assert!(
+        used(now - super::AGENT_PREVIEW_VALID_SECS),
+        "exactly 30 days"
+    );
+    assert!(
+        !used(now - super::AGENT_PREVIEW_VALID_SECS - 1),
+        "past 30 days"
+    );
+    assert!(!used(now + 1), "stamped after now: the clock was set back");
+    assert!(!used(now + 365 * 86_400), "a year ahead");
+    assert!(!used(0), "never previewed by this version");
+}
+
 #[test]
 fn a_previewed_agent_scope_is_cleared_by_roots_or_exclusions_and_lapses_after_thirty_days() {
     let (_temp, cleaner, root) = fixture();
@@ -2871,6 +2881,215 @@ fn the_agent_scopes_have_their_own_state_veto_and_veto_key() {
     );
 }
 
+/// A read-only probe of this machine, never part of a normal run: the real
+/// `inspect` with production wiring (real process table, real agent registries,
+/// real `/tmp`) over the roots in `GITPULSE_PROBE_ROOTS` (a `:`-separated
+/// list), the cleaner's state in a temp directory, and no removal path called.
+///
+/// What it reads: the process table, the Claude registries under the config
+/// directories derived from `GITPULSE_PROBE_HOME` (handed to the detector through
+/// `GITPULSE_CLAUDE_CONFIG_DIRS`), the system temp directory and the roots. What
+/// it writes: only files in its own temporary directory (the cleaner's state and
+/// the test trust store); repository trust is granted in that test store, not the
+/// real one. It prints `PROBE` lines (scope completeness, candidates by scope,
+/// kept reasons, issues, process counts, and per live session folder whether it
+/// came up as a candidate), which is the before/after table a change to the
+/// cleaner's rules is judged by; any live session's folder showing as a candidate
+/// is a defect.
+/// `GITPULSE_PROBE_HOME=$HOME GITPULSE_PROBE_ROOTS=<a>:<b> cargo test --lib -- --ignored --nocapture probe_the_real_machine`.
+#[cfg(unix)]
+#[test]
+#[ignore = "reads the real machine; run by hand"]
+fn probe_the_real_machine_with_production_wiring() {
+    let roots: Vec<String> = std::env::var("GITPULSE_PROBE_ROOTS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert!(!roots.is_empty(), "set GITPULSE_PROBE_ROOTS");
+    // The test build runs under a hermetic HOME, so the Claude config
+    // directories production would resolve with the real one are resolved here
+    // from `GITPULSE_PROBE_HOME` and handed to the detector. Reads only.
+    let real_home = std::env::var("GITPULSE_PROBE_HOME").expect("set GITPULSE_PROBE_HOME");
+    let dirs = crate::workbench::conversation::config_dirs_in(
+        None,
+        None,
+        None,
+        Some(Path::new(&real_home)),
+    );
+    eprintln!("PROBE config dirs: {:?} error={:?}", dirs.dirs, dirs.error);
+    std::env::set_var(
+        "GITPULSE_CLAUDE_CONFIG_DIRS",
+        std::env::join_paths(&dirs.dirs).unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = crate::engine::process::canonicalize_plain(temp.path())
+        .unwrap()
+        .join("state");
+    let cleaner = Cleaner::new(state_dir);
+    let mut config = cleaner.state().unwrap().config;
+    config.roots = roots;
+    config.scopes.agent_scratch_builds = true;
+    // The test build keeps its own repository-trust store, so none of the
+    // owner's repositories is trusted in it. Trusting what discovery finds
+    // here changes only that test store, never the real one, and stands for
+    // the owner having opened and trusted these repositories in the app.
+    let probe_roots = discovery::roots(&config.roots, false).unwrap();
+    let grant = |dir: &Path| {
+        let plain = dir.to_string_lossy().into_owned();
+        if let Ok(preview) = crate::repository_trust::inspect(&plain) {
+            let _ = crate::repository_trust::grant(&plain, &preview.identity, false);
+        }
+    };
+    for root in &probe_roots {
+        grant(root);
+    }
+    for _ in 0..3 {
+        let found = discovery::discover(&probe_roots, &[], &AtomicBool::new(false));
+        for repo in &found.repos {
+            grant(repo);
+        }
+    }
+    let started = std::time::Instant::now();
+    let inventory = cleaner.inspect(&config, config.scopes, true).unwrap();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "PROBE elapsed={elapsed:?} scopes_complete={} partial={} repositories={} candidates={} kept={} shed_repos={}",
+        inventory.scopes_complete,
+        inventory.partial,
+        inventory.repositories,
+        inventory.candidates.len(),
+        inventory.kept.len(),
+        inventory.shed_repos
+    );
+    let mut by_scope = std::collections::BTreeMap::<String, usize>::new();
+    for c in &inventory.candidates {
+        *by_scope.entry(c.scope.clone()).or_default() += 1;
+    }
+    eprintln!("PROBE candidates by scope: {by_scope:?}");
+    for c in inventory
+        .candidates
+        .iter()
+        .filter(|c| c.scope.starts_with("agent-"))
+    {
+        eprintln!("PROBE CANDIDATE {} {} {}", c.scope, c.bytes, c.path);
+    }
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for k in &inventory.kept {
+        let head: String = k.reason.chars().take(60).collect();
+        *reasons.entry(format!("{} | {head}", k.scope)).or_default() += 1;
+    }
+    for (reason, n) in &reasons {
+        eprintln!("PROBE KEPT x{n}: {reason}");
+    }
+    for issue in inventory.issues.iter().take(40) {
+        let head: String = issue.chars().take(220).collect();
+        eprintln!("PROBE ISSUE {head}");
+    }
+    let table = crate::sysload::procscan::read_use_table().unwrap();
+    let mine: Vec<_> = table.iter().filter(|p| p.mine).collect();
+    eprintln!(
+        "PROBE processes total={} mine={} mine_cwd_unreadable={} mine_argv_unreadable={} mine_env_unreadable={} mine_env_empty={}",
+        table.len(),
+        mine.len(),
+        mine.iter().filter(|p| p.cwd.is_none()).count(),
+        mine.iter().filter(|p| p.argv.is_none()).count(),
+        mine.iter().filter(|p| p.env.is_none()).count(),
+        mine.iter()
+            .filter(|p| p.env.as_ref().is_some_and(Vec::is_empty))
+            .count()
+    );
+    let live = super::super::agent::LiveSessions::observe();
+    eprintln!(
+        "PROBE live claude ids={} unidentified={} incomplete={:?}",
+        live.ids.len(),
+        live.unidentified,
+        live.incomplete
+    );
+    // What the unidentified sessions are, by shape only: executable, flag
+    // names and the names (never values) of session-related variables.
+    for kind in crate::insights::live_sessions::observe()
+        .iter()
+        .filter(|k| k.kind == "claude")
+    {
+        eprintln!(
+            "PROBE claude detector ok={} live={} unverified={}",
+            kind.ok,
+            kind.live.len(),
+            kind.unverified.len()
+        );
+        for session in kind.live.iter().filter(|s| s.session_id.is_none()) {
+            let row = table
+                .iter()
+                .find(|p| i64::from(p.pid) == i64::from(session.pid));
+            let flags: Vec<String> = row
+                .and_then(|p| p.argv.as_ref())
+                .map(|argv| {
+                    argv.iter()
+                        .filter(|a| a.starts_with('-'))
+                        .map(|a| a.split('=').next().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let names: Vec<String> = row
+                .and_then(|p| p.env.as_ref())
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|e| e.split_once('=').map(|(n, _)| n.to_string()))
+                        .filter(|n| {
+                            let upper = n.to_uppercase();
+                            upper.contains("SESSION") || upper.starts_with("CLAUDE")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "PROBE UNIDENTIFIED pid={} entrypoint={:?} status={:?} tree={:?} exe={:?} flags={flags:?} env_names={names:?}",
+                session.pid,
+                session.entrypoint,
+                session.status,
+                session.tree,
+                row.and_then(|p| p.exe.clone())
+            );
+        }
+    }
+    // Every live session's folder must read as in use, never as a candidate.
+    let base = Path::new("/private/tmp/claude-501");
+    let mut live_as_candidate = 0;
+    if let Ok(projects) = fs::read_dir(base) {
+        for project in projects.flatten() {
+            for id in live.ids.iter() {
+                let folder = project.path().join(id);
+                if !folder.is_dir() {
+                    continue;
+                }
+                let as_candidate = inventory
+                    .candidates
+                    .iter()
+                    .any(|c| Path::new(&c.path).starts_with(&folder));
+                let kept: Vec<&str> = inventory
+                    .kept
+                    .iter()
+                    .filter(|k| Path::new(&k.path).starts_with(&folder))
+                    .map(|k| k.reason.as_str())
+                    .collect();
+                eprintln!(
+                    "PROBE LIVE {} candidate={as_candidate} kept={:?}",
+                    folder.display(),
+                    kept.iter()
+                        .map(|r| r.chars().take(70).collect::<String>())
+                        .collect::<Vec<_>>()
+                );
+                if as_candidate {
+                    live_as_candidate += 1;
+                }
+            }
+        }
+    }
+    eprintln!("PROBE live sessions whose folder is a candidate: {live_as_candidate}");
+}
+
 /// A Cargo target as Cargo writes one, every entry last modified 30 days ago.
 fn old_cargo_target(dir: &std::path::Path) {
     fs::create_dir_all(dir.join("debug")).unwrap();
@@ -2880,10 +3099,12 @@ fn old_cargo_target(dir: &std::path::Path) {
     )
     .unwrap();
     fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
+    fs::write(dir.join("debug/.cargo-lock"), "").unwrap();
     fs::write(dir.join("debug/app.o"), vec![b'x'; 4096]).unwrap();
     let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
     for path in [
         dir.join("debug/app.o"),
+        dir.join("debug/.cargo-lock"),
         dir.join("CACHEDIR.TAG"),
         dir.join(".rustc_info.json"),
         dir.join("debug"),

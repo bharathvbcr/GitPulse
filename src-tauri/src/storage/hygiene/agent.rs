@@ -13,9 +13,15 @@
 //!
 //! A directory is a candidate only when all of these hold, and a check that
 //! could not run keeps it:
-//! - it carries Cargo's own producer evidence (`CACHEDIR.TAG` with Cargo's
-//!   signature and `.rustc_info.json`). A directory merely named `target` is
-//!   kept, whatever else is true of it;
+//! - it carries producer evidence: `.rustc_info.json` (a file Cargo writes) and
+//!   a `CACHEDIR.TAG` with the cache-directory signature. That signature is
+//!   the generic one every tool that follows the cache-directory convention
+//!   writes, not Cargo's own, so `.rustc_info.json` and the layout check below
+//!   carry the weight. A directory merely named `target` is kept, whatever
+//!   else is true of it;
+//! - its top level holds only what Cargo, rustdoc and the coverage tools write
+//!   (see `foreign_top_level`), so a folder someone keeps their own files in
+//!   is kept;
 //! - it is reached without crossing a symlink and lies inside the scope root;
 //! - its relative path and every entry inside it pass DevCouncil's name
 //!   protections (`protected_artifact`, and `protected_entry` through the
@@ -43,12 +49,17 @@ pub(super) const SCOPE_SESSION: &str = "agent-session-scratch";
 pub(super) const SCOPE_REPOSITORY: &str = "agent-repo-scratch";
 pub(super) const SCOPE_CLAUDE: &str = "agent-claude-target";
 
-/// The signature Cargo writes in `CACHEDIR.TAG`.
+/// The signature in `CACHEDIR.TAG`. It is the cache-directory convention's
+/// generic signature, shared by every tool that follows it, not Cargo's own.
 const CARGO_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 /// Session folders examined per scan; past it the rest are counted.
 const MAX_SESSION_FOLDERS: usize = 4096;
 /// Directory levels below a scratchpad or scratch root searched for targets.
 const SEARCH_DEPTH: usize = 3;
+/// What a running Claude session without a usable id is reported as. The scan
+/// states it once as its own issue line, so it never hides in the count of
+/// folders left alone; the UI shows that line as its own sentence.
+pub(crate) const SESSION_UNMATCHED: &str = "cannot be matched to a session folder";
 const MAX_TARGETS_PER_ROOT: usize = 16;
 /// What the strict walk of one Cargo target may spend. A real target has tens
 /// of thousands of entries (measured read-only on this machine: a 48 GiB
@@ -187,6 +198,9 @@ impl Scan {
             if inventory.candidates.len() >= CANDIDATE_CAP {
                 inventory.partial = true;
                 inventory.scopes_complete = false;
+                inventory.issues.push(format!(
+                    "More than {CANDIDATE_CAP} candidates were found (the candidate cap), so the rest of the agent scratch builds were not listed and this preview does not cover the agent scratch scope. Remove some by hand, then preview again."
+                ));
                 break;
             }
             inventory.candidates.push(candidate);
@@ -197,7 +211,7 @@ impl Scan {
         let unlisted = self.unlisted + overflow;
         if unlisted > 0 {
             inventory.issues.push(format!(
-                "{unlisted} more agent scratch folder(s) were left alone and are not listed"
+                "{unlisted} more agent scratch folder(s) were left alone and are not listed: the list shows the first {MAX_KEPT} (the kept-list cap)"
             ));
         }
         if self.unexamined > 0 {
@@ -245,11 +259,30 @@ pub(crate) struct LiveSessions {
 
 impl LiveSessions {
     pub(crate) fn observe() -> Self {
-        Self::from_observation(&crate::insights::live_sessions::observe())
+        let observation = crate::insights::live_sessions::observe();
+        // The registry names a session id for most sessions; one it does not name
+        // may still show its id on its own command line. A table that could not
+        // be read recovers nothing, and those sessions stay unidentified.
+        let table = crate::sysload::procscan::read_use_table().unwrap_or_default();
+        Self::from_observation_with(&observation, &|pid| {
+            table
+                .iter()
+                .find(|p| u32::try_from(p.pid).is_ok_and(|p| p == pid))
+                .and_then(|p| p.argv.clone())
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_observation(
         observation: &crate::insights::live_sessions::Observation,
+    ) -> Self {
+        Self::from_observation_with(observation, &|_| None)
+    }
+
+    /// `argv_of` answers a live session's command line from the process table.
+    pub(crate) fn from_observation_with(
+        observation: &crate::insights::live_sessions::Observation,
+        argv_of: &dyn Fn(u32) -> Option<Vec<String>>,
     ) -> Self {
         let mut out = Self::default();
         for kind in observation.iter().filter(|k| k.kind == "claude") {
@@ -268,7 +301,18 @@ impl LiveSessions {
                     Some(id) => {
                         out.ids.insert(id.to_string());
                     }
-                    None => out.unidentified += 1,
+                    None => match argv_of(session.pid) {
+                        // Helper modes of the executable are not sessions: the
+                        // session that started one is counted on its own.
+                        Some(argv) if crate::sysload::procscan::is_claude_helper(&argv) => {}
+                        Some(argv) => match crate::sysload::procscan::claude_session_id_in(&argv) {
+                            Some(id) => {
+                                out.ids.insert(id);
+                            }
+                            None => out.unidentified += 1,
+                        },
+                        None => out.unidentified += 1,
+                    },
                 }
             }
         }
@@ -301,13 +345,18 @@ pub(crate) struct Context<'a> {
 pub(super) struct Verdict {
     pub snapshot: tree::Snapshot,
     pub evidence: Vec<String>,
+    /// The folder whose processes were read: the target itself, or the session
+    /// folder around it. The delete path reads it again just before removal.
+    pub guarded: PathBuf,
 }
 
 fn at(seconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// Cargo's own evidence that this directory is a build directory it made.
+/// Producer evidence that this directory is a Cargo build directory:
+/// `.rustc_info.json` (a file Cargo writes) beside a `CACHEDIR.TAG` with the
+/// generic cache-directory signature.
 pub(crate) fn cargo_evidence(dir: &Path) -> Result<(), String> {
     let tag = dir.join("CACHEDIR.TAG");
     let regular = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
@@ -320,7 +369,7 @@ pub(crate) fn cargo_evidence(dir: &Path) -> Result<(), String> {
         .is_ok()
         && text.starts_with(CARGO_SIGNATURE);
     if !signed {
-        return Err("its CACHEDIR.TAG does not carry Cargo's signature".into());
+        return Err("its CACHEDIR.TAG does not carry the cache-directory signature".into());
     }
     if !regular(&dir.join(".rustc_info.json")) {
         return Err("no .rustc_info.json, so it is not a Cargo target directory".into());
@@ -328,14 +377,17 @@ pub(crate) fn cargo_evidence(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The names a Cargo build folder is given: `target`, `<name>-target` (the
+/// `--target-dir .claude/<name>-target` convention) and `target-<name>`.
 fn named_like_a_build_folder(name: &str) -> bool {
-    name == "target" || name.starts_with("target-")
+    name == "target" || name.ends_with("-target") || name.starts_with("target-")
 }
 
 /// Cargo targets below `root`, never through a symlink, and the directories
 /// named like build folders that carry no producer evidence.
 fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    let mut wrappers: Vec<PathBuf> = Vec::new();
     let mut capped = false;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -363,13 +415,22 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             match cargo_evidence(&path) {
+                Ok(()) if scope == SCOPE_REPOSITORY && !named_like_a_build_folder(&name) => {
+                    // Inside a repository nothing says who made a folder, so only
+                    // one named like a build folder is offered.
+                    scan.keep(
+                        &path,
+                        scope,
+                        "it carries Cargo's markers but is not named like a build folder (target, <name>-target, target-<name>)",
+                    );
+                }
                 Ok(()) => {
                     if found.len() >= MAX_TARGETS_PER_ROOT {
                         if !capped {
                             capped = true;
                             scan.issues.push(format!(
-                                "{}: more than {MAX_TARGETS_PER_ROOT} Cargo build folders; the rest were not examined",
-                                root.display()
+                                "{root}: more than {MAX_TARGETS_PER_ROOT} Cargo build folders under one scratch root (the per-root cap), so the rest were not examined. Remove old ones there by hand or move them out of {root}, then preview again.",
+                                root = root.display()
                             ));
                         }
                         scan.complete = false;
@@ -379,12 +440,38 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) ->
                 }
                 Err(why) if named_like_a_build_folder(&name) => {
                     scan.keep(&path, scope, format!("named like a build folder but {why}"));
+                    // A session's scratchpad often holds a plain folder named
+                    // like a build folder that wraps the real targets
+                    // (`target-x/<profile>-target`). Its children are looked at
+                    // one level down, each judged as a target in its own right;
+                    // the outer folder is never offered or removed.
+                    if scope == SCOPE_SESSION {
+                        wrappers.push(path);
+                    }
                 }
                 Err(_) if depth + 1 < SEARCH_DEPTH && name != ".git" && name != "node_modules" => {
                     stack.push((path, depth + 1));
                 }
                 Err(_) => {}
             }
+        }
+    }
+    for wrapper in wrappers {
+        let Ok(children) = std::fs::read_dir(&wrapper) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+                || cargo_evidence(&path).is_err()
+            {
+                continue;
+            }
+            if found.len() >= MAX_TARGETS_PER_ROOT {
+                scan.complete = false;
+                break;
+            }
+            found.push(path);
         }
     }
     found.sort();
@@ -402,7 +489,7 @@ fn judge(
     ctx: &Context<'_>,
 ) -> Result<Verdict, Refusal> {
     let root = crate::engine::process::canonicalize_plain(scope_root)
-        .map_err(|e| format!("its scope root could not be resolved: {e}"))?;
+        .map_err(|e| Refusal::Unexamined(format!("its scope root could not be resolved: {e}")))?;
     if !target.is_absolute()
         || target
             .components()
@@ -412,7 +499,7 @@ fn judge(
     }
     tree::no_symlinks(target)?;
     let real = crate::engine::process::canonicalize_plain(target)
-        .map_err(|e| format!("it could not be resolved: {e}"))?;
+        .map_err(|e| Refusal::Unexamined(format!("it could not be resolved: {e}")))?;
     if real != target || !real.starts_with(&root) || real == root {
         return Err("it is not inside the folder this scope covers".into());
     }
@@ -427,22 +514,32 @@ fn judge(
         .into());
     }
     cargo_evidence(target)?;
-    let mut evidence =
-        vec!["Cargo target: CACHEDIR.TAG with Cargo's signature and .rustc_info.json".to_string()];
+    if let Some(foreign) = foreign_top_level(target)? {
+        return Err(format!(
+            "it holds {foreign} at its top level, which Cargo, rustdoc and the coverage tools do not write"
+        )
+        .into());
+    }
+    let mut evidence = vec![
+        "Cargo target: .rustc_info.json (Cargo's own file) beside the generic CACHEDIR.TAG, and a top level of only what Cargo, rustdoc and coverage tooling write".to_string(),
+    ];
     let guarded = match session {
         Some((id, session_dir)) => {
+            // A detector that could not look is not an answer.
             if let Some(why) = &ctx.live.incomplete {
-                return Err(format!(
-                    "owner unproven: whether the session is finished could not be told: {why}"
-                )
-                .into());
+                return Err(Refusal::Unexamined(format!(
+                    "whether the session is finished could not be told: {why}"
+                )));
             }
             if ctx.live.ids.contains(id) {
                 return Err(format!("in use: agent session {id} is running").into());
             }
+            // The check ran and has an answer: no session folder can be shown
+            // finished while a running session cannot be matched to one. The
+            // scan says so once, in its own line.
             if ctx.live.unidentified > 0 {
                 return Err(format!(
-                    "owner unproven: {} running Claude session(s) have no session id to match, so session {id} cannot be shown finished",
+                    "owner unproven: {} running Claude session(s) {SESSION_UNMATCHED}, so session {id} cannot be shown finished",
                     ctx.live.unidentified
                 )
                 .into());
@@ -452,42 +549,27 @@ fn judge(
         }
         None => target,
     };
-    let reading = (ctx.use_of)(guarded)
-        .map_err(|e| format!("owner unproven: the process table could not be read: {e}"))?;
-    if !reading.provably_unused() {
-        let why = reading
-            .why_kept()
-            .unwrap_or_else(|| "a process may be using it".into());
-        return Err(if reading.users.is_empty() {
-            format!("owner unproven: {why}")
-        } else {
-            format!("in use: {why}")
-        }
-        .into());
-    }
+    let other_users = unused_now(ctx, guarded)?;
     evidence.push(format!(
         "no process uses {} (working directory, executable and arguments read; environment too where the OS shows it, which macOS does not for Apple platform programs{})",
         guarded.display(),
-        if reading.other_users > 0 {
-            format!(
-                "; {} other-user process(es) not inspected",
-                reading.other_users
-            )
+        if other_users > 0 {
+            format!("; {other_users} other-user process(es) not inspected")
         } else {
             String::new()
         }
     ));
-    let snapshot =
-        tree::snapshot_within(target, true, ctx.cancel, ctx.target_budget).map_err(|e| {
-            if e == tree::BUDGET_EXCEEDED {
-                format!(
-                    "too large to verify within {} entries / {} s, so it is kept",
-                    ctx.target_budget.entries, ctx.target_budget.seconds
-                )
-            } else {
-                e
-            }
-        })?;
+    let snapshot = tree::snapshot_within(target, true, ctx.cancel, ctx.target_budget).map_err(
+        |e| match e {
+            tree::WalkError::Refused(why) => Refusal::Kept(why),
+            tree::WalkError::Budget => Refusal::Kept(format!(
+                "too large to verify within {} entries / {} s, so it is kept",
+                ctx.target_budget.entries, ctx.target_budget.seconds
+            )),
+            tree::WalkError::CouldNotRead(why) => Refusal::Unexamined(why),
+            tree::WalkError::Cancelled => Refusal::Unexamined("the walk was cancelled".into()),
+        },
+    )?;
     if let Some(inside) = tree::crossing_device(&snapshot) {
         return Err(format!(
             "it holds a different filesystem (a mount point) at {}",
@@ -505,7 +587,128 @@ fn judge(
         "newest file is {newest_days} day(s) old; retention is {} day(s)",
         ctx.retention_days
     ));
-    Ok(Verdict { snapshot, evidence })
+    Ok(Verdict {
+        snapshot,
+        evidence,
+        guarded: guarded.to_path_buf(),
+    })
+}
+
+/// Reads the process table for `guarded` and refuses unless nothing may be
+/// using it. Run at judgement and again immediately before removal.
+fn unused_now(ctx: &Context<'_>, guarded: &Path) -> Result<usize, Refusal> {
+    let reading = (ctx.use_of)(guarded)
+        .map_err(|e| Refusal::Unexamined(format!("the process table could not be read: {e}")))?;
+    if reading.provably_unused() {
+        return Ok(reading.other_users);
+    }
+    let why = reading
+        .why_kept()
+        .unwrap_or_else(|| "a process may be using it".into());
+    Err(if reading.users.is_empty() {
+        // Processes it could not read: nothing was found and nothing could be
+        // ruled out. That is a check that could not finish.
+        Refusal::Unexamined(why)
+    } else {
+        Refusal::Kept(format!("in use: {why}"))
+    })
+}
+
+/// What Cargo, rustdoc and the coverage tools write directly in a target
+/// directory, as far as this machine and Cargo's build-cache page show.
+///
+/// Files, by where they were seen: `CACHEDIR.TAG` and `.rustc_info.json` in
+/// every real target here; `*.profraw` in `scratchpad/target/llvm-cov-target`
+/// (cargo-llvm-cov). Accepted on the coordinator's list and not found on this
+/// machine or in the build-cache page: `.future-incompat-report.json`,
+/// `.rustdoc_fingerprint.json`, `*.profdata`, `.DS_Store`.
+/// Directories: profile directories (the build-cache page: "debug", "release",
+/// "User-defined profiles are stored in a directory with the same name as the
+/// profile", which is why a name cannot be listed: a profile directory is the
+/// one that holds `.cargo-lock`, seen in `debug/` and `release/` here); a target
+/// triple directory (the page: `target/<tuple>/debug/`; seen as
+/// `aarch64-apple-darwin/` holding `release/`), recognised by holding a profile
+/// directory; `doc` and `package` (named on the page); `tmp` (in most real
+/// targets here); and a marked Cargo target of its own (`llvm-cov-target`).
+/// Anything else, a symlink included, is returned by name so the person can act
+/// on it. `Err` when the listing could not be read.
+fn foreign_top_level(target: &Path) -> Result<Option<String>, Refusal> {
+    const FILES: [&str; 4] = [
+        "CACHEDIR.TAG",
+        ".rustc_info.json",
+        ".future-incompat-report.json",
+        ".rustdoc_fingerprint.json",
+    ];
+    // A profile directory holds `.cargo-lock` (seen in `debug/` and `release/`
+    // here), `.fingerprint` and `deps` (the documented layout).
+    // A directory that cannot be looked into is not a foreign one: the check
+    // could not run, which is a different answer from "not Cargo's".
+    let is_profile = |dir: &Path| -> Result<bool, Refusal> {
+        for name in [".cargo-lock", ".fingerprint", "deps"] {
+            match std::fs::symlink_metadata(dir.join(name)) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Refusal::Unexamined(format!(
+                        "{} could not be read: {e}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        Ok(false)
+    };
+    let entries = std::fs::read_dir(target)
+        .map_err(|e| Refusal::Unexamined(format!("its top level could not be listed: {e}")))?;
+    let mut names: Vec<(String, PathBuf, std::fs::Metadata)> = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| Refusal::Unexamined(format!("its top level could not be listed: {e}")))?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| Refusal::Unexamined(format!("its top level could not be read: {e}")))?;
+        names.push((entry.file_name().to_string_lossy().into_owned(), path, meta));
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path, meta) in names {
+        let accepted = if meta.is_file() {
+            FILES.contains(&name.as_str())
+                || name.ends_with(".profraw")
+                || name.ends_with(".profdata")
+                || name == ".DS_Store"
+        } else if meta.is_dir() {
+            if matches!(name.as_str(), "doc" | "package" | "tmp")
+                || is_profile(&path)?
+                || cargo_evidence(&path).is_ok()
+            {
+                true
+            } else {
+                // A target-triple directory holds profile directories.
+                let inner = std::fs::read_dir(&path).map_err(|e| {
+                    Refusal::Unexamined(format!("{} could not be listed: {e}", path.display()))
+                })?;
+                let mut triple = false;
+                for e in inner {
+                    let e = e.map_err(|e| {
+                        Refusal::Unexamined(format!("{} could not be listed: {e}", path.display()))
+                    })?;
+                    if std::fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir())
+                        && is_profile(&e.path())?
+                    {
+                        triple = true;
+                        break;
+                    }
+                }
+                triple
+            }
+        } else {
+            false
+        };
+        if !accepted {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 fn candidate_from(
@@ -569,6 +772,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
         }
     };
     let mut folders = 0usize;
+    let mut blocked = 0usize;
     for project in projects.flatten() {
         let project_dir = project.path();
         if !std::fs::symlink_metadata(&project_dir).is_ok_and(|m| m.is_dir()) {
@@ -630,15 +834,28 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                             ctx.deadline,
                         ));
                     }
-                    Err(refusal) => scan.refuse(&target, SCOPE_SESSION, &refusal),
+                    Err(refusal) => {
+                        if matches!(&refusal, Refusal::Kept(why) if why.contains(SESSION_UNMATCHED))
+                        {
+                            blocked += 1;
+                        }
+                        scan.refuse(&target, SCOPE_SESSION, &refusal);
+                    }
                 }
             }
         }
     }
+    if blocked > 0 {
+        scan.issues.push(format!(
+            "No session scratchpad build can be offered: {} running Claude session(s) {SESSION_UNMATCHED}, so none of the {blocked} folder(s) found can be shown finished. They are offered again once that count is zero.",
+            ctx.live.unidentified
+        ));
+    }
     if folders > MAX_SESSION_FOLDERS {
         scan.issues.push(format!(
-            "{} session folder(s) past the first {MAX_SESSION_FOLDERS} were not examined",
-            folders - MAX_SESSION_FOLDERS
+            "{} session folder(s) past the first {MAX_SESSION_FOLDERS} under {} were not examined (the session-folder cap). Clear finished session folders there, then preview again.",
+            folders - MAX_SESSION_FOLDERS,
+            scope_root.display()
         ));
     }
     scan
@@ -815,7 +1032,12 @@ enum GitAnswer {
 /// status was obtained (the host shed the spawn, the repository is not trusted,
 /// it timed out, git could not start).
 fn git_status(dir: &Path, args: &[&str]) -> Result<(i32, String), String> {
-    match crate::engine::git_cli::git_captured(dir, args) {
+    // Every git question the cleaner asks about a candidate, at preview and at
+    // delete time alike, goes through here, so the relief is granted here and
+    // covers exactly this one read-only spawn.
+    match crate::engine::process::with_disk_relief(|| {
+        crate::engine::git_cli::git_captured(dir, args)
+    }) {
         Ok(run) => {
             if let Some(why) = &run.incomplete {
                 return Err(format!("git {} output was cut short: {why:?}", args[0]));
@@ -927,6 +1149,11 @@ pub(super) fn remove_judged(
     if bytes > budget {
         return Err("Candidate exceeds the remaining byte budget".into());
     }
+    // The judgement above read the process table, then walked the tree. A build
+    // may have started in between, so it is read once more right before the
+    // first deletion. A build that starts after this is not prevented; removal
+    // stops at the first entry that changed since the review.
+    let _ = unused_now(ctx, &verdict.guarded)?;
     tree::remove_reviewed(target, &verdict.snapshot, ctx.cancel)?;
     Ok(bytes)
 }

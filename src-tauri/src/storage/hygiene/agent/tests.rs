@@ -42,7 +42,9 @@ fn age(path: &Path, days: u64) {
 
 /// A Cargo target directory with Cargo's own markers and some output.
 fn cargo_target(dir: &Path, days_old: u64) {
+    // A profile directory as Cargo writes it: `.cargo-lock` inside.
     fs::create_dir_all(dir.join("debug")).unwrap();
+    fs::write(dir.join("debug/.cargo-lock"), "").unwrap();
     fs::write(dir.join("CACHEDIR.TAG"), CARGO_SIGNATURE).unwrap();
     fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
     fs::write(dir.join("debug/app.o"), vec![b'x'; 4096]).unwrap();
@@ -149,9 +151,22 @@ fn a_session_that_cannot_be_shown_finished_keeps_every_folder() {
         scan_sessions(&root, UID, ctx, false)
     });
     assert!(scan.candidates.is_empty());
-    assert!(kept_reason(&scan, OLD)
-        .reason
-        .contains("no session id to match"));
+    assert!(kept_reason(&scan, OLD).reason.contains(SESSION_UNMATCHED));
+    // It is not hidden in the count of folders left alone: the scan says it as
+    // its own line, naming the running sessions and what happens next.
+    assert!(
+        scan.issues
+            .iter()
+            .any(|i| i.contains("2 running Claude session(s)") && i.contains(SESSION_UNMATCHED)),
+        "{:?}",
+        scan.issues
+    );
+    // Once the count is zero the same folder is offered again.
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+    assert!(scan.issues.is_empty(), "{:?}", scan.issues);
     let blind = LiveSessions {
         incomplete: Some("the claude detector could not look: scan failed".into()),
         ..LiveSessions::default()
@@ -617,9 +632,13 @@ fn a_recent_or_unproven_claude_build_folder_says_which() {
         scan_claude_targets(std::slice::from_ref(&repo), ctx, false)
     });
     assert!(scan.candidates.is_empty());
+    // Processes the OS would not show are a check that could not finish, not a
+    // rule that kept the folder.
     assert!(kept_reason(&scan, "x-target")
         .reason
-        .starts_with("owner unproven:"));
+        .starts_with(COULD_NOT_CHECK));
+    assert!(scan.unexamined >= 1, "{}", scan.unexamined);
+    assert!(!scan.complete);
 }
 
 /// A real Cargo target has a `tmp` directory and crate-named build-script
@@ -827,31 +846,33 @@ fn the_cleaners_git_checks_are_answered_under_a_full_disk_only_with_relief() {
         (
             git_ignores(&repo, "tmp/a"),
             git_tracks(&repo, "tmp/a"),
-            crate::engine::worktree::list_worktrees_lite(repo.to_str().unwrap()).is_ok(),
+            super::super::global::listed_worktrees(repo.to_str().unwrap()).is_ok(),
         )
     };
+    // The injected governor has no history, so the real accessor answers
+    // false: the host is shed, the cleaner's helpers get no relief.
     let (ignored, tracked, listed) = asks();
     assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
     assert!(matches!(tracked, GitAnswer::Unknown(_)), "{tracked:?}");
-    assert!(!listed, "shed without relief");
-    let (ignored, tracked, listed) = crate::engine::process::with_disk_relief(asks);
+    assert!(!listed, "shed when the governor does not say disk-only");
+    // The governor says disk-only: each of the three helpers is answered.
+    let (ignored, tracked, listed) = crate::engine::process::with_disk_only_answer(true, asks);
     assert_eq!(ignored, GitAnswer::Yes);
     assert_eq!(tracked, GitAnswer::No);
-    assert!(
-        listed,
-        "the worktree listing runs on the calling thread too"
-    );
-    // Under another cause relief admits nothing.
-    drop(_disk);
-    let _swap = crate::sysload::inject_governor(GovernorInput {
-        readings: Readings {
-            swap_used: Reading::Value(60 << 30),
-            ..Readings::calm()
-        },
-        ..GovernorInput::test_pressure(Level::Critical)
+    assert!(listed, "the worktree listing is admitted too");
+    // The relief is the helper's, not the thread's: another spawn on the same
+    // thread, before and after a helper, is still shed.
+    let other = || crate::engine::worktree::list_worktrees_lite(repo.to_str().unwrap()).is_ok();
+    crate::engine::process::with_disk_only_answer(true, || {
+        assert!(!other(), "a spawn outside the helpers is shed");
+        assert_eq!(git_ignores(&repo, "tmp/a"), GitAnswer::Yes);
+        assert!(!other(), "and still shed after a helper ran");
     });
-    let (ignored, _, _) = crate::engine::process::with_disk_relief(asks);
+    // Disk-only false (memory, swap, CPU, thermal, battery at Elevated, no
+    // governor in this process) admits nothing.
+    let (ignored, _, listed) = crate::engine::process::with_disk_only_answer(false, asks);
     assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
+    assert!(!listed);
 }
 
 fn empty_inventory() -> super::super::global::CleanerInventory {
@@ -1088,4 +1109,217 @@ fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
     assert!(reason.starts_with("in use:"), "{reason}");
     assert!(reason.contains(&format!("process {pid}")), "{reason}");
     assert!(target.is_dir());
+}
+
+/// A folder holding anything Cargo, rustdoc and the coverage tools did not
+/// write at its top level is not offered, however well it carries the markers:
+/// someone put their own files in a build folder.
+#[test]
+fn a_marked_target_holding_foreign_files_at_its_top_level_is_kept() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    for (name, foreign) in [
+        ("with-src", "src"),
+        ("with-notes", "NOTES.md"),
+        ("with-dump", "dump.sql"),
+    ] {
+        let target = pad.join(name);
+        cargo_target(&target, 30);
+        if foreign == "src" {
+            fs::create_dir_all(target.join("src")).unwrap();
+            fs::write(target.join("src/lib.rs"), "fn main() {}").unwrap();
+        } else {
+            fs::write(target.join(foreign), "mine").unwrap();
+        }
+        age(&target, 30);
+    }
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+    for (name, foreign) in [
+        ("with-src", "src"),
+        ("with-notes", "NOTES.md"),
+        ("with-dump", "dump.sql"),
+    ] {
+        let reason = &kept_reason(&scan, name).reason;
+        assert!(reason.contains(foreign), "{reason}");
+        assert!(reason.contains("do not write"), "{reason}");
+    }
+    // None of that was a check that could not run.
+    assert_eq!(scan.unexamined, 0);
+
+    // The layouts seen on real folders pass: a target-triple directory holding
+    // a profile directory, a nested marked target (cargo-llvm-cov), profile
+    // data, `tmp`, `doc` and the macOS folder file.
+    let (_temp2, root2) = temp_root();
+    let pad2 = scratchpad(&root2, OLD);
+    let real = pad2.join("target-real");
+    cargo_target(&real, 30);
+    fs::create_dir_all(real.join("aarch64-apple-darwin/release")).unwrap();
+    fs::write(real.join("aarch64-apple-darwin/release/.cargo-lock"), "").unwrap();
+    cargo_target(&real.join("llvm-cov-target"), 30);
+    for dir in ["tmp", "doc"] {
+        fs::create_dir_all(real.join(dir)).unwrap();
+    }
+    for file in ["a.profraw", "merged.profdata", ".DS_Store"] {
+        fs::write(real.join(file), "").unwrap();
+    }
+    age(&real, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root2, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+
+    // A symlink at the top level is not Cargo's.
+    std::os::unix::fs::symlink("/", real.join("link")).unwrap();
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root2, UID, ctx, false)
+    });
+    assert!(scan.candidates.is_empty());
+    assert!(kept_reason(&scan, "target-real").reason.contains("link"));
+}
+
+/// A repository scratch folder is offered only when it is named like a build
+/// folder, even with every marker.
+#[test]
+fn a_marked_folder_under_a_repositorys_tmp_needs_a_build_folder_name() {
+    let (_temp, repo) = temp_root();
+    for name in ["build-out", "my-target", "target-2", "target"] {
+        cargo_target(&repo.join("tmp").join(name), 30);
+    }
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert!(
+        kept_reason(&scan, "build-out")
+            .reason
+            .contains("not named like a build folder"),
+        "{:?}",
+        scan.kept
+    );
+    // The three accepted names pass the naming rule; git is what keeps them
+    // here (this directory is no repository), and not one is offered as named.
+    assert!(!scan
+        .kept
+        .iter()
+        .any(|k| k.path.ends_with("my-target") && k.reason.contains("not named like")));
+    assert!(!scan
+        .kept
+        .iter()
+        .any(|k| k.path.ends_with("target-2") && k.reason.contains("not named like")));
+}
+
+/// A plain folder named like a build folder, in a session's scratchpad, that
+/// wraps the real targets: the children are judged one by one, the wrapper is
+/// never offered, and a live session keeps them.
+#[test]
+fn a_build_named_wrapper_in_a_session_scratchpad_is_looked_into_one_level() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let wrapper = pad.join("target-wrap");
+    fs::create_dir_all(&wrapper).unwrap();
+    cargo_target(&wrapper.join("inner"), 30);
+    age(&wrapper, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    let offered: Vec<&str> = scan.candidates.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(offered.len(), 1, "{offered:?} / {:?}", scan.kept);
+    assert!(offered[0].ends_with("target-wrap/inner"), "{offered:?}");
+    assert!(
+        kept_reason(&scan, "target-wrap")
+            .reason
+            .contains("named like a build folder but"),
+        "the wrapper itself is never offered"
+    );
+    let live = LiveSessions {
+        ids: BTreeSet::from([OLD.to_string()]),
+        ..LiveSessions::default()
+    };
+    let scan = run(&live, &idle, |ctx| scan_sessions(&root, UID, ctx, false));
+    assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+    assert!(kept_reason(&scan, "inner").reason.contains("is running"));
+    // Removing the child leaves the wrapper in place.
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    run(&nobody(), &idle, |ctx| {
+        remove(&scan.candidates[0], ctx, u64::MAX)
+    })
+    .unwrap();
+    assert!(wrapper.is_dir());
+    assert!(!wrapper.join("inner").exists());
+}
+
+/// A process that begins using the folder after the judgement and before the
+/// first deletion is caught by the second reading.
+#[test]
+fn a_process_that_starts_between_the_judgement_and_the_removal_keeps_the_folder() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    let target = pad.join("cargo-target");
+    cargo_target(&target, 30);
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    let candidate = &scan.candidates[0];
+    let calls = Cell::new(0);
+    let second_reading_finds_it = |_: &Path| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            Ok(DirUse::default())
+        } else {
+            Ok(DirUse {
+                users: vec![(77, UseKind::WorkingDirectory)],
+                ..DirUse::default()
+            })
+        }
+    };
+    let refused = run(&nobody(), &second_reading_finds_it, |ctx| {
+        remove(candidate, ctx, u64::MAX)
+    })
+    .expect_err("the second reading finds a user");
+    assert_eq!(calls.get(), 2, "read at judgement and again before removal");
+    assert!(refused.contains("process 77"), "{refused}");
+    assert!(target.join("debug/app.o").is_file(), "nothing was removed");
+}
+
+/// Claude sessions the registry names no id for: an id on the command line
+/// identifies the session; the executable's helper modes are not sessions; a
+/// session with neither stays unidentified.
+#[test]
+fn a_session_without_a_registry_id_is_identified_from_its_command_line() {
+    let mut claude = observed("claude", true, vec![None, None, None, None]);
+    for (live, pid) in claude.live.iter_mut().zip([11, 12, 13, 14]) {
+        live.pid = pid;
+    }
+    let argv = |pid: u32| -> Option<Vec<String>> {
+        let args: &[&str] = match pid {
+            11 => &["claude", "--session-id", "session-0009-cccccccc"],
+            12 => &["/x/rg", "--files"],
+            13 => &["claude", "--chrome-native-host"],
+            _ => return None,
+        };
+        Some(args.iter().map(|s| (*s).to_string()).collect())
+    };
+    let live = LiveSessions::from_observation_with(&vec![claude], &argv);
+    assert!(live.ids.contains("session-0009-cccccccc"), "{live:?}");
+    assert_eq!(live.unidentified, 1, "only pid 14 has no way to be told");
+    assert!(live.incomplete.is_none());
+}
+
+/// A detector that could not look is a check that could not run: the folder is
+/// unexamined, the scan is incomplete, and nothing is offered.
+#[test]
+fn a_blind_session_detector_makes_the_folder_unexamined() {
+    let (_temp, root) = temp_root();
+    cargo_target(&scratchpad(&root, OLD).join("target-x"), 30);
+    let blind = LiveSessions {
+        incomplete: Some("the claude detector could not look: scan failed".into()),
+        ..LiveSessions::default()
+    };
+    let scan = run(&blind, &idle, |ctx| scan_sessions(&root, UID, ctx, false));
+    assert!(scan.candidates.is_empty());
+    assert_eq!(scan.unexamined, 1);
+    assert!(!scan.complete);
+    assert!(kept_reason(&scan, OLD).reason.starts_with(COULD_NOT_CHECK));
 }

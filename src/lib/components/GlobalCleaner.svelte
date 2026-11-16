@@ -31,6 +31,9 @@
   const coverage = $derived(coverageNotice(inventory));
   /** The backend's prefix for a kept folder whose check did not run: not an answer, so not "left alone". */
   const COULD_NOT_CHECK = "could not be checked:";
+  // A running Claude session no scratch folder can be matched to: the scan says
+  // so once, as its own sentence, so it does not hide in the folders left alone.
+  const SESSION_UNMATCHED = "cannot be matched to a session folder";
   const uncheckedCount = $derived(inventory?.kept?.filter((item) => item.reason.startsWith(COULD_NOT_CHECK)).length ?? 0);
   const GIB = 1073741824;
   const IDLE_DAY_CHOICES = [7, 14, 30, 90];
@@ -183,7 +186,7 @@
       <div class="gp-card space-y-2 p-3">
         <strong>{inventory.repositories} repositories · {inventory.candidates.length} output candidates · {inventory.visited_entries.toLocaleString()} entries inspected</strong>
         {#if coverage}<p class="gp-notice" data-tone="warn">{coverage}</p>{/if}
-        {#each inventory.issues as issue}<p class="gp-notice break-all" data-tone="warn">{issue}</p>{/each}
+        {#each inventory.issues as issue}<p class="gp-notice break-all" data-tone="warn" data-testid={issue.includes(SESSION_UNMATCHED) ? "session-unmatched" : undefined}>{issue}</p>{/each}
         <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.path.startsWith("/") ? row.path : `${row.repo_path}/${row.path}`}</p><p class="text-textMuted"><span class="gp-chip" data-kind="label" data-testid="candidate-scope">{scopeLabel(row.scope)}</span> {row.provider}</p>{#if row.evidence?.length}<p class="text-textMuted break-all" data-testid="candidate-evidence">{row.evidence.join(" · ")}</p>{/if}</div><span class="shrink-0 text-right">{humanBytes(row.bytes)}{#if row.private_bytes !== undefined}<span class="block text-textMuted">frees {humanBytes(row.private_bytes)}</span>{/if}</span></div>{/each}</div>
         {#if inventory.kept?.length}
           <div class="space-y-1" data-testid="kept-items">

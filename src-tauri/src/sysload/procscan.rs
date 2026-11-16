@@ -2042,6 +2042,39 @@ fn classify_use(spellings: &[PathBuf], process: &ProcessUse) -> Option<UseKind> 
     None
 }
 
+/// The id a Claude CLI was started with, from `--session-id <id>` or
+/// `--session-id=<id>`. Only that flag: `--resume <id>` may continue under a new
+/// id, so it would name a session that is not the one running. The value must be
+/// shaped like an id (letters, digits, `-` and `_`, 8 to 96 long).
+pub(crate) fn claude_session_id_in(argv: &[String]) -> Option<String> {
+    let mut iter = argv.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let value = if arg == "--session-id" {
+            iter.next()?.as_str()
+        } else if let Some(value) = arg.strip_prefix("--session-id=") {
+            value
+        } else {
+            continue;
+        };
+        let plain = (8..=96).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        return plain.then(|| value.to_string());
+    }
+    None
+}
+
+/// Whether a process the scan files under the Claude executable is one of its
+/// helper modes, not a session: the browser bridge (`--chrome-native-host`) and
+/// the bundled ripgrep, which the binary runs as when `argv[0]` is `rg`.
+pub(crate) fn is_claude_helper(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|a| Path::new(a).file_name())
+        .is_some_and(|name| name == "rg")
+        || argv.iter().skip(1).any(|a| a == "--chrome-native-host")
+}
+
 /// [`DirUse`] over an already-read process table, `me` excluded.
 pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
     let spellings = dir_spellings(dir);
@@ -2051,7 +2084,11 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
             out.users.push((process.pid, kind));
         } else if !process.mine {
             out.other_users += 1;
-        } else if process.argv.is_none() || process.env.is_none() {
+        } else if process.argv.is_none() || process.env.is_none() || process.cwd.is_none() {
+            // A working directory the OS would not show is as unproven as an
+            // argument list it would not show. (Measured on this machine: no
+            // process of the owner's has an unreadable cwd, so this costs
+            // nothing and closes the case where one does.)
             out.unreadable.push(process.pid);
         }
     }
@@ -2803,6 +2840,17 @@ mod os {
             return None;
         }
         let cwd = cwd(pid);
+        // The OS would not even say who owns it (a failed lookup that was not
+        // "no such process"): it may be the user's, so it is unproven, never
+        // counted as another user's and never dropped.
+        if first.uid == UNKNOWN_OWNER {
+            return Some(super::ProcessUse {
+                pid,
+                mine: true,
+                cwd,
+                ..Default::default()
+            });
+        }
         if first.uid != uid() {
             return Some(super::ProcessUse {
                 pid,
@@ -3889,6 +3937,65 @@ pub(crate) mod tests {
                 (3, UseKind::Environment)
             ]
         );
+    }
+
+    /// A session started with an explicit id names it in its own arguments; a
+    /// resume does not (it may continue under a new id), and a helper mode of the
+    /// same executable is not a session at all.
+    #[test]
+    fn a_claude_cli_session_id_comes_from_session_id_only() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let id = "0123abcd-4567-89ef-0123-456789abcdef";
+        assert_eq!(
+            claude_session_id_in(&args(&["claude", "--model", "m", "--session-id", id])),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            claude_session_id_in(&args(&["claude", &format!("--session-id={id}")])),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            claude_session_id_in(&args(&["claude", "--resume", id])),
+            None
+        );
+        assert_eq!(
+            claude_session_id_in(&args(&["claude", "--session-id", "../../etc"])),
+            None,
+            "an id is a plain name, never a path"
+        );
+        assert_eq!(
+            claude_session_id_in(&args(&["claude", "--session-id"])),
+            None
+        );
+        assert!(is_claude_helper(&args(&["rg", "-G", "--hidden"])));
+        assert!(is_claude_helper(&args(&[
+            "/x/claude",
+            "--chrome-native-host"
+        ])));
+        assert!(!is_claude_helper(&args(&["claude", "--session-id", id])));
+    }
+
+    /// A process of the user's whose working directory the OS would not show
+    /// is unproven, like one whose arguments it would not show.
+    #[test]
+    fn an_unreadable_working_directory_is_unproven() {
+        let dir = Path::new("/work/x");
+        let hidden = ProcessUse {
+            pid: 7,
+            mine: true,
+            cwd: None,
+            exe: Some("/bin/tool".into()),
+            argv: Some(vec!["t".into()]),
+            env: Some(vec![]),
+        };
+        let reading = dir_use_in(dir, std::slice::from_ref(&hidden), 1);
+        assert_eq!(reading.unreadable, vec![7]);
+        assert!(!reading.provably_unused());
+        let seen = ProcessUse {
+            cwd: Some("/elsewhere".into()),
+            ..hidden
+        };
+        assert!(dir_use_in(dir, &[seen], 1).provably_unused());
     }
 
     #[test]

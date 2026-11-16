@@ -120,6 +120,18 @@ pub struct ReclaimScopes {
     )]
     pub agent_scratch_days: u32,
 }
+/// `git worktree list`, one of the three read-only questions (with `check-ignore`
+/// and `ls-files` in `agent.rs`) the cleaner asks that are admitted while the
+/// disk is the only reason the host sheds work. The relief is granted around
+/// this one spawn, never around a whole scan.
+pub(super) fn listed_worktrees(
+    repo_path: &str,
+) -> Result<Vec<crate::engine::worktree::WorktreeInfo>, CommandError> {
+    crate::engine::process::with_disk_relief(|| {
+        crate::engine::worktree::list_worktrees_lite(repo_path)
+    })
+}
+
 fn default_worktree_idle_days() -> u32 {
     7
 }
@@ -160,8 +172,12 @@ impl ReclaimScopes {
     /// Whether a preview taken at `previewed_at` no longer covers the agent
     /// scratch scope at `now`. A scope that is off has nothing to lapse.
     fn agent_lapsed(self, previewed_at: u64, now: u64) -> bool {
+        // A preview stamped in the future (a clock set back since) cannot be
+        // shown to be recent, so it lapses like an old one.
         self.agent_scratch_builds
-            && (previewed_at == 0 || now.saturating_sub(previewed_at) > AGENT_PREVIEW_VALID_SECS)
+            && (previewed_at == 0
+                || previewed_at > now
+                || now - previewed_at > AGENT_PREVIEW_VALID_SECS)
     }
     /// What a run may use: the saved scopes when a person previewed exactly
     /// this set, otherwise none of them. The agent scratch scope also needs a
@@ -703,12 +719,15 @@ impl Cleaner {
     /// the new next run time when it moved.
     fn bring_forward_for_disk(
         &self,
-        cause: Option<crate::sysload::Binding>,
+        disk_only: bool,
         now: u64,
     ) -> Result<Option<u64>, CommandError> {
-        use crate::sysload::Binding;
         self.expire_disk_forward(now)?;
-        if !matches!(cause, Some(Binding::LowDisk | Binding::DiskFilling)) {
+        // `disk_only` is `crate::sysload::shed_is_disk_only()`: the host is
+        // shedding, every other input has read Clear for a while, and a disk
+        // input is Elevated or above. The same answer admits the cleaner's own
+        // read-only checks, so a run brought forward is a run that can look.
+        if !disk_only {
             return Ok(None);
         }
         self.update(|saved| {
@@ -1049,17 +1068,18 @@ impl Cleaner {
         }
         Ok(inventory)
     }
-    /// Reads the roots and builds the inventory. The checks it runs are
-    /// read-only and bounded, so they are admitted while the host sheds work for
-    /// the disk alone (the cleaner exists to relieve that pressure), and shed
-    /// under every other cause as any spawn is.
+    /// Reads the roots and builds the inventory. The read-only git checks it
+    /// runs (`check-ignore`, `ls-files`, `worktree list`) are admitted by
+    /// `with_disk_relief` at the helper that spawns each one, so the same
+    /// relief covers the delete-time re-judgement; any other spawn on this
+    /// thread is shed as usual.
     fn inspect(
         &self,
         config: &CleanerConfig,
         scopes: ReclaimScopes,
         measure: bool,
     ) -> Result<CleanerInventory, CommandError> {
-        crate::engine::process::with_disk_relief(|| self.inspect_roots(config, scopes, measure))
+        self.inspect_roots(config, scopes, measure)
     }
     fn inspect_roots(
         &self,
@@ -1249,7 +1269,7 @@ impl Cleaner {
                 // `.claude/`), and discovery skips `.claude`, where the session
                 // worktrees live.
                 let mut checkouts = vec![repo.clone()];
-                match crate::engine::worktree::list_worktrees_lite(repo_path) {
+                match listed_worktrees(repo_path) {
                     Err(e) => {
                         // Worktrees not listed are worktrees not examined: this
                         // inspection is no preview of the scope, and the run
@@ -1363,7 +1383,7 @@ impl Cleaner {
             push_issue(&mut result.issues, format!("{what}: {}", error.message()));
         };
         if scopes.worktree_caches {
-            let infos = match crate::engine::worktree::list_worktrees_lite(repo_path) {
+            let infos = match listed_worktrees(repo_path) {
                 Ok(infos) => infos,
                 Err(e) => {
                     result.scopes_complete = false;
@@ -1672,9 +1692,17 @@ impl Cleaner {
             && !scopes.agent_scratch_builds
             && approval.previewed_scopes == Some(config.scopes);
         if lapsed {
+            let now = super::now();
+            let why = if approval.previewed_at == 0 {
+                "it was never previewed by this version of GitPulse"
+            } else if approval.previewed_at > now {
+                "its preview is dated in the future (the clock was set back), so its age cannot be told"
+            } else {
+                "its preview is more than 30 days old"
+            };
             push_issue(
                 &mut run.issues,
-                "Agent scratch removal was skipped: its preview is more than 30 days old, so it no longer counts as approved. Nothing was examined or removed for it. Preview it again in GitPulse.".into(),
+                format!("Agent scratch removal was skipped: {why}, so it does not count as approved. Nothing was examined or removed for it. Preview it again in GitPulse."),
             );
         }
         if config.scopes.any() && !scopes.any() && !lapsed {
@@ -2200,7 +2228,7 @@ fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandErr
     // The task store is per checkout: the worktree's own store refuses on any
     // lease, the main checkout's on one that names this branch or none.
     leases_clear(worktree, None)?;
-    let main = crate::engine::worktree::list_worktrees_lite(worktree)?
+    let main = listed_worktrees(worktree)?
         .into_iter()
         .find(|info| info.is_main)
         .ok_or("The main checkout of this worktree could not be found")?;
@@ -2273,7 +2301,7 @@ pub fn start_scheduler() -> Result<(), CommandError> {
                 // Not due. A full disk makes it due: the host is shedding
                 // work because of it, and this run frees what the saved
                 // scopes allow.
-                match cleaner.bring_forward_for_disk(crate::sysload::shed_cause(), super::now()) {
+                match cleaner.bring_forward_for_disk(crate::sysload::shed_is_disk_only(), super::now()) {
                     Ok(Some(_)) => log::info!("Cleaner schedule brought forward: the disk is the reason the host is shedding work"),
                     Ok(None) => {}
                     Err(e) => log::warn!("Cleaner could not be brought forward for the disk: {e}", e = e.message()),

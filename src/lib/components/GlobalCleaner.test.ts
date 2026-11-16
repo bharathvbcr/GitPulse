@@ -76,6 +76,8 @@ describe("GlobalCleaner reclaim scopes and clone budget", () => {
   it("tells a folder that could not be checked from one left alone, and shows an absolute path once", () => {
     expect(source).toContain('const COULD_NOT_CHECK = "could not be checked:"');
     expect(source).toContain("unchecked-count");
+    expect(source).toContain('const SESSION_UNMATCHED = "cannot be matched to a session folder"');
+    expect(source).toContain("session-unmatched");
     expect(source).toContain("could not be checked");
     expect(source).toContain('row.path.startsWith("/")');
     expect(source).toContain("not limited to the roots above");

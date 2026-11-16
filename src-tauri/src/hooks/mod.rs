@@ -3224,7 +3224,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
 fn scratch_build_line(checkout: &str) -> String {
     let root = checkout.trim_end_matches('/');
     format!(
-        "scratch builds: put throwaway build output in {root}/.gitpulse/scratch/target-<label>, passed as an absolute --target-dir or CARGO_TARGET_DIR (a relative one is not seen as in use); never put build output directly inside a checkout's .claude/ folder, because new session worktrees are seeded with a copy of it"
+        "scratch builds: put throwaway build output in {root}/.gitpulse/scratch/target-<label>, as an absolute --target-dir or CARGO_TARGET_DIR (a relative one is resolved against the build's working directory); never put build output directly inside a checkout's .claude/ folder, because new session worktrees are seeded with a copy of it"
     )
 }
 
@@ -8928,7 +8928,7 @@ done
             .filter(|l| l.contains(".gitpulse/scratch/target-"))
             .collect();
         assert_eq!(named.len(), 1, "{brief}");
-        assert!(named[0].len() < 400, "{}", named[0]);
+        assert!(named[0].len() < 350, "{}", named[0]);
         assert!(
             named[0].contains("/repo/.gitpulse/scratch/target-<label>"),
             "the root is absolute and under the session's own checkout: {}",

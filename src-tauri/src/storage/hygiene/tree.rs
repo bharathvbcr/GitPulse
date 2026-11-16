@@ -115,8 +115,39 @@ impl Budget {
 pub const BUDGET_EXCEEDED: &str =
     "Measurement incomplete: traversal budget exceeded. Cleanup is unavailable.";
 
+/// Why a walk did not produce a snapshot. The kinds are different facts: a
+/// rule refused the tree (`Refused`), the walk could not look (`CouldNotRead`,
+/// `Cancelled`), or it was too large for its budget (`Budget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkError {
+    /// What was found inside is not eligible: a symlink, a special file, a
+    /// protected name.
+    Refused(String),
+    /// An entry could not be listed or read.
+    CouldNotRead(String),
+    /// The walk spent its entries or its time.
+    Budget,
+    Cancelled,
+}
+
+impl From<String> for WalkError {
+    fn from(message: String) -> Self {
+        Self::CouldNotRead(message)
+    }
+}
+
+impl WalkError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Refused(message) | Self::CouldNotRead(message) => message.clone(),
+            Self::Budget => BUDGET_EXCEEDED.into(),
+            Self::Cancelled => "Cancelled".into(),
+        }
+    }
+}
+
 pub fn snapshot(root: &Path, strict: bool, cancel: &AtomicBool) -> Result<Snapshot, String> {
-    snapshot_within(root, strict, cancel, Budget::STANDARD)
+    snapshot_within(root, strict, cancel, Budget::STANDARD).map_err(|e| e.message())
 }
 
 /// [`snapshot`] with an explicit budget. A snapshot holds one map entry per
@@ -127,7 +158,7 @@ pub fn snapshot_within(
     strict: bool,
     cancel: &AtomicBool,
     budget: Budget,
-) -> Result<Snapshot, String> {
+) -> Result<Snapshot, WalkError> {
     let mut result = Snapshot {
         entries: BTreeMap::new(),
         bytes: 0,
@@ -165,15 +196,15 @@ fn walk(
     (deadline, max_entries): (Instant, usize),
     cancel: &AtomicBool,
     result: &mut Snapshot,
-) -> Result<(), String> {
+) -> Result<(), WalkError> {
     if cancel.load(Ordering::Relaxed) {
-        return Err("Cancelled".into());
+        return Err(WalkError::Cancelled);
     }
     if Instant::now() >= deadline
         || result.entries.len() >= max_entries
         || relative.components().count() > MAX_DEPTH
     {
-        return Err(BUDGET_EXCEEDED.into());
+        return Err(WalkError::Budget);
     }
     // `join("")` appends a separator, and a trailing slash makes lstat follow
     // a symlinked root: the walk then measured the target as if it were the root.
@@ -187,25 +218,30 @@ fn walk(
         // A symlinked root measures nothing: returning an empty snapshot made
         // the inventory report 0 bytes for a cache it never looked at.
         if relative.as_os_str().is_empty() {
-            return Err(format!(
+            return Err(WalkError::Refused(format!(
                 "{} is a symlink; it was not measured",
                 path.display()
-            ));
+            )));
         }
         if strict {
-            return Err(format!("Symlink inside candidate: {}", relative.display()));
+            return Err(WalkError::Refused(format!(
+                "Symlink inside candidate: {}",
+                relative.display()
+            )));
         }
         return Ok(());
     }
     if !meta.is_file() && !meta.is_dir() {
-        return Err("Special files inside candidate; cleanup is unavailable".into());
+        return Err(WalkError::Refused(
+            "Special files inside candidate; cleanup is unavailable".into(),
+        ));
     }
     if strict && !relative.as_os_str().is_empty() {
         if devmap_query::hygiene::protected_entry_in(root, relative) {
-            return Err(format!(
+            return Err(WalkError::Refused(format!(
                 "Protected content inside candidate: {}",
                 relative.display()
-            ));
+            )));
         }
         if root.file_name().is_some_and(|n| n == "__pycache__")
             && (!meta.is_file()
@@ -214,7 +250,9 @@ fn walk(
                     Some("pyc" | "pyo")
                 ))
         {
-            return Err("Python bytecode directory contains non-bytecode content".into());
+            return Err(WalkError::Refused(
+                "Python bytecode directory contains non-bytecode content".into(),
+            ));
         }
     }
     let stamp = Stamp::read(&meta)?;
@@ -584,7 +622,8 @@ mod tests {
             },
         )
         .expect_err("more than three entries");
-        assert_eq!(error, super::BUDGET_EXCEEDED);
+        assert_eq!(error, super::WalkError::Budget);
+        assert_eq!(error.message(), super::BUDGET_EXCEEDED);
     }
 
     #[test]
