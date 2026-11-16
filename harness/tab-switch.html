@@ -1045,7 +1045,9 @@
             // or exactly the ground colour; a sheen, edge or shadow is never allowed.
             check("header: rows 1 and 2 sit on the window's ground: no fill, no sheen, no edge, no shadow", () => {
               const root = document.documentElement;
-              const ground = getComputedStyle(document.body).backgroundColor;
+              // The ground is the theme's own background, which follows the host's colour scheme
+              // (light on the Linux runner, dark on a Mac in dark mode), not the harness page's body.
+              const ground = `rgb(${getComputedStyle(root).getPropertyValue("--c-bg").trim().split(/\s+/).join(", ")})`;
               const bare = (el) => {
                 const style = getComputedStyle(el);
                 return style.boxShadow === "none" && style.backgroundImage === "none" &&
