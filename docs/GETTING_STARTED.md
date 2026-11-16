@@ -77,10 +77,12 @@ Manvi card and status pill do the same for Manvi.
   `gitpulse-hook` that ship inside the app into `~/.local/bin` and registers the
   MCP server with Claude Code and Codex through their own `mcp add`. It shows
   the plan first and changes nothing until you apply it; anything already set
-  up differently is left alone and reported. **Copy setup prompt** gives your
-  agent the same steps to carry out instead, plus the optional Claude Code
-  plugin that adds GitPulse's hooks and skills. No source checkout or Rust
-  toolchain is needed.
+  up differently is left alone and reported, with the commands to switch it.
+  **Copy setup prompt** gives your agent the same steps to carry out instead,
+  plus the optional Claude Code plugin that adds GitPulse's hooks and skills.
+  The plugin also provides the `gitpulse` server, so use it or the direct
+  registration, not both; Connect skips the Claude Code registration when the
+  plugin is enabled. No source checkout or Rust toolchain is needed.
 - **GitHub:** install and authenticate `gh` for pull requests, issues, and Actions.
 - **Code Map:** use **Help → Set Up Optional Tools** for DevMap, the default
   module. There is no prebuilt DevMap this version can read yet, so the wizard

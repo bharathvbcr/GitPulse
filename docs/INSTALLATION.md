@@ -53,7 +53,11 @@ plan. Because the links point into the app, they follow the app when you update
 it. Connecting does not install GitPulse's Claude Code plugin, which is what
 wires its hooks; **Copy setup prompt** includes the plugin's install commands,
 and its hooks find `gitpulse-hook` only when `~/.local/bin` is on your shell's
-`PATH`.
+`PATH`. The plugin also provides the `gitpulse` server, so use the plugin or
+the direct registration, not both: when the plugin is enabled, Connect marks
+the Claude Code registration done instead of adding a second server. A
+registration or link from an older setup (for example a `cargo install` copy
+in `~/.cargo/bin`) is left alone, and the plan shows the commands to switch it.
 Connecting is refused while macOS runs the app from a temporary App
 Translocation location (opened straight from the DMG or Downloads); move it to
 Applications first. `bun run mcp:install` is only for building these binaries
