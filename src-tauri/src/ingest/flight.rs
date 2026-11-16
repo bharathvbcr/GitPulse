@@ -334,10 +334,15 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let slot = slots.entry(key).or_default();
             slot.running = None;
-            slot.incomplete_streak = if result.truncated || !result.error.is_empty() {
-                slot.incomplete_streak.saturating_add(1)
-            } else {
+            // A pass that was cut short but moved the work forward (a ref read,
+            // a transcript ingested) is a cold family converging, so it waits
+            // the base interval; only a pass with nothing to show doubles it.
+            slot.incomplete_streak = if !(result.truncated || !result.error.is_empty()) {
                 0
+            } else if result.made_progress() {
+                1
+            } else {
+                slot.incomplete_streak.saturating_add(1)
             };
             slot.last = Some(Finished {
                 at: clock(),
@@ -681,5 +686,69 @@ mod tests {
         advance(10);
         timed_pass(&gate, &runs, true);
         assert_eq!(count(), 5, "the backoff survived a completed pass");
+    }
+
+    /// A pass cut short that nonetheless did work (a transcript ingested, a ref
+    /// read) is a cold family converging, not a stuck one: it keeps the base
+    /// interval. Only a pass with nothing to show for it doubles the wait.
+    #[test]
+    fn only_incomplete_passes_without_progress_back_off() {
+        let (clock, offset) = manual_clock();
+        let gate = Gate::with_clock(
+            Intervals {
+                complete: Duration::from_secs(60),
+                incomplete: Duration::from_secs(10),
+                incomplete_cap: Duration::from_secs(300),
+            },
+            clock,
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+        let advance = |seconds: u64| {
+            *offset.lock().unwrap() += Duration::from_secs(seconds);
+        };
+        let count = || runs.load(Ordering::SeqCst);
+        let pass = |progress: bool| {
+            let counted = Arc::clone(&runs);
+            gate.run("/repo", Duration::from_secs(5), move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                CatchUp {
+                    truncated: true,
+                    error: "catch-up truncated".into(),
+                    transcripts: i64::from(progress),
+                    ..CatchUp::default()
+                }
+            })
+        };
+
+        pass(true);
+        for expected in 2..=6 {
+            advance(9);
+            pass(true);
+            assert_eq!(count(), expected - 1, "pass {expected} started early");
+            advance(1);
+            pass(true);
+            assert_eq!(
+                count(),
+                expected,
+                "pass {expected}: progress was made, so the base interval applies"
+            );
+        }
+        // Passes with nothing to show double the wait from the base: 10 s
+        // after the last pass that made progress, then 20 s, then 40 s.
+        advance(10);
+        pass(false);
+        assert_eq!(count(), 7);
+        advance(19);
+        pass(false);
+        assert_eq!(count(), 7, "no progress, so the wait doubled to 20 s");
+        advance(1);
+        pass(false);
+        assert_eq!(count(), 8);
+        advance(39);
+        pass(false);
+        assert_eq!(count(), 8, "no progress, so the wait doubled to 40 s");
+        advance(1);
+        pass(false);
+        assert_eq!(count(), 9);
     }
 }

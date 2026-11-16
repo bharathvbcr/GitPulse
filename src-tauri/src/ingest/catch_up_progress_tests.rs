@@ -280,3 +280,93 @@ fn a_pass_cut_short_leaves_its_recorded_refs_recorded_once() {
         "a ref was recorded twice or not at all: {first:?} {second:?}"
     );
 }
+
+/// The spawn gate sheds Background work while the host is under pressure or
+/// the spawn budget is low: git never starts, so the pass has read nothing and
+/// learned nothing about the repository. That is a pass cut short, to be
+/// retried, and not one that failed. The predicate is the one the binding
+/// path applies (`commands::audit::is_partial`): truncated, a backlog counted,
+/// no failed write, and every part of `error` a "catch-up truncated: " note.
+#[test]
+fn a_pass_whose_spawns_are_shed_ends_truncated_and_is_not_a_failure() {
+    use crate::sysload::{GovernorInput, Level};
+    let (main, _parent, linked) = repo_with_worktrees(3);
+    let anchor = plain(main.path());
+    // One clean pass first, so the ledger, the family and the default branch
+    // are all warm and the shed lands on the reads of the next pass.
+    with_empty_transcripts(|| {
+        let warm = catch_up_into_bounded(&anchor, &anchor, None);
+        assert!(!warm.truncated && warm.error.is_empty(), "{warm:?}");
+    });
+    for (index, worktree) in linked.iter().enumerate() {
+        std::fs::write(worktree.join("note.txt"), index.to_string()).unwrap();
+        crate::test_support::git_in(worktree, &["add", "."]);
+        crate::test_support::git_in(worktree, &["commit", "-q", "-m", &format!("note {index}")]);
+    }
+    let shed = with_empty_transcripts(|| {
+        let _pressed =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        crate::engine::process::with_background_processes(|| {
+            catch_up_into_bounded(&anchor, &anchor, None)
+        })
+    });
+    assert!(shed.truncated, "{shed:?}");
+    assert_eq!(shed.failed_records, 0, "{shed:?}");
+    assert!(
+        shed.reflog_refs_skipped > 0,
+        "no backlog was counted: {shed:?}"
+    );
+    assert!(
+        !shed.finished(),
+        "a shed pass must not read as complete: {shed:?}"
+    );
+    assert!(
+        shed.error
+            .split("; ")
+            .all(|part| part.starts_with("catch-up truncated: ")),
+        "a shed pass reported a failure, not a deferral: {:?}",
+        shed.error
+    );
+
+    let next = with_empty_transcripts(|| catch_up_into_bounded(&anchor, &anchor, None));
+    assert!(!next.truncated && next.error.is_empty(), "{next:?}");
+    assert!(
+        next.recorded >= 3,
+        "the shed pass lost what the next one should record: {next:?}"
+    );
+}
+
+/// The gate backs off a pass that is stuck and keeps the base interval for one
+/// that is converging. A pass that fails for its own reasons (here a ledger
+/// that refuses a row) over refs that have not moved reads the same refs every
+/// time: that is not progress, however many reads it did cleanly.
+#[test]
+fn a_pass_that_keeps_failing_over_unchanged_refs_is_not_progress() {
+    let (main, _parent, linked) = repo_with_worktrees(2);
+    let anchor = plain(main.path());
+    with_empty_transcripts(|| {
+        let first =
+            catch_up_into_bounded(&anchor, &anchor, Some(std::time::Duration::from_secs(60)));
+        assert!(first.error.is_empty(), "{first:?}");
+        std::fs::write(linked[0].join("boom.txt"), "x").unwrap();
+        crate::test_support::git_in(&linked[0], &["add", "."]);
+        crate::test_support::git_in(&linked[0], &["commit", "-q", "-m", "boom"]);
+        let db = main.path().join(".devcouncil").join("ledger.sqlite");
+        let conn = rusqlite::Connection::open(&db).expect("open the ledger file");
+        conn.execute_batch(
+            "CREATE TRIGGER inject_failure BEFORE INSERT ON events
+             WHEN NEW.object LIKE '%boom%'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .expect("inject the failure");
+        for round in 0..2 {
+            let out =
+                catch_up_into_bounded(&anchor, &anchor, Some(std::time::Duration::from_secs(60)));
+            assert!(out.failed_records > 0, "round {round}: {out:?}");
+            assert!(
+                !out.made_progress(),
+                "round {round}: a pass stuck on a failed write counted as progress: {out:?}"
+            );
+        }
+    });
+}

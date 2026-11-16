@@ -182,6 +182,11 @@ pub struct CatchUp {
     /// Non-zero sets `truncated`.
     #[serde(default)]
     pub reflog_refs_skipped: i64,
+    /// Reflogs this pass read cleanly (no error, nothing pending). Not part of
+    /// the wire shape: it exists so the gate can tell a pass that moved a cold
+    /// family forward from one that is stuck.
+    #[serde(skip)]
+    pub reflog_refs_read: i64,
     /// True when the wall-clock deadline stopped the pass early.
     ///
     /// A truncated pass is a floor: remaining transcripts/reflog entries were
@@ -998,6 +1003,11 @@ fn ingest_reflogs(
     worktrees.truncate(max_worktrees);
     total.reflog_refs_skipped = i64::try_from(skipped).unwrap_or(i64::MAX);
 
+    // Reads the spawn gate refused (Background work is shed while the budget is
+    // low or the host is under pressure). Git never ran, so nothing was read
+    // and nothing is wrong: they are counted as not read, which makes the pass
+    // `truncated` and retried, and are not reported as errors.
+    let mut deferred = 0usize;
     let mut refs: Vec<(String, String)> = worktrees
         .into_iter()
         .map(|worktree| (worktree, "HEAD".to_string()))
@@ -1015,19 +1025,28 @@ fn ingest_reflogs(
             }
             Err(reason) => {
                 total.reflog_refs_skipped += 1;
-                total.absorb_reflog(CatchUp {
-                    error: format!(
-                        "the default branch could not be read: {reason}",
-                        reason = reason.message()
-                    ),
-                    ..CatchUp::default()
-                });
+                if crate::engine::process::is_deferred_under_load(reason.message()) {
+                    deferred += 1;
+                } else {
+                    total.absorb_reflog(CatchUp {
+                        error: format!(
+                            "the default branch could not be read: {reason}",
+                            reason = reason.message()
+                        ),
+                        ..CatchUp::default()
+                    });
+                }
             }
         }
     }
     let slice = budget.share(REFLOG_SHARE_PERCENT);
     let bounded = slice.remaining().is_some();
     let mut cycle = take_reflog_cycle(ledger_repo, bounded);
+    // Refs this pass left for the next: the slice ran out, or a read was cut
+    // off or shed. Only these keep a cycle open. A ref that failed for its own
+    // reasons, or the default branch being unreadable, is reported by this pass
+    // and must not hold the others' reads for the length of a cycle.
+    let mut left = 0usize;
     for (worktree, ref_name) in &refs {
         let key = (worktree.clone(), ref_name.clone());
         if cycle.read.contains(&key) {
@@ -1035,6 +1054,7 @@ fn ingest_reflogs(
         }
         if slice.expired() {
             total.reflog_refs_skipped += 1;
+            left += 1;
             continue;
         }
         let one = replay_ref(
@@ -1044,6 +1064,12 @@ fn ingest_reflogs(
             REFLOG_WINDOW,
             slice.remaining(),
         );
+        if crate::engine::process::is_deferred_under_load(&one.error) {
+            total.reflog_refs_skipped += 1;
+            left += 1;
+            deferred += 1;
+            continue;
+        }
         // Only a clean read counts as read: one the slice cut off, one that
         // failed and one with entries still pending are all tried again by the
         // next pass, and none may let a later pass report complete without
@@ -1053,15 +1079,29 @@ fn ingest_reflogs(
         total.absorb_reflog(one);
         if cut_off {
             total.reflog_refs_skipped += 1;
+            left += 1;
         } else if clean {
+            total.reflog_refs_read += 1;
             cycle.read.insert(key);
         }
     }
-    keep_reflog_cycle(ledger_repo, cycle, bounded && total.reflog_refs_skipped > 0);
+    keep_reflog_cycle(ledger_repo, cycle, bounded && left > 0);
+    // A read only moved the work forward if refs remain for the next pass to
+    // read: when the cycle ended, a pass that is still incomplete for another
+    // reason (a failed write, an unreadable default branch) re-read the same
+    // refs it read last time and made no progress.
+    if left == 0 {
+        total.reflog_refs_read = 0;
+    }
     if total.reflog_refs_skipped > 0 {
         total.mark_reflog_incomplete(format!(
-            "{} reflog(s) not read this pass",
-            total.reflog_refs_skipped
+            "{} reflog(s) not read this pass{}",
+            total.reflog_refs_skipped,
+            if deferred > 0 {
+                " (git was deferred under load)"
+            } else {
+                ""
+            }
         ));
     }
     total
@@ -1506,6 +1546,7 @@ impl CatchUp {
         self.failed_records += other.failed_records;
         self.reflog_pending += other.reflog_pending;
         self.reflog_refs_skipped += other.reflog_refs_skipped;
+        self.reflog_refs_read += other.reflog_refs_read;
         self.reflog_unreached |= other.reflog_unreached;
         self.truncated |= other.truncated;
         if !other.error.is_empty() {
@@ -1646,6 +1687,13 @@ impl CatchUp {
             return self.is_unlisted_only_truncation();
         }
         self.error.is_empty()
+    }
+
+    /// Whether the pass moved the work forward: it recorded something, ingested
+    /// a transcript or read a reflog cleanly. A pass can be cut short and still
+    /// have made progress, which the gate tells apart from one that is stuck.
+    pub fn made_progress(&self) -> bool {
+        self.recorded > 0 || self.transcripts > 0 || self.reflog_refs_read > 0
     }
 }
 
@@ -1843,6 +1891,21 @@ fn catch_up_with(
         Ok(siblings) => {
             unresolved_streak(&streak_key, false);
             pass::ingest_family_until(ledger_repo, worktree_path, siblings, &mut expired)
+        }
+        // The family could not be listed because git was not started (shed
+        // under load), which says nothing about the family: the pass is cut
+        // short, not failed, and the next one asks again.
+        Err(reason)
+            if crate::engine::process::is_deferred_under_load(reason)
+                && is_git_checkout(worktree_path) =>
+        {
+            CatchUp {
+                truncated: true,
+                error: format!(
+                    "catch-up truncated: the transcript pass was deferred under load: {reason}"
+                ),
+                ..CatchUp::default()
+            }
         }
         Err(reason) if is_git_checkout(worktree_path) => {
             // A checkout whose family cannot be listed may well have live
