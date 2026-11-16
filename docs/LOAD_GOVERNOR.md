@@ -807,8 +807,31 @@ snapshot. Any doubt is false: a process with no governor of its own (the
 headless cleaner run, the MCP server, a hook), a governor built from one
 sample (`Governor::instant`), an unavailable or stale-old sensor. The
 published snapshot does not carry the count, so a reader of it cannot answer
-this. So
-a build that writes in lumps with pauses of up to 240 s is held at Severe from
+this.
+
+Running on battery does not count against it: the battery input exists to save
+power, not to protect the machine, and spending some battery to free a nearly
+full disk is the right trade (an unreadable power source is no more a doubt
+than a reading of "on battery"). The tier, the binding and what is shed are
+untouched, and a laptop on battery with a healthy disk still sheds background
+work and is not disk only. Memory pressure, compressor thrash, compressor
+segments, swap, thermal and CPU load keep blocking exactly as before.
+
+**The disk remedy.** `sysload::disk_remedy_due()` is true when
+`shed_is_disk_only()` is, or when the low-disk level input itself reads Severe
+(free space under the Severe floor, under the configured or automatic floors
+and the input's mode) in a fresh reading, whatever else is pressed: a nearly
+full disk brings memory pressure with it on macOS because swap cannot grow, so
+the remedy must not wait on a symptom of what it fixes. It is for the cleaner's
+own work only (its read-only checks, its bring-forward, its scheduled run); it
+admits nothing else, and agent launches are refused at Severe as before. It
+does not cover the fill-rate projection alone (a burst can project Severe with
+plenty of space left) or low disk at Elevated, and it is false on any doubt: no
+governor in this process (the headless run, the MCP server, a hook), a sensor
+that is off, unavailable or stale, free space unreadable, the low-disk input
+turned off. It takes one short lock and does no IO.
+
+**What the hold costs.** A build that writes in lumps with pauses of up to 240 s is held at Severe from
 the first bind until free space reaches the floor, where the level rule takes
 over, rather than admitting launches in each pause. The cost is a linger: a
 finished write that left little room can keep refusing for at most the

@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::sysload::diskrate::FillTracker;
-use crate::sysload::sensor::{Thermal, Why};
+use crate::sysload::sensor::{Power, Thermal, Why};
 use crate::sysload::thresholds::InputMode;
 use crate::sysload::Reading;
 
@@ -881,7 +881,11 @@ fn a_lapsed_fill_hold_is_gone_it_names_nothing_and_a_blip_does_not_rearm_it() {
 
 /// CPU load of `per_cpu` on the 18 logical CPUs the calm readings carry.
 fn cpu_load(d: &mut Direct, per_cpu: f64) {
-    d.input.readings.load = Reading::Value([per_cpu * 18.0; 3]);
+    cpu_load_input(&mut d.input, per_cpu);
+}
+
+fn cpu_load_input(input: &mut Input, per_cpu: f64) {
+    input.readings.load = Reading::Value([per_cpu * 18.0; 3]);
 }
 
 #[test]
@@ -1125,6 +1129,161 @@ fn the_process_wide_accessor_answers_true_in_a_pause_the_fill_hold_keeps() {
     ));
     let _lapsed = inject_governor_with_history(history);
     assert!(!shed_is_disk_only());
+}
+
+/// `input` on battery with the battery input switched on (it is off by
+/// default), so it reads Elevated and sheds background work.
+fn on_battery(mut input: Input) -> Input {
+    input.thresholds.battery.mode = InputMode::Shed;
+    input.readings.power = Reading::Value(Power::Battery);
+    input
+}
+
+// Running on battery used to count against "the disk is the only reason", so
+// a laptop unplugged never got the disk remedy. That is decided policy now: the
+// battery input exists to save power, not to protect the machine, and spending
+// some battery to free a nearly full disk is the right trade. Memory, thrash,
+// segments, swap, thermal and CPU keep blocking exactly as before.
+#[test]
+fn on_battery_a_nearly_full_disk_is_still_the_only_reason() {
+    use crate::sysload::{inject_governor_with_history, shed_is_disk_only};
+    // Low disk Severe (8 GiB free) with everything else Clear for 10 ticks.
+    let mut d = Direct::new();
+    d.input = on_battery(d.input.clone());
+    d.input.readings.free_disk = Reading::Value(8 << 30);
+    for tick in 1..=2 * EXIT_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(d.disk_only(), tick >= EXIT_SAMPLES, "tick {tick}: {v:?}");
+    }
+    assert_eq!(d.governor.held, Tier::Severe);
+    // The real accessor, through a governor with history.
+    let _held =
+        inject_governor_with_history(std::iter::repeat_n(on_battery(disk_input(8, false)), 10));
+    assert!(shed_is_disk_only());
+    // An unreadable power source is no more a doubt than "on battery".
+    let mut unreadable = disk_input(8, false);
+    unreadable.thresholds.battery.mode = InputMode::Shed;
+    unreadable.readings.power = Reading::Unavailable(Why::Failed);
+    let _unreadable = inject_governor_with_history(std::iter::repeat_n(unreadable, 10));
+    assert!(shed_is_disk_only());
+}
+
+#[test]
+fn on_battery_with_a_healthy_disk_the_host_sheds_but_is_not_disk_only() {
+    use crate::sysload::{inject_governor_with_history, shed_is_disk_only};
+    let mut d = Direct::new();
+    d.input = on_battery(d.input.clone());
+    d.input.readings.free_disk = Reading::Value(200 << 30);
+    for _ in 0..3 * EXIT_SAMPLES {
+        d.tick(false, false);
+    }
+    // Nothing about the verdict changed: battery still sheds background work.
+    assert_eq!(d.governor.held, Tier::Elevated);
+    assert_eq!(d.governor.binding, Some(Binding::Battery));
+    assert!(!d.disk_only());
+    let _held =
+        inject_governor_with_history(std::iter::repeat_n(on_battery(disk_input(200, false)), 10));
+    assert!(!shed_is_disk_only());
+}
+
+#[test]
+fn on_battery_a_pressed_input_beside_the_disk_still_blocks_it() {
+    use crate::sysload::{inject_governor_with_history, shed_is_disk_only};
+    let mut d = Direct::new();
+    d.input = on_battery(d.input.clone());
+    d.input.readings.free_disk = Reading::Value(8 << 30);
+    for _ in 0..3 * EXIT_SAMPLES {
+        d.tick_at(Level::Warn, false);
+    }
+    assert!(!d.disk_only(), "low disk Severe + memory Warn on battery");
+    let mut warn = on_battery(disk_input(8, false));
+    warn.level = Some(Level::Warn);
+    let _warn = inject_governor_with_history(std::iter::repeat_n(warn, 10));
+    assert!(!shed_is_disk_only());
+}
+
+#[test]
+fn on_battery_a_fill_held_pause_is_disk_only() {
+    use crate::sysload::{inject_governor_with_history, shed_is_disk_only};
+    let mut d = Direct::new();
+    d.input = on_battery(d.input.clone());
+    for _ in 0..5 {
+        d.tick(false, true);
+    }
+    for after in 1..FILL_SEVERE_RELEASE_SAMPLES {
+        let v = d.tick(false, false);
+        assert_eq!(v.tier, Tier::Severe, "{after}");
+        assert!(d.disk_only(), "{after} ticks into the pause, on battery");
+    }
+    let history = std::iter::repeat_n(on_battery(disk_input(40, true)), 5)
+        .chain(std::iter::repeat_n(on_battery(disk_input(40, false)), 20));
+    let _held = inject_governor_with_history(history);
+    assert!(shed_is_disk_only());
+}
+
+/// What `disk_remedy_due` and `shed_is_disk_only` answer for a governor that
+/// has read `input` for ten ticks.
+fn remedy_after(input: Input) -> (bool, bool) {
+    use crate::sysload::{disk_remedy_due, inject_governor_with_history, shed_is_disk_only};
+    let _held = inject_governor_with_history(std::iter::repeat_n(input, 10));
+    (disk_remedy_due(), shed_is_disk_only())
+}
+
+#[test]
+fn the_disk_remedy_is_due_below_the_severe_floor_whatever_else_is_pressed() {
+    use crate::sysload::{disk_remedy_due, inject_governor};
+    // Free disk 8 GiB, under the 16 GiB Severe floor of a 64 GiB Mac.
+    let mut memory = disk_input(8, false);
+    memory.level = Some(Level::Critical);
+    assert_eq!(
+        remedy_after(memory.clone()),
+        (true, false),
+        "memory critical"
+    );
+    let mut everything = disk_input(8, false);
+    everything.readings.swap_used = Reading::Value(60 << 30);
+    cpu_load_input(&mut everything, 7.0);
+    assert_eq!(remedy_after(everything), (true, false), "swap + CPU Severe");
+    // The level branch needs no history.
+    let _instant = inject_governor(memory);
+    assert!(disk_remedy_due());
+}
+
+#[test]
+fn the_disk_remedy_is_not_due_on_a_projection_or_an_elevated_disk_or_on_any_doubt() {
+    let warn = |mut input: Input| {
+        input.level = Some(Level::Warn);
+        input
+    };
+    // Low disk Elevated (24 GiB, between the floors) + memory Warn.
+    assert!(!remedy_after(warn(disk_input(24, false))).0, "Elevated");
+    // The fill projection alone, with space well above the Severe floor.
+    assert!(!remedy_after(warn(disk_input(40, true))).0, "projection");
+    let mut off = disk_input(8, false);
+    off.level = Some(Level::Critical);
+    let mut disabled = off.clone();
+    disabled.thresholds.disk.mode = InputMode::Off;
+    assert!(!remedy_after(disabled).0, "low-disk input off");
+    let mut unreadable = off.clone();
+    unreadable.readings.free_disk = Reading::Unavailable(Why::Failed);
+    assert!(!remedy_after(unreadable).0, "free disk unreadable");
+    let mut stale = off;
+    stale.state = SensorState::StaleRecent;
+    assert!(!remedy_after(stale).0, "stale reading");
+}
+
+#[test]
+fn whenever_the_disk_is_the_only_reason_the_remedy_is_due() {
+    for (name, input) in [
+        ("low disk Severe", disk_input(8, false)),
+        ("low disk Elevated", disk_input(24, false)),
+        ("disk filling", disk_input(40, true)),
+        ("on battery", on_battery(disk_input(24, false))),
+    ] {
+        let (due, only) = remedy_after(input);
+        assert!(only, "{name}: the disk alone");
+        assert!(due, "{name}: disk only implies the remedy is due");
+    }
 }
 
 #[test]
