@@ -56,6 +56,60 @@ GitHub CLI, DevMap, Manvi, and local model servers are optional; install the
 ones needed for the features you use. The [first repository guide](docs/GETTING_STARTED.md)
 walks through a review, task creation, and optional setup.
 
+## Quick install & agent setup
+
+If you installed the packaged desktop app, **Settings → Agents → Connect** (or its **Copy setup prompt**) symlinks the bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` without needing a source checkout or Rust toolchain, and **Help → Set Up Optional Tools** installs DevMap, the analysis suite, or Manvi interactively. To build and install all GitPulse helpers, **DevCouncil** components (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`), **Manvi** (`manvi`), and MCP integrations from source (requires **Git**, **Bun 1.4.2**, **Rust 1.100+**, and **Go 1.27.4+**):
+
+```sh
+# 1. From your GitPulse checkout: install gitpulse-mcp, gitpulse-hook, and worktree/cache helpers
+git clone https://github.com/bharathvbcr/GitPulse.git && cd GitPulse
+bun install --frozen-lockfile
+bun run mcp:install
+cargo install --path crates/gitpulse-worktree --locked --force
+
+# 2. Install DevCouncil components (devmap, dcstore, dcverify, dcgrep, devcouncil)
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force devmap-cli
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcstore dc-store
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcverify dc-verify
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcgrep dc-grep
+go install github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/cmd/devcouncil@latest
+
+# 3. Install Manvi (policy harness, workbench host, and managed agent runner)
+go install github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest
+
+# 4. Verify installed binaries, MCP health, and store schema alignment
+bun run mcp:doctor
+bun run check:schema-parity
+devmap doctor && devcouncil doctor && manvi doctor
+```
+
+### Agent setup prompt
+
+Paste this prompt into Claude Code, Codex, Antigravity, or Cursor to install, wire up every DevCouncil/Manvi module and MCP server, and verify your environment end-to-end:
+
+````text
+Set up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain on this machine and verify every binary, schema, and host integration without skipping failing checks:
+
+1. Preflight tools: confirm `git`, `bun`, `rustc`/`cargo`, and `go` are on `PATH`, and check whether sibling `GitPulse`, `DevCouncil`, and `Manvi` checkouts exist (or clone them from `https://github.com/bharathvbcr/{GitPulse,DevCouncil,Manvi}.git` into a chosen workspace folder if I ask). Do not install anything outside Cargo/Go/Bun user bins without asking.
+2. Install GitPulse MCP, hooks, and worktree CLIs from the GitPulse checkout:
+   - Run `bun install --frozen-lockfile` (if `node_modules` is missing).
+   - Run `bun run mcp:install` (installs `gitpulse-mcp` and `gitpulse-hook` and records the source digest).
+   - Run `cargo install --path crates/gitpulse-worktree --locked --force` (installs `gitpulse-worktree` and `gitpulse-rustc`).
+3. Install all DevCouncil components and modules (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`):
+   - If a local `DevCouncil` checkout is present, run `bash scripts/install.sh` (or `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force` for `devmap-cli`, `dc-store`/`--bin dcstore`, `dc-verify`/`--bin dcverify`, `dc-grep`/`--bin dcgrep`, plus `go install github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/cmd/devcouncil@latest`).
+4. Install Manvi (`manvi`):
+   - From a local `Manvi` checkout run `go -C manvi install ./cmd/manvi`, or remotely run `go install github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest`.
+5. Configure MCP servers and agent plugins cleanly (preview before writing; preserve existing user-owned configs):
+   - Register **either** the GitPulse plugin (`plugins/gitpulse/` for Claude Code/Codex/Cursor or `plugins/gitpulse-agy/` for Antigravity) **or** a direct `gitpulse` MCP registration (`gitpulse-mcp`), **never both** — the plugin already provides the `gitpulse` server (repo insights, worktree coordination, collision radar, task board, and in-process `devmap_*`). If using the packaged app instead of source builds, prefer `~/.local/bin` symlinks from **Settings → Agents → Connect**.
+   - Run `devmap integrate <host> --dry-run` (and `devcouncil integrate <host> --dry-run` if using the orchestrator MCP) for my active agent client(s) (`claude`, `codex`, `cursor`, `antigravity`), show me the planned file changes (noting any `not_ours` protected files), and apply only with my approval (`--apply`) so `devmap mcp` (code graph) and `devcouncil mcp` (orchestrator/leases) are wired safely alongside `gitpulse-mcp`.
+6. Verify end-to-end and report exact tool outputs:
+   - Run `bun run mcp:doctor` (both `gitpulse-mcp` and `gitpulse-hook` must report matching).
+   - Run `bun run check:schema-parity` (must agree across vendored crates, `devmap`, `dcstore`, `gitpulse-mcp`, and `manvi`).
+   - Run `devmap doctor`, `devcouncil doctor`, `manvi doctor`, `dcstore --version`, `dcverify --version`, and `dcgrep --help`.
+   - In the target repository, run `devmap paths --json` and `devmap status --json` (and `devmap build --manifest` if missing or stale).
+Report what succeeded, what could not run, and the exact paths of installed binaries and updated MCP configs.
+````
+
 ## Four views, one workspace
 
 GitPulse has 4 application views with 11 specialized sections. Each view keeps related sections together.
