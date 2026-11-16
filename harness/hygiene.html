@@ -189,7 +189,7 @@
     check("an agent scratch candidate shows who made it and why it is believed idle",(root.querySelector('[data-testid="candidate-evidence"]')?.textContent??"").includes("made by agent session s1")&&root.textContent.includes("agent scratchpad"));
     check("a folder left alone shows its reason",(root.querySelector('[data-testid="kept-items"]')?.textContent??"").includes("so Cargo did not make it"));
     const keptText=root.querySelector('[data-testid="kept-items"]')?.textContent??"";
-    check("a folder whose check did not run is counted apart from those left alone",(root.querySelector('[data-testid="unchecked-count"]')?.textContent??"").includes("1 folder could not be checked")&&keptText.includes("1 agent scratch folder left alone"));
+    check("a folder whose check did not run is counted apart from those left alone",(root.querySelector('[data-testid="unchecked-count"]')?.textContent??"").includes("Couldn't check 1 folder.")&&keptText.includes("1 agent scratch folder left alone"));
     check("an absolute candidate path is shown once, not behind its repository path",!root.textContent.includes("/private/tmp/claude-501//private/tmp/claude-501"));
     const leaked=root.querySelector('[data-testid="leaked-temp"]')?.textContent??"";
     check("leaked temp directories are listed and stated never removed",leaked.includes(".tmpAbC")&&leaked.includes("never removed"));

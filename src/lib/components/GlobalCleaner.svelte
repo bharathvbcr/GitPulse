@@ -193,7 +193,7 @@
         {#if inventory.kept?.length}
           <div class="space-y-1" data-testid="kept-items">
             <strong>{inventory.kept.length - uncheckedCount} agent scratch folder{inventory.kept.length - uncheckedCount === 1 ? "" : "s"} left alone</strong>
-            {#if uncheckedCount > 0}<p class="gp-notice" data-tone="warn" data-testid="unchecked-count">{uncheckedCount} folder{uncheckedCount === 1 ? "" : "s"} could not be checked. They were kept, but nothing was learned about them; inspect again.</p>{/if}
+            {#if uncheckedCount > 0}<p class="gp-notice" data-tone="warn" data-testid="unchecked-count">Couldn't check {uncheckedCount} folder{uncheckedCount === 1 ? "" : "s"}. They were kept, but nothing was learned about them; inspect again.</p>{/if}
             <div class="max-h-40 overflow-y-auto">{#each inventory.kept as item (`${item.scope}/${item.path}`)}<p class="py-1"><span class="font-mono break-all">{item.path}</span><span class="block text-textMuted" data-unchecked={item.reason.startsWith(COULD_NOT_CHECK) ? "true" : undefined}>{item.reason}</span></p>{/each}</div>
           </div>
         {/if}
