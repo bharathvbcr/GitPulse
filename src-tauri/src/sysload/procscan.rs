@@ -1999,21 +1999,44 @@ fn classify_use(spellings: &[PathBuf], process: &ProcessUse) -> Option<UseKind> 
             }
             // The program's own name is never a path argument, and a relative
             // argument means nothing without the directory it is relative to.
-            if index > 0 && !arg.starts_with('/') && !arg.starts_with('-') {
-                if let Some(cwd) = &process.cwd {
-                    if inside(&lexical_join(cwd, arg)) {
-                        return Some(UseKind::Argument);
-                    }
+            // `--target-dir=rel` carries its path after the `=`.
+            let relative = if arg.starts_with("--") {
+                arg.split_once('=').map(|(_, value)| value)
+            } else if arg.starts_with('-') {
+                None
+            } else {
+                Some(arg.as_str())
+            };
+            if let (true, Some(relative), Some(cwd)) = (index > 0, relative, &process.cwd) {
+                if !relative.is_empty()
+                    && !relative.starts_with('/')
+                    && inside(&lexical_join(cwd, relative))
+                {
+                    return Some(UseKind::Argument);
                 }
             }
         }
     }
     if let Some(env) = &process.env {
-        if env
-            .iter()
-            .any(|entry| entry.split_once('=').is_some_and(|(_, value)| names(value)))
-        {
-            return Some(UseKind::Environment);
+        for entry in env {
+            let Some((name, value)) = entry.split_once('=') else {
+                continue;
+            };
+            if names(value) {
+                return Some(UseKind::Environment);
+            }
+            // A relative build directory means the process's own working
+            // directory, which may be somewhere else entirely.
+            if matches!(name, "CARGO_TARGET_DIR" | "CARGO_BUILD_TARGET_DIR")
+                && !value.is_empty()
+                && !value.starts_with('/')
+            {
+                if let Some(cwd) = &process.cwd {
+                    if inside(&lexical_join(cwd, value)) {
+                        return Some(UseKind::Environment);
+                    }
+                }
+            }
         }
     }
     None
@@ -3804,6 +3827,68 @@ pub(crate) mod tests {
             ..unreadable
         };
         assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
+    }
+
+    /// A relative build directory means the process's own working directory:
+    /// `--target-dir rel`, `--target-dir=rel` and `CARGO_TARGET_DIR=rel` each
+    /// name the directory from another cwd, and none of them from a cwd that
+    /// resolves elsewhere or a value that names a longer sibling.
+    #[test]
+    fn a_relative_build_directory_is_resolved_against_the_processs_cwd() {
+        let dir = Path::new("/work/repo/.gitpulse/scratch/target-a");
+        let table = vec![
+            table_row(
+                1,
+                "/work/repo",
+                "/bin/tool",
+                &[
+                    "cargo",
+                    "build",
+                    "--target-dir",
+                    ".gitpulse/scratch/target-a",
+                ],
+                &[],
+            ),
+            table_row(
+                2,
+                "/work/repo",
+                "/bin/tool",
+                &["cargo", "build", "--target-dir=.gitpulse/scratch/target-a"],
+                &[],
+            ),
+            table_row(
+                3,
+                "/work/repo/src",
+                "/bin/tool",
+                &["cargo", "build"],
+                &["CARGO_TARGET_DIR=../.gitpulse/scratch/target-a"],
+            ),
+            // The same words from a cwd that resolves somewhere else.
+            table_row(
+                4,
+                "/elsewhere",
+                "/bin/tool",
+                &["cargo", "build", "--target-dir=.gitpulse/scratch/target-a"],
+                &["CARGO_TARGET_DIR=.gitpulse/scratch/target-a"],
+            ),
+            // A longer sibling name is not the directory.
+            table_row(
+                5,
+                "/work/repo",
+                "/bin/tool",
+                &["cargo", "build", "--target-dir=.gitpulse/scratch/target-ab"],
+                &[],
+            ),
+        ];
+        let reading = dir_use_in(dir, &table, 99);
+        assert_eq!(
+            reading.users,
+            vec![
+                (1, UseKind::Argument),
+                (2, UseKind::Argument),
+                (3, UseKind::Environment)
+            ]
+        );
     }
 
     #[test]

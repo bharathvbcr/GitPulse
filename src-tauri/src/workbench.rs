@@ -204,10 +204,14 @@ impl WorkbenchState {
         let target = target
             .canonicalize()
             .unwrap_or_else(|_| target.to_path_buf());
-        match crate::terminal::foreground::working_in(&target) {
+        // Working directory, executable, arguments and environment: a build
+        // run with `--target-dir` inside the worktree from elsewhere has no
+        // process "working in" it. A process of the user's that cannot be read
+        // refuses, as an unreadable table does.
+        match crate::sysload::procscan::processes_using(&target) {
             Ok(pids) if pids.is_empty() => Ok(()),
             Ok(pids) => Err(format!(
-                "{} still working in this worktree ({}). Close {} before removing the worktree.",
+                "{} still using this worktree ({}). Close {} before removing the worktree.",
                 if pids.len() == 1 { "A process is" } else { "Processes are" },
                 crate::terminal::foreground::describe_pids(&pids),
                 if pids.len() == 1 { "it" } else { "them" },
