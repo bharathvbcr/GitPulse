@@ -1287,6 +1287,27 @@ pub(crate) fn inject(input: Input) -> Injected {
     Injected
 }
 
+/// Test seam: like [`inject`], but the governor has lived through `inputs`,
+/// one counted sensor tick each, 2 s apart, through the same [`Governor::observe`]
+/// path the sampler uses (hysteresis, the fill hold, the disk-only count). The
+/// last input is what the thread's governor then holds. `inject` builds a
+/// governor from one sample, which has counted nothing, so it can never answer
+/// [`shed_is_disk_only`] true; this one can. Panics on no inputs.
+#[cfg(test)]
+pub(crate) fn inject_with_history(inputs: impl IntoIterator<Item = Input>) -> Injected {
+    let mut governor = Governor::default();
+    let mut now = Instant::now();
+    let mut last = None;
+    for input in inputs {
+        governor.observe(now, input.clone());
+        now += Duration::from_millis(super::CADENCE_MS);
+        last = Some(input);
+    }
+    let last = last.expect("a history needs at least one tick");
+    INJECTED.with(|slot| *slot.borrow_mut() = Some((last, governor)));
+    Injected
+}
+
 /// The input this thread's injection holds, for a test that must hand it to
 /// the pool thread a command hops to (the slot is thread-local).
 #[cfg(test)]

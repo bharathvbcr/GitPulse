@@ -1072,6 +1072,61 @@ fn cpu_elevated_arriving_mid_hold_makes_a_fill_held_severe_not_disk_only() {
     }
 }
 
+/// An input with `free_gib` GiB free and the fill rule Severe or not, memory
+/// normal, everything else calm.
+fn disk_input(free_gib: u64, fill_severe: bool) -> Input {
+    let mut input = Input::test_pressure(Level::Normal);
+    input.readings.free_disk = Reading::Value(free_gib << 30);
+    input.readings.disk_fill_sustained = Reading::Value(if fill_severe { 10 << 30 } else { 0 });
+    input
+}
+
+#[test]
+fn the_process_wide_accessor_answers_true_when_the_disk_alone_is_the_reason() {
+    use crate::sysload::{inject_governor, inject_governor_with_history, shed_is_disk_only};
+    // Low disk Severe (8 GiB free under the 16 GiB floor) and the fill rule
+    // Severe, each with every other input Clear for EXIT_SAMPLES ticks.
+    for (name, input) in [
+        ("low disk", disk_input(8, false)),
+        ("disk filling", disk_input(40, true)),
+    ] {
+        let _held = inject_governor_with_history(std::iter::repeat_n(input.clone(), 10));
+        assert!(shed_is_disk_only(), "{name} Severe alone");
+        // One tick short of the count is not enough.
+        let _short = inject_governor_with_history(std::iter::repeat_n(
+            input.clone(),
+            EXIT_SAMPLES as usize - 1,
+        ));
+        assert!(!shed_is_disk_only(), "{name}: {} ticks", EXIT_SAMPLES - 1);
+        // The same disk state with CPU Elevated beside it.
+        let mut busy = input.clone();
+        busy.readings.load = Reading::Value([4.0 * 18.0; 3]);
+        let _busy = inject_governor_with_history(std::iter::repeat_n(busy, 10));
+        assert!(!shed_is_disk_only(), "{name} Severe + CPU Elevated");
+        // A governor built from one sample has counted nothing.
+        let _instant = inject_governor(input);
+        assert!(!shed_is_disk_only(), "{name}: no history");
+    }
+}
+
+#[test]
+fn the_process_wide_accessor_answers_true_in_a_pause_the_fill_hold_keeps() {
+    use crate::sysload::{inject_governor_with_history, shed_is_disk_only};
+    // Five ticks of the fill rule Severe, then twenty in a pause: every disk
+    // input reads Clear and Severe is held.
+    let history = std::iter::repeat_n(disk_input(40, true), 5)
+        .chain(std::iter::repeat_n(disk_input(40, false), 20));
+    let _held = inject_governor_with_history(history);
+    assert!(shed_is_disk_only());
+    // After the hold lapses and Severe is left, nothing is shed.
+    let history = std::iter::repeat_n(disk_input(40, true), 5).chain(std::iter::repeat_n(
+        disk_input(40, false),
+        FILL_SEVERE_RELEASE_SAMPLES as usize + 1,
+    ));
+    let _lapsed = inject_governor_with_history(history);
+    assert!(!shed_is_disk_only());
+}
+
 #[test]
 fn a_burst_of_a_minute_or_less_never_refuses_when_it_leaves_42_gib_or_more() {
     for (from, size, dur) in [(54.0, 12.0, 30), (62.0, 20.0, 60), (50.0, 8.0, 30)] {

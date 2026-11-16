@@ -65,7 +65,10 @@ pub use governor::{
     REFUSAL_NOTICE_AFTER,
 };
 #[cfg(test)]
-pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};
+pub(crate) use governor::{
+    inject as inject_governor, inject_with_history as inject_governor_with_history,
+    injected_input as injected_governor_input,
+};
 pub use procscan::{
     observe_sessions, observe_sessions_with_caller, process_start_us, terminate_orphan, AgentKind,
     AgentSession, CallerIdentity, ForeignProcess, LaunchedTree, MemguardHealth, Orphan, ProcView,
