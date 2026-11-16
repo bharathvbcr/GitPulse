@@ -151,7 +151,7 @@ fn the_level_rule_alone_says_nothing_on_the_same_replay() {
 }
 
 #[test]
-fn deleting_the_output_unbinds_within_the_exit_samples() {
+fn deleting_the_output_holds_severe_for_the_180_s_release_then_clears() {
     let mut replay = Replay::new();
     let mut last = None;
     for i in 0..=678u64 {
@@ -163,6 +163,17 @@ fn deleting_the_output_unbinds_within_the_exit_samples() {
     // 45 GiB -> 167 GiB when the build output is deleted.
     let mut seen = Vec::new();
     for _ in 0..(EXIT_SAMPLES + 1) {
+        seen.push(replay.tick_gib(167.0));
+    }
+    // A Severe the fill rule caused is held for its own, longer release, not
+    // the five ticks every other cause takes.
+    assert_eq!(
+        seen.last().unwrap().verdict.tier,
+        Tier::Severe,
+        "{:?}",
+        seen.last().unwrap().verdict
+    );
+    for _ in 0..FILL_SEVERE_RELEASE_SAMPLES {
         seen.push(replay.tick_gib(167.0));
     }
     let last = seen.last().unwrap();
@@ -243,16 +254,33 @@ struct Outcome {
     shedding_s: u64,
     /// Second of the first fall back to Clear after Severe.
     cleared_after_severe: Option<u64>,
+    /// Seconds not admitting launches.
+    refused_s: u64,
+    /// Seconds spent at a tier below Severe after the first Severe, before the
+    /// run ended: the time launches were admitted in the middle of a fill.
+    outside_severe_s: u64,
 }
 
 /// Drives `free` for `seconds` at the 2 s tick; the tracker is reset at `reset`.
 fn drive(free: impl Fn(u64) -> f64, seconds: u64, reset: Option<u64>) -> Outcome {
+    drive_until(free, seconds, reset, 0.0)
+}
+
+/// [`drive`], stopping when free space reaches `stop_at` GiB: the severe floor
+/// is 16 GiB on the 64 GiB Mac these tests model, where the level rule has the
+/// last word and the fill rule's work is done.
+fn drive_until(
+    free: impl Fn(u64) -> f64,
+    seconds: u64,
+    reset: Option<u64>,
+    stop_at: f64,
+) -> Outcome {
     let mut replay = Replay::new();
     let mut out = Outcome::default();
     for i in 0..seconds / 2 {
         let s = i * 2;
         let at = free(s);
-        if at < 0.0 {
+        if at <= stop_at {
             break;
         }
         if reset == Some(s) {
@@ -269,6 +297,10 @@ fn drive(free: impl Fn(u64) -> f64, seconds: u64, reset: Option<u64>) -> Outcome
         }
         if !seen.verdict.admit {
             out.refused.get_or_insert((s, at));
+            out.refused_s += 2;
+        }
+        if out.severe.is_some() && tier != Tier::Severe {
+            out.outside_severe_s += 2;
         }
         if out.severe.is_some() && tier == Tier::Clear {
             out.cleared_after_severe.get_or_insert(s);
@@ -338,9 +370,10 @@ fn a_one_off_burst_never_refuses_and_sheds_for_a_bounded_time_at_every_start() {
 fn smooth_falls_shed_as_early_as_before_and_refuse_with_minutes_to_spare() {
     // (from, GiB/min, the shed no later than this free space, the refusal with
     // at least this many true minutes left, and with more than this free).
-    for (from, rate, shed_by, minutes, refuse_above) in
-        [(99.0, 2.7, 91.0, 8.0, 0.0), (150.0, 10.0, 128.0, 6.0, 60.0)]
-    {
+    for (from, rate, shed_by, minutes, refuse_above) in [
+        (99.0, 2.7, 91.0, 8.0, 40.0),
+        (150.0, 10.0, 128.0, 6.0, 60.0),
+    ] {
         for start in Start::ALL {
             let out = drive(
                 linear(from, rate, start.begins(false)),
@@ -379,21 +412,24 @@ fn a_build_that_writes_in_lumps_is_a_fall_whatever_the_pauses_between() {
         (150.0, 12.0, 30, 90, 8.0),
     ] {
         for start in Start::ALL {
-            let out = drive(
+            let out = drive_until(
                 lumps(from, size, dur, every, start.begins(false)),
-                2_400,
+                14_400,
                 start.reset(),
+                16.0,
             );
             let case =
                 format!("{size} GiB over {dur} s every {every} s from {from}, {start:?}: {out:?}");
             eprintln!("{case}");
-            // Shed with 20 true minutes left, or as soon as two minutes of
-            // history allow when the pattern starts with less than that.
+            // Shed with 20 true minutes left when the pattern starts with that
+            // much; when it starts with less, within 160 s of its start, which
+            // is what two minutes of history allow.
             let (shed_at, shed_free) = out.elevated.expect(&case);
-            assert!(
-                minutes_left(shed_free, average) >= 20.0 || shed_at <= start.begins(false) + 160,
-                "{case}"
-            );
+            if minutes_left(from, average) >= 20.0 {
+                assert!(minutes_left(shed_free, average) >= 20.0, "{case}");
+            } else {
+                assert!(shed_at <= start.begins(false) + 160, "{case}");
+            }
             let (_, free) = out.severe.expect(&case);
             assert!(minutes_left(free, average) >= 6.0, "{case}");
             if let Some(second) = out.cleared_after_severe {
@@ -403,6 +439,114 @@ fn a_build_that_writes_in_lumps_is_a_fall_whatever_the_pauses_between() {
                 );
             }
         }
+    }
+}
+
+/// The intermittent rows of the release review, each as (from GiB, GiB per
+/// lump, seconds a lump takes, seconds between lump starts).
+const INTERMITTENT: [(f64, f64, u64, u64); 8] = [
+    (100.0, 5.0, 1, 60),
+    (150.0, 5.0, 1, 80),
+    (150.0, 5.0, 1, 90),
+    (150.0, 10.0, 1, 150),
+    (150.0, 10.0, 1, 180),
+    (150.0, 15.0, 1, 240),
+    (150.0, 12.0, 30, 90),
+    (99.0, 8.0 * 40.0 / 60.0, 40, 120),
+];
+
+#[test]
+fn a_severe_the_fill_rule_caused_is_held_through_every_pause_until_the_floor() {
+    // Pattern from 30 s in, run until free space reaches the 16 GiB floor. The
+    // time spent below Severe after the first Severe is launches admitted in
+    // the middle of the fill, and must be zero.
+    for (from, size, dur, every) in INTERMITTENT {
+        let out = drive_until(lumps(from, size, dur, every, 30), 14_400, None, 16.0);
+        let case = format!("{size} GiB over {dur} s every {every} s from {from}: {out:?}");
+        eprintln!("{case}");
+        let (second, free) = out.severe.expect(&case);
+        assert!(free > 16.0, "{case}: Severe at second {second}");
+        assert_eq!(out.outside_severe_s, 0, "{case}");
+        assert_eq!(out.cleared_after_severe, None, "{case}");
+    }
+}
+
+#[test]
+fn writes_too_slow_to_matter_before_the_floor_are_reported_not_tuned_for() {
+    // 20 GiB per 300 s and 30 GiB per 600 s from 150 GiB: 4 and 3 GiB a minute
+    // on average. Nothing is asserted about when they bind; what they do is
+    // printed (`--nocapture`) and the release rule still holds.
+    for (size, every) in [(20.0, 300), (30.0, 600)] {
+        let out = drive_until(lumps(150.0, size, 1, every, 30), 14_400, None, 16.0);
+        eprintln!("{size} GiB per {every} s from 150: {out:?}");
+        if out.severe.is_some() {
+            assert_eq!(out.outside_severe_s, 0, "{out:?}");
+        }
+    }
+}
+
+/// A one-off write of `size` GiB over `dur` seconds from `from` GiB free,
+/// starting at second `at`, and whatever followed it for 2 400 s.
+fn refused_after_a_write(from: f64, size: f64, dur: u64, at: u64) -> Outcome {
+    drive(burst(from, size, dur, at), at + dur + 2_400, None)
+}
+
+#[test]
+fn a_finished_write_that_left_little_room_refuses_for_at_most_the_window_plus_the_hold() {
+    // The bound: the ten-minute net fall keeps the write for ten minutes after
+    // it ends, and a Severe the fill rule caused is held three minutes more
+    // (`FILL_SEVERE_RELEASE`): 780 s, and a few ticks of hysteresis.
+    let bound = 800;
+    // (from GiB free, GiB written, seconds it took)
+    for (from, size, dur) in [(40.0, 12.0, 30), (60.0, 20.0, 80), (107.0, 40.0, 120)] {
+        for (name, at) in [("warm", 630), ("cold", 100)] {
+            let out = refused_after_a_write(from, size, dur, at);
+            eprintln!("{size} GiB over {dur} s from {from}, {name}: {out:?}");
+            assert!(
+                out.refused_s <= bound,
+                "{size} GiB over {dur} s ending at {} GiB free, {name}: refused {} s: {out:?}",
+                from - size,
+                out.refused_s
+            );
+        }
+    }
+}
+
+#[test]
+fn a_lone_burst_binds_severe_at_half_the_headroom_cold_and_all_of_it_warm() {
+    // Severe wants the sustained rate to put the floor under ten minutes away:
+    // rate = fall / divisor, headroom / rate < 10 min. The divisor is
+    // max(history, 5 min) and the fall is capped by the ten-minute window, so
+    // on a cold history (under 5 min) the fall must exceed half the headroom
+    // left after it, and on a warm one (10 min) all of it. 16 GiB floor.
+    let floor = 16.0;
+    // (starts at s, from GiB, size that must not bind, size that must)
+    for (at, from, quiet, loud) in [(100, 100.0, 26.0, 30.0), (630, 200.0, 80.0, 100.0)] {
+        let headroom_after = |size: f64| from - size - floor;
+        let name = if at < 300 { "cold" } else { "warm" };
+        let share = |size: f64| size / headroom_after(size);
+        let quiet_out = drive(burst(from, quiet, 30, at), at + 30 + 900, None);
+        let loud_out = drive(burst(from, loud, 30, at), at + 30 + 900, None);
+        eprintln!(
+            "{name}: {quiet} GiB is {:.2} of the headroom it leaves: severe {:?}; {loud} GiB is {:.2}: severe {:?}",
+            share(quiet),
+            quiet_out.severe,
+            share(loud),
+            loud_out.severe
+        );
+        assert_eq!(quiet_out.severe, None, "{name}: {quiet_out:?}");
+        assert!(loud_out.severe.is_some(), "{name}: {loud_out:?}");
+    }
+}
+
+#[test]
+fn a_burst_of_a_minute_or_less_never_refuses_when_it_leaves_42_gib_or_more() {
+    for (from, size, dur) in [(54.0, 12.0, 30), (62.0, 20.0, 60), (50.0, 8.0, 30)] {
+        let out = refused_after_a_write(from, size, dur, 630);
+        assert_eq!(
+            out.refused, None,
+            "{size} GiB over {dur} s from {from}: {out:?}"
+        );
     }
 }
 

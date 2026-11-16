@@ -64,6 +64,18 @@ use std::time::{Duration, Instant};
 pub const ENTER_SAMPLES: u32 = 3;
 /// Consecutive samples below the held tier before it is left.
 pub const EXIT_SAMPLES: u32 = 5;
+/// How long a Severe that the disk fill rule caused is held after the fill
+/// rule last read Severe, as continuous time below it. A build that writes in
+/// lumps loses space in bursts with pauses between them, and the ordinary
+/// exit of [`EXIT_SAMPLES`] (10 s) lapsed to admitting launches in the middle
+/// of the fill, three times in 150 s for 5 GiB every 80 s. Three minutes is
+/// the shortest hold that left none of the intermittent patterns in the review
+/// sweep (60 s: 242 s of lapses, 120 s: 34 s, 180 s: none). A Severe that the
+/// level, memory, swap or CPU caused keeps [`EXIT_SAMPLES`].
+pub const FILL_SEVERE_RELEASE: Duration = Duration::from_secs(180);
+/// [`FILL_SEVERE_RELEASE`] in sampler ticks.
+pub const FILL_SEVERE_RELEASE_SAMPLES: u32 =
+    (FILL_SEVERE_RELEASE.as_millis() / super::CADENCE_MS as u128) as u32;
 /// Continuous pressure refusal after which the person is told.
 pub const REFUSAL_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 /// How long a person's "Admit anyway" lasts.
@@ -699,7 +711,15 @@ impl Governor {
                     self.down = (tier, binding);
                 }
                 self.down_streak += 1;
-                if self.down_streak >= EXIT_SAMPLES {
+                // Only a Severe the fill rule holds is kept longer: the cause
+                // is the binding the held tier carries.
+                let exit =
+                    if self.held == Tier::Severe && self.binding == Some(Binding::DiskFilling) {
+                        FILL_SEVERE_RELEASE_SAMPLES
+                    } else {
+                        EXIT_SAMPLES
+                    };
+                if self.down_streak >= exit {
                     (self.held, self.binding) = self.down;
                     self.down_streak = 0;
                 }

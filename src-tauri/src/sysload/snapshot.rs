@@ -129,7 +129,10 @@ const OFF_SEQ_TAIL: usize = 656;
 // mistaken for it, and ends with its own checksum, since the version-1
 // checksum stops at `OFF_CHECKSUM`.
 const OFF_EXT: usize = RECORD_LEN;
-const EXT_MAGIC: [u8; 4] = *b"GPX2";
+// The block's marker. `GPX2` was the marker of the block before the two disk
+// fill rates changed what bytes 694 and 696..704 mean; a branch build that
+// reads `GPX2` ignores this block (no extension) instead of misreading it.
+const EXT_MAGIC: [u8; 4] = *b"GPX3";
 const OFF_X_SEGMENTS_STATUS: usize = 668;
 const OFF_X_VERDICT_STATUS: usize = 669;
 const OFF_X_TIER: usize = 670;
