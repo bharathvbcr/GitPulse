@@ -21,9 +21,26 @@ zero telemetry.
 [Getting started](docs/GETTING_STARTED.md) ·
 [Documentation](docs/README.md) ·
 [Website](https://gitpulse.vbcr.dev/) ·
-[Release notes](CHANGELOG.md)
+[Release notes](CHANGELOG.md) ·
+[v2.0 Beta notes](docs/RELEASE_NOTES_v2.0.0.md)
 
 ![GitPulse on macOS: commit graph and selected commit diff](docs/assets/screenshot-graph.png)
+
+## GitPulse 2.0 — Coming Soon
+
+GitPulse 2.0 (currently in beta on `main` as `1.99.0` — see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)) brings a redesigned desktop shell, out-of-process terminal and agent hosting, pre-operation Git recovery snapshots, and faster multi-agent worktree orchestration:
+
+- **Streamlined 4 views & 11 sections with floating glass cards:**
+  - **Work (`Overview · Remote · Tasks`)**: Inline 3-way conflict editor leading Overview whenever a merge or rebase is parked, plus folded branch cleanup, policy activity, outgoing-commit checks, and release tag publishing.
+  - **Code (`Explorer · Map`)**: Inline Search and Blame toggles inside Explorer, and a Map overview of repository size, caps, and critical files with hover tooltips across files, symbols, and subsystems.
+  - **History (`Graph · Diff`)**: Unified `Commits | HEAD moves | Suspects` switcher on Graph, a **History (`⌥H`)** commit-graph rail tab right inside Diff, rich commit hover cards (full message body, `git notes`, recorded verification), and `Shift+click` `older..newer` commit-to-commit comparisons.
+  - **Insights (`Pulse · Coverage · Health · Storage`)**: Secrets folded into Health under one health verdict, and five-row previewed report lists (`Show all N`) across Health, Storage, Hygiene, Pulse, Fleet, Coverage, and Map.
+- **Theme preset gallery, saved themes shelf & macOS window wallpapers:** Seventeen built-in `gitpulse-theme/1` presets across Standard (*Neural HUD*, *Reactor*, *Pure Black*, *Crimson*, *Phosphor*, *Synthwave*, *Paper*), Developer (*Amber CRT*, *Blueprint*, *Midnight IDE*, *Arctic*, *Solar Dark*, *Daylight*), and Sci-Fi (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*); a **My themes** shelf for up to 24 saved or imported themes; and eleven seeded static SVG backdrops or custom raster wallpapers (`<= 2560px` JPEG in IndexedDB, macOS only).
+- **Always-on Unix terminal host (`gitpulse-ptyd`) & hosted Manvi runs:** PTY terminal sessions on Unix unconditionally live in `gitpulse-ptyd` so interactive shells and TUI coding agents survive app restarts or crashes ([Terminal host](docs/TERMINAL_HOST.md)), paired with a durable 64-row session recovery ledger (`terminal-sessions.v1.jsonl`, `TerminalResume --fork`) and default-on detached `manvi serve --listen` hosting for managed Codex and Claude runs.
+- **Pre-operation Git snapshots (`refs/gitpulse/ops/<n>`) & agent turn checkpoints (`refs/gitpulse/turns/`):** Allowed agent Git mutations record pre-operation snapshots with CAS-checked undo (`cmd_undo_op_snapshot`) in Reflog, while opt-in turn checkpoints capture working-tree state at agent turn start and end (inspectable over MCP via `gitpulse_turn_checkpoints`).
+- **Workbench schema 17 & faster Tasks board:** Merges the Inbox column into Backlog (five columns: *Backlog*, *Ready*, *In progress*, *Review*, *Done*), adds cross-repo queues, a two-way GitHub issue sync outbox, and DAG launch readiness, automatically fills board columns up to 2,000 cards (`fillBoard`), refreshes live while the window is on screen even when unfocused (`liveOnScreen`), and adds a two-row board header plus attention inbox dismiss/restore.
+- **Claude Code worktree hooks, instant DevMap seeding & live MCP sessions:** `WorktreeCreate` and `WorktreeRemove` plugin hooks provision `claude --worktree`, `EnterWorktree`, and isolated subagent worktrees with CoW dependency caches, `.worktreeinclude`, approved `post_create` hooks, and a CoW-seeded DevMap index (`~1.2 s` query-ready vs `~7.6 s` cold). `gitpulse_sessions` and `agents.live` report running Claude Code, Codex, Antigravity, DevCouncil, and Manvi sessions per worktree with zero `git` spawns.
+- **Manvi Anthropic account registry, Firebase diagnostics & GitHub author avatars:** Launches `manvi serve` through `~/.anthropic-accounts` (`anthropic-account exec --no-fallback`) without storing an Anthropic API key in GitPulse (`Cloud · <model>` status-bar pill), classifies Firebase App Hosting CLI failures with redacted *Copy diagnostics*, renders GitHub commit author avatars in Graph, and expands `dc-redact` secret detection (`ya29.`, `1//`, `GOCSPX-`, GitLab `gldt-`/`glft-`/`glrt-`/`glwt-`, Slack `xoxe-`, AWS `ABIA`/`ACCA`/`A3T`, HuggingFace `api_org_`).
 
 ## Get started
 

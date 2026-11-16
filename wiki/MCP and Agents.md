@@ -36,17 +36,20 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
 ## Hooks
 
-`plugins/gitpulse/hooks/hooks.json` registers seventeen hooks, all spawning `gitpulse-hook`:
+`plugins/gitpulse/hooks/hooks.json` registers nineteen hooks across twelve lifecycle events (including `WorktreeCreate` and `WorktreeRemove` via `plugins/gitpulse/hooks/gitpulse-worktree.sh`), all spawning `gitpulse-hook`:
 
 | Event | Subcommand | What it does |
 | --- | --- | --- |
-| `PreToolUse` on `Edit` / `MultiEdit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
-| `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push. |
-| `SessionStart` | `session-brief` | Adds a repository snapshot to the session's context. |
+| `PreToolUse` on `Edit` / `MultiEdit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file, or refuses (`deny`) when outside the bound task scope. |
+| `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push or an out-of-scope file write. |
+| `SessionStart` | `session-brief`, `peer-inbox` | Adds a repository snapshot (asking the running GitPulse app first before scanning worktrees directly) and unread peer inbox messages to the session's context. |
+| `WorktreeCreate`, `WorktreeRemove` | `worktree-create`, `worktree-remove` | Creates or removes Claude Code `.claude/worktrees/<name>` checkouts through GitPulse's CoW cache, `.worktreeinclude`, `post_create` hook, and DevMap clone path, falling back to plain `git` when untrusted or unavailable. |
 | `Notification`, one entry per matcher | `notify <matcher>` | Tells a running GitPulse that this agent wants the user, and why. |
 | `StopFailure` | `notify error` | Same, for a turn that ended on an error. |
-| `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended). |
+| `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` (plus `peer-inbox` on `PostToolUse` and `UserPromptSubmit`) | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended), plus synchronous peer-inbox delivery. |
 | `Stop`, a second entry with `asyncRewake` and a 1800 s timeout | `deliver` | Waits, in the background, for a message a person previewed and confirmed in GitPulse's **Send to agent**, and wakes the idle session with it (exit 2, text on stderr). |
+
+**Antigravity (`plugins/gitpulse-agy/hooks.json` and `plugins/gitpulse/hooks.json`):** Antigravity IDE 2.32.1 denied any `PreToolUse` tool call whose hook returned `{}` without `"decision":"allow"`, and answering `"allow"` would override the user's own approval settings. GitPulse therefore registers **no `PreToolUse` hooks** (`collision-guard` or `command-gate`) for Antigravity; Antigravity keeps `SessionStart` (`session-brief`, `peer-inbox`), `PreInvocation` (`peer-inbox`), `PostInvocation` (`peer-inbox`), `PostToolUse` (`notify tool_finished`), and `Stop` (`stop-or-notify`), and informational hook notices without a permission decision render as `{"reason": ...}` rather than `{"decision": "ask"}`.
 
 The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`, `elicitation_url_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
 
@@ -98,7 +101,8 @@ Pass an **absolute** `repo_path` on every call.
 
 | Tool | When |
 | --- | --- |
-| `gitpulse_insights` | First look at a repo |
+| `gitpulse_insights` | First look at a repo (includes `agents.live` per-worktree running sessions and `served_by` when answered from the running app's shared reads) |
+| `gitpulse_sessions` | Who is running here, which session is me (`is_caller`), `run_id`, and live `state` (`working`/`blocked`/`done`/`idle`/`unknown`) without spawning `git` |
 | `gitpulse_status` | Narrower: ledger + worktrees + codeintel |
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |

@@ -11,25 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.99.0] - 2026-11-15
+
+The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
+ships as 1.99.0 because release and macOS bundle versions are plain numbers, so
+2.0.0 sorts after it.
+
 ### Added
 
 - **Workbench schema 17 (`dc-store` at `b5215026`):** Cross-repo queue (`workbench/queue_driver.rs`), two-way GitHub issue sync outbox (`workbench/github_sync.rs`), and DAG launch readiness (`workbench/terminal_launch.rs`).
-- **Pre-operation Git snapshot log & guarded undo:** Allowed agent Git writes record snapshots under `refs/gitpulse/ops/<n>` via the desktop single-instance mailbox (`src-tauri/src/engine/git_writer.rs`), with CAS-checked restore in `cmd_undo_op_snapshot` and dirty-worktree confirmation in `ReflogViewer.svelte`.
+- **Pre-operation Git snapshot log & guarded undo:** Allowed agent Git writes record snapshots under `refs/gitpulse/ops/<n>` via the desktop single-instance mailbox (`src-tauri/src/engine/git_writer.rs`), with CAS-checked restore in `cmd_undo_op_snapshot`, dirty-worktree confirmation in `ReflogViewer.svelte`, deadline-bounded capture (`CaptureOutcome`), and resilient ref pruning (`f61212e4`, `8276c79a`, `1c241608`, `02be199f`).
+- **Agent turn checkpoints & `gitpulse_turn_checkpoints` MCP tool:** When `turn_checkpoints.enabled` is set, hooks capture working-tree state at turn start and end (`refs/gitpulse/turns/`) via a private index preserving real index `mtime` with an in-flight cap of 2 and omitting `.env*` untracked files (`c9fd7eb7`, `dbe97cf3`, `b7052506`, `820d4864`), and `gitpulse_turn_checkpoints` lists checkpoints or returns a bounded patch (`9e8a057a`).
 - **Durable interactive terminal session ledger (`src-tauri/src/terminal/session_ledger.rs`):** Bounded 64-row JSONL recovery log (`terminal-sessions.v1.jsonl`) and `TerminalResume` (`--fork` support) across app restarts and unexpected exits.
-- **Timezone & DST test runner (`bun run test:tz`, `scripts/test-timezones.mjs`):** Executes date-sensitive frontend suites across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata`.
-
-### Changed
-
-- **Vendored `dc-redact` at DevCouncil `d9c7a512` & `dc-glob` commit briefs:** Expanded bare Google OAuth credential redaction (`GOCSPX-`, `ya29.`, `1//`) and delegated test-path classification in `src-tauri/src/ai/commit_brief.rs` to `dc-glob`.
-- **"Count a terminal bell as waiting for you" (`asksForReader`)** in Settings → Agents now defaults to off.
-
-## [1.99.0] - 2026-11-13
-
-The 2.0 beta. It ships as 1.99.0 because release and macOS bundle versions are
-plain numbers, so 2.0.0 sorts after it.
-
-### Added
-
+- **Live agent sessions over MCP (`gitpulse_sessions` & `agents.live`):** Reports running Claude Code, Codex, Antigravity, DevCouncil, and Manvi sessions per worktree path (`src-tauri/src/insights/live_sessions.rs`), plus `gitpulse_sessions` for zero-git session discovery (`is_caller`, `run_id`, `task_id`, `state`, `state_source`, `state_age_s`) and shared app-read metadata (`served_by`, `5db46657`).
+- **Theme preset gallery, saved themes shelf, and macOS window wallpapers:** Settings → Appearance adds a 17-preset gallery across standard, developer, and sci-fi themes (`src/lib/ui/appearance/presets.ts`), a **My themes** shelf (`savedThemes.ts`, up to 24 saved or imported `gitpulse-theme/1` files), and 11 seeded static SVG backdrops or custom raster images (`<= 2560px` JPEG in IndexedDB, macOS only, cleared under reduced transparency or increased contrast, `fe965760`, `6b92f6f5`).
+- **Manvi Anthropic account registry integration:** When `~/.anthropic-accounts` is present, GitPulse launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi` (`src-tauri/src/harness/anthropic_account.rs`) without reading or storing an Anthropic API key in GitPulse, and shows `Cloud · <model>` on the status-bar pill (`HarnessBadge.svelte`, `06c1ca2d`).
+- **Commit author GitHub avatars & Map page tooltips:** Graph commit rows render GitHub author avatars (`src-tauri/src/github/avatars.rs`, `AuthorAvatar.svelte`) with initials fallback, and the Map page displays hover tooltips on files, symbols, and subsystems (`RepoMapPanel.svelte`).
+- **Tasks inbox notification dismiss/restore & `expected_revision` CAS overwrites:** Each notice in the Tasks attention inbox (`AttentionInbox.svelte`, `attentionDismiss.ts`) can be dismissed out of Active/Unread and restored from All (`74604208`), and `gitpulse_add_task` with `overwrite: true` accepts `expected_revision` to refuse stale overwrites with `revision_conflict` (`4427d307`).
+- **Crash-window contract, CI skip guard, `ci:local` tree check, & timezone runner:** Machine-checked crash-window table (`scripts/crash-windows.json`, `6bc0f1d2`), `scripts/check-workflows.mjs` guard forbidding skippable jobs/steps in release-gate workflows (`ef08c127`, `d601dd11`, `fe821b5a`), `ci:local` working-tree movement detection (`f6fbc6c1`), and `bun run test:tz` (`scripts/test-timezones.mjs`) across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata`.
+- **Trademark policy & DCO sign-off:** Added `TRADEMARKS.md`, Developer Certificate of Origin (`Signed-off-by`) guidance in `CONTRIBUTING.md`, and Apache-2.0 attribution for vendored DevCouncil crates in `NOTICE` (`f528a855`).
 - **Theme and Pulse card exports save through the system save panel.** You
   pick the folder and name, the panel asks before replacing a file, and a write
   that fails says why in one sentence.
@@ -95,6 +95,9 @@ plain numbers, so 2.0.0 sorts after it.
 
 ### Fixed
 
+- **Read-only hook ledger binding lookup:** `read_active_task_binding` only refuses unimported sibling rows that would be kept as a `bind` or `unbind` under `SourceAuthority`, preventing unrelated sibling ledger traffic from failing read-only hook lookups (`95a17657`).
+- **Health automatic scans & secrets signal crash reporting:** Automatic dependency and secrets scans wait for the pane to settle, skip fresh results, and hold off after a failure (stating why, `5f2a1e0b`, `4c81201d`), and a secrets scanner killed by a signal is reported as a crash naming the signal (`b0382546`).
+- **Bare push upstream planning:** Planning a bare `git push` reads the branch's own upstream configuration (`branch.<name>.remote` and `branch.<name>.merge`) and never falls back to `push -u` when the config read fails (`246be08b`, `34c37455`).
 - **The Firebase panel no longer fails with "Unable to obtain permissions".**
   This was not a Google Cloud permission. The Firebase CLI writes
   `firebase-debug.log` into the folder it starts in, before it reads any
@@ -147,6 +150,11 @@ plain numbers, so 2.0.0 sorts after it.
 
 ### Changed
 
+- **Unix terminal host (`gitpulse-ptyd`) is now unconditional, and hosted Manvi defaults to on:** On Unix (`#[cfg(unix)]`), PTY terminal sessions always live in `gitpulse-ptyd` so interactive shells and TUI agents survive app restarts or crashes (`docs/TERMINAL_HOST.md`, `b7b698ef`). **Settings → Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`) now defaults to on and governs the detached `manvi serve --listen` process for managed Codex and Claude runs.
+- **Tasks board automatic column fill, live on-screen refresh, two-row header, & verdict memo:** After every board read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards in 200-card chunks up to 2,000 cards while the column cursor matches; live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused, `bac79cf7`); the Tasks header splits into a title row and a toolbar row (`PageHeader.svelte`, `TaskBoard.svelte`, `5606e1d9`); and task verification verdicts are cached in `verdict_memo` with an exact SQLite change signal and shared byte budget (`2bdd2511`, `e7c4491a`, `86ca8530`).
+- **Antigravity (`agy`) hook compatibility:** Stopped registering `PreToolUse` hooks (`collision-guard` and `command-gate`) in `plugins/gitpulse/hooks.json` and `plugins/gitpulse-agy/hooks.json` because Antigravity IDE 2.32.1 denied tool calls whose pre-tool hook returned `{}` without `"decision":"allow"` (`b643b232`). Informational hook notices without a permission decision now render as `{"reason": ...}` rather than `{"decision": "ask"}` (`71212fa3`).
+- **Command gate, hook task-scope fence (`ft-d3bd46c0`), and collision path folding (`ft-9cfd5574`):** `command-gate` fences argument-writing commands and cross-checkout writes against declared task scope (`f7677983`), `SessionStart` (`session-brief`) queries the running GitPulse app before scanning worktrees directly (`f3cbc522`), and collision path matching folds file-vs-directory, case-insensitive filesystem, and submodule paths (`9a48dae8`).
+- **Settings dialog, repository tab menu, & terminal dock dismiss:** Enlarged the Settings dialog (`1024x736`, `208px` category rail) with grouped `gp-card` sections (`78ce2e53`), streamlined the repository tab context menu to per-tab actions with icons (`df636f29`), added double-click on page headers/backgrounds to minimize an expanded terminal dock (`panelDismiss.ts`), and defaulted **"Count a terminal bell as waiting for you"** (`asksForReader`) in Settings → Agents to off.
 - **Panes and cards float.** Side panes and cards sit on the window as rounded
   cards with their own margin, the darker separators between bands are gone, and
   page layouts follow the pane's width rather than the window's.
@@ -285,12 +293,7 @@ plain numbers, so 2.0.0 sorts after it.
 
 ### Security
 
-- **Bare Google OAuth credentials are redacted.** Access tokens (`ya29.`),
-  refresh tokens (`1//`) and client secrets (`GOCSPX-`) are now recognised by
-  their prefix alone, with no `access_token=` or `Bearer` beside them. That
-  covers copied diagnostics, ledger records and everything else that goes
-  through the shared redaction table, which is re-vendored from DevCouncil
-  d9c7a512. This only widens what is redacted.
+- **Expanded secret redaction (`dc-redact` at DevCouncil `cbd51369` & `dc-glob` commit briefs):** Bare Google OAuth credentials (`ya29.`, `1//`, `GOCSPX-`), 25-char GitLab tokens (`gldt-`/`glft-`/`glrt-`/`glwt-`), Slack `xoxe-` refresh and rotated tokens, AWS `ABIA`/`ACCA`/`A3T` key IDs, HuggingFace `api_org_` tokens, and CLI passwords after `command=curl` / `$(curl` are redacted across copied diagnostics, ledger records, and every surface using the shared redaction table (`d9c7a512`, `046df249`), while eliminating false positives on `fn npm_…()`, `MIN_TOKEN_NAP`, `++latest`, and single-brace templates. Test-path classification in `src-tauri/src/ai/commit_brief.rs` is delegated to `dc-glob`.
 
 ## [1.5.0] - 2026-11-03
 
