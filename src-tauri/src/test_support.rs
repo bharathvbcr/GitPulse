@@ -59,13 +59,14 @@ impl Drop for IsolatedHarnessGuard {
     }
 }
 
-/// Re-executes a libtest filter from a copy of this harness.
+/// Re-executes a libtest filter from a second name for this harness.
 ///
 /// `cargo llvm-cov --workspace` can unlink the running `current_exe()` while
 /// later cases still need to spawn it. `Command::spawn` then fails with
-/// `NotFound` even though this process is still mapped. Copying beside the
+/// `NotFound` even though this process is still mapped. Linking beside the
 /// original keeps `@rpath` intact and gives the child a path cargo will not
-/// replace. Keep the guard alive until the child exits.
+/// replace, without writing the image again (a copy is the fallback where
+/// linking fails). Keep the guard alive until the child exits.
 #[cfg(test)]
 pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnessGuard) {
     let src = std::env::current_exe().expect("test executable");
@@ -84,21 +85,30 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
         std::process::id(),
         HARNESS_CLONE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::copy(&src, &path).unwrap_or_else(|error| {
-        panic!(
-            "copy test harness for isolation spawn: {} -> {}: {error}",
-            src.display(),
-            path.display()
-        );
-    });
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&path)
-            .expect("cloned harness metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("cloned harness executable");
+    // A hard link names the same file under a second name, which is all the
+    // isolation needs (`cargo llvm-cov` unlinks the original's *name*; the file
+    // lives on under this one) and writes no bytes. A copy writes the whole
+    // test image, hundreds of MB, every call: free on macOS (APFS clones it) but
+    // 410 MiB a call on Linux, where a serial run of the `devmap::live` tests
+    // alone averaged 164 MiB/s and was aborted by the disk-write watchdog. The
+    // copy remains the fallback for a filesystem that cannot link.
+    if fs::hard_link(&src, &path).is_err() {
+        fs::copy(&src, &path).unwrap_or_else(|error| {
+            panic!(
+                "copy test harness for isolation spawn: {} -> {}: {error}",
+                src.display(),
+                path.display()
+            );
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)
+                .expect("cloned harness metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("cloned harness executable");
+        }
     }
     let mut command = Command::new(&path);
     command.args(["--exact", filter, "--nocapture"]);
@@ -781,6 +791,30 @@ mod tests {
         );
         assert_ne!(guard.path(), src.as_path());
         assert_eq!(guard.path().parent(), src.parent());
+    }
+
+    /// The harness image is hundreds of MB. A copy of it per call wrote 410 MiB
+    /// each on Linux (APFS clones it for free, which hid this on macOS), so the
+    /// serial Ubuntu run was aborted by the disk-write watchdog. The isolated
+    /// name must be a second name for the same file, not a second file.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_harness_is_a_second_name_for_the_image_not_a_copy_of_it() {
+        use std::os::unix::fs::MetadataExt;
+        let (_command, guard) = isolated_libtest_command("does-not-need-to-exist");
+        let src = std::env::current_exe().expect("test executable");
+        let (image, isolated) = (
+            std::fs::metadata(&src).expect("image metadata"),
+            std::fs::metadata(guard.path()).expect("isolated metadata"),
+        );
+        assert_eq!(
+            (image.dev(), image.ino()),
+            (isolated.dev(), isolated.ino()),
+            "the isolated harness is a separate file ({} bytes written)",
+            isolated.len()
+        );
+        assert!(isolated.nlink() >= 2, "no second name for the image");
+        assert_ne!(isolated.mode() & 0o111, 0, "the isolated harness cannot run");
     }
 
     /// A fixture git spawns under the inheritance lock, so it cannot inherit
