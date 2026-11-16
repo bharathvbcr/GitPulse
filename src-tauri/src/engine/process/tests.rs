@@ -1330,6 +1330,69 @@ fn audit_output_cap_cannot_disable_the_global_memory_bound() {
     assert!(run_bounded_capped(cmd, "sh", Duration::from_secs(5), None, usize::MAX).is_err());
 }
 
+/// A draining reader keeps no stdout, so it may declare a stream budget
+/// past the buffered limit and read past it, every byte still counted
+/// against that budget; a buffered read may not, and nor may a draining
+/// one past its own ceiling.
+#[cfg(unix)]
+#[test]
+fn only_a_draining_reader_may_stream_past_the_buffered_output_limit() {
+    #[derive(Default)]
+    struct Counting(usize);
+    impl ProcessObserver for Counting {
+        fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+            if matches!(stream, OutputStream::Stdout) {
+                self.0 += bytes.len();
+            }
+        }
+        fn drains_stdout(&self) -> bool {
+            true
+        }
+    }
+    let past = MAX_OUTPUT_BYTES + 1024;
+    let script = format!("head -c {past} /dev/zero");
+    let mut counting = Counting::default();
+    let run = run_observed(
+        Command::new("sh").args(["-c", &script]),
+        "sh",
+        Duration::from_secs(60),
+        None,
+        past,
+        &mut counting,
+    )
+    .expect("a draining reader may declare a budget past the buffered limit");
+    assert!(run.success && run.incomplete.is_none());
+    assert_eq!(counting.0, past, "every byte reached the observer");
+    assert!(run.stdout.len() < MAX_OUTPUT_BYTES, "and none was held");
+
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "printf ok"]);
+    assert!(run_bounded_capped(cmd, "sh", Duration::from_secs(5), None, past).is_err());
+    assert!(run_observed(
+        Command::new("sh").args(["-c", "printf ok"]),
+        "sh",
+        Duration::from_secs(5),
+        None,
+        MAX_DRAINED_OUTPUT_BYTES + 1,
+        &mut Counting::default(),
+    )
+    .is_err());
+
+    // The declared budget still bounds a draining read.
+    let mut short = Counting::default();
+    let run = run_observed(
+        Command::new("sh").args(["-c", &script]),
+        "sh",
+        Duration::from_secs(60),
+        None,
+        1024,
+        &mut short,
+    )
+    .expect("runs");
+    assert!(run.incomplete.is_some(), "cut at the declared budget");
+    assert!(short.0 <= 1024, "observer saw {} bytes", short.0);
+}
+
 /// A descendant retaining the write ends must not erase bytes the parent
 /// already emitted. The result remains explicitly incomplete until EOF.
 #[cfg(unix)]

@@ -290,6 +290,7 @@ fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, Comman
             stderr: Vec::new(),
             success: false,
             status_code: -1,
+            signal: None,
             incomplete: Some(Incomplete::Deadline {
                 message,
                 over_cap: None,

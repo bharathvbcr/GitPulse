@@ -231,6 +231,9 @@ site | src/ledger/bindings/authority_tests.rs | settle | 0 | mtime-gap
 # src/ledger/schema_bump_adv_tests.rs
 site | src/ledger/schema_bump_adv_tests.rs | two_processes_opening_one_old_ledger_migrate_it_once_and_both_succeed | 0 | race-widen
 
+# src/leak_scan/recall_tests.rs
+site | src/leak_scan/recall_tests.rs | run | 0 | bounded-poll
+
 # src/logging/performance.rs
 site | src/logging/performance.rs | a_burst_of_quick_calls_wakes_the_watchdog_once_not_once_per_call | 0 | spacing
 site | src/logging/performance.rs | wait_until | 0 | bounded-poll

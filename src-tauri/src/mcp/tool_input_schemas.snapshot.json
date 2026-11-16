@@ -533,6 +533,12 @@
         "minLength": 1,
         "type": "string"
       },
+      "expected_revision": {
+        "description": "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
       "kind": {
         "description": "Type, e.g. feature (default), bug, refactor, chore, spike",
         "maxLength": 64,
@@ -2260,6 +2266,39 @@
     "required": [
       "repo_path",
       "child_session_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_turn_checkpoints": {
+    "additionalProperties": false,
+    "properties": {
+      "against": {
+        "description": "With `id`: another of this worktree's checkpoint ids to compare against, instead of the checkpoint's parent commit",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "id": {
+        "description": "A checkpoint id from the list (the digits of its stamp). With it, returns that checkpoint's patch instead of the list",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum number of checkpoints listed (default 20, max 50)",
+        "maximum": 50,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
     ],
     "type": "object"
   },

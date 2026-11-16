@@ -50,8 +50,24 @@ describe("SecretsSection", () => {
     // Kingfisher run.
     const module = source.slice(0, source.indexOf("</script>"));
     expect(module).toContain("<script module");
-    expect(module).toContain("const inflightScans = new Map<string, Promise<SecretsReport>>()");
+    // The join itself (runtime/autoScan.ts) is shared with Health's dependency
+    // audit and unit-tested there; what is pinned here is that this section
+    // keeps it at module scope.
+    expect(module).toContain("const inflightScans = createScanJoin<SecretsReport>()");
     expect(source).toContain("inflightScans.has(path)");
+  });
+
+  it("starts an automatic scan only through the shared settle, and a click directly", () => {
+    // The wait and the freshness rule live in runtime/autoScan.ts so Health's
+    // dependency audit asks the same question. The mount effect must not call
+    // scan() itself outside the join of a scan already running.
+    expect(source).toContain("scheduleAutoScan({");
+    expect(source).toContain("stillNeeded:");
+    expect(source).toContain("onclick={() => scan()}");
+    const effect = source.slice(source.indexOf("$effect(() => {"), source.indexOf("function recordFailure"));
+    expect(effect.match(/scan\(path\)/g)).toHaveLength(2);
+    expect(effect.indexOf("inflightScans.has(path)")).toBeLessThan(effect.indexOf("void scan(path)"));
+    expect(effect).toContain("return () => {\n      stopPending();");
   });
 
   it("previews the findings table and keeps the cap disclosure", () => {

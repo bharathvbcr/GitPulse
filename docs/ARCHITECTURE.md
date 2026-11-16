@@ -970,5 +970,5 @@ The current implementation includes controlled-provider browser verification and
 real native-to-Go/provider transport tests. Broader managed-agent qualification,
 installed OS notification proof,
 the complete workspace/task interaction set and whole-application performance
-qualification remain open. See [the implementation contract](AGENTIC_WORKSPACES_PLAN.md)
+qualification remain open. See [the implementation contract](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md)
 for the complete scope and exact verification boundaries.

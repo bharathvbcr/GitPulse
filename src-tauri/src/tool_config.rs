@@ -689,6 +689,41 @@ where
     }))
 }
 
+/// Whether the hooks ask the app for a turn checkpoint at each agent turn
+/// boundary (`turn_checkpoints.enabled` in `tools.json`, under the platform
+/// config directory, or the file `GITPULSE_TOOL_CONFIG` names).
+///
+/// Off unless turned on: a checkpoint hashes the worktree's files, so it is
+/// the person's choice, never a default. A block this cannot read is read as
+/// off, and says so in the log. No UI sets it yet; write the key by hand:
+/// `{ "turn_checkpoints": { "enabled": true } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnCheckpointSettings {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl TurnCheckpointSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn lenient_turn_checkpoints<'de, D>(deserializer: D) -> Result<TurnCheckpointSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable turn_checkpoints block, checkpoints stay off: {error}"
+        );
+        TurnCheckpointSettings::default()
+    }))
+}
+
 /// Whether merging an agent attempt's commits needs a recorded review
 /// (`docs/AGENT_OUTPUT_REVIEW.md`): a host-wide default, and a per-repository
 /// override keyed by the repository's canonical common Git directory, so every
@@ -871,6 +906,13 @@ pub struct ToolConfig {
         skip_serializing_if = "crate::sysload::DiskGuard::is_default"
     )]
     pub host_load_disk_guard: crate::sysload::DiskGuard,
+    /// Whether hooks take turn checkpoints. Off by default.
+    #[serde(
+        default,
+        deserialize_with = "lenient_turn_checkpoints",
+        skip_serializing_if = "TurnCheckpointSettings::is_default"
+    )]
+    pub turn_checkpoints: TurnCheckpointSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -895,6 +937,7 @@ impl Default for ToolConfig {
             host_load_thresholds: crate::sysload::Thresholds::default(),
             host_load_hook_mode: HostLoadHookMode::default(),
             host_load_disk_guard: crate::sysload::DiskGuard::default(),
+            turn_checkpoints: TurnCheckpointSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1598,6 +1641,28 @@ pub fn host_load_hook_mode() -> HostLoadHookMode {
     load()
         .map(|cfg| cfg.host_load_hook_mode)
         .unwrap_or_default()
+}
+
+/// The stored turn-checkpoint switch. Any failure to read it is "off": a
+/// checkpoint is work the person opted into, and an unreadable file must not
+/// be what turns it on.
+pub fn turn_checkpoint_settings() -> TurnCheckpointSettings {
+    load().map(|cfg| cfg.turn_checkpoints).unwrap_or_default()
+}
+
+/// [`turn_checkpoint_settings`] read from `tools.json` in `dir`, for callers
+/// that already hold the profile directory (the hooks) and tests.
+pub fn turn_checkpoint_settings_in(dir: &Path) -> TurnCheckpointSettings {
+    read_disk(&dir.join("tools.json"))
+        .map(|cfg| cfg.turn_checkpoints)
+        .unwrap_or_default()
+}
+
+pub fn set_turn_checkpoint_settings(next: TurnCheckpointSettings) -> Result<(), String> {
+    update(|cfg| {
+        cfg.turn_checkpoints = next;
+        Ok(())
+    })
 }
 
 /// Stores the switches and the thresholds. A threshold that fails validation
@@ -2976,3 +3041,7 @@ mod model_setting_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "tool_config_turn_checkpoint_tests.rs"]
+mod turn_checkpoint_tests;

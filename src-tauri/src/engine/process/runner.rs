@@ -33,6 +33,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 /// keeps [`DEFAULT_TIMEOUT`].
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Stream budget a run may declare when its observer drains stdout
+/// ([`ProcessObserver::drains_stdout`]): the bytes are dropped as they are
+/// seen, so [`MAX_OUTPUT_BYTES`]' reason — what a buffered read costs to
+/// hold — does not apply, but the stream is still bounded, and every byte
+/// still counts against the declared cap.
+pub const MAX_DRAINED_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -630,6 +636,10 @@ pub(crate) struct BoundedRun {
     pub stderr: Vec<u8>,
     pub success: bool,
     pub status_code: i32,
+    /// The signal that ended the child, on Unix, when one did. `status_code`
+    /// is -1 for that death and for "no status at all" alike, so a caller that
+    /// must tell a crash from a deadline or a cancel reads this.
+    pub signal: Option<i32>,
     /// Why `stdout` is a prefix, when it is; `None` when it is the whole
     /// stream. Carried as a reason rather than a flag so no caller has to
     /// guess which of the two causes it is looking at.
@@ -1128,13 +1138,16 @@ fn run_admitted_inner(
         )
         .into());
     }
-    if stdout_cap > MAX_OUTPUT_BYTES
-        || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
+    let stdout_limit = if observer.drains_stdout() {
+        MAX_DRAINED_OUTPUT_BYTES
+    } else {
+        MAX_OUTPUT_BYTES
+    };
+    if stdout_cap > stdout_limit || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
     {
-        return Err(format!(
-            "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
-        )
-        .into());
+        return Err(
+            format!("{label} input/output budget exceeds the {stdout_limit} byte limit").into(),
+        );
     }
     let queue_deadline = gate.clock.now() + timeout;
     if stdin_bytes.is_some() {
@@ -1429,8 +1442,23 @@ fn run_admitted_inner(
             && status.is_some_and(|status| status.success())
             && !cancelled,
         status_code: status.and_then(|status| status.code()).unwrap_or(-1),
+        signal: terminating_signal(status),
         incomplete,
         stderr_incomplete,
         cancelled,
     })
+}
+
+/// The signal that ended a child, where the platform reports one.
+fn terminating_signal(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }

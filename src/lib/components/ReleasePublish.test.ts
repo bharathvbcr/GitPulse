@@ -64,6 +64,20 @@ describe("ReleasePublish after a repository switch", () => {
   });
 });
 
+describe("ReleasePublish after the secret scan refused the tag's push", () => {
+  it("offers Publish anyway only under that refusal, and only that button sends the override", () => {
+    expect(source).toContain('secretScanBlocked = ipcErrorKind(outcome.cause) === "secret_scan_blocked";');
+    const offer = source.slice(source.indexOf("{#if secretScanBlocked}"));
+    expect(offer.indexOf("onclick={() => void publishRelease(true)}")).toBeGreaterThan(0);
+    expect(offer.indexOf("Publish anyway")).toBeGreaterThan(0);
+    // One caller passes `true`; the main button passes nothing, never its click event.
+    expect(source.match(/publishRelease\(true\)/g)).toHaveLength(1);
+    expect(source).toContain("onclick={() => void publishRelease()}");
+    expect(source).not.toContain("onclick={publishRelease}");
+    expect(source).toContain("repoStore.publishRelease(tag, releaseMessage.trim() || `Release ${tag}`, allowSecrets)");
+  });
+});
+
 describe("ReleasePublish contracts", () => {
   it("cannot push without the confirmation and a tag", () => {
     expect(source).toContain('const canPush = $derived(releaseConfirmed && releaseTag.trim() !== "" && !publishing);');

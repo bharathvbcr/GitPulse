@@ -294,7 +294,9 @@ fn malformed_and_failed_runs_fail_closed() {
         ("no output", "exit 0", "not valid JSON"),
         ("jsonl rows", "echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/x\"}}'; echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/y\"}}'; exit 200", "not"),
         ("bad flag", &format!("echo '{PLANTED}' >&2; exit 2"), "exited with status 2"),
-        ("signal", "kill -9 $$", "terminated before it finished"),
+        ("signal", "kill -9 $$", "stopped by SIGKILL before it finished"),
+        ("fault", "kill -s BUS $$", "kingfisher crashed (SIGBUS)"),
+        ("abort", "kill -s ABRT $$", "kingfisher crashed (SIGABRT)"),
         ("crash with output", &format!("echo '{{\"findings\":[]}}'; echo '{PLANTED}' >&2; exit 101"), "status 101"),
     ];
     for (name, body, expected) in cases {

@@ -3664,6 +3664,7 @@ mod batch_tests {
             stderr: stderr.as_bytes().to_vec(),
             success,
             status_code: if success { 0 } else { 1 },
+            signal: None,
             incomplete,
             stderr_incomplete: None,
             cancelled: false,

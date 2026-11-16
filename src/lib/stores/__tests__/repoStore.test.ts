@@ -18,6 +18,8 @@ import { withDeferralRetry } from "../../ipc/invoke";
 import { jitteredRetryDelayMs } from "../../async/deferral";
 import { harnessStore } from "../harnessStore";
 import { gitActionCount } from "../../desktop/exitGuard";
+import { toastStore } from "../toastStore";
+import { readFileSync } from "node:fs";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -5645,5 +5647,69 @@ describe("repositoryTrustRefused reads the kind, never the wording", () => {
     expect(repositoryTrustRefused(new Error(text))).toBe(false);
     expect(repositoryTrustRefused(new IpcError("unclassified", text))).toBe(false);
     expect(repositoryTrustRefused(undefined)).toBe(false);
+  });
+});
+
+describe("a push the secret scan refused", () => {
+  afterEach(() => toastStore.clear());
+
+  it("offers Push anyway, which alone sends the override, to the repository that was refused", async () => {
+    const pushes: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_push: async (_cmd, args) => {
+          pushes.push({ ...(args ?? {}) });
+          if (!args?.allowSecrets) {
+            throw new IpcError(
+              "secret_scan_blocked",
+              "Push blocked by the secret scan. Nothing was pushed.\n1 added line looks like a credential:\n  aws access key id at 0123456789ab:k.env:1",
+              { gate: "push" },
+            );
+          }
+          return { policy: null, output: "pushed" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.push();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.surfaced).toBe(true);
+    expect(pushes).toEqual([{ repoPath: "/r/a", remote: undefined, branch: undefined, force: false }]);
+    const toast = get(toastStore).find((t) => t.action?.label === "Push anyway");
+    expect(toast?.kind).toBe("error");
+    expect(toast?.duration, "the findings stay until the person dismisses them").toBe(0);
+    expect(toast?.message).toContain("0123456789ab:k.env:1");
+    // The person moves to another repository before pressing the button.
+    await store.openRepo("/r/b");
+    expect(await toast!.action!.onClick()).toBe(true);
+    expect(pushes[1]).toEqual({ repoPath: "/r/a", remote: undefined, branch: undefined, force: false, allowSecrets: true });
+    expect(pushes).toHaveLength(2);
+  });
+
+  it("raises no override for any other failure", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_push: async () => {
+          throw new IpcError("unclassified", "rejected: non-fast-forward");
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.push();
+    expect(outcome.ok).toBe(false);
+    expect(get(toastStore).some((t) => t.action?.label === "Push anyway")).toBe(false);
+  });
+
+  it("takes no override from a caller", () => {
+    const source = readFileSync(new URL("../repoStore.ts", import.meta.url), "utf8");
+    const push = source.slice(source.indexOf("    push: async ("), source.indexOf("    reportIssue: async ("));
+    const signature = push.slice(0, push.indexOf("=> {"));
+    expect(signature).not.toContain("allowSecrets");
+    // `run(true, …)` is the override; it is reached only through the toast's button.
+    expect(push.match(/run\(true/g)).toHaveLength(1);
+    expect(push).toContain("offerPushPastSecretScan(await run(false, target), () => run(true, refused))");
+    const offer = source.slice(source.indexOf("function offerPushPastSecretScan"), source.indexOf("function repoFacts"));
+    expect(offer).toContain('label: "Push anyway"');
+    expect(offer).toContain('{ label: "Push anyway", onClick: async () => (await again()).ok }');
   });
 });

@@ -29,10 +29,6 @@ it("keeps the bundled DevMap skills and plugin marketplace available to Git", ()
   const published = ["devmap", "devmap-debugging", "devmap-exploring", "devmap-impact", "devmap-refactoring"]
     .map((skill) => `.agents/skills/${skill}/SKILL.md`);
   published.push(".agents/plugins/marketplace.json");
-  published.push(".cursor/rules/devmap.mdc");
-  for (const skill of ["devmap", "devmap-debugging", "devmap-exploring", "devmap-impact", "devmap-refactoring"]) {
-    published.push(`.cursor/skills/${skill}/SKILL.md`);
-  }
   for (const path of published) {
     const result = spawnSync("git", ["check-ignore", "--no-index", "-q", path], {
       cwd: new URL("..", import.meta.url),
@@ -40,7 +36,14 @@ it("keeps the bundled DevMap skills and plugin marketplace available to Git", ()
     expect(result.error).toBeUndefined();
     expect(result.status, path).toBe(1);
   }
-  for (const path of [".agents/session.json", ".agents/skills/private/SKILL.md", ".agents/skills/devmap/local.txt"]) {
+  for (const path of [
+    ".agents/session.json",
+    ".agents/skills/private/SKILL.md",
+    ".agents/skills/devmap/local.txt",
+    ".cursor/mcp.json",
+    ".cursor/rules/devmap.mdc",
+    ".cursor/skills/devmap/SKILL.md",
+  ]) {
     const result = spawnSync("git", ["check-ignore", "--no-index", "-q", path], {
       cwd: new URL("..", import.meta.url),
     });

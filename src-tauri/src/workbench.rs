@@ -36,6 +36,7 @@ mod reconcile;
 pub(crate) mod retention;
 pub mod review;
 mod send_to_agent;
+pub(crate) mod store_probe;
 mod suggest;
 pub mod terminal_command;
 mod terminal_launch;

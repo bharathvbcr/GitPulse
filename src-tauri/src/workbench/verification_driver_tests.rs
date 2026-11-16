@@ -11,7 +11,7 @@ use crate::workbench::verification_driver::{
     target_of, verdict_covers, verification_base, Backend, Driver, Facts, Report, Step, Target,
     MAX_ACTIVE,
 };
-use crate::workbench::verification_gate::{self as gate, Record, STATE_COULD_NOT_RUN};
+use crate::workbench::verification_gate::{self as gate, Memo, Record, STATE_COULD_NOT_RUN};
 use crate::workbench::WorkbenchError;
 use dc_store::Store;
 use serde_json::{json, Value};
@@ -28,6 +28,8 @@ struct Fake {
     head_error: RefCell<Option<String>>,
     /// When set, `base_of` returns this instead of a base.
     base_error: RefCell<Option<String>>,
+    /// Its own memo, so what one test reads is not another's to evict.
+    memo: Memo,
 }
 
 impl Fake {
@@ -40,6 +42,7 @@ impl Fake {
             epoch: Instant::now(),
             head_error: RefCell::new(None),
             base_error: RefCell::new(None),
+            memo: Memo::new(),
         }
     }
 }
@@ -72,6 +75,9 @@ impl Backend for Fake {
     }
     fn cancelled(&self) -> bool {
         self.cancelled.get()
+    }
+    fn memo(&self) -> &Memo {
+        &self.memo
     }
 }
 
@@ -278,7 +284,7 @@ fn a_sidecar_that_is_down_is_recorded_as_could_not_run_not_failed_and_not_retrie
     assert_eq!(driver.sweep(&store, &fake), Report::default());
     assert!(fake.starts.borrow().is_empty());
     let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
-    let held = gate::check(&store, &id, &identity);
+    let held = gate::check(fake.memo(), &store, &id, &identity);
     assert!(matches!(held, gate::Gate::Held(m) if m.contains("could not run")));
 }
 
@@ -511,17 +517,18 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
         )
         .unwrap();
     let ids = [id.clone(), other.clone(), never.clone()];
-    let batch = gate::latest_many(&store, &ids).unwrap();
+    let memo = Memo::new();
+    let batch = memo.latest_many(&store, &ids).unwrap();
     for one in &ids {
         assert_eq!(
             batch.get(one),
-            gate::latest(&store, one).unwrap().as_ref(),
+            Memo::new().latest(&store, one).unwrap().as_ref(),
             "{one}"
         );
     }
     assert_eq!(batch[&id].outcome, "passed");
     assert!(!batch.contains_key(&never));
-    assert!(gate::latest_many(&store, &[]).unwrap().is_empty());
+    assert!(Memo::new().latest_many(&store, &[]).unwrap().is_empty());
 }
 
 /// Records more evidence of another kind for `item` than one evidence page
@@ -547,7 +554,10 @@ fn the_per_card_read_finds_a_verdict_behind_more_than_a_page_of_other_evidence()
     let head = head_of(&repo);
     store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
     bury_under_other_evidence(&store, &id);
-    let found = gate::latest(&store, &id).unwrap().expect("the verdict");
+    let found = Memo::new()
+        .latest(&store, &id)
+        .unwrap()
+        .expect("the verdict");
     assert_eq!(found.outcome, "passed");
 }
 
@@ -1756,4 +1766,98 @@ fn a_host_that_is_closing_refuses_the_wait() {
     let (result, _) = judge(&store, &fake, &repo, &id, &head);
     assert!(result.unwrap_err().contains("GitPulse closed"));
     assert!(fake.starts.borrow().is_empty());
+}
+
+/// Five sweeps and a board read, each on its own connection, over a store
+/// nobody writes to between them: the evidence table is walked once.
+#[test]
+fn sweeps_and_a_board_read_of_an_unchanged_store_walk_it_once() {
+    use crate::workbench::verification_gate::memo::seam;
+    let (_d, store, repo, id) = setup();
+    // The claim judges the card through the host's shared memo (`complete_task`
+    // has no backend), which walks the table once. That walk is the baseline: a
+    // sweep through the fake's own memo is a second memo meeting the store for
+    // the first time, so its first read walks once more, and nothing after it
+    // does. Nothing writes in between: a probe that watched `data_version`,
+    // `schema_version`, the driver connection's `total_changes` and every
+    // table's row count across the sweeps saw all of them hold still.
+    claim(&store, &repo, &id);
+    let path = std::path::PathBuf::from(store.connection().path().unwrap());
+    let claimed = seam::walks(&path);
+    assert_eq!(claimed, 1, "the claim walks the table once");
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    let first = driver.sweep(&store, &fake);
+    assert_eq!(first.started, 1, "{first:?}");
+    assert_eq!(
+        seam::walks(&path),
+        claimed + 1,
+        "the fake's memo walks once for the first sweep"
+    );
+    let walked = seam::walks(&path);
+    for _ in 0..5 {
+        assert_eq!(driver.sweep(&store, &fake), Report::default());
+    }
+    let board = Store::open_readonly(&path).unwrap();
+    status_batch(&board, &fake, std::slice::from_ref(&id)).unwrap();
+    assert_eq!(
+        seam::walks(&path),
+        walked,
+        "five more sweeps and a board read of an unchanged store walked it again"
+    );
+}
+
+/// The driver's own connection follows the profile: it is reopened when the
+/// file at the path is another file, and not held for one that is gone.
+#[test]
+fn the_driver_reopens_a_store_that_was_replaced() {
+    use crate::workbench::verification_driver::driver_store;
+    let memo = Memo::new();
+    let verdict_of = |store: &Store| {
+        memo.latest(store, "a")
+            .unwrap()
+            .map(|record| record.outcome)
+    };
+    let put = |store: &Store, outcome: &str| {
+        store
+            .evidence_append(
+                gate::EVIDENCE_TYPE,
+                Some("a"),
+                None,
+                None,
+                &format!(r#"{{"item_id":"a","state":"settled","outcome":"{outcome}"}}"#),
+            )
+            .unwrap();
+    };
+    let (dir, path) = profile();
+    {
+        put(&Store::open(&path).unwrap(), "passed");
+    }
+    let mut held = None;
+    for _ in 0..2 {
+        // Same file both times: the connection is kept, not reopened.
+        let store = driver_store(Some(path.clone()), &mut held).expect("opens");
+        assert_eq!(verdict_of(store).as_deref(), Some("passed"));
+    }
+    let replacement = dir.path().join("replacement.sqlite");
+    {
+        put(&Store::open(&replacement).unwrap(), "failed");
+    }
+    // The held connection keeps the old file open; its log and index go with
+    // it so the replacement is not opened against them.
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.clone().into_os_string();
+        companion.push(suffix);
+        let _ = std::fs::remove_file(companion);
+    }
+    std::fs::rename(&replacement, &path).unwrap();
+    let after = driver_store(Some(path.clone()), &mut held).expect("reopens");
+    assert_eq!(
+        verdict_of(after).as_deref(),
+        Some("failed"),
+        "the connection still read the file that was replaced"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(driver_store(Some(path.clone()), &mut held).is_none());
+    assert!(driver_store(None, &mut held).is_none());
 }

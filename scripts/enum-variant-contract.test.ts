@@ -40,6 +40,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
+    "SkipReason",
+    "the secret scan's skip reason rides in a `secret_scan_blocked` error's detail; the commit view renders the refusal's message and never branches on the reason",
+  ],
+  [
     "LandedVia",
     "`gitpulse_landed` is an MCP read tool: its `via` reaches agents over MCP and has no frontend consumer",
   ],
@@ -54,6 +58,14 @@ const NO_TS_MIRROR = new Map<string, string>([
   [
     "LandedAtSource",
     "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
+  ],
+  [
+    "TurnEvent",
+    "engine::turn_checkpoint wire type: the hook sends it as `event` inside `desktop::instance::Request::RecordTurnCheckpoint` over the profile's unix socket to the running owner, and `gitpulse_turn_checkpoints` returns it to agents over MCP; it has no frontend consumer (capture, list and diff only, no UI)",
+  ],
+  [
+    "CaptureOutcome",
+    "engine::turn_checkpoint wire type: the app answers the hook's `Request::RecordTurnCheckpoint` with it and `gitpulse_turn_checkpoints` returns it to agents over MCP; no frontend consumer reads it (no turn checkpoint UI)",
   ],
   [
     "PrWorktreeRefusalCode",

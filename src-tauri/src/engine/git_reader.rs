@@ -4486,7 +4486,7 @@ pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
 /// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
 /// the writers would refuse to name in a command, `fix(ui)` among them, is
 /// still the one HEAD is on.
-fn head_branch_name(repo: &Path) -> Result<Option<String>, CommandError> {
+pub(crate) fn head_branch_name(repo: &Path) -> Result<Option<String>, CommandError> {
     symbolic_ref_target(repo, "HEAD")?
         .map(|target| branch_of_head_target(&target))
         .transpose()

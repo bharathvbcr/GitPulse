@@ -621,6 +621,7 @@ mod tests {
                 stderr: Vec::new(),
                 success: true,
                 status_code: 0,
+                signal: None,
                 incomplete,
                 stderr_incomplete: None,
                 cancelled: false,
