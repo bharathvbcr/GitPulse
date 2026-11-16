@@ -138,7 +138,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   the sampler publishes, then counts the sample, so a record carries the
   verdict the previous count produced (pending on a writer's first tick, and
   unsupported while the sensor is switched off). The hook reads it (see The command
-  gate). The extension opens with the magic `GPX2` and ends
+  gate). The extension opens with the magic `GPX3` (`GPX2` was the block before the two disk fill rates changed its layout; a branch build that reads `GPX2` ignores this one) and ends
   with a checksum of its own, which also covers the sequence.
 
 **Sequence lock.** The writer makes the head sequence odd, writes the body and
@@ -171,7 +171,7 @@ sequence at 656 and the version-1 checksum formula where they were, so:
   reader that *required* the new length would have read an older writer's record
   as `Short`, so the sensor would read dead and nothing would be governed while
   an older build still writes; this build does not do that.)
-- A record that does not open its extension with `GPX2` (a longer record from
+- A record that does not open its extension with `GPX3` (a longer record from
   some other newer writer) reads the same way. One that does but fails the
   extension's checksum is `Torn`, never decoded.
 - A writer that wins the election sizes the file to its own length, so an older
@@ -762,8 +762,43 @@ always acceptable:
   or less however large, exact for a steady fall, and positive across pauses.
   The net fall divides by the longer of its history and five minutes, so a
   cold start does not inflate it and a lone burst reads as at most its size
-  over five minutes: it can refuse only when it alone ate half of what is left
-  above the floor.
+  over five minutes. Severe needs the floor under ten minutes away, so a lone
+  burst binds it only when the fall exceeds half of the headroom above the
+  floor that it leaves, on a cold history (under five minutes), and all of it
+  on a warm one (ten minutes). Pinned by
+  `a_lone_burst_binds_severe_at_half_the_headroom_cold_and_all_of_it_warm`:
+  on a 64 GiB Mac a 26 GiB burst (0.45 of the headroom it leaves) does not bind
+  on a cold history and a 30 GiB one (0.56) does; warm, 80 GiB (0.77) does not
+  and 100 GiB (1.19) does. A figure of a third on a cold history was not
+  reproduced: the test measures half.
+
+**Leaving a fill-caused Severe.** A Severe the fill rule caused is left only
+after the fill rule has read below Severe for 180 s without a break
+(`FILL_SEVERE_RELEASE`, 90 ticks), not the five ticks every other exit takes;
+the level, memory and CPU exits are unchanged. Causes are told apart by the
+binding the governor already holds while it is Severe: held Severe with the
+`disk_filling` binding gets the long release, anything else the short one. So
+a build that writes in lumps with pauses of up to 240 s is held at Severe from
+the first bind until free space reaches the floor, where the level rule takes
+over, rather than admitting launches in each pause. The cost is a linger: a
+finished write that left little room can keep refusing for at most the
+ten-minute net-fall window plus the 180 s hold, about 13 minutes (tested bound
+800 s). Measured on the real tracker and governor: 12 GiB over 30 s ending at
+28 GiB free refused for 742 s warm and 748 s cold; 20 GiB over 80 s ending at
+40 GiB, 276 s warm and 514 s cold; 40 GiB over 120 s ending at 67 GiB, 288 s
+warm and 454 s cold; a burst of a minute or less on a warm
+history that leaves 42 GiB or more free never refuses. Deleting the output
+also waits out the 180 s. Writes slower than 3 to 4 GiB a minute on average
+(20 GiB per 300 s, 30 GiB per 600 s from 150 GiB) are reported by the tests,
+not tuned for.
+
+**Which clock.** The history resets on a gap of more than ten seconds between
+samples, so a machine that sleeps comes back with an empty history and the
+rates read *warming up* until it has refilled. The gap is measured on the
+sampler's monotonic clock (`CLOCK_MONOTONIC` on macOS, `CLOCK_BOOTTIME` on
+Linux, per the code comments); whether macOS's monotonic clock counts sleep was
+not verified, and either way the first tick after a wake has a gap over ten
+seconds from the sampler's own cadence.
 
 What was rejected, from the model behind this: fitting the whole window reads a
 step of h GiB as about 1.5 h over the window and refused launches for a burst
@@ -801,7 +836,7 @@ own directory is used only when no `cwd` was given. They refuse a coverage
 build below its headroom (60 GiB by default) and any heavy build below the
 severe floor. A coverage build is a `cargo llvm-cov` that builds anywhere in
 the line (also by its own binary name, `cargo-llvm-cov llvm-cov`) or a cargo
-build or test run with `RUSTFLAGS` containing `-C instrument-coverage` ahead
+build or test run with `RUSTFLAGS` containing `-C instrument-coverage` (also `-C instrument_coverage`, `-Cinstrument-coverage`) ahead
 of it; `clean`, `report`, `show-env`, `--help` and `--version` build nothing
 and are never refused. They follow the same two switches as everything else
 here: with `host_load.enabled` off nothing is measured and they say nothing,
@@ -811,7 +846,10 @@ and with `host_load.govern_launches` off they advise and never refuse.
 `/elsewhere`, which the hook cannot know without evaluating the shell; only
 the `cwd` it was given and the literal build directories above are read.
 `sudo`, `xargs`, `env --chdir`, cargo aliases, a build directory from a shell
-variable, and `eval "$(cargo llvm-cov show-env ...)"; cargo test` are not
+variable or a `~` (`--target-dir ~/x`, `--target-dir=~/x`, `CARGO_TARGET_DIR=$HOME/x`),
+`export CARGO_TARGET_DIR=/x; cargo build`, a `CARGO_TARGET_DIR` already set in
+the session, `build.target-dir` in `.cargo/config.toml`, `RUSTFLAGS` exported
+earlier in the line, `CARGO_ENCODED_RUSTFLAGS`, and `eval "$(cargo llvm-cov show-env ...)"; cargo test` are not
 seen: that last one runs an *instrumented* build after a `show-env` that
 itself builds nothing, and it gets only the ordinary floor check, not the
 coverage headroom. Wrappers seen through: `env`, `time`, `nice`, `nohup`,

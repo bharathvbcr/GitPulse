@@ -283,7 +283,12 @@ export function fillRateLine(snapshot: Snapshot | null, fill: DiskFill | null | 
   // record an older build wrote and something re-serialised without it.
   if (!reading) return FILL_OLDER_BUILD;
   if (reading.status === "value") {
-    return reading.value > 0 ? `Fill rate: ${fillRateLabel(reading.value)}` : "Fill rate: not falling";
+    // The sustained rate is what the severe rule binds on; when it is the
+    // higher of the two the line shows it, so the number on screen is the one
+    // deciding. Unavailable sustained readings leave the quick one as it was.
+    const sustained = snapshot.disk_fill_sustained;
+    const rate = sustained?.status === "value" ? Math.max(reading.value, sustained.value) : reading.value;
+    return rate > 0 ? `Fill rate: ${fillRateLabel(rate)}` : "Fill rate: not falling";
   }
   // Each reason is decided in Rust (`diskrate`, `sampler`, `snapshot`); this
   // only words it.

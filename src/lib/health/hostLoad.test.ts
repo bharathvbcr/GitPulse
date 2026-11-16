@@ -352,6 +352,19 @@ describe("the fill rate line tells not measured from not falling", () => {
     expect(fillRateLine(snapshot({ status: "value", value: 0.5 * GIB }), null)).toBe("Fill rate: 512 MB/min");
   });
 
+  it("shows the sustained rate when it binds and the quick line reads lower", () => {
+    const both = (quick: number, sustained: Reading<number>) =>
+      ({
+        disk_fill_rate: { status: "value", value: quick },
+        disk_fill_sustained: sustained,
+      }) as unknown as Snapshot;
+    expect(fillRateLine(both(0, { status: "value", value: 2 * GIB }), null)).toBe(`Fill rate: ${fillRateLabel(2 * GIB)}`);
+    expect(fillRateLine(both(3 * GIB, { status: "value", value: 2 * GIB }), null)).toBe(`Fill rate: ${fillRateLabel(3 * GIB)}`);
+    expect(fillRateLine(both(0.5 * GIB, { status: "unavailable", value: "not_yet" }), null)).toBe(
+      "Fill rate: 512 MB/min",
+    );
+  });
+
   it("gives the projection when the disk is heading for the floor, and nothing without a snapshot", () => {
     expect(fillRateLine(snapshot({ status: "value", value: 2.7 * GIB }), projection)).toBe(diskFillLine(projection));
     expect(fillRateLine(null, null)).toBeNull();
