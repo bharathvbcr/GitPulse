@@ -95,22 +95,74 @@ pub fn no_symlinks(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a walk may spend before it gives up.
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    pub entries: usize,
+    pub seconds: u64,
+}
+
+impl Budget {
+    /// The default for every candidate: 250,000 entries or 15 seconds.
+    pub const STANDARD: Budget = Budget {
+        entries: MAX_ENTRIES,
+        seconds: 15,
+    };
+}
+
+/// The error a walk returns when it spent its budget. A caller that wants to
+/// say "too large to verify" rather than "refused" compares against this.
+pub const BUDGET_EXCEEDED: &str =
+    "Measurement incomplete: traversal budget exceeded. Cleanup is unavailable.";
+
 pub fn snapshot(root: &Path, strict: bool, cancel: &AtomicBool) -> Result<Snapshot, String> {
+    snapshot_within(root, strict, cancel, Budget::STANDARD)
+}
+
+/// [`snapshot`] with an explicit budget. A snapshot holds one map entry per
+/// file and directory (a relative path and a 64-byte stamp, about 250 bytes
+/// with the map's own overhead), so the entry budget is also the memory bound.
+pub fn snapshot_within(
+    root: &Path,
+    strict: bool,
+    cancel: &AtomicBool,
+    budget: Budget,
+) -> Result<Snapshot, String> {
     let mut result = Snapshot {
         entries: BTreeMap::new(),
         bytes: 0,
         newest: 0,
     };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    walk(root, Path::new(""), strict, deadline, cancel, &mut result)?;
+    let deadline = Instant::now() + Duration::from_secs(budget.seconds);
+    walk(
+        root,
+        Path::new(""),
+        strict,
+        (deadline, budget.entries),
+        cancel,
+        &mut result,
+    )?;
     Ok(result)
+}
+
+/// The first entry of a snapshot that lives on another device than its root: a
+/// mount point inside the candidate. Removing the candidate would reach into a
+/// different filesystem, which nothing reviewed. Pure over the snapshot, so a
+/// test hands it entries with other device numbers.
+pub fn crossing_device(snapshot: &Snapshot) -> Option<&Path> {
+    let root = snapshot.entries.get(Path::new(""))?.identity.0;
+    snapshot
+        .entries
+        .iter()
+        .find(|(_, stamp)| stamp.identity.0 != root)
+        .map(|(path, _)| path.as_path())
 }
 
 fn walk(
     root: &Path,
     relative: &Path,
     strict: bool,
-    deadline: Instant,
+    (deadline, max_entries): (Instant, usize),
     cancel: &AtomicBool,
     result: &mut Snapshot,
 ) -> Result<(), String> {
@@ -118,12 +170,10 @@ fn walk(
         return Err("Cancelled".into());
     }
     if Instant::now() >= deadline
-        || result.entries.len() >= MAX_ENTRIES
+        || result.entries.len() >= max_entries
         || relative.components().count() > MAX_DEPTH
     {
-        return Err(
-            "Measurement incomplete: traversal budget exceeded. Cleanup is unavailable.".into(),
-        );
+        return Err(BUDGET_EXCEEDED.into());
     }
     // `join("")` appends a separator, and a trailing slash makes lstat follow
     // a symlinked root: the walk then measured the target as if it were the root.
@@ -180,7 +230,7 @@ fn walk(
                 root,
                 &relative.join(entry.file_name()),
                 strict,
-                deadline,
+                (deadline, max_entries),
                 cancel,
                 result,
             )?;
@@ -277,7 +327,11 @@ mod unix {
         if Stamp::read(&held.metadata().map_err(|e| e.to_string())?)? != *first {
             return Err("Directory changed after preview".into());
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // 60 seconds, and 1 more for every 5,000 reviewed entries: a build
+        // directory the agent scopes may reach holds several hundred thousand,
+        // and a run that stops half way leaves a partly removed folder.
+        let deadline = Instant::now()
+            + Duration::from_secs(60 + u64::try_from(expected.entries.len() / 5_000).unwrap_or(0));
         // Children sort after their parents in BTreeMap; reverse traversal
         // deletes only reviewed leaves, then empty directories. New entries
         // survive and cause ENOTEMPTY, never an unreviewed recursive sweep.
@@ -475,6 +529,62 @@ mod tests {
         let reviewed = walk(&target).unwrap();
         remove_reviewed(&target, &reviewed, &AtomicBool::new(false)).unwrap();
         assert!(!target.exists());
+    }
+
+    fn stamp(dev: u64) -> super::Stamp {
+        super::Stamp {
+            directory: true,
+            len: 0,
+            modified: 0,
+            identity: (dev, 1),
+            changed: (0, 0),
+        }
+    }
+
+    /// A candidate holding an entry on another device (a mount point) is
+    /// reported, naming the entry; one wholly on a device is not. The snapshot
+    /// is the stat seam: it carries each entry's device as the walk read it.
+    #[test]
+    fn an_entry_on_another_device_is_reported() {
+        let mut snapshot = super::Snapshot {
+            entries: std::collections::BTreeMap::new(),
+            bytes: 0,
+            newest: 0,
+        };
+        snapshot.entries.insert("".into(), stamp(7));
+        snapshot.entries.insert("debug".into(), stamp(7));
+        assert_eq!(super::crossing_device(&snapshot), None);
+        snapshot.entries.insert("debug/mnt".into(), stamp(9));
+        assert_eq!(
+            super::crossing_device(&snapshot),
+            Some(Path::new("debug/mnt"))
+        );
+        // A real tree is on one device.
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        cargo_layout(&root.join("t"), true);
+        let real = walk(&root.join("t")).unwrap();
+        assert_eq!(super::crossing_device(&real), None);
+    }
+
+    /// A budget smaller than the tree stops the walk with the error a caller
+    /// recognises as "too large", not as a refusal.
+    #[test]
+    fn a_walk_past_its_budget_returns_the_budget_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        cargo_layout(&root.join("t"), true);
+        let error = super::snapshot_within(
+            &root.join("t"),
+            true,
+            &AtomicBool::new(false),
+            super::Budget {
+                entries: 3,
+                seconds: 30,
+            },
+        )
+        .expect_err("more than three entries");
+        assert_eq!(error, super::BUDGET_EXCEEDED);
     }
 
     #[test]

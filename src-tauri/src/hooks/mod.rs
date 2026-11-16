@@ -3214,16 +3214,24 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
     session_brief_with(snapshot, here, source, None, None)
 }
 
+/// Where throwaway build output goes, as an absolute path under the session's
+/// own checkout. `.gitpulse/` is per repository, on the repository's own
+/// volume, ignored by git here and not on DevCouncil's preserved-name list
+/// (`tmp`, `.cache` and `.claude` are), and the cleaner's agent scratch scope
+/// knows it, so output kept there is accounted for. The path is absolute
+/// because a relative `--target-dir` or `CARGO_TARGET_DIR` is invisible to the
+/// check that a build is still running in it.
+fn scratch_build_line(checkout: &str) -> String {
+    let root = checkout.trim_end_matches('/');
+    format!(
+        "scratch builds: put throwaway build output in {root}/.gitpulse/scratch/target-<label>, passed as an absolute --target-dir or CARGO_TARGET_DIR (a relative one is not seen as in use); never put build output directly inside a checkout's .claude/ folder, because new session worktrees are seeded with a copy of it"
+    )
+}
+
 /// [`session_brief`] with two more lines right under the header, so they are
 /// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
 /// says (`load_gate::brief_line_live`), and the running app's fact source and
 /// age (`app_age_ms`) when the snapshot came from the app.
-/// Where throwaway build output goes. `.gitpulse/` is per repository, on the
-/// repository's own volume, ignored by git here and not on DevCouncil's
-/// preserved-name list (`tmp`, `.cache` and `.claude` are), and the cleaner's
-/// agent scratch scope knows it, so output kept there is accounted for.
-const SCRATCH_BUILD_LINE: &str = "scratch builds: put throwaway build output in .gitpulse/scratch/target-<label> (CARGO_TARGET_DIR); never under .claude/, which new worktrees copy whole";
-
 fn session_brief_with(
     snapshot: &InsightsSnapshot,
     here: &str,
@@ -3248,7 +3256,7 @@ fn session_brief_with(
     if let Some(age_ms) = app_age_ms {
         out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
     }
-    out.push_str(SCRATCH_BUILD_LINE);
+    out.push_str(&scratch_build_line(here));
     out.push('\n');
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
@@ -8920,8 +8928,24 @@ done
             .filter(|l| l.contains(".gitpulse/scratch/target-"))
             .collect();
         assert_eq!(named.len(), 1, "{brief}");
-        assert!(named[0].len() < 180, "{}", named[0]);
-        assert!(named[0].contains("never under .claude/"), "{}", named[0]);
+        assert!(named[0].len() < 400, "{}", named[0]);
+        assert!(
+            named[0].contains("/repo/.gitpulse/scratch/target-<label>"),
+            "the root is absolute and under the session's own checkout: {}",
+            named[0]
+        );
+        assert!(named[0].contains("absolute --target-dir"), "{}", named[0]);
+        assert!(
+            named[0].contains("never put build output directly inside a checkout's .claude/")
+                && named[0].contains("seeded with a copy"),
+            "{}",
+            named[0]
+        );
+        let other = session_brief(&snapshot_fixture(), "/work/lane/", "startup");
+        assert!(
+            other.contains("/work/lane/.gitpulse/scratch/target-<label>"),
+            "{other}"
+        );
         let mut snapshot = snapshot_fixture();
         snapshot.worktrees.items = (0..400)
             .map(|i| WorktreeSummary {

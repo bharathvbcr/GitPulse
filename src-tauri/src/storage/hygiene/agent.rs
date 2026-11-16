@@ -50,10 +50,23 @@ const MAX_SESSION_FOLDERS: usize = 4096;
 /// Directory levels below a scratchpad or scratch root searched for targets.
 const SEARCH_DEPTH: usize = 3;
 const MAX_TARGETS_PER_ROOT: usize = 16;
+/// What the strict walk of one Cargo target may spend. A real target has tens
+/// of thousands of entries (measured read-only on this machine: a 48 GiB
+/// build folder held 137,894 and walked in 4 s, a 25 GiB one 65,674 in 1.3 s),
+/// so the default 250,000 / 15 s was close to enough and a target past it was
+/// always kept. 600,000 / 45 s is about four times the largest measured. The
+/// snapshot costs about 250 bytes an entry, so the worst case is ~150 MB held
+/// for the walk and released after the judgement.
+pub(crate) const CARGO_TARGET_BUDGET: tree::Budget = tree::Budget {
+    entries: 600_000,
+    seconds: 45,
+};
 /// The most kept items one preview carries.
 const MAX_KEPT: usize = 200;
 /// Leaked temp directories reported, largest first.
 const MAX_LEAKED: usize = 20;
+/// Entries of the temp directory looked at for leaked folders.
+const MAX_TEMP_ENTRIES: usize = 512;
 /// Smallest temp directory worth reporting.
 const LEAK_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 const NO_PROOF: &str = "no owner can be proven: no creator marker names a process, and the name pattern is shared by every tool that makes temp directories";
@@ -86,6 +99,46 @@ pub(super) struct Scan {
     pub unlisted: usize,
     /// Every folder the scope covers was examined.
     pub complete: bool,
+    /// Folders a check could not run for (git refused, timed out or was shed,
+    /// a directory could not be listed). They are kept, but never as an answer:
+    /// the run counts them as unexamined, which brings the next run forward.
+    pub unexamined: u32,
+}
+
+/// Prefix of the kept reason for a folder whose check did not run. The UI keys
+/// on it to say "could not be checked" and not "skipped" or "in use".
+pub(crate) const COULD_NOT_CHECK: &str = "could not be checked:";
+
+/// Why a judgement did not approve a folder. The two are different facts: a
+/// folder that was examined and failed a rule, and one a check could not be
+/// run for. Only the second asks for another look soon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// Examined, and a rule keeps it.
+    Kept(String),
+    /// A check could not run, so the folder is kept without having been judged.
+    Unexamined(String),
+}
+
+impl Refusal {
+    pub(super) fn message(&self) -> String {
+        match self {
+            Self::Kept(why) => why.clone(),
+            Self::Unexamined(why) => format!("{COULD_NOT_CHECK} {why}"),
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Self {
+        Self::Kept(why)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(why: &str) -> Self {
+        Self::Kept(why.into())
+    }
 }
 
 impl Scan {
@@ -99,6 +152,30 @@ impl Scan {
         } else {
             self.unlisted += 1;
         }
+    }
+
+    /// Keeps a folder with the reason its judgement gave.
+    fn refuse(&mut self, path: &Path, scope: &str, refusal: &Refusal) {
+        if matches!(refusal, Refusal::Unexamined(_)) {
+            self.unexamined = self.unexamined.saturating_add(1);
+            self.complete = false;
+        }
+        self.keep(path, scope, refusal.message());
+    }
+
+    /// Whether this scan's own deadline passed. Says so once, and marks the
+    /// scan incomplete, so a cut-off scan is never read as a clean one.
+    fn out_of_time(&mut self, ctx: &Context<'_>, what: &str) -> bool {
+        if ctx.deadline > Instant::now() {
+            return false;
+        }
+        if self.complete {
+            self.issues.push(format!(
+                "{what}: the agent scratch scan reached its time limit, so the rest were not examined"
+            ));
+        }
+        self.complete = false;
+        true
     }
 
     /// Folds this scan into the inventory, within its candidate and kept-list
@@ -123,6 +200,13 @@ impl Scan {
                 "{unlisted} more agent scratch folder(s) were left alone and are not listed"
             ));
         }
+        if self.unexamined > 0 {
+            inventory.shed_repos = inventory.shed_repos.saturating_add(self.unexamined);
+            inventory.issues.push(format!(
+                "{} agent scratch folder(s) could not be checked and were kept; the run counts them as unexamined and tries again sooner",
+                self.unexamined
+            ));
+        }
         inventory.issues.extend(self.issues);
         if !self.complete {
             inventory.partial = true;
@@ -143,15 +227,19 @@ pub(crate) fn current_uid() -> u32 {
     u32::MAX
 }
 
-/// The live agent sessions as far as they could be told apart.
+/// The live Claude sessions as far as they could be told apart. A scratchpad
+/// folder belongs to a Claude session, so only the Claude detector answers
+/// "is this one running": a Codex, Antigravity, DevCouncil or Manvi session
+/// cannot hold one, and neither it nor its detector failing keeps a folder.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LiveSessions {
-    /// Registry session ids of sessions known to be running.
+    /// Registry session ids of Claude sessions known to be running.
     pub ids: BTreeSet<String>,
-    /// Running sessions (or registry entries) with no usable session id:
-    /// they cannot be matched to a folder, so none can be shown finished.
+    /// Running Claude sessions (or registry entries) with no usable session
+    /// id: they cannot be matched to a folder, so none can be shown finished.
     pub unidentified: usize,
-    /// Why the observation is not complete, when a detector could not look.
+    /// Why the Claude observation is not complete, when its detector could not
+    /// look.
     pub incomplete: Option<String>,
 }
 
@@ -164,7 +252,7 @@ impl LiveSessions {
         observation: &crate::insights::live_sessions::Observation,
     ) -> Self {
         let mut out = Self::default();
-        for kind in observation {
+        for kind in observation.iter().filter(|k| k.kind == "claude") {
             if !kind.ok {
                 out.incomplete = Some(format!(
                     "the {} detector could not look: {}",
@@ -184,6 +272,11 @@ impl LiveSessions {
                 }
             }
         }
+        // No Claude entry at all is a detector that did not run, not a machine
+        // with no Claude sessions.
+        if !observation.iter().any(|k| k.kind == "claude") {
+            out.incomplete = Some("the claude detector reported nothing".into());
+        }
         out
     }
 }
@@ -196,7 +289,11 @@ pub(crate) struct Context<'a> {
     pub live: &'a LiveSessions,
     pub use_of: &'a dyn Fn(&Path) -> Result<DirUse, String>,
     pub cancel: &'a AtomicBool,
+    /// The scan's own deadline, separate from every other part of a run.
     pub deadline: Instant,
+    /// What the strict walk of one Cargo target may spend; see
+    /// [`CARGO_TARGET_BUDGET`].
+    pub target_budget: tree::Budget,
 }
 
 /// What a judgement approves: the reviewed tree to remove and why it was
@@ -237,15 +334,22 @@ fn named_like_a_build_folder(name: &str) -> bool {
 
 /// Cargo targets below `root`, never through a symlink, and the directories
 /// named like build folders that carry no producer evidence.
-fn find_targets(root: &Path, scan: &mut Scan, scope: &str) -> Vec<PathBuf> {
+fn find_targets(root: &Path, scan: &mut Scan, scope: &str, ctx: &Context<'_>) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    let mut capped = false;
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
+        if scan.out_of_time(ctx, &root.display().to_string()) {
+            break;
+        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                scan.complete = false;
-                scan.keep(&dir, scope, format!("could not be listed: {e}"));
+                scan.refuse(
+                    &dir,
+                    scope,
+                    &Refusal::Unexamined(format!("it could not be listed: {e}")),
+                );
                 continue;
             }
         };
@@ -261,6 +365,13 @@ fn find_targets(root: &Path, scan: &mut Scan, scope: &str) -> Vec<PathBuf> {
             match cargo_evidence(&path) {
                 Ok(()) => {
                     if found.len() >= MAX_TARGETS_PER_ROOT {
+                        if !capped {
+                            capped = true;
+                            scan.issues.push(format!(
+                                "{}: more than {MAX_TARGETS_PER_ROOT} Cargo build folders; the rest were not examined",
+                                root.display()
+                            ));
+                        }
                         scan.complete = false;
                     } else {
                         found.push(path);
@@ -289,7 +400,7 @@ fn judge(
     relative_to: &Path,
     session: Option<(&str, &Path)>,
     ctx: &Context<'_>,
-) -> Result<Verdict, String> {
+) -> Result<Verdict, Refusal> {
     let root = crate::engine::process::canonicalize_plain(scope_root)
         .map_err(|e| format!("its scope root could not be resolved: {e}"))?;
     if !target.is_absolute()
@@ -312,7 +423,8 @@ fn judge(
         return Err(format!(
             "its path {} is on the preserved-name list (dependencies, environments, shared caches or persistent local state)",
             relative.display()
-        ));
+        )
+        .into());
     }
     cargo_evidence(target)?;
     let mut evidence =
@@ -322,18 +434,20 @@ fn judge(
             if let Some(why) = &ctx.live.incomplete {
                 return Err(format!(
                     "owner unproven: whether the session is finished could not be told: {why}"
-                ));
+                )
+                .into());
             }
             if ctx.live.ids.contains(id) {
-                return Err(format!("in use: agent session {id} is running"));
+                return Err(format!("in use: agent session {id} is running").into());
             }
             if ctx.live.unidentified > 0 {
                 return Err(format!(
-                    "owner unproven: {} running agent session(s) have no session id to match, so session {id} cannot be shown finished",
+                    "owner unproven: {} running Claude session(s) have no session id to match, so session {id} cannot be shown finished",
                     ctx.live.unidentified
-                ));
+                )
+                .into());
             }
-            evidence.push(format!("no running agent session has the id {id}"));
+            evidence.push(format!("no running Claude session has the id {id}"));
             session_dir
         }
         None => target,
@@ -348,7 +462,8 @@ fn judge(
             format!("owner unproven: {why}")
         } else {
             format!("in use: {why}")
-        });
+        }
+        .into());
     }
     evidence.push(format!(
         "no process uses {} (working directory, executable and arguments read; environment too where the OS shows it, which macOS does not for Apple platform programs{})",
@@ -362,7 +477,24 @@ fn judge(
             String::new()
         }
     ));
-    let snapshot = tree::snapshot(target, true, ctx.cancel)?;
+    let snapshot =
+        tree::snapshot_within(target, true, ctx.cancel, ctx.target_budget).map_err(|e| {
+            if e == tree::BUDGET_EXCEEDED {
+                format!(
+                    "too large to verify within {} entries / {} s, so it is kept",
+                    ctx.target_budget.entries, ctx.target_budget.seconds
+                )
+            } else {
+                e
+            }
+        })?;
+    if let Some(inside) = tree::crossing_device(&snapshot) {
+        return Err(format!(
+            "it holds a different filesystem (a mount point) at {}",
+            inside.display()
+        )
+        .into());
+    }
     tree::require_age(&snapshot, ctx.retention_days, at(ctx.now))
         .map_err(|e| format!("too recent: {e}"))?;
     let newest_days = ctx
@@ -443,8 +575,11 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
             continue;
         }
         let Ok(sessions) = std::fs::read_dir(&project_dir) else {
-            scan.complete = false;
-            scan.keep(&project_dir, SCOPE_SESSION, "could not be listed");
+            scan.refuse(
+                &project_dir,
+                SCOPE_SESSION,
+                &Refusal::Unexamined("it could not be listed".into()),
+            );
             continue;
         };
         for session in sessions.flatten() {
@@ -454,8 +589,11 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                 continue;
             }
             folders += 1;
-            if folders > MAX_SESSION_FOLDERS || ctx.deadline <= Instant::now() {
+            if folders > MAX_SESSION_FOLDERS {
                 scan.complete = false;
+                continue;
+            }
+            if scan.out_of_time(ctx, "session scratchpads") {
                 continue;
             }
             let scratchpad = session_dir.join("scratchpad");
@@ -467,7 +605,10 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                 continue;
             }
             let project_name = project.file_name().to_string_lossy().into_owned();
-            for target in find_targets(&scratchpad, &mut scan, SCOPE_SESSION) {
+            for target in find_targets(&scratchpad, &mut scan, SCOPE_SESSION, ctx) {
+                if scan.out_of_time(ctx, "session scratchpads") {
+                    break;
+                }
                 match judge(
                     &scope_root,
                     &target,
@@ -489,7 +630,7 @@ pub(super) fn scan_sessions(tmp_root: &Path, uid: u32, ctx: &Context<'_>, measur
                             ctx.deadline,
                         ));
                     }
-                    Err(why) => scan.keep(&target, SCOPE_SESSION, why),
+                    Err(refusal) => scan.refuse(&target, SCOPE_SESSION, &refusal),
                 }
             }
         }
@@ -514,7 +655,10 @@ pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> 
         if !std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        for target in find_targets(&root, &mut scan, SCOPE_REPOSITORY) {
+        for target in find_targets(&root, &mut scan, SCOPE_REPOSITORY, ctx) {
+            if scan.out_of_time(ctx, "repository scratch builds") {
+                break;
+            }
             match judge_repository(repo, &target, ctx) {
                 Ok(verdict) => scan.candidates.push(candidate_from(
                     SCOPE_REPOSITORY,
@@ -525,7 +669,7 @@ pub(super) fn scan_repository(repo: &Path, ctx: &Context<'_>, measure: bool) -> 
                     measure,
                     ctx.deadline,
                 )),
-                Err(why) => scan.keep(&target, SCOPE_REPOSITORY, why),
+                Err(refusal) => scan.refuse(&target, SCOPE_REPOSITORY, &refusal),
             }
         }
     }
@@ -554,10 +698,16 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&claude) else {
-            scan.complete = false;
-            scan.keep(&claude, SCOPE_CLAUDE, "owner unproven: could not be listed");
+            scan.refuse(
+                &claude,
+                SCOPE_CLAUDE,
+                &Refusal::Unexamined("it could not be listed".into()),
+            );
             continue;
         };
+        if scan.out_of_time(ctx, ".claude build folders") {
+            break;
+        }
         let mut targets: Vec<PathBuf> = entries
             .flatten()
             .filter(|e| {
@@ -577,6 +727,9 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
                 );
                 continue;
             }
+            if scan.out_of_time(ctx, ".claude build folders") {
+                break;
+            }
             match judge_claude(checkout, &target, ctx) {
                 Ok(verdict) => {
                     let mut evidence = vec![
@@ -595,7 +748,7 @@ pub(super) fn scan_claude_targets(checkouts: &[PathBuf], ctx: &Context<'_>, meas
                         ctx.deadline,
                     ));
                 }
-                Err(why) => scan.keep(&target, SCOPE_CLAUDE, why),
+                Err(refusal) => scan.refuse(&target, SCOPE_CLAUDE, &refusal),
             }
         }
     }
@@ -628,7 +781,7 @@ fn seeded_copy_note(checkout: &Path, verdict: &Verdict) -> Option<String> {
 /// A `.claude` build folder is judged like a scratch target in a repository,
 /// except that git need not ignore it (it is not in the project's tree) and
 /// the path must be exactly `<checkout>/.claude/<name>-target`.
-fn judge_claude(checkout: &Path, target: &Path, ctx: &Context<'_>) -> Result<Verdict, String> {
+fn judge_claude(checkout: &Path, target: &Path, ctx: &Context<'_>) -> Result<Verdict, Refusal> {
     let claude = checkout.join(".claude");
     let name = target
         .file_name()
@@ -639,52 +792,120 @@ fn judge_claude(checkout: &Path, target: &Path, ctx: &Context<'_>) -> Result<Ver
         return Err("it is not a build folder directly under .claude".into());
     }
     let rel = format!(".claude/{name}");
-    let tracked =
-        crate::engine::git_cli::git_text(checkout, &["ls-files", "--", &rel]).map_err(|e| {
-            format!(
-                "owner unproven: whether it holds tracked files could not be read: {}",
-                e.message()
-            )
-        })?;
-    if !tracked.trim().is_empty() {
-        return Err("it holds files git tracks".into());
+    match git_tracks(checkout, &rel) {
+        GitAnswer::No => {}
+        GitAnswer::Yes => return Err("it holds files git tracks".into()),
+        GitAnswer::Unknown(why) => return Err(Refusal::Unexamined(why)),
     }
     judge(&claude, target, &claude, None, ctx)
 }
 
-fn judge_repository(repo: &Path, target: &Path, ctx: &Context<'_>) -> Result<Verdict, String> {
-    let relative = target
-        .strip_prefix(repo)
-        .map_err(|_| "it is not inside the repository".to_string())?;
-    let rel = relative.to_string_lossy().into_owned();
+/// What a git question came back with. A question git could not answer is its
+/// own answer: collapsing it into `No` is how a refused spawn, an untrusted
+/// repository or a timeout would read as "git does not ignore it" or "nothing
+/// is tracked".
+#[derive(Debug, PartialEq, Eq)]
+enum GitAnswer {
+    Yes,
+    No,
+    Unknown(String),
+}
+
+/// Runs one read-only git question and hands back its exit status, or why no
+/// status was obtained (the host shed the spawn, the repository is not trusted,
+/// it timed out, git could not start).
+fn git_status(dir: &Path, args: &[&str]) -> Result<(i32, String), String> {
+    match crate::engine::git_cli::git_captured(dir, args) {
+        Ok(run) => {
+            if let Some(why) = &run.incomplete {
+                return Err(format!("git {} output was cut short: {why:?}", args[0]));
+            }
+            Ok((
+                run.status_code,
+                String::from_utf8_lossy(&run.stdout).into_owned(),
+            ))
+        }
+        Err(e) => Err(format!("git {} did not run: {}", args[0], e.message())),
+    }
+}
+
+/// Whether git ignores `rel` (a path relative to `dir`).
+fn git_ignores(dir: &Path, rel: &str) -> GitAnswer {
+    match git_status(dir, &["check-ignore", "-q", "--", rel]) {
+        Ok((0, _)) => GitAnswer::Yes,
+        Ok((1, _)) => GitAnswer::No,
+        Ok((code, _)) => GitAnswer::Unknown(format!("git check-ignore exited with status {code}")),
+        Err(why) => GitAnswer::Unknown(why),
+    }
+}
+
+/// Whether git tracks anything at or under `rel`.
+fn git_tracks(dir: &Path, rel: &str) -> GitAnswer {
+    match git_status(dir, &["ls-files", "--", rel]) {
+        Ok((0, listing)) if listing.trim().is_empty() => GitAnswer::No,
+        Ok((0, _)) => GitAnswer::Yes,
+        Ok((code, _)) => GitAnswer::Unknown(format!("git ls-files exited with status {code}")),
+        Err(why) => GitAnswer::Unknown(why),
+    }
+}
+
+/// The scratch root a repository scratch build lives under: `.gitpulse/scratch`
+/// or `tmp` of the checkout. Candidates are judged relative to it, so the
+/// root's own name is not a reason to refuse what is inside.
+fn repository_scratch_root(checkout: &Path, target: &Path) -> Result<PathBuf, String> {
+    [checkout.join(".gitpulse/scratch"), checkout.join("tmp")]
+        .into_iter()
+        .find(|root| {
+            target
+                .strip_prefix(root)
+                .is_ok_and(|rest| rest != Path::new(""))
+        })
+        .ok_or_else(|| "it is not inside this checkout's .gitpulse/scratch or tmp".to_string())
+}
+
+fn judge_repository(checkout: &Path, target: &Path, ctx: &Context<'_>) -> Result<Verdict, Refusal> {
+    let scratch = repository_scratch_root(checkout, target)?;
+    let rel = target
+        .strip_prefix(checkout)
+        .map_err(|_| "it is not inside the repository".to_string())?
+        .to_string_lossy()
+        .into_owned();
     // Producer-owned and ignored: not tracked, and git ignores it, so removing
     // it cannot lose work and it never showed in status.
-    let ignored =
-        crate::engine::git_cli::git_text(repo, &["check-ignore", "-q", "--", &rel]).is_ok();
-    if !ignored {
-        return Err("git does not ignore it, so it could be work in progress".into());
+    match git_ignores(checkout, &rel) {
+        GitAnswer::Yes => {}
+        GitAnswer::No => {
+            return Err("git does not ignore it, so it could be work in progress".into());
+        }
+        GitAnswer::Unknown(why) => return Err(Refusal::Unexamined(why)),
     }
-    let tracked =
-        crate::engine::git_cli::git_text(repo, &["ls-files", "--", &rel]).map_err(|e| {
-            format!(
-                "whether it holds tracked files could not be read: {}",
-                e.message()
-            )
-        })?;
-    if !tracked.trim().is_empty() {
-        return Err("it holds files git tracks".into());
+    match git_tracks(checkout, &rel) {
+        GitAnswer::No => {}
+        GitAnswer::Yes => return Err("it holds files git tracks".into()),
+        GitAnswer::Unknown(why) => return Err(Refusal::Unexamined(why)),
     }
-    judge(repo, target, repo, None, ctx)
+    judge(&scratch, target, &scratch, None, ctx)
 }
 
 /// The cleaner run's delete step for a candidate this module offered. The
 /// candidate is judged again from scratch; `budget` is what the run's byte
 /// cap still allows. Returns the bytes the reviewed tree held.
+#[cfg(test)]
 pub(crate) fn remove(
     candidate: &CleanerCandidate,
     ctx: &Context<'_>,
     budget: u64,
 ) -> Result<u64, String> {
+    remove_judged(candidate, ctx, budget).map_err(|refusal| refusal.message())
+}
+
+/// [`remove`] keeping the difference between a candidate a rule keeps and one
+/// a check could not be run for, which the cleaner records as unexamined.
+pub(super) fn remove_judged(
+    candidate: &CleanerCandidate,
+    ctx: &Context<'_>,
+    budget: u64,
+) -> Result<u64, Refusal> {
     let scope_root = Path::new(&candidate.repo_path);
     let target = Path::new(&candidate.path);
     let verdict = match candidate.scope.as_str() {
@@ -696,12 +917,12 @@ pub(crate) fn remove(
                 &scratchpad,
                 Some((id.as_str(), session_dir.as_path())),
                 ctx,
-            )?
+            )
         }
-        SCOPE_REPOSITORY => judge_repository(scope_root, target, ctx)?,
-        SCOPE_CLAUDE => judge_claude(scope_root, target, ctx)?,
-        other => return Err(format!("{other} is not an agent scratch scope")),
-    };
+        SCOPE_REPOSITORY => judge_repository(scope_root, target, ctx),
+        SCOPE_CLAUDE => judge_claude(scope_root, target, ctx),
+        other => return Err(format!("{other} is not an agent scratch scope").into()),
+    }?;
     let bytes = verdict.snapshot.bytes;
     if bytes > budget {
         return Err("Candidate exceeds the remaining byte budget".into());
@@ -734,12 +955,36 @@ fn session_of(scope_root: &Path, target: &Path) -> Result<(String, PathBuf, Path
 
 /// Temp directories of the user's temp area nobody can account for, reported
 /// for a person to look at. Never a candidate.
-pub(super) fn leaked_temp(user_temp: &Path, ctx: &Context<'_>) -> Vec<LeakedTemp> {
-    let Ok(entries) = std::fs::read_dir(user_temp) else {
-        return Vec::new();
+///
+/// Anything that stops the listing from being whole (the directory cannot be
+/// read, more entries than the cap, the scan's own deadline) is an issue in
+/// `issues`: an empty list is never the answer to a listing that failed.
+pub(super) fn leaked_temp(
+    user_temp: &Path,
+    ctx: &Context<'_>,
+    issues: &mut Vec<String>,
+) -> Vec<LeakedTemp> {
+    let entries = match std::fs::read_dir(user_temp) {
+        Ok(entries) => entries,
+        Err(e) => {
+            issues.push(format!(
+                "{} could not be listed, so leaked temp directories were not looked for: {e}",
+                user_temp.display()
+            ));
+            return Vec::new();
+        }
     };
     let mut found = Vec::new();
-    for entry in entries.flatten().take(512) {
+    let mut seen = 0usize;
+    for entry in entries.flatten() {
+        seen += 1;
+        if seen > MAX_TEMP_ENTRIES {
+            issues.push(format!(
+                "{} holds more than {MAX_TEMP_ENTRIES} entries; the rest were not looked at for leaked temp directories",
+                user_temp.display()
+            ));
+            break;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if !name.starts_with(".tmp") || !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
@@ -747,6 +992,10 @@ pub(super) fn leaked_temp(user_temp: &Path, ctx: &Context<'_>) -> Vec<LeakedTemp
             continue;
         }
         if ctx.deadline <= Instant::now() {
+            issues.push(format!(
+                "{}: the leaked temp look reached its time limit, so the rest were not examined",
+                user_temp.display()
+            ));
             break;
         }
         let measured = tree::snapshot(&path, false, ctx.cancel).ok();

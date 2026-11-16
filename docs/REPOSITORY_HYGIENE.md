@@ -150,15 +150,24 @@ default, and no run — scheduled, in-app or manual — uses any of them until a
 person has previewed the current set with **Inspect saved roots**. The preview
 is recorded in `hygiene/state.json` only by that command, never from the saved
 policy, and any change to the set clears it, so turning a scope off and on
-again needs a fresh preview. A run with scopes enabled but not previewed uses
-none of them and says so.
+again needs a fresh preview. Changing the roots or the exclusions clears it
+too, for every scope. A run with scopes enabled but not previewed uses none of
+them and says so.
+
+A run does not delete "exactly the previewed set". It applies the rules you
+previewed to what it finds when it runs: a folder that newly matches since the
+preview is included, one that stopped matching is not, and every candidate is
+judged again from scratch at delete time. For the agent scratch scope the
+approval also lapses 30 days after the last preview (`previewed_at`, written
+only while that scope is on); a run after that skips the scope and says so in
+its issues, and the Settings page stops showing the set as previewed.
 
 | Setting | What it adds | Vetoes kept |
 | --- | --- | --- |
 | **Reclaim build caches in idle linked worktrees** (`scopes.worktree_caches`) | Linked worktrees under the roots (including `.claude/worktrees/*` and `.gitpulse/worktrees/*`, which discovery never enters) are inventoried, and the caches worktree creation clones into them (`target`, `.turbo`) become candidates | No process working anywhere in the worktree; its tree clean; no task lease in the main checkout's store naming its branch (or naming none), and none at all in the worktree's own store; producer evidence, ignored and untracked; nothing open; nothing modified for the idle days. Budgeted by clone-private bytes, not logical size |
 | **Judge uncommitted work per project** (`scopes.per_tree_vetoes`) | Uncommitted work refuses a repository's output only when it is in the project directory that produced it | Task leases stay repository-wide; every other check unchanged |
 | **Remove stale linked worktrees** (`scopes.prune_worktrees`) | Linked worktrees the stale-worktree report calls stale are removed with `git worktree remove`, never forced; the branch is kept | No process inside, clean, unlocked, no task lease in either store, idle at least a day, and integrated into the main worktree's branch or idle past the idle days; a detached HEAD must be integrated |
-| **Remove agent scratch builds** (`scopes.agent_scratch_builds`) | Cargo build folders agents leave outside any repository scan: in `<temp>/claude-<uid>/<project>/<session>/scratchpad` of a session that is finished, in `.gitpulse/scratch` or `tmp` inside a repository when git ignores them, and Cargo targets (`target` or `*-target`) directly under a checkout's `.claude/`, including the copy a new session worktree is seeded with (only the target folder, never config or skills; a never-built-in copy is called out as such) | Cargo's own evidence (`CACHEDIR.TAG` signature and `.rustc_info.json`; a directory merely named `target` is kept); no symlink on the way and the path inside the scope root; DevCouncil's `protected_artifact` on the relative path and `protected_entry` on every entry; no process uses it (working directory, executable, argument or environment) and none of your processes was unreadable; for a scratchpad, no running agent session has the id and every agent detector could look, and a running session with no id keeps every folder; nothing modified within `scopes.agent_scratch_days` (default 7, minimum 7). The scratchpad and every other file in it stay. The delete step judges each candidate again from scratch and stops at the run's byte cap |
+| **Remove agent scratch builds** (`scopes.agent_scratch_builds`) | Cargo build folders agents leave outside any repository scan: in `<temp>/claude-<uid>/<project>/<session>/scratchpad` of a session that is finished, in `.gitpulse/scratch` or `tmp` of a checkout (the repository and each of its linked worktrees under the roots) when git ignores them, and Cargo targets (`target` or `*-target`) directly under a checkout's `.claude/`, including the copy a new session worktree is seeded with (only the target folder, never config or skills; a never-built-in copy is called out as such) | Cargo's own evidence (`CACHEDIR.TAG` signature and `.rustc_info.json`; a directory merely named `target` is kept); no symlink on the way and the path inside the scope root; DevCouncil's `protected_artifact` on the path relative to the scope root (`<checkout>/tmp`, `<checkout>/.gitpulse/scratch`, the scratchpad, `.claude`: the root's own name is not consulted, every name between it and the target is) and `protected_entry` on every entry; no entry on a different device than the target (a mount point keeps it); a strict walk of at most 600,000 entries or 45 seconds, past which it is kept as "too large to verify"; no process uses it (working directory, executable, argument or environment) and none of your processes was unreadable; for a scratchpad, the folder name is a session id the Claude registry does not list as running, the Claude detector could look, and no running Claude session lacks an id (Codex, Antigravity, DevCouncil and Manvi sessions never keep a scratchpad: they cannot hold one); git's answers to "is it ignored" and "is anything tracked" are three-valued, and one git could not give (shed under load, untrusted repository, timeout) keeps the folder as **could not be checked**, counted as unexamined so the next run comes sooner, never as "not ignored"; nothing modified within `scopes.agent_scratch_days` (default 7, minimum 7). The scratchpad and every other file in it stay. The delete step judges each candidate again from scratch and stops at the run's byte cap |
 
 The idle threshold (`scopes.worktree_idle_days`) defaults to 7 days and cannot
 go below DevCouncil's scheduled-retention minimum of 7. `node_modules` is never
@@ -169,14 +178,38 @@ with the reason, and temp directories in the user temp area that nobody can
 account for. Those are report-only: an origin would be provable only from a
 creator marker naming a process that is gone, nothing writes one, and there is
 no deletion path for them. The SessionStart brief tells agents to put
-throwaway builds in `.gitpulse/scratch/target-<label>`. That path is per
-repository, on its volume, ignored by git here, and not on the preserved-name
-list (`tmp`, `.cache` and `.claude` are).
+throwaway builds in `<their checkout>/.gitpulse/scratch/target-<label>`, as an
+absolute `--target-dir` or `CARGO_TARGET_DIR`, and never to put build output
+directly inside a checkout's `.claude/` folder, because new session worktrees
+are seeded with a copy of it. That path is per repository, on its volume,
+ignored by git here, and not on the preserved-name list (`tmp`, `.cache` and
+`.claude` are).
+
+The session scope is not limited by the configured roots: scratchpads live in
+the system temp directory. Exclusions still apply to every agent candidate, in
+the preview as in the run.
+
+**What the in-use check cannot see.** It reads working directory, executable,
+arguments and environment of the processes of the user running GitPulse.
+Relative `--target-dir rel`, `--target-dir=rel` and `CARGO_TARGET_DIR=rel` are
+resolved against the process's own working directory. Still invisible: the
+environment of Apple platform programs, which macOS withholds and which reads
+as empty (it cannot be told apart from a genuinely empty environment, so it is
+not marked unproven: doing so would keep every folder while any `/bin/sh` runs);
+a `target-dir` set only in a `.cargo/config` file; and other users' processes,
+which are counted and reported but not inspected. Worktree teardown uses the
+same check, and a process of yours it could not read refuses.
 
 When the host is shedding work because the disk is full or filling
-(`sysload::shed_cause`), an enabled schedule is brought forward to now, at
-most once every 3 hours. The run that follows uses the saved, previewed scopes
-and every check it always makes.
+(`sysload::shed_cause`), an enabled in-app schedule is brought forward to now, at
+most once every 3 hours (it does not bump the policy revision, so a Settings page
+open at the time can still save). Under a persistently low disk this is a run
+every 3 hours, only for a schedule that is already enabled and only in the app:
+the headless launchd path never brings itself forward. The run that follows uses
+the saved, previewed scopes and every check it always makes, and its bounded
+read-only git checks are admitted while the disk is the only thing the host
+sheds for (`with_disk_relief` in the spawn gate); under memory, swap, CPU or
+thermal pressure they are shed like any other spawn.
 
 ### Stale worktrees
 
@@ -208,7 +241,11 @@ walk every worktree.
 New policy fields are written to `state.json` only once they differ from their
 defaults, so a file this build writes with defaults stays readable by an older
 build. Once a scope or the clone budget is changed, an older build refuses the
-file as invalid and stops cleaning until this build is installed again.
+file as invalid and stops cleaning until this build is installed again. That
+includes turning on the agent scratch scope (its fields are then written), the
+preview timestamp that scope keeps, and a bring-forward still within its
+3-hour gap (the stamp is dropped afterwards): enabling the new scope makes the
+state unreadable to builds from before it existed.
 
 The newest 20 runs retain exact target paths, before/after logical bytes, skips,
 errors and partial outcomes. An item is journaled before mutation; failed journal

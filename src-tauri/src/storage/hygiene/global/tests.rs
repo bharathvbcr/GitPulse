@@ -4,6 +4,7 @@ use super::{
 use crate::procguard::LockedSpawn;
 use crate::storage::hygiene::discovery;
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -2526,7 +2527,15 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
         Some(now)
     );
     assert_eq!(next(&cleaner), now);
-    assert_eq!(cleaner.state().unwrap().config.revision, before + 1);
+    assert_eq!(
+        cleaner.state().unwrap().config.revision,
+        before,
+        "the schedule moving is not an edit of the policy a person's open page is compared against"
+    );
+    // A save carrying the revision read before the bring-forward still lands.
+    let mut open_page = cleaner.state().unwrap().config;
+    open_page.next_run_at = later;
+    assert!(cleaner.save(open_page).is_ok());
     // Due now, and not asked again within the gap, whatever the cause.
     cleaner
         .update(|saved| {
@@ -2586,7 +2595,436 @@ fn the_agent_scratch_scope_ships_off_and_an_older_policy_reads_it_off() {
         ..defaults
     };
     assert!(on.any());
-    assert!(!on.effective(None).agent_scratch_builds);
-    assert!(!on.effective(Some(defaults)).agent_scratch_builds);
-    assert!(on.effective(Some(on)).agent_scratch_builds);
+    let now = 1_000_000_000;
+    assert!(!on.effective(None, now, now).agent_scratch_builds);
+    assert!(!on.effective(Some(defaults), now, now).agent_scratch_builds);
+    assert!(on.effective(Some(on), now, now).agent_scratch_builds);
+}
+
+/// What an older build (one whose state reader refuses unknown fields) reads.
+/// It is the parent's shape: no agent scope, no `previewed_at`, no bring-forward
+/// stamp.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentScopes {
+    #[serde(default)]
+    worktree_caches: bool,
+    #[serde(default)]
+    per_tree_vetoes: bool,
+    #[serde(default)]
+    prune_worktrees: bool,
+    #[serde(default)]
+    worktree_idle_days: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentConfig {
+    version: u32,
+    revision: u64,
+    roots: Vec<String>,
+    exclusions: Vec<String>,
+    enabled: bool,
+    #[serde(default)]
+    run_when_closed: bool,
+    interval_hours: u32,
+    next_run_at: u64,
+    retention_days: u32,
+    max_run_bytes: u64,
+    max_targets: u32,
+    #[serde(default)]
+    scopes: Option<ParentScopes>,
+    #[serde(default)]
+    clone_budget: Option<serde_json::Value>,
+}
+
+impl ParentScopes {
+    fn read(&self) -> u64 {
+        u64::from(self.worktree_caches)
+            + u64::from(self.per_tree_vetoes)
+            + u64::from(self.prune_worktrees)
+            + u64::from(self.worktree_idle_days)
+    }
+}
+
+impl ParentConfig {
+    fn read(&self) -> u64 {
+        u64::from(self.version)
+            + self.revision
+            + self.roots.len() as u64
+            + self.exclusions.len() as u64
+            + u64::from(self.enabled)
+            + u64::from(self.run_when_closed)
+            + u64::from(self.interval_hours)
+            + self.next_run_at
+            + u64::from(self.retention_days)
+            + self.max_run_bytes
+            + u64::from(self.max_targets)
+            + self.scopes.as_ref().map_or(0, ParentScopes::read)
+            + u64::from(self.clone_budget.is_some())
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentSaved {
+    config: ParentConfig,
+    history: Vec<serde_json::Value>,
+    cancel_run: Option<String>,
+    #[serde(default)]
+    background_error: Option<String>,
+    #[serde(default)]
+    deferral_retries: u32,
+    #[serde(default)]
+    previewed_scopes: Option<ParentScopes>,
+}
+
+impl ParentSaved {
+    fn read(&self) -> u64 {
+        self.config.read()
+            + self.history.len() as u64
+            + u64::from(self.cancel_run.is_some())
+            + u64::from(self.background_error.is_some())
+            + u64::from(self.deferral_retries)
+            + self.previewed_scopes.as_ref().map_or(0, ParentScopes::read)
+    }
+}
+
+/// A state this build writes stays readable by the build before it, until a
+/// person turns the new scope on: no agent field, no preview stamp and no
+/// bring-forward stamp is written at its default or once it no longer limits
+/// anything. Turning the scope on does write them, and the older build then
+/// refuses the state, which the docs say.
+#[test]
+fn state_written_with_the_new_scope_off_is_readable_by_the_parents_reader() {
+    use crate::sysload::Binding;
+    let (_temp, cleaner, root) = fixture();
+    let read = |cleaner: &Cleaner| -> Result<ParentSaved, String> {
+        let bytes = fs::read(cleaner.dir.join("state.json")).map_err(|e| e.to_string())?;
+        let parsed: ParentSaved = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        parsed.read();
+        Ok(parsed)
+    };
+    let later = super::current_time() + 86_400;
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = true;
+            saved.config.roots = vec![root.to_string_lossy().into_owned()];
+            saved.config.next_run_at = later;
+            saved.config.scopes.worktree_caches = true;
+            saved.previewed_scopes = Some(saved.config.scopes);
+            Ok(())
+        })
+        .unwrap();
+    read(&cleaner).expect("old scopes on, new scope off");
+    // One bring-forward writes its stamp; it is not written once the gap passed.
+    let now = super::current_time();
+    cleaner
+        .bring_forward_for_disk(Some(Binding::LowDisk), now)
+        .unwrap();
+    assert!(
+        read(&cleaner).is_err(),
+        "a pending bring-forward is written"
+    );
+    cleaner
+        .bring_forward_for_disk(None, now + super::DISK_FORWARD_MIN_GAP_SECS)
+        .unwrap();
+    read(&cleaner).expect("the stamp is dropped once its gap has passed");
+    // The new scope on writes its fields.
+    cleaner
+        .update(|saved| {
+            saved.config.scopes.agent_scratch_builds = true;
+            saved.config.scopes.agent_scratch_days = 14;
+            Ok(())
+        })
+        .unwrap();
+    assert!(read(&cleaner).is_err());
+}
+
+/// The agent scratch approval is bound to what it was shown, and lapses.
+#[test]
+fn a_previewed_agent_scope_is_cleared_by_roots_or_exclusions_and_lapses_after_thirty_days() {
+    let (_temp, cleaner, root) = fixture();
+    // A sibling of the root: a nested one would be folded into it.
+    let other = root.parent().unwrap().join("other-root");
+    fs::create_dir(&other).unwrap();
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    let saved = cleaner.save(c).unwrap().config;
+    let now = super::current_time();
+    let approve = |cleaner: &Cleaner, at: u64| {
+        cleaner
+            .update(|saved| {
+                saved.previewed_scopes = Some(saved.config.scopes);
+                saved.previewed_at = at;
+                Ok(())
+            })
+            .unwrap();
+    };
+    approve(&cleaner, now);
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    // Changing the roots clears it, then the exclusions, with the scopes alone
+    // unchanged.
+    let mut c = cleaner.state().unwrap().config;
+    c.roots = vec![
+        root.to_string_lossy().into_owned(),
+        other.to_string_lossy().into_owned(),
+    ];
+    cleaner.save(c).unwrap();
+    assert!(!cleaner.state().unwrap().scopes_previewed, "roots");
+    approve(&cleaner, now);
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    let mut c = cleaner.state().unwrap().config;
+    c.exclusions = vec![other.to_string_lossy().into_owned()];
+    cleaner.save(c).unwrap();
+    assert!(!cleaner.state().unwrap().scopes_previewed, "exclusions");
+    // Saving the same roots and exclusions again keeps an approval.
+    approve(&cleaner, now);
+    let same = cleaner.state().unwrap().config;
+    cleaner.save(same).unwrap();
+    assert!(cleaner.state().unwrap().scopes_previewed, "unchanged");
+    let _ = saved;
+    // The lapse is the agent scope's alone, and a lapsed scope is not used.
+    let scopes = cleaner.state().unwrap().config.scopes;
+    let thirty = 30 * 86_400;
+    assert!(
+        scopes
+            .effective(Some(scopes), now, now + thirty)
+            .agent_scratch_builds
+    );
+    assert!(
+        !scopes
+            .effective(Some(scopes), now, now + thirty + 1)
+            .agent_scratch_builds
+    );
+    assert!(!scopes.effective(Some(scopes), 0, now).agent_scratch_builds);
+    let worktrees = super::ReclaimScopes {
+        worktree_caches: true,
+        agent_scratch_builds: true,
+        ..Default::default()
+    };
+    let lapsed = worktrees.effective(Some(worktrees), now, now + thirty + 1);
+    assert!(lapsed.worktree_caches && !lapsed.agent_scratch_builds);
+    approve(&cleaner, now - thirty - 5);
+    cleaner
+        .update(|saved| {
+            saved.config.scopes = worktrees;
+            saved.previewed_scopes = Some(worktrees);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        !cleaner.state().unwrap().scopes_previewed,
+        "a lapsed approval is not shown as previewed"
+    );
+}
+
+/// The agent arms of the state veto and of the veto cache key: a session
+/// scratchpad has no repository state to read, scratch output in a repository
+/// is kept only by an active lease and never by a dirty tree, and the cache
+/// key keeps two scratchpads apart while folding a repository's targets.
+#[test]
+fn the_agent_scopes_have_their_own_state_veto_and_veto_key() {
+    let (_temp, cleaner, root) = fixture();
+    let dirty = repo(&root, "dirty-repo");
+    fs::write(dirty.join("uncommitted.txt"), "work").unwrap();
+    let candidate = |scope: &str, repo_path: &Path, path: &str| CleanerCandidate {
+        repo_path: repo_path.to_string_lossy().into_owned(),
+        path: path.into(),
+        provider: String::new(),
+        bytes: 1,
+        scope: scope.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: vec![],
+    };
+    let scopes = super::ReclaimScopes::default();
+    let session = candidate(
+        "agent-session-scratch",
+        &root.join("nowhere"),
+        "/tmp/claude-1/p/s1/scratchpad/t",
+    );
+    assert!(cleaner.quiet_tree(&session, scopes).is_ok());
+    for scope in ["agent-repo-scratch", "agent-claude-target"] {
+        let scratch = candidate(scope, &dirty, &dirty.join("tmp/a/target").to_string_lossy());
+        assert!(
+            cleaner.quiet_tree(&scratch, scopes).is_ok(),
+            "{scope}: a dirty tree elsewhere is no reason to keep ignored scratch output"
+        );
+    }
+    let other = candidate(
+        "agent-session-scratch",
+        &root,
+        "/tmp/claude-1/p/s2/scratchpad/t",
+    );
+    assert_ne!(
+        super::veto_key(&session, scopes),
+        super::veto_key(&other, scopes)
+    );
+    let one = candidate("agent-repo-scratch", &dirty, "/x/a");
+    let two = candidate("agent-repo-scratch", &dirty, "/x/b");
+    assert_eq!(super::veto_key(&one, scopes), super::veto_key(&two, scopes));
+    let claude = candidate("agent-claude-target", &dirty, "/x/c");
+    assert_eq!(
+        super::veto_key(&claude, scopes),
+        super::veto_key(&one, scopes)
+    );
+}
+
+/// A Cargo target as Cargo writes one, every entry last modified 30 days ago.
+fn old_cargo_target(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join("debug")).unwrap();
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
+    fs::write(dir.join("debug/app.o"), vec![b'x'; 4096]).unwrap();
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    for path in [
+        dir.join("debug/app.o"),
+        dir.join("CACHEDIR.TAG"),
+        dir.join(".rustc_info.json"),
+        dir.join("debug"),
+        dir.to_path_buf(),
+    ] {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+}
+
+/// Preview, then run, through `inventory` and `perform_with_gate` with the
+/// injected gate: scope 1 (a finished session's scratchpad under a stand-in
+/// temp root), scope 2 (a linked worktree's `.gitpulse/scratch`, which
+/// discovery never reaches) and scope 3 (`.claude` targets in the checkout and
+/// in the worktree). Only the targets go; the scratchpad, `.claude/skills` and
+/// every other file stay. A lapsed approval skips the scope and says so.
+#[cfg(unix)]
+#[test]
+fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
+    use crate::sysload::procscan::DirUse;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let temp_root = crate::engine::process::canonicalize_plain(temp.path())
+        .unwrap()
+        .join("faketmp");
+    fs::create_dir_all(&temp_root).unwrap();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("agent-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: |_| Ok(DirUse::default()),
+        temp_root: temp_root.clone(),
+    });
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".gitpulse/\ntmp/\n").unwrap();
+    let scratch_in_worktree = wt.join(".gitpulse/scratch/target-a");
+    old_cargo_target(&scratch_in_worktree);
+    fs::write(wt.join(".gitpulse/scratch/notes.txt"), "keep").unwrap();
+    let claude_main = repo.join(".claude/x-target");
+    old_cargo_target(&claude_main);
+    fs::create_dir_all(repo.join(".claude/skills")).unwrap();
+    fs::write(repo.join(".claude/skills/a.md"), "skill").unwrap();
+    let claude_wt = wt.join(".claude/y-target");
+    old_cargo_target(&claude_wt);
+    let uid = super::super::agent::current_uid();
+    let pad = temp_root.join(format!(
+        "claude-{uid}/proj/session-0001-aaaaaaaa/scratchpad"
+    ));
+    let session_target = pad.join("target-s");
+    old_cargo_target(&session_target);
+    fs::write(pad.join("notes.txt"), "keep").unwrap();
+
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    let scopes: std::collections::BTreeSet<&str> = preview
+        .candidates
+        .iter()
+        .map(|c| c.scope.as_str())
+        .collect();
+    for scope in [
+        "agent-session-scratch",
+        "agent-repo-scratch",
+        "agent-claude-target",
+    ] {
+        assert!(scopes.contains(scope), "{scope}: {preview:?}");
+    }
+    let offered: Vec<&str> = preview.candidates.iter().map(|c| c.path.as_str()).collect();
+    for expected in [
+        &scratch_in_worktree,
+        &claude_main,
+        &claude_wt,
+        &session_target,
+    ] {
+        assert!(
+            offered.iter().any(|p| Path::new(p) == expected.as_path()),
+            "{} not offered: {offered:?} / kept {:?} / issues {:?}",
+            expected.display(),
+            preview.kept,
+            preview.issues
+        );
+    }
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "{:?}",
+        preview.issues
+    );
+
+    // A lapsed approval: nothing is removed and the run says why.
+    let day = 86_400;
+    cleaner
+        .update(|saved| {
+            saved.previewed_at = super::current_time() - 31 * day;
+            Ok(())
+        })
+        .unwrap();
+    let saved = cleaner.state().unwrap().config;
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut lapsed = journaled_run(&cleaner, "lapsed-run");
+    {
+        let _run_lock = cleaner.lock("run.lock").unwrap();
+        // With nothing eligible and part of the repository unread the run may
+        // end in the ordinary refusal; nothing is removed either way.
+        let _ = cleaner.perform_with_gate(&saved, &mut lapsed, |_, _, _| {
+            panic!("a lapsed scope offers nothing to gate")
+        });
+    }
+    assert!(
+        lapsed.issues.iter().any(|i| i.contains("30 days")),
+        "{:?}",
+        lapsed.issues
+    );
+    assert!(session_target.is_dir() && claude_main.is_dir());
+
+    // A fresh preview approves it again, and the run removes exactly them.
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "agent-run");
+    for gone in [
+        &scratch_in_worktree,
+        &claude_main,
+        &claude_wt,
+        &session_target,
+    ] {
+        assert!(!gone.exists(), "{} survived: {run:?}", gone.display());
+    }
+    assert!(
+        pad.join("notes.txt").is_file(),
+        "the scratchpad's files stay"
+    );
+    assert!(wt.join(".gitpulse/scratch/notes.txt").is_file());
+    assert!(repo.join(".claude/skills/a.md").is_file());
+    assert!(wt.join("Cargo.toml").is_file());
 }

@@ -73,6 +73,15 @@ describe("GlobalCleaner reclaim scopes and clone budget", () => {
     expect(source).toContain("inventory.kept");
     expect(source).toContain("inventory.leaked_temp");
   });
+  it("tells a folder that could not be checked from one left alone, and shows an absolute path once", () => {
+    expect(source).toContain('const COULD_NOT_CHECK = "could not be checked:"');
+    expect(source).toContain("unchecked-count");
+    expect(source).toContain("could not be checked");
+    expect(source).toContain('row.path.startsWith("/")');
+    expect(source).toContain("not limited to the roots above");
+    expect(source).toContain("folders that newly match since your inspection are included");
+    expect(source).toContain("approval lapses 30 days");
+  });
 
   it("warns that no run uses a scope until the saved set was previewed", () => {
     expect(source).toContain("anyScopeOn(scopesOf(cleaner.config)) && !cleaner.scopes_previewed");

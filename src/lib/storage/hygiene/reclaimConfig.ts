@@ -1,7 +1,8 @@
 import type { CleanerConfig, CloneBudget, ReclaimScopes } from "./globalTypes";
 
 /** The backend's defaults. The wire omits `scopes` and `clone_budget` while they sit at them. */
-export const DEFAULT_SCOPES: ReclaimScopes = Object.freeze({
+export type ResolvedScopes = Required<ReclaimScopes>;
+export const DEFAULT_SCOPES: ResolvedScopes = Object.freeze({
   worktree_caches: false,
   per_tree_vetoes: false,
   prune_worktrees: false,
@@ -12,7 +13,7 @@ export const DEFAULT_SCOPES: ReclaimScopes = Object.freeze({
 export const DEFAULT_CLONE_BUDGET: CloneBudget = Object.freeze({ max_target_clones: 0, max_private_bytes: 50 * 1024 ** 3 });
 
 /** A config's scopes, with a missing field read as the default rather than as undefined. */
-export function scopesOf(config: Pick<CleanerConfig, "scopes">): ReclaimScopes {
+export function scopesOf(config: Pick<CleanerConfig, "scopes">): ResolvedScopes {
   return { ...DEFAULT_SCOPES, ...(config.scopes ?? {}) };
 }
 export function cloneBudgetOf(config: Pick<CleanerConfig, "clone_budget">): CloneBudget {
@@ -20,7 +21,7 @@ export function cloneBudgetOf(config: Pick<CleanerConfig, "clone_budget">): Clon
 }
 /** Whether any scope that widens what the cleaner may delete is on. */
 export function anyScopeOn(scopes: ReclaimScopes): boolean {
-  return scopes.worktree_caches || scopes.per_tree_vetoes || scopes.prune_worktrees || scopes.agent_scratch_builds;
+  return scopes.worktree_caches || scopes.per_tree_vetoes || scopes.prune_worktrees || scopes.agent_scratch_builds === true;
 }
 /** Sum of `private_bytes` over the worktrees that were sized; unsized ones add nothing. */
 export function privateBytesTotal(worktrees: ReadonlyArray<{ private_bytes?: number }>): { total: number; sized: number } {

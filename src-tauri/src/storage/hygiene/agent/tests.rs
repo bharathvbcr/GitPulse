@@ -72,6 +72,7 @@ fn run<T>(
         use_of,
         cancel: &cancel,
         deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: CARGO_TARGET_BUDGET,
     })
 }
 
@@ -363,24 +364,38 @@ fn a_young_unreadable_or_oversized_target_is_kept() {
     assert!(sealed.is_dir());
 }
 
-/// Routed through the same name protection as every other scope: whatever the
-/// vendored list says about a `tmp` path part decides it here too, so a fix
-/// there reaches this scope without a change here.
+/// Names between the scope root and a target are judged by the vendored
+/// preserved-name list; names above it are not. A target under a preserved
+/// directory inside the scratchpad is kept, one under an ordinary directory is
+/// offered, and the list itself is asserted so a change to it fails here.
 #[test]
-fn the_preserved_name_list_decides_scratch_paths() {
+fn a_preserved_name_between_the_scope_root_and_the_target_keeps_it() {
+    assert!(devmap_query::hygiene::protected_artifact(
+        "tmp/cargo-target"
+    ));
+    assert!(devmap_query::hygiene::protected_artifact(
+        "node_modules/cargo-target"
+    ));
+    assert!(!devmap_query::hygiene::protected_artifact(
+        "work/cargo-target"
+    ));
     let (_temp, root) = temp_root();
     let pad = scratchpad(&root, OLD);
     cargo_target(&pad.join("tmp/cargo-target"), 30);
-    let protected = devmap_query::hygiene::protected_artifact("tmp/cargo-target");
+    cargo_target(&pad.join("work/cargo-target"), 30);
     let scan = run(&nobody(), &idle, |ctx| {
         scan_sessions(&root, UID, ctx, false)
     });
-    assert_eq!(scan.candidates.is_empty(), protected, "{:?}", scan.kept);
-    if protected {
-        assert!(kept_reason(&scan, "cargo-target")
+    let offered: Vec<&str> = scan.candidates.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(offered.len(), 1, "{offered:?} / {:?}", scan.kept);
+    assert!(offered[0].ends_with("work/cargo-target"));
+    assert!(
+        kept_reason(&scan, "tmp/cargo-target")
             .reason
-            .contains("preserved-name list"));
-    }
+            .contains("preserved-name list"),
+        "{:?}",
+        scan.kept
+    );
 }
 
 #[test]
@@ -425,7 +440,9 @@ fn leaked_temp_directories_are_reported_and_never_removed() {
     fs::create_dir_all(&small).unwrap();
     fs::write(small.join("note"), "x").unwrap();
     age(&big, 40);
-    let leaks = run(&nobody(), &idle, |ctx| leaked_temp(&root, ctx));
+    let mut issues = Vec::new();
+    let leaks = run(&nobody(), &idle, |ctx| leaked_temp(&root, ctx, &mut issues));
+    assert!(issues.is_empty(), "{issues:?}");
     assert_eq!(leaks.len(), 1, "{leaks:?}");
     assert!(leaks[0].path.ends_with(".tmpLEAK01"));
     assert!(leaks[0].age_days >= 39);
@@ -663,4 +680,412 @@ fn a_claude_target_with_tmp_is_removed_and_a_repository_inside_it_is_not() {
         .reason
         .contains("Protected content inside candidate"));
     assert!(main.join("tmp/repo/.git/config").is_file());
+}
+
+fn observed(
+    kind: &str,
+    ok: bool,
+    live: Vec<Option<&str>>,
+) -> crate::insights::live_sessions::KindObservation {
+    crate::insights::live_sessions::KindObservation {
+        kind: kind.into(),
+        ok,
+        error: if ok {
+            String::new()
+        } else {
+            "scan failed".into()
+        },
+        live: live
+            .into_iter()
+            .map(|id| crate::insights::LiveSession {
+                kind: kind.into(),
+                pid: 1,
+                entrypoint: String::new(),
+                status: String::new(),
+                cwd: String::new(),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                session_id: id.map(str::to_string),
+                proc_start: None,
+                registry_cwd: None,
+                start_us: None,
+                is_caller: false,
+                ide_hosted: false,
+                terminal_session_id: None,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Only a Claude session can hold a Claude scratchpad, so only the Claude
+/// detector decides. A Codex or Manvi session with no id, or a detector that
+/// could not look, keeps nothing; an unidentified Claude session, a Claude
+/// detector that failed, and no Claude entry at all each keep everything.
+#[test]
+fn only_the_claude_detector_decides_whether_a_scratchpad_is_finished() {
+    let others_blind = vec![
+        observed("claude", true, vec![Some("session-0002-bbbbbbbb")]),
+        observed("codex", false, vec![]),
+        observed("manvi", true, vec![None, None]),
+        observed("antigravity", true, vec![None]),
+    ];
+    let live = LiveSessions::from_observation(&others_blind);
+    assert_eq!(live.unidentified, 0, "{live:?}");
+    assert!(live.incomplete.is_none(), "{live:?}");
+    assert!(live.ids.contains("session-0002-bbbbbbbb"));
+    let (_temp, root) = temp_root();
+    cargo_target(&scratchpad(&root, OLD).join("target-x"), 30);
+    let scan = run(&live, &idle, |ctx| scan_sessions(&root, UID, ctx, false));
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+
+    let unidentified = LiveSessions::from_observation(&vec![observed("claude", true, vec![None])]);
+    assert_eq!(unidentified.unidentified, 1);
+    let scan = run(&unidentified, &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert!(kept_reason(&scan, OLD).reason.contains("Claude session(s)"));
+
+    let blind = LiveSessions::from_observation(&vec![observed("claude", false, vec![])]);
+    assert!(blind.incomplete.is_some());
+    let missing = LiveSessions::from_observation(&vec![observed("codex", true, vec![])]);
+    assert!(
+        missing.incomplete.is_some(),
+        "no Claude entry is a detector that did not run"
+    );
+}
+
+/// A check git could not answer is not "git does not ignore it". The same
+/// repository, untrusted, is kept as one that could not be checked, counts as
+/// unexamined and leaves the scan incomplete.
+#[test]
+fn a_git_question_that_could_not_run_is_unexamined_not_an_answer() {
+    let (_temp, root) = temp_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    // Not trusted: git refuses to run in it.
+    fs::write(
+        repo.join(".git/info/exclude"),
+        ".gitpulse/scratch/target-a/\n",
+    )
+    .unwrap();
+    cargo_target(&repo.join(".gitpulse/scratch/target-a"), 30);
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert!(scan.candidates.is_empty());
+    let kept = kept_reason(&scan, "target-a");
+    assert!(kept.reason.starts_with(COULD_NOT_CHECK), "{}", kept.reason);
+    assert!(!kept.reason.contains("does not ignore"), "{}", kept.reason);
+    assert_eq!(scan.unexamined, 1);
+    assert!(!scan.complete);
+    let mut inventory = empty_inventory();
+    scan.absorb_into(&mut inventory);
+    assert_eq!(inventory.shed_repos, 1, "the run counts it as unexamined");
+    assert!(!inventory.scopes_complete);
+    assert!(inventory
+        .issues
+        .iter()
+        .any(|i| i.contains("could not be checked")));
+    // The same folder with git answering "not ignored" is an answer.
+    crate::test_support::trust_repo(&repo);
+    fs::write(repo.join(".git/info/exclude"), "").unwrap();
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert!(kept_reason(&scan, "target-a")
+        .reason
+        .contains("does not ignore"));
+    assert_eq!(scan.unexamined, 0);
+    assert!(scan.complete);
+}
+
+/// The cleaner's own git checks (`check-ignore`, `ls-files`, `worktree list`)
+/// run on the calling thread, so the thread-local disk relief reaches them:
+/// under a full disk they are shed without it and answered with it. This is
+/// the proof of which checks the relief covers; `scan_storage`'s own reads are
+/// not asked here and keep whatever class they run in.
+#[test]
+fn the_cleaners_git_checks_are_answered_under_a_full_disk_only_with_relief() {
+    use crate::sysload::{GovernorInput, Level, Reading, Readings};
+    let (_temp, root) = temp_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
+    fs::write(repo.join(".git/info/exclude"), "tmp/\n").unwrap();
+    let _disk = crate::sysload::inject_governor(GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(1 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    });
+    assert_eq!(
+        crate::sysload::shed_cause(),
+        Some(crate::sysload::Binding::LowDisk)
+    );
+    let asks = || {
+        (
+            git_ignores(&repo, "tmp/a"),
+            git_tracks(&repo, "tmp/a"),
+            crate::engine::worktree::list_worktrees_lite(repo.to_str().unwrap()).is_ok(),
+        )
+    };
+    let (ignored, tracked, listed) = asks();
+    assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
+    assert!(matches!(tracked, GitAnswer::Unknown(_)), "{tracked:?}");
+    assert!(!listed, "shed without relief");
+    let (ignored, tracked, listed) = crate::engine::process::with_disk_relief(asks);
+    assert_eq!(ignored, GitAnswer::Yes);
+    assert_eq!(tracked, GitAnswer::No);
+    assert!(
+        listed,
+        "the worktree listing runs on the calling thread too"
+    );
+    // Under another cause relief admits nothing.
+    drop(_disk);
+    let _swap = crate::sysload::inject_governor(GovernorInput {
+        readings: Readings {
+            swap_used: Reading::Value(60 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Critical)
+    });
+    let (ignored, _, _) = crate::engine::process::with_disk_relief(asks);
+    assert!(matches!(ignored, GitAnswer::Unknown(_)), "{ignored:?}");
+}
+
+fn empty_inventory() -> super::super::global::CleanerInventory {
+    super::super::global::CleanerInventory {
+        repositories: 0,
+        visited_entries: 0,
+        partial: false,
+        issues: vec![],
+        candidates: vec![],
+        kept: vec![],
+        leaked_temp: vec![],
+        incomplete_repos: BTreeSet::new(),
+        shed_repos: 0,
+        scopes_complete: true,
+    }
+}
+
+/// `<repo>/tmp` is a scratch root like any other: a real marked target under
+/// `tmp/a/target` is offered (the root's own name is not consulted), a target
+/// whose path between the root and itself names a repository is refused.
+#[test]
+fn a_marked_target_under_a_repositorys_tmp_is_offered_and_one_under_a_git_dir_is_not() {
+    let (_temp, root) = temp_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
+    fs::write(repo.join(".git/info/exclude"), "/tmp/\n").unwrap();
+    cargo_target(&repo.join("tmp/a/target"), 30);
+    let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
+    assert!(scan.candidates[0].path.ends_with("tmp/a/target"));
+    let freed = run(&nobody(), &idle, |ctx| {
+        remove(&scan.candidates[0], ctx, u64::MAX)
+    })
+    .unwrap();
+    assert!(freed > 0);
+    assert!(!repo.join("tmp/a/target").exists());
+    // Forged: a target below a repository's own metadata.
+    let hidden = repo.join("tmp/x/.git/y/target");
+    cargo_target(&hidden, 30);
+    let forged = CleanerCandidate {
+        repo_path: repo.to_string_lossy().into_owned(),
+        path: hidden.to_string_lossy().into_owned(),
+        provider: String::new(),
+        bytes: 1,
+        scope: SCOPE_REPOSITORY.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: vec![],
+    };
+    let refused = run(&nobody(), &idle, |ctx| remove(&forged, ctx, u64::MAX))
+        .expect_err("names between the scratch root and the target are consulted");
+    assert!(refused.contains("preserved-name list"), "{refused}");
+    assert!(hidden.join("debug/app.o").is_file());
+}
+
+/// A scan whose own deadline has passed says so; it is never a clean answer.
+#[test]
+fn a_scan_past_its_deadline_is_incomplete_and_says_so() {
+    let (_temp, root) = temp_root();
+    cargo_target(&scratchpad(&root, OLD).join("target-x"), 30);
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = Context {
+        now: now(),
+        retention_days: 7,
+        live: &live,
+        use_of: &idle,
+        cancel: &cancel,
+        deadline: Instant::now(),
+        target_budget: CARGO_TARGET_BUDGET,
+    };
+    let scan = scan_sessions(&root, UID, &ctx, false);
+    assert!(scan.candidates.is_empty());
+    assert!(!scan.complete);
+    assert!(
+        scan.issues.iter().any(|i| i.contains("time limit")),
+        "{:?}",
+        scan.issues
+    );
+    let mut issues = Vec::new();
+    let big = root.join(".tmpLEAK01");
+    fs::create_dir_all(&big).unwrap();
+    leaked_temp(&root, &ctx, &mut issues);
+    assert!(
+        issues.iter().any(|i| i.contains("time limit")),
+        "{issues:?}"
+    );
+    // A temp directory that cannot be listed is an issue, not an empty answer.
+    let mut issues = Vec::new();
+    let found = leaked_temp(&root.join("missing"), &ctx, &mut issues);
+    assert!(found.is_empty());
+    assert!(issues.iter().any(|i| i.contains("could not be listed")));
+}
+
+/// A target past the walk budget is kept for being too large to verify, which
+/// is neither "protected" nor "unexamined".
+#[test]
+fn a_target_too_large_to_verify_says_so() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    cargo_target(&pad.join("target-x"), 30);
+    for n in 0..20 {
+        fs::write(pad.join(format!("target-x/debug/f{n}")), "x").unwrap();
+    }
+    age(&pad.join("target-x"), 30);
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let ctx = Context {
+        now: now(),
+        retention_days: 7,
+        live: &live,
+        use_of: &idle,
+        cancel: &cancel,
+        deadline: Instant::now() + Duration::from_secs(60),
+        target_budget: tree::Budget {
+            entries: 10,
+            seconds: 30,
+        },
+    };
+    let scan = scan_sessions(&root, UID, &ctx, false);
+    assert!(scan.candidates.is_empty());
+    let kept = kept_reason(&scan, "target-x");
+    assert!(
+        kept.reason
+            .contains("too large to verify within 10 entries / 30 s"),
+        "{}",
+        kept.reason
+    );
+    assert_eq!(scan.unexamined, 0);
+}
+
+/// More folders than a scan finds Cargo targets for are reported, not silently
+/// dropped.
+#[test]
+fn more_targets_than_the_cap_are_reported() {
+    let (_temp, root) = temp_root();
+    let pad = scratchpad(&root, OLD);
+    for n in 0..=MAX_TARGETS_PER_ROOT {
+        cargo_target(&pad.join(format!("target-{n:02}")), 30);
+    }
+    let scan = run(&nobody(), &idle, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    assert_eq!(scan.candidates.len(), MAX_TARGETS_PER_ROOT);
+    assert!(!scan.complete);
+    assert!(
+        scan.issues
+            .iter()
+            .any(|i| i.contains("more than") && i.contains("not examined")),
+        "{:?}",
+        scan.issues
+    );
+}
+
+/// Folding a scan into an inventory is bounded: past the candidate cap the
+/// inventory is partial and no preview; the kept list is capped and the
+/// overflow counted.
+#[test]
+fn absorbing_a_scan_respects_the_candidate_and_kept_caps() {
+    let candidate = |n: usize| CleanerCandidate {
+        repo_path: "/r".into(),
+        path: format!("/r/t{n}"),
+        provider: String::new(),
+        bytes: 1,
+        scope: SCOPE_REPOSITORY.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: vec![],
+    };
+    let mut inventory = empty_inventory();
+    let scan = Scan {
+        candidates: (0..600).map(candidate).collect(),
+        complete: true,
+        ..Scan::default()
+    };
+    scan.absorb_into(&mut inventory);
+    assert_eq!(inventory.candidates.len(), 512);
+    assert!(inventory.partial && !inventory.scopes_complete);
+
+    let mut inventory = empty_inventory();
+    let mut scan = Scan {
+        complete: true,
+        ..Scan::default()
+    };
+    for n in 0..(MAX_KEPT + 30) {
+        scan.keep(Path::new(&format!("/k{n}")), SCOPE_SESSION, "kept");
+    }
+    assert_eq!(scan.unlisted, 30);
+    scan.absorb_into(&mut inventory);
+    assert_eq!(inventory.kept.len(), MAX_KEPT);
+    assert!(inventory
+        .issues
+        .iter()
+        .any(|i| i.contains("30 more agent scratch folder(s)")));
+    assert!(inventory.scopes_complete);
+}
+
+/// What the real wiring sees: a child process whose working directory is the
+/// target, found through the real process table. Killed by its recorded pid.
+#[test]
+fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
+    use crate::procguard::LockedSpawn;
+    let (_temp, root) = temp_root();
+    let target = scratchpad(&root, OLD).join("target-x");
+    cargo_target(&target, 30);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "read line"])
+        .current_dir(&target)
+        .stdin(std::process::Stdio::piped())
+        .spawn_locked()
+        .unwrap();
+    let pid = i32::try_from(child.id()).unwrap();
+    let real_use = |dir: &Path| crate::sysload::procscan::dir_use(dir);
+    let held = crate::test_support::env::wait_until(Duration::from_secs(20), || {
+        crate::sysload::procscan::dir_use(&target)
+            .is_ok_and(|u| u.users.iter().any(|(p, _)| *p == pid))
+    });
+    let scan = run(&nobody(), &real_use, |ctx| {
+        scan_sessions(&root, UID, ctx, false)
+    });
+    let candidate = scan.candidates.first().cloned();
+    let refused = candidate.as_ref().map(|c| {
+        run(&nobody(), &real_use, |ctx| remove(c, ctx, u64::MAX))
+            .expect_err("a process holds it as its working directory")
+    });
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(held, "the child never showed in the process table");
+    assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+    assert!(refused.is_none());
+    let reason = &kept_reason(&scan, "target-x").reason;
+    assert!(reason.starts_with("in use:"), "{reason}");
+    assert!(reason.contains(&format!("process {pid}")), "{reason}");
+    assert!(target.is_dir());
 }

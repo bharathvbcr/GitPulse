@@ -1,5 +1,5 @@
 /** Opt-in reclaim scopes. Omitted from the wire while every field is at its default. */
-export interface ReclaimScopes { worktree_caches: boolean; per_tree_vetoes: boolean; prune_worktrees: boolean; worktree_idle_days: number; agent_scratch_builds: boolean; agent_scratch_days: number; }
+export interface ReclaimScopes { worktree_caches: boolean; per_tree_vetoes: boolean; prune_worktrees: boolean; worktree_idle_days: number; agent_scratch_builds?: boolean; agent_scratch_days?: number; }
 /** The build-cache clone budget; 0 is no limit for both fields. Omitted from the wire at its default. */
 export interface CloneBudget { max_target_clones: number; max_private_bytes: number; }
 export interface CleanerConfig {

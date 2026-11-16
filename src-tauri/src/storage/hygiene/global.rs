@@ -98,16 +98,26 @@ pub struct ReclaimScopes {
     pub worktree_idle_days: u32,
     /// Remove Cargo build folders agents leave outside any repository scan:
     /// in the scratchpad of a session that is provably finished (no running
-    /// agent session has its id, no live process uses the folder), and in
-    /// scratch build directories inside a repository (`.gitpulse/scratch`,
-    /// `tmp`) that git ignores. Each needs Cargo's own producer evidence and
-    /// nothing modified for `agent_scratch_days`; the scratchpad itself and
-    /// every other file in it stay. Temp directories nobody can account for
-    /// are listed, never removed.
-    #[serde(default)]
+    /// Claude session has its id, no live process uses the folder), in
+    /// scratch build directories of a checkout and its linked worktrees
+    /// (`.gitpulse/scratch`, `tmp`) that git ignores, and Cargo targets
+    /// directly under a checkout's `.claude/`. Each needs Cargo's own producer
+    /// evidence and nothing modified for `agent_scratch_days`; the scratchpad
+    /// itself and every other file in it stay. Temp directories nobody can
+    /// account for are listed, never removed. Its approval is the preview of
+    /// the current set, roots and exclusions, and lapses 30 days after it.
+    /// Turning it on writes fields a build from before it refuses to read.
+    ///
+    /// Both agent fields are left out of the saved state at their defaults, so
+    /// a build from before this scope existed (whose reader refuses unknown
+    /// fields) still reads the file until a person turns the scope on.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub agent_scratch_builds: bool,
     /// Retention for `agent_scratch_builds`. 7 to 3650, like the other scopes.
-    #[serde(default = "default_agent_scratch_days")]
+    #[serde(
+        default = "default_agent_scratch_days",
+        skip_serializing_if = "is_default_agent_days"
+    )]
     pub agent_scratch_days: u32,
 }
 fn default_worktree_idle_days() -> u32 {
@@ -116,6 +126,15 @@ fn default_worktree_idle_days() -> u32 {
 fn default_agent_scratch_days() -> u32 {
     7
 }
+fn is_default_agent_days(days: &u32) -> bool {
+    *days == default_agent_scratch_days()
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+/// How long a preview keeps the agent scratch scope approved. The scope reaches
+/// outside the repository roots, so its approval is not open-ended.
+const AGENT_PREVIEW_VALID_SECS: u64 = 30 * 86400;
 impl Default for ReclaimScopes {
     fn default() -> Self {
         Self {
@@ -138,11 +157,27 @@ impl ReclaimScopes {
             || self.prune_worktrees
             || self.agent_scratch_builds
     }
+    /// Whether a preview taken at `previewed_at` no longer covers the agent
+    /// scratch scope at `now`. A scope that is off has nothing to lapse.
+    fn agent_lapsed(self, previewed_at: u64, now: u64) -> bool {
+        self.agent_scratch_builds
+            && (previewed_at == 0 || now.saturating_sub(previewed_at) > AGENT_PREVIEW_VALID_SECS)
+    }
     /// What a run may use: the saved scopes when a person previewed exactly
-    /// this set, otherwise none of them.
-    fn effective(self, previewed: Option<ReclaimScopes>) -> ReclaimScopes {
+    /// this set, otherwise none of them. The agent scratch scope also needs a
+    /// preview from the last [`AGENT_PREVIEW_VALID_SECS`].
+    fn effective(
+        self,
+        previewed: Option<ReclaimScopes>,
+        previewed_at: u64,
+        now: u64,
+    ) -> ReclaimScopes {
         if previewed == Some(self) {
-            self
+            ReclaimScopes {
+                agent_scratch_builds: self.agent_scratch_builds
+                    && !self.agent_lapsed(previewed_at, now),
+                ..self
+            }
         } else {
             ReclaimScopes {
                 worktree_idle_days: self.worktree_idle_days,
@@ -397,6 +432,11 @@ struct Saved {
     /// change to the scopes clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previewed_scopes: Option<ReclaimScopes>,
+    /// When that preview finished. Read only for the agent scratch scope's
+    /// 30-day lapse, so it is written only while that scope is on: a state
+    /// without it stays readable by builds from before the scope existed.
+    #[serde(default, skip_serializing_if = "is_zero_secs")]
+    previewed_at: u64,
     /// When the schedule was last brought forward because the disk was the
     /// reason the host was shedding work; bounds how often that can happen.
     /// Omitted while zero so an older build can still read the file.
@@ -443,6 +483,22 @@ pub struct Cleaner {
     quiet_override: Option<QuietCheck>,
     #[cfg(test)]
     state_after_read: Option<Box<dyn Fn() + Send + Sync>>,
+    /// What a test says about the machine for the agent scratch scopes, so an
+    /// end-to-end run reads neither the real process table, nor the real agent
+    /// registries, nor the real `/tmp`.
+    #[cfg(test)]
+    agent_machine: Option<AgentMachine>,
+}
+
+/// The parts of the machine the agent scratch scopes read, as a test supplies
+/// them in place of the real ones.
+#[cfg(test)]
+pub(super) struct AgentMachine {
+    pub live: fn() -> super::agent::LiveSessions,
+    pub use_of: fn(&Path) -> Result<crate::sysload::procscan::DirUse, String>,
+    /// Stands for `/tmp` (the session scratchpads) and the user's temp
+    /// directory (leaked folders).
+    pub temp_root: PathBuf,
 }
 // Explicit unlock matters after fork/dup: closing only the owner's descriptor
 // can leave a shared file description locked until a child reaches exec.
@@ -487,7 +543,41 @@ impl Cleaner {
             quiet_override: None,
             #[cfg(test)]
             state_after_read: None,
+            #[cfg(test)]
+            agent_machine: None,
         }
+    }
+    /// The live Claude sessions, read now.
+    fn agent_live(&self) -> super::agent::LiveSessions {
+        #[cfg(test)]
+        if let Some(machine) = &self.agent_machine {
+            return (machine.live)();
+        }
+        super::agent::LiveSessions::observe()
+    }
+    /// Which processes use `dir`, read now.
+    fn agent_use(&self, dir: &Path) -> Result<crate::sysload::procscan::DirUse, String> {
+        #[cfg(test)]
+        if let Some(machine) = &self.agent_machine {
+            return (machine.use_of)(dir);
+        }
+        crate::sysload::procscan::dir_use(dir)
+    }
+    /// The directory holding `claude-<uid>/<project>/<session>/scratchpad`.
+    fn agent_session_root(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(machine) = &self.agent_machine {
+            return machine.temp_root.clone();
+        }
+        std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"))
+    }
+    /// The user's temp directory, where leaked folders are looked for.
+    fn agent_user_temp(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(machine) = &self.agent_machine {
+            return machine.temp_root.clone();
+        }
+        std::env::temp_dir()
     }
     /// The state veto for one candidate, judged at the scope that offered
     /// it: the whole repository by default, the producing project directory
@@ -617,6 +707,7 @@ impl Cleaner {
         now: u64,
     ) -> Result<Option<u64>, CommandError> {
         use crate::sysload::Binding;
+        self.expire_disk_forward(now)?;
         if !matches!(cause, Some(Binding::LowDisk | Binding::DiskFilling)) {
             return Ok(None);
         }
@@ -633,13 +724,27 @@ impl Cleaner {
             {
                 return Ok(None);
             }
+            // The revision is left alone: it is what a person's open Settings
+            // page is compared against on save, and the schedule moving is not
+            // an edit of the policy. A save carrying the old revision then
+            // writes its own schedule, which is the person's say.
             saved.disk_forward_at = now;
             config.next_run_at = now;
-            config.revision = config
-                .revision
-                .checked_add(1)
-                .ok_or("Policy revision exhausted")?;
             Ok(Some(now))
+        })
+    }
+    /// Drops the bring-forward stamp once its gap has passed, so the state file
+    /// carries it only while it still limits something.
+    fn expire_disk_forward(&self, now: u64) -> Result<(), CommandError> {
+        let stale = |at: u64| at != 0 && now >= at.saturating_add(DISK_FORWARD_MIN_GAP_SECS);
+        if !stale(self.read()?.disk_forward_at) {
+            return Ok(());
+        }
+        self.update(|saved| {
+            if stale(saved.disk_forward_at) {
+                saved.disk_forward_at = 0;
+            }
+            Ok(())
         })
     }
     fn activity(&self, path: &Path) -> Result<(), CommandError> {
@@ -691,7 +796,7 @@ impl Cleaner {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
             Err(e) => return Err(e.to_string().into()),
             Ok(m) if !m.is_file() || m.len() > MAX_STATE_BYTES => {
-                return Err("Cleaner state is not a bounded regular file".into())
+                return Err("Cleaner state is not a bounded regular file".into());
             }
             Ok(_) => {}
         }
@@ -765,8 +870,12 @@ impl Cleaner {
                 }
             }
         }
-        let scopes_previewed =
-            saved.config.scopes.any() && saved.previewed_scopes == Some(saved.config.scopes);
+        let scopes_previewed = saved.config.scopes.any()
+            && saved.previewed_scopes == Some(saved.config.scopes)
+            && !saved
+                .config
+                .scopes
+                .agent_lapsed(saved.previewed_at, super::now());
         Ok(CleanerState {
             config: saved.config,
             history: saved.history,
@@ -815,9 +924,14 @@ impl Cleaner {
                 .revision
                 .checked_add(1)
                 .ok_or("Policy revision exhausted")?;
-            if config.scopes != saved.config.scopes {
-                // A changed scope set has not been seen by anyone yet.
+            if config.scopes != saved.config.scopes
+                || config.roots != saved.config.roots
+                || config.exclusions != saved.config.exclusions
+            {
+                // A changed scope set, or a changed set of places it applies
+                // to, has not been seen by anyone yet.
                 saved.previewed_scopes = None;
+                saved.previewed_at = 0;
             }
             let previous = saved.config.enabled && saved.config.run_when_closed;
             let next = config.enabled && config.run_when_closed;
@@ -913,8 +1027,17 @@ impl Cleaner {
         let mut inventory = self.inspect(&config, config.scopes, true)?;
         if let Some(previewed) = previewed_by(&inventory, config.scopes) {
             self.update(|saved| {
-                if saved.config.scopes == previewed {
+                if saved.config.scopes == previewed
+                    && saved.config.roots == config.roots
+                    && saved.config.exclusions == config.exclusions
+                {
                     saved.previewed_scopes = Some(previewed);
+                    // Kept only for the one scope whose approval lapses.
+                    saved.previewed_at = if previewed.agent_scratch_builds {
+                        super::now()
+                    } else {
+                        0
+                    };
                 }
                 Ok(())
             })?;
@@ -926,7 +1049,19 @@ impl Cleaner {
         }
         Ok(inventory)
     }
+    /// Reads the roots and builds the inventory. The checks it runs are
+    /// read-only and bounded, so they are admitted while the host sheds work for
+    /// the disk alone (the cleaner exists to relieve that pressure), and shed
+    /// under every other cause as any spawn is.
     fn inspect(
+        &self,
+        config: &CleanerConfig,
+        scopes: ReclaimScopes,
+        measure: bool,
+    ) -> Result<CleanerInventory, CommandError> {
+        crate::engine::process::with_disk_relief(|| self.inspect_roots(config, scopes, measure))
+    }
+    fn inspect_roots(
         &self,
         config: &CleanerConfig,
         scopes: ReclaimScopes,
@@ -953,17 +1088,13 @@ impl Cleaner {
         // The agent scratch scope reads the process table and the agent
         // detectors once for the whole inspection; a check that cannot run
         // keeps what it guards, so a failure here only costs candidates.
-        let agent_live = scopes
-            .agent_scratch_builds
-            .then(super::agent::LiveSessions::observe);
-        let agent_use = |dir: &Path| crate::sysload::procscan::dir_use(dir);
-        let agent_ctx = agent_live.as_ref().map(|live| super::agent::Context {
-            now: current_time(),
+        let mut agent = scopes.agent_scratch_builds.then(|| AgentPass {
+            cleaner: self,
+            live: self.agent_live(),
             retention_days: scopes.agent_scratch_days,
-            live,
-            use_of: &agent_use,
-            cancel: &self.cancel,
-            deadline: Instant::now() + Duration::from_secs(90),
+            spent: Duration::ZERO,
+            noted_cut: false,
+            seen: BTreeSet::new(),
         });
         for repo in found.repos {
             if start.elapsed() > Duration::from_secs(120)
@@ -1111,22 +1242,25 @@ impl Cleaner {
                     &mut result,
                 );
             }
-            if let Some(ctx) = &agent_ctx {
-                super::agent::scan_repository(&repo, ctx, measure).absorb_into(&mut result);
-                // The checkout's own `.claude/` and every linked worktree's
-                // under the roots: sessions build there, and a new session
-                // worktree is seeded with a copy of it.
+            if let Some(agent) = agent.as_mut() {
+                // Every checkout of this repository: its own and each linked
+                // worktree under the roots. Sessions build in all of them (a
+                // worktree's `.gitpulse/scratch` and `tmp` as much as its
+                // `.claude/`), and discovery skips `.claude`, where the session
+                // worktrees live.
                 let mut checkouts = vec![repo.clone()];
                 match crate::engine::worktree::list_worktrees_lite(repo_path) {
                     Err(e) => {
                         // Worktrees not listed are worktrees not examined: this
-                        // inspection is no preview of the scope.
+                        // inspection is no preview of the scope, and the run
+                        // counts it as unexamined so it tries again sooner.
                         result.partial = true;
                         result.scopes_complete = false;
+                        result.shed_repos = result.shed_repos.saturating_add(1);
                         push_issue(
                             &mut result.issues,
                             format!(
-                                "{repo_path}: linked worktrees could not be listed, so their .claude build folders were not examined: {}",
+                                "{repo_path}: linked worktrees could not be listed, so their agent scratch builds were not examined: {}",
                                 e.message()
                             ),
                         );
@@ -1148,15 +1282,41 @@ impl Cleaner {
                         }
                     }
                 }
-                super::agent::scan_claude_targets(&checkouts, ctx, measure)
-                    .absorb_into(&mut result);
+                checkouts.retain(|checkout| agent.seen.insert(checkout.clone()));
+                for checkout in &checkouts {
+                    agent.scan(&mut result, &excludes, |ctx| {
+                        super::agent::scan_repository(checkout, ctx, measure)
+                    });
+                }
+                agent.scan(&mut result, &excludes, |ctx| {
+                    super::agent::scan_claude_targets(&checkouts, ctx, measure)
+                });
             }
         }
-        if let Some(ctx) = &agent_ctx {
-            let tmp = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
-            super::agent::scan_sessions(&tmp, super::agent::current_uid(), ctx, measure)
-                .absorb_into(&mut result);
-            result.leaked_temp = super::agent::leaked_temp(&std::env::temp_dir(), ctx);
+        if let Some(agent) = agent.as_mut() {
+            let session_root = self.agent_session_root();
+            agent.scan(&mut result, &excludes, |ctx| {
+                super::agent::scan_sessions(
+                    &session_root,
+                    super::agent::current_uid(),
+                    ctx,
+                    measure,
+                )
+            });
+            let user_temp = self.agent_user_temp();
+            let mut leak_issues = Vec::new();
+            if let Some(found) = agent
+                .with_context(|ctx| super::agent::leaked_temp(&user_temp, ctx, &mut leak_issues))
+            {
+                result.leaked_temp = found;
+            } else {
+                leak_issues.push(
+                    "Leaked temp directories were not looked for: the agent scratch scan had used its time".into(),
+                );
+            }
+            for issue in leak_issues {
+                push_issue(&mut result.issues, issue);
+            }
         }
         result.candidates.sort_by(|a, b| {
             b.bytes
@@ -1498,12 +1658,26 @@ impl Cleaner {
         // Only scopes a person previewed as they now stand are used, by a
         // scheduled run and a manual one alike: the in-app scheduler runs with
         // nobody watching too.
-        let scopes = config.scopes.effective(self.read()?.previewed_scopes);
+        let approval = self.read()?;
+        let scopes = config.scopes.effective(
+            approval.previewed_scopes,
+            approval.previewed_at,
+            super::now(),
+        );
         let inventory = self.inspect(config, scopes, false)?;
         run.repositories = inventory.repositories;
         run.partial = inventory.partial;
         run.issues = inventory.issues;
-        if config.scopes.any() && !scopes.any() {
+        let lapsed = config.scopes.agent_scratch_builds
+            && !scopes.agent_scratch_builds
+            && approval.previewed_scopes == Some(config.scopes);
+        if lapsed {
+            push_issue(
+                &mut run.issues,
+                "Agent scratch removal was skipped: its preview is more than 30 days old, so it no longer counts as approved. Nothing was examined or removed for it. Preview it again in GitPulse.".into(),
+            );
+        }
+        if config.scopes.any() && !scopes.any() && !lapsed {
             push_issue(
                 &mut run.issues,
                 "Reclaim scopes are enabled but have not been previewed since they last changed, so this run used none of them. Inspect saved roots in GitPulse to preview them.".into(),
@@ -1680,8 +1854,8 @@ impl Cleaner {
                         gate(&candidate.repo_path, None, &candidate.path)?;
                     }
                     self.still_authorized(config, &run.id)?;
-                    let live = super::agent::LiveSessions::observe();
-                    let in_use = |dir: &Path| crate::sysload::procscan::dir_use(dir);
+                    let live = self.agent_live();
+                    let in_use = |dir: &Path| self.agent_use(dir);
                     let ctx = super::agent::Context {
                         now: current_time(),
                         retention_days: scopes.agent_scratch_days,
@@ -1689,9 +1863,20 @@ impl Cleaner {
                         use_of: &in_use,
                         cancel: &self.cancel,
                         deadline: Instant::now() + Duration::from_secs(60),
+                        target_budget: super::agent::CARGO_TARGET_BUDGET,
                     };
-                    let freed = super::agent::remove(&candidate, &ctx, remaining)
-                        .map_err(CommandError::from)?;
+                    let freed = super::agent::remove_judged(&candidate, &ctx, remaining).map_err(
+                        |refusal| match refusal {
+                            // A check that could not run is recorded as
+                            // unexamined, like one the host shed: the folder
+                            // was never judged.
+                            super::agent::Refusal::Unexamined(why) => CommandError::typed(
+                                IpcErrorKind::DeferredUnderLoad,
+                                format!("{} {why}", super::agent::COULD_NOT_CHECK),
+                            ),
+                            super::agent::Refusal::Kept(why) => CommandError::from(why),
+                        },
+                    )?;
                     attempted = attempted.saturating_add(freed);
                     row.status = "completed".into();
                     row.message = format!(
@@ -1816,6 +2001,90 @@ impl Cleaner {
         }
         .into();
         Ok(())
+    }
+}
+
+/// What the agent scratch scan may spend, whatever the repository scan before
+/// it took: its own clock, started when it first runs and charged only for the
+/// time its own scans use.
+const AGENT_SCAN_BUDGET: Duration = Duration::from_secs(90);
+
+/// The agent scratch scopes' share of one inspection.
+struct AgentPass<'a> {
+    cleaner: &'a Cleaner,
+    live: super::agent::LiveSessions,
+    retention_days: u32,
+    spent: Duration,
+    noted_cut: bool,
+    /// Checkouts already scanned, so one that is both a discovered repository
+    /// and a linked worktree is offered once.
+    seen: BTreeSet<PathBuf>,
+}
+
+impl AgentPass<'_> {
+    /// Runs `f` with a context whose deadline is what is left of the agent
+    /// budget; `None` when none is left.
+    fn with_context<T>(&mut self, f: impl FnOnce(&super::agent::Context<'_>) -> T) -> Option<T> {
+        if self.spent >= AGENT_SCAN_BUDGET {
+            return None;
+        }
+        let started = Instant::now();
+        let cleaner = self.cleaner;
+        let use_of = |dir: &Path| cleaner.agent_use(dir);
+        let ctx = super::agent::Context {
+            now: current_time(),
+            retention_days: self.retention_days,
+            live: &self.live,
+            use_of: &use_of,
+            cancel: &cleaner.cancel,
+            deadline: started + (AGENT_SCAN_BUDGET - self.spent),
+            target_budget: super::agent::CARGO_TARGET_BUDGET,
+        };
+        let out = f(&ctx);
+        self.spent += started.elapsed();
+        Some(out)
+    }
+
+    /// One scan folded into the inventory. A candidate inside an exclusion is
+    /// kept and said so, as the run would refuse it; a scan the budget left no
+    /// time for is reported, never read as clean.
+    fn scan(
+        &mut self,
+        result: &mut CleanerInventory,
+        excludes: &[PathBuf],
+        f: impl FnOnce(&super::agent::Context<'_>) -> super::agent::Scan,
+    ) {
+        match self.with_context(f) {
+            Some(mut scan) => {
+                let (excluded, offered): (Vec<_>, Vec<_>) = scan
+                    .candidates
+                    .drain(..)
+                    .partition(|c| excludes.iter().any(|p| Path::new(&c.path).starts_with(p)));
+                scan.candidates = offered;
+                for candidate in excluded {
+                    result.kept.push(super::agent::KeptItem {
+                        path: candidate.path,
+                        scope: candidate.scope,
+                        reason: "inside an excluded folder, which a run never touches".into(),
+                    });
+                }
+                scan.absorb_into(result);
+            }
+            None => {
+                if !self.noted_cut {
+                    self.noted_cut = true;
+                    push_issue(
+                        &mut result.issues,
+                        format!(
+                            "The agent scratch scan used its {} s and stopped; what it had not reached was not examined",
+                            AGENT_SCAN_BUDGET.as_secs()
+                        ),
+                    );
+                }
+                result.partial = true;
+                result.scopes_complete = false;
+            }
+        }
     }
 }
 
