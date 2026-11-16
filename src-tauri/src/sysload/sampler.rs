@@ -595,12 +595,14 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 .governor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let input = Input::from_report(
+            let mut input = Input::from_report(
                 &status.sensor,
                 status.snapshot.as_ref(),
                 govern_launches,
                 thresholds,
             );
+            // Measured in this process, so it is not in the snapshot.
+            input.readings.exec_latency = (options.exec_latency)();
             let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
                 governor.observe(Instant::now(), input)
             } else {
@@ -922,6 +924,38 @@ mod tests {
         assert_eq!(previous.len(), 1, "the old boot's ring was kept");
         assert_eq!(previous[0].tier, Some(super::governor::Tier::Severe));
         assert_eq!(previous[0].admit, Some(false));
+    }
+
+    /// The exec-latency reading the options supply reaches the governor the
+    /// sampler feeds: a slow one sheds background work (here, as on any host,
+    /// unless something else already binds first, which sheds it too).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_exec_latency_option_reaches_the_governor() {
+        use super::super::exec_probe::ExecLatency;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.exec_latency = Box::new(|| {
+            Reading::Value(ExecLatency {
+                median_ms: 1_360,
+                n: 9,
+                slow: true,
+            })
+        });
+        let sampler = start(options).unwrap();
+        crate::test_support::wait_until(Duration::from_secs(30), || {
+            sampler
+                .status()
+                .is_some_and(|s| s.governor.verdict.shed.background)
+        });
+        let status = sampler.status().expect("a status");
+        assert!(
+            status.governor.verdict.shed.background,
+            "{:?}",
+            status.governor.verdict
+        );
+        sampler.stop();
     }
 
     /// Real: while the trace write is blocked the sampler keeps publishing at

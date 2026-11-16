@@ -141,13 +141,25 @@ pub(crate) fn refusal_message_at(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low{by}"
         )),
-        Refusal::Pressure { reactive, cause } => deferred(format!(
-            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}",
-            if reactive { "reactive" } else { "background" },
-            cause
-                .unwrap_or(crate::sysload::Binding::MemoryPressure)
-                .cause_phrase()
-        )),
+        Refusal::Pressure { reactive, cause } => {
+            let cause = cause.unwrap_or(crate::sysload::Binding::MemoryPressure);
+            // Slow start-up is the one cause with a number worth quoting in
+            // the sentence: how slow. It follows the phrase, after the marker
+            // every reader matches on.
+            let measured = match cause {
+                crate::sysload::Binding::ExecLatency => crate::sysload::exec_latency()
+                    .map(|latency| {
+                        format!(" (median {})", crate::sysload::format_latency(latency.median_ms))
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            deferred(format!(
+                "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}{measured}",
+                if reactive { "reactive" } else { "background" },
+                cause.cause_phrase()
+            ))
+        }
     }
 }
 

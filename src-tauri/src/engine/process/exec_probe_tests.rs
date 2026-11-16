@@ -110,3 +110,49 @@ fn a_probe_past_its_deadline_is_a_deadline_hit() {
         ExecProbeRun::DeadlineHit
     );
 }
+
+/// Slow start-up, as the verdict says it: background work is refused with the
+/// deferral marker and the cause named, a read someone waits on is admitted.
+#[test]
+fn slow_start_up_defers_background_spawns_by_name_and_admits_reactive_ones() {
+    use super::{is_deferred_under_load, refusal_message};
+    use crate::sysload::{Binding, ExecLatency, Reading};
+    let mut input = GovernorInput::test_pressure(Level::Normal);
+    input.readings.exec_latency = Reading::Value(ExecLatency {
+        median_ms: 1_360,
+        n: 12,
+        slow: true,
+    });
+    let _slow = inject_governor(input);
+    let gate = SpawnGate::with_rate(16, 8, 1);
+    let background = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+    let refusal = background.expect("background work is shed");
+    assert_eq!(
+        refusal,
+        Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::ExecLatency)
+        }
+    );
+    let message = refusal_message("git status", refusal);
+    assert!(
+        message.message().contains(
+            "background work is shed while process start-up is slow (median 1.4 s)"
+        ),
+        "{}",
+        message.message()
+    );
+    assert!(
+        is_deferred_under_load(message.message()),
+        "{}",
+        message.message()
+    );
+    assert!(
+        with_admission(Admission::Reactive, || gate.acquire_until(far(), &|| false)).is_ok(),
+        "reactive reads are admitted"
+    );
+    assert!(
+        with_admission(Admission::Interactive, || gate.acquire_until(far(), &|| false)).is_ok(),
+        "a click is admitted"
+    );
+}

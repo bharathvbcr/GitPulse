@@ -842,6 +842,22 @@ impl Thresholds {
             "CPU load",
             readings.load_per_cpu().map(|v| high_tier(v, &self.load)),
         );
+        // Not a Settings input: start-up time has one documented default
+        // (`exec_probe::ENTER_MS` and `EXIT_MS`, latched where the reading is
+        // made) and sheds background work only, never reactive work or a
+        // launch, so a slow start-up cannot by itself refuse anything.
+        take(
+            Binding::ExecLatency,
+            InputMode::Shed,
+            "process start-up time",
+            value_or_gap(readings.exec_latency).map(|latency| {
+                if latency.slow {
+                    Tier::Elevated
+                } else {
+                    Tier::Clear
+                }
+            }),
+        );
         take(
             Binding::Battery,
             self.battery.mode,
@@ -960,6 +976,25 @@ impl Thresholds {
                     format!("the thermal state is {other:?} (was serious or worse)").to_lowercase()
                 }
             },
+            Binding::ExecLatency => {
+                let latency = readings.exec_latency.value()?;
+                let took = format_latency(latency.median_ms);
+                let now = if latency.slow {
+                    format!(
+                        "at or above {}",
+                        format_latency(super::exec_probe::ENTER_MS)
+                    )
+                } else {
+                    format!(
+                        "now back under {}, held until it stays clear",
+                        format_latency(super::exec_probe::EXIT_MS)
+                    )
+                };
+                format!(
+                    "starting a process takes a median {took} over the last {} probes, {now}",
+                    latency.n
+                )
+            }
             Binding::Battery => match readings.power.value()? {
                 Power::Battery => "the computer is running on battery".to_string(),
                 Power::Ac => {
@@ -967,6 +1002,16 @@ impl Thresholds {
                 }
             },
         })
+    }
+}
+
+/// A start-up time in words: whole milliseconds under a second, else seconds
+/// to one decimal.
+pub(crate) fn format_latency(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1_000.0)
     }
 }
 
