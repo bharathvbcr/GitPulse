@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 // Bare `Duration` is named by the macOS-only `AskerDeadline::new` and, through
-// `use super::*`, by this module's test files; everything else spells the path.
-#[cfg(any(target_os = "macos", test))]
+// `use super::*`, by macOS-only tests; everything else spells the path.
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 use std::time::Instant;
 
