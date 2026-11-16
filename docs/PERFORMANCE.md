@@ -3136,3 +3136,159 @@ Where: Apple Silicon macOS release build (`host_load` 15 fresh cold processes ea
 
 The cold-process `insights::sessions` call tracks `ft-7ba9b4b2`'s ~10 ms `observe_sessions` baseline (`min` 11.90 ms vs 9.73 ms on this host) and spawns 0 `git` processes (verified via git `trace2` in both `mcp_protocol` and `tests/mcp_sessions.rs`), compared to 10 `git` processes for `gitpulse_insights`. On `mcp_protocol -- --smoke`, load average was 74.1 across 18 CPUs, so absolute times reflect shared host load while `min`, relative ratios, `facets_ok`, and `git_processes=0` establish the comparison.
 
+---
+
+## 2026-11-15: commit secret scan recall against Kingfisher and Betterleaks
+
+How much of what Kingfisher finds does the commit gate's scan (`leak_scan`, the vendored `dc_redact::find_secret` table) find? This is the measurement that drives which shapes go upstream into DevCouncil `rust/dc-redact`.
+
+### Reproduce
+
+Kingfisher and Betterleaks must be installed (PATH, the GUI fallback directories, or `GITPULSE_KINGFISHER` / `GITPULSE_BETTERLEAKS`). Neither validates anything live.
+
+```bash
+GITPULSE_LEAK_RECALL_OUT=/tmp/leak-recall.md cargo test --manifest-path src-tauri/Cargo.toml --lib leak_scan::recall_tests::measure_recall -- --ignored --exact --nocapture
+```
+
+The run takes about 15 s after the build.
+
+- **How plants are made:** `src-tauri/src/leak_scan/plant_sampler.rs` samples candidates from each visible Kingfisher rule's own regex. It makes four at minimum length and two with the secret at a realistic length, seeded by the rule id. Each must match the rule as the `regex` crate reads it.
+- **What counts as a plant:** Kingfisher scans the candidates once, and a rule's plant is the first candidate it reports as that rule. **Kingfisher is therefore 100% by construction.**
+- **Rules that need a helper:** some rules are reported only when one of Kingfisher's hidden helper rules also matches the same file, for example `aikido-client-secret` beside `aikido-client-id`. Betterleaks behaves the same on those files.
+  - A rule Kingfisher confirms on no candidate alone is planted again, after one sample of each hidden helper rule with the same vendor stem. Kingfisher then scans those files a second time.
+  - Those plants are reported in their own table and never added to the comparable one.
+  - On them, Betterleaks and dc-redact are credited only for a hit on the secret's lines. Several helpers are secrets themselves, and a hit on a helper line is named in the report and not credited.
+  - Choosing helpers by stem is a heuristic. A confirmation beside them shows that the rule needs a helper on the same input.
+- **Scoring:** Betterleaks and dc-redact (through `Tally`, the gate's own entry point) are then scored on the same files.
+- **No committed tokens:** plants live in a temporary directory, and both oracles run with `--redact`. The report names rules only, and `assert_no_plant_in` refuses to print or write it if any 16-character run of a plant appears in it.
+- **Fails loudly, never scores zero:** a missing binary, an unexpected exit status, a missing or unparseable report, or an oracle that finds nothing in a non-empty corpus fails the run. Betterleaks exits 0 on a directory that does not exist, which is why the directory is checked first.
+- **Spread:** `GITPULSE_LEAK_RECALL_SALT=<n>` draws a different deterministic corpus, for measuring how much the numbers move.
+- **Stderr in failures:** a failure message carries the oracle's stderr with every run of 16 or more token characters redacted.
+
+**Old-table column.** Swap the older table in, run the command above, then restore:
+
+```bash
+git checkout b07f2d9b -- src-tauri/vendored/dc-redact
+```
+
+```bash
+git checkout HEAD -- src-tauri/vendored/dc-redact
+```
+
+`ENGINE` is a constant and reads `devcouncil@cbd51369` in both runs. To tell the runs apart, use the report header's table fingerprint, an FNV-1a of the vendored source: `1c12c06020db8cec` for the old table, `8d1f4ea6dc4a1dc0` for cbd51369.
+
+### Measured (kingfisher 2.16.0, betterleaks 1.10.1, salt 0)
+
+Kingfisher lists 454 visible rules (368 high, 86 medium), plus 47 helper rules it never reports on their own.
+
+| confidence | plants | Kingfisher | Betterleaks | dc-redact, old table (`b07f2d9b`) | dc-redact, DevCouncil `cbd51369` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| high | 316 | 316/316 | 306/316 | 42/316 | **49/316** |
+| medium | 76 | 76/76 | 58/76 | 9/76 | **10/76** |
+
+**Spread over five corpora (salts 0–4, same build):**
+
+| table | high | medium |
+| --- | --- | --- |
+| old | 42, 40, 42, 44, 41 | 9, 10, 10, 10, 10 |
+| `cbd51369` | 49, 47, 48, 50, 48 | 10, 11, 11, 11, 11 |
+
+The re-vendor gains 6 to 7 high plants and 1 medium plant on every one of the five corpora.
+
+**Rules measured beside their helper rules** (not part of the table above; all are high confidence):
+
+| salt | plants | Kingfisher | Betterleaks | dc-redact, either table |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 30 | 30/30 | 30/30 | 0/30 |
+| 1 | 31 | 31/31 | 30/31 | 0/31 |
+| 2 | 30 | 30/30 | 29/30 | 0/30 |
+| 3 | 30 | 30/30 | 29/30 | 0/30 |
+| 4 | 30 | 30/30 | 30/30 | 0/30 |
+
+- **What these rules are:** client secrets, API secrets and tokens whose id, URL or account name is a separate helper match. Examples: Alibaba, Azure storage account key, PayPal, MongoDB Atlas, PlanetScale, Snowflake, Supabase, Auth0, Salesforce.
+- **dc-redact finds none of them** on any salt, on either table.
+- **Where line attribution mattered:**
+  - On salts 3 and 4, dc-redact flagged a Polymarket helper line (the helper is itself a secret), not the `polymarket-api-key` plant.
+  - On salts 1 to 3, Betterleaks reported a Tableau helper line, not the token.
+  - Neither is credited.
+- **Every measured rule, salt 0:**
+
+  | confidence | plants | Betterleaks | dc-redact |
+  | --- | ---: | ---: | ---: |
+  | high | 346 | 336 | 49 |
+  | medium | 76 | 58 | 10 |
+
+**Against the lost 2026-11-14 corpus (41/308 high, 14/75 medium):**
+- **High reproduces:** 42/316 on the old table is 13.3%, the same as 41/308.
+- **Medium does not reproduce with this table's method.** It comes out at 9–10 out of 76–77 on every salt, not 14.
+- **One reconstruction comes close but not exactly** (the report's "reconstructed" section). It counts a plant when Kingfisher reports any rule on it, and bins it by that finding's confidence.
+  - On the old table this gives dc-redact **14/83** medium, which matches 14.
+  - But it gives 83 plants, not 75, and Betterleaks 65, not the earlier 62.
+  - The extra medium hits are high-confidence Betterleaks rules whose bytes Kingfisher hands to a medium Veles rule (npm, DigitalOcean, OpenRouter).
+  - So the earlier corpus probably counted sibling-claimed plants under medium. That is inferred, not established, since the generator is lost.
+  - On cbd51369 the reconstruction gives 15/83.
+
+**Rules without a confirmed plant: 32 (22 high, 10 medium), down from 62 before helper rules were planted.** None of them is measured. The ranked list in the report shows them per vendor in a "not measured" column, so a vendor is never read as covered because its rules went unplanted. Each rule's reason is in the report:
+
+| reason | rules |
+| --- | ---: |
+| Kingfisher reported nothing, and no hidden helper shares the vendor, so the cause is not established. Examples: `slack-webhook-url`, `twilio-api-key`, `gcp-application-default-credentials`, `kubernetes-secret-yaml`, `resend-api-key`. | 17 |
+| A sibling rule claims the bytes. For example, Kingfisher reports the Veles npm rule instead of Betterleaks' `npm-access-token`, and `generic-credential-uri` instead of `sidekiq-sensitive-url`. | 7 |
+| Not confirmed alone or beside the helpers planted: `aws-session-token`, `azure-ad-client-secret`, `browserstack-access-key`, `ovh-application-secret`. For Azure, the sampler could not produce `azure-client-id` or `azure-tenant-id`, so only `azure-storage-account-name` was planted. | 4 |
+| No sample matched the rule's own regex. | 3 |
+| Its only helper (`canva-client-id`) could not be sampled, so nothing was planted. | 1 |
+
+Unmeasured rules for common vendors include:
+- AWS: `aws-session-token`, CodeCommit and CodeCatalyst git credentials;
+- Azure AD client secret;
+- `gcp-application-default-credentials`;
+- Twilio;
+- `slack-webhook-url`.
+
+Each of the three helpers that could not be sampled has a `\b` beside a lazy gap, for example `client_id\b(?s:.{0,24}?)<uuid>` or `id(?:.|[\n\r]){0,16}?\b(OC-…)`. At minimum length the sampler draws that gap empty, so the boundary falls between two word characters and the sample never matches.
+- This is inferred from the patterns; the sampler does not report why a draw failed.
+- Teaching `plant_sampler.rs` to keep such a gap non-empty would let these rules be tried properly.
+
+### Where dc-redact misses (current table)
+
+- **Length artefacts:** 8 misses are found once the secret is at a realistic length, for example Slack bot and app tokens whose minimum-length plant is under dc-redact's floor. The report labels these and keeps them out of the ranking.
+- **Real misses:** 355 rules, grouped by vendor. That is 325 measured alone, plus the 30 measured beside their helpers.
+
+| tier | vendors missed | rules missed |
+| --- | ---: | ---: |
+| cloud | 22 | 36 |
+| CI, source and packages | 39 | 65 |
+| payments and finance | 31 | 44 |
+| AI providers | 32 | 38 |
+| databases and data | 21 | 31 |
+| messaging and email | 21 | 31 |
+| observability and on-call | 11 | 20 |
+| identity and secret managers | 8 | 9 |
+| generic and context | 3 | 4 |
+| other SaaS | 60 | 77 |
+
+Each tier is ranked by how common the credential is (the order of `VENDORS` in `recall_tests.rs`).
+
+**Formats missing for vendors dc-redact already names:**
+- AWS Bedrock API keys, long- and short-lived;
+- the Gemini API key format (`gcp-gemini-api`);
+- three GitLab formats: incoming-mail token, runner registration token, session cookie;
+- Stripe `stripe-access-token`;
+- four Slack formats: legacy token, legacy workspace token, session cookie, session token;
+- OpenRouter's Veles form, `sk-or-v<n>-` with a free body. dc-redact only has `v1` with a 64-hex body.
+
+**Vendors with no shape at all, first in each tier:**
+- **Cloud:** Azure (Teams webhook, storage account key), Alibaba (2), Cloudflare (4), Heroku (2), Vercel (6), Netlify, Fly.io, IBM Cloud, Exoscale.
+- **CI and packages:** Bitbucket (3), Docker (4), RubyGems, NuGet, crates.io, Packagist (3), Gitea, CircleCI (3), Travis, Buildkite (2), HashiCorp Terraform and Vault (3), Pulumi, Artifactory (2).
+- **Payments:** Square, Plaid (3), Coinbase, Flutterwave (3), Paddle, GoCardless, PayPal, Razorpay, Ramp.
+- **AI providers:** Cohere, Groq, Mistral, Perplexity, DeepSeek, Together, Cerebras, NVIDIA, Langfuse.
+- **Databases:** PlanetScale (3), MongoDB Atlas, Snowflake, ClickHouse, Supabase (2), Upstash, Neon, Databricks, Elastic, Confluent (2), and the four Kingfisher connection-string password rules.
+
+The vendors added to these lists by the helper planting: Alibaba, Azure storage, Exoscale, Artifactory, PayPal, Razorpay, Ramp, Langfuse, MongoDB Atlas, Snowflake, ClickHouse, Supabase, Upstash, and a third PlanetScale rule.
+
+**Betterleaks misses 10 high and 18 medium plants in the comparable table**, and none of the 30 beside their helpers at salt 0. Each is named in the report, as one of three cases:
+- a Veles or Kingfisher-native rule it has no counterpart for;
+- a rule it has, whose filters drop the plant;
+- a plant at minimum length only, which it finds at realistic length.
+
+**Report sections:** the funnel, the comparable table, the rules measured beside their helpers (with the helpers planted for each), every measured rule together, per-rule results for all three tools, the ranked vendor list (misses and not-measured rules), the reconstructed old method, every disagreement with its reason, and every rule without a plant with its reason.
