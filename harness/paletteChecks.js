@@ -55,11 +55,13 @@ const closed = () => waitFor(() => !input()).catch(() => undefined);
 const check = (name, pass) => results.push({ name, pass: Boolean(pass) });
 const type = async value => { input().value = value; input().dispatchEvent(new Event("input", { bubbles: true })); await settle(); };
 // The enter and exit are <=70 ms transitions, but they run on the page's frame clock, so on a runner
-// without a GPU they outlast any fixed sleep. A palette opened while the last one is still leaving keeps
-// its input but not the focus, and then every key goes to the opener. "Not transitioning" is the
-// condition, bounded by waitFor; looping animations (a caret, a spinner) are not transitions.
+// without a GPU they outlast any fixed sleep, and the card stays in the DOM for a frame after its exit
+// animation has finished. A palette opened while the last one is still leaving keeps its input but not
+// the focus, and then every key goes to the opener. Idle is: nothing in the palette is animating, and
+// either no input remains or the one that does holds the focus (a leaving card has already lost it).
+// Looping animations (a caret, a spinner) are not transitions. Bounded by waitFor.
 const transitioning = () => document.getAnimations().some(a => a.playState === "running" && a.effect?.target && root.contains(a.effect.target) && Number.isFinite(a.effect.getTiming().iterations));
-const idle = () => waitFor(() => !transitioning()).catch(() => undefined);
+const idle = () => waitFor(() => !transitioning() && (!input() || document.activeElement === input())).catch(() => undefined);
 const open = async () => { await new Promise(resolve => setTimeout(resolve, 90)); await idle(); opener.focus(); opener.click(); await settle(); };
 const key = async (value, opts = {}) => { (document.activeElement ?? window).dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true, cancelable: true, ...opts })); await settle(); };
 const option = text => [...root.querySelectorAll("[role=option]")].find(el => el.textContent.includes(text));
