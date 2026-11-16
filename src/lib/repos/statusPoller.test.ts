@@ -42,6 +42,7 @@ function harness(options: {
     deletePollRun: (id) => {
       pollRuns.delete(id);
     },
+    notePollApplied: () => {},
     acquireWatch,
     hydrate,
     isBackground: () => options.hidden ?? false,

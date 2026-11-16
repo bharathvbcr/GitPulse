@@ -229,7 +229,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let syncingFilter = false;
 
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
-  const { snapshotRuns, pollRuns } = sessionBook;
+  const { snapshotRuns, pollRuns, statusPollApplied, statsInflight } = sessionBook;
 
   let lastPersistedPayload: string | null = null;
   let lastSentRecentsJson: string | null = null;
@@ -425,7 +425,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return {
       ...session,
       generation: session.generation + 1,
-      statsPending: false,
+      // A drain still running for the old generation hands its work to the new
+      // one when it stops (`fetchBranchStats`), and that call decides when the
+      // numbers are complete. Clearing the flag here would show partial stats
+      // as finished until then.
+      statsPending: statsInflight.has(session.id) ? session.statsPending : false,
     };
   }
 
@@ -549,6 +553,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     deletePollRun: (id) => {
       pollRuns.delete(id);
+    },
+    notePollApplied: (id) => {
+      statusPollApplied.set(id, (statusPollApplied.get(id) ?? 0) + 1);
     },
     acquireWatch: watchCoordinator.acquireWatch,
     hydrate: (id, path, generation) => hydration.hydrate(id, path, generation),
