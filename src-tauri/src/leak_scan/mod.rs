@@ -487,6 +487,10 @@ pub fn parse_raw(raw: &[u8]) -> Option<Vec<RawEntry>> {
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(test)]
+mod plant_sampler;
+#[cfg(test)]
+mod recall_tests;
+#[cfg(test)]
 mod staged_tests;
 #[cfg(test)]
 mod tests;
