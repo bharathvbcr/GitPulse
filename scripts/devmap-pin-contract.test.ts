@@ -35,6 +35,11 @@ export function devmapPinProblems(ci: string): string[] {
 
   const installing = [...ci.matchAll(/\n {2}([a-z][a-z-]*):\n/g)].map((m) => m[1]).filter((id) => jobText(ci, id).includes("name: Install devmap"));
   if (installing.length === 0) problems.push("no job installs devmap");
+  // The worktree crate's cli_e2e tests drive the real CLI, so a job that runs them needs it too.
+  for (const id of [...ci.matchAll(/\n {2}([a-z][a-z-]*):\n/g)].map((m) => m[1])) {
+    const runsWorktreeCrate = /cargo test --manifest-path crates\/gitpulse-worktree\/Cargo\.toml/.test(jobText(ci, id));
+    if (runsWorktreeCrate && !installing.includes(id)) problems.push(`${id} runs the worktree crate's tests without installing devmap`);
+  }
   for (const id of installing) {
     const job = jobText(ci, id);
     const install = job.indexOf("name: Install devmap");
@@ -95,6 +100,9 @@ describe("devmap pin contract", () => {
       has(broken(/key: devmap-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.DEVMAP_REV \}\}/g, "key: devmap-${{ runner.os }}"), "does not include DEVMAP_REV");
       // Only the save's key: a restore on the pin and a save under another key is a cache that never hits.
       has(broken(/(actions\/cache\/save@[^\n]*\n\s+with:\n\s+path: [^\n]*\n\s+key: devmap-)\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.DEVMAP_REV \}\}/, "$1${{ runner.os }}"), "does not include DEVMAP_REV");
+    });
+    it("a job that runs the worktree crate's tests without devmap", () => {
+      has(broken(/(rust-test-macos-extras:[\s\S]*?)- name: Install devmap/, "$1- name: Fetch devmap"), "runs the worktree crate's tests without installing devmap");
     });
     it("a cache that is saved only when the whole job passes", () => {
       has(broken("uses: actions/cache/restore@", "uses: actions/cache@"), "saves only when the whole job succeeds");
