@@ -9422,6 +9422,188 @@ mod tests {
         );
     }
 
+    /// Every git child started in `repo`, whatever it asked: a default-base
+    /// lookup is five of them, and none of them may run for an unchanged
+    /// repository.
+    fn children_in(repo: &Path) -> usize {
+        crate::engine::process::spawn_log::spawns_in(repo).len()
+    }
+
+    /// Gives `repo` an `origin/HEAD` the way a clone leaves it.
+    fn point_origin_head_at_main(repo: &Path) {
+        git_in(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+
+    /// Asks for the default base once, lets the cache's write window pass, and
+    /// asks again over the same unchanged repository. Returns the two answers
+    /// and the children the second ask started. The window is waited out on a
+    /// manual clock, as the catch-up pass waits it out in production: the
+    /// first answer was computed inside it and is rightly not kept, so what
+    /// is measured is whether the answer is kept once the stamp has settled.
+    fn second_ask_over_unchanged_repo(ask: &Path) -> (DefaultBase, DefaultBase, usize) {
+        let clock = ref_cache::ManualClock::install();
+        let first = default_base(ask);
+        clock.advance(std::time::Duration::from_secs(4));
+        let settling = default_base(ask);
+        let before = children_in(ask);
+        let second = default_base(ask);
+        let spawned = children_in(ask) - before;
+        assert_eq!(
+            settling, second,
+            "an unchanged repository changed its answer"
+        );
+        (first, second, spawned)
+    }
+
+    #[test]
+    fn an_unchanged_repository_answers_the_default_base_without_a_child() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let plain = init_repo_with_remotes(&["origin"], "main");
+            let repo = plain.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(second.base.as_ref().map(|(n, _)| n.as_str()), Some("main"));
+            assert_eq!(spawned, 0, "plain repository with origin/HEAD");
+
+            let bare = init_repo_with_remotes(&[], "main");
+            let repo = bare.path().canonicalize().unwrap();
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(spawned, 0, "repository with no remote");
+
+            let no_head = init_repo_with_remotes(&["origin"], "main");
+            let repo = no_head.path().canonicalize().unwrap();
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(second.remote_head, None);
+            assert_eq!(spawned, 0, "origin without an origin/HEAD");
+        });
+    }
+
+    #[test]
+    fn a_linked_worktree_and_a_symlinked_spelling_answer_without_a_child() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let main = init_repo_with_remotes(&["origin"], "main");
+            let main_path = main.path().canonicalize().unwrap();
+            point_origin_head_at_main(&main_path);
+            let linked = tempfile::TempDir::new().unwrap();
+            let linked_path = linked.path().canonicalize().unwrap().join("wt");
+            git_in(
+                &main_path,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "lane",
+                    linked_path.to_str().unwrap(),
+                ],
+            );
+            crate::test_support::trust_repo(&linked_path);
+            let (_, _, spawned) = second_ask_over_unchanged_repo(&linked_path);
+            assert_eq!(spawned, 0, "linked worktree");
+
+            let spelling = tempfile::TempDir::new().unwrap();
+            let link = spelling.path().join("via-link");
+            std::os::unix::fs::symlink(&main_path, &link).unwrap();
+            crate::test_support::trust_repo(&link);
+            let (_, _, spawned) = second_ask_over_unchanged_repo(&link);
+            assert_eq!(spawned, 0, "symlinked spelling of the repository");
+        });
+    }
+
+    #[test]
+    fn a_change_to_what_the_default_base_reads_is_recomputed_exactly_once() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let clock = ref_cache::ManualClock::install();
+            let settle = |clock: &ref_cache::ManualClock| {
+                clock.advance(std::time::Duration::from_secs(4));
+                default_base(&repo)
+            };
+            let first = default_base(&repo);
+            assert_eq!(first.remote, "origin");
+            let _ = settle(&clock);
+            // The one child every computation starts whichever remote it
+            // settles on (the HEAD symref's name follows the remote).
+            let marker = |repo: &Path| {
+                crate::engine::process::spawn_log::spawns_in(repo)
+                    .iter()
+                    .filter(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
+                    .count()
+            };
+            let recomputes = |after: &dyn Fn()| {
+                let before = marker(&repo);
+                after();
+                let answer = settle(&clock);
+                let once = marker(&repo) - before;
+                let again_before = marker(&repo);
+                let steady = default_base(&repo);
+                assert_eq!(steady, answer);
+                assert_eq!(marker(&repo), again_before, "the new answer was not kept");
+                (answer, once)
+            };
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["branch", "release"]);
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/release", "HEAD"],
+                );
+                git_in(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/release",
+                    ],
+                );
+            });
+            assert_eq!(once, 1, "origin/HEAD moved");
+            assert_eq!(
+                answer.remote_head.as_deref(),
+                Some("refs/remotes/origin/release")
+            );
+            assert_eq!(answer.base.map(|(n, _)| n).as_deref(), Some("release"));
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "checkout.defaultRemote", "upstream"]);
+            });
+            assert_eq!(once, 1, "config edited");
+            assert_eq!(answer.remote, "upstream");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "--unset", "checkout.defaultRemote"]);
+                git_in(
+                    &repo,
+                    &["remote", "add", "second", "https://example.com/second.git"],
+                );
+            });
+            assert_eq!(once, 1, "remote added");
+            assert_eq!(answer.remote, "origin", "two remotes fall back to origin");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "branch.lane.remote", "second"]);
+                git_in(&repo, &["switch", "-c", "lane"]);
+            });
+            assert_eq!(once, 1, "branch switched");
+            assert_eq!(answer.remote, "second");
+        });
+    }
+
     /// The lookups read a failed spawn as "not set", so under load a refusal
     /// produced "origin" and no base. A memo must not keep that: the next ask
     /// after load falls has to see the repository, with nothing changed on
