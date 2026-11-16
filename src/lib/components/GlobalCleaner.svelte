@@ -212,7 +212,7 @@
             {#each inventory.long_lived as item (item.path)}<p class="py-1"><span class="text-textMuted">{item.label}</span> <span class="font-mono break-all">{item.path}</span><span class="block text-textMuted" data-testid="long-lived-size">{item.error ? item.error :item.bytes === undefined || item.bytes === null ? "size unknown" : `${item.at_least ? "at least " : ""}${humanBytes(item.bytes)}`}</span></p>{/each}
           </div>
         {/if}
-        <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
+        <p class="text-textMuted">These are current logical sizes. Each file is counted once, and only files wholly inside the folder count. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
         <button class="gp-btn" data-variant="danger" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
       </div>
     {/if}
