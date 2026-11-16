@@ -1659,6 +1659,31 @@ impl Ended {
         }
     }
 
+    /// A failure writing the answer to the op log. Its asker (a git write's
+    /// hook) waits [`OP_RECORD_DEADLINE`], lets the write run and leaves, by
+    /// design, so a snapshot that finishes after that is delivered to nobody. The
+    /// snapshot itself was taken, which is all the asker ever needed from the
+    /// owner, so that is not a refusal. Unlike [`Ended::after_ask`] this does
+    /// not insist the ask was read-only, because the answer is the only thing
+    /// the asker could have missed; unlike a delivery, nothing it acted on
+    /// depends on the asker hearing back.
+    ///
+    /// [`Unheard`] needs both signals: the write failed the way a departed peer
+    /// makes it fail, and the socket reads as hung up with nothing queued. An
+    /// error on a peer that is still connected stays a refusal.
+    ///
+    /// [`Unheard`]: Ended::Unheard
+    fn after_op_record(stream: &UnixStream, started: Instant, reason: String) -> Self {
+        let ms = started.elapsed().as_millis();
+        if write_says_peer_left(&reason) && crate::local_socket::peer_hung_up_silently(stream) {
+            Self::Unheard(format!(
+                "the asker of the op log left before its answer, {ms} ms after asking: {reason}"
+            ))
+        } else {
+            Self::Refused(format!("the op log, {ms} ms after asking: {reason}"))
+        }
+    }
+
     /// A failure with nothing of the peer's first frame read: a [`Probe`]
     /// only if the peer is provably gone and sent nothing. When that cannot be
     /// established it is a refusal, so an unexplained failure stays loud.
@@ -1671,6 +1696,19 @@ impl Ended {
             Self::Refused(reason)
         }
     }
+}
+
+/// Whether a failed write's `reason` (as [`write_frame`] words it) is one a
+/// peer that closed its end causes: a broken pipe, a reset, or a socket that is
+/// no longer connected. Read from the `os error` number rather than the text,
+/// which differs between macOS and Linux. A timeout is a peer that is still
+/// there and slow, and anything else is ours, so those are not this.
+fn write_says_peer_left(reason: &str) -> bool {
+    let code = reason
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once("(os error "))
+        .and_then(|(_, number)| number.parse::<i32>().ok());
+    matches!(code, Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN))
 }
 
 impl From<String> for Ended {
@@ -1772,7 +1810,7 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     }
     if let Request::RecordGitOp { id, .. } = &request {
         return answer_op_record(stream, shared, id, &request, before_hello)
-            .map_err(Ended::Refused);
+            .map_err(|reason| Ended::after_op_record(stream, started, reason));
     }
     if let Request::RecordTurnCheckpoint { id, .. } = &request {
         return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {

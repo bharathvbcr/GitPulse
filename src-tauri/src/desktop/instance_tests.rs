@@ -871,6 +871,67 @@ fn an_undelivered_answer_stays_loud_unless_the_ask_was_read_only_and_its_asker_l
 }
 
 #[test]
+fn an_op_record_asker_that_gave_up_is_not_a_refused_launch() {
+    // The installed log's "instance mailbox refused a launch: write: Broken
+    // pipe" lines carry no "ms after asking", so they are not an asked read:
+    // they are the op log. A git write's hook waits `OP_RECORD_DEADLINE`, lets
+    // the write run and leaves; the snapshot's ack then meets a closed socket.
+    // Nothing was refused and no launch was involved.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let control = server.try_clone().unwrap();
+    *shared.op_record.lock().unwrap() = Some(Arc::new(move |_, _| {
+        wait_for_hang_up(&control);
+        Ok(serde_json::json!({ "snapshotted": true }))
+    }));
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: op_request("op-gone"),
+    })
+    .unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        read_frame(&mut reader).unwrap().expect("greeting");
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(writer);
+        drop(reader);
+        served.join().unwrap()
+    });
+    let Err(ended) = outcome else {
+        panic!("an answer nobody was left to read was not delivered")
+    };
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Info, "{line}");
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    assert!(!line.contains("refused a launch"), "{line}");
+    assert!(line.contains("the op log"), "names what was asked: {line}");
+    assert!(line.contains(" ms"), "says how long it took: {line}");
+}
+
+#[test]
+fn a_write_error_says_its_peer_left_only_for_the_errors_a_departed_peer_causes() {
+    let os = |code: i32| {
+        format!(
+            "write: {} (os error {code})",
+            std::io::Error::from_raw_os_error(code)
+        )
+    };
+    for code in [libc::EPIPE, libc::ECONNRESET, libc::ENOTCONN] {
+        assert!(write_says_peer_left(&os(code)), "{}", os(code));
+    }
+    // A timeout is a peer that is still there and slow; a full disk or a
+    // permission error is ours. Both stay refusals.
+    for code in [libc::EAGAIN, libc::ETIMEDOUT, libc::EACCES, libc::ENOSPC] {
+        assert!(!write_says_peer_left(&os(code)), "{}", os(code));
+    }
+    assert!(!write_says_peer_left("the op log is not attached"));
+    assert!(!write_says_peer_left("write: Broken pipe"));
+}
+
+#[test]
 fn a_valid_frame_is_handled_and_logs_nothing() {
     let (mut server, client) = UnixStream::pair().unwrap();
     // SAFETY: `getuid` has no preconditions.
