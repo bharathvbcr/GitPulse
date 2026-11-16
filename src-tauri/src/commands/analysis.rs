@@ -72,9 +72,32 @@ pub async fn cmd_get_file_coverage(
     off_thread(move || CoverageScanner::file_coverage(&repo_path, &file_path)).await
 }
 
+type DepsFlights =
+    crate::singleflight::SingleFlight<String, Result<DepsHealthReport, CommandError>>;
+
+/// A scan can spawn every auditor and wait on the registry, so a second panel
+/// or a re-click while one runs must join it, not start another full audit of
+/// the same repository.
+fn deps_flights() -> &'static DepsFlights {
+    static FLIGHTS: std::sync::OnceLock<DepsFlights> = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(DepsFlights::default)
+}
+
+fn scan_deps_once<F>(
+    flights: &DepsFlights,
+    repo_path: &str,
+    scan: F,
+) -> Result<DepsHealthReport, CommandError>
+where
+    F: FnOnce() -> Result<DepsHealthReport, CommandError>,
+{
+    flights.run(repo_path.to_string(), scan)
+}
+
 #[tauri::command(async)]
 pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, IpcError> {
-    off_thread(move || DepsScanner::scan(&repo_path)).await
+    off_thread(move || scan_deps_once(deps_flights(), &repo_path, || DepsScanner::scan(&repo_path)))
+        .await
 }
 
 /// On-demand Kingfisher secrets scan of the working tree.
@@ -237,4 +260,62 @@ pub async fn cmd_hygiene_execute(
         Ok(Guarded { policy, output })
     })
     .await
+}
+
+#[cfg(test)]
+mod deps_flight_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn failing() -> Result<DepsHealthReport, CommandError> {
+        Err(CommandError::from("scan stub".to_string()))
+    }
+
+    /// The defect: every caller ran its own full audit of the repository.
+    #[test]
+    fn concurrent_scans_of_one_repository_share_one_audit() {
+        let flights = Arc::new(DepsFlights::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let leader = {
+            let (flights, runs) = (Arc::clone(&flights), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                scan_deps_once(&flights, "/repo", || {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    // Wait for the second caller to either join this scan or
+                    // (the defect) start a scan of its own, so a regression
+                    // fails the count below instead of hanging here.
+                    while flights.followers(&"/repo".to_string()) == 0
+                        && runs.load(Ordering::SeqCst) == 1
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    failing()
+                })
+            })
+        };
+        while runs.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let follower = scan_deps_once(&flights, "/repo", || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            failing()
+        });
+        assert!(follower.is_err());
+        assert!(leader.join().unwrap().is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn different_repositories_scan_independently() {
+        let flights = DepsFlights::default();
+        let runs = AtomicUsize::new(0);
+        for repo in ["/a", "/b"] {
+            let _ = scan_deps_once(&flights, repo, || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                failing()
+            });
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
 }
