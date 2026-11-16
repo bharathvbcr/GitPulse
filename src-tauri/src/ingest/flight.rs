@@ -55,6 +55,21 @@ impl Budget {
         }
     }
 
+    /// A budget that ends `percent` of the way from now to this one's limit,
+    /// on the same clock: a phase's own slice, so that what it leaves unused
+    /// belongs to the phases after it and what it overruns does not. Unbounded
+    /// stays unbounded.
+    pub fn share(&self, percent: u32) -> Self {
+        let now = (self.clock)();
+        Self {
+            limit: self.limit.and_then(|limit| {
+                let left = limit.saturating_duration_since(now);
+                now.checked_add(left / 100 * percent.min(100))
+            }),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
     pub fn expired(&self) -> bool {
         self.limit.is_some_and(|limit| (self.clock)() >= limit)
     }
