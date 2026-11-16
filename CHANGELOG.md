@@ -15,7 +15,44 @@ before that tag is pushed.
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
 ships as 1.99.0 because release and macOS bundle versions are plain numbers, so
-2.0.0 sorts after it.
+2.0.0 sorts after it. 1.99.0 (GitPulse 2.0) is the first release since 1.3.1:
+1.3.5 was withdrawn and 1.4.0 and 1.5.0 were never published, so their changes
+are merged here and upgrading from 1.3.1 also brings everything in the 1.4.0
+section of `CHANGELOG.md`. Read **Upgrade** below first: the task profile moves
+one way (dc-store store schema 11, workbench schema 17), the DevMap store moves
+one way to schema 29, the ledger bumps to writer generation 2, the Unix terminal
+host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
+`gitpulse-hook` need reinstalling.
+
+### Upgrade
+
+- **The task profile moves one way to workbench schema 17** (`dc-store` at
+  `b5215026`, store schema stays 11). Schema 15 added CI result attention rows,
+  schema 16 merged `inbox` tasks into `backlog` (rewriting archived and deleted
+  tasks too without spending a revision), and schema 17 adds cross-repo queue,
+  GitHub issue sync outbox, and DAG launch readiness tables. An older host refuses
+  an upgraded profile with `schema_unsupported`; the desktop app keeps a backup
+  (such as `<profile>.pre-schema-14.bak`). Rebuild and update GitPulse (app,
+  `gitpulse-mcp`, `gitpulse-hook` via `bun run mcp:install`), `dcstore`, and
+  Manvi together, then confirm with `bun run check:schema-parity`.
+- **The DevMap store moves one way to schema 29** (from 27; `7ae2fa6a`,
+  `2a919f00`, `d889efd1`). Stored extraction documents are zstd-compressed and
+  the reader floor is 29, so a `devmap` CLI or `gitpulse-mcp` from before this
+  release cannot read an index this build writes. Rebuild and reinstall the
+  `devmap` CLI with the app, then confirm with `bun run check:schema-parity`.
+- **The terminal host (`gitpulse-ptyd`, protocol 3) is unconditional on Unix**
+  (from protocol 2; `55d90664`, `b7b698ef`), and **Keep managed agent runs
+  running when GitPulse quits** (`keep_terminals_running`) defaults to on.
+  Sessions still held by a `gitpulse-ptyd` from an earlier build cannot be
+  adopted by this one; finish or close those terminals before updating.
+- **Ledger schema writer generation 2 (OD 1)** and **toolchain floors**: rebuild
+  `gitpulsed` alongside the app; source builds require Rust 1.100 and Go 1.27.4.
+- **Reinstall `gitpulse-hook` and `gitpulse-mcp`** (`bun run mcp:install`): the
+  hook gains `deliver`, `worktree-create`, `worktree-remove`, `peer-inbox`, and
+  `stop-or-notify`, and both must read workbench schema 17.
+- **`devmap_*` tools on `gitpulse-mcp` default to depth 3, not 10** (`8f276a4a`),
+  matching the standalone `devmap mcp` server. A caller that relied on the old
+  default passes `depth` explicitly.
 
 ### Added
 
@@ -93,246 +130,6 @@ ships as 1.99.0 because release and macOS bundle versions are plain numbers, so
   Only the active account is included, never the other accounts you have signed
   in with.
 
-### Fixed
-
-- **Read-only hook ledger binding lookup:** `read_active_task_binding` only refuses unimported sibling rows that would be kept as a `bind` or `unbind` under `SourceAuthority`, preventing unrelated sibling ledger traffic from failing read-only hook lookups (`95a17657`).
-- **Health automatic scans & secrets signal crash reporting:** Automatic dependency and secrets scans wait for the pane to settle, skip fresh results, and hold off after a failure (stating why, `5f2a1e0b`, `4c81201d`), and a secrets scanner killed by a signal is reported as a crash naming the signal (`b0382546`).
-- **Bare push upstream planning:** Planning a bare `git push` reads the branch's own upstream configuration (`branch.<name>.remote` and `branch.<name>.merge`) and never falls back to `push -u` when the config read fails (`246be08b`, `34c37455`).
-- **The Firebase panel no longer fails with "Unable to obtain permissions".**
-  This was not a Google Cloud permission. The Firebase CLI writes
-  `firebase-debug.log` into the folder it starts in, before it reads any
-  command, and GitPulse started it in `/`, where it cannot write. Each run now
-  keeps its debug log in its own temporary folder, removed afterwards, so the
-  log no longer lands in `/` or in your repository.
-- **A Firebase deploy that times out or loses the network is reported as an
-  unknown outcome.** It says to check the Firebase console before deploying
-  again, never "try again", because a second create deploys twice.
-- **Go to line works again.** Every Go threw "trim is not a function" and the
-  cursor never moved.
-- **The Code page keeps the editor's minimum width beside two floating cards,**
-  counting each card's margins.
-- **A commit clicked in HEAD moves or Suspects stays selected when the graph
-  reloads without it.** A filter typed above the reflog, the page size or a
-  watcher refresh dropped the clicked commit from the loaded graph and the
-  details pane jumped to the newest commit, under a highlight that had not
-  moved. Those lists now pin their selection; a click on the graph itself
-  still falls back as before when a filter drops it.
-
-- **A branch comparison in the Diff view no longer lists the working tree's
-  files.** The file rail guessed the selection's kind from which ids were set, so
-  a range diff (`main...feature`) read as a worktree file and offered your
-  uncommitted files beside it. It now uses the kind the store recorded.
-
-- **A task agent's new worktree starts with a DevMap index instead of a cold
-  rebuild.** Lanes under `.gitpulse/worktrees/` now get a copy-on-write clone of
-  the main checkout's DevMap store, bound to the lane, before the agent starts.
-  Then GitPulse's live refresh runs the lane's own incremental build in the
-  background whenever the clone is not fresh for the lane's tree. Until that
-  build lands, `devmap status` in the lane reports the index as stale. Before,
-  lanes started with no store, and DevMap's SessionStart hook cold-built a full
-  one in every lane. Measured on this repository: a lane is query-ready in about
-  1.2 s (debug build) instead of about 7.6 s and ~38 CPU-seconds, and costs
-  7–20 MB instead of about 366 MB. Its own build then takes about 2.5 s. With
-  eight lanes at once, a bare clone plus incremental build took about 9 s,
-  against about 42 s cold. The same seed-then-refresh now covers every
-  GitPulse path that creates a worktree:
-  - The Worktrees panel seeds by default (new `seedDevmap`). The zero-copy
-    pointer is now opt-in, because only GitPulse reads it: the `devmap`
-    agents run cold-builds beside it.
-  - MCP `gitpulse_worktree_create`, `switch` and `isolate`.
-  - The `gitpulse-worktree` CLI, whose plain `create` with shared caches
-    used to seed nothing.
-
-  A seed that is skipped (low disk, or no index in the
-  main checkout) or fails is logged, and the lane still starts; DevMap's own
-  hook then builds the index as before. Measurements and remaining work are in
-  `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.
-
-### Changed
-
-- **Unix terminal host (`gitpulse-ptyd`) is now unconditional, and hosted Manvi defaults to on:** On Unix (`#[cfg(unix)]`), PTY terminal sessions always live in `gitpulse-ptyd` so interactive shells and TUI agents survive app restarts or crashes (`docs/TERMINAL_HOST.md`, `b7b698ef`). **Settings → Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`) now defaults to on and governs the detached `manvi serve --listen` process for managed Codex and Claude runs.
-- **Tasks board automatic column fill, live on-screen refresh, two-row header, & verdict memo:** After every board read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards in 200-card chunks up to 2,000 cards while the column cursor matches; live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused, `bac79cf7`); the Tasks header splits into a title row and a toolbar row (`PageHeader.svelte`, `TaskBoard.svelte`, `5606e1d9`); and task verification verdicts are cached in `verdict_memo` with an exact SQLite change signal and shared byte budget (`2bdd2511`, `e7c4491a`, `86ca8530`).
-- **Antigravity (`agy`) hook compatibility:** Stopped registering `PreToolUse` hooks (`collision-guard` and `command-gate`) in `plugins/gitpulse/hooks.json` and `plugins/gitpulse-agy/hooks.json` because Antigravity IDE 2.32.1 denied tool calls whose pre-tool hook returned `{}` without `"decision":"allow"` (`b643b232`). Informational hook notices without a permission decision now render as `{"reason": ...}` rather than `{"decision": "ask"}` (`71212fa3`).
-- **Command gate, hook task-scope fence (`ft-d3bd46c0`), and collision path folding (`ft-9cfd5574`):** `command-gate` fences argument-writing commands and cross-checkout writes against declared task scope (`f7677983`), `SessionStart` (`session-brief`) queries the running GitPulse app before scanning worktrees directly (`f3cbc522`), and collision path matching folds file-vs-directory, case-insensitive filesystem, and submodule paths (`9a48dae8`).
-- **Settings dialog, repository tab menu, & terminal dock dismiss:** Enlarged the Settings dialog (`1024x736`, `208px` category rail) with grouped `gp-card` sections (`78ce2e53`), streamlined the repository tab context menu to per-tab actions with icons (`df636f29`), added double-click on page headers/backgrounds to minimize an expanded terminal dock (`panelDismiss.ts`), and defaulted **"Count a terminal bell as waiting for you"** (`asksForReader`) in Settings → Agents to off.
-- **Panes and cards float.** Side panes and cards sit on the window as rounded
-  cards with their own margin, the darker separators between bands are gone, and
-  page layouts follow the pane's width rather than the window's.
-- **Health leads with its verdict,** severity chips share one casing, and long
-  package names, rule ids and paths truncate with the full text on hover.
-- **The Go helpers build on Go 1.27.4,** the version DevCouncil's orchestrator
-  module now requires.
-- **GitPulse builds on Rust 1.100.** Its own crates (`src-tauri`,
-  `crates/gitpulse-worktree`, `crates/git-status-parity`) declare
-  `rust-version = "1.100"`, an owner decision that replaces the unpinned floor.
-  The in-tree `src-tauri/framework/*` forks of third-party crates keep their own
-  `rust-version`. The vendored DevCouncil and MarkDev crates were re-vendored
-  from their 1.100 trees with `scripts/vendor-crates.mjs`. That refresh also
-    moved the vendored `dc-store` and `devmap-store` to `rusqlite` 0.41.1, so
-    GitPulse's own `rusqlite` (and the `gitpulse-worktree` dev-dependency) moved
-    from 0.40.2 to 0.41.1 with it, and `libsqlite3-sys` from 0.38.2 to 0.39.1,
-    as the line next to the dependency requires.
-  - **Cargo's new build-dir layout is handled.** cargo 1.100 no longer writes
-    `target/<profile>/deps/`; units live in `build/<pkg>/<hash>/{out,run,fingerprint}`.
-    The shared build cache (`gitpulse-rustc`) now finds its binary from a test
-    or bench binary in either layout, and its fixtures cover both. A cloned
-    `target/` rewrites a build script's recorded `run/stdout` and
-    `run/root-output` (it previously rewrote only the older `output` files, so a
-    1.100 clone kept the anchor's `OUT_DIR`), and treats `.cargo-build-lock` and
-    `.cargo-artifact-lock` as a build in progress. The Rust build-cache
-    integration test read `target/debug/deps` unconditionally and failed under 1.100;
-    it now reads the dep-info of whichever layout the build produced and fails
-    when it finds none.
-  - **Registry cooldown.** `.cargo/config.toml` sets
-    `[registry] global-min-publish-age = "3 days"`.
-  - **Language features.** `strip_prefix(..).unwrap_or(x)` sites became
-    `trim_prefix`/`trim_suffix`, `x = !x` became `x.toggle()`, and single-purpose
-    function-local drop guards became `std::mem::DropGuard`.
-- **The Tasks board has five columns: Inbox is merged into Backlog.** New tasks
-  start in Backlog everywhere they started in Inbox: quick add, the task
-  editor, issues imported from GitHub, task briefs without a `status:` and
-  `gitpulse_add_task`.
-  - **Nothing you saved breaks.** A search that says `status:inbox`, a hidden
-    column, a column's work-in-progress limit, a saved view, a `status: inbox`
-    brief in `tasks/` and an older agent's `inbox` in `gitpulse_add_task` or
-    `gitpulse_list_tasks` are all read as Backlog. The tools no longer list
-    `inbox` as a choice. A hidden Inbox column no longer hides Backlog unless
-    Backlog was hidden too.
-  - The Tasks header's **Inbox** button (notifications) and the agent inbox are
-    different features and are unchanged.
-  - **The task profile moves one way to workbench schema 16.** The vendored
-    dc-store (DevCouncil `c6788883`) rewrites every task held as `inbox` to
-    `backlog` the first time it opens the profile, archived and deleted tasks
-    and their history included, without spending a revision. A host built
-    against workbench schema 15 refuses the upgraded profile, so rebuild
-    GitPulse, Manvi and DevCouncil from the same dc-store and reinstall
-    `gitpulse-mcp` and `gitpulse-hook` before any of them opens it. An agent run
-    brief written before the upgrade keeps the `Status: inbox` it was handed,
-    and a run prepared but not yet started at upgrade time must be prepared
-    again.
-
-- **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
-  are gone as pages; their content lives with the subject it acts on.
-  - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or
-    revert is parked (or its state could not be read), and is absent otherwise.
-    Every way in — the status bar, the tray and its `3` key, the merge dialog,
-    blocked rows, the palette's *Resolve conflicts* — lands on the editor, even
-    when you were already on Overview and scrolled into the rows.
-  - **Overview** gains two collapsed disclosures: *Branch and tag cleanup*
-    (always listed, no count until a scan has run; *Stale branches…* opens the
-    dead-branch cleanup) and *Policy activity* (grants and the agent journal).
-  - **Remote** gains *Outgoing commits* (checked before you push, works without
-    `gh`), *Report issue…*, *Add to tasks* / *Add all to tasks*, and *Push
-    release tag…* on Releases. Its issue list stays the only one.
-  - **Settings → Agents** holds *Manvi policy*, *Capability boundary* and
-    *Local model servers*; branch naming moved beside the new-branch field of
-    the Worktrees panel.
-  - Quick pull and Quick push are gone; they ran the same pull and push the
-    sidebar, palette and branch menu offer.
-  - A saved Resolve or Policy selection, an old native menu build, and the
-    palette's Manvi phrases all land on the card that answers them. The Go →
-    Work menu and the tray drop `section:work:policy` (12 sections now).
-
-- **Regression suspects are Graph's third list, not their own section.**
-  Graph's toggle reads *Commits | HEAD moves | Suspects*, and the commit
-  details stay under whichever list is showing. History has two sections now
-  (Graph, Diff), so ⌥3 goes and the Go → History menu loses its Suspects item.
-  *Find regression suspects* in the command palette still opens it (same
-  command id), with the symptom field focused, and a session saved on the old
-  Suspects section reopens on the Suspects list.
-  - **The question replaces the commit filter** in History's context bar while
-    Suspects is showing: symptom, last known good, cone depth, *Find suspects*.
-    ⌘F focuses the symptom there. The filter does not narrow a ranking, whose
-    scores mean something only within one answer.
-  - **Clicking a suspect selects it in place.** It used to jump to the Diff
-    section, so the ranking and the commit it named were never on screen
-    together. The details pane now carries the suspect's verdict (evidence,
-    hops, touched symbols) whichever list selected the commit.
-  - **The other lists mark what was ranked.** Commit rows and HEAD moves show a
-    *suspect #n* chip whose tooltip names the symptom and window it came from;
-    the chips go when the answer does, or when the repository changes.
-  - **Any commit can start the question.** *Suspects since* in the details pane
-    makes the commit on screen the last known good and switches to the list,
-    running at once when a symptom is already named.
-  - **Blame, a diff hunk and the code graph can ask too.** Blame's toolbar has
-    *Suspects* for the blamed file, a diff hunk names the symbol it changes
-    with *suspects* beside it, and a code-graph node's connections panel offers
-    *Find suspects for …* by its DevMap id. The palette gains *Find suspects
-    for the open file*. All of them land on Graph's Suspects list through one
-    entry point (`codeintel/openSuspects.ts`) and ask at once.
-  - **Branch and Reset act on the commit in the details pane**, whichever list
-    selected it, instead of sitting on every HEAD-moves row. They are the same
-    two actions as the graph's row menu, which gains *Reset Branch Here (keep
-    changes)…*; one module owns both (`branches/commitActions.ts`), where the
-    row menu and the reflog each had their own branch-at-commit. The reset
-    still previews every commit that would leave the branch, still names the
-    reflog entry it came from, and still uses `reset --keep`. HEAD moves now
-    reloads whenever HEAD moves, not only after its own buttons.
-  - **One selection path for all three lists** (`repoStore.selectHistoryCommit`).
-    The answer lives in a store (`codeintel/suspectsQuery.ts`) rather than in
-    the pane, so switching lists keeps it; the code-graph client still loads on
-    first run, not with History.
-
-- **The reflog is part of History › Graph, not its own section.** A
-  *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
-  reflog, with the commit details below either list. History had three
-  sections after this (Graph, Diff, Suspects; Suspects then folded into Graph
-  too, above), so Suspects moved from ⌥4 to ⌥3 and the Go → History menu lost
-  its Reflog item. *Open Reflog — HEAD movements
-  and recovery points* in the command palette still opens it, and a session
-  saved on the old Reflog section reopens on the HEAD-moves list.
-  - **Clicking an entry selects it in place.** It used to select the commit on
-    Graph while the Reflog pane stayed on screen, so the click changed nothing
-    you could see. Commits a reset or amend left reachable only from the reflog
-    now open too, marked *Not in the graph*; a pruned one shows the details
-    error and Retry. Choosing one survives graph reloads.
-  - **The commit filter narrows the reflog.** Its text matches an entry's
-    selector, sha, action or message, and the header says how many of the
-    loaded entries match. The branch chip does not apply, since this is HEAD's
-    log.
-
-### Security
-
-- **Expanded secret redaction (`dc-redact` at DevCouncil `cbd51369` & `dc-glob` commit briefs):** Bare Google OAuth credentials (`ya29.`, `1//`, `GOCSPX-`), 25-char GitLab tokens (`gldt-`/`glft-`/`glrt-`/`glwt-`), Slack `xoxe-` refresh and rotated tokens, AWS `ABIA`/`ACCA`/`A3T` key IDs, HuggingFace `api_org_` tokens, and CLI passwords after `command=curl` / `$(curl` are redacted across copied diagnostics, ledger records, and every surface using the shared redaction table (`d9c7a512`, `046df249`), while eliminating false positives on `fn npm_…()`, `MIN_TOKEN_NAP`, `++latest`, and single-brace templates. Test-path classification in `src-tauri/src/ai/commit_brief.rs` is delegated to `dc-glob`.
-
-## [1.5.0] - 2026-11-03
-
-1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
-1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
-the 1.4.0 section of `CHANGELOG.md`. Read both **Upgrade** sections first: the
-task profile moves one way (dc-store store schema 11, workbench schema 15), the
-DevMap store moves one way to schema 29, the terminal host protocol is now 3,
-and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
-
-### Upgrade
-
-- **The task profile moves one way to workbench schema 15** (dc-store vendored
-  from DevCouncil `012c7f8a`; store schema stays 11; `4ddc3fd0`, `54a29019`,
-  `5bba42a2`). CI results are stored as `run_ci_passed` / `run_ci_failed` /
-  `run_ci_cancelled` attention rows, which a schema 14 host cannot read, so a
-  schema 14 build refuses an upgraded profile with `schema_unsupported`. The
-  desktop app performs the upgrade and keeps `<profile>.pre-schema-14.bak`
-  beside it. Update GitPulse (app, `gitpulse-mcp`, `gitpulse-hook` via
-  `bun run mcp:install`), `dcstore` and Manvi together, then confirm with
-  `bun run check:schema-parity`.
-- **The DevMap store moves one way to schema 29** (from 27; `7ae2fa6a`,
-  `2a919f00`, `d889efd1`). Stored extraction documents are zstd-compressed and
-  the reader floor is 29, so a `devmap` CLI or `gitpulse-mcp` from before this
-  release cannot read an index this build writes. Rebuild and reinstall the
-  `devmap` CLI with the app, then confirm with `bun run check:schema-parity`.
-- **The terminal host speaks protocol 3** (from 2; `55d90664`, which adds the
-  saved-transcript request). Sessions still held by a `gitpulse-ptyd` from an
-  earlier build cannot be adopted by this one; finish or close those terminals
-  before updating.
-- **Reinstall `gitpulse-hook` and `gitpulse-mcp`** (`bun run mcp:install`): the
-  hook gains the `deliver` subcommand Send to agent uses, and both must read
-  workbench schema 15.
-- **`devmap_*` tools on `gitpulse-mcp` default to depth 3, not 10** (`8f276a4a`),
-  matching the standalone `devmap mcp` server. A caller that relied on the old
-  default passes `depth` explicitly.
-
-### Added
-
 - **Zero-copy agentic worktrees.** Eleven `gitpulse_worktree_*` MCP tools
   (create, switch, isolate, prune, merge, claim, release, send_message,
   overlay_sync, inbox, radar) give parallel agents their own checkouts and a way
@@ -396,10 +193,10 @@ and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 - **Tasks board: the hidden-repository note names the repository**
   (`78a3b3a4`; `taskHiddenRepositories.ts`) instead of giving a bare count.
 - **A setting for whether a terminal bell asks for you.** "Count a terminal bell
-  as waiting for you" in Settings → Agents (`bellAsksForReader`, on by default)
-  decides whether bells from Codex, Cursor and shells count as the agent asking
-  for the reader, on the task's Agents pane and the board's agent chips alike
-  (`19d4ae12`, `cc7ccbd4`).
+  as waiting for you" in Settings → Agents (`asksForReader`, initially added as
+  `bellAsksForReader` on by default and now off by default) decides whether bells
+  from Codex, Cursor and shells count as the agent asking for the reader, on the
+  task's Agents pane and the board's agent chips alike (`19d4ae12`, `cc7ccbd4`).
 - **A durable record of hook reports that got no reply in time (`.drops`).**
   When a hook notification reply misses its budget (300 ms for `SessionEnd`,
   1.5 s for other events), the hook appends `{"v":1,"at":<unix_ms>,"event":...,
@@ -626,6 +423,147 @@ and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
   typed `low_disk` / `cache_error` advisories for worktree caches.
 
 ### Changed
+
+- **Unix terminal host (`gitpulse-ptyd`) is now unconditional, and hosted Manvi defaults to on:** On Unix (`#[cfg(unix)]`), PTY terminal sessions always live in `gitpulse-ptyd` so interactive shells and TUI agents survive app restarts or crashes (`docs/TERMINAL_HOST.md`, `b7b698ef`). **Settings → Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`) now defaults to on and governs the detached `manvi serve --listen` process for managed Codex and Claude runs.
+- **Tasks board automatic column fill, live on-screen refresh, two-row header, & verdict memo:** After every board read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards in 200-card chunks up to 2,000 cards while the column cursor matches; live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused, `bac79cf7`); the Tasks header splits into a title row and a toolbar row (`PageHeader.svelte`, `TaskBoard.svelte`, `5606e1d9`); and task verification verdicts are cached in `verdict_memo` with an exact SQLite change signal and shared byte budget (`2bdd2511`, `e7c4491a`, `86ca8530`).
+- **Antigravity (`agy`) hook compatibility:** Stopped registering `PreToolUse` hooks (`collision-guard` and `command-gate`) in `plugins/gitpulse/hooks.json` and `plugins/gitpulse-agy/hooks.json` because Antigravity IDE 2.32.1 denied tool calls whose pre-tool hook returned `{}` without `"decision":"allow"` (`b643b232`). Informational hook notices without a permission decision now render as `{"reason": ...}` rather than `{"decision": "ask"}` (`71212fa3`).
+- **Command gate, hook task-scope fence (`ft-d3bd46c0`), and collision path folding (`ft-9cfd5574`):** `command-gate` fences argument-writing commands and cross-checkout writes against declared task scope (`f7677983`), `SessionStart` (`session-brief`) queries the running GitPulse app before scanning worktrees directly (`f3cbc522`), and collision path matching folds file-vs-directory, case-insensitive filesystem, and submodule paths (`9a48dae8`).
+- **Settings dialog, repository tab menu, & terminal dock dismiss:** Enlarged the Settings dialog (`1024x736`, `208px` category rail) with grouped `gp-card` sections (`78ce2e53`), streamlined the repository tab context menu to per-tab actions with icons (`df636f29`), added double-click on page headers/backgrounds to minimize an expanded terminal dock (`panelDismiss.ts`), and defaulted **"Count a terminal bell as waiting for you"** (`asksForReader`) in Settings → Agents to off.
+- **Panes and cards float.** Side panes and cards sit on the window as rounded
+  cards with their own margin, the darker separators between bands are gone, and
+  page layouts follow the pane's width rather than the window's.
+- **Health leads with its verdict,** severity chips share one casing, and long
+  package names, rule ids and paths truncate with the full text on hover.
+- **The Go helpers build on Go 1.27.4,** the version DevCouncil's orchestrator
+  module now requires.
+- **GitPulse builds on Rust 1.100.** Its own crates (`src-tauri`,
+  `crates/gitpulse-worktree`, `crates/git-status-parity`) declare
+  `rust-version = "1.100"`, an owner decision that replaces the unpinned floor.
+  The in-tree `src-tauri/framework/*` forks of third-party crates keep their own
+  `rust-version`. The vendored DevCouncil and MarkDev crates were re-vendored
+  from their 1.100 trees with `scripts/vendor-crates.mjs`. That refresh also
+    moved the vendored `dc-store` and `devmap-store` to `rusqlite` 0.41.1, so
+    GitPulse's own `rusqlite` (and the `gitpulse-worktree` dev-dependency) moved
+    from 0.40.2 to 0.41.1 with it, and `libsqlite3-sys` from 0.38.2 to 0.39.1,
+    as the line next to the dependency requires.
+  - **Cargo's new build-dir layout is handled.** cargo 1.100 no longer writes
+    `target/<profile>/deps/`; units live in `build/<pkg>/<hash>/{out,run,fingerprint}`.
+    The shared build cache (`gitpulse-rustc`) now finds its binary from a test
+    or bench binary in either layout, and its fixtures cover both. A cloned
+    `target/` rewrites a build script's recorded `run/stdout` and
+    `run/root-output` (it previously rewrote only the older `output` files, so a
+    1.100 clone kept the anchor's `OUT_DIR`), and treats `.cargo-build-lock` and
+    `.cargo-artifact-lock` as a build in progress. The Rust build-cache
+    integration test read `target/debug/deps` unconditionally and failed under 1.100;
+    it now reads the dep-info of whichever layout the build produced and fails
+    when it finds none.
+  - **Registry cooldown.** `.cargo/config.toml` sets
+    `[registry] global-min-publish-age = "3 days"`.
+  - **Language features.** `strip_prefix(..).unwrap_or(x)` sites became
+    `trim_prefix`/`trim_suffix`, `x = !x` became `x.toggle()`, and single-purpose
+    function-local drop guards became `std::mem::DropGuard`.
+- **The Tasks board has five columns: Inbox is merged into Backlog.** New tasks
+  start in Backlog everywhere they started in Inbox: quick add, the task
+  editor, issues imported from GitHub, task briefs without a `status:` and
+  `gitpulse_add_task`.
+  - **Nothing you saved breaks.** A search that says `status:inbox`, a hidden
+    column, a column's work-in-progress limit, a saved view, a `status: inbox`
+    brief in `tasks/` and an older agent's `inbox` in `gitpulse_add_task` or
+    `gitpulse_list_tasks` are all read as Backlog. The tools no longer list
+    `inbox` as a choice. A hidden Inbox column no longer hides Backlog unless
+    Backlog was hidden too.
+  - The Tasks header's **Inbox** button (notifications) and the agent inbox are
+    different features and are unchanged.
+  - **The task profile moves one way to workbench schema 16.** The vendored
+    dc-store (DevCouncil `c6788883`) rewrites every task held as `inbox` to
+    `backlog` the first time it opens the profile, archived and deleted tasks
+    and their history included, without spending a revision. A host built
+    against workbench schema 15 refuses the upgraded profile, so rebuild
+    GitPulse, Manvi and DevCouncil from the same dc-store and reinstall
+    `gitpulse-mcp` and `gitpulse-hook` before any of them opens it. An agent run
+    brief written before the upgrade keeps the `Status: inbox` it was handed,
+    and a run prepared but not yet started at upgrade time must be prepared
+    again.
+
+- **Work has three sections: Overview, Remote and Tasks.** Resolve and Policy
+  are gone as pages; their content lives with the subject it acts on.
+  - **The conflict editor leads Overview** while a merge, rebase, cherry-pick or
+    revert is parked (or its state could not be read), and is absent otherwise.
+    Every way in — the status bar, the tray and its `3` key, the merge dialog,
+    blocked rows, the palette's *Resolve conflicts* — lands on the editor, even
+    when you were already on Overview and scrolled into the rows.
+  - **Overview** gains two collapsed disclosures: *Branch and tag cleanup*
+    (always listed, no count until a scan has run; *Stale branches…* opens the
+    dead-branch cleanup) and *Policy activity* (grants and the agent journal).
+  - **Remote** gains *Outgoing commits* (checked before you push, works without
+    `gh`), *Report issue…*, *Add to tasks* / *Add all to tasks*, and *Push
+    release tag…* on Releases. Its issue list stays the only one.
+  - **Settings → Agents** holds *Manvi policy*, *Capability boundary* and
+    *Local model servers*; branch naming moved beside the new-branch field of
+    the Worktrees panel.
+  - Quick pull and Quick push are gone; they ran the same pull and push the
+    sidebar, palette and branch menu offer.
+  - A saved Resolve or Policy selection, an old native menu build, and the
+    palette's Manvi phrases all land on the card that answers them. The Go →
+    Work menu and the tray drop `section:work:policy` (12 sections now).
+
+- **Regression suspects are Graph's third list, not their own section.**
+  Graph's toggle reads *Commits | HEAD moves | Suspects*, and the commit
+  details stay under whichever list is showing. History has two sections now
+  (Graph, Diff), so ⌥3 goes and the Go → History menu loses its Suspects item.
+  *Find regression suspects* in the command palette still opens it (same
+  command id), with the symptom field focused, and a session saved on the old
+  Suspects section reopens on the Suspects list.
+  - **The question replaces the commit filter** in History's context bar while
+    Suspects is showing: symptom, last known good, cone depth, *Find suspects*.
+    ⌘F focuses the symptom there. The filter does not narrow a ranking, whose
+    scores mean something only within one answer.
+  - **Clicking a suspect selects it in place.** It used to jump to the Diff
+    section, so the ranking and the commit it named were never on screen
+    together. The details pane now carries the suspect's verdict (evidence,
+    hops, touched symbols) whichever list selected the commit.
+  - **The other lists mark what was ranked.** Commit rows and HEAD moves show a
+    *suspect #n* chip whose tooltip names the symptom and window it came from;
+    the chips go when the answer does, or when the repository changes.
+  - **Any commit can start the question.** *Suspects since* in the details pane
+    makes the commit on screen the last known good and switches to the list,
+    running at once when a symptom is already named.
+  - **Blame, a diff hunk and the code graph can ask too.** Blame's toolbar has
+    *Suspects* for the blamed file, a diff hunk names the symbol it changes
+    with *suspects* beside it, and a code-graph node's connections panel offers
+    *Find suspects for …* by its DevMap id. The palette gains *Find suspects
+    for the open file*. All of them land on Graph's Suspects list through one
+    entry point (`codeintel/openSuspects.ts`) and ask at once.
+  - **Branch and Reset act on the commit in the details pane**, whichever list
+    selected it, instead of sitting on every HEAD-moves row. They are the same
+    two actions as the graph's row menu, which gains *Reset Branch Here (keep
+    changes)…*; one module owns both (`branches/commitActions.ts`), where the
+    row menu and the reflog each had their own branch-at-commit. The reset
+    still previews every commit that would leave the branch, still names the
+    reflog entry it came from, and still uses `reset --keep`. HEAD moves now
+    reloads whenever HEAD moves, not only after its own buttons.
+  - **One selection path for all three lists** (`repoStore.selectHistoryCommit`).
+    The answer lives in a store (`codeintel/suspectsQuery.ts`) rather than in
+    the pane, so switching lists keeps it; the code-graph client still loads on
+    first run, not with History.
+
+- **The reflog is part of History › Graph, not its own section.** A
+  *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's
+  reflog, with the commit details below either list. History had three
+  sections after this (Graph, Diff, Suspects; Suspects then folded into Graph
+  too, above), so Suspects moved from ⌥4 to ⌥3 and the Go → History menu lost
+  its Reflog item. *Open Reflog — HEAD movements
+  and recovery points* in the command palette still opens it, and a session
+  saved on the old Reflog section reopens on the HEAD-moves list.
+  - **Clicking an entry selects it in place.** It used to select the commit on
+    Graph while the Reflog pane stayed on screen, so the click changed nothing
+    you could see. Commits a reset or amend left reachable only from the reflog
+    now open too, marked *Not in the graph*; a pruned one shows the details
+    error and Retry. Choosing one survives graph reloads.
+  - **The commit filter narrows the reflog.** Its text matches an entry's
+    selector, sha, action or message, and the header says how many of the
+    loaded entries match. The branch chip does not apply, since this is HEAD's
+    log.
 
 - **DevMap live refresh no longer waits on a hung status probe.** The status
   probe is off the live-refresh IPC path: a refresh waits at most a 1 s grace
@@ -938,6 +876,59 @@ and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
   with it (derived from the handler list at build), and the registry is 284 handlers.
 
 ### Fixed
+
+- **Read-only hook ledger binding lookup:** `read_active_task_binding` only refuses unimported sibling rows that would be kept as a `bind` or `unbind` under `SourceAuthority`, preventing unrelated sibling ledger traffic from failing read-only hook lookups (`95a17657`).
+- **Health automatic scans & secrets signal crash reporting:** Automatic dependency and secrets scans wait for the pane to settle, skip fresh results, and hold off after a failure (stating why, `5f2a1e0b`, `4c81201d`), and a secrets scanner killed by a signal is reported as a crash naming the signal (`b0382546`).
+- **Bare push upstream planning:** Planning a bare `git push` reads the branch's own upstream configuration (`branch.<name>.remote` and `branch.<name>.merge`) and never falls back to `push -u` when the config read fails (`246be08b`, `34c37455`).
+- **The Firebase panel no longer fails with "Unable to obtain permissions".**
+  This was not a Google Cloud permission. The Firebase CLI writes
+  `firebase-debug.log` into the folder it starts in, before it reads any
+  command, and GitPulse started it in `/`, where it cannot write. Each run now
+  keeps its debug log in its own temporary folder, removed afterwards, so the
+  log no longer lands in `/` or in your repository.
+- **A Firebase deploy that times out or loses the network is reported as an
+  unknown outcome.** It says to check the Firebase console before deploying
+  again, never "try again", because a second create deploys twice.
+- **Go to line works again.** Every Go threw "trim is not a function" and the
+  cursor never moved.
+- **The Code page keeps the editor's minimum width beside two floating cards,**
+  counting each card's margins.
+- **A commit clicked in HEAD moves or Suspects stays selected when the graph
+  reloads without it.** A filter typed above the reflog, the page size or a
+  watcher refresh dropped the clicked commit from the loaded graph and the
+  details pane jumped to the newest commit, under a highlight that had not
+  moved. Those lists now pin their selection; a click on the graph itself
+  still falls back as before when a filter drops it.
+
+- **A branch comparison in the Diff view no longer lists the working tree's
+  files.** The file rail guessed the selection's kind from which ids were set, so
+  a range diff (`main...feature`) read as a worktree file and offered your
+  uncommitted files beside it. It now uses the kind the store recorded.
+
+- **A task agent's new worktree starts with a DevMap index instead of a cold
+  rebuild.** Lanes under `.gitpulse/worktrees/` now get a copy-on-write clone of
+  the main checkout's DevMap store, bound to the lane, before the agent starts.
+  Then GitPulse's live refresh runs the lane's own incremental build in the
+  background whenever the clone is not fresh for the lane's tree. Until that
+  build lands, `devmap status` in the lane reports the index as stale. Before,
+  lanes started with no store, and DevMap's SessionStart hook cold-built a full
+  one in every lane. Measured on this repository: a lane is query-ready in about
+  1.2 s (debug build) instead of about 7.6 s and ~38 CPU-seconds, and costs
+  7–20 MB instead of about 366 MB. Its own build then takes about 2.5 s. With
+  eight lanes at once, a bare clone plus incremental build took about 9 s,
+  against about 42 s cold. The same seed-then-refresh now covers every
+  GitPulse path that creates a worktree:
+  - The Worktrees panel seeds by default (new `seedDevmap`). The zero-copy
+    pointer is now opt-in, because only GitPulse reads it: the `devmap`
+    agents run cold-builds beside it.
+  - MCP `gitpulse_worktree_create`, `switch` and `isolate`.
+  - The `gitpulse-worktree` CLI, whose plain `create` with shared caches
+    used to seed nothing.
+
+  A seed that is skipped (low disk, or no index in the
+  main checkout) or fails is logged, and the lane still starts; DevMap's own
+  hook then builds the index as before. Measurements and remaining work are in
+  `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.
 
 - **The cleaner reclaims again.** Its refusal is scoped to the repositories it
   could not read (`2540db65`), each artifact tree is budgeted on its own so a
@@ -1279,6 +1270,8 @@ and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
   the commit-graph HEAD reader.
 
 ### Security
+
+- **Expanded secret redaction (`dc-redact` at DevCouncil `cbd51369` & `dc-glob` commit briefs):** Bare Google OAuth credentials (`ya29.`, `1//`, `GOCSPX-`), 25-char GitLab tokens (`gldt-`/`glft-`/`glrt-`/`glwt-`), Slack `xoxe-` refresh and rotated tokens, AWS `ABIA`/`ACCA`/`A3T` key IDs, HuggingFace `api_org_` tokens, and CLI passwords after `command=curl` / `$(curl` are redacted across copied diagnostics, ledger records, and every surface using the shared redaction table (`d9c7a512`, `046df249`), while eliminating false positives on `fn npm_…()`, `MIN_TOKEN_NAP`, `++latest`, and single-brace templates. Test-path classification in `src-tauri/src/ai/commit_brief.rs` is delegated to `dc-glob`.
 
 - **The signal guard models the Linux tools on Linux** (`d9954240`, `1ba087a0`,
   `ft-06723bb7`): `procps` `pkill`/`pgrep`, `psmisc` `killall` and `sysvinit`
@@ -5297,8 +5290,7 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.5.0...HEAD
-[1.5.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.5.0
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...HEAD
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
