@@ -318,9 +318,14 @@ jobs:
       # cached on that SHA; the step after it fails the job when the CLI's schema
       # and the vendored one differ, so a stale pin cannot pass quietly. Not on
       # Windows, where this leg does not build yet.
+      # Restore and save are separate steps: `actions/cache` saves in a post step
+      # that runs only when the whole job succeeded, and this job's suite is red
+      # on a runner more often than not, so the build would never be kept. It is
+      # saved the moment the schema check passes, whatever the tests do after. Saving over
+      # an existing key is a logged no-op, so no step-level `if` is needed to skip it.
       - name: Cache devmap
         if: ${{ runner.os != 'Windows' }}
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
@@ -340,6 +345,13 @@ jobs:
       - name: Installed devmap matches the vendored schema
         if: ${{ runner.os != 'Windows' }}
         run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        if: ${{ runner.os != 'Windows' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       - name: Rust Unit & Integration Tests
         if: ${{ !cancelled() }}
@@ -445,7 +457,7 @@ jobs:
 
       # The CLI the worktree-overlay and radar tests drive, as in rust-test.
       - name: Cache devmap
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
@@ -463,6 +475,12 @@ jobs:
 
       - name: Installed devmap matches the vendored schema
         run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       # This shard's bucket of the suite. `--profile ci` is one test at a time
       # and writes target/nextest/ci/junit.xml, which the completeness job reads.

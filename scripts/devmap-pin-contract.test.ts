@@ -41,7 +41,15 @@ export function devmapPinProblems(ci: string): string[] {
     const check = job.indexOf("bun run check:vendor-schema");
     if (check === -1) problems.push(`${id} installs devmap but never runs check:vendor-schema`);
     else if (check < install) problems.push(`${id} runs check:vendor-schema before it installs devmap`);
-    if (!/key: devmap-.*\$\{\{ env\.DEVMAP_REV \}\}/.test(job)) problems.push(`${id} caches devmap on a key that does not include DEVMAP_REV`);
+    // The restore and the save each name a key, and the two must both move with the pin.
+    const keys = job.split("\n").filter((l) => /^\s+key: devmap-/.test(l));
+    if (keys.length === 0 || keys.some((l) => !/\$\{\{ env\.DEVMAP_REV \}\}/.test(l))) problems.push(`${id} caches devmap on a key that does not include DEVMAP_REV`);
+    // `actions/cache` saves in a post step that runs only if the whole job passed. These jobs'
+    // suites are red on a runner more often than not, so the verified build is saved on its own.
+    if (/uses: actions\/cache@/.test(job)) problems.push(`${id} caches devmap with actions/cache, which saves only when the whole job succeeds`);
+    const save = job.indexOf("actions/cache/save@");
+    if (save === -1) problems.push(`${id} never saves its devmap build with actions/cache/save`);
+    else if (check !== -1 && save < check) problems.push(`${id} saves its devmap build before check:vendor-schema has passed`);
   }
   return problems;
 }
@@ -84,7 +92,16 @@ describe("devmap pin contract", () => {
       has(broken(/\n {6}- name: Installed devmap matches the vendored schema\n {8}run: bun run check:vendor-schema\n/, "\n"), "never runs check:vendor-schema");
     });
     it("a cache key that does not move with the pin", () => {
-      has(broken(/key: devmap-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.DEVMAP_REV \}\}/, "key: devmap-${{ runner.os }}"), "does not include DEVMAP_REV");
+      has(broken(/key: devmap-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.DEVMAP_REV \}\}/g, "key: devmap-${{ runner.os }}"), "does not include DEVMAP_REV");
+      // Only the save's key: a restore on the pin and a save under another key is a cache that never hits.
+      has(broken(/(actions\/cache\/save@[^\n]*\n\s+with:\n\s+path: [^\n]*\n\s+key: devmap-)\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ env\.DEVMAP_REV \}\}/, "$1${{ runner.os }}"), "does not include DEVMAP_REV");
+    });
+    it("a cache that is saved only when the whole job passes", () => {
+      has(broken("uses: actions/cache/restore@", "uses: actions/cache@"), "saves only when the whole job succeeds");
+    });
+    it("a build that is restored but never saved, or saved before it is checked", () => {
+      has(broken(/\n {6}- name: Keep the verified devmap build\n[\s\S]*?\n\n/, "\n\n"), "never saves its devmap build");
+      has(broken(/(\n {6}- name: Cache devmap\n)/, "\n      - name: Early\n        uses: actions/cache/save@x\n$1"), "before check:vendor-schema has passed");
     });
   });
 });
