@@ -2311,6 +2311,7 @@ mod family_cost_tests {
 
     /// `git hash-object --stdin` asked directly, the authority a key must equal.
     fn real_key(repo: &str, source: &str) -> String {
+        use crate::procguard::LockedSpawn;
         use std::io::Write;
         use std::process::Stdio;
         let mut command = std::process::Command::new("git");
@@ -2320,7 +2321,7 @@ mod family_cost_tests {
             .current_dir(repo)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
+            .spawn_locked()
             .expect("git hash-object");
         child
             .stdin
