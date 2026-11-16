@@ -182,6 +182,11 @@ pub struct CatchUp {
     /// Non-zero sets `truncated`.
     #[serde(default)]
     pub reflog_refs_skipped: i64,
+    /// Reflogs this pass read cleanly (no error, nothing pending). Not part of
+    /// the wire shape: it exists so the gate can tell a pass that moved a cold
+    /// family forward from one that is stuck.
+    #[serde(skip)]
+    pub reflog_refs_read: i64,
     /// True when the wall-clock deadline stopped the pass early.
     ///
     /// A truncated pass is a floor: remaining transcripts/reflog entries were
@@ -909,10 +914,42 @@ const LEGACY_SEEN_MARGIN_SECS: i64 = 86_400;
 /// Worktree HEAD reflogs one pass reads. A family past this reports how many
 /// it left (`reflog_refs_skipped`) and is `truncated`, never complete.
 ///
-/// `benches/command_timings.rs` times a complete pass over 17 linked
-/// worktrees plus the main checkout. A cap under that aborts the bench
+/// The pass's deadline is what bounds the work in practice; this is the guard
+/// for a pass with no deadline over a pathological family. It sits well above
+/// the two dozen worktrees real agent use keeps alive: at 18 a family of 22
+/// could not be read whole by any pass, so every pass reported `truncated` for
+/// ever. `benches/command_timings.rs` times a complete pass over 17 linked
+/// worktrees plus the main checkout, so a cap under that aborts the bench
 /// before it can record a sample.
-const MAX_REFLOG_WORKTREES: usize = 18;
+const MAX_REFLOG_WORKTREES: usize = 64;
+
+/// The share of a pass's remaining budget the reflogs may spend. The
+/// transcripts get the rest: a host that takes a second to start each `git`
+/// reflog child used to spend all five seconds on the reflogs, pass after
+/// pass, and no transcript was ever read.
+const REFLOG_SHARE_PERCENT: u32 = 70;
+
+/// How long a partly read set of reflogs stays the one the next pass resumes.
+/// Past it the reflogs read earlier are old news and the pass begins again.
+/// It is a multiple of the longest wait the gate leaves between incomplete
+/// passes ([`flight::INTERVALS`]), or a family that needs the backoff's
+/// longest waits would find its cycle stale at every pass and never finish.
+const REFLOG_CYCLE_FRESH: std::time::Duration =
+    std::time::Duration::from_secs(flight::INTERVALS.incomplete_cap.as_secs() * 3);
+
+/// The refs a family's passes have read since the last time every one of them
+/// was, per repository.
+struct ReflogCycle {
+    began: std::time::Instant,
+    read: std::collections::HashSet<(String, String)>,
+}
+
+fn reflog_cycles() -> &'static std::sync::Mutex<std::collections::HashMap<String, ReflogCycle>> {
+    static CYCLES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ReflogCycle>>,
+    > = std::sync::OnceLock::new();
+    CYCLES.get_or_init(Default::default)
+}
 
 /// Replays one checkout's HEAD reflog into its repository-wide ledger.
 pub(crate) fn ingest_reflog_into(
@@ -931,6 +968,14 @@ pub(crate) fn ingest_reflog_into(
 /// Spawns at most `max_worktrees + 1` reflog children (two more per ref that
 /// had to look past its window), plus the default-base lookup the rest of the
 /// engine already caches.
+///
+/// Under a deadline the reflogs take [`REFLOG_SHARE_PERCENT`] of what is left
+/// and stop at it, a child still running at that point included. A family too
+/// large to read in that time is read across passes: the refs one pass read
+/// are remembered ([`ReflogCycle`]), the next resumes with the others, and the
+/// pass that reads the last of them reports complete. That is a claim about
+/// the passes of the last few minutes, not about one, and a pass with no
+/// deadline never relies on it: it reads every ref and ends the cycle.
 fn ingest_reflogs(
     ledger_repo: &str,
     worktree_path: &str,
@@ -958,6 +1003,11 @@ fn ingest_reflogs(
     worktrees.truncate(max_worktrees);
     total.reflog_refs_skipped = i64::try_from(skipped).unwrap_or(i64::MAX);
 
+    // Reads the spawn gate refused (Background work is shed while the budget is
+    // low or the host is under pressure). Git never ran, so nothing was read
+    // and nothing is wrong: they are counted as not read, which makes the pass
+    // `truncated` and retried, and are not reported as errors.
+    let mut deferred = 0usize;
     let mut refs: Vec<(String, String)> = worktrees
         .into_iter()
         .map(|worktree| (worktree, "HEAD".to_string()))
@@ -975,37 +1025,122 @@ fn ingest_reflogs(
             }
             Err(reason) => {
                 total.reflog_refs_skipped += 1;
-                total.absorb_reflog(CatchUp {
-                    error: format!(
-                        "the default branch could not be read: {reason}",
-                        reason = reason.message()
-                    ),
-                    ..CatchUp::default()
-                });
+                if crate::engine::process::is_deferred_under_load(reason.message()) {
+                    deferred += 1;
+                } else {
+                    total.absorb_reflog(CatchUp {
+                        error: format!(
+                            "the default branch could not be read: {reason}",
+                            reason = reason.message()
+                        ),
+                        ..CatchUp::default()
+                    });
+                }
             }
         }
     }
-    for (index, (worktree, ref_name)) in refs.iter().enumerate() {
-        if budget.expired() {
-            total.reflog_refs_skipped += i64::try_from(refs.len() - index).unwrap_or(i64::MAX);
-            break;
+    let slice = budget.share(REFLOG_SHARE_PERCENT);
+    let bounded = slice.remaining().is_some();
+    let mut cycle = take_reflog_cycle(ledger_repo, bounded);
+    // Refs this pass left for the next: the slice ran out, or a read was cut
+    // off or shed. Only these keep a cycle open. A ref that failed for its own
+    // reasons, or the default branch being unreadable, is reported by this pass
+    // and must not hold the others' reads for the length of a cycle.
+    let mut left = 0usize;
+    for (worktree, ref_name) in &refs {
+        let key = (worktree.clone(), ref_name.clone());
+        if cycle.read.contains(&key) {
+            continue;
+        }
+        if slice.expired() {
+            total.reflog_refs_skipped += 1;
+            left += 1;
+            continue;
         }
         let one = replay_ref(
             ledger_repo,
             worktree,
             ref_name,
             REFLOG_WINDOW,
-            budget.remaining(),
+            slice.remaining(),
         );
+        if crate::engine::process::is_deferred_under_load(&one.error) {
+            total.reflog_refs_skipped += 1;
+            left += 1;
+            deferred += 1;
+            continue;
+        }
+        // Only a clean read counts as read: one the slice cut off, one that
+        // failed and one with entries still pending are all tried again by the
+        // next pass, and none may let a later pass report complete without
+        // having been read. A failed read is reported by this pass either way.
+        let clean = one.error.is_empty() && !one.truncated;
+        let cut_off = !one.error.is_empty() && slice.expired();
         total.absorb_reflog(one);
+        if cut_off {
+            total.reflog_refs_skipped += 1;
+            left += 1;
+        } else if clean {
+            total.reflog_refs_read += 1;
+            cycle.read.insert(key);
+        }
+    }
+    keep_reflog_cycle(ledger_repo, cycle, bounded && left > 0);
+    // A read only moved the work forward if refs remain for the next pass to
+    // read: when the cycle ended, a pass that is still incomplete for another
+    // reason (a failed write, an unreadable default branch) re-read the same
+    // refs it read last time and made no progress.
+    if left == 0 {
+        total.reflog_refs_read = 0;
     }
     if total.reflog_refs_skipped > 0 {
         total.mark_reflog_incomplete(format!(
-            "{} reflog(s) not read this pass",
-            total.reflog_refs_skipped
+            "{} reflog(s) not read this pass{}",
+            total.reflog_refs_skipped,
+            if deferred > 0 {
+                " (git was deferred under load)"
+            } else {
+                ""
+            }
         ));
     }
     total
+}
+
+/// The cycle this pass resumes: the refs earlier passes of a bounded run read,
+/// or none for a new cycle (nothing remembered, the memory gone stale, or a pass
+/// with no deadline, which reads everything).
+fn take_reflog_cycle(ledger_repo: &str, bounded: bool) -> ReflogCycle {
+    let fresh = ReflogCycle {
+        began: std::time::Instant::now(),
+        read: Default::default(),
+    };
+    if !bounded {
+        return fresh;
+    }
+    let mut cycles = reflog_cycles()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match cycles.remove(ledger_repo) {
+        Some(cycle) if cycle.began.elapsed() < REFLOG_CYCLE_FRESH => cycle,
+        _ => fresh,
+    }
+}
+
+/// Remembers `cycle` for the next pass when refs are still unread, and forgets
+/// it when every one was read: the next pass begins a new cycle.
+fn keep_reflog_cycle(ledger_repo: &str, cycle: ReflogCycle, unfinished: bool) {
+    let mut cycles = reflog_cycles()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !unfinished {
+        cycles.remove(ledger_repo);
+        return;
+    }
+    if cycles.len() >= 64 && !cycles.contains_key(ledger_repo) {
+        cycles.clear();
+    }
+    cycles.insert(ledger_repo.to_string(), cycle);
 }
 
 /// Where this pass's window over a family of `members` starts, and the next
@@ -1411,6 +1546,7 @@ impl CatchUp {
         self.failed_records += other.failed_records;
         self.reflog_pending += other.reflog_pending;
         self.reflog_refs_skipped += other.reflog_refs_skipped;
+        self.reflog_refs_read += other.reflog_refs_read;
         self.reflog_unreached |= other.reflog_unreached;
         self.truncated |= other.truncated;
         if !other.error.is_empty() {
@@ -1552,6 +1688,13 @@ impl CatchUp {
         }
         self.error.is_empty()
     }
+
+    /// Whether the pass moved the work forward: it recorded something, ingested
+    /// a transcript or read a reflog cleanly. A pass can be cut short and still
+    /// have made progress, which the gate tells apart from one that is stuck.
+    pub fn made_progress(&self) -> bool {
+        self.recorded > 0 || self.transcripts > 0 || self.reflog_refs_read > 0
+    }
 }
 
 /// Runs both replays for a repository.
@@ -1600,8 +1743,14 @@ pub fn catch_up_into_bounded(
 /// pass on its own interval. The repository's address — a `git worktree list`
 /// and the sibling-ledger consolidation — is resolved inside the budget too.
 pub fn catch_up_coalesced(repo_path: &str) -> CatchUp {
+    catch_up_through(flight::gate(), repo_path)
+}
+
+/// [`catch_up_coalesced`] through `gate`, so a test can run passes back to back
+/// without waiting out the process-wide gate's intervals.
+fn catch_up_through(gate: &flight::Gate, repo_path: &str) -> CatchUp {
     let repo = repo_path.to_string();
-    flight::gate().run(repo_path, CATCH_UP_DEADLINE, move |budget, progress| {
+    gate.run(repo_path, CATCH_UP_DEADLINE, move |budget, progress| {
         progress.enter(Phase::Resolving);
         match ledger::bindings::repository_address(&repo) {
             Ok(address) => catch_up_with(&address.anchor, &address.worktree, budget, progress),
@@ -1742,6 +1891,21 @@ fn catch_up_with(
         Ok(siblings) => {
             unresolved_streak(&streak_key, false);
             pass::ingest_family_until(ledger_repo, worktree_path, siblings, &mut expired)
+        }
+        // The family could not be listed because git was not started (shed
+        // under load), which says nothing about the family: the pass is cut
+        // short, not failed, and the next one asks again.
+        Err(reason)
+            if crate::engine::process::is_deferred_under_load(reason)
+                && is_git_checkout(worktree_path) =>
+        {
+            CatchUp {
+                truncated: true,
+                error: format!(
+                    "catch-up truncated: the transcript pass was deferred under load: {reason}"
+                ),
+                ..CatchUp::default()
+            }
         }
         Err(reason) if is_git_checkout(worktree_path) => {
             // A checkout whose family cannot be listed may well have live
@@ -2878,6 +3042,8 @@ mod watermark_tests {
     }
 }
 
+#[cfg(test)]
+mod catch_up_progress_tests;
 #[cfg(test)]
 mod codex_tests;
 #[cfg(test)]
