@@ -514,3 +514,34 @@ fn a_park_whose_close_never_landed_takes_the_offer_back() {
     assert!(why.contains("still running"), "{why}");
     assert_eq!(steps, ["mark", "kill", "check", "unmark"]);
 }
+
+/// "Still running" is the agent's own process, by pid and start time, not the
+/// terminal's listing, which marks a session as ending before its close has
+/// sent a signal.
+#[cfg(unix)]
+#[test]
+fn a_park_judges_still_running_by_the_agents_own_process() {
+    use crate::procguard::LockedSpawn;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn_locked()
+        .expect("spawn a stand-in agent");
+    let pid = i32::try_from(child.id()).unwrap();
+    let facts = crate::sysload::procscan::probe_one(pid).expect("the stand-in is visible");
+    let seen = IdleSession {
+        pid,
+        start_us: facts.start_us,
+        ..idle_row()
+    };
+    assert!(still_running(&seen), "a live agent is still running");
+    assert!(
+        !still_running(&IdleSession {
+            start_us: facts.start_us + 1,
+            ..seen.clone()
+        }),
+        "the same pid with another start time is not the agent"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!still_running(&seen), "a reaped agent is not running");
+}

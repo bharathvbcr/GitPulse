@@ -842,8 +842,9 @@ native system dialog that page script cannot answer, with the session checked
 again before the dialog and after it. The session's row is marked for the
 reopen offer before its terminal is closed, because a close can outlast its own
 deadline while the terminal is already on its way out; if the close fails and
-the terminal is still running, the mark is taken back and the park is refused,
-so a live session is never offered for reopening. It is **not reachable over MCP** and
+the agent's own process (by pid and start time) is still alive, the mark is
+taken back and the park is refused. The terminal's listing is not asked: a close
+marks a session as ending before it sends the first signal. It is **not reachable over MCP** and
 nothing is parked on its own. An observed session is never parked, and Codex
 cannot be resumed from GitPulse, so neither is offered.
 
