@@ -828,7 +828,7 @@ fn codex_root_with(
     source::sources()
         .iter()
         .find(|s| s.actor_id() == "codex")
-        .and_then(|s| s.root())
+        .and_then(|s| s.roots().list.into_iter().next())
         .unwrap()
         .path
 }
