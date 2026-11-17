@@ -271,7 +271,7 @@
           data-active={active ? "true" : "false"}
           data-tip-guide={active ? guideKey : undefined}
           onclick={() => selectTab(item.id)}
-          class="gp-seg-btn relative inline-flex items-center gap-1.5 {tabClass(item, active)}"
+          class="gp-seg-btn relative inline-flex h-[26px] items-center gap-1.5 {tabClass(item, active)}"
         >
           {#if macos && active}
             <span

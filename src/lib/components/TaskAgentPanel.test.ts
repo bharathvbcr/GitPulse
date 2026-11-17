@@ -30,6 +30,18 @@ describe("the bell setting reaches the pane and the board without a reload", () 
   });
 });
 
+// The 1 s clock effect writes `now` when it starts, and `now` rebuilds `live` as a new array.
+// An effect that read `live` re-ran for its own write whenever Date.now() had moved on, which on a
+// slow host it always had: effect_update_depth_exceeded and an 8-12 s main-thread stall in the
+// `task-runs` page on the Linux runner (about half of its runs). It reads a boolean instead.
+describe("the clock effect does not depend on what its own write rebuilds", () => {
+  it("asks anyLive (a boolean), not the live array", () => {
+    expect(source).toContain("const anyLive = $derived(live.length > 0);");
+    expect(source).toContain("if (!active || !anyLive) return;");
+    expect(source).not.toContain("if (!active || live.length === 0) return;");
+  });
+});
+
 describe("TaskAgentPanel checkout links", () => {
   it("names an attempt's checkout by the canonical rule, not a private basename", () => {
     // A private `checkoutName` returned the path's last segment, which for an
