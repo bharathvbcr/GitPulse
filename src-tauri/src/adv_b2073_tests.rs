@@ -897,3 +897,34 @@ fn adv2_local_only_clean_ignores_broken_remote_config() {
     assert_eq!(judged, vec!["git branch -D gone"], "{r:?}");
     assert!(!present(&f.repo, "refs/heads/gone"));
 }
+/// Sole claimant is NOT the by-name owner: origin writes upstream/*, and the
+/// configured `upstream` remote fetches somewhere else entirely.
+#[test]
+fn adv2_sole_claimant_differing_from_the_name_owner_is_refused() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"]), ("upstream", &["x"])]);
+    respec(
+        &f.repo,
+        "origin",
+        &["+refs/heads/*:refs/remotes/upstream/*"],
+    );
+    respec(&f.repo, "upstream", &["+refs/heads/*:refs/remotes/up2/*"]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/upstream/x"], true);
+    assert_refused_untouched(&f, "upstream/x", &judged, &r);
+}
+
+/// A ref no remote's refspec writes any more (zero claimants) whose name owner
+/// is origin.
+#[test]
+fn adv2_zero_claimants_is_refused() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"])]);
+    respec(
+        &f.repo,
+        "origin",
+        &["+refs/heads/*:refs/remotes/upstream/*"],
+    );
+    assert!(present(&f.repo, "refs/remotes/origin/x"));
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    assert_refused_untouched(&f, "origin/x", &judged, &r);
+}

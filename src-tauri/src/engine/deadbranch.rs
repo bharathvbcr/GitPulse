@@ -1054,18 +1054,42 @@ where
                 )
                 .into());
             }
-            // Two remotes whose fetch refspecs write the same tracking ref
-            // (`origin` and `origin/eu` both map onto refs/remotes/origin/eu/x)
-            // leave the ref's owner a guess, and the wrong guess deletes
-            // another remote's branch.
+            // The delete goes to the remote that fetches into this ref. Its
+            // name owner must be the one and only remote whose fetch refspec
+            // writes it: several claimants leave the owner a guess (`origin`
+            // and `origin/eu` both map onto refs/remotes/origin/eu/x), a lone
+            // other claimant means the name owner never fetched it, and none
+            // means the ref is stale. Every wrong guess deletes some other
+            // remote's branch. A remote with no `fetch` refspec has git's
+            // default, so for an ordinary remote this check changes nothing.
+            let owner = b.remote_name.as_deref().unwrap_or_default();
             let claimants = claims.claimants(rest);
-            if claimants.len() > 1 {
-                return Err(format!(
-                    "Refusing to delete '{}': the remotes {} both fetch into it, so its owner is ambiguous",
-                    b.full_ref,
-                    claimants.join(" and ")
-                )
-                .into());
+            match claimants.as_slice() {
+                [only] if only == owner => {}
+                [] => {
+                    return Err(format!(
+                        "Refusing to delete '{}': no configured fetch refspec writes it, so its owner cannot be proven",
+                        b.full_ref
+                    )
+                    .into());
+                }
+                [only] => {
+                    return Err(format!(
+                        "Refusing to delete '{}': it is named for '{owner}' but only '{only}' fetches into it",
+                        b.full_ref
+                    )
+                    .into());
+                }
+                many => {
+                    let (last, rest_names) = many.split_last().expect("two or more");
+                    let quantity = if many.len() == 2 { "both" } else { "all" };
+                    return Err(format!(
+                        "Refusing to delete '{}': the remotes {} and {last} {quantity} fetch into it, so its owner is ambiguous",
+                        b.full_ref,
+                        rest_names.join(", ")
+                    )
+                    .into());
+                }
             }
         }
     }
