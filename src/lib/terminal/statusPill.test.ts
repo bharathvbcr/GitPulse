@@ -105,4 +105,21 @@ describe("terminal pill copy", () => {
     expect(one.focusKey).toBeNull();
     expect(one.alive).toBe(1);
   });
+
+  it("says where a session waits in the build queue, and says nothing when the queue was not read", () => {
+    const waiter = (terminal_session: string) =>
+      ({
+        name: terminal_session,
+        record: { terminal_session } as never,
+      }) as never;
+    const queued = shell({ sessionId: "term-b" });
+    const queue = [waiter("term-a"), waiter("term-b")];
+    const view = terminalPillView([queued], { open: true, repoPath: "/repo/app", identity, buildQueue: queue });
+    expect(view.sessions[0].phrase).toBe("Waiting for a build slot (2nd)");
+    expect(view.summary).toContain("Waiting for a build slot (2nd)");
+    const unread = terminalPillView([queued], { open: true, repoPath: "/repo/app", identity });
+    expect(unread.sessions[0].phrase).toBeNull();
+    const other = terminalPillView([shell({ sessionId: "term-z" })], { open: true, repoPath: "/repo/app", identity, buildQueue: queue });
+    expect(other.sessions[0].phrase).toBeNull();
+  });
 });

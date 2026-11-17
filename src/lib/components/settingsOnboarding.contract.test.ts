@@ -25,10 +25,14 @@ describe("Settings panels load once (SO-1)", () => {
     }
   });
 
-  it("the host-load toggles stay disabled until a read has succeeded, so defaults are never saved over real settings", () => {
+  it("the host-load toggles and the profile select stay disabled until a read has succeeded, so defaults are never saved over real settings", () => {
     const source = read("HostLoadSetting.svelte");
     expect(source).toContain("readOk = true");
-    expect(source.match(/disabled=\{busy \|\| !readOk/g)).toHaveLength(2);
+    // The two original switches, the incremental-compilation switch and the
+    // memory profile select.
+    expect(source.match(/disabled=\{busy \|\| !readOk/g)).toHaveLength(4);
+    // The segments (command gate, lease mode, slot count) save only after a read.
+    expect(source.match(/if \(readOk && !busy\)/g)).toHaveLength(3);
   });
 
   it("the command-gate mode is not saved before a read has succeeded either", () => {

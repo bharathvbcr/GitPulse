@@ -1147,3 +1147,34 @@ fn an_unreadable_envelope_is_skipped_without_hiding_the_readable_ones_behind_it(
         "an unreadable envelope is left in place, not deleted"
     );
 }
+
+/// The peer-inbox hook asks this on every tool call. An empty mailbox must be
+/// answered without the session `flock` (no `.locks` entry appears), a pending
+/// envelope must be seen, and a claimed one must not.
+#[test]
+fn has_unclaimed_takes_no_lock_and_sees_only_pending_envelopes() {
+    let (dir, mailbox) = mailbox();
+    assert!(!mailbox.has_unclaimed(SESSION).unwrap());
+    assert!(
+        !dir.path().join(".locks").exists(),
+        "the empty check must not take the session lock"
+    );
+
+    mailbox
+        .deposit(SESSION, "msg-fast-1", "ping", SystemTime::now())
+        .unwrap();
+    assert!(mailbox.has_unclaimed(SESSION).unwrap());
+
+    let claimed = mailbox
+        .try_claim_batch(SESSION, 4, SystemTime::now())
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        !mailbox.has_unclaimed(SESSION).unwrap(),
+        "a claimed c-* envelope is not unclaimed"
+    );
+    assert!(
+        mailbox.has_unclaimed("not a session").is_err(),
+        "an invalid session key is an error, not an empty mailbox"
+    );
+}

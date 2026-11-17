@@ -40,6 +40,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         now: SystemTime::now(),
         disk: plenty_of_disk(),
         read_free: |_| Free::Missing,
+        lease: LeaseSource::Fixed(LeaseFacts::default()),
     }
 }
 
@@ -1532,5 +1533,132 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
     assert!(
         gather_live("").disk.free_bytes.is_some(),
         "no cwd given: the process's own directory"
+    );
+}
+
+fn with_lease(mut g: Gathered, facts: LeaseFacts) -> Gathered {
+    g.lease = LeaseSource::Fixed(facts);
+    g
+}
+
+#[test]
+fn a_leased_build_in_a_session_without_the_wrapper_is_told_so_once_and_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = with_lease(
+        gathered(verdict(Tier::Clear, None, true), dir.path()),
+        LeaseFacts {
+            on: true,
+            not_gated: Some(
+                "this session's PATH does not start with GitPulse's lease folder".into(),
+            ),
+            full: None,
+            ..LeaseFacts::default()
+        },
+    );
+    let first = context(&judged("cargo build", &g));
+    assert!(
+        first.contains("did NOT lease-gate this build (cargo build)"),
+        "{first}"
+    );
+    assert!(
+        first.contains("PATH does not start with GitPulse's lease folder"),
+        "{first}"
+    );
+    assert!(
+        first.contains("will not repeat for this session"),
+        "{first}"
+    );
+    // The same session, the same reason: said once.
+    assert!(judged("cargo test", &g).is_silent());
+    // A different session is told again.
+    let mut other = call("cargo build");
+    other.session_id = "00000000-aaaa-4bbb-8ccc-000000000000".into();
+    assert!(context(&judge(&other, || g.clone())).contains("did NOT lease-gate"));
+    // A command with no lease row (a package script) and a session with leases
+    // switched off are told nothing.
+    assert!(judged("npm test", &g).is_silent());
+    let off = with_lease(
+        gathered(verdict(Tier::Clear, None, true), dir.path()),
+        LeaseFacts {
+            on: false,
+            not_gated: Some("x".into()),
+            full: Some("y".into()),
+            ..LeaseFacts::default()
+        },
+    );
+    assert!(judged("cargo build", &off).is_silent());
+}
+
+#[test]
+fn a_heavy_command_with_every_slot_held_is_told_it_will_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let facts = LeaseFacts {
+        on: true,
+        not_gated: None,
+        full: Some("cargo test in /w/a (pid 41); cargo build in /w/b (pid 42)".into()),
+        refusing: None,
+        wait_max_s: 1_800,
+        wait_hard_s: 14_400,
+    };
+    for availability in [
+        verdict(Tier::Clear, None, true),
+        verdict(Tier::Elevated, Some(Binding::Swap), true),
+        Availability::Unavailable("no snapshot".into()),
+    ] {
+        let out = judged(
+            "cargo build",
+            &with_lease(gathered(availability, dir.path()), facts.clone()),
+        );
+        let text = context(&out);
+        assert!(
+            text.contains("Every build slot is held (cargo test in /w/a (pid 41)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("queue for up to 30 minutes")
+                && text.contains("run it in the background"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("600000"),
+            "no timeout is promised that the wrapper's wait can outlast: {text}"
+        );
+        assert_eq!(decision_of(&out), None, "a queue is never a refusal");
+    }
+    // A refusal stays a refusal and does not grow a queue line it cannot use.
+    let refused = judged("cargo build", &with_lease(severe(dir.path()), facts));
+    assert_eq!(decision_of(&refused), Some(PermissionDecision::Deny));
+    assert!(!reason(&refused).contains("slot is held"));
+}
+
+#[test]
+fn a_heavy_command_under_load_that_refuses_builds_is_not_told_every_slot_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let facts = LeaseFacts {
+        on: true,
+        not_gated: None,
+        full: None,
+        refusing: Some("no new builds while the host load is severe".into()),
+        wait_max_s: 1_800,
+        wait_hard_s: 14_400,
+    };
+    let out = judged(
+        "cargo build",
+        &with_lease(
+            gathered(verdict(Tier::Clear, None, true), dir.path()),
+            facts,
+        ),
+    );
+    let text = context(&out);
+    assert!(
+        text.contains(
+            "Host load is refusing new builds (no new builds while the host load is severe)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("up to 240 minutes"), "{text}");
+    assert!(
+        !text.contains("slot is held") && !text.contains("()"),
+        "{text}"
     );
 }

@@ -136,7 +136,7 @@ fn claim(dir: &Path, name: &str) -> Claim {
 
 /// Makes `dir` if needed and confirms it is a real directory only this user
 /// can write. A directory someone else planted is refused, not used.
-pub(super) fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};

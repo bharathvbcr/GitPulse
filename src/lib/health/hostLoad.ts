@@ -20,7 +20,9 @@ import type {
   Level,
   MemguardHealth,
   PreviousBoot,
+  ProfileChoice,
   Reading,
+  ResourceProfile,
   TraceRecord,
   SensorState,
   Snapshot,
@@ -507,4 +509,34 @@ export function traceRow(record: TraceRecord): string[] {
     readOrUnknown(record.free_disk, bytes),
     readOrUnknown(record.launched_sessions, String),
   ];
+}
+
+/** The memory profile select's options (`host_load_profile`), in the order shown. */
+export const PROFILE_CHOICES: readonly { value: ProfileChoice; label: string }[] = [
+  { value: "auto", label: "Automatic (from this computer's memory)" },
+  { value: "compact", label: "Compact (8 GB of memory or less)" },
+  { value: "standard", label: "Standard (up to 16 GB)" },
+  { value: "roomy", label: "Roomy (more than 16 GB)" },
+];
+
+/** A select's value as a choice; anything that is not one reads as automatic. */
+export function asProfileChoice(value: string): ProfileChoice {
+  return PROFILE_CHOICES.find((choice) => choice.value === value)?.value ?? "auto";
+}
+
+/**
+ * Which tier is in use and why. An unreadable memory size is said so rather
+ * than shown as a derived answer.
+ */
+export function profileNote(profile: ResourceProfile): string {
+  switch (profile.basis) {
+    case "override":
+      return `In use: ${profile.tier}, as you chose.`;
+    case "memory_unreadable":
+      return `In use: ${profile.tier}, because this computer's memory couldn't be read.`;
+    case "memory":
+      return profile.memory_bytes === null
+        ? `In use: ${profile.tier}.`
+        : `In use: ${profile.tier}, from ${bytes(profile.memory_bytes)} of memory.`;
+  }
 }

@@ -17,10 +17,13 @@
     hostLoadSettings,
     thresholdsAreDefault as defaultThresholds,
     loadHostLoadSettings,
+    resourceProfile,
     updateHostLoadSettings,
     type HostLoadHookMode,
+    type LeaseMode,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
+  import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
   import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
@@ -34,6 +37,14 @@
     { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },
     { value: "off", label: "Off", title: "Say nothing about load" },
   ];
+  const LEASE_MODES: readonly { value: LeaseMode; label: string; title: string }[] = [
+    { value: "on", label: "Queue", title: "A cargo or go build waits for a free slot" },
+    { value: "off", label: "Off", title: "Builds run at once and the wrapper says nothing" },
+  ];
+  const SLOT_COUNTS: readonly { value: string; label: string }[] = ["1", "2", "3", "4", "6", "8"].map((n) => ({
+    value: n,
+    label: n,
+  }));
   let busy = $state(false);
   let error = $state("");
   // False until a read succeeds: before that `settings` is the defaults, and a
@@ -90,6 +101,34 @@
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
+  <div class="space-y-1 pt-1">
+    <label class="text-textPrimary" for="gp-host-load-profile">Memory profile</label>
+    <select
+      id="gp-host-load-profile"
+      class="gp-select text-meta w-full min-w-0"
+      data-size="sm"
+      data-testid="host-load-profile"
+      disabled={busy || !readOk}
+      value={settings.profile}
+      onchange={(event) => void save({ profile: asProfileChoice(event.currentTarget.value) })}
+    >
+      {#each PROFILE_CHOICES as choice (choice.value)}
+        <option value={choice.value}>{choice.label}</option>
+      {/each}
+    </select>
+    <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
+      Sizes how much GitPulse keeps ready in memory. Every terminal you can see always keeps its GPU drawing
+      (up to 8, about 49 MB each), whatever you pick here. Only terminals that are out of sight are limited:
+      the number allowed to keep theirs is
+      {#if $resourceProfile}{$resourceProfile.budgets.gpu_contexts}{:else}this setting's limit{/if}
+      minus the terminals on screen, never below zero, and each is let go after a while. While you
+      switch terminals quickly (about six new ones in a minute), hidden terminals keep theirs for the full
+      hold time (15 seconds, 1 minute or 5 minutes, by size), up to 8 in all, and the limit applies again once you slow down. It also sets how many repositories
+      keep their commit graph.
+      It never changes your session limits or scrollback. Automatic picks from this computer's memory.
+      {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
+    </p>
+  </div>
   <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
     <p class="text-text">Command gate: heavy commands in agent sessions</p>
     <p class="text-textMuted text-micro leading-snug">
@@ -106,6 +145,38 @@
       }}
     />
   </div>
+  <div class="space-y-1 pt-1" data-testid="host-load-lease-settings">
+    <p class="text-text">Build slots: heavy cargo and go builds</p>
+    <p class="text-textMuted text-micro leading-snug">
+      Queue (the default): a cargo or go build started from an agent session takes one of this many slots and
+      waits when they are all held, so a handful of sessions cannot compile at once. Under elevated load it
+      halves the count, and under severe load it starts nothing new. A build that cannot be leased still runs and
+      says so. Off: builds run at once.
+    </p>
+    <SettingSegment
+      ariaLabel="Whether heavy builds queue for a slot"
+      options={LEASE_MODES}
+      value={settings.leases.mode}
+      onselect={(next) => {
+        if (readOk && !busy) void save({ leases: { ...settings.leases, mode: next } });
+      }}
+    />
+    <SettingSegment
+      ariaLabel="How many builds may run at once"
+      options={SLOT_COUNTS}
+      value={String(settings.leases.slots)}
+      onselect={(next) => {
+        if (readOk && !busy) void save({ leases: { ...settings.leases, slots: Number(next) } });
+      }}
+    />
+  </div>
+  <SettingToggle
+    label="Turn incremental compilation off for leased builds"
+    description="Off by default. Sets CARGO_INCREMENTAL=0 for a build that holds a slot: smaller target directories, slower rebuilds. Nothing is deleted."
+    checked={settings.leases.incremental_off}
+    disabled={busy || !readOk}
+    onchange={(next) => void save({ leases: { ...settings.leases, incremental_off: next } })}
+  />
   <div class="flex items-center gap-2 pt-1">
     <p class="text-textMuted text-micro leading-snug flex-1">
       Each input below can slow GitPulse's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.

@@ -5,6 +5,7 @@ import {
   createGpuSlots,
   GPU_HIDE_GRACE_MS,
   GPU_RECOVER_DELAY_MS,
+  gpuPolicy,
   type GpuAddon,
   type GpuSlots,
   type GpuState,
@@ -40,6 +41,8 @@ function harness(slots: GpuSlots = createGpuSlots()) {
       return addon;
     },
     slots,
+    // Written against the roomy grace; the shared policy starts at the compact one.
+    policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
     onChange: (state) => changes.push(state),
   });
   return { renderer, made, changes, slots, failAttach: () => { failNext = true; } };

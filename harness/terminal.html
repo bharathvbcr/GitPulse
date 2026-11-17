@@ -717,7 +717,167 @@
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
             check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => el.querySelector("canvas")).length === 1);
+
+            // -- The resource profile's cap budgets hidden contexts, never a pane on
+            // screen: on the compact budget (two) three more panes beside an anchor
+            // standing for the dock's session all draw through WebGL, and what leaves
+            // the screen is held only within the budget. Real xterm terminals and WebGL
+            // addons share one pool of their own (the page's pool has been busy by now
+            // and would be damping), as the dock's sessions share the page's.
+            {
+              const { Terminal } = await import("@xterm/xterm");
+              const { WebglAddon } = await import("@xterm/addon-webgl");
+              const { createGpuRenderer, createGpuSlots } = await import("../src/lib/terminal/gpuRenderer.ts");
+              const { MAX_VISIBLE_SESSIONS } = await import("../src/lib/terminal/attendance.ts");
+              const { COMPACT_BUDGETS } = await import("../src/lib/resourceBudgets.ts");
+              // Each block gets its own pool on the compact budget, as the page's has, so the
+              // contexts the rest of this page created a moment ago are not counted as the
+              // churn this block measures (the pool damps on recent creations).
+              // The compact hold, as shipped: the 0 set above would release every hidden
+              // context at once and leave nothing to hold or damp.
+              gpuPolicy.hideGraceMs = COMPACT_BUDGETS.gpu_hide_grace_ms;
+              const compactPool = () =>createGpuSlots(COMPACT_BUDGETS.gpu_contexts, MAX_VISIBLE_SESSIONS);
+              let gpuSlots = compactPool();
+              // A loss the page did not ask for is the engine's: past its per-page cap it
+              // force-loses the context drawn least recently. Our own releases go through
+              // `loseContext`, so wrapping it tells the two apart.
+              const ours = new WeakSet();
+              const realGetExtension = WebGL2RenderingContext.prototype.getExtension;
+              WebGL2RenderingContext.prototype.getExtension = function (name) {
+                const ext = realGetExtension.call(this, name);
+                if (name !== "WEBGL_lose_context" || !ext) return ext;
+                return { loseContext: () => { ours.add(this); ext.loseContext(); }, restoreContext: () => ext.restoreContext() };
+              };
+              const churn = { forced: [], created: 0 };
+              const makePane = (label = "pane") => {
+                const host = document.createElement("div");
+                host.style.cssText = "position:fixed;left:0;top:0;width:360px;height:120px;opacity:0.01;pointer-events:none";
+                document.body.append(host);
+                const term = new Terminal({ cols: 40, rows: 6, allowProposedApi: true });
+                term.open(host);
+                const pane = { host, term, canvas: null, renderer: null, label };
+                pane.renderer = createGpuRenderer({
+                  attach: () => {
+                    const addon = new WebglAddon();
+                    term.loadAddon(addon);
+                    churn.created += 1;
+                    pane.canvas = [...term.element.querySelectorAll("canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+                    const gl = pane.canvas.getContext("webgl2");
+                    // As TerminalSession.svelte hears it: a loss on this canvas is the session's to count.
+                    pane.canvas.addEventListener("webglcontextlost", () => {
+                      if (!ours.has(gl)) churn.forced.push(pane.label);
+                      pane.renderer.lose(pane.canvas);
+                    }, true);
+                    return {
+                      canvas: pane.canvas,
+                      dispose: () => addon.dispose(),
+                      onContextLoss: (listener) => addon.onContextLoss(listener),
+                      clearTextureAtlas: () => addon.clearTextureAtlas(),
+                    };
+                  },
+                  slots: gpuSlots,
+                  refresh: () => term.refresh(0, term.rows - 1),
+                });
+                return pane;
+              };
+              // The anchor stands for the dock's own session: on screen the whole time.
+              const anchor = makePane("anchor");
+              anchor.renderer.sync(true);
+              const base = gpuSlots.held();
+              check("the anchor is the only context before the panes (compact budget in force)",
+                () => base === 1 && gpuSlots.cap() === 2);
+              const panes = [makePane(), makePane(), makePane()];
+              for (const pane of panes) pane.renderer.sync(true);
+              await frames(2);
+              const contexts = panes.map((pane) => pane.canvas?.getContext("webgl2"));
+              check("three panes on screen on the compact budget all draw through WebGL",
+                () => panes.every((pane) => pane.renderer.state() === "webgl") && contexts.every((gl) => !!gl && !gl.isContextLost()));
+              check("the pool holds one context per pane on screen, past the budget of two",
+                () => gpuSlots.held() === base + 3);
+              panes[0].renderer.sync(false);
+              check("a pane that leaves the screen while the pool is over its budget releases its context at once",
+                () => panes[0].renderer.state() === "dom" && contexts[0].isContextLost() && gpuSlots.held() === base + 2);
+              panes[1].renderer.sync(false);
+              check("the next one to leave is released too: the dock's session and one pane still on screen use the budget",
+                () => panes[1].renderer.state() === "dom" && contexts[1].isContextLost() && gpuSlots.held() === 2);
+              panes[2].renderer.sync(false);
+              check("the last one to leave is held for the grace: one hidden context, inside the budget",
+                () => panes[2].renderer.state() === "webgl" && !contexts[2].isContextLost() && gpuSlots.held() === 2);
+              check("the dock's own session was never touched by any of that",
+                () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost());
+              for (const pane of panes) {
+                pane.renderer.dispose();
+                pane.term.dispose();
+                pane.host.remove();
+              }
+              check("disposing the panes returns every context they held", () => gpuSlots.held() === base);
+              anchor.renderer.dispose();
+              anchor.term.dispose();
+              anchor.host.remove();
+              gpuSlots = compactPool();
+
+              // -- Dock cycling on the compact budget: one pane that stays on screen and
+              // draws nothing, then five docks shown in turn. On this budget every show
+              // creates a context and every hide releases one, so the page creates and
+              // loses a context per switch. An engine that caps live contexts per page
+              // (WebKit counts a lost one until it is collected) may force-lose the
+              // least recently drawn context: the idle pane's. The idle pane must come
+              // through every round on WebGL, never lost, never on the DOM renderer.
+              const rounds = [];
+              const idlePane = makePane("idle");
+              idlePane.renderer.sync(true);
+              await frames(2);
+              const idleGl = idlePane.canvas.getContext("webgl2");
+              const docks = Array.from({ length: 5 }, (_, n) => makePane(`dock${n}`));
+              let shownDock = -1;
+              let switches = 0;
+              for (const count of [20, 40, 80]) {
+                const forcedBefore = churn.forced.length;
+                const createdBefore = churn.created;
+                for (let i = 0; i < count; i += 1) {
+                  const next = (shownDock + 1) % docks.length;
+                  docks[next].renderer.sync(true);
+                  if (shownDock >= 0) docks[shownDock].renderer.sync(false);
+                  shownDock = next;
+                  switches += 1;
+                  await frames(2);
+                }
+                rounds.push({
+                  switches: count,
+                  created: churn.created - createdBefore,
+                  forced: churn.forced.slice(forcedBefore),
+                  idleState: idlePane.renderer.state(),
+                  idleLost: idleGl.isContextLost(),
+                  dockStates: docks.map((dock) => dock.renderer.state()),
+                });
+              }
+              report.churn = rounds.map((row) => `${row.switches} switches: ${row.created} created, forced losses [${row.forced.join(",")}], idle ${row.idleState}${row.idleLost ? " (context lost)" : ""}, docks ${row.dockStates.join("/")}`);
+              for (const row of rounds) {
+                check(`after ${row.switches} dock switches on the compact budget the idle pane is still on live WebGL, with no forced loss`,
+                  () => row.idleState === "webgl" && !row.idleLost && !row.forced.includes("idle"));
+                check(`after ${row.switches} dock switches no dock was left on the DOM renderer for good`,
+                  () => !row.dockStates.includes("lost"));
+              }
+              for (const pane of [idlePane, ...docks]) {
+                pane.renderer.dispose();
+                pane.term.dispose();
+                pane.host.remove();
+              }
+              WebGL2RenderingContext.prototype.getExtension = realGetExtension;
+            }
             gpuPolicy.hideGraceMs = 400;
+
+            // -- The loss budget below is the page's own: a loss while the page is creating
+            // contexts in a burst is forgiven (`gpuRenderer.ts`), and the cycles above
+            // were such a burst. Let the creation record age out first, and say how long.
+            {
+              const { gpuSlots: pageSlots, GPU_CHURN_FORGIVE_AT, GPU_CHURN_WINDOW_MS } = await import("../src/lib/terminal/gpuRenderer.ts");
+              const calmFrom = performance.now();
+              while (pageSlots.recentCreations() >= GPU_CHURN_FORGIVE_AT && performance.now() - calmFrom < GPU_CHURN_WINDOW_MS + 2000) await wait(500);
+              report.calmWaitMs = Math.round(performance.now() - calmFrom);
+              check("the page's recent context creations are below the churn threshold before the loss budget is exercised",
+                () => pageSlots.recentCreations() < GPU_CHURN_FORGIVE_AT);
+            }
 
             // -- A lost context: the DOM at once, then WebGL again, within the budget.
             const loseNow = async () => {
@@ -1993,7 +2153,7 @@
         const sync = fit.length && fit.every((row) => row.pass) ? await runSync() : { results: [], numbers: {} };
         const bypass = sync.results.length && sync.results.every((row) => row.pass) ? await runBypass() : [];
         const results = [...checks, ...stress, ...fit, ...sync.results, ...bypass];
-        const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}; skipped in this engine ${JSON.stringify(report.skipped)}`;
+        const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}; skipped in this engine ${JSON.stringify(report.skipped)}; dock churn ${JSON.stringify(report.churn ?? null)}; calm wait ms ${report.calmWaitMs ?? null}`;
         document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors, diagnostics }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }

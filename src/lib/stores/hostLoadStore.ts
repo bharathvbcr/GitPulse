@@ -1,10 +1,11 @@
-import { derived, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { refusalNotice } from "../health/hostLoad";
 import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
+import type { ResourceBudgets } from "../resourceBudgets";
 
 /**
  * Host load as the app's sampler publishes it (`src-tauri/src/sysload`,
@@ -173,6 +174,8 @@ export interface AgentSession {
    * session above it that the scan could see", not "started by a person".
    */
   parent_pid: number | null;
+  /** CPU nanoseconds per second since the previous tick; a full core is 1e9. */
+  cpu_rate: Reading<number>;
   footprint: Reading<number>;
   /**
    * Bytes per second the session's own process and its attached descendants
@@ -193,6 +196,7 @@ export interface LaunchedTree {
   unreadable_members: number;
   footprint: Reading<number>;
   write_rate: Reading<number>;
+  cpu_rate: Reading<number>;
 }
 
 export interface ForeignProcess {
@@ -374,6 +378,25 @@ export interface GovernorPulse {
   largest_foreign: number | null;
 }
 
+/** `sysload::ProfileTier`: how much headroom the machine has. */
+export type ProfileTier = "compact" | "standard" | "roomy";
+/** `host_load_profile`: `auto` derives the tier from memory, the others pin it. */
+export type ProfileChoice = "auto" | ProfileTier;
+/**
+ * `sysload::ProfileBasis`: how the tier was decided. `memory_unreadable` is a
+ * default (`standard`), not a derived answer.
+ */
+export type ProfileBasis = "memory" | "override" | "memory_unreadable";
+
+/** `sysload::ResourceProfile`: the capacity budgets this machine allows. */
+export interface ResourceProfile {
+  tier: ProfileTier;
+  basis: ProfileBasis;
+  memory_bytes: number | null;
+  logical_cores: number | null;
+  budgets: ResourceBudgets;
+}
+
 /** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
 export const HOST_PRESSURE_REFUSAL = "host_pressure";
 
@@ -439,6 +462,7 @@ export interface HostLoadStatus {
   sensor: SensorReport;
   pressure: PressureInput;
   governor: GovernorReport;
+  profile: ResourceProfile;
   snapshot_path: string | null;
   writer: WriterIdentity | null;
   writer_is_self: boolean;
@@ -512,6 +536,24 @@ export interface Thresholds {
 /** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
 export type HostLoadHookMode = "enforce" | "advise" | "off";
 
+/** `tool_config::LeaseMode`. */
+export type LeaseMode = "on" | "off";
+
+/** `tool_config::HostLoadLeases`: how heavy builds are leased. Stored as `host_load_leases`. */
+export interface HostLoadLeases {
+  mode: LeaseMode;
+  slots: number;
+  wait_max_s: number;
+  wait_hard_s: number;
+  incremental_off: boolean;
+}
+
+/** `tool_config::HostLoadIdle`: when a session counts as idle and when Health offers Park. Stored as `host_load_idle`. */
+export interface HostLoadIdle {
+  idle_after_s: number;
+  park_after_s: number;
+}
+
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
@@ -519,7 +561,26 @@ export interface HostLoadSettings {
   /** Stored as the top-level `host_load_hook_mode`, never inside `host_load`. */
   hook_mode: HostLoadHookMode;
   thresholds: Thresholds;
+  leases: HostLoadLeases;
+  idle: HostLoadIdle;
+  /**
+   * Which resource profile sizes GitPulse's caches. Stored as the top-level
+   * `host_load_profile`, never inside `host_load`.
+   */
+  profile: ProfileChoice;
 }
+
+/** Mirrors `HostLoadLeases::default` in Rust. */
+export const DEFAULT_LEASES: HostLoadLeases = {
+  mode: "on",
+  slots: 4,
+  wait_max_s: 1800,
+  wait_hard_s: 14400,
+  incremental_off: false,
+};
+
+/** Mirrors `HostLoadIdle::default` in Rust. */
+export const DEFAULT_IDLE: HostLoadIdle = { idle_after_s: 900, park_after_s: 3600 };
 
 /**
  * Mirrors `Thresholds::default` in Rust. Provisional: each default was set
@@ -627,12 +688,40 @@ export function startHostLoad(): void {
   const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
     announceRefusal(event.payload);
+    rereadProfileIfUnsettled();
   }).catch((error) => {
     if (listening === attempt) listening = null;
     diagnostics.warn("hostLoad", `couldn't listen for the host-load pulse; will retry: ${String(error)}`);
     return null;
   });
   listening = attempt;
+  profileRetryNotBefore = Date.now() + PROFILE_RETRY_BASE_MS;
+  void refreshHostLoad().catch(() => undefined);
+}
+
+/** First wait before the profile is reread; each further wait doubles, up to the cap. */
+export const PROFILE_RETRY_BASE_MS = 2_000;
+export const PROFILE_RETRY_CAP_MS = 60_000;
+
+let profileRetries = 0;
+let profileRetryNotBefore = 0;
+
+/**
+ * The pulse does not carry the resource profile, so a start-up read that failed,
+ * or that said the computer's memory could not be read, would leave every
+ * consumer on a guessed tier until a restart. While the profile is unsettled
+ * (no status yet, or `memory_unreadable`) a pulse rereads it, but on a doubling
+ * wait that levels off at `PROFILE_RETRY_CAP_MS`: at most one read a minute for
+ * a read that never succeeds, never one per two-second tick, and never a stop
+ * that would strand the tier. A change of setting starts the waits over.
+ */
+function rereadProfileIfUnsettled(): void {
+  const held = get(statusStore);
+  if (held !== null && held.profile.basis !== "memory_unreadable") return;
+  const now = Date.now();
+  if (now < profileRetryNotBefore) return;
+  profileRetryNotBefore = now + Math.min(PROFILE_RETRY_CAP_MS, PROFILE_RETRY_BASE_MS * 2 ** profileRetries);
+  profileRetries += 1;
   void refreshHostLoad().catch(() => undefined);
 }
 
@@ -665,6 +754,8 @@ export function refreshHostLoad(): Promise<HostLoadStatus | null> {
  * reads again instead of joining it.
  */
 function refreshAfterChange(): void {
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   void (refreshing ?? Promise.resolve())
     .catch(() => undefined)
     .then(() => refreshHostLoad())
@@ -692,12 +783,129 @@ export async function admitAnyway(): Promise<string> {
   return message;
 }
 
-/** Mirrors `HostLoadSettings::default` in Rust: on. */
+/** `sysload::lease::Record`: what a slot or a ticket says about its build. */
+/** `sysload::lease::Priority`: terminals first, then task runs, then sessions only observed. */
+export type Priority = "terminal" | "run" | "observed";
+
+export interface LeaseRecord {
+  pid: number;
+  start_us: number;
+  session_key: string;
+  priority: Priority;
+  terminal_session: string | null;
+  run_id: string | null;
+  cwd: string;
+  label: string;
+  enqueued_mono_ns: number;
+  granted_mono_ns: number | null;
+  tier_at_grant: Tier | null;
+  verdict_unavailable_reason: string | null;
+  overflow: boolean;
+}
+
+export interface LeaseHolder {
+  slot: number;
+  pid: number;
+  /** Null is a lock with no readable record of whose it is. */
+  record: LeaseRecord | null;
+}
+
+export interface LeaseWaiter {
+  name: string;
+  record: LeaseRecord;
+}
+
+/** `sysload::lease::Capacity`. */
+export interface LeaseCapacity {
+  configured: number;
+  slots: number;
+  refuses: boolean;
+  tier: Tier | null;
+  note: string | null;
+}
+
+/** `sysload::lease::Status`: every field that could not be read says why instead of reading zero. */
+export interface LeaseStatus {
+  on: boolean;
+  configured: number;
+  capacity: LeaseCapacity;
+  holders: LeaseHolder[];
+  queue: LeaseWaiter[];
+  unreadable: string[];
+  error: string | null;
+  links_missing: string | null;
+  misses: number | null;
+  /** The marker directory held more than one read looks at: `misses` is a floor. */
+  misses_truncated: boolean;
+  misses_error: string | null;
+  unleased_running: number | null;
+  unleased_error: string | null;
+  now_mono_ns: number;
+}
+
+/**
+ * Reads the build leases; never writes. `queueOnly` skips the process-table
+ * read and the miss count (what the terminal pill needs is the queue), and
+ * the fields it skipped say so instead of reading zero.
+ */
+export function loadLeaseStatus(queueOnly = false): Promise<LeaseStatus | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  return invoke<LeaseStatus>("cmd_host_load_leases", { queueOnly });
+}
+
+/** `sysload::activity::SessionActivity`. */
+export type SessionActivity =
+  | { state: "busy"; why: string }
+  | { state: "idle"; since_ms: number; why: string }
+  | { state: "unknown"; why: string };
+
+export interface IdleSession {
+  terminal_session: string | null;
+  kind: AgentKind;
+  pid: number;
+  start_us: number;
+  cwd: string | null;
+  footprint: Reading<number>;
+  activity: SessionActivity;
+  /** Why it cannot be parked, or null when it can. */
+  park_blocked: string | null;
+}
+
+/** `sysload::activity::Report`. */
+export interface IdleReport {
+  sessions: IdleSession[];
+  idle: number;
+  unknown: number;
+  idle_after_s: number;
+  park_after_s: number;
+  error: string | null;
+}
+
+export function loadIdleReport(): Promise<IdleReport | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  return invoke<IdleReport>("cmd_host_load_idle");
+}
+
+/**
+ * A person's "Park" on one idle session. The backend checks it again, asks in a
+ * native dialog that page script cannot answer, and checks once more; a No or
+ * a changed session rejects, so a caller must not retry on a rejection.
+ */
+export async function parkSession(terminalSession: string): Promise<string> {
+  const message = await invoke<string>("cmd_host_load_park", { sessionId: terminalSession });
+  refreshAfterChange();
+  return message;
+}
+
+/** Mirrors `HostLoadSettings::default` in Rust: on, profile derived. */
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
   hook_mode: "enforce",
   thresholds: DEFAULT_THRESHOLDS,
+  leases: DEFAULT_LEASES,
+  idle: DEFAULT_IDLE,
+  profile: "auto",
 };
 
 /**
@@ -723,6 +931,9 @@ export async function saveHostLoadSettings(settings: HostLoadSettings): Promise<
   }
   const saved = await invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
   settingsStore.set(saved);
+  // The profile is part of the status: reread it so a change of tier reaches
+  // every consumer now, not on a restart.
+  refreshAfterChange();
   return saved;
 }
 
@@ -760,6 +971,16 @@ export const hostLoadStatus: Readable<HostLoadStatus | null> = {
 };
 
 /**
+ * The resource profile the backend derived, or null until the first status
+ * arrives. A consumer sizing itself from it uses `COMPACT_BUDGETS` while it
+ * is null, never a roomy default (`resourceBudgets.ts`).
+ */
+export const resourceProfile: Readable<ResourceProfile | null> = derived(
+  statusStore,
+  (status) => status?.profile ?? null,
+);
+
+/**
  * The memory-pressure input for features that defer background work under
  * load (card 1c): a level only while the sensor may be acted on.
  */
@@ -773,6 +994,8 @@ export function resetHostLoadForTests(): void {
   listening = null;
   refreshing = null;
   noticeShown = false;
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   pulseStore.set(null);
   statusStore.set(null);
   settingsStore.set(null);

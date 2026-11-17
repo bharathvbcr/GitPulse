@@ -18,6 +18,7 @@
   import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
   import ListPreviewToggle from "../ListPreviewToggle.svelte";
   import HealthTable from "./HealthTable.svelte";
+  import HostLoadLeases from "./HostLoadLeases.svelte";
   import {
     admitAnyway,
     hostLoadStatus,
@@ -367,6 +368,8 @@
         <p class="text-textMuted" data-testid="host-load-terminate-outcome">{outcome}</p>
       {/if}
     {/if}
+
+    <HostLoadLeases />
 
     {#if status.previous_boot}
       <div class="space-y-1" data-testid="host-load-previous-boot">

@@ -30,11 +30,14 @@
  *
  * ## Invariants this module keeps
  *
- *  - **At most `MAX_VISIBLE_SESSIONS` contexts per window.** Slots are counted
- *    exactly: a slot is held from `attach` until the context has been freed, a
- *    session in its hold counts, and a caller that claims more sessions are on
- *    screen than can be is refused here, where the mistake is, and keeps
- *    drawing through the DOM.
+ *  - **At most `MAX_VISIBLE_SESSIONS` contexts per window, and a terminal on
+ *    screen is never refused one before that.** Slots are counted exactly: a
+ *    slot is held from `attach` until the context has been freed, a session in
+ *    its hold counts, and a caller that claims more sessions are on screen than
+ *    can be is refused here, where the mistake is, and keeps drawing through
+ *    the DOM. The resource profile's cap budgets only what is held beyond the
+ *    terminals on screen (`max(cap, on screen)` contexts in all), so a small
+ *    machine holds fewer hidden contexts, never a slower on-screen pane.
  *  - **A loss never blanks the pane.** The DOM renderer is back synchronously,
  *    on the canvas's own `webglcontextlost`, without waiting out the addon's
  *    three-second restore window.
@@ -63,6 +66,7 @@
  * Nothing here imports xterm: `attach` is the caller's, so the decisions are
  * testable without a WebGL context.
  */
+import { COMPACT_BUDGETS } from "../resourceBudgets";
 import { MAX_VISIBLE_SESSIONS } from "./attendance";
 
 /**
@@ -72,7 +76,11 @@ import { MAX_VISIBLE_SESSIONS } from "./attendance";
  */
 export type GpuState = "dom" | "webgl" | "reset" | "lost";
 
-/** How long a hidden session keeps its context before giving it back. */
+/**
+ * How long a hidden session keeps its context before giving it back, on a
+ * machine with room (the `roomy` resource profile). `gpuPolicy.hideGraceMs`
+ * follows the profile (`resourceBudgets.ts`) and starts at the compact value.
+ */
 export const GPU_HIDE_GRACE_MS = 5 * 60_000;
 /** After a loss, how long before the session attaches again. */
 export const GPU_RECOVER_DELAY_MS = 1_500;
@@ -80,6 +88,45 @@ export const GPU_RECOVER_DELAY_MS = 1_500;
 export const GPU_LOSS_BUDGET = 3;
 /** The span a session's losses are counted over. */
 export const GPU_LOSS_WINDOW_MS = 10 * 60_000;
+
+/**
+ * The span the pool counts the contexts the page creates over. An engine that
+ * caps live WebGL contexts per page (WebKit: 16, and a lost one counts until
+ * it is collected) force-loses the one drawn least recently when a burst of
+ * creations passes the cap, which on the small tiers, where every dock switch
+ * creates one context and releases another, is a pane nobody is touching.
+ */
+export const GPU_CHURN_WINDOW_MS = 60_000;
+/**
+ * Creations in the window at which the pool stops releasing hidden holders
+ * that are over the tier's budget. Chosen from the WebKit dock-cycling check
+ * in `harness/terminal.html`: with the dock session, one idle pane and the
+ * pane being shown live, the engine's 16 is reached after about thirteen
+ * creations in a burst and the idle pane was force-lost within the first
+ * twenty; six creations is one turn of a five-dock rotation, early enough that
+ * the docks are held (up to the window maximum of eight) before the cap is
+ * near, and rare enough that a person switching a few times a minute never
+ * reaches it.
+ */
+export const GPU_CHURN_DAMPING_AT = 6;
+/**
+ * Creations in the window at which a loss is the page's own churn, not the
+ * session's fault, and does not count against its budget.
+ */
+export const GPU_CHURN_FORGIVE_AT = 12;
+/**
+ * Losses one session may have forgiven in the loss window. Forgiveness is for
+ * a burst; a session that keeps losing while the page keeps creating is
+ * counted again past this, so it cannot recover in a loop for ever.
+ *
+ * Deliberately looser than the old limit: a session that loses about 1.2 times
+ * a minute while the page stays at 12 or more creations a minute (this many
+ * forgiven losses plus the budget's worth of counted ones, per loss window) is
+ * never finalized, where the old limit of the budget alone ended a session that
+ * lost 0.4 times a minute. The page creating that fast is the cause the pool
+ * blames, and a finalized session draws on the slower DOM renderer for good.
+ */
+export const GPU_LOSS_FORGIVEN_MAX = 3 * GPU_LOSS_BUDGET;
 
 /** The numbers above, as one object the browser harness can shorten. */
 export interface GpuPolicy {
@@ -89,9 +136,14 @@ export interface GpuPolicy {
   lossWindowMs: number;
 }
 
-/** Read at each decision; the harness narrows it, nothing else writes to it. */
+/**
+ * Read at each decision; the harness narrows it and the resource profile sets
+ * the grace (`applyResourceBudgets`). Until a profile arrives the grace is the
+ * compact one, so a small machine never starts out holding hidden contexts for
+ * the roomy five minutes.
+ */
 export const gpuPolicy: GpuPolicy = {
-  hideGraceMs: GPU_HIDE_GRACE_MS,
+  hideGraceMs: COMPACT_BUDGETS.gpu_hide_grace_ms,
   recoverDelayMs: GPU_RECOVER_DELAY_MS,
   lossBudget: GPU_LOSS_BUDGET,
   lossWindowMs: GPU_LOSS_WINDOW_MS,
@@ -151,8 +203,37 @@ export interface GpuSlots {
   /** Slots held now, including those a hidden session is holding. */
   held(): number;
   /**
+   * The budget for hidden contexts. Every terminal on screen always keeps its
+   * own context (up to the window maximum of eight, roughly 49 MB of graphics
+   * memory each), so the budget limits only what is kept for terminals out of
+   * sight: the pool holds `max(cap, terminals on screen)` contexts in all, and
+   * the hidden ones allowed are `max(0, cap - terminals on screen)`. A cap of
+   * two with one terminal on screen keeps one hidden context; with two or more
+   * on screen it keeps none. One exception: while the page is creating contexts
+   * in a burst (`GPU_CHURN_DAMPING_AT` in the last minute) hidden terminals keep
+   * theirs beyond the budget, up to the window maximum, so that showing them
+   * again does not create more; the budget applies again when the burst ends.
+   */
+  cap(): number;
+  /**
+   * Records that the page has just created a context. The pool counts them
+   * over the last minute (`GPU_CHURN_WINDOW_MS`).
+   */
+  noteCreated(): void;
+  /** Contexts the page created in the last minute. */
+  recentCreations(): number;
+  /**
+   * Changes the cap (floored, at least one; a value that is not a finite
+   * number is ignored). A smaller cap gives up hidden holders beyond it,
+   * longest-hidden first, at once; an on-screen or attaching session is never
+   * taken from.
+   */
+  setCap(next: number): void;
+  /**
    * Offers a held slot to whoever needs it: `release` must free the context
-   * and `give()` its slot. Returns a function that withdraws the offer.
+   * and `give()` its slot. Returns a function that withdraws the offer. When
+   * the pool is over its budget the longest-hidden offer is taken up at once,
+   * so a terminal hidden past the budget does not wait out its grace.
    */
   idle(release: () => void): () => void;
   /**
@@ -162,7 +243,22 @@ export interface GpuSlots {
   wait(retry: () => void): () => void;
 }
 
-export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
+export function createGpuSlots(
+  initialCap: number = MAX_VISIBLE_SESSIONS,
+  /** The most contexts that may be live at once, whatever the budget. */
+  hardCap: number = initialCap,
+  /** The clock the creation count reads; a test's, or the page's. */
+  now: () => number = () => Date.now(),
+): GpuSlots {
+  let cap = initialCap;
+  /** When the page created its contexts, oldest first, over the last minute. */
+  const created: number[] = [];
+  const MAX_RECORDED = 1_024;
+  const recent = () => {
+    const cutoff = now() - GPU_CHURN_WINDOW_MS;
+    while (created.length > 0 && created[0] <= cutoff) created.shift();
+    return created.length;
+  };
   let held = 0;
   /** Hidden holders, longest-hidden first (a Set keeps insertion order). */
   const idles = new Set<() => void>();
@@ -170,6 +266,23 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
   /** Above zero while a take is freeing a slot for itself: nobody else may have it. */
   let reclaiming = 0;
   let notifying = false;
+
+  /** Holders that are drawing or attaching: everything held that is not on offer. */
+  const active = () => held - idles.size;
+  /**
+   * How many contexts may be held while `onScreen` terminals are drawing: the
+   * budget, or one per terminal on screen when that is more, never past the
+   * window's maximum. The budget is for the hidden; it never takes a context
+   * from a terminal that can be seen.
+   */
+  const allowed = (onScreen: number) => {
+    // While the page is creating contexts fast, releasing the over-budget hidden
+    // ones only feeds the churn that makes the engine force-lose a pane on
+    // screen: they stay, up to the window maximum, and the tier's budget applies
+    // again once the rate drops (the next decision, or the hold's own timer).
+    const budget = recent() >= GPU_CHURN_DAMPING_AT ? hardCap : cap;
+    return Math.min(hardCap, Math.max(budget, onScreen));
+  };
 
   const reclaimOldest = () => {
     const [oldest] = idles;
@@ -183,13 +296,19 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
     }
   };
 
+  /** Gives up hidden holders the pool can no longer afford, longest-hidden first. */
+  const trim = () => {
+    const limit = allowed(active());
+    while (held > limit && idles.size > 0) reclaimOldest();
+  };
+
   const notify = () => {
     if (notifying) return;
     notifying = true;
     try {
       // Each retry either takes the slot, which ends the loop's condition, or
       // is final; a waiter that is refused again re-registers behind the loop.
-      while (waiters.size > 0 && (held < cap || idles.size > 0)) {
+      while (waiters.size > 0 && active() < hardCap) {
         const [next] = waiters;
         waiters.delete(next);
         next();
@@ -201,8 +320,11 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
 
   return {
     take() {
-      if (held >= cap) reclaimOldest();
-      if (held >= cap) return false;
+      if (active() >= hardCap) return false;
+      // A terminal on screen always gets its context: the budget is spent on
+      // hidden holders first, longest-hidden first.
+      const limit = allowed(active() + 1);
+      while (held + 1 > limit && idles.size > 0) reclaimOldest();
       held += 1;
       return true;
     },
@@ -211,8 +333,24 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
       if (reclaiming === 0) notify();
     },
     held: () => held,
+    cap: () => cap,
+    noteCreated() {
+      created.push(now());
+      if (created.length > MAX_RECORDED) created.shift();
+    },
+    recentCreations: recent,
+    setCap(next) {
+      if (!Number.isFinite(next)) return;
+      cap = Math.max(1, Math.floor(next));
+      // An on-screen or attaching session is not in `idles`, so it is never taken from.
+      trim();
+      notify();
+    },
     idle(release) {
       idles.add(release);
+      // Hidden while the pool is over its budget: the longest-hidden holder
+      // goes now, which is this one when it is the only one on offer.
+      trim();
       notify();
       return () => {
         idles.delete(release);
@@ -227,8 +365,13 @@ export function createGpuSlots(cap: number = MAX_VISIBLE_SESSIONS): GpuSlots {
   };
 }
 
-/** Every terminal in the window draws from this one pool. */
-export const gpuSlots = createGpuSlots();
+/**
+ * Every terminal in the window draws from this one pool. Its budget for
+ * hidden contexts starts at the compact one and follows the resource profile
+ * (`applyResourceBudgets`); a terminal on screen is never held back by it, up
+ * to `MAX_VISIBLE_SESSIONS`.
+ */
+export const gpuSlots = createGpuSlots(COMPACT_BUDGETS.gpu_contexts, MAX_VISIBLE_SESSIONS);
 
 export interface GpuRenderer {
   /**
@@ -282,6 +425,9 @@ export function createGpuRenderer(deps: {
   let stopWaiting: (() => void) | null = null;
   let recoverTimer: ReturnType<typeof setTimeout> | null = null;
   let losses: number[] = [];
+  /** Losses the page's own churn caused, which did not count against the budget. */
+  let forgiven: number[] = [];
+  let lastLossAt = 0;
 
   const set = (next: GpuState) => {
     if (next === state) return;
@@ -367,6 +513,7 @@ export function createGpuRenderer(deps: {
       return;
     }
     addon = created;
+    slots.noteCreated();
     lossListener = created.onContextLoss(() => lose());
     set("webgl");
     repaint();
@@ -384,7 +531,7 @@ export function createGpuRenderer(deps: {
   const scheduleRecover = () => {
     clearRecover();
     if (closed || final || !wanted) return;
-    const wait = Math.max(0, (losses.at(-1) ?? 0) + policy().recoverDelayMs - Date.now());
+    const wait = Math.max(0, lastLossAt + policy().recoverDelayMs - Date.now());
     recoverTimer = setTimeout(() => {
       recoverTimer = null;
       attempt();
@@ -406,11 +553,20 @@ export function createGpuRenderer(deps: {
       return;
     }
     const now = Date.now();
+    lastLossAt = now;
     losses = losses.filter((at) => now - at < policy().lossWindowMs);
-    losses.push(now);
-    if (losses.length > policy().lossBudget) {
-      finalize();
-      return;
+    forgiven = forgiven.filter((at) => now - at < policy().lossWindowMs);
+    // A page creating contexts fast makes its engine force-lose the one drawn
+    // least recently, whichever pane that is: the loss is the pool's doing, not
+    // this session's, so it is not counted, and the session attaches again.
+    if (slots.recentCreations() >= GPU_CHURN_FORGIVE_AT && forgiven.length < GPU_LOSS_FORGIVEN_MAX) {
+      forgiven.push(now);
+    } else {
+      losses.push(now);
+      if (losses.length > policy().lossBudget) {
+        finalize();
+        return;
+      }
     }
     set("reset");
     scheduleRecover();
@@ -457,7 +613,7 @@ export function createGpuRenderer(deps: {
         }
         return state;
       }
-      if (state === "reset" && (losses.at(-1) ?? 0) + policy().recoverDelayMs > Date.now()) {
+      if (state === "reset" && lastLossAt + policy().recoverDelayMs > Date.now()) {
         if (!recoverTimer) scheduleRecover();
         return state;
       }

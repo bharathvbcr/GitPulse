@@ -49,6 +49,15 @@ use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 pub mod advisory_once;
 pub mod deliver;
 mod heavy_commands;
+#[cfg(unix)]
+pub mod lease_wrapper;
+
+/// Whether `program args` is a build that takes a build slot: the one reading
+/// of the heavy table (`heavy_commands::leased`) the lease wrapper acts on and
+/// Health counts unleased builds by.
+pub(crate) fn build_is_leased(program: &str, args: &[String]) -> bool {
+    heavy_commands::leased(program, args)
+}
 mod load_gate;
 pub(crate) mod notify_drops;
 mod notify_input;
@@ -3657,12 +3666,23 @@ fn run_session_brief_with(
         ));
     };
     report_agent_session_meta(&here, input);
+    let load_line = load_gate::brief_line_live();
+    #[cfg(unix)]
+    let load_line = {
+        let route = lease_wrapper::route_session(
+            &input.session_id,
+            std::env::var_os("CLAUDE_ENV_FILE").as_deref(),
+            crate::tool_config::default_config_dir().as_deref(),
+            std::env::var_os(lease_wrapper::BIN_ENV).is_some(),
+        );
+        format!("{load_line}; {}", route.describe())
+    };
     let brief = session_brief_with(
         &snapshot,
         &here,
         &input.source,
         app_age_ms,
-        Some(&load_gate::brief_line_live()),
+        Some(&load_line),
     );
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
@@ -3904,11 +3924,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// source-only contract test cannot see, because it reads the source rather
 /// than whatever executable a host will actually spawn.
 pub fn identity() -> String {
+    let served: Vec<&str> = SUBCOMMANDS.iter().chain(&BINARY_MODES).copied().collect();
     format!(
         "gitpulse-hook {VERSION}\nsubcommands: {}\n",
-        SUBCOMMANDS.join(", ")
+        served.join(", ")
     )
 }
+
+/// What this binary does besides answer a hook: it is the build-lease wrapper
+/// (`gitpulse-hook lease -- cargo build`, `lease_wrapper`). Advertised on the
+/// `--version` line so `mcp:doctor` can tell a binary that has it from an older
+/// one, but not a hook subcommand: no host sends it and `dispatch` refuses it.
+pub const BINARY_MODES: [&str; 1] = ["lease"];
 
 /// Routes one parsed payload to its handler.
 ///
@@ -4212,6 +4239,11 @@ fn peer_inbox_prepare(
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
         return (None, fresh_user_turn);
     }
+    // This runs on every tool call: learn that nothing is waiting without the
+    // session lock. An error falls through to the prepare, which reports it.
+    if matches!(mailbox.has_unclaimed(&input.session_id), Ok(false)) {
+        return (None, fresh_user_turn);
+    }
 
     let fallback_reader = format!(
         "{}:{}",
@@ -4467,6 +4499,14 @@ fn run_notify(
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
 ) -> Result<HookOutput, HookError> {
+    // A Claude Code `Stop` arrives here as `notify turn_finished`, and never
+    // reaches `stop_continue_in` (Antigravity's stop path, which marks the peer
+    // idle itself), so without this the peer stayed "working" after its turn.
+    if argument == Some("turn_finished") {
+        if let Some(root) = trusted_hook_root(input) {
+            let _ = upsert_hook_peer(&root, input, "idle");
+        }
+    }
     let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
     if argument == Some("tool_finished") {
         report_agent_touched_file(input);
@@ -10663,8 +10703,14 @@ done
             .expect("the subcommand line keeps its prefix");
         let served: Vec<&str> = listed.split(", ").collect();
         // Derived from SUBCOMMANDS rather than spelled out, so a hook added to
-        // the dispatcher is advertised without anyone editing this test.
-        assert_eq!(served, SUBCOMMANDS.to_vec());
+        // the dispatcher is advertised without anyone editing this test. The
+        // binary's own modes follow the hooks.
+        let mut expected = SUBCOMMANDS.to_vec();
+        expected.extend(BINARY_MODES);
+        assert_eq!(served, expected);
+        assert!(served.contains(&"lease"), "the lease wrapper is advertised");
+        #[cfg(unix)]
+        assert_eq!(BINARY_MODES, [lease_wrapper::SUBCOMMAND]);
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 
@@ -12855,5 +12901,77 @@ done
             .entries
             .is_empty());
         primary.shutdown();
+    }
+
+    /// The peer-inbox hook runs on every tool call. Once a session's mailbox
+    /// exists and holds nothing pending, it must not take the session lock to
+    /// find that out. And a Claude Code `Stop` (`notify turn_finished`) must
+    /// leave the peer idle rather than "working" until its next tool call; that
+    /// held only on Antigravity's stop path.
+    #[test]
+    fn an_empty_peer_inbox_takes_no_lock_and_a_claude_turn_finished_marks_the_peer_idle() {
+        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
+        let repo_str = repo_dir.path().to_str().unwrap().to_owned();
+        crate::test_support::trust_repo(repo_dir.path());
+        let mb_dir = tempfile::tempdir().unwrap();
+        let mb_root = mb_dir.path().join("agent-mailbox");
+        let mailbox = crate::agent_mailbox::Mailbox::new(mb_root.clone());
+        let locks = mb_root.join(".locks");
+        let sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let peer_state = || {
+            crate::engine::agent_bus::list_reconciled_peers(&repo_str)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.record.provider_session_id.as_deref() == Some(sid))
+                .map(|p| p.record.turn_state)
+        };
+        let post_tool = parse_input(
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": sid,
+                "cwd": repo_str,
+                "tool_name": "Read",
+                "tool_input": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stop = parse_input(
+            &json!({ "hook_event_name": "Stop", "session_id": sid, "cwd": repo_str }).to_string(),
+        )
+        .unwrap();
+
+        // A waiting message is delivered through the claim, which takes the lock.
+        mailbox
+            .deposit(sid, "msg-first", "ping", std::time::SystemTime::now())
+            .unwrap();
+        assert!(
+            !peer_inbox_in(&mailbox, &post_tool).is_silent(),
+            "a pending message must be delivered"
+        );
+        assert_eq!(peer_state().as_deref(), Some("working"));
+
+        // The session's mailbox now exists with nothing pending: the next tool
+        // call must answer that without the session lock.
+        std::fs::remove_dir_all(&locks).unwrap();
+        assert!(peer_inbox_in(&mailbox, &post_tool).is_silent());
+        assert!(
+            !locks.exists(),
+            "an empty session mailbox must be answered without the session lock"
+        );
+
+        let _ = run_notify(Some("turn_finished"), &stop, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            peer_state().as_deref(),
+            Some("idle"),
+            "a Claude Stop must mark the peer idle"
+        );
+
+        assert!(peer_inbox_in(&mailbox, &post_tool).is_silent());
+        assert_eq!(
+            peer_state().as_deref(),
+            Some("working"),
+            "the next tool call resumes it"
+        );
     }
 }

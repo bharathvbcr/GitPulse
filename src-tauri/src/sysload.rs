@@ -37,12 +37,15 @@
 //! been verified on a real Linux host. Windows reports unavailable. See
 //! [`Platform`].
 
+pub mod activity;
 mod disk;
 mod diskrate;
 mod exec_probe;
 mod governor;
+pub mod lease;
 mod probe;
 pub(crate) mod procscan;
+mod profile;
 mod sampler;
 mod sensor;
 mod snapshot;
@@ -77,9 +80,13 @@ pub use procscan::{
     AgentSession, CallerIdentity, ForeignProcess, LaunchedTree, MemguardHealth, Orphan, ProcView,
     ScanContext, Scanner as ProcessScanner, SessionCount, SessionScan,
 };
+pub use profile::{
+    current as current_profile, derive as derive_profile, ProfileBasis, ProfileChoice, ProfileTier,
+    ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES, STANDARD_MAX_BYTES,
+};
 pub use sampler::{
-    pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput, Role,
-    SamplerOptions, StopHandle,
+    profile, pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput,
+    Role, SamplerOptions, StopHandle,
 };
 pub use sensor::{
     Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, HostSample, Level,

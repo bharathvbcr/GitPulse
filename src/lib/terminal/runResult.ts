@@ -218,6 +218,11 @@ export interface TerminalListing {
   ending?: boolean;
   /** Parent session id when spawned as an Option A child session. */
   parent_session_id?: string;
+  /**
+   * Milliseconds since its terminal last printed, when the host that holds the
+   * PTY can say. Absent is unknown, never quiet.
+   */
+  quiet_ms?: number | null;
 }
 
 /**

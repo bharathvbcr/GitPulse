@@ -17,6 +17,7 @@
 use super::diskrate::FillTracker;
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
+use super::profile::{current as current_profile, ProfileChoice, ResourceProfile};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
 use super::snapshot::{self, PublishedVerdict, Snapshot, TickStats, Writer, WriterIdentity};
 use super::trace::{self, PreviousBoot, TraceFeed, TraceRecord};
@@ -74,6 +75,9 @@ pub struct HostLoadStatus {
     /// What the governor decided from this sensor: admission, shedding and
     /// why (`sysload::governor`).
     pub governor: GovernorReport,
+    /// What this machine can afford GitPulse to hold, sized from the memory
+    /// this sensor reads and `host_load_profile` (`sysload::profile`).
+    pub profile: ResourceProfile,
     pub snapshot_path: Option<String>,
     pub writer: Option<WriterIdentity>,
     pub writer_is_self: bool,
@@ -131,6 +135,8 @@ pub struct SamplerOptions {
     /// `host_load.govern_launches`, read once per tick: whether severe
     /// pressure refuses agent launches.
     pub govern_launches: Box<dyn Fn() -> bool + Send>,
+    /// `host_load_profile`, read once per tick: the tier the user asked for.
+    pub profile_choice: Box<dyn Fn() -> ProfileChoice + Send>,
     /// Each input's mode and thresholds, read once per tick like
     /// `govern_launches`.
     pub thresholds: Box<dyn Fn() -> super::Thresholds + Send>,
@@ -155,6 +161,7 @@ impl SamplerOptions {
             cadence: Duration::from_millis(CADENCE_MS),
             enabled: Box::new(|| true),
             govern_launches: Box::new(|| true),
+            profile_choice: Box::new(|| ProfileChoice::Auto),
             thresholds: Box::new(super::Thresholds::default),
             on_tick: None,
             begin_activity: Box::new(|| {
@@ -318,8 +325,12 @@ pub fn status() -> HostLoadStatus {
         {
             // Aged to now, not to the tick that stored it: a sampler that
             // stopped ticking must not leave a fresh-looking verdict.
+            // The profile is re-derived from the stored choice too: a change in
+            // Settings must reach the page on its next read, not after the
+            // sampler's next tick.
             return HostLoadStatus {
                 governor: governor::report(),
+                profile: current_profile(stored_profile_choice()),
                 previous_boot: shared
                     .previous_boot
                     .lock()
@@ -328,10 +339,22 @@ pub fn status() -> HostLoadStatus {
                 ..status
             };
         }
-        return reader_status(&shared.dir, Role::Reader, Vec::new(), TickStats::default());
+        return reader_status(
+            &shared.dir,
+            Role::Reader,
+            Vec::new(),
+            TickStats::default(),
+            stored_profile_choice(),
+        );
     }
     match crate::tool_config::default_config_dir() {
-        Some(dir) => reader_status(&dir, Role::NotSampling, Vec::new(), TickStats::default()),
+        Some(dir) => reader_status(
+            &dir,
+            Role::NotSampling,
+            Vec::new(),
+            TickStats::default(),
+            stored_profile_choice(),
+        ),
         None => HostLoadStatus {
             platform: Platform::current(),
             role: Role::NotSampling,
@@ -344,6 +367,7 @@ pub fn status() -> HostLoadStatus {
             },
             pressure: PressureInput::Unavailable,
             governor: governor::report(),
+            profile: current_profile(stored_profile_choice()),
             snapshot_path: None,
             writer: None,
             writer_is_self: false,
@@ -356,7 +380,28 @@ pub fn status() -> HostLoadStatus {
     }
 }
 
-fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats) -> HostLoadStatus {
+/// The user's `host_load_profile`, as stored.
+fn stored_profile_choice() -> ProfileChoice {
+    crate::tool_config::host_load_settings().profile
+}
+
+/// What this machine can afford GitPulse to hold: its installed memory under
+/// the stored `host_load_profile`. Like [`governor::shed`], it answers in
+/// every process, sampling or not: installed memory is read from the
+/// operating system directly, so the "Measure memory pressure" switch and the
+/// sampler's first tick do not change it. `memory_unreadable` means that read
+/// itself failed.
+pub fn profile() -> ResourceProfile {
+    current_profile(stored_profile_choice())
+}
+
+fn reader_status(
+    dir: &Path,
+    role: Role,
+    problems: Vec<String>,
+    tick: TickStats,
+    choice: ProfileChoice,
+) -> HostLoadStatus {
     let path = dir.join(snapshot::SNAPSHOT_FILE_NAME);
     let (sensor, snap) = snapshot::report(&path, Clock::now());
     let role = if Platform::current() == Platform::Unavailable {
@@ -369,6 +414,7 @@ fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats)
         role,
         pressure: PressureInput::of(&sensor),
         governor: governor::report(),
+        profile: current_profile(choice),
         sensor,
         snapshot_path: Some(path.to_string_lossy().into_owned()),
         writer: snap.as_ref().map(|s| s.writer.clone()),
@@ -578,13 +624,25 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 if let Err(why) = w.publish(&snap) {
                     tick_problems.push(format!("publish: {why}"));
                 }
-                let mut status = reader_status(&shared.dir, Role::Writer, tick_problems, tick);
+                let mut status = reader_status(
+                    &shared.dir,
+                    Role::Writer,
+                    tick_problems,
+                    tick,
+                    (options.profile_choice)(),
+                );
                 status.writer_is_self = true;
                 status.snapshot_path = Some(w.path().to_string_lossy().into_owned());
                 status.procs = procs;
                 status
             }
-            None => reader_status(&shared.dir, Role::Reader, tick_problems, tick),
+            None => reader_status(
+                &shared.dir,
+                Role::Reader,
+                tick_problems,
+                tick,
+                (options.profile_choice)(),
+            ),
         };
 
         let govern_launches = (options.govern_launches)();
@@ -719,6 +777,60 @@ mod tests {
         assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
     }
 
+    /// Installed memory is a fact about the machine, not a sample: a status
+    /// read before any tick (no snapshot behind it) already carries a tier
+    /// derived from it, so a big machine is never left on `standard` while it
+    /// waits for the sampler. A chosen tier is carried through as before.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_status_read_before_any_tick_already_derives_from_installed_memory() {
+        use super::super::profile::ProfileBasis;
+        let dir = tempfile::tempdir().unwrap();
+        let none = |choice| {
+            reader_status(
+                dir.path(),
+                Role::NotSampling,
+                Vec::new(),
+                TickStats::default(),
+                choice,
+            )
+        };
+        let auto = none(ProfileChoice::Auto);
+        assert!(auto.snapshot.is_none(), "no sampler has written anything");
+        assert_eq!(auto.profile.basis, ProfileBasis::Memory);
+        assert!(auto.profile.memory_bytes.is_some_and(|bytes| bytes > 0));
+        let pinned = none(ProfileChoice::Compact).profile;
+        assert_eq!(pinned.tier, super::super::profile::ProfileTier::Compact);
+        assert_eq!(pinned.basis, ProfileBasis::Override);
+    }
+
+    /// The "Measure memory pressure" switch stops the readings; it must not
+    /// change what the machine is. With sampling off the tick writes an empty
+    /// snapshot, and the profile is still the one sampling on gives.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_profile_with_sampling_off_equals_the_profile_with_sampling_on() {
+        use super::super::profile::ProfileBasis;
+        let first_status = |enabled: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = SamplerOptions::new(dir.path().to_path_buf());
+            options.cadence = Duration::from_millis(100);
+            options.enabled = Box::new(move || enabled);
+            let sampler = start(options).unwrap();
+            let mut status = None;
+            crate::test_support::wait_until(Duration::from_secs(10), || {
+                status = sampler.status();
+                status.is_some()
+            });
+            sampler.stop();
+            status.expect("a status within ten seconds")
+        };
+        let off = first_status(false);
+        let on = first_status(true);
+        assert_eq!(off.profile.basis, ProfileBasis::Memory, "{:?}", off.profile);
+        assert_eq!(off.profile, on.profile);
+    }
+
     fn report(state: SensorState, level: Option<Level>, enabled: bool) -> SensorReport {
         SensorReport {
             state,
@@ -792,6 +904,12 @@ mod tests {
             status.sensor
         );
         assert_eq!(status.writer.as_ref().unwrap().pid, std::process::id());
+        assert_eq!(
+            status.profile.basis,
+            super::super::profile::ProfileBasis::Memory,
+            "a real host reads its own memory: {:?}",
+            status.profile
+        );
         let procs = status
             .procs
             .as_ref()
