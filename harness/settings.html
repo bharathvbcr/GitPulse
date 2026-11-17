@@ -465,6 +465,10 @@
             await until(() => window.__gpHostLoadCalls.includes("save:compact") && window.__gpHostLoadCalls.at(-1) === "status");
             const calls = window.__gpHostLoadCalls;
             check("choosing a profile saves it, then rereads the status", calls.indexOf("save:compact") >= 0 && calls.lastIndexOf("status") > calls.indexOf("save:compact"));
+            check("the profile save carries the rest of the settings unchanged", window.__gpHost.attempts.length === 1
+              && window.__gpHost.attempts[0].settings.profile === "compact" && window.__gpHost.attempts[0].settings.hook_mode === "enforce");
+            // The host-load card's checks below count saves from their own start.
+            window.__gpHost.attempts.length = 0;
           }
           const externalHeadings =[...agents.querySelectorAll("h4")].filter((h) => h.textContent.trim() === "External CLIs");
           check("External CLIs renders exactly once", externalHeadings.length === 1);
