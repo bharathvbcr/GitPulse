@@ -742,12 +742,15 @@ link's target is run with `--version` and must list `lease` among what it
 serves (`sysload::lease::hook_serves_lease`). A `gitpulse-hook` from before
 leases takes `cargo build` for an unknown hook subcommand and exits 0, so a
 `cargo test` through it would "pass" without running. A target that does not
-answer that way is never linked, and a link already in the folder that does not
-reach a wrapper is removed, so a session whose `PATH` already starts with the
-folder finds the real `cargo` behind it. A link to another install's working
-wrapper is left alone. A probe that could not run (a timeout of 2 s, a spawn
-refused under load) is "not verified", never a pass, and is asked again next
-time; a definite answer is remembered per file (device, inode, size, mtime).
+answer that way is never linked, and a link already in the folder that
+certainly does not reach a wrapper is removed, so a session whose `PATH`
+already starts with the folder finds the real `cargo` behind it. A link to
+another install's working wrapper is left alone. A probe that could not run (a
+timeout of 2 s, a spawn refused or deferred under load) is "not verified":
+never a pass, so nothing is routed through it, and never a verdict, so no link
+is made or removed on it; it is asked again next time. A definite answer is
+remembered per file (device, inode, size, mtime). The app makes the links on a
+thread of their own at launch, so a slow probe never holds startup.
 
 A leased build gets `GITPULSE_LEASE_HELD=<slot>`, `CARGO_SLOT_HELD=gitpulse-lease`
 (so the owner's shim does not queue it a second time), and, unless the caller
@@ -839,8 +842,9 @@ native system dialog that page script cannot answer, with the session checked
 again before the dialog and after it. The session's row is marked for the
 reopen offer before its terminal is closed, because a close can outlast its own
 deadline while the terminal is already on its way out; if the close fails and
-the terminal is still running, the mark is taken back and the park is refused,
-so a live session is never offered for reopening. It is **not reachable over MCP** and
+the agent's own process (by pid and start time) is still alive, the mark is
+taken back and the park is refused. The terminal's listing is not asked: a close
+marks a session as ending before it sends the first signal. It is **not reachable over MCP** and
 nothing is parked on its own. An observed session is never parked, and Codex
 cannot be resumed from GitPulse, so neither is offered.
 

@@ -614,10 +614,13 @@ fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
             "{kind}: the probe is bounded"
         );
         let problem = problem.unwrap_or_else(|| panic!("{kind}: reported as working"));
-        assert!(
-            problem.contains("not verified as a build-lease wrapper"),
-            "{kind}: {problem}"
-        );
+        let expected = if kind == "hangs" {
+            // Never answered: not verified, which is not a verdict.
+            "not verified as a build-lease wrapper"
+        } else {
+            "is not a build-lease wrapper"
+        };
+        assert!(problem.contains(expected), "{kind}: {problem}");
         assert!(
             path_of(&lease::launch_env(
                 Some(&config),

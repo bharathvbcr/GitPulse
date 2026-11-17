@@ -545,14 +545,12 @@ fn close_parked(
     }
 }
 
-/// Whether `session_id` is still listed and not on its way out.
-fn still_running(state: &crate::terminal::TerminalSessions, session_id: &str) -> bool {
-    match crate::terminal::list_sessions(state) {
-        Ok(listed) => listed.iter().any(|s| s.id == session_id && !s.detached),
-        // Not known to have closed: treated as running, so a live terminal is
-        // never offered for reopening.
-        Err(_) => true,
-    }
+/// Whether the agent `seen` names is still alive: its own process, by pid and
+/// start time. The terminal's listing cannot say: a close marks the session
+/// as ending before it sends the first signal, so one whose signal never
+/// landed lists as on its way out all the same.
+fn still_running(seen: &IdleSession) -> bool {
+    crate::sysload::procscan::probe_one(seen.pid).is_some_and(|f| f.start_us == seen.start_us)
 }
 
 /// Parks one session: the check, the native dialog, the check again, then the
@@ -584,7 +582,7 @@ pub fn park_session(
             let marked = close_parked(
                 || crate::terminal::kill_session(state, session_id),
                 || ledger.mark_parked(session_id),
-                || still_running(state, session_id),
+                || still_running(seen),
                 || {
                     ledger.undo_park(session_id);
                 },
