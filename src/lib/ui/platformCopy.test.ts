@@ -15,6 +15,7 @@ import {
   shortcutTextLabel,
   statusIconLocationName,
   systemSettingsName,
+  watchScopeDescription,
 } from "./platformCopy";
 
 const EVERY_OS: readonly HostOS[] = ["macos", "windows", "linux", "unknown"];
@@ -303,6 +304,17 @@ describe("repository access guidance", () => {
     ["unknown", "does not verify access"],
   ] as const)("describes %s recovery without claiming access", (os, expected) => {
     expect(repositoryAccessGuidance(os)).toContain(expected);
+  });
+});
+
+describe("watch scope description", () => {
+  it("describes the narrowing on macOS and says elsewhere that the choice changes nothing", () => {
+    expect(watchScopeDescription("macos")).toContain("Narrow stops watching");
+    for (const os of ["windows", "linux", "unknown"] as const) {
+      expect(watchScopeDescription(os)).toContain("macOS only");
+      expect(watchScopeDescription(os)).toContain(osDisplayName(os));
+      expect(watchScopeDescription(os)).not.toContain("Narrow stops watching");
+    }
   });
 });
 

@@ -6,6 +6,8 @@
    */
   import SettingSegment from "./SettingSegment.svelte";
   import { interfaceStore, type WatchScope } from "../stores/interfaceStore";
+  import { hostPlatform } from "../stores/platformStore";
+  import { watchScopeDescription } from "../ui/platformCopy";
 
   const OPTIONS: readonly { value: WatchScope; label: string }[] = [
     { value: "narrow", label: "Narrow (skip ignored build folders)" },
@@ -21,9 +23,5 @@
     value={$interfaceStore.watchScope}
     onselect={(scope) => interfaceStore.setWatchScope(scope)}
   />
-  <p class="text-textMuted text-micro mt-1.5">
-    On macOS, Narrow stops watching folders git ignores that hold build output or other checkouts,
-    which cuts system file-event work during builds. Whole worktree watches everything, as before.
-    It only affects macOS.
-  </p>
+  <p class="text-textMuted text-micro mt-1.5">{watchScopeDescription($hostPlatform.os)}</p>
 </div>

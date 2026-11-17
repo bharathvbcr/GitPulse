@@ -177,6 +177,17 @@ export function liquidGlassRequirement(os: HostOS): string {
     : `Not available on ${osDisplayName(os)}; the window keeps its standard material.`;
 }
 
+/**
+ * What the watch-scope setting does on this host. The narrowing applies to the
+ * macOS file-event stream only, so elsewhere this says the choice changes
+ * nothing rather than describing a saving the host never gets.
+ */
+export function watchScopeDescription(os: HostOS): string {
+  return os === "macos"
+    ? "Narrow stops watching folders git ignores that hold build output or other checkouts, which cuts system file-event work during builds. Whole worktree watches everything, as before."
+    : `This setting changes file watching on macOS only; on ${osDisplayName(os)} both choices watch the same folders.`;
+}
+
 /** The OS as a reader would name it. */
 export function osDisplayName(os: HostOS): string {
   switch (os) {

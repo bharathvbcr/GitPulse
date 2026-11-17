@@ -814,7 +814,11 @@ mod tests {
             isolated.len()
         );
         assert!(isolated.nlink() >= 2, "no second name for the image");
-        assert_ne!(isolated.mode() & 0o111, 0, "the isolated harness cannot run");
+        assert_ne!(
+            isolated.mode() & 0o111,
+            0,
+            "the isolated harness cannot run"
+        );
     }
 
     /// A fixture git spawns under the inheritance lock, so it cannot inherit
