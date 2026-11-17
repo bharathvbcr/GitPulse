@@ -184,7 +184,7 @@ export function liquidGlassRequirement(os: HostOS): string {
  */
 export function watchScopeDescription(os: HostOS): string {
   return os === "macos"
-    ? "Narrow stops watching folders git ignores that hold build output or other checkouts, which cuts system file-event work during builds. Whole worktree watches everything, as before."
+    ? "Narrow stops watching folders git ignores that hold build output or other worktrees, which cuts system file-event work during builds. Whole worktree watches everything, as before."
     : `This setting changes file watching on macOS only; on ${osDisplayName(os)} both choices watch the same folders.`;
 }
 
