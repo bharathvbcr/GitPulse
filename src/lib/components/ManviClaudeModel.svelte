@@ -8,7 +8,7 @@
    * branch names, health and coverage plans) follow the same choice.
    */
   import { onMount } from "svelte";
-  import { harnessStore } from "../stores/harnessStore";
+  import { harnessStore, manviWritable } from "../stores/harnessStore";
   import { CLAUDE_MODELS } from "../workbench/taskModel";
   import { claudeKey, claudeKeyProblem, type ClaudeCredentialStatus } from "../workbench/claudeKey";
   import { formatDisplayFailure } from "../diagnostics/report";
@@ -16,6 +16,12 @@
   /** What Manvi itself is set to run on (`manvi use`); the controls below write it back. */
   let manvi = $derived($harnessStore.ai?.manvi ?? null);
   let manviReadable = $derived(manvi?.state === "ready");
+  /**
+   * The radios can set Manvi's mode once Manvi answered, including while no
+   * mode is chosen (`not_chosen`): then neither radio is checked, so either
+   * one is a real choice that fires its change.
+   */
+  let canChoose = $derived(manviWritable(manvi));
   /** The Claude choice while Manvi is on cloud, else null. */
   let choice = $derived(manvi?.state === "ready" && manvi.mode === "cloud" ? { model: manvi.model } : null);
   /** null until the backend has answered. */
@@ -92,7 +98,7 @@
         type="radio"
         name="manvi-model"
         checked={manviReadable && !choice}
-        disabled={working || !manviReadable}
+        disabled={working || !canChoose}
         onchange={useLocal}
       />
       Local model (below)
@@ -102,7 +108,7 @@
         type="radio"
         name="manvi-model"
         checked={Boolean(choice)}
-        disabled={working || !manviReadable}
+        disabled={working || !canChoose}
         onchange={() => void run(async () => { await harnessStore.useManvi("cloud"); })}
       />
       Claude API

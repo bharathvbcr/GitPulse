@@ -62,8 +62,10 @@ pub(crate) struct UseCloud {
 /// narrow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ManviStatus {
-    /// `ready` (the fields below are Manvi's answer), `not_installed`,
-    /// `needs_update` (a Manvi without `manvi use`) or `failed`.
+    /// `ready` (the fields below are Manvi's answer), `not_chosen` (Manvi
+    /// answered, but its mode is the built-in default nobody chose, so no
+    /// selection is offered), `not_installed`, `needs_update` (a Manvi without
+    /// `manvi use`) or `failed`.
     pub state: String,
     /// Why the state is not `ready`; empty when it is.
     pub detail: String,
@@ -194,8 +196,28 @@ pub(crate) fn parse(stdout: &[u8]) -> Result<UseStatus, String> {
     Ok(status)
 }
 
+/// The layer `provider_from` names when nothing chose the mode: Manvi's
+/// built-in default (cloud), with no saved config, environment or flag.
+const PROVIDER_FROM_DEFAULT: &str = "default";
+
+/// What a person reads while Manvi's mode is its built-in default.
+pub(crate) const NOT_CHOSEN_DETAIL: &str = "Manvi's model has not been chosen yet. Choose Local model or Claude API in the Manvi pane (or run `manvi use local` or `manvi use cloud`) to send GitPulse's AI requests through Manvi.";
+
 /// The frontend's view of a parsed status.
+///
+/// A mode nobody chose (`provider_from: default`) is `not_chosen`, never
+/// `ready`: Manvi's built-in default is cloud, and following it would send
+/// diffs to the Claude API for a person who never picked it. The fields still
+/// say what Manvi would run, but no selection is offered, so every reader
+/// falls back to GitPulse's own loopback client and its consent dialog.
 pub(crate) fn present(status: &UseStatus) -> ManviStatus {
+    if status.provider_from == PROVIDER_FROM_DEFAULT {
+        return ManviStatus {
+            state: "not_chosen".into(),
+            detail: NOT_CHOSEN_DETAIL.into(),
+            ..fields(status)
+        };
+    }
     let (typed, selection, unsupported) = match selection_for(status) {
         Ok(selection) => (
             Some(selection.clone()),
@@ -206,6 +228,17 @@ pub(crate) fn present(status: &UseStatus) -> ManviStatus {
     };
     ManviStatus {
         state: "ready".into(),
+        unsupported,
+        selection,
+        typed,
+        ..fields(status)
+    }
+}
+
+/// What Manvi reported, as shown; no state, selection or verdict.
+fn fields(status: &UseStatus) -> ManviStatus {
+    ManviStatus {
+        state: String::new(),
         detail: String::new(),
         mode: status.mode.clone(),
         provider: status.provider.clone(),
@@ -218,9 +251,9 @@ pub(crate) fn present(status: &UseStatus) -> ManviStatus {
         local_model: status.local.model.clone(),
         cloud_model: status.cloud.model.clone(),
         warnings: status.warnings.clone(),
-        unsupported,
-        selection,
-        typed,
+        unsupported: String::new(),
+        selection: None,
+        typed: None,
     }
 }
 
@@ -486,6 +519,35 @@ mod manvi_use_tests {
         let wire = present(&local).selection.unwrap();
         assert_eq!(wire["provider"], "local");
         assert_eq!(wire["base_url"], "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn a_mode_nobody_chose_offers_no_selection_but_still_shows_what_manvi_would_run() {
+        let unchosen = parse(&with(|v| {
+            v["provider_from"] = json!("default");
+            v["model_from"] = json!("default");
+        }))
+        .unwrap();
+        let shown = present(&unchosen);
+        assert_eq!(shown.state, "not_chosen");
+        assert_eq!(shown.detail, NOT_CHOSEN_DETAIL);
+        assert_eq!(shown.selection, None);
+        assert_eq!(shown.typed, None);
+        assert!(shown.unsupported.is_empty());
+        assert_eq!(
+            (shown.mode.as_str(), shown.model.as_str()),
+            ("cloud", "claude-sonnet-5-5")
+        );
+        assert_eq!(shown.provider_from, "default");
+
+        // Every other layer is a choice: the saved config, the environment
+        // and a flag each keep the selection.
+        for from in ["config", "env", "flag"] {
+            let chosen = parse(&with(|v| v["provider_from"] = json!(from))).unwrap();
+            let shown = present(&chosen);
+            assert_eq!(shown.state, "ready", "{from}");
+            assert!(shown.typed.is_some(), "{from}");
+        }
     }
 
     #[test]

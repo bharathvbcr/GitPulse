@@ -120,15 +120,16 @@ pub(super) fn selection(
 /// Where one AI request goes, and why it did not go where Manvi says when it
 /// did not.
 ///
-/// Manvi's own config decides (`manvi use`): in either mode the request goes
-/// through Manvi's `work.assist.complete` on the worker for that selection,
-/// the same worker task enhancements use. GitPulse's own loopback client
-/// ([`Route::Local`], with the caller's saved selection and the consent gate)
-/// is only the fallback for a Manvi that is not installed, has no `manvi use`,
-/// or lacks the op in local mode, and the reason comes back as a warning to
-/// put on the result. A mode GitPulse cannot use, a cloud Manvi without the
-/// op, and any other failure to start the worker are errors, never a quiet
-/// move to loopback.
+/// Manvi's own config decides (`manvi use`) once someone has chosen a mode:
+/// in either mode the request goes through Manvi's `work.assist.complete` on
+/// the worker for that selection, the same worker task enhancements use.
+/// GitPulse's own loopback client ([`Route::Local`], with the caller's saved
+/// selection and the consent gate) is the fallback for a Manvi that is not
+/// installed, has no `manvi use`, has no chosen mode (`not_chosen`: its
+/// built-in default is cloud, which nobody picked), or lacks the op in local
+/// mode, and the reason comes back as a warning to put on the result. A mode
+/// GitPulse cannot use, a cloud Manvi without the op, and any other failure to
+/// start the worker are errors, never a quiet move to loopback.
 pub(super) fn resolve_route(
     status: &crate::harness::manvi_use::ManviStatus,
     served: impl FnOnce(&crate::harness::sidecar::ModelSelection) -> Result<bool, (String, String)>,
@@ -146,7 +147,9 @@ pub(super) fn resolve_route(
     };
     match status.state.as_str() {
         "ready" => {}
-        "not_installed" | "needs_update" | "failed" => return fall_back(status.detail.clone()),
+        "not_installed" | "needs_update" | "failed" | "not_chosen" => {
+            return fall_back(status.detail.clone())
+        }
         other => return Err(format!("Manvi reported an unknown state `{other}`.")),
     }
     let Some(selection) = status.typed.clone() else {
@@ -477,6 +480,49 @@ mod assist_tests {
             fallback(),
         );
         assert!(other.is_err());
+    }
+
+    /// What `manvi use --json` answers when nobody has saved a choice: Manvi's
+    /// built-in default, cloud, from the catalogue (`provider_from: default`).
+    const UNCHOSEN: &str = r#"{"mode":"cloud","provider":"anthropic","provider_from":"default","user_config":"/home/u/.config/manvi/config.toml","shadowed_by":[],"model":"claude-sonnet-5-5","model_from":"default","local":{"base_url":"http://127.0.0.1:8000/v1","base_url_from":"default","model":"","model_from":"default"},"cloud":{"model":"claude-sonnet-5-5","model_from":"default"},"warnings":[]}"#;
+
+    fn unchosen() -> ManviStatus {
+        crate::harness::manvi_use::interpret(crate::harness::manvi_use::UseRun {
+            success: true,
+            stdout: UNCHOSEN.as_bytes().to_vec(),
+            stderr: String::new(),
+        })
+    }
+
+    #[test]
+    fn an_unchosen_manvi_default_never_routes_a_diff_to_the_cloud() {
+        // A saved loopback selection is used as before, behind the consent
+        // gate; the worker is never asked and the warning says what to choose.
+        let (route, warning) = resolve_route(
+            &unchosen(),
+            |_| panic!("no worker is asked while Manvi's model is not chosen"),
+            fake_route,
+            fallback(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&route, Route::Local(Some(s)) if s.model == "saved"),
+            "{route:?}"
+        );
+        let warning = warning.unwrap();
+        assert!(warning.contains("not been chosen"), "{warning}");
+        assert!(warning.contains("Manvi pane"), "{warning}");
+        assert!(warning.contains("its own connection"), "{warning}");
+
+        // With nothing saved the loopback client sweeps and asks first.
+        let (route, _) = resolve_route(
+            &unchosen(),
+            |_| panic!("no worker is asked while Manvi's model is not chosen"),
+            fake_route,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(route, Route::Local(None)), "{route:?}");
     }
 
     #[test]

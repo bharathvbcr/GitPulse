@@ -76,8 +76,8 @@ describe("Claude selections", () => {
     ).toBeNull();
   });
 
-  it("falls back to the saved selection, then the scan, only when Manvi could not be read", () => {
-    for (const state of ["not_installed", "needs_update", "failed"]) {
+  it("falls back to the saved selection, then the scan, only when Manvi could not be read or has no chosen mode", () => {
+    for (const state of ["not_installed", "needs_update", "failed", "not_chosen"]) {
       expect(effectiveSelection({ preferred: ok, ai: { selected: null, manvi: { state, selection: null } } })).toEqual(ok);
     }
     expect(effectiveSelection({ preferred: null, ai: { selected: ok } })).toEqual(ok);

@@ -184,8 +184,12 @@ network.
 Built-in AI (commit messages, explanations, branch names, health and coverage plans)
 runs on whatever Manvi itself is set to (`manvi use`), through Manvi's
 `work.assist.complete`: a local model server in local mode, the Claude API in cloud
-mode, and only in cloud mode does a diff leave the machine. GitPulse's own loopback
-client is the fallback only when Manvi is not installed or is too old. Task enhancement and agent
+mode, and only in cloud mode does a diff leave the machine. Cloud mode has to be
+chosen: with nothing saved, Manvi reports its built-in default (cloud) and GitPulse
+does not follow it. It uses its own loopback client instead, which asks before it
+sends anything to a server it found, until a mode is chosen in the Manvi pane or with
+`manvi use`. The loopback client is also the fallback when Manvi is not installed or
+is too old. Task enhancement and agent
 runs use their configured provider; supported Mac builds can also use Apple
 Intelligence for task titles and descriptions. These are distinct execution paths.
 

@@ -250,9 +250,12 @@ flowchart TD
   the same features go through Manvi's `work.assist.complete`; that route never
   sweeps, probes or falls back to loopback after a failed call. In cloud mode the
   request reaches the Claude API. Manvi does not redact the prompt (`redactions` is
-  always 0), so the staged diff or commit goes as GitPulse built it. GitPulse's own
-  loopback client (and its consent flow) is used only when Manvi is not installed or
-  lacks the op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
+  always 0), so the staged diff or commit goes as GitPulse built it. Cloud mode is
+  followed only when someone chose it (saved config, `MANVI_*` environment or a
+  flag): an unset config answers cloud with `provider_from: default`, which GitPulse
+  reads as `not_chosen` and does not route to Manvi. GitPulse's own loopback client
+  (and its consent flow) is used then, and when Manvi is not installed or lacks the
+  op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
   `manvi use cloud|local` only on a human action: the Manvi pane's cloud/local
   toggle and Claude model picker, and picking a local model in the Manvi pill or
   the Local model servers card (which switches Manvi to local for every program

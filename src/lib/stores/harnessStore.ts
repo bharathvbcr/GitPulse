@@ -124,11 +124,15 @@ export interface AiSelection {
 
 /**
  * What `manvi use --json` said, read by the backend (`cmd_ai_status`). `state`
- * is `ready` when Manvi answered; `not_installed`, `needs_update` (a Manvi
- * without `manvi use`) and `failed` carry why in `detail`.
+ * is `ready` when Manvi answered with a mode someone chose. `not_chosen` means
+ * Manvi answered but its mode is the built-in default (cloud) nobody picked:
+ * the fields say what it would run, `selection` is null, and AI features use
+ * GitPulse's own loopback client until a mode is chosen in the Manvi pane.
+ * `not_installed`, `needs_update` (a Manvi without `manvi use`) and `failed`
+ * carry why in `detail`.
  */
 export interface ManviStatus {
-  state: "ready" | "not_installed" | "needs_update" | "failed";
+  state: "ready" | "not_chosen" | "not_installed" | "needs_update" | "failed";
   detail: string;
   /** `cloud`, `local` or `other`. */
   mode: string;
@@ -218,8 +222,9 @@ export interface AiReadiness {
  * - Local through Manvi: ready when the local server is up (local discovery
  *   follows Manvi's own server and model).
  * - A mode GitPulse cannot use: not ready, and says so.
- * - Manvi unreadable (not installed, no `manvi use`, failed) or not asked yet:
- *   GitPulse's own loopback client, with local discovery's verdict.
+ * - Manvi unreadable (not installed, no `manvi use`, failed), on a mode nobody
+ *   chose (`not_chosen`), or not asked yet: GitPulse's own loopback client,
+ *   with local discovery's verdict.
  *
  * Pure, so it is testable without Svelte.
  */
@@ -257,6 +262,15 @@ export function deriveAiReadiness(state: Pick<HarnessState, "ai" | "claudeCreden
     model: ai?.selected?.model ?? "",
     reason: ai?.detail || (ai ? "" : "Local models have not been checked."),
   };
+}
+
+/**
+ * Whether a person can set Manvi's mode from GitPulse (`cmd_manvi_use`): Manvi
+ * answered `manvi use`, with a chosen mode (`ready`) or with none
+ * (`not_chosen`, which is exactly when a choice is wanted).
+ */
+export function manviWritable(manvi: Pick<ManviStatus, "state"> | null | undefined): boolean {
+  return manvi?.state === "ready" || manvi?.state === "not_chosen";
 }
 
 /** How AI features name where a request goes, for tooltips and notes. */
@@ -1065,13 +1079,15 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     /**
      * Picks a local model. Saved as GitPulse's own selection (the loopback
      * fallback uses it) and, when Manvi can be written, made Manvi's choice
-     * too: `manvi use local --base-url U --model M`. `null` (Automatic) only
-     * clears the saved selection; Manvi's config is left as it is.
+     * too: `manvi use local --base-url U --model M`. Manvi can be written when
+     * it answered, with a chosen mode or with none (`not_chosen`): picking a
+     * model is the person's choice. `null` (Automatic) only clears the saved
+     * selection; Manvi's config is left as it is.
      */
     selectModel: async (selection: AiSelection | null) => {
       savePreferred(selection);
       update((s) => ({ ...s, preferred: selection }));
-      if (selection && get({ subscribe }).ai?.manvi?.state === "ready") {
+      if (selection && manviWritable(get({ subscribe }).ai?.manvi)) {
         try {
           await useManvi("local", { baseUrl: selection.base_url, model: selection.model });
           return get({ subscribe }).ai;

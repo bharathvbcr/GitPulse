@@ -5,6 +5,7 @@ import {
   createHarnessStore,
   deriveAiReadiness,
   describeAiTarget,
+  manviWritable,
   type AiStatus,
   type ClaudeCredentialState,
   type ManviStatus,
@@ -112,6 +113,21 @@ describe("aiReadiness", () => {
     expect(none).toMatchObject({ ready: false, via: "loopback", reason: "Local models have not been checked." });
   });
 
+  it("a Manvi on its unchosen default is never cloud: the loopback client answers and the pane may choose", () => {
+    // What the backend sends for an unset Manvi config: the fields say cloud,
+    // the state says nobody chose it, and there is no selection.
+    const unchosen = manvi({ state: "not_chosen", provider_from: "default", model_from: "default", selection: null });
+    const r = deriveAiReadiness({ ai: ai(unchosen), claudeCredential: credential(null) });
+    expect(r).toEqual({ ready: true, target: "local", via: "loopback", model: "qwen3", reason: "" });
+    expect(describeAiTarget(r)).toBe("the local model");
+    expect(manviWritable(unchosen)).toBe(true);
+    expect(manviWritable(manvi())).toBe(true);
+    for (const state of ["not_installed", "needs_update", "failed"] as const) {
+      expect(manviWritable(unreadable(state))).toBe(false);
+    }
+    expect(manviWritable(null)).toBe(false);
+  });
+
   it("names the destination for tooltips", () => {
     const named = (s: ManviStatus, cred = credential({})) => describeAiTarget(deriveAiReadiness({ ai: ai(s), claudeCredential: cred }));
     expect(named(manvi())).toBe("claude-sonnet-5-5 (Claude API, via Manvi)");
@@ -189,6 +205,13 @@ describe("the store", () => {
     await fallbackStore.selectModel({ base_url: local.base_url, model: "llama" });
     expect(old.calls.some((c) => c.cmd === "cmd_manvi_use")).toBe(false);
     expect(get(fallbackStore).preferred).toEqual({ base_url: local.base_url, model: "llama" });
+
+    // A Manvi with no chosen mode answered, so picking a model is that choice.
+    const fresh = backend(manvi({ state: "not_chosen", provider_from: "default", selection: null }));
+    const freshStore = createHarnessStore({ invoke: fresh.invokeFn, confirm: async () => false });
+    await freshStore.refreshAi();
+    await freshStore.selectModel({ base_url: local.base_url, model: "llama" });
+    expect(fresh.calls.find((c) => c.cmd === "cmd_manvi_use")!.args).toMatchObject({ mode: "local", model: "llama" });
   });
 
   it("accepting the loopback consent dialog remembers GitPulse's own selection and never writes Manvi's config", async () => {

@@ -5,9 +5,10 @@
 //! Claude through the Anthropic API, or a local model server), and in either
 //! mode they go through Manvi's `work.assist.complete` op as a
 //! [`Route::Manvi`]. That route never sweeps, probes or touches loopback from
-//! this process. GitPulse's own loopback client ([`Route::Local`]) is only the
-//! fallback for a Manvi that is not installed or lacks the op, and a request
-//! never goes both ways. Commit messages are classified from the staged
+//! this process. GitPulse's own loopback client ([`Route::Local`]) is the
+//! fallback for a Manvi that is not installed, lacks the op, or has no chosen
+//! mode (its built-in default, cloud, is not a choice anyone made), and a
+//! request never goes both ways. Commit messages are classified from the staged
 //! patch first (`commit_brief`); a model only phrases that classification, and
 //! the classified text is the message when no model can be reached. The pieces
 //! are split three ways, and the split is the point:
@@ -16,8 +17,11 @@
 //!   only — the transport itself refuses any other address, so a diff cannot
 //!   leave the machine through a mistyped setting. They are the fallback
 //!   path. When Manvi is on its cloud mode the request goes to the Claude API
-//!   through Manvi: that is the one deliberate way a diff leaves the machine,
-//!   and only after the user chose cloud in Manvi's config.
+//!   through Manvi: that is the one deliberate way a diff leaves the machine.
+//!   It takes a saved choice of cloud (or `MANVI_*` environment or a flag), not
+//!   just Manvi's answer: an unset Manvi config reports cloud with
+//!   `provider_from: default`, which GitPulse reads as `not_chosen` and routes
+//!   to the loopback client behind its consent dialog instead.
 //! * The MANVI harness answers the questions a host cannot answer for itself:
 //!   how large this model's context really is and where that number came from
 //!   (`capability.probe`), whether the assembled request fits (`chat.prepare`),
@@ -153,8 +157,9 @@ impl std::fmt::Debug for ManviRoute {
 #[derive(Debug, Clone)]
 pub enum Route {
     /// GitPulse's own loopback client. Only the fallback for a Manvi that is
-    /// not installed or lacks `work.assist.complete`; `None` means nothing was
-    /// chosen and the consent gate ([`resolve_target`]) applies.
+    /// not installed, lacks `work.assist.complete`, or has no chosen mode;
+    /// `None` means nothing was chosen and the consent gate
+    /// ([`resolve_target`]) applies.
     Local(Option<AiSelection>),
     /// Manvi's `work.assist.complete`, on whatever Manvi is set to run on.
     Manvi(ManviRoute),
