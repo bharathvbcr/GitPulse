@@ -678,3 +678,222 @@ fn adv_foreign_ref_namespaces_select_nothing() {
     )
     .is_some());
 }
+
+// ---- branch cleanup: refspec / owner re-attack (f00d6e50) ------------------
+
+use crate::engine::remotes::FetchClaims;
+
+fn present(p: &Path, r: &str) -> bool {
+    try_g(p, &["rev-parse", "--verify", "-q", r]).is_some()
+}
+
+fn cfg(p: &Path, args: &[&str]) {
+    let mut v = vec!["config"];
+    v.extend_from_slice(args);
+    git_in(p, &v);
+}
+
+/// Replace every fetch refspec of `remote` with `specs` and fetch.
+fn respec(p: &Path, remote: &str, specs: &[&str]) {
+    let key = format!("remote.{remote}.fetch");
+    git_in(p, &["config", "--unset-all", &key]);
+    for s in specs {
+        git_in(p, &["config", "--add", &key, s]);
+    }
+    git_in(p, &["fetch", "-q", remote]);
+}
+
+fn assert_refused_untouched(
+    f: &Fixture,
+    target: &str,
+    judged: &[String],
+    r: &Result<DeadbranchCleanResult, CommandError>,
+) {
+    assert!(
+        judged.is_empty(),
+        "{target}: reached the gate: {judged:?} {r:?}"
+    );
+    for (_, bare) in &f.bares {
+        assert!(
+            present(bare, "refs/heads/x"),
+            "{target}: a remote branch was deleted"
+        );
+    }
+}
+
+#[test]
+fn adv2_nondefault_refspec_into_unconfigured_namespace_is_refused() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"])]);
+    respec(
+        &f.repo,
+        "origin",
+        &["+refs/heads/*:refs/remotes/upstream/*"],
+    );
+    assert!(present(&f.repo, "refs/remotes/upstream/x"));
+    let (judged, r) = clean(&f.repo, &["refs/remotes/upstream/x"], true);
+    assert_refused_untouched(&f, "upstream/x", &judged, &r);
+}
+
+#[test]
+fn adv2_nondefault_refspec_into_a_configured_remotes_namespace_is_refused() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"]), ("upstream", &["x"])]);
+    respec(
+        &f.repo,
+        "origin",
+        &["+refs/heads/*:refs/remotes/upstream/*"],
+    );
+    let (judged, r) = clean(&f.repo, &["refs/remotes/upstream/x"], true);
+    assert_refused_untouched(&f, "upstream/x", &judged, &r);
+    assert!(r.unwrap_err().into_message().contains("ambiguous"));
+}
+
+#[test]
+fn adv2_refspec_shapes_claim_exactly_their_destinations() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("o", &["a-dev"])]);
+    let p = &f.repo;
+    git_in(p, &["config", "--unset-all", "remote.o.fetch"]);
+    for s in [
+        "^refs/heads/secret",
+        "refs/heads/*-dev:refs/remotes/o/*-dev",
+        "refs/heads/only:refs/remotes/o/only",
+    ] {
+        git_in(p, &["config", "--add", "remote.o.fetch", s]);
+    }
+    let claims = FetchClaims::read(p).unwrap();
+    assert_eq!(claims.claimants("o/a-dev"), vec!["o"]);
+    assert_eq!(claims.claimants("o/only"), vec!["o"]);
+    assert!(claims.claimants("o/a").is_empty());
+    assert!(claims.claimants("o/secret").is_empty());
+    // A lone negative refspec fetches nothing: no claim, and no default claim.
+    git_in(p, &["config", "--unset-all", "remote.o.fetch"]);
+    git_in(
+        p,
+        &["config", "--add", "remote.o.fetch", "^refs/heads/secret"],
+    );
+    let claims = FetchClaims::read(p).unwrap();
+    assert!(claims.claimants("o/a-dev").is_empty());
+}
+
+#[test]
+fn adv2_negative_refspec_beside_a_positive_one_still_deletes() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x", "secret"])]);
+    cfg(
+        &f.repo,
+        &["--add", "remote.origin.fetch", "^refs/heads/secret"],
+    );
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    assert_eq!(judged, vec!["git push origin --delete x"], "{r:?}");
+}
+
+#[test]
+fn adv2_dotted_and_prefix_named_remotes() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"]), ("orig", &["y"]), ("my.fork", &["z"])]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    assert_eq!(judged, vec!["git push origin --delete x"], "{r:?}");
+    let (judged, r) = clean(&f.repo, &["refs/remotes/orig/y"], true);
+    assert_eq!(judged, vec!["git push orig --delete y"], "{r:?}");
+    let (judged, r) = clean(&f.repo, &["refs/remotes/my.fork/z"], true);
+    assert_eq!(judged, vec!["git push my.fork --delete z"], "{r:?}");
+}
+
+#[test]
+fn adv2_metacharacter_remote_name_claims_nothing_spurious() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"])]);
+    // git refuses `*` in ref names, so such a remote has no tracking refs, but
+    // its config must not make origin's refs ambiguous or unreadable.
+    cfg(&f.repo, &["remote.a*b.url", "/nonexistent"]);
+    cfg(&f.repo, &["remote.a.b.url", "/nonexistent2"]);
+    let claims = FetchClaims::read(&f.repo).unwrap();
+    assert_eq!(claims.claimants("origin/x"), vec!["origin"]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    assert_eq!(judged, vec!["git push origin --delete x"], "{r:?}");
+}
+
+#[test]
+fn adv2_unreadable_config_refuses_every_remote_delete() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"])]);
+    assert!(FetchClaims::read(&f.repo).is_ok());
+    let cfg_path = f.repo.join(".git/config");
+    let good = std::fs::read_to_string(&cfg_path).unwrap();
+    std::fs::write(
+        &cfg_path,
+        format!("{good}\n[remote \"origin\"\n\tgarbage ===\n"),
+    )
+    .unwrap();
+    assert!(
+        FetchClaims::read(&f.repo).is_err(),
+        "malformed config read as claims"
+    );
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    assert!(judged.is_empty(), "{judged:?} {r:?}");
+    assert!(r.is_err());
+    assert!(present(&f.bares[0].1, "refs/heads/x"));
+}
+
+#[test]
+fn adv2_unreadable_include_refuses() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["x"])]);
+    let dir = f.repo.join("incdir");
+    std::fs::create_dir(&dir).unwrap();
+    cfg(&f.repo, &["include.path", dir.to_str().unwrap()]);
+    let readable = git_text(&f.repo, &["config", "--get-regexp", "-z", "^remote\\..*"]).is_ok();
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/x"], true);
+    if !readable {
+        assert!(judged.is_empty(), "{judged:?} {r:?}");
+        assert!(present(&f.bares[0].1, "refs/heads/x"));
+    }
+}
+
+#[test]
+fn adv2_mixed_selection_with_an_ambiguous_ref_deletes_nothing() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["eu/y", "ok"]), ("origin/eu", &["x"])]);
+    git_in(&f.repo, &["branch", "gone"]);
+    let (judged, r) = clean(
+        &f.repo,
+        &[
+            "refs/heads/gone",
+            "refs/remotes/origin/ok",
+            "refs/remotes/origin/eu/x",
+        ],
+        true,
+    );
+    assert!(judged.is_empty(), "reached authorize: {judged:?} {r:?}");
+    let msg = r.expect_err("whole clean refused").into_message();
+    assert!(
+        msg.contains("refs/remotes/origin/eu/x"),
+        "culprit not named: {msg}"
+    );
+    assert!(present(&f.repo, "refs/heads/gone"), "local branch deleted");
+    assert!(present(&f.bares[0].1, "refs/heads/ok"));
+    assert!(present(&f.bares[1].1, "refs/heads/x"));
+}
+
+#[test]
+fn adv2_local_only_clean_ignores_broken_remote_config() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["eu/y"]), ("origin/eu", &["x"])]);
+    git_in(&f.repo, &["branch", "gone"]);
+    // Valid-but-odd remote config (git itself rejects an invalid refspec for
+    // every branch operation, which no remote-aware check could change).
+    cfg(
+        &f.repo,
+        &[
+            "--add",
+            "remote.nourl.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    cfg(&f.repo, &["--add", "remote.neg.fetch", "^refs/heads/x"]);
+    let (judged, r) = clean(&f.repo, &["refs/heads/gone"], true);
+    assert_eq!(judged, vec!["git branch -D gone"], "{r:?}");
+    assert!(!present(&f.repo, "refs/heads/gone"));
+}
