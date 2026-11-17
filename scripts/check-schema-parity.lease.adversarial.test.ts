@@ -25,9 +25,9 @@ describe("lease rustConstant shapes", () => {
   it("two cfg-gated definitions differing -> null; equal -> value", () => {
     expect(rustConstant(`#[cfg(a)]\npub const ${C}: u32 = 1;\n#[cfg(not(a))]\npub const ${C}: u32 = 2;`, C)).toBeNull();
   });
-  it("cfg(test) block definition differing from the real one is not silently taken", () => {
+  it("a cfg(test) copy differing from the real constant is ignored: the shipped value wins", () => {
     const t = `pub const ${C}: u32 = 2;\n#[cfg(test)]\nmod t {\n pub const ${C}: u32 = 1;\n}`;
-    expect(rustConstant(t, C)).toBeNull();
+    expect(rustConstant(t, C)).toBe(2);
   });
   it("lease row at a pin predating stacked.rs: key left out, judged unverifiable not match/crash", () => {
     const run = ((_c: string, a: readonly string[]) => a[0] === "cat-file" ? { status: 0, stdout: "" } : { status: 128, stdout: "" }) as never;
@@ -120,4 +120,62 @@ if [ "$1" = "--version" ]; then ${body}; fi
     expect((readCliSchema(b) as any).lease).toBeNull();
     expect(Date.now() - t).toBeLessThan(25_000);
   }, 40_000);
+});
+
+describe("rustConstant ignores string literals and cfg(test) items", () => {
+  it("ignores comment / doc / block / string-literal lookalikes", () => {
+    expect(rustConstant(`// pub const ${C}: u32 = 2;\n`, C)).toBeNull();
+    expect(rustConstant(`/// pub const ${C}: u32 = 2;\n`, C)).toBeNull();
+    expect(rustConstant(`/* pub const ${C}: u32 = 2; */`, C)).toBeNull();
+    expect(rustConstant(`const S: &str = "pub const ${C}: u32 = 2;";`, C)).toBeNull();
+    expect(rustConstant(`const S: &str = r#"pub const ${C}: u32 = 2;"#;`, C)).toBeNull();
+  });
+  it("a cfg(test)-only definition is not read as the real constant", () => {
+    expect(rustConstant(`#[cfg(test)]\nmod t {\n pub const ${C}: u32 = 1;\n}`, C)).toBeNull();
+    expect(rustConstant(`#[cfg(test)]\npub const ${C}: u32 = 1;\n`, C)).toBeNull();
+  });
+  it("a real constant beside a differing cfg(test) copy reads as the real one, not null", () => {
+    expect(rustConstant(`#[cfg(test)]\nmod t {\n pub const ${C}: u32 = 1;\n fn f() { if true { } }\n}\npub const ${C}: u32 = 2;`, C)).toBe(2);
+  });
+  it("still reads the string-form constant devmap-extract declares", () => {
+    expect(rustConstant('pub const EXTRACTION_SCHEMA_VERSION: &str = "94";', "EXTRACTION_SCHEMA_VERSION")).toBe(94);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("readCliSchema token boundaries", () => {
+  const dirs: string[] = [];
+  afterEach(async () => { await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }))); });
+  async function bin(body: string, doctor = true) {
+    const dir = await mkdtemp(path.join(tmpdir(), "adv-lease-"));
+    dirs.push(dir);
+    const b = path.join(dir, "devmap");
+    await writeFile(b, `#!/bin/sh
+if [ "$1" = "doctor" ]; then ${doctor ? `echo '{"expected_schema_version":27}'; exit 0` : "exit 1"}; fi
+if [ "$1" = "status" ]; then echo '{}'; exit 0; fi
+if [ "$1" = "--version" ]; then ${body}; fi
+`);
+    await chmod(b, 0o755);
+    return b;
+  }
+  const field = async (line: string, doctor: boolean, key: "lease" | "extract") =>
+    (readCliSchema(await bin(`echo "${line}"`, doctor)) as any)[key];
+  for (const doctor of [true, false]) {
+    const tag = doctor ? "doctor" : "version";
+    it(`[${tag}] 'format 2a' is not read as 2`, async () => {
+      expect(await field("devmap 0.2.5 (store schema 27, stack lease format 2a)", doctor, "lease")).toBeNull();
+    });
+    it(`[${tag}] two conflicting occurrences are unverifiable, equal ones read`, async () => {
+      expect(await field("devmap (store schema 27, stack lease format 2) stack lease format 1", doctor, "lease")).toBeNull();
+      expect(await field("devmap (store schema 27, stack lease format 2) stack lease format 2", doctor, "lease")).toBe(2);
+    });
+    it(`[${tag}] phrase inside a path/build string is not read`, async () => {
+      expect(await field("devmap 0.2.5 (store schema 27, build /home/stack lease format 2/x)", doctor, "lease")).toBeNull();
+    });
+    it(`[${tag}] extract schema has the same boundaries`, async () => {
+      expect(await field("devmap (store schema 27, extract schema 94a)", doctor, "extract")).toBeNull();
+      expect(await field("devmap (store schema 27, extract schema 94) extract schema 93", doctor, "extract")).toBeNull();
+      expect(await field("devmap (store schema 27, build /x/extract schema 94/y)", doctor, "extract")).toBeNull();
+      expect(await field("devmap (store schema 27, extract schema 94, build z)", doctor, "extract")).toBe(94);
+    });
+  }
 });

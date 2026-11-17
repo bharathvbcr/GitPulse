@@ -53,16 +53,24 @@ export function readVendoredSchema() {
 }
 
 /**
- * The stack-lease format a `--version` line names (`stack lease format N`), or
- * null. devmap's `stacked::STACK_FORMAT_VERSION` is not a schema constant, so
- * only a build that prints it can say which lease it reads.
+ * The number a `--version` line prints after `label` (`extract schema N`,
+ * `stack lease format N`), or null. The token must stand alone: not glued to a
+ * path or word on its left, and ended by whitespace, `,`, `;`, `)` or the end
+ * of the line, so `format 2a` and a phrase inside a path are not read. Two
+ * occurrences that disagree say nothing, rather than letting the first win.
  *
  * @param {string} line
+ * @param {string} label
  */
-function leaseFormat(line) {
-  const found = /stack lease format (\d+)/i.exec(line);
-  return found ? Number(found[1]) : null;
+export function versionToken(line, label) {
+  const found = new Set(
+    [...line.matchAll(new RegExp(String.raw`(?<![\w./\\~-])${label} (\d+)(?=$|[\s,;)])`, "gi"))].map((match) => Number(match[1])),
+  );
+  return found.size === 1 ? [...found][0] : null;
 }
+
+const leaseFormat = (/** @type {string} */ line) => versionToken(line, "stack lease format");
+const extractSchema = (/** @type {string} */ line) => versionToken(line, "extract schema");
 
 /** @param {string} [bin] the devmap to ask; PATH's by default */
 export function readCliSchema(bin = "devmap") {
@@ -79,10 +87,10 @@ export function readCliSchema(bin = "devmap") {
       if (typeof parsed.expected_schema_version === "number") {
         // doctor does not name the extraction schema; the --version line may.
         const line = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 15_000 });
-        const extract = line.status === 0 ? /extract schema (\d+)/i.exec(line.stdout || "") : null;
+        const extract = line.status === 0 ? extractSchema(line.stdout || "") : null;
         return {
           available: true,
-          extract: extract ? Number(extract[1]) : null,
+          extract,
           lease: line.status === 0 ? leaseFormat(line.stdout || "") : null,
           expected: parsed.expected_schema_version,
           versionLine: `doctor expected_schema_version ${parsed.expected_schema_version} (code_graph ${parsed.code_graph_schema_version ?? "?"}, version ${parsed.version ?? "?"})`,
@@ -104,7 +112,7 @@ export function readCliSchema(bin = "devmap") {
   const versionLine = (which.stdout || "").trim();
   const fromVersion = /store schema (\d+)/i.exec(versionLine);
   // Optional: printed only by a devmap that names its extraction schema.
-  const extract = /extract schema (\d+)/i.exec(versionLine);
+  const extract = extractSchema(versionLine);
   let expected = fromVersion ? Number(fromVersion[1]) : null;
   try {
     const status = execFileSync(bin, ["status", "--json", "--progress", "never"], {
@@ -124,7 +132,7 @@ export function readCliSchema(bin = "devmap") {
   if (expected == null) {
     return { available: false, reason: `could not parse schema from: ${versionLine}` };
   }
-  return { available: true, expected, versionLine, source: "version", extract: extract ? Number(extract[1]) : null, lease: leaseFormat(versionLine) };
+  return { available: true, expected, versionLine, source: "version", extract, lease: leaseFormat(versionLine) };
 }
 
 /** @param {string[]} argv */

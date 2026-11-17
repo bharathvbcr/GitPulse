@@ -86,10 +86,22 @@ const ALL_KEYS = /** @type {SchemaKey[]} */ (Object.keys(SCHEMAS));
  * newlines kept. String and char literals are copied through untouched, so a
  * `//` inside a string is not a comment. Only live declarations remain.
  *
+ * With `blankStrings`, string contents are blanked as well (quotes and
+ * newlines kept), so a declaration quoted inside a string is not one. The one
+ * literal kept is a bare `"123"` right after `=`: devmap-extract declares its
+ * version as such a string.
+ *
  * @param {string} text
+ * @param {boolean} [blankStrings]
  * @returns {string}
  */
-export function withoutComments(text) {
+export function withoutComments(text, blankStrings = false) {
+  const blank = (/** @type {string} */ literal, /** @type {string} */ before) => {
+    if (!blankStrings || (/^"\d+"$/.test(literal) && /=\s*$/.test(before))) return literal;
+    const open = literal.indexOf('"');
+    const close = literal.lastIndexOf('"');
+    return close <= open ? literal : literal.slice(0, open + 1) + literal.slice(open + 1, close).replace(/[^\n]/g, " ") + literal.slice(close);
+  };
   let out = "";
   let i = 0;
   while (i < text.length) {
@@ -110,12 +122,12 @@ export function withoutComments(text) {
       const hashes = /^r(#*)"/.exec(text.slice(i, i + 40))?.[1] ?? "";
       const close = text.indexOf(`"${hashes}`, i + 2 + hashes.length);
       const end = close === -1 ? text.length : close + 1 + hashes.length;
-      out += text.slice(i, end);
+      out += blank(text.slice(i, end), out);
       i = end;
     } else if (text[i] === '"') {
       let end = i + 1;
       while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
-      out += text.slice(i, end + 1);
+      out += blank(text.slice(i, end + 1), out);
       i = end + 1;
     } else if (text[i] === "'" && /^'(?:\\.[^']*|[^\\'])'/.test(text.slice(i, i + 12))) {
       const literal = /^'(?:\\.[^']*|[^\\'])'/.exec(text.slice(i, i + 12))?.[0] ?? "'";
@@ -129,6 +141,42 @@ export function withoutComments(text) {
 }
 
 /**
+ * Rust source (comments and string contents already blanked) without the
+ * items gated by `#[cfg(test)]`: a test module's copy of a constant is not the
+ * one the build ships. The item runs to its matching `}`, or to `;` when it
+ * has no body.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function withoutTestItems(text) {
+  const gate = /#\[cfg\(\s*test\s*\)\]/g;
+  let out = "";
+  let at = 0;
+  for (let match = gate.exec(text); match !== null; match = gate.exec(text)) {
+    if (match.index < at) continue;
+    out += text.slice(at, match.index);
+    let i = match.index + match[0].length;
+    while (i < text.length && text[i] !== "{" && text[i] !== ";") i++;
+    if (text[i] === "{") {
+      let depth = 0;
+      do {
+        const quoted = /^'(?:\\.[^']*|[^\\'])'/.exec(text.slice(i, i + 12));
+        if (text[i] === "'" && quoted) i += quoted[0].length;
+        else {
+          if (text[i] === "{") depth++;
+          else if (text[i] === "}") depth--;
+          i++;
+        }
+      } while (depth > 0 && i < text.length);
+    } else i++;
+    at = i;
+    gate.lastIndex = i;
+  }
+  return out + text.slice(at);
+}
+
+/**
  * One `pub const NAME: <int type> = N;` from a Rust source file, or the
  * `pub const NAME: &str = "N";` form devmap-extract declares its version in.
  * A string that is not a whole number is not found, and so is a constant
@@ -139,7 +187,7 @@ export function withoutComments(text) {
  * @returns {number | null}
  */
 export function rustConstant(text, constant) {
-  text = withoutComments(text);
+  text = withoutTestItems(withoutComments(text, true));
   const integer = String.raw`[iu](?:8|16|32|64|size)\s*=\s*(\d+)`;
   const string = String.raw`&(?:'static\s+)?str\s*=\s*"(\d+)"`;
   const found = [...text.matchAll(new RegExp(String.raw`pub const ${constant}:\s*(?:${integer}|${string})\s*;`, "g"))].map((match) => Number(match[1] ?? match[2]));
