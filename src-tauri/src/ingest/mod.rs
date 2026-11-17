@@ -211,17 +211,25 @@ pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// callers that count failures leave it out, and callers that show errors keep it.
 pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts cannot be located";
 
-/// Where each transcript source looks, by name, for the hermetic canary that
+/// Every place each transcript source looks, by name, one entry per root (a
+/// source with none is listed once, with `None`), for the hermetic canary that
 /// checks every per-user directory resolves under the test process's own root.
+/// Claude reads one root per configuration directory, so a canary that saw only
+/// the first would pass while another still pointed at a real account.
 #[cfg(test)]
 pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     source::sources()
         .iter()
-        .map(|source| {
-            (
-                source.name(),
-                source.roots().list.into_iter().next().map(|root| root.path),
-            )
+        .flat_map(|source| {
+            let roots = source.roots().list;
+            if roots.is_empty() {
+                vec![(source.name(), None)]
+            } else {
+                roots
+                    .into_iter()
+                    .map(|root| (source.name(), Some(root.path)))
+                    .collect()
+            }
         })
         .collect()
 }

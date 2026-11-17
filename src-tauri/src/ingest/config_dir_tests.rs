@@ -225,3 +225,28 @@ fn an_explicit_override_that_is_a_file_keeps_its_silence() {
     );
     assert_eq!(out.error, "", "{out:?}");
 }
+
+/// The hermetic canary walks `source_roots()`; it saw only a source's first root,
+/// so a second config directory could point at a real account unnoticed.
+#[test]
+fn source_roots_lists_every_claude_config_dir_not_just_the_first() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = repo_dir();
+    let repo = repo.path().to_str().unwrap();
+    transcript_in(&home.path().join(".claude"), repo, "S-default");
+    transcript_in(&home.path().join(".claude-chandra"), repo, "S-chandra");
+    transcript_in(&home.path().join(".claude-lappi"), repo, "S-lappi");
+
+    let roots = with_home(home.path(), None, source_roots);
+
+    let claude: Vec<_> = roots
+        .iter()
+        .filter(|(name, _)| *name == "Claude")
+        .filter_map(|(_, root)| root.as_deref())
+        .collect();
+    assert_eq!(claude.len(), 3, "{roots:?}");
+    assert!(
+        claude.iter().all(|root| root.starts_with(home.path())),
+        "{roots:?}"
+    );
+}
