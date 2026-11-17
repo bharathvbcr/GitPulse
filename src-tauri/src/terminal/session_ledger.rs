@@ -342,34 +342,6 @@ impl SessionLedger {
         changed
     }
 
-    /// Takes back [`Self::mark_parked`] for a tab whose terminal did not close:
-    /// it is still running, so it must not be offered for reopening. Only a row
-    /// still marked as parked (`AppQuit`) goes back to `Running`; one the exit
-    /// has since settled is left as it is. Returns whether a row changed.
-    pub fn undo_park(&self, terminal_id: &str) -> bool {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut changed = false;
-        for entry in guard.entries.iter_mut().rev() {
-            let Entry::Valid(row) = entry else { continue };
-            if row.terminal_id.as_deref() != Some(terminal_id) {
-                continue;
-            }
-            if row.end_state == SessionEndState::AppQuit {
-                row.end_state = SessionEndState::Running;
-                row.ended_at = None;
-                changed = true;
-            }
-            break;
-        }
-        if changed {
-            self.persist_locked(&guard.entries);
-        }
-        changed
-    }
-
     /// Marks every non-withdrawn `Running` row as [`SessionEndState::AppQuit`]
     /// synchronously and flushes to disk before teardown sends `SIGHUP`.
     pub fn mark_app_quit(&self) -> usize {
@@ -1204,28 +1176,6 @@ mod tests {
             relaunched.view_with(|_, _| Transcript::Found).offers.len(),
             1
         );
-    }
-
-    #[test]
-    fn a_park_that_did_not_close_its_terminal_is_taken_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
-        let repo = dir.path().join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        let ledger = SessionLedger::open(&ledger_path);
-        ledger.record_spawn(spawn_spec("term-1-0", "claude", Some(UUID_1), &repo, None));
-        assert!(ledger.mark_parked("term-1-0"));
-        assert_eq!(ledger.view_with(|_, _| Transcript::Found).offers.len(), 1);
-        assert!(ledger.undo_park("term-1-0"));
-        assert!(
-            ledger.view_with(|_, _| Transcript::Found).offers.is_empty(),
-            "a terminal that is still running is not offered for reopening"
-        );
-        assert!(!ledger.undo_park("term-1-0"), "only a parked row goes back");
-        assert!(!ledger.undo_park("term-nope"));
-        // It is a running row again, which a relaunch reconciles as one.
-        let relaunched = SessionLedger::open(&ledger_path);
-        assert_eq!(relaunched.reconcile_startup(&HashSet::new()), 1);
     }
 
     #[test]

@@ -460,11 +460,8 @@ fn park_enforces_the_park_after_time_itself_not_only_what_health_offers() {
     assert_eq!(late.unwrap(), "parked");
 }
 
-/// What `close_parked` did, in order.
-fn park_steps(
-    kill: Result<(), String>,
-    running_after: bool,
-) -> (Result<bool, String>, Vec<&'static str>) {
+/// What `close_parked` did, in order, and what it returned.
+fn park_steps(kill: Result<(), String>) -> ((bool, Option<String>), Vec<&'static str>) {
     let steps = std::cell::RefCell::new(Vec::new());
     let out = close_parked(
         || {
@@ -475,73 +472,35 @@ fn park_steps(
             steps.borrow_mut().push("mark");
             true
         },
-        || {
-            steps.borrow_mut().push("check");
-            running_after
-        },
-        || steps.borrow_mut().push("unmark"),
     );
     (out, steps.into_inner())
 }
 
 #[test]
 fn a_park_marks_the_row_before_it_closes_the_terminal() {
-    let (out, steps) = park_steps(Ok(()), false);
-    assert_eq!(out, Ok(true));
+    let (out, steps) = park_steps(Ok(()));
+    assert_eq!(out, (true, None));
     assert_eq!(steps, ["mark", "kill"]);
 }
 
 #[test]
 fn a_park_whose_close_is_only_slow_keeps_the_reopen_offer() {
     // The hangup was sent and the terminal is on its way out; its cleanup
-    // missed the close deadline. The session is gone, so it must be offered
-    // back: that offer is the point of parking.
-    let (out, steps) = park_steps(
-        Err("Terminal process has not finished cleanup; retry Close".into()),
-        false,
-    );
-    assert_eq!(out, Ok(true), "{steps:?}");
-    assert_eq!(steps, ["mark", "kill", "check"]);
+    // missed the close deadline. That offer is the point of parking.
+    let slow = "Terminal process has not finished cleanup; retry Close";
+    let (out, steps) = park_steps(Err(slow.into()));
+    assert_eq!(out, (true, Some(slow.to_string())), "{steps:?}");
+    assert_eq!(steps, ["mark", "kill"]);
 }
 
 #[test]
-fn a_park_whose_close_never_landed_takes_the_offer_back() {
-    // The terminal is still running: offering it for reopening would start a
-    // second copy of a live conversation.
-    let (out, steps) = park_steps(Err("could not signal the terminal".into()), true);
-    let why = out.unwrap_err();
-    assert!(why.contains("could not signal the terminal"), "{why}");
-    assert!(why.contains("still running"), "{why}");
-    assert_eq!(steps, ["mark", "kill", "check", "unmark"]);
-}
-
-/// "Still running" is the agent's own process, by pid and start time, not the
-/// terminal's listing, which marks a session as ending before its close has
-/// sent a signal.
-#[cfg(unix)]
-#[test]
-fn a_park_judges_still_running_by_the_agents_own_process() {
-    use crate::procguard::LockedSpawn;
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn_locked()
-        .expect("spawn a stand-in agent");
-    let pid = i32::try_from(child.id()).unwrap();
-    let facts = crate::sysload::procscan::probe_one(pid).expect("the stand-in is visible");
-    let seen = IdleSession {
-        pid,
-        start_us: facts.start_us,
-        ..idle_row()
-    };
-    assert!(still_running(&seen), "a live agent is still running");
-    assert!(
-        !still_running(&IdleSession {
-            start_us: facts.start_us + 1,
-            ..seen.clone()
-        }),
-        "the same pid with another start time is not the agent"
+fn a_park_whose_close_failed_keeps_its_mark_and_says_what_the_close_reported() {
+    // Neither the listing nor the agent's process tells a slow close from a
+    // signal that never landed, so the mark stays and the failure is said.
+    let (out, steps) = park_steps(Err("could not signal the terminal".into()));
+    assert_eq!(
+        out,
+        (true, Some("could not signal the terminal".to_string()))
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    assert!(!still_running(&seen), "a reaped agent is not running");
+    assert_eq!(steps, ["mark", "kill"]);
 }

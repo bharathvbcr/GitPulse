@@ -514,43 +514,22 @@ fn lease_sessions() -> (Vec<String>, bool) {
 }
 
 /// Closes a parked session's terminal and marks its row to be offered for
-/// reopening. `Ok(marked)` says whether a row was marked.
+/// reopening: whether a row was marked, and what the close reported if it
+/// failed.
 ///
-/// The row is marked first. Closing can take longer than the close allows (a
-/// terminal whose cleanup has not finished by its deadline is still on its way
-/// out), and a mark made only after a close that reported success would be
-/// lost with that error, taking the reopen offer, the point of parking, with
-/// it. When the close fails and the terminal is still running, the mark is
-/// taken back: a live terminal offered for reopening would start a second copy
-/// of its conversation.
+/// The row is marked first, and the mark is kept whatever the close reports.
+/// A close can outlast its own deadline while the terminal is already on its
+/// way out ("has not finished cleanup", the agent still inside its hangup
+/// grace), and a mark made only after a close that succeeded was lost with
+/// that error, taking the reopen offer, the point of parking, with it. Neither
+/// the terminal's listing nor the agent's process can tell that case from a
+/// signal that never landed, so the failure is said, not guessed at.
 fn close_parked(
     kill: impl FnOnce() -> Result<(), String>,
     mark: impl FnOnce() -> bool,
-    still_running: impl FnOnce() -> bool,
-    unmark: impl FnOnce(),
-) -> Result<bool, String> {
+) -> (bool, Option<String>) {
     let marked = mark();
-    match kill() {
-        Ok(()) => Ok(marked),
-        Err(why) if still_running() => {
-            if marked {
-                unmark();
-            }
-            Err(format!(
-                "could not close it ({why}); it is still running, so it was not parked"
-            ))
-        }
-        // The hangup reached it and it is going away; only its cleanup was slow.
-        Err(_) => Ok(marked),
-    }
-}
-
-/// Whether the agent `seen` names is still alive: its own process, by pid and
-/// start time. The terminal's listing cannot say: a close marks the session
-/// as ending before it sends the first signal, so one whose signal never
-/// landed lists as on its way out all the same.
-fn still_running(seen: &IdleSession) -> bool {
-    crate::sysload::procscan::probe_one(seen.pid).is_some_and(|f| f.start_us == seen.start_us)
+    (marked, kill().err())
 }
 
 /// Parks one session: the check, the native dialog, the check again, then the
@@ -579,14 +558,10 @@ pub fn park_session(
                 .and_then(|l| l.into_iter().find(|s| s.id == session_id))
                 .map(|s| s.repo);
             let ledger = state.session_ledger();
-            let marked = close_parked(
+            let (marked, close_error) = close_parked(
                 || crate::terminal::kill_session(state, session_id),
                 || ledger.mark_parked(session_id),
-                || still_running(seen),
-                || {
-                    ledger.undo_park(session_id);
-                },
-            )?;
+            );
             let recorded = repo.is_some_and(|repo| {
                 crate::ledger::record(crate::ledger::Draft {
                     repo_path: repo,
@@ -601,13 +576,19 @@ pub fn park_session(
                 .is_some()
             });
             Ok(format!(
-                "Parked {} in {}. {}{}",
+                "Parked {} in {}. {}{}{}",
                 seen.kind.name(),
                 seen.cwd.as_deref().unwrap_or("an unknown folder"),
                 if marked {
                     "It is offered for reopening with its conversation resumed."
                 } else {
                     "It was closed, but GitPulse has no record of the tab to offer it back from: resume it by hand."
+                },
+                match &close_error {
+                    Some(why) => format!(
+                        " Closing its terminal reported: {why}. If the terminal is still open, close it before reopening the session."
+                    ),
+                    None => String::new(),
                 },
                 if recorded {
                     ""
