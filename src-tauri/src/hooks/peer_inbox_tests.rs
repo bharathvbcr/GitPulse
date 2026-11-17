@@ -48,14 +48,10 @@ fn delivered_text(output: &HookOutput) -> String {
 /// Waits until `held` is the only owner, i.e. until the worker thread that
 /// captured a clone of it has finished and dropped its closure.
 fn wait_for_worker<T>(held: &Arc<T>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while Arc::strong_count(held) > 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the abandoned worker never finished"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        crate::test_support::wait_until(Duration::from_secs(20), || Arc::strong_count(held) == 1),
+        "the abandoned worker never finished"
+    );
 }
 
 #[test]
