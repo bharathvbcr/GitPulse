@@ -52,10 +52,31 @@ export function readVendoredSchema() {
   return Number(match[1]);
 }
 
-export function readCliSchema() {
+/**
+ * The number a `--version` line prints after `label` (`extract schema N`,
+ * `stack lease format N`), or null. The token must stand alone: not glued to a
+ * path or word on its left, and ended by whitespace, `,`, `;`, `)` or the end
+ * of the line, so `format 2a` and a phrase inside a path are not read. Two
+ * occurrences that disagree say nothing, rather than letting the first win.
+ *
+ * @param {string} line
+ * @param {string} label
+ */
+export function versionToken(line, label) {
+  const found = new Set(
+    [...line.matchAll(new RegExp(String.raw`(?<![\w./\\~-])${label} (\d+)(?=$|[\s,;)])`, "gi"))].map((match) => Number(match[1])),
+  );
+  return found.size === 1 ? [...found][0] : null;
+}
+
+const leaseFormat = (/** @type {string} */ line) => versionToken(line, "stack lease format");
+const extractSchema = (/** @type {string} */ line) => versionToken(line, "extract schema");
+
+/** @param {string} [bin] the devmap to ask; PATH's by default */
+export function readCliSchema(bin = "devmap") {
   // Prefer `devmap doctor --json` (binary-declared expected_schema_version).
   // Fall back to `--version` prose only when doctor is absent (older installs).
-  const doctor = spawnSync("devmap", ["doctor", "--json"], {
+  const doctor = spawnSync(bin, ["doctor", "--json"], {
     encoding: "utf8",
     cwd: REPO,
     timeout: 30_000,
@@ -65,11 +86,12 @@ export function readCliSchema() {
       const parsed = JSON.parse((doctor.stdout || "").trim().split("\n").pop() || "");
       if (typeof parsed.expected_schema_version === "number") {
         // doctor does not name the extraction schema; the --version line may.
-        const line = spawnSync("devmap", ["--version"], { encoding: "utf8", timeout: 15_000 });
-        const extract = line.status === 0 ? /extract schema (\d+)/i.exec(line.stdout || "") : null;
+        const line = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 15_000 });
+        const extract = line.status === 0 ? extractSchema(line.stdout || "") : null;
         return {
           available: true,
-          extract: extract ? Number(extract[1]) : null,
+          extract,
+          lease: line.status === 0 ? leaseFormat(line.stdout || "") : null,
           expected: parsed.expected_schema_version,
           versionLine: `doctor expected_schema_version ${parsed.expected_schema_version} (code_graph ${parsed.code_graph_schema_version ?? "?"}, version ${parsed.version ?? "?"})`,
           source: "doctor",
@@ -80,7 +102,7 @@ export function readCliSchema() {
     }
   }
 
-  const which = spawnSync("devmap", ["--version"], { encoding: "utf8" });
+  const which = spawnSync(bin, ["--version"], { encoding: "utf8" });
   if (which.error || which.status !== 0) {
     return {
       available: false,
@@ -90,10 +112,10 @@ export function readCliSchema() {
   const versionLine = (which.stdout || "").trim();
   const fromVersion = /store schema (\d+)/i.exec(versionLine);
   // Optional: printed only by a devmap that names its extraction schema.
-  const extract = /extract schema (\d+)/i.exec(versionLine);
+  const extract = extractSchema(versionLine);
   let expected = fromVersion ? Number(fromVersion[1]) : null;
   try {
-    const status = execFileSync("devmap", ["status", "--json", "--progress", "never"], {
+    const status = execFileSync(bin, ["status", "--json", "--progress", "never"], {
       encoding: "utf8",
       cwd: REPO,
       timeout: 30_000,
@@ -110,7 +132,7 @@ export function readCliSchema() {
   if (expected == null) {
     return { available: false, reason: `could not parse schema from: ${versionLine}` };
   }
-  return { available: true, expected, versionLine, source: "version", extract: extract ? Number(extract[1]) : null };
+  return { available: true, expected, versionLine, source: "version", extract, lease: leaseFormat(versionLine) };
 }
 
 /** @param {string[]} argv */
