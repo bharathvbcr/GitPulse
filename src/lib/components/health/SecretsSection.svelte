@@ -12,19 +12,25 @@
   const secretsCache = createRepoPanelCache<SecretsReport>();
 
   /**
-   * The Kingfisher scan in flight for each repository.
+   * The scan in flight for each repository.
    *
    * Module-level, not per instance. Health renders this section from more
    * than one branch (the local scan loading, failed, or loaded), so a
    * dependency scan that finishes remounts it. A per-instance guard let the
-   * new instance see no cache and start a second full Kingfisher scan beside
-   * the first; now it joins the one already running.
+   * new instance see no cache and start a second scan beside the first; now
+   * it joins the one already running.
    */
   const inflightScans = createScanJoin<SecretsReport>();
 
-  function scanRepository(repoPath: string): Promise<SecretsReport> {
-    return inflightScans.run(repoPath, () =>
-      invoke<unknown>("cmd_scan_secrets", { repoPath }).then((payload) => {
+  // A click on Rescan also asks Kingfisher for a second opinion, which is a
+  // different request from the automatic in-process scan, so it is joined
+  // under its own key: a click must not attach itself to an automatic scan
+  // that never starts Kingfisher.
+  const SECOND_OPINION_KEY = "\0second-opinion";
+
+  function scanRepository(repoPath: string, secondOpinion: boolean): Promise<SecretsReport> {
+    return inflightScans.run(secondOpinion ? repoPath + SECOND_OPINION_KEY : repoPath, () =>
+      invoke<unknown>("cmd_scan_secrets", secondOpinion ? { repoPath, secondOpinion: true } : { repoPath }).then((payload) => {
         const next = parseSecretsReport(payload);
         if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
         return next;
@@ -41,6 +47,7 @@
     AlertTriangle,
     LoaderCircle,
     ShieldCheck,
+    Info,
     FolderSearch,
     Clipboard,
     Check,
@@ -64,6 +71,7 @@
     filterFindings,
     findingKey,
     groupSizes,
+    engineLabel,
     isStale,
     isSuperseded,
     locationChips,
@@ -91,9 +99,11 @@
   /**
    * Working-tree secrets, as a section of Health.
    *
-   * Kingfisher findings located against Git: tracked, untracked, ignored,
-   * nested repository. No secret value is ever read or shown — a finding is a
-   * rule, a path and a line.
+   * Findings located against Git: tracked, untracked, ignored, nested
+   * repository. The in-process scanner answers on its own; Rescan also asks
+   * Kingfisher, when it is installed, for a second opinion. No
+   * secret value is ever read or shown — a finding is a rule, a path and a
+   * line.
    *
    * The scan is this section's own, independent of the dependency scan above
    * it: a failed npm audit says nothing about secrets, so the section renders
@@ -152,7 +162,7 @@
       : "",
   );
   /**
-   * The heading count. `total` is Kingfisher's own count and a floor when it
+   * The heading count. `total` is the union of both engines' rows and a floor when it
    * dropped or could not read rows, so the heading never states only the rows
    * that reached the table.
    */
@@ -184,7 +194,8 @@
     pending = false;
   }
 
-  async function scan(path?: string) {
+  /** `secondOpinion` is true only for a click: an automatic scan never starts Kingfisher. */
+  async function scan(path?: string, secondOpinion = false) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     stopPending();
@@ -196,7 +207,7 @@
     held = null;
     const failureKey = `secrets:${repoPath}`;
     try {
-      const next = await scanRepository(repoPath);
+      const next = await scanRepository(repoPath, secondOpinion);
       if (!next.ok) recordFailure(scanFailureCopy(next));
       // Per repository, not per pane: it must be recorded even when this pane
       // was left before the scan returned. A scan a newer one replaced is
@@ -218,7 +229,9 @@
     } finally {
       // A cancelled scan must still release the spinner when nothing newer
       // has taken over; otherwise a closed-then-reopened path spins forever.
-      if (inflight === guard) loading = false;
+      if (inflight === guard) {
+        loading = false;
+      }
     }
   }
 
@@ -360,7 +373,7 @@
         <span class="text-meta text-textMuted" data-testid="secrets-meta">
           {#if !report.ok}<span class="text-warn">Unavailable</span>{/if}
           {#if scannedAgo}{report.ok ? "" : "· "}scanned {scannedAgo}{/if}
-          {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
+          <span data-testid="secrets-engine" title="The scanner that produced this result">· {engineLabel(report)}</span>
           {#if report.kingfisher_version_rejected}<span
               class="text-warn"
               title="The scan output named a version that was refused as unsafe to display.">
@@ -384,7 +397,8 @@
         type="button"
         class="gp-btn"
         data-size="sm"
-        onclick={() => scan()}
+        onclick={() => scan(undefined, true)}
+        title="Rescan the working tree, then ask Kingfisher (when installed) for a second opinion"
         disabled={loading || !$repoStore.currentPath}
         aria-label="Rescan secrets"
       >
@@ -403,11 +417,11 @@
     <p class="text-meta text-textMuted" data-testid="secrets-backoff">{describeBackoff(held)}</p>
   {/if}
   {#if !$repoStore.currentPath}
-    <p class="text-textMuted">No repository open. Open one to scan its working tree with Kingfisher.</p>
+    <p class="text-textMuted">No repository open. Open one to scan its working tree.</p>
   {:else if pending && !report && !loading}
     <p class="text-textMuted">The working-tree scan starts once you stay on this page. Rescan starts it now.</p>
   {:else if loading && !report}
-    <!-- A full Kingfisher scan outlasts a second, so the wait is a skeleton;
+    <!-- A full-tree scan can outlast a second, so the wait is a skeleton;
          the spinner lives only inside the busy Rescan button above. -->
     <div class="space-y-2">
       <p class="text-textMuted">Scanning working tree…</p>
@@ -437,12 +451,14 @@
 
     <div
       class="gp-notice"
-      role={headline.tone === "ok" ? "status" : "alert"}
+      role={headline.tone === "ok" || headline.tone === "neutral" ? "status" : "alert"}
       data-testid="secrets-verdict"
-      data-tone={headline.tone}
+      data-tone={headline.tone === "neutral" ? "unknown" : headline.tone}
     >
       {#if headline.tone === "ok"}
         <ShieldCheck size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+      {:else if headline.tone === "neutral"}
+        <Info size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {:else}
         <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {/if}
@@ -543,12 +559,12 @@
       <EmptyState
         icon={ShieldCheck}
         title="Nothing to rotate"
-        hint="No secret matched in the files Kingfisher could read. The scope below says what that covers."
+        hint="No secret matched in the files the scan could read. The scope below says what that covers."
         compact
       />
     {/if}
 
-    {#if report.kingfisher_present}
+    {#if report.ok || report.kingfisher_present}
       <details class="text-meta text-textMuted px-0.5" data-testid="secrets-scope">
         <summary class="cursor-pointer select-none">What this scan covers</summary>
         <ul class="mt-1.5 space-y-0.5 list-disc pl-4">

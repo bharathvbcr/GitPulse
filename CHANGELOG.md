@@ -11,6 +11,33 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **The Secrets scan no longer needs Kingfisher.** Health's working-tree
+  secrets scan is now GitPulse's own in-process scanner (`leak_scan`, the
+  vendored `dc-redact` credential table): it reads every tracked file and every
+  untracked file git does not ignore, with a per-file cap, a byte budget and a
+  time limit, and lists every file it could not read. A scan with any skip is
+  partial, never clean. The report names its engine. A scan that left
+  nested repositories unread is partial. The in-process scan recognises far
+  fewer credential shapes than Kingfisher (recall tables in
+  `docs/PERFORMANCE.md`), so Kingfisher is its second opinion: a Rescan click
+  (`cmd_scan_secrets` takes an optional `second_opinion` argument) also runs
+  it when installed and merges its findings, one row per path and line. The
+  report says whether it was not installed, not run, unavailable (with the
+  reason) or ran, and a failed Kingfisher never changes the in-process result.
+  The green "No secrets reported" headline now needs both engines; the
+  in-process scan alone reads "No known secret shapes matched". Kingfisher
+  has no option to honour `.gitignore`, so its scope still includes ignored
+  files.
+
+### Fixed
+
+- **A conflicted file was scanned and counted up to three times.**
+  `git ls-files -t` lists an unmerged path once per stage and `--deduplicate`
+  does not apply with `-t`, so the working-tree scan now keeps one entry per
+  path (tracked wins).
+
 ## [1.99.0] - 2026-11-15
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It

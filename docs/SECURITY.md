@@ -419,9 +419,28 @@ flowchart TD
   still parses repository-supplied files with the user's account permissions.
 
 ### Secrets Scanner Privacy & Fail-Closed Reporting
-- Insights → Health integrates the Kingfisher secrets scanner to discover exposed
-  API keys, access tokens, and credentials in repository files.
-- Kingfisher runs with `--redact` and `--no-validate`, a scrubbed environment
+- Insights → Health scans the working tree for exposed API keys, access tokens,
+  and credentials with GitPulse's own in-process scanner (`leak_scan`, the
+  vendored `dc-redact` credential table). It reads every tracked file and every
+  untracked file git does not ignore, in this process, with a per-file cap, a
+  byte budget and a time limit; every input it could not read is listed and
+  makes the scan partial. It matches fewer credential shapes than Kingfisher
+  (recall is measured in `docs/PERFORMANCE.md`), so a clean result is weaker
+  than a corroborated one: the green "No secrets reported" headline needs
+  Kingfisher's second opinion to have run to completion as well, and a complete
+  in-process scan alone reads "No known secret shapes matched". A scan that
+  left nested repositories unread is partial. Findings carry the rule, path,
+  line and Git location only; no confidence, value grouping or version is
+  invented for them.
+- Kingfisher is the second opinion, run only on an explicit Rescan click (an
+  automatic scan starts no process) and only when it is installed. Its rows are
+  merged into the in-process findings, a row at a path and line both engines
+  report is kept once, and the report states whether the second opinion was
+  not installed, not run, unavailable (with the reason) or ran. A Kingfisher
+  that fails, is killed, times out or is truncated never changes the in-process
+  result. It has no option to honour `.gitignore`, so it also reads ignored
+  files (wholly ignored build, dependency and scratch trees are excluded by
+  GitPulse). It runs with `--redact` and `--no-validate`, a scrubbed environment
   (`PATH`, `HOME`, `NO_COLOR` only), and a fixed argv that never loads a
   repository config. Findings cross IPC as rule ID and name, repo-relative
   path, line, confidence, Git location, and a per-scan ordinal grouping rows
@@ -431,7 +450,10 @@ flowchart TD
 - Scanner standard output is unlogged in diagnostics to eliminate accidental
   secret disclosure in application logs or bug reports.
 - Fail-closed reporting: scans that time out, error, abort, or truncate are
-  reported as unverified / not clean, never as an all-clear. Kingfisher exits
+  reported as unverified / not clean, never as an all-clear. The in-process scan
+  reports any file over its cap, past its budget, unreadable, or not reached
+  before its time limit as a skip, and a scan with a skip, or with a nested
+  repository it did not read, is partial. Kingfisher exits
   0 when it cannot read a file, so completeness is taken from its audit
   record; a scan it marks partial, or one that carries no audit, is never
   shown as clean.

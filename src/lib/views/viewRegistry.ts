@@ -208,7 +208,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         id: "health",
         label: "Health",
         summary:
-          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets via Kingfisher, and dead code from the code map. A scanner that did not run is listed, not implied clean. No secret values are shown.",
+          "Local audits across ecosystems, Dependabot and code scanning alerts, working-tree secrets, and dead code from the code map. A scanner that did not run is listed, not implied clean. No secret values are shown.",
         paletteCommand: "Scan dependencies and secrets",
       },
       {

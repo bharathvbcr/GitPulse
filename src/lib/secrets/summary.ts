@@ -11,6 +11,61 @@ import { plural } from "../format";
 import { SCAN_FRESH_MS, isScanStale } from "../runtime/autoScan";
 import type { SecretFinding, SecretLocation, SecretsReport } from "./types";
 
+/**
+ * The scanner named for a header: the in-process engine's own name, with
+ * Kingfisher and its version added when it ran as the second opinion.
+ */
+export function engineLabel(report: SecretsReport): string {
+  const name = report.engine || "unknown engine";
+  const second = report.second_opinion;
+  if (second.state !== "ran") return name;
+  return `${name} + ${second.version ? `Kingfisher ${second.version}` : "Kingfisher"}`;
+}
+
+/**
+ * One sentence on the second opinion, for a headline's detail. Null when
+ * there is nothing to say: the in-process result stands alone and Kingfisher
+ * is not installed to add to it.
+ */
+export function secondOpinionNote(report: SecretsReport): string | null {
+  const second = report.second_opinion;
+  switch (second.state) {
+    case "not_installed":
+      return "Kingfisher isn't installed. It recognises more credential shapes and gives a second opinion on Rescan.";
+    case "not_run":
+      return report.kingfisher_present
+        ? "Rescan also runs Kingfisher for a second opinion."
+        : "Kingfisher isn't installed. It recognises more credential shapes and gives a second opinion on Rescan.";
+    case "unavailable":
+      return `Kingfisher's second opinion was unavailable: ${second.reason.replace(/[.\s]+$/, "")}. Rescan to try again.`;
+    case "ran": {
+      const base = `Kingfisher${second.version ? ` ${second.version}` : ""} reported ${plural(second.findings_total, "finding")}: ${second.confirmed.toLocaleString("en-US")} already listed here, ${second.added.toLocaleString("en-US")} added.`;
+      if (second.completeness === "complete") return base;
+      return second.completeness === "partial"
+        ? `${base} It didn't read every file.`
+        : `${base} It didn't report whether it read every file.`;
+    }
+  }
+}
+
+/** Skipped inputs named in a note before it says how many more there are. */
+const SKIPPED_SHOWN = 5;
+
+/**
+ * The inputs the in-process scan did not read, by name and reason; null when
+ * it read everything. A scan that skipped anything is partial, never clean.
+ */
+export function skippedNote(report: SecretsReport): string | null {
+  if (report.skipped_total === 0) return null;
+  const shown = report.skipped
+    .slice(0, SKIPPED_SHOWN)
+    .map((skip) => `${skip.path} (${skip.reason})`)
+    .join(", ");
+  const more = report.skipped_total - Math.min(report.skipped.length, SKIPPED_SHOWN);
+  const tail = more > 0 ? `${shown ? ", and " : ""}${more.toLocaleString("en-US")} more` : "";
+  return `${plural(report.skipped_total, "input")} not read: ${shown}${tail}.`;
+}
+
 /** Most actionable first; matches the backend's sort. */
 export const LOCATION_ORDER: readonly SecretLocation[] = [
   "git_metadata",
@@ -114,7 +169,11 @@ export function distinctSecrets(findings: readonly SecretFinding[]): number {
   return groups.size + ungrouped;
 }
 
-export type VerdictTone = "ok" | "warn" | "danger";
+/**
+ * `ok` is green and means two engines agreed; `neutral` is a complete scan
+ * that found nothing but was not corroborated, so it carries no green.
+ */
+export type VerdictTone = "ok" | "neutral" | "warn" | "danger";
 
 export interface Verdict {
   tone: VerdictTone;
@@ -123,8 +182,11 @@ export interface Verdict {
 }
 
 /**
- * The headline. "No secrets reported" is reachable only from a scan that
- * succeeded, read every input, lost no rows, and found nothing.
+ * The headline. "No secrets reported" (green) is reachable only when the
+ * in-process scan succeeded, read every input, lost no rows and found
+ * nothing, and Kingfisher's second opinion also ran to completion and found
+ * nothing. A complete in-process scan alone says only that no known secret
+ * shape matched.
  */
 export function verdict(report: SecretsReport): Verdict {
   const total = report.findings_total;
@@ -140,11 +202,18 @@ export function verdict(report: SecretsReport): Verdict {
   }
   if (total === 0 && lost === 0 && !report.findings_truncated) {
     if (report.completeness === "complete") {
+      const second = report.second_opinion;
+      if (second.state === "ran" && second.completeness === "complete") {
+        return {
+          tone: "ok",
+          title: "No secrets reported",
+          detail: `${engineLabel(report)} read every file in scope and matched no credential shape. Kingfisher, run as a second opinion, reported nothing at medium confidence or above.`,
+        };
+      }
       return {
-        tone: "ok",
-        title: "No secrets reported",
-        detail:
-          "Kingfisher read every file in scope and reported nothing at medium confidence or above.",
+        tone: "neutral",
+        title: "No known secret shapes matched",
+        detail: `${report.engine || "The in-process scan"} read every file in scope. ${secondOpinionNote(report) ?? ""}`.trim(),
       };
     }
     const partial = report.completeness === "partial";
@@ -154,8 +223,12 @@ export function verdict(report: SecretsReport): Verdict {
         ? "No findings, but the scan was partial"
         : "No findings, completeness unverified",
       detail: partial
-        ? "Kingfisher couldn't read some files (permissions, or files that changed mid-scan). This is not a clean result."
-        : "This Kingfisher did not report whether it read every file. This is not a clean result.",
+        ? skippedNote(report)
+          ? `${skippedNote(report)} This is not a clean result.`
+          : excludedNote(report.excluded_paths)
+            ? `${excludedNote(report.excluded_paths)} This is not a clean result.`
+            : "Some files couldn't be read (permissions, or files that changed mid-scan). This is not a clean result."
+        : "The scan did not report whether it read every file. This is not a clean result.",
     };
   }
   const floor = report.findings_truncated || lost > 0;
@@ -169,11 +242,21 @@ export function verdict(report: SecretsReport): Verdict {
 function findingsDetail(report: SecretsReport): string {
   const parts: string[] = [];
   if (report.completeness === "partial") {
-    parts.push("Some files couldn't be read, so this list is a floor.");
+    const skipped = skippedNote(report);
+    const left = excludedNote(report.excluded_paths);
+    parts.push(
+      skipped
+        ? `${skipped} This list is a floor.`
+        : left
+          ? `${left} This list is a floor.`
+          : "Some files couldn't be read, so this list is a floor.",
+    );
   } else if (report.completeness === "unverified") {
-    parts.push("Kingfisher did not report whether it read every file.");
+    parts.push("The scan did not report whether it read every file.");
   }
-  if (report.findings_truncated) parts.push("Kingfisher omitted findings past its own report cap.");
+  if (report.findings_truncated) parts.push("More findings were found than are listed.");
+  const second = secondOpinionNote(report);
+  if (second) parts.push(second);
   const lost = report.findings_unreadable;
   if (lost > 0) {
     parts.push(`${plural(lost, "finding")} couldn't be read and ${lost === 1 ? "is" : "are"} not listed.`);
@@ -193,24 +276,37 @@ export function capNote(report: SecretsReport): string | null {
 }
 
 /**
- * What "every file in scope" means. Each line is a behaviour measured on
- * Kingfisher 2.7.0 with GitPulse's argv, not a paraphrase of its docs.
+ * What "every file in scope" means. The first group is a property of the
+ * in-process reader; the second is Kingfisher's, each line a behaviour
+ * measured with GitPulse's argv, and appears only once it has run.
  */
 export function scopeNotes(report: SecretsReport): string[] {
   const notes = [
     "Working tree only: commit history is not scanned.",
+    "Reads every tracked file and every untracked file git does not ignore. Ignored files (build output, local .env files) are not read by this scan.",
     "Values are matched locally and never validated against a provider.",
-    "Symbolic links are not followed, and Kingfisher skips some directories itself (node_modules).",
-    "Inline kingfisher:ignore comments are honored.",
+    "Symbolic links are not followed.",
+    "Recognises far fewer credential shapes than Kingfisher (recall is measured in docs/PERFORMANCE.md), so a clean result from this scan alone is weak.",
   ];
   if (report.max_file_size_mb > 0) {
-    notes.push(`Files over ${report.max_file_size_mb} MB are skipped without being reported.`);
+    notes.push(
+      `Files over ${report.max_file_size_mb} MB, or past the scan's byte or time budget, are listed as not read.`,
+    );
   }
-  if (report.nested_repos_scanned) {
-    notes.push("Nested repositories and submodules inside this tree are scanned too.");
-  }
+  const skipped = skippedNote(report);
+  if (skipped) notes.push(skipped);
   const left = excludedNote(report.excluded_paths);
   if (left) notes.push(left);
+  const second = report.second_opinion;
+  if (second.state === "ran") {
+    notes.push(
+      "Kingfisher, the second opinion, has no option to honour .gitignore, so it also reads ignored files (build output, local .env files) apart from wholly ignored dependency and scratch trees.",
+      "Kingfisher reads nested repositories and submodules inside this tree, skips some directories itself (node_modules), and skips files over its size limit without reporting them.",
+      "Inline kingfisher:ignore comments are honored. Symbolic links are not followed.",
+    );
+  } else if (second.state === "unavailable") {
+    notes.push("Kingfisher was asked for a second opinion and did not finish; nothing here comes from it.");
+  }
   return notes;
 }
 
@@ -218,17 +314,15 @@ export function scopeNotes(report: SecretsReport): string[] {
 const EXCLUDED_SHOWN = 10;
 
 /**
- * The trees the scan left out, by name: ignored build output, dependency and
- * scratch directories, and this repository's own worktrees nested inside it.
- * A finding there is a copy of one the scan can see, or is scanned when that
- * worktree is the repository open; the note keeps the narrower scope visible.
+ * The nested repositories and submodules the in-process scan named and did
+ * not read: they belong to another repository's index.
  */
 function excludedNote(paths: readonly string[]): string | null {
   if (paths.length === 0) return null;
   const shown = paths.slice(0, EXCLUDED_SHOWN).join(", ");
   const more = paths.length - EXCLUDED_SHOWN;
   const tail = more > 0 ? `, and ${more.toLocaleString("en-US")} more` : "";
-  return `Not scanned: ignored build output, dependency and scratch trees, and this repository's other worktrees inside it (${shown}${tail}).`;
+  return `Not scanned: nested repositories and submodules, which belong to another index (${shown}${tail}).`;
 }
 
 /** A cached report older than this is refreshed when the panel reopens. */

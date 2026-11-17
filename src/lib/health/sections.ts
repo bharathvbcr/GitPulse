@@ -92,7 +92,7 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     label: "Secrets",
     heading: "Working-tree secrets",
     summary:
-      "Secrets Kingfisher matched in the working tree, located against Git. No secret values are shown.",
+      "Secrets matched in the working tree, located against Git. No secret values are shown.",
   },
   {
     id: "issues",

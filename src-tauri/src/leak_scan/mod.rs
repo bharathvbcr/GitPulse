@@ -8,15 +8,18 @@
 //! are read, how they are bounded, and an account of every input it could not
 //! read, so a scan that missed something can never be reported as clean.
 //!
-//! Kingfisher stays the opt-in deep scan of the whole working tree
-//! (`crate::secrets`); this is the everyday path that has to be fast, local
-//! and dependency-free.
+//! This is the primary secrets scanner: the everyday path that has to be
+//! fast, local and dependency-free. Kingfisher (`crate::secrets`) is the
+//! opt-in deep scan, which also reads the files git ignores.
 //!
-//! The module is pure over bytes. [`staged`] (what a commit adds) and
-//! [`range`] (what a push sends) are the places that run git.
+//! The module is pure over bytes. [`staged`] (what a commit adds), [`range`]
+//! (what a push sends) and [`worktree`] (every tracked and untracked,
+//! non-ignored file on disk, the Health panel's Secrets scan) are the places
+//! that run git.
 
 pub mod range;
 pub mod staged;
+pub mod worktree;
 
 use serde::Serialize;
 use std::ops::Range;
@@ -583,3 +586,5 @@ mod recall_tests;
 mod staged_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod worktree_tests;

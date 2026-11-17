@@ -270,7 +270,7 @@ function githubFacet(
  * The secrets scan, read through the Secrets section's own verdict so the
  * chip and the section cannot disagree. Only that verdict's `ok` — a scan
  * that succeeded, read every input, lost no rows and found nothing — is
- * clear; a partial, unverified or unavailable scan is unknown, and any
+ * clear; a partial, unverified, unavailable or uncorroborated scan is unknown, and any
  * finding is critical: a credential in the working tree is one commit from
  * history, and rotating it is the fix.
  */
@@ -288,6 +288,17 @@ function secretsFacet(report: SecretsReport | null): HealthFacet {
   }
   const shown = secretsVerdict(report);
   if (shown.tone === "ok") return { id, label, value: "none", tone: "clear" };
+  // One engine found nothing and the second opinion has not corroborated it:
+  // not a finding, and not clear either.
+  if (shown.tone === "neutral") {
+    return {
+      id,
+      label,
+      value: "none matched",
+      tone: "unknown",
+      caveat: `${shown.title}. ${shown.detail}`.trim(),
+    };
+  }
   if (report.findings_total > 0) {
     const floor = report.findings_truncated || report.findings_unreadable > 0 || !report.ok;
     return {

@@ -1,4 +1,9 @@
-//! Optional Kingfisher secret scan for the Insights Secrets section.
+//! The Insights Secrets section's working-tree scan.
+//!
+//! [`scan_working_tree`] answers it with the in-process scanner
+//! (`crate::leak_scan::worktree`) by default; Kingfisher is the opt-in deep
+//! scan, which also reads the files git ignores. The rest of this module is
+//! the Kingfisher side:
 //!
 //! Resolves `kingfisher` like every other external tool (PATH, then the
 //! GUI-launch fallback directories), spawns it with a scrubbed environment,
@@ -8,16 +13,26 @@
 //! fingerprints stay in this process; the webview gets an ordinal instead.
 
 mod parse;
+mod primary;
 mod report;
 mod run;
 
-pub use parse::{ScanCompleteness, SecretFinding, SecretLocation, SecretsReport};
+pub use parse::{
+    ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation, SecretSkip, SecretsReport,
+    ENGINE_KINGFISHER,
+};
+pub use primary::scan_working_tree;
 pub use report::MAX_FINDINGS;
 pub use run::{
     build_scan_argv, build_scrubbed_env, build_version_argv, nested_repos_scanning_enabled,
-    report_from_exit, resolve_kingfisher, scan_secrets, scan_with_binary, ScanTicket,
-    MAX_FILE_SIZE_MB, SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
+    report_from_exit, resolve_kingfisher, scan_with_binary, ScanTicket, MAX_FILE_SIZE_MB,
+    SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
 };
+
+// Its Kingfisher stand-ins are `/bin/sh` scripts made executable with Unix
+// permissions, so the module builds on Unix only.
+#[cfg(all(test, unix))]
+mod primary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -326,19 +341,6 @@ mod tests {
         assert!(!report.ok);
         let serialized = serde_json::to_string(&report).expect("serialize");
         assert!(!serialized.contains(PLANTED), "leaked: {serialized}");
-    }
-
-    #[test]
-    fn missing_binary_is_not_clean_and_says_where_it_looked() {
-        let report = run::missing_binary_report();
-        assert!(!report.ok);
-        assert!(!report.kingfisher_present);
-        let error = report.error.as_deref().unwrap_or_default();
-        assert!(error.contains("brew install kingfisher"));
-        // Not "not on PATH": the lookup also searched the fallback dirs, and
-        // naming only PATH was the false cause a Dock launch got.
-        assert!(error.contains("standard install directories"), "{error}");
-        assert!(report.findings.is_empty());
     }
 
     /// The Dock-launch reproduction: launchd hands a GUI app

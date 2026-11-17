@@ -5,13 +5,16 @@ import {
   LOCATION_ORDER,
   capNote,
   distinctSecrets,
+  engineLabel,
   filterFindings,
   groupSizes,
   isStale,
   isSuperseded,
   locationLabel,
   locationChips,
+  secondOpinionNote,
   scopeNotes,
+  skippedNote,
   scanFailureCopy,
   shouldCache,
   STALE_AFTER_MS,
@@ -19,6 +22,12 @@ import {
   verdict,
 } from "./summary";
 
+const IN_HOUSE = "dc-redact 0.2.5 (devcouncil@b9b2314d)";
+
+/**
+ * A clean in-process scan that Kingfisher corroborated: the only fixture the
+ * green headline is reachable from.
+ */
 function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
   return {
     ok: true,
@@ -27,7 +36,7 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
     kingfisher_present: true,
     kingfisher_version: "2.7.0",
     kingfisher_version_rejected: false,
-    nested_repos_scanned: true,
+    nested_repos_scanned: false,
     excluded_paths: [],
     completeness: "complete",
     findings: [],
@@ -35,9 +44,13 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
     findings_unreadable: 0,
     findings_truncated: false,
     git_status_known: true,
-    max_file_size_mb: 256,
+    max_file_size_mb: 32,
     scanned_at_ms: 1_000_000,
     duration_ms: 10,
+    engine: IN_HOUSE,
+    skipped_total: 0,
+    skipped: [],
+    second_opinion: { state: "ran", completeness: "complete", version: "2.7.0", findings_total: 0, confirmed: 0, added: 0 },
     ...overrides,
   };
 }
@@ -62,6 +75,11 @@ describe("verdict", () => {
     const shortfalls: Partial<SecretsReport>[] = [
       { completeness: "partial" },
       { completeness: "unverified" },
+      { second_opinion: { state: "not_run" } },
+      { second_opinion: { state: "not_installed" } },
+      { second_opinion: { state: "unavailable", reason: "kingfisher did not finish within 300s" } },
+      { second_opinion: { state: "ran", completeness: "partial", version: null, findings_total: 0, confirmed: 0, added: 0 } },
+      { second_opinion: { state: "ran", completeness: "unverified", version: null, findings_total: 0, confirmed: 0, added: 0 } },
       { findings_unreadable: 1 },
       { findings_truncated: true },
       { ok: false, error: "kingfisher timed out" },
@@ -92,6 +110,14 @@ describe("verdict", () => {
     expect(verdict(report({ findings: rows, findings_total: 1, findings_truncated: true })).title).toBe(
       "1 finding+",
     );
+  });
+
+  it("says a cut list is cut without blaming one engine", () => {
+    const detail = verdict(
+      inHouse({ findings: [row()], findings_total: 250, findings_truncated: true }),
+    ).detail;
+    expect(detail).toContain("More findings were found than are listed.");
+    expect(detail).not.toContain("Kingfisher omitted");
   });
 
   it("keeps a failed scan's findings in view", () => {
@@ -157,10 +183,10 @@ describe("cap and scope", () => {
   it("names every measured exclusion", () => {
     const notes = scopeNotes(report()).join(" ");
     expect(notes).toContain("commit history is not scanned");
-    expect(notes).toContain("256 MB");
+    expect(notes).toContain("32 MB");
     expect(notes).toContain("Symbolic links are not followed");
     expect(notes).toContain("kingfisher:ignore");
-    expect(notes).toContain("Nested repositories");
+    expect(notes).toContain("nested repositories");
     expect(notes).not.toContain("Not scanned");
   });
 
@@ -329,5 +355,155 @@ describe("parseSecretsReport", () => {
     expect(parseSecretsReport({ ...report(), kingfisher_version_rejected: true })
       .kingfisher_version_rejected).toBe(true);
     expect(parseSecretsReport(report()).kingfisher_version_rejected).toBe(false);
+  });
+});
+
+/** What the in-process scanner returns: no version, no confidence, no groups. */
+function inHouse(overrides: Partial<SecretsReport> = {}): SecretsReport {
+  return report({
+    engine: IN_HOUSE,
+    kingfisher_present: false,
+    kingfisher_version: null,
+    second_opinion: { state: "not_installed" },
+    ...overrides,
+  });
+}
+
+describe("the in-process engine", () => {
+  it("is named in the header, with Kingfisher added once it has run", () => {
+    expect(engineLabel(inHouse())).toBe(IN_HOUSE);
+    expect(engineLabel(report())).toBe(`${IN_HOUSE} + Kingfisher 2.7.0`);
+    expect(engineLabel(report({ engine: "" , second_opinion: { state: "not_run" } }))).toBe("unknown engine");
+  });
+
+  it("is not green on its own: a complete empty scan says only that no known shape matched", () => {
+    for (const second_opinion of [
+      { state: "not_installed" },
+      { state: "not_run" },
+      { state: "unavailable", reason: "kingfisher output was truncated" },
+    ] as const) {
+      const v = verdict(inHouse({ second_opinion }));
+      expect(v.tone).toBe("neutral");
+      expect(v.title).toBe("No known secret shapes matched");
+      expect(v.title).not.toContain("No secrets reported");
+      expect(v.detail).toContain(IN_HOUSE);
+    }
+  });
+
+  it("points at Rescan when Kingfisher is installed and at installing it when it is not", () => {
+    expect(verdict(inHouse({ kingfisher_present: true, second_opinion: { state: "not_run" } })).detail).toContain(
+      "Rescan also runs Kingfisher for a second opinion.",
+    );
+    expect(verdict(inHouse({ second_opinion: { state: "not_installed" } })).detail).toContain(
+      "Kingfisher isn't installed.",
+    );
+    expect(
+      verdict(inHouse({ second_opinion: { state: "unavailable", reason: "kingfisher did not finish within 300s." } }))
+        .detail,
+    ).toContain("Kingfisher's second opinion was unavailable: kingfisher did not finish within 300s. Rescan to try again.");
+  });
+
+  it("is green only when the second opinion ran complete and both found nothing", () => {
+    expect(verdict(report())).toMatchObject({ tone: "ok", title: "No secrets reported" });
+    // Both ran clean, but Kingfisher reported a row: not clean.
+    expect(
+      verdict(report({ findings_total: 1, findings: [row()] })).tone,
+    ).toBe("danger");
+  });
+
+  it("states what a second opinion added, and when it was unavailable, beside the findings", () => {
+    const ran = report({
+      findings: [row()],
+      findings_total: 3,
+      second_opinion: { state: "ran", completeness: "complete", version: "2.7.0", findings_total: 3, confirmed: 1, added: 2 },
+    });
+    expect(verdict(ran).detail).toContain("Kingfisher 2.7.0 reported 3 findings: 1 already listed here, 2 added.");
+    const down = report({
+      findings: [row()],
+      findings_total: 1,
+      second_opinion: { state: "unavailable", reason: "kingfisher crashed (SIGBUS)" },
+    });
+    expect(verdict(down).title).toBe("1 finding");
+    expect(verdict(down).detail).toContain("Kingfisher's second opinion was unavailable: kingfisher crashed (SIGBUS).");
+    expect(secondOpinionNote(report({ second_opinion: { state: "ran", completeness: "partial", version: null, findings_total: 0, confirmed: 0, added: 0 } }))).toContain(
+      "It didn't read every file.",
+    );
+  });
+
+  it("never calls a scan that left nested repositories unread clean, and names them", () => {
+    const v = verdict(inHouse({ completeness: "partial", excluded_paths: ["vendor/inner/"] }));
+    expect(v.tone).toBe("warn");
+    expect(v.detail).toContain("vendor/inner/");
+    expect(v.detail).toContain("This is not a clean result.");
+  });
+
+  it("never calls a scan with skipped inputs clean, and names them", () => {
+    const skipped = [{ path: "big.bin", reason: "larger than the scan reads", bytes: 40_000_000 }];
+    const partial = inHouse({ completeness: "partial", skipped_total: 3, skipped });
+    const v = verdict(partial);
+    expect(v.tone).toBe("warn");
+    expect(v.title).toContain("partial");
+    expect(v.detail).toContain("3 inputs not read: big.bin (larger than the scan reads), and 2 more.");
+    expect(v.detail).toContain("not a clean result");
+    expect(skippedNote(partial)).toContain("big.bin");
+    expect(skippedNote(inHouse())).toBeNull();
+  });
+
+  it("states the narrower scope instead of Kingfisher's", () => {
+    const notes = scopeNotes(inHouse({ excluded_paths: ["vendor/inner/"] })).join("\n");
+    expect(notes).toContain("Ignored files");
+    expect(notes).toContain("far fewer credential shapes");
+    expect(notes).toContain("nested repositories and submodules");
+    expect(notes).not.toContain("skipped without being reported");
+    expect(notes).not.toContain("kingfisher:ignore");
+  });
+
+  it("describes Kingfisher's scope only once it has run, including that it reads ignored files", () => {
+    const ran = scopeNotes(report()).join("\n");
+    expect(ran).toContain("no option to honour .gitignore");
+    expect(ran).toContain("kingfisher:ignore");
+    const alone = scopeNotes(inHouse()).join("\n");
+    expect(alone).not.toContain("honour .gitignore");
+    expect(scopeNotes(inHouse({ second_opinion: { state: "unavailable", reason: "x" } })).join("\n")).toContain(
+      "did not finish; nothing here comes from it",
+    );
+  });
+
+  it("parses the second opinion strictly: absent is not run, unknown is unavailable, never ran", () => {
+    const base = { ok: true, completeness: "complete", findings: [] };
+    expect(parseSecretsReport(base).second_opinion).toEqual({ state: "not_run" });
+    expect(parseSecretsReport({ ...base, second_opinion: { state: "not_installed" } }).second_opinion).toEqual({
+      state: "not_installed",
+    });
+    expect(parseSecretsReport({ ...base, second_opinion: { state: "ran", completeness: "bogus" } }).second_opinion.state).toBe(
+      "unavailable",
+    );
+    expect(parseSecretsReport({ ...base, second_opinion: "ran" }).second_opinion.state).toBe("unavailable");
+    expect(parseSecretsReport({ ...base, second_opinion: { state: "mystery" } }).second_opinion.state).toBe("unavailable");
+    expect(
+      parseSecretsReport({
+        ...base,
+        second_opinion: { state: "ran", completeness: "complete", version: "2.7.0", findings_total: 4, confirmed: 1, added: -3 },
+      }).second_opinion,
+    ).toEqual({ state: "ran", completeness: "complete", version: "2.7.0", findings_total: 4, confirmed: 1, added: 0 });
+    const token = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5";
+    const redacted = parseSecretsReport({ ...base, second_opinion: { state: "unavailable", reason: `failed near ${token}` } })
+      .second_opinion;
+    expect(JSON.stringify(redacted)).not.toContain(token);
+  });
+
+  it("parses a report that lists skips as partial even if it declared complete", () => {
+    const parsed = parseSecretsReport({
+      ok: true,
+      engine: IN_HOUSE,
+      completeness: "complete",
+      findings: [],
+      skipped_total: 1,
+      skipped: [{ path: "a", reason: "could not be read", bytes: null }],
+    });
+    expect(parsed.completeness).toBe("partial");
+    expect(parsed.engine).toBe(IN_HOUSE);
+    expect(parsed.skipped).toEqual([{ path: "a", reason: "could not be read", bytes: null }]);
+    expect(verdict(parsed).tone).toBe("warn");
   });
 });
