@@ -818,8 +818,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   /**
    * Runs one AI call with the saved selection. With none saved the backend
    * finds a server but sends nothing, answering `ai_endpoint_unconfirmed`; this
-   * asks the user about exactly that runtime and address, saves the choice
-   * through the same path as picking a model (`selectModel`), and asks again.
+   * asks the user about exactly that runtime and address, saves the choice as
+   * GitPulse's own loopback selection (`askEndpointConsent`: `savePreferred`
+   * only, never `selectModel`, so Manvi's config is not written), and asks
+   * again.
    * A saved selection whose server no longer serves its model is refused the
    * same way, marked stale: the saved choice is dropped and the refusal shown,
    * with no prompt about a server that is not there.
