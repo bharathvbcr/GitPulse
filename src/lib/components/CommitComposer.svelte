@@ -70,6 +70,8 @@
   const instanceId = $props.id();
   const keysId = `${instanceId}-commit-message-keys`;
   let commitError = $state<{ message: string; kind: IpcErrorKind } | null>(null);
+  /** Whether the last commit attempt was a commit-all, so "Commit anyway" repeats that one. */
+  let lastAttemptQuick = false;
   let isCommitting = $state(false);
   let lastVerdict = $state<PolicyVerdict | null>(null);
 
@@ -223,9 +225,15 @@
     generation = null;
   }
 
-  async function handleCommit(forceQuick = false) {
+  /**
+   * `allowSecrets` only from the "Commit anyway" button under a
+   * `secret_scan_blocked` refusal: the person has read what the scan found
+   * (or could not read) and commits past it.
+   */
+  async function handleCommit(forceQuick = false, allowSecrets = false) {
     const message = commitMessage.trim();
     const useQuick = (forceQuick || includeUnstaged) && !isAmending;
+    lastAttemptQuick = useQuick;
     if (!message) return;
     if (conflictedCount > 0) return;
     if (useQuick ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending) return;
@@ -234,7 +242,9 @@
     isCommitting = true;
     try {
       await finishCommit(
-        useQuick ? await repoStore.quickCommit(message) : await repoStore.commit(message, isAmending),
+        useQuick
+          ? await repoStore.quickCommit(message, allowSecrets)
+          : await repoStore.commit(message, isAmending, allowSecrets),
         epoch,
       );
     } finally {
@@ -463,7 +473,34 @@
     <HookRunNotice />
   {/if}
 
-  {#if commitError?.kind === "identity_missing"}
+  <!-- The refusal's text names shape, path and line only; the toast announces
+       it like any commit error. -->
+  {#if commitError?.kind === "secret_scan_blocked"}
+    <div data-secret-scan-blocked class="flex flex-col gap-1.5">
+      <div class="text-micro text-danger whitespace-pre-wrap font-mono leading-relaxed">{commitError.message}</div>
+      <div class="flex items-center gap-1.5">
+        <button
+          type="button"
+          class="gp-btn"
+          data-size="sm"
+          data-variant="danger"
+          title="Commit without the secret scan's approval. Anything credential-shaped stays in history even after it is removed."
+          onclick={() => { commitError = null; void handleCommit(lastAttemptQuick, true); }}
+        >
+          Commit anyway
+        </button>
+        <button
+          type="button"
+          class="gp-btn"
+          data-size="sm"
+          data-variant="ghost"
+          onclick={() => { commitError = null; void focusMessage(); }}
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+  {:else if commitError?.kind === "identity_missing"}
     <IdentityPrompt
       onSaved={() => { commitError = null; void handleCommit(); void focusMessage(); }}
       onDismiss={() => { commitError = null; void focusMessage(); }}

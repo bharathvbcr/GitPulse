@@ -7,7 +7,7 @@
 //! * **Admission (card 1b):** [`admit`] is called before an agent launch's
 //!   checkout probes, its capacity check and its PTY spawn. It refuses only on
 //!   memory pressure, and fails open on everything else.
-//! * **Shedding (card 1c):** the spawn gate (`engine::git_cli`) asks
+//! * **Shedding (card 1c):** the spawn gate (`engine::process`) asks
 //!   [`shed`] which of its own admission classes to refuse, and refuses them
 //!   with the deferral marker the frontend already retries on. Nothing here
 //!   schedules anything.
@@ -54,7 +54,7 @@
 //! override.
 
 use super::disk::LowDisk;
-use super::thresholds::{Readings, Thresholds};
+use super::thresholds::{DiskFill, Readings, Thresholds};
 use super::{Level, Platform, SensorReport, SensorState, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -64,6 +64,18 @@ use std::time::{Duration, Instant};
 pub const ENTER_SAMPLES: u32 = 3;
 /// Consecutive samples below the held tier before it is left.
 pub const EXIT_SAMPLES: u32 = 5;
+/// How long a Severe that the disk fill rule caused is held after the fill
+/// rule last read Severe, as continuous time below it. A build that writes in
+/// lumps loses space in bursts with pauses between them, and the ordinary
+/// exit of [`EXIT_SAMPLES`] (10 s) lapsed to admitting launches in the middle
+/// of the fill, three times in 150 s for 5 GiB every 80 s. Three minutes is
+/// the shortest hold that left none of the intermittent patterns in the review
+/// sweep (60 s: 242 s of lapses, 120 s: 34 s, 180 s: none). A Severe that the
+/// level, memory, swap or CPU caused keeps [`EXIT_SAMPLES`].
+pub const FILL_SEVERE_RELEASE: Duration = Duration::from_secs(180);
+/// [`FILL_SEVERE_RELEASE`] in sampler ticks.
+pub const FILL_SEVERE_RELEASE_SAMPLES: u32 =
+    (FILL_SEVERE_RELEASE.as_millis() / super::CADENCE_MS as u128) as u32;
 /// Continuous pressure refusal after which the person is told.
 pub const REFUSAL_NOTICE_AFTER: Duration = Duration::from_secs(30 * 60);
 /// How long a person's "Admit anyway" lasts.
@@ -84,12 +96,21 @@ pub enum Binding {
     Swap,
     /// Free disk space on the volume holding GitPulse's state.
     LowDisk,
+    /// Free disk space is falling fast enough to reach the severe floor within
+    /// the horizon (`diskrate`, the `disk_fill` rule). Published to older
+    /// readers as [`Binding::LowDisk`]; see [`Binding::wire`].
+    DiskFilling,
     /// `NSProcessInfo.thermalState`.
     Thermal,
     /// The 1-minute load average per logical CPU.
     CpuLoad,
     /// Running on battery.
     Battery,
+    /// A trivial child takes a median of [`super::exec_probe::ENTER_MS`] or
+    /// more to start (`exec_probe`). Published to older readers as
+    /// [`Binding::CpuLoad`], the nearest binding they know that also only
+    /// sheds; see [`Binding::wire`].
+    ExecLatency,
 }
 
 impl Binding {
@@ -106,6 +127,8 @@ impl Binding {
             Some(Self::Thermal) => 6,
             Some(Self::CpuLoad) => 7,
             Some(Self::Battery) => 8,
+            Some(Self::DiskFilling) => 9,
+            Some(Self::ExecLatency) => 10,
         }
     }
 
@@ -122,8 +145,67 @@ impl Binding {
             6 => Some(Self::Thermal),
             7 => Some(Self::CpuLoad),
             8 => Some(Self::Battery),
+            9 => Some(Self::DiskFilling),
+            10 => Some(Self::ExecLatency),
             _ => return None,
         })
+    }
+
+    /// The binding a build that predates this one understands this as. Such a
+    /// reader refuses a code it does not know by treating the whole published
+    /// verdict as unreadable, which for the command gate means "not
+    /// load-checked" and no refusal: the very moment the disk is filling would
+    /// be the one the installed hook stopped protecting. So the byte every
+    /// version reads carries this, and the exact binding rides beside it
+    /// ([`Binding::of_wire`]).
+    pub(super) fn wire(self) -> Self {
+        match self {
+            Self::DiskFilling => Self::LowDisk,
+            Self::ExecLatency => Self::CpuLoad,
+            other => other,
+        }
+    }
+
+    /// The pair stored for `binding`: the byte every version reads, and a byte
+    /// that is 0 unless that one is not the whole truth.
+    pub(super) fn wire_codes(binding: Option<Self>) -> (u8, u8) {
+        let base = Self::code_of(binding.map(Self::wire));
+        match binding {
+            Some(exact) if exact.wire() != exact => (base, Self::code_of(Some(exact))),
+            _ => (base, 0),
+        }
+    }
+
+    /// The binding a stored pair names: the detail byte when this build knows
+    /// it, otherwise what the base byte says. `None` only when the base byte is
+    /// one this build does not know.
+    pub(super) fn of_wire(base: u8, detail: u8) -> Option<Option<Self>> {
+        let general = Self::of_code(base)?;
+        if detail == 0 {
+            return Some(general);
+        }
+        Some(match Self::of_code(detail) {
+            Some(exact @ Some(_)) => exact,
+            _ => general,
+        })
+    }
+
+    /// What is wrong, as the end of a sentence about work that is shed or
+    /// refused: "background work is shed while {this}". Names the cause the
+    /// verdict names, never memory pressure for a disk or a swap.
+    pub fn cause_phrase(self) -> &'static str {
+        match self {
+            Self::MemoryPressure => "the kernel reports memory pressure",
+            Self::CompressorThrash => "the memory compressor is thrashing",
+            Self::CompressorSegments => "the memory compressor is nearly out of segments",
+            Self::Swap => "swap in use is above GitPulse's limit for it",
+            Self::LowDisk => "free disk space is below GitPulse's floor",
+            Self::DiskFilling => "free disk space is falling fast toward GitPulse's floor",
+            Self::Thermal => "the Mac is thermally throttled",
+            Self::CpuLoad => "the CPU load average is above GitPulse's limit for it",
+            Self::Battery => "the Mac is running on battery",
+            Self::ExecLatency => "process start-up is slow",
+        }
     }
 }
 
@@ -190,6 +272,19 @@ impl Reason {
 pub struct Shed {
     pub background: bool,
     pub reactive: bool,
+    /// What put the host in the tier that sheds: the binding of the verdict.
+    /// `None` when nothing is shed. A caller that says why it refused reads
+    /// this rather than assuming memory.
+    pub cause: Option<Binding>,
+}
+
+impl Shed {
+    /// [`Binding::cause_phrase`] of the cause, for the sentence a refusal
+    /// says. Memory pressure when no cause was recorded: the only cause a
+    /// verdict published before causes were carried could have had.
+    pub fn cause_phrase(&self) -> &'static str {
+        self.cause.unwrap_or(Binding::MemoryPressure).cause_phrase()
+    }
 }
 
 /// What the governor decides from, copied out of a sensor report so the
@@ -240,7 +335,11 @@ impl Input {
                 .map(|d| d.swapouts_pressure),
             largest_foreign: snapshot.and_then(|s| s.largest_foreign.value()),
             govern_launches,
-            readings: snapshot.map_or_else(Readings::default, |s| Readings::of(&s.host)),
+            readings: snapshot.map_or_else(Readings::default, |s| Readings {
+                disk_fill: s.disk_fill_rate,
+                disk_fill_sustained: s.disk_fill_sustained,
+                ..Readings::of(&s.host)
+            }),
             thresholds,
         }
     }
@@ -311,11 +410,15 @@ fn availability(input: &Input) -> Availability {
 /// One sample's tier and the resource that put it there: the highest tier any
 /// input reaches, and on equal tiers the first of memory pressure, compressor
 /// thrash, compressor segments, swap, low disk, thermal, CPU load, battery.
-fn sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
+fn sample(input: &Input) -> Option<Sample> {
     if !matches!(availability(input), Availability::Governing) {
         return None;
     }
     let mut best = (Tier::Clear, None);
+    let mut fill = Tier::Clear;
+    let mut disk = Tier::Clear;
+    let mut low_disk = Tier::Clear;
+    let mut others_clear = input.level == Some(Level::Normal) && !input.compressor_thrash;
     let mut consider = |tier: Tier, binding: Binding| {
         if tier > best.0 {
             best = (tier, Some(binding));
@@ -330,10 +433,61 @@ fn sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
     if input.level == Some(Level::Warn) {
         consider(Tier::Elevated, Binding::MemoryPressure);
     }
-    for c in input.thresholds.assess(&input.readings).contributions {
+    let assessed = input.thresholds.assess(&input.readings);
+    // An input that could not be read is doubt, not quiet. The disk inputs
+    // are the ones asked about, and the power source is exempt: it exists to
+    // save power, not to protect the machine, and what it feeds is only the
+    // battery input, so an unreadable one is no more a doubt than a reading of
+    // "on battery" (spending battery to free a nearly full disk is the right
+    // trade).
+    if assessed.unreadable.iter().any(|b| {
+        !matches!(
+            b,
+            Binding::DiskFilling | Binding::LowDisk | Binding::Battery
+        )
+    }) {
+        others_clear = false;
+    }
+    for c in assessed.contributions {
+        if c.binding == Binding::DiskFilling {
+            fill = fill.max(c.tier);
+        }
+        if matches!(c.binding, Binding::DiskFilling | Binding::LowDisk) {
+            disk = disk.max(c.tier);
+            if c.binding == Binding::LowDisk {
+                low_disk = low_disk.max(c.tier);
+            }
+        } else if c.tier != Tier::Clear && c.binding != Binding::Battery {
+            others_clear = false;
+        }
         consider(c.tier, c.binding);
     }
-    Some(best)
+    Some(Sample {
+        tier: best.0,
+        binding: best.1,
+        fill,
+        disk,
+        low_disk,
+        others_clear,
+    })
+}
+
+/// What one sample read: the tier and the resource that put it there, and what
+/// the winner hides. `fill` is the tier the fill rule itself read: its release
+/// hold follows that reading, not whichever cause the binding happens to name.
+/// `disk` is the higher of the two disk inputs, and `others_clear` whether
+/// every other input (memory level, compressor thrash, every other
+/// contribution) read Clear: together, whether the disk is the only thing
+/// wrong.
+struct Sample {
+    tier: Tier,
+    binding: Option<Binding>,
+    fill: Tier,
+    disk: Tier,
+    /// The low-disk level input alone (free space against the Severe floor,
+    /// after the input's mode cap), not the fill-rate projection.
+    low_disk: Tier,
+    others_clear: bool,
 }
 
 fn level_words(level: Option<Level>) -> String {
@@ -453,7 +607,11 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
                 ),
                 warnings,
             );
-            verdict.shed.background = true;
+            verdict.shed = Shed {
+                background: true,
+                reactive: false,
+                cause: Some(binding),
+            };
             verdict
         }
         Tier::Severe => {
@@ -481,6 +639,7 @@ pub fn decide(input: &Input, held: Tier, held_binding: Option<Binding>) -> Gover
             verdict.shed = Shed {
                 background: true,
                 reactive: true,
+                cause: Some(binding),
             };
             verdict
         }
@@ -500,6 +659,17 @@ pub struct Governor {
     /// The highest tier, and its binding, of the current run below the held
     /// one: what the run leaves to.
     down: (Tier, Option<Binding>),
+    /// Consecutive counted ticks the fill rule has read Severe.
+    fill_run: u32,
+    /// Counted ticks since the fill rule last read Severe, once it read it for
+    /// [`ENTER_SAMPLES`] in a row (so a blip under another cause's Severe arms
+    /// nothing): the fill hold, `None` when not armed or once it has lapsed.
+    /// Leaving Severe waits for it to lapse, whichever cause the held tier
+    /// names.
+    fill_since: Option<u32>,
+    /// Consecutive counted ticks in which every input other than low disk and
+    /// disk filling read Clear: what [`Governor::disk_only`] rests on.
+    others_clear_run: u32,
     last: Option<(Instant, Input)>,
     refusing_since: Option<Instant>,
     noticed: bool,
@@ -515,6 +685,9 @@ impl Default for Governor {
             up: (Tier::Severe, None),
             down_streak: 0,
             down: (Tier::Clear, None),
+            fill_run: 0,
+            fill_since: None,
+            others_clear_run: 0,
             last: None,
             refusing_since: None,
             noticed: false,
@@ -537,9 +710,9 @@ impl Governor {
     /// history. `now` is when the sample was taken.
     pub fn instant(now: Instant, input: Input) -> Self {
         let mut governor = Self::default();
-        if let Some((tier, binding)) = sample(&input) {
-            governor.held = tier;
-            governor.binding = binding;
+        if let Some(read) = sample(&input) {
+            governor.held = read.tier;
+            governor.binding = read.binding;
         }
         governor.last = Some((now, input));
         governor
@@ -570,8 +743,19 @@ impl Governor {
                 self.binding = None;
                 self.up_streak = 0;
                 self.down_streak = 0;
+                self.fill_run = 0;
+                self.fill_since = None;
+                self.others_clear_run = 0;
             }
-            Some((tier, binding)) if counts => self.count(tier, binding),
+            Some(read) if counts => {
+                self.others_clear_run = if read.others_clear {
+                    self.others_clear_run.saturating_add(1)
+                } else {
+                    0
+                };
+                self.count_fill(read.fill);
+                self.count(read.tier, read.binding);
+            }
             Some(_) => {}
         }
         self.last = Some((now, input));
@@ -591,6 +775,34 @@ impl Governor {
             verdict,
             notice_raised,
         }
+    }
+
+    /// The fill hold's clock: armed by [`ENTER_SAMPLES`] consecutive Severe
+    /// readings of the fill rule, restarted by each one while it lasts,
+    /// advanced by every counted tick the fill rule reads lower, and disarmed
+    /// when it reaches [`FILL_SEVERE_RELEASE_SAMPLES`]. A lapsed hold is gone:
+    /// arming it again takes [`ENTER_SAMPLES`] in a row again, and nothing
+    /// names the fill rule for a Severe another cause keeps.
+    fn count_fill(&mut self, fill: Tier) {
+        if fill == Tier::Severe {
+            self.fill_run += 1;
+            if self.fill_run >= ENTER_SAMPLES || self.fill_since.is_some() {
+                self.fill_since = Some(0);
+            }
+        } else {
+            self.fill_run = 0;
+            self.fill_since = self
+                .fill_since
+                .map(|ticks| ticks.saturating_add(1))
+                .filter(|ticks| *ticks < FILL_SEVERE_RELEASE_SAMPLES);
+        }
+    }
+
+    /// Whether the fill hold lets Severe go: it was never armed, or it ran
+    /// out ([`FILL_SEVERE_RELEASE_SAMPLES`] counted ticks without the fill
+    /// rule reading Severe).
+    fn fill_hold_released(&self) -> bool {
+        self.fill_since.is_none()
     }
 
     fn count(&mut self, tier: Tier, binding: Option<Binding>) {
@@ -616,7 +828,14 @@ impl Governor {
                     self.down = (tier, binding);
                 }
                 self.down_streak += 1;
-                if self.down_streak >= EXIT_SAMPLES {
+                // Severe is left on both clocks: the ordinary down streak, and,
+                // when the fill rule armed its hold, the hold's own. The hold
+                // follows the fill rule's reading, not the held binding.
+                let released = self.held != Tier::Severe || self.fill_hold_released();
+                if self.down_streak >= EXIT_SAMPLES && released {
+                    if self.held == Tier::Severe {
+                        self.fill_since = None;
+                    }
                     (self.held, self.binding) = self.down;
                     self.down_streak = 0;
                 }
@@ -657,14 +876,88 @@ impl Governor {
             Some((at, input)) => {
                 let aged = input.aged(now.saturating_duration_since(*at));
                 // An input the ageing made ungovernable holds no tier.
-                let held = if sample(&aged).is_some() {
+                let read = sample(&aged);
+                let held = if read.is_some() {
                     self.held
                 } else {
                     Tier::Clear
                 };
-                decide(&aged, held, self.binding)
+                // A Severe kept only by the fill hold (every current reading
+                // is lower) names the fill rule, whatever cause entered it.
+                let binding = match &read {
+                    Some(read)
+                        if held == Tier::Severe
+                            && read.tier < Tier::Severe
+                            && !self.fill_hold_released() =>
+                    {
+                        Some(Binding::DiskFilling)
+                    }
+                    _ => self.binding,
+                };
+                decide(&aged, held, binding)
             }
         }
+    }
+
+    /// The exec-latency reading of the last input, when it is a value: what a
+    /// refusal that names slow start-up quotes.
+    fn exec_latency(&self) -> Option<super::exec_probe::ExecLatency> {
+        self.last
+            .as_ref()
+            .and_then(|(_, input)| input.readings.exec_latency.value())
+    }
+
+    /// Whether the disk is the only reason the host is shedding at `now`.
+    /// True only when all of these hold, and false on any doubt:
+    /// the host is shedding (`shed` has a class); at least
+    /// [`EXIT_SAMPLES`] consecutive counted ticks have read every input other
+    /// than low disk and disk filling Clear (memory level normal, no
+    /// compressor thrash, no other contribution above Clear, none unreadable;
+    /// running on battery is not a reason, see `sample`);
+    /// the last reading still has every one of those inputs Clear; and the
+    /// disk is what is shedding: a disk input reads at least Elevated now, or
+    /// the fill hold is armed and not lapsed, or the held binding is low disk
+    /// or disk filling (a tier the hysteresis still holds after the reading
+    /// recovered). In those last two the disk is the only thing wrong, so
+    /// there is no doubt to resolve conservatively. A governor with no history
+    /// (one from [`Governor::instant`]) has counted nothing and answers
+    /// false, as does one whose sensor is unavailable, and one that sheds
+    /// nothing (a hold lapsed and Severe left).
+    pub fn disk_only(&self, now: Instant) -> bool {
+        let Some((at, input)) = &self.last else {
+            return false;
+        };
+        let shed = self.verdict(now).shed;
+        if !(shed.background || shed.reactive) || self.others_clear_run < EXIT_SAMPLES {
+            return false;
+        }
+        let held_for_disk = !self.fill_hold_released()
+            || matches!(self.binding, Some(Binding::LowDisk | Binding::DiskFilling));
+        sample(&input.aged(now.saturating_duration_since(*at)))
+            .is_some_and(|read| read.others_clear && (read.disk >= Tier::Elevated || held_for_disk))
+    }
+
+    /// Whether the disk remedy (the cleaner's own work) is due at `now`: the
+    /// disk is the only reason the host is shedding ([`Governor::disk_only`]),
+    /// or the low-disk level input itself reads Severe (free space under the
+    /// Severe floor, after the floors and the input's mode) in a fresh
+    /// reading, whatever else is pressed. A nearly full disk brings memory
+    /// pressure with it on macOS (swap cannot grow), so waiting for the others
+    /// to be quiet would wait on a symptom of what the remedy fixes. The
+    /// fill-rate projection alone does not qualify (a burst can project Severe
+    /// with plenty of space left), nor does low disk at Elevated. False on any
+    /// doubt: no reading, a sensor that is off, unavailable or stale, free
+    /// space unreadable, the low-disk input turned off.
+    pub fn disk_remedy_due(&self, now: Instant) -> bool {
+        if self.disk_only(now) {
+            return true;
+        }
+        let Some((at, input)) = &self.last else {
+            return false;
+        };
+        let aged = input.aged(now.saturating_duration_since(*at));
+        aged.state == SensorState::Fresh
+            && sample(&aged).is_some_and(|read| read.low_disk == Tier::Severe)
     }
 
     /// A person said "Admit anyway": launches pass for [`OVERRIDE_WINDOW`].
@@ -690,8 +983,20 @@ impl Governor {
             .refusing_since
             .filter(|_| refusing)
             .map(|since| now.saturating_duration_since(since));
+        let disk_fill = self.last.as_ref().and_then(|(_, input)| {
+            input
+                .thresholds
+                .disk_fill(&input.readings)
+                .filter(|_| input.state.governs())
+        });
         GovernorReport {
             verdict,
+            exec_latency: self
+                .last
+                .as_ref()
+                .filter(|(_, input)| input.state.governs())
+                .and_then(|(_, input)| input.readings.exec_latency.value()),
+            disk_fill,
             refusing_for_s: refusing_for.map(|d| d.as_secs()),
             notice: self.noticed && refusing,
             largest_foreign: self
@@ -708,6 +1013,15 @@ impl Governor {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GovernorReport {
     pub verdict: GovernorVerdict,
+    /// How long a trivial child last took to start, beside the memory
+    /// pressure the verdict reports. `None` when this process runs no probe or
+    /// the probe has no reading: unknown, never fast.
+    pub exec_latency: Option<super::exec_probe::ExecLatency>,
+    /// Where the disk is heading, while the fill-rate rule is on and the
+    /// projection is at least elevated: its rate and the minutes it leaves
+    /// before the severe floor. Shown even when the rule's mode keeps it from
+    /// binding, so a person sees the fall that is not being acted on.
+    pub disk_fill: Option<DiskFill>,
     /// Seconds of continuous pressure refusal, `None` when not refusing.
     pub refusing_for_s: Option<u64>,
     /// Refusal has run past [`REFUSAL_NOTICE_AFTER`]: tell the person.
@@ -725,6 +1039,8 @@ impl GovernorReport {
     /// The report of a process that does not govern.
     fn ungoverned() -> Self {
         Self {
+            disk_fill: None,
+            exec_latency: None,
             verdict: GovernorVerdict {
                 admit: true,
                 shed: Shed::default(),
@@ -1036,6 +1352,27 @@ pub(crate) fn inject(input: Input) -> Injected {
     Injected
 }
 
+/// Test seam: like [`inject`], but the governor has lived through `inputs`,
+/// one counted sensor tick each, 2 s apart, through the same [`Governor::observe`]
+/// path the sampler uses (hysteresis, the fill hold, the disk-only count). The
+/// last input is what the thread's governor then holds. `inject` builds a
+/// governor from one sample, which has counted nothing, so it can never answer
+/// [`shed_is_disk_only`] true; this one can. Panics on no inputs.
+#[cfg(test)]
+pub(crate) fn inject_with_history(inputs: impl IntoIterator<Item = Input>) -> Injected {
+    let mut governor = Governor::default();
+    let mut now = Instant::now();
+    let mut last = None;
+    for input in inputs {
+        governor.observe(now, input.clone());
+        now += Duration::from_millis(super::CADENCE_MS);
+        last = Some(input);
+    }
+    let last = last.expect("a history needs at least one tick");
+    INJECTED.with(|slot| *slot.borrow_mut() = Some((last, governor)));
+    Injected
+}
+
 /// The input this thread's injection holds, for a test that must hand it to
 /// the pool thread a command hops to (the slot is thread-local).
 #[cfg(test)]
@@ -1102,6 +1439,10 @@ fn governed_report() -> GovernorReport {
 /// Which of the spawn gate's classes to refuse right now. The gate asks this
 /// per spawn, so it takes one short lock and does no IO.
 pub fn shed() -> Shed {
+    shed_now()
+}
+
+fn shed_now() -> Shed {
     let now = Instant::now();
     #[cfg(test)]
     if let Some(shed) =
@@ -1117,6 +1458,81 @@ pub fn shed() -> Shed {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .verdict(now)
             .shed
+    })
+}
+
+/// The median start-up time and sample count behind a slow-start shed, as this
+/// process's governor last read them, or `None` when this process has no
+/// governor or no reading. For the sentence a refusal says; it decides nothing.
+pub fn exec_latency() -> Option<super::exec_probe::ExecLatency> {
+    #[cfg(test)]
+    if let Some(latency) =
+        INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.exec_latency()))
+    {
+        return latency;
+    }
+    APP_GOVERNOR.get().and_then(|governor| {
+        governor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exec_latency()
+    })
+}
+
+/// What put the host in the tier that sheds, or `None` when nothing is shed.
+/// The same verdict [`shed`] answers from, for a caller that says why it
+/// refused and has no business scheduling by it (`tests/governor_sites.rs`
+/// pins [`shed`] to the spawn gate).
+pub fn shed_cause() -> Option<Binding> {
+    shed_now().cause
+}
+
+/// Whether the disk is the ONLY reason the host is shedding: the answer for a
+/// caller that may do its (disk-freeing) work while the disk is the whole
+/// problem and must keep shedding when anything else is also pressed.
+/// [`shed_cause`] is one binding picked by priority, so it says "disk" for a
+/// disk Severe that has CPU Severe or thermal Critical beside it; this does
+/// not. Running on battery does not count against it. True only when the host
+/// is shedding, every other input has read Clear
+/// for [`EXIT_SAMPLES`] counted ticks (and reads Clear now), and the disk is
+/// what is shedding: a disk input reads Elevated or above now, or the fill
+/// hold keeps Severe after the fill reading recovered, or the held binding is
+/// still low disk or disk filling. False on any doubt: no governor in this process (the headless
+/// run, the MCP server, a hook), a governor with no history, an unavailable
+/// or stale sensor, an unreadable input. One short lock, no IO.
+pub fn shed_is_disk_only() -> bool {
+    in_process_governor(Governor::disk_only)
+}
+
+/// Whether the disk remedy, the cleaner's own work, may proceed: the disk is
+/// the only reason the host is shedding ([`shed_is_disk_only`]), or free disk
+/// is below the Severe floor (the low-disk level input reads Severe in a
+/// fresh reading) whatever else is pressed. Memory pressure comes with a
+/// nearly full disk because swap cannot grow, so the remedy must not wait on
+/// it. Admits the cleaner's work only: agent launches are still refused at
+/// Severe as before. The fill-rate projection alone and low disk at Elevated
+/// do not qualify. False on any doubt: no governor in this process, an
+/// unavailable or stale sensor, unreadable free space, the low-disk input off.
+/// One short lock, no IO.
+pub fn disk_remedy_due() -> bool {
+    in_process_governor(Governor::disk_remedy_due)
+}
+
+/// Asks this process's governor (the injected one under test) a question that
+/// takes the current time; false when there is none.
+fn in_process_governor(ask: fn(&Governor, Instant) -> bool) -> bool {
+    let now = Instant::now();
+    #[cfg(test)]
+    if let Some(answer) = INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| ask(g, now))) {
+        return answer;
+    }
+    APP_GOVERNOR.get().is_some_and(|governor| {
+        ask(
+            &governor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            now,
+        )
     })
 }
 
@@ -1270,6 +1686,10 @@ fn write_ledger(
 
 #[cfg(test)]
 mod adv2;
+#[cfg(test)]
+mod exec_latency_tests;
+#[cfg(test)]
+mod fill_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

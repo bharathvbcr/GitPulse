@@ -192,7 +192,9 @@ fn backup_creation_and_restoration_roundtrip() {
 
     let branch_info = StaleBranchInfo {
         name: "feature/legacy".to_string(),
+        full_ref: "refs/heads/feature/legacy".to_string(),
         short_name: "feature/legacy".to_string(),
+        remote_name: None,
         age_days: 100,
         severity: "stale".to_string(),
         is_merged: true,

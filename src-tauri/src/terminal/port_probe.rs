@@ -547,8 +547,8 @@ mod linux {
             return true;
         }
         // IPv4-mapped `::ffff:x.x.x.x`
-        if lower.starts_with("0000000000000000ffff0000") {
-            return is_loopback_or_wildcard_hex_v4(&lower[24..]);
+        if let Some(v4) = lower.strip_prefix("0000000000000000ffff0000") {
+            return is_loopback_or_wildcard_hex_v4(v4);
         }
         false
     }
@@ -621,6 +621,8 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::listening_loopback_ports_for_root_pid;
+    // The tests that bind sockets run on macOS and Linux only.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::net::{TcpListener, UdpSocket};
 
     #[test]

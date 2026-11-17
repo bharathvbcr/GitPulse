@@ -52,7 +52,7 @@ fn terminals(dir: &Path) -> TerminalSessions {
 }
 
 fn repo() -> tempfile::TempDir {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -72,9 +72,15 @@ fn repo() -> tempfile::TempDir {
 /// repository this app trusted only for its own session is refused there.
 #[test]
 fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = host_dir();
     let repo = tempfile::tempdir().unwrap();
-    common::run_git(repo.path(), &["init", "-q"]);
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status_locked()
+        .unwrap()
+        .success());
     let path = repo.path().to_str().unwrap();
     let preview = gitpulse_lib::repository_trust::inspect(path).unwrap();
     gitpulse_lib::repository_trust::grant(path, &preview.identity, false).unwrap();
@@ -564,7 +570,7 @@ fn transcript_text(
             String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
             tail,
         ),
-        other => panic!("expected a transcript for {session}, got {other:?}"),
+        _other => panic!("expected a transcript, got another read"),
     }
 }
 
@@ -680,16 +686,23 @@ fn output_printed_while_no_app_was_there_is_in_the_transcript() {
     assert!(tail.live, "the session is still running");
 }
 
-/// An app that runs terminals itself keeps no transcript, and says that rather
-/// than answering "missing".
+/// A missing terminal host binary must fail closed rather than falling back to
+/// running PTYs inside the app process.
 #[test]
-fn the_in_process_engine_says_it_keeps_no_transcript() {
-    let state = TerminalSessions::default();
-    match gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false, None).unwrap()
-    {
-        gitpulse_lib::terminal::TranscriptRead::Unavailable { reason } => {
-            assert!(reason.contains("terminal host"), "{reason}")
-        }
-        other => panic!("{other:?}"),
-    }
+fn a_missing_host_binary_fails_closed_instead_of_running_in_process() {
+    let dir = host_dir();
+    let state = TerminalSessions::with_host(HostConfig {
+        dir: dir.path().to_path_buf(),
+        binary: Some(PathBuf::from("/nonexistent/gitpulse-ptyd")),
+        idle_exit: Some(Duration::from_secs(3)),
+        log_dir: Some(dir.path().join("logs")),
+    });
+    assert!(
+        gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false, None).is_err()
+    );
+    assert!(list_sessions(&state).is_err());
+    assert!(
+        !state.host_trouble().is_empty(),
+        "failed host launch must record a trouble message"
+    );
 }

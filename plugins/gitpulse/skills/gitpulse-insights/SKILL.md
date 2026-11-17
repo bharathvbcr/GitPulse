@@ -10,7 +10,7 @@ metadata:
 
 # GitPulse insights
 
-GitPulse's MCP read tools (`gitpulse_insights`, `gitpulse_status`, `gitpulse_ledger_events`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar`, and the rest of the `readOnlyHint: true` set) never touch git or task state: they create and migrate nothing. Writes on the server are restricted to five task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and nine repository-trust-gated worktree lifecycle and coordination tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with git mutations additionally gated through `harness::guard_command`.
+GitPulse's MCP read tools (`gitpulse_insights`, `gitpulse_sessions`, `gitpulse_status`, `gitpulse_ledger_events`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar`, and the rest of the `readOnlyHint: true` set) never touch git or task state: they create and migrate nothing. Writes on the server are restricted to five task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and nine repository-trust-gated worktree lifecycle and coordination tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with git mutations additionally gated through `harness::guard_command`.
 
 It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process DevMap). Policy and agent hosting go through **Manvi**, not this server.
 
@@ -26,12 +26,14 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | Tool | When |
 | --- | --- |
 | `gitpulse_insights` | First look at a repo |
+| `gitpulse_sessions` | Who is running here, which session is me (`is_caller`), `run_id`, and live `state` (`working`/`blocked`/`done`/`idle`/`unknown`) without spawning git |
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
 | `gitpulse_active_changes` | Need the file list, not just counts |
 | `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_status` | Narrower status (ledger + worktrees + codeintel) |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
+| `gitpulse_turn_checkpoints` | This worktree's turn checkpoints (files at each agent turn boundary, when the person enabled `turn_checkpoints`): the list, or with `id` a bounded patch. A checkpoint with `omissions.untracked_omitted` above 0 is partial. Read-only; nothing is restored |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |
 | `gitpulse_codeintel_*` | Symbol search, impact, dependencies, trace, dead symbols |
 | `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |
@@ -40,7 +42,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_merge_tasks`, `gitpulse_delete_task` | Repository-trust-gated task-board writes (see the gitpulse-tasks skill) |
 | `gitpulse_browser_open` | Show the person a local dev server's page: asks the running GitPulse (macOS) to open a Browser session on a loopback URL (`localhost`, `127.0.0.0/8`, `[::1]`) in a trusted repository's terminal dock, reusing and reloading a session already on that address. Brings GitPulse and the repository forward. Opens only — it cannot read, drive or close the page. Fails when GitPulse is not running or predates browser sessions |
 | `gitpulse_terminal_spawn`, `gitpulse_terminal_wait`, `gitpulse_terminal_read`, `gitpulse_terminal_send`, `gitpulse_terminal_close`, `gitpulse_terminal_list`, `gitpulse_terminal_open_file` | Option A scoped child terminal orchestration and right-hand split-pane file preview inside a running GitPulse window (macOS), authenticated by `GITPULSE_TERMINAL_SESSION` + `GITPULSE_SESSION_TOKEN` (see the `gitpulse-terminal` skill) |
-| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null and `verified` false for a commit with no verification note; a verification does not survive a rewrite |
+| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `verified` is true only for a note recording a pass of the whole suite, and `confidence` is null whenever it is false: no note, or a note recording a failure, an affected-tests-only pass (`passed-affected`) or an unrecognised verdict (read `verification.verdict` for which); a verification does not survive a rewrite |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `false` only when absence is provable, otherwise null with a `reason` code; `reverted` from a revert commit by ancestry; `landed_at` from the base branch's reflog. Refuses in a partial clone. Writes nothing (the content check runs in a quarantined object directory) |
 
 ## Host load
@@ -53,6 +55,7 @@ The SessionStart brief that `gitpulse_insights` accompanies carries a `host load
 - A missing code graph is `available: false` with a reason, not an empty hit list.
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
 - `agents.ok: false` is "the worktree listing failed", not "no agents"; `agents.truncated: true` means the counts came from a capped sample, so `agents.sessions` is a floor and a kind whose worktrees all fall past the cap is absent from `agents.kinds` rather than undercounted.
-- An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running Claude Code sessions per worktree with their status. A kind that keeps no readable registry (Codex) is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
+- An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running agent sessions per worktree (discovered via the host process scan across Claude Code, Codex, Antigravity, DevCouncil, and Manvi, enriched with Claude Code's session registry). On platforms without a process scan, any kind that keeps no readable registry is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
+- `gitpulse_sessions` spawns no `git` and reports each attributed session's `is_caller`, `run_id`, `tree`, `task_id`, `state`, `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`, bounded by `(cap, total, returned, truncated)` (caller first). When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process scan and Claude registry; Codex sessions with no hub entry report `state: "unknown"` (never `"idle"`), and sessions with no registry or hub entry report `state_source: "none"`.
 
 Pass `repo_path` as an absolute filesystem path on every call. The protocol is MCP `2026-07-28`: include `_meta.io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on each request. Legacy `initialize` still works for older clients.

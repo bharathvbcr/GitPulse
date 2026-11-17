@@ -23,9 +23,12 @@
 //! sessions" and "no Codex session is running" are different facts.
 
 use super::{LiveKindStatus, LiveSession, LiveSessionFacet, LiveSessionNode, LiveWorktree};
+use crate::alerts::{HubSessionState, HubStateRead, HubStateSnapshot};
 use crate::workbench::process_birth::{self, Liveness};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Registry entries one probe will read. Claude Code prunes its registry as
 /// sessions exit, so a real one holds tens of entries; past this the kind is
@@ -121,8 +124,8 @@ pub(crate) fn observe() -> Observation {
         .iter()
         .map(|dir| dir.join("sessions"))
         .collect();
-    match crate::sysload::procscan::observe_sessions() {
-        Ok(sessions) => from_scan(&sessions, &registries),
+    match crate::sysload::procscan::observe_sessions_with_caller() {
+        Ok(scan) => from_scan_with(&scan.sessions, scan.caller, &registries),
         // A scan that exists and failed is a failed detector; falling back to
         // the registry would report its undercount as if it were the answer.
         Err(error) if crate::sysload::procscan::SCAN_SUPPORTED => failed_scan(&error),
@@ -146,14 +149,28 @@ const SCANNED_KINDS: [crate::sysload::AgentKind; 5] = [
 /// Turns the process scan's sessions into per-kind observations, enriched
 /// from Claude Code's registries at `claude_sessions` (one per config
 /// directory) where an entry names the same process.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn from_scan(
     sessions: &[crate::sysload::AgentSession],
     claude_sessions: &[PathBuf],
 ) -> Observation {
-    let mut details = std::collections::HashMap::new();
-    for dir in claude_sessions {
-        details.extend(registry_details(dir));
-    }
+    from_scan_with(sessions, None, claude_sessions)
+}
+
+pub(crate) fn from_scan_with(
+    sessions: &[crate::sysload::AgentSession],
+    caller: Option<crate::sysload::CallerIdentity>,
+    claude_sessions: &[PathBuf],
+) -> Observation {
+    let reg = read_claude_registry_snapshot(claude_sessions, None);
+    from_scan_snapshot(sessions, caller, &reg)
+}
+
+fn from_scan_snapshot(
+    sessions: &[crate::sysload::AgentSession],
+    caller: Option<crate::sysload::CallerIdentity>,
+    reg: &ClaudeRegistrySnapshot,
+) -> Observation {
     let mut kinds: Vec<KindObservation> = SCANNED_KINDS
         .iter()
         .map(|kind| KindObservation {
@@ -174,10 +191,9 @@ pub(crate) fn from_scan(
         // The entry describes this process only if the process was already
         // running when the entry was written; a later process on the same pid
         // is a reuse and inherits nothing from it.
-        let entry = details.get(&pid).filter(|entry| {
-            u128::from(session.start_us) * 1_000
-                <= u128::from(entry.started_at) * 1_000_000 + BIRTH_CLOCK_SLACK_NANOS
-        });
+        let entry = reg.matching_entry(pid, session.start_us).map(|r| &r.entry);
+        let is_caller =
+            caller.is_some_and(|c| c.pid == session.pid && c.start_us == session.start_us);
         seen.live.push(LiveSession {
             kind: session.kind.name().into(),
             pid,
@@ -190,6 +206,8 @@ pub(crate) fn from_scan(
             session_id: entry.and_then(|e| nonempty(&e.session_id)),
             proc_start: entry.and_then(|e| nonempty(&e.proc_start)),
             registry_cwd: entry.map(|e| e.cwd.clone()),
+            start_us: (session.start_us > 0).then_some(session.start_us),
+            is_caller,
             ide_hosted: session.ide_hosted,
             terminal_session_id: session.terminal_session_id.clone(),
         });
@@ -208,23 +226,128 @@ fn failed_scan(error: &str) -> Observation {
         .collect()
 }
 
-/// Claude Code's registry entries by pid, for enrichment only. Unreadable
-/// entries are skipped: the session they might describe is already counted
-/// from the process table.
-fn registry_details(dir: &Path) -> std::collections::HashMap<u32, ClaudeRegistryEntry> {
-    let mut details = std::collections::HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return details;
-    };
-    for entry in entries.flatten().take(MAX_REGISTRY_ENTRIES) {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
-            if let Ok(parsed) = read_entry(&path) {
-                details.insert(parsed.pid, parsed);
+struct ClaudeRegistryRecord {
+    entry: ClaudeRegistryEntry,
+    mtime_ms: Option<u64>,
+}
+
+#[derive(Default)]
+struct ClaudeRegistrySnapshot {
+    entries: HashMap<u32, ClaudeRegistryRecord>,
+    corrupt_pids: HashSet<u32>,
+    has_unkeyed_corrupt: bool,
+    errors: Vec<String>,
+}
+
+impl ClaudeRegistrySnapshot {
+    fn matching_entry(&self, pid: u32, start_us: u64) -> Option<&ClaudeRegistryRecord> {
+        self.entries.get(&pid).filter(|rec| {
+            u128::from(start_us) * 1_000
+                <= u128::from(rec.entry.started_at) * 1_000_000 + BIRTH_CLOCK_SLACK_NANOS
+        })
+    }
+
+    fn has_corruption_for(&self, pid: u32) -> bool {
+        self.has_unkeyed_corrupt || self.corrupt_pids.contains(&pid) || !self.errors.is_empty()
+    }
+
+    fn degraded_error(&self) -> Option<String> {
+        if !self.errors.is_empty() {
+            return Some(self.errors.join("; "));
+        }
+        if !self.corrupt_pids.is_empty() || self.has_unkeyed_corrupt {
+            return Some(
+                "one or more Claude session registry entries are unreadable or corrupt".into(),
+            );
+        }
+        None
+    }
+}
+
+fn system_time_ms(ts: SystemTime) -> Option<u64> {
+    ts.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+fn read_claude_registry_snapshot(
+    dirs: &[PathBuf],
+    discovery_error: Option<&str>,
+) -> ClaudeRegistrySnapshot {
+    let mut out = ClaudeRegistrySnapshot::default();
+    if let Some(error) = discovery_error {
+        out.errors.push(error.to_owned());
+    }
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                out.errors
+                    .push(format!("cannot read {}: {error}", dir.display()));
+                continue;
+            }
+        };
+        let mut paths = Vec::new();
+        for item in entries {
+            match item {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "json") {
+                        paths.push(path);
+                    }
+                }
+                Err(error) => {
+                    out.errors
+                        .push(format!("cannot list {}: {error}", dir.display()));
+                    break;
+                }
+            }
+        }
+        paths.sort();
+        if paths.len() > MAX_REGISTRY_ENTRIES {
+            out.errors.push(format!(
+                "{} holds more than {MAX_REGISTRY_ENTRIES} entries; truncated",
+                dir.display()
+            ));
+            paths.truncate(MAX_REGISTRY_ENTRIES);
+        }
+        for path in paths {
+            match read_entry(&path) {
+                Ok(parsed) => {
+                    let mtime_ms = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(system_time_ms);
+                    let replace = out
+                        .entries
+                        .get(&parsed.pid)
+                        .is_none_or(|prev| parsed.started_at >= prev.entry.started_at);
+                    if replace {
+                        out.entries.insert(
+                            parsed.pid,
+                            ClaudeRegistryRecord {
+                                entry: parsed,
+                                mtime_ms,
+                            },
+                        );
+                    }
+                }
+                Err(_) => {
+                    let parsed_pid = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u32>().ok());
+                    if let Some(pid) = parsed_pid {
+                        out.corrupt_pids.insert(pid);
+                    } else {
+                        out.has_unkeyed_corrupt = true;
+                    }
+                }
             }
         }
     }
-    details
+    out
 }
 
 /// [`observe`]'s registry fallback, for a platform with no process scan, with
@@ -359,6 +482,8 @@ fn read_claude_registry(dir: &Path, alive: &dyn Fn(u32, u128) -> Liveness) -> Ki
                 session_id: nonempty(&entry.session_id),
                 proc_start: nonempty(&entry.proc_start),
                 registry_cwd: Some(entry.cwd),
+                start_us: None,
+                is_caller: false,
                 ide_hosted: false,
                 terminal_session_id: None,
             }),
@@ -820,6 +945,448 @@ pub(crate) fn unattributed(error: &str) -> LiveSessionFacet {
     }
 }
 
+/// Default number of rows returned by [`sessions`] when a caller omits `limit`.
+pub const DEFAULT_SESSIONS_CAP: u32 = 64;
+const MAX_SESSIONS_CAP: u32 = 256;
+
+/// Status of the desktop app's live hook-state snapshot facet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStateFacet {
+    pub ok: bool,
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_ms: Option<u64>,
+}
+
+/// One attributed agent session with caller flag, launch metadata, task
+/// binding, and sourced execution state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub kind: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_us: Option<u64>,
+    pub is_caller: bool,
+    pub worktree: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    pub state: String,
+    pub state_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_age_s: Option<u64>,
+}
+
+/// Bounded read-only session snapshot for `gitpulse_sessions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsReport {
+    pub repo_path: String,
+    pub ok: bool,
+    pub error: String,
+    pub app_state: AppStateFacet,
+    pub kinds: Vec<LiveKindStatus>,
+    pub cap: u32,
+    pub total: u32,
+    pub returned: u32,
+    pub truncated: bool,
+    pub sessions: Vec<SessionRow>,
+}
+
+/// Read-only `gitpulse_sessions` query: process scan + Claude registry +
+/// CARD 11 worktree attribution + desktop hook-state snapshot, with zero `git`
+/// subprocesses.
+pub fn sessions(
+    repo_path: &str,
+    cap: Option<u32>,
+    run_task_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<SessionsReport, String> {
+    let pair = crate::engine::worktree::admit_worktree_pair(repo_path, repo_path)
+        .map_err(|e| e.into_message())?;
+    let (checkouts, checkouts_error) = match pair.registered_checkouts() {
+        Some(paths) => (paths, None),
+        None => (
+            vec![pair.repo_path().to_path_buf()],
+            Some(
+                "worktree registry metadata is incomplete; only the requested checkout was checked"
+                    .to_string(),
+            ),
+        ),
+    };
+    let worktree_paths: Vec<String> = checkouts
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let primary_repo = worktree_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| pair.repo_path().to_string_lossy().into_owned());
+    let now_ms = super::claims::now_ms();
+    let mut problems = Vec::new();
+    if let Some(err) = checkouts_error {
+        problems.push(err);
+    }
+    let claim_rows = match super::claims::read_store(
+        &super::claims::store_path(pair.common_dir()),
+        now_ms,
+        super::claims::DEFAULT_TTL_MS,
+        super::claims::DEFAULT_CAP,
+    ) {
+        Ok(read) => {
+            if let Some(degraded) = read.degraded() {
+                problems.push(format!("{}: {degraded}", pair.common_dir().display()));
+            }
+            read.rows
+        }
+        Err(error) => {
+            problems.push(error);
+            Vec::new()
+        }
+    };
+    let locks = read_worktree_locks(&worktree_paths);
+    let configs = crate::workbench::conversation::claude_config_dirs();
+    let registries: Vec<PathBuf> = configs
+        .dirs
+        .iter()
+        .map(|dir| dir.join("sessions"))
+        .collect();
+    let scan = crate::sysload::procscan::observe_sessions_with_caller();
+    let reg = read_claude_registry_snapshot(&registries, configs.error.as_deref());
+    let hub_read = crate::alerts::read_state_snapshot();
+    let ledger_task = |wt: &str| {
+        if crate::ledger::is_initialised(&primary_repo) {
+            if let Ok(Some((_, Some(tid)))) =
+                crate::ledger::newest_binding_readonly(&primary_repo, wt, wt)
+            {
+                return Some(tid);
+            }
+        }
+        if wt != primary_repo && crate::ledger::is_initialised(wt) {
+            if let Ok(Some((_, Some(tid)))) = crate::ledger::newest_binding_readonly(wt, wt, wt) {
+                return Some(tid);
+            }
+        }
+        None
+    };
+
+    Ok(assemble_sessions_report(
+        pair.repo_path().to_string_lossy().into_owned(),
+        &worktree_paths,
+        &locks,
+        &claim_rows,
+        problems,
+        scan,
+        &reg,
+        hub_read,
+        cap,
+        now_ms,
+        run_task_lookup,
+        &ledger_task,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_sessions_report(
+    repo_path: String,
+    worktree_paths: &[String],
+    locks: &[WorktreeLock],
+    claim_rows: &[super::claims::FileClaim],
+    mut problems: Vec<String>,
+    scan: Result<crate::sysload::SessionScan, String>,
+    reg: &ClaudeRegistrySnapshot,
+    hub_read: HubStateRead,
+    cap: Option<u32>,
+    now_ms: u64,
+    run_task_lookup: &dyn Fn(&str) -> Option<String>,
+    ledger_task_lookup: &dyn Fn(&str) -> Option<String>,
+) -> SessionsReport {
+    let resolved_cap = cap
+        .unwrap_or(DEFAULT_SESSIONS_CAP)
+        .clamp(1, MAX_SESSIONS_CAP);
+    let (app_state, hub_snap) = match hub_read {
+        HubStateRead::Ok(snap) => (
+            AppStateFacet {
+                ok: true,
+                error: String::new(),
+                updated_ms: Some(snap.updated_ms),
+            },
+            Some(snap),
+        ),
+        HubStateRead::Unavailable(reason) => (
+            AppStateFacet {
+                ok: false,
+                error: reason,
+                updated_ms: None,
+            },
+            None,
+        ),
+    };
+
+    let obs = match scan {
+        Ok(ref scanned) => from_scan_snapshot(&scanned.sessions, scanned.caller, reg),
+        Err(ref error) => failed_scan(error),
+    };
+    let worktrees: Vec<(String, PathBuf)> = worktree_paths
+        .iter()
+        .map(|p| (p.clone(), comparable(p)))
+        .collect();
+
+    let mut kinds = Vec::with_capacity(obs.len());
+    let mut attributed: Vec<(String, LiveSession)> = Vec::new();
+    for item in obs {
+        let mut count: u32 = 0;
+        let mut unverified_here: u32 = 0;
+        for session in item.live {
+            if let Some(wt) = owner_of(&session, &worktrees, locks, claim_rows) {
+                count = count.saturating_add(1);
+                attributed.push((wt.to_string(), session));
+            }
+        }
+        for cwd in &item.unverified {
+            let possible = match cwd {
+                Some(dir) => owning_worktree(&comparable(dir), &worktrees).is_some(),
+                None => true,
+            };
+            if possible {
+                unverified_here = unverified_here.saturating_add(1);
+            }
+        }
+        let mut kind_ok = item.ok && unverified_here == 0 && !item.truncated;
+        let mut kind_error = item.error;
+        if item.kind == "claude" {
+            if let Some(reg_err) = reg.degraded_error() {
+                kind_ok = false;
+                if kind_error.is_empty() {
+                    kind_error = reg_err;
+                } else {
+                    kind_error = format!("{kind_error}; {reg_err}");
+                }
+            }
+        }
+        if !kind_ok && !kind_error.is_empty() {
+            problems.push(format!("{}: {kind_error}", item.kind));
+        }
+        kinds.push(LiveKindStatus {
+            kind: item.kind,
+            ok: kind_ok,
+            error: kind_error,
+            sessions: count,
+            unverified: unverified_here,
+            truncated: item.truncated,
+        });
+    }
+
+    let hub_index = hub_snap
+        .as_ref()
+        .map(|snap| HubIndex::build(snap, &attributed));
+    let mut run_task_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut wt_task_cache: HashMap<String, Option<String>> = HashMap::new();
+
+    let mut rows: Vec<SessionRow> = attributed
+        .into_iter()
+        .map(|(worktree, live)| {
+            let (state, state_source, state_age_s) =
+                resolve_session_state(&live, reg, hub_index.as_ref(), now_ms);
+            let task_id = live
+                .run_id
+                .as_deref()
+                .and_then(|rid| {
+                    run_task_cache
+                        .entry(rid.to_string())
+                        .or_insert_with(|| run_task_lookup(rid))
+                        .clone()
+                })
+                .or_else(|| {
+                    wt_task_cache
+                        .entry(worktree.clone())
+                        .or_insert_with(|| ledger_task_lookup(&worktree))
+                        .clone()
+                });
+            let entrypoint = (!live.entrypoint.is_empty()).then_some(live.entrypoint);
+            SessionRow {
+                kind: live.kind,
+                pid: live.pid,
+                start_us: live.start_us,
+                is_caller: live.is_caller,
+                worktree,
+                cwd: live.cwd,
+                tree: live.tree,
+                run_id: live.run_id,
+                task_id,
+                parent_pid: live.parent_pid,
+                session_id: live.session_id,
+                entrypoint,
+                state,
+                state_source,
+                state_age_s,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        (!a.is_caller)
+            .cmp(&(!b.is_caller))
+            .then_with(|| a.worktree.cmp(&b.worktree))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    rows.truncate(resolved_cap as usize);
+    let returned = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let truncated = total > returned;
+    let ok = problems.is_empty() && kinds.iter().all(|k| k.ok);
+    let error = problems.join("; ");
+
+    SessionsReport {
+        repo_path,
+        ok,
+        error,
+        app_state,
+        kinds,
+        cap: resolved_cap,
+        total,
+        returned,
+        truncated,
+        sessions: rows,
+    }
+}
+
+struct HubIndex<'a> {
+    by_key: HashMap<&'a str, &'a HubSessionState>,
+    by_provider_sid: HashMap<&'a str, &'a HubSessionState>,
+    by_place: HashMap<PathBuf, Vec<&'a HubSessionState>>,
+    live_kind_cwd_counts: HashMap<(String, PathBuf), usize>,
+}
+
+impl<'a> HubIndex<'a> {
+    fn build(snap: &'a HubStateSnapshot, attributed: &[(String, LiveSession)]) -> Self {
+        let mut by_key = HashMap::new();
+        let mut by_provider_sid = HashMap::new();
+        let mut by_place: HashMap<PathBuf, Vec<&HubSessionState>> = HashMap::new();
+        for entry in &snap.sessions {
+            by_key.insert(entry.key.as_str(), entry);
+            if let Some(sid) = entry
+                .provider_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                by_provider_sid.insert(sid, entry);
+            }
+            if entry.key.starts_with("hook-") {
+                if let Some(place) = entry.place.as_deref().filter(|s| !s.is_empty()) {
+                    by_place.entry(comparable(place)).or_default().push(entry);
+                }
+            }
+        }
+        let mut live_kind_cwd_counts = HashMap::new();
+        for (_, live) in attributed {
+            let key = (live.kind.clone(), comparable(&live.cwd));
+            *live_kind_cwd_counts.entry(key).or_insert(0) += 1;
+        }
+        Self {
+            by_key,
+            by_provider_sid,
+            by_place,
+            live_kind_cwd_counts,
+        }
+    }
+
+    fn find(&self, live: &LiveSession) -> Option<&'a HubSessionState> {
+        if let Some(term_key) = live.terminal_session_id.as_deref() {
+            if let Some(entry) = self.by_key.get(term_key).copied() {
+                return Some(entry);
+            }
+        }
+        if let Some(sid) = live.session_id.as_deref() {
+            if let Some(entry) = self.by_provider_sid.get(sid).copied() {
+                return Some(entry);
+            }
+        }
+        let cwd_canon = comparable(&live.cwd);
+        if self
+            .live_kind_cwd_counts
+            .get(&(live.kind.clone(), cwd_canon.clone()))
+            .copied()
+            .unwrap_or(0)
+            != 1
+        {
+            return None;
+        }
+        let candidates = self.by_place.get(&cwd_canon)?;
+        let matching: Vec<&HubSessionState> = candidates
+            .iter()
+            .copied()
+            .filter(|entry| {
+                hook_key_matches_kind(&entry.key, &live.kind)
+                    && match (&entry.provider_session_id, &live.session_id) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            })
+            .collect();
+        (matching.len() == 1).then(|| matching[0])
+    }
+}
+
+fn hook_key_matches_kind(key: &str, kind: &str) -> bool {
+    let Some(rest) = key.strip_prefix("hook-") else {
+        return false;
+    };
+    if rest.starts_with(&format!("{kind}-")) {
+        return true;
+    }
+    !SCANNED_KINDS
+        .iter()
+        .any(|k| rest.starts_with(&format!("{}-", k.name())))
+}
+
+fn resolve_session_state(
+    live: &LiveSession,
+    reg: &ClaudeRegistrySnapshot,
+    hub: Option<&HubIndex<'_>>,
+    now_ms: u64,
+) -> (String, String, Option<u64>) {
+    if let Some(entry) = hub.and_then(|idx| idx.find(live)) {
+        return (
+            entry.state.clone(),
+            "hub".into(),
+            Some(now_ms.saturating_sub(entry.changed_ms) / 1000),
+        );
+    }
+    if live.kind == "claude" {
+        if let Some(rec) = reg.matching_entry(live.pid, live.start_us.unwrap_or(0)) {
+            let state = normalize_registry_status(&rec.entry.status).to_owned();
+            let age = rec.mtime_ms.map(|m| now_ms.saturating_sub(m) / 1000);
+            return (state, "registry".into(), age);
+        }
+        if reg.has_corruption_for(live.pid) {
+            return ("unknown".into(), "unknown".into(), None);
+        }
+    }
+    ("unknown".into(), "none".into(), None)
+}
+
+fn normalize_registry_status(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "busy" | "working" | "running" => "working",
+        "idle" => "idle",
+        "blocked" | "waiting" | "attention" | "permission" | "needs_input" | "needs_you" => {
+            "blocked"
+        }
+        "done" | "finished" | "completed" | "stopped" => "done",
+        _ => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1490,8 @@ mod tests {
             session_id: None,
             proc_start: None,
             registry_cwd: None,
+            start_us: None,
+            is_caller: false,
             ide_hosted: false,
             terminal_session_id: None,
         }
@@ -1207,6 +1776,7 @@ mod tests {
             parent_pid: None,
             cpu_rate: crate::sysload::Reading::Value(0),
             footprint: crate::sysload::Reading::Value(1),
+            write_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
             members: 1,
             unreadable_members: 0,
             ide_hosted: false,
@@ -1563,5 +2133,209 @@ mod tests {
         );
         // What was found is still reported, so a partial answer stays useful.
         assert_eq!(claude.live.len(), 1);
+    }
+
+    #[test]
+    fn sessions_report_states_sources_caller_task_and_bounding() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let wt = repo.path().join("wt-main");
+        fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+
+        let claude_dir = tempfile::TempDir::new().unwrap();
+        let reg_path = claude_dir.path();
+        fs::write(
+            reg_path.join("102.json"),
+            serde_json::json!({
+                "pid": 102,
+                "cwd": &wt_str,
+                "startedAt": 1000,
+                "entrypoint": "cli",
+                "status": "busy",
+                "sessionId": "sid-102"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Corrupt entry for PID 103
+        fs::write(reg_path.join("103.json"), "{not-valid-json").unwrap();
+
+        let scan_sessions = vec![
+            crate::sysload::AgentSession {
+                kind: crate::sysload::AgentKind::Claude,
+                pid: 101,
+                start_us: 100_000,
+                cwd: Some(wt_str.clone()),
+                tree: Some("run:run-caller".into()),
+                run_id: Some("run-caller".into()),
+                parent_pid: None,
+                footprint: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                cpu_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                write_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                members: 1,
+                unreadable_members: 0,
+                ide_hosted: false,
+                terminal_session_id: Some("term-101".into()),
+            },
+            crate::sysload::AgentSession {
+                kind: crate::sysload::AgentKind::Claude,
+                pid: 102,
+                start_us: 200_000,
+                cwd: Some(wt_str.clone()),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                footprint: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                cpu_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                write_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                members: 1,
+                unreadable_members: 0,
+                ide_hosted: false,
+                terminal_session_id: None,
+            },
+            crate::sysload::AgentSession {
+                kind: crate::sysload::AgentKind::Claude,
+                pid: 103,
+                start_us: 300_000,
+                cwd: Some(wt_str.clone()),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                footprint: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                cpu_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                write_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                members: 1,
+                unreadable_members: 0,
+                ide_hosted: false,
+                terminal_session_id: None,
+            },
+            crate::sysload::AgentSession {
+                kind: crate::sysload::AgentKind::Codex,
+                pid: 104,
+                start_us: 400_000,
+                cwd: Some(wt_str.clone()),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                footprint: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                cpu_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                write_rate: crate::sysload::Reading::Unavailable(crate::sysload::Why::Unsupported),
+                members: 1,
+                unreadable_members: 0,
+                ide_hosted: false,
+                terminal_session_id: None,
+            },
+        ];
+        let reg_snap = read_claude_registry_snapshot(&[reg_path.to_path_buf()], None);
+        let now_ms = 50_000;
+
+        // Case 1: App not running (Unavailable) -> app_state.ok == false, registry answers 102, 101 has state_source="none", 103 corrupt="unknown", 104 codex="unknown"/"none"
+        let offline = assemble_sessions_report(
+            wt_str.clone(),
+            std::slice::from_ref(&wt_str),
+            &[],
+            &[],
+            Vec::new(),
+            Ok(crate::sysload::SessionScan {
+                sessions: scan_sessions.clone(),
+                caller: Some(crate::sysload::CallerIdentity {
+                    pid: 102,
+                    start_us: 200_000,
+                }),
+            }),
+            &reg_snap,
+            HubStateRead::Unavailable("app not running".into()),
+            None,
+            now_ms,
+            &|rid| (rid == "run-caller").then(|| "task-1".into()),
+            &|_| None,
+        );
+        assert!(!offline.app_state.ok);
+        assert!(offline.app_state.error.contains("app not running"));
+        assert!(!offline.ok); // 103.json corrupt sets claude ok=false
+        assert_eq!(offline.total, 4);
+        assert_eq!(offline.returned, 4);
+        assert!(!offline.truncated);
+        // Caller 102 is sorted first!
+        assert_eq!(offline.sessions[0].pid, 102);
+        assert!(offline.sessions[0].is_caller);
+        assert_eq!(offline.sessions[0].state, "working");
+        assert_eq!(offline.sessions[0].state_source, "registry");
+        assert!(offline.sessions[0].state_age_s.is_some());
+
+        let r101 = offline.sessions.iter().find(|s| s.pid == 101).unwrap();
+        assert!(!r101.is_caller);
+        assert_eq!(r101.run_id.as_deref(), Some("run-caller"));
+        assert_eq!(r101.task_id.as_deref(), Some("task-1"));
+        assert_eq!(r101.state, "unknown");
+        assert_eq!(r101.state_source, "none");
+
+        let r103 = offline.sessions.iter().find(|s| s.pid == 103).unwrap();
+        assert_eq!(r103.state, "unknown");
+        assert_eq!(r103.state_source, "unknown");
+
+        let r104 = offline.sessions.iter().find(|s| s.pid == 104).unwrap();
+        assert_eq!(r104.kind, "codex");
+        assert_eq!(r104.state, "unknown");
+        assert_eq!(r104.state_source, "none");
+
+        // Case 2: App running -> hub state overrides 101 by terminal_session_id, 102 by session_id, and cap=2 bounds result while keeping caller first.
+        let hub = HubStateSnapshot {
+            version: 1,
+            writer_pid: std::process::id(),
+            writer_start_us: 1,
+            updated_ms: now_ms,
+            sessions: vec![
+                HubSessionState {
+                    key: "term-101".into(),
+                    provider_session_id: None,
+                    place: Some(wt_str.clone()),
+                    state: "blocked".into(),
+                    event: Some("permission_request".into()),
+                    changed_ms: now_ms - 5_000,
+                },
+                HubSessionState {
+                    key: "hook-claude-abc".into(),
+                    provider_session_id: Some("sid-102".into()),
+                    place: Some(wt_str.clone()),
+                    state: "done".into(),
+                    event: Some("turn_finished".into()),
+                    changed_ms: now_ms - 12_000,
+                },
+            ],
+        };
+        let online = assemble_sessions_report(
+            wt_str.clone(),
+            &[wt_str],
+            &[],
+            &[],
+            Vec::new(),
+            Ok(crate::sysload::SessionScan {
+                sessions: scan_sessions,
+                caller: Some(crate::sysload::CallerIdentity {
+                    pid: 102,
+                    start_us: 200_000,
+                }),
+            }),
+            &reg_snap,
+            HubStateRead::Ok(hub),
+            Some(2),
+            now_ms,
+            &|_| None,
+            &|_| None,
+        );
+        assert!(online.app_state.ok);
+        assert_eq!(online.cap, 2);
+        assert_eq!(online.total, 4);
+        assert_eq!(online.returned, 2);
+        assert!(online.truncated);
+        assert_eq!(online.sessions[0].pid, 102);
+        assert_eq!(online.sessions[0].state, "done");
+        assert_eq!(online.sessions[0].state_source, "hub");
+        assert_eq!(online.sessions[0].state_age_s, Some(12));
+        assert_eq!(online.sessions[1].pid, 101);
+        assert_eq!(online.sessions[1].state, "blocked");
+        assert_eq!(online.sessions[1].state_source, "hub");
+        assert_eq!(online.sessions[1].state_age_s, Some(5));
     }
 }

@@ -87,11 +87,14 @@
   } from "../ui/manviFocus";
   import DevcouncilSuitePanel from "./DevcouncilSuitePanel.svelte";
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
+  import AgentConnectPanel from "./AgentConnectPanel.svelte";
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
   import HostLoadSetting from "./HostLoadSetting.svelte";
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
+  import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
+  import WatchScopeSetting from "./WatchScopeSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -122,6 +125,8 @@
     "host-load-thermal",
     "host-load-battery",
     "host-load-disk",
+    "host-load-disk-fill",
+    "host-load-disk-coverage",
   ] as const;
   // The host-load input id behind the compressor row: a stored threshold key, not copy.
   const COMPRESSOR_INPUT = "compressor_segments" as const;
@@ -1218,6 +1223,17 @@
                   <div data-setting="host-load-disk" hidden={!shown("host-load-disk")}>
                     <HostLoadInputSetting input="disk" active={isOpen && activeSection === "agents"} />
                   </div>
+                  <div data-setting="host-load-disk-fill" hidden={!shown("host-load-disk-fill")}>
+                    <HostLoadDiskGuardSetting guard="fill" active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="host-load-disk-coverage" hidden={!shown("host-load-disk-coverage")}>
+                    <HostLoadDiskGuardSetting guard="coverage" active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["watch-scope"])}>
+                  <div data-setting="watch-scope" hidden={!shown("watch-scope")}>
+                    <WatchScopeSetting />
+                  </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["mcp-plugin"])}>
                   <h3 class="gp-label">MCP plugin</h3>
@@ -1336,6 +1352,9 @@
                         {/if}
                       </div>
                     {/if}
+                    <div class="pt-3">
+                      <AgentConnectPanel active={isOpen && activeSection === "agents"} />
+                    </div>
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["external-tools"])}>

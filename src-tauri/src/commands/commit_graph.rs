@@ -537,11 +537,11 @@ pub(super) fn commit_graph_page(
         let injected = crate::sysload::injected_governor_input();
         // The request's cancel flag is thread-local and does not follow a
         // spawn, so the walk puts it in force on whichever thread runs it.
-        let walk_cancel = crate::engine::git_cli::read_cancel::current();
+        let walk_cancel = crate::engine::process::read_cancel::current();
         let walk = || {
             #[cfg(test)]
             let _carried = injected.clone().map(crate::sysload::inject_governor);
-            let _cancellable = crate::engine::git_cli::read_cancel::enter(walk_cancel.as_ref());
+            let _cancellable = crate::engine::process::read_cancel::enter(walk_cancel.as_ref());
             GitReader::read_commit_history_paged(
                 &repo_path,
                 skip.unwrap_or(0),

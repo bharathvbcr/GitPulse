@@ -30,6 +30,19 @@ describe("HealthPanel rendering", () => {
     expect(freshness.label.length).toBeGreaterThan(0);
   });
 
+  it("scans automatically only through the shared settle, reusing a fresh audit", () => {
+    // Behaviour is pinned in harness/healthChecks.js (vitest never runs
+    // $effect); this keeps the wiring from being inlined back into the effect.
+    const effect = source.slice(source.indexOf("$effect(() => {\n    const path = $currentRepoPath;"), source.indexOf("async function openExternal"));
+    expect(effect).toContain("isScanStale(cached.scannedAtMs, Date.now())");
+    expect(effect).toContain("scheduleAutoScan({");
+    expect(effect).toContain("scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs })");
+    // No bare `void scan(path);` is left in the effect: that was the
+    // scan-on-every-mount.
+    expect(effect).not.toMatch(/^\s*void scan\(path\);/m);
+    expect(source).toContain("onclick={() => scan()}");
+  });
+
   it("labels outdated results as npm-only, through the catalog heading", () => {
     expect(HEALTH_SECTIONS.find((s) => s.id === "outdated")?.heading).toBe(
       "Outdated npm packages",
@@ -92,5 +105,28 @@ describe("HealthPanel scan-failure banner", () => {
   it("strips a trailing full stop from the error before adding its own", () => {
     // errorMsg often ends in "." already; appending another read "..".
     expect(source).toContain("{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? \"\")}");
+  });
+});
+
+describe("HealthPanel missing-code-map notice", () => {
+  it("offers Set up / Build index on both cards when the graph is missing", () => {
+    const graphCard = source.slice(source.indexOf('<HealthSection id="code-graph">'), source.indexOf('id="dead-code"'));
+    expect(graphCard).toContain("<MissingToolNotice");
+    expect(graphCard).toContain("graph={codegraph}");
+    const deadCard = source.slice(source.indexOf('id="dead-code"'), source.indexOf("<TerminalIncidentsSection"));
+    expect(deadCard).toContain("<MissingToolNotice");
+    // The raw reason is no longer printed inline.
+    expect(graphCard).not.toContain("({codegraph.reason})");
+  });
+
+  it("does not offer install when the status read itself failed", () => {
+    expect(source).toContain("codegraphReadError = graph.status === \"fulfilled\" ? null : formatError(graph.reason);");
+    expect(source).toContain("{#if codegraphReadError}");
+    expect(source).toContain("codegraph && !codegraph.available && !codegraphReadError");
+    expect(source).toContain("That is not the same as");
+  });
+
+  it("rebuilds the scan after a successful Build index", () => {
+    expect(source).toContain("onBuilt={() => void scan()}");
   });
 });

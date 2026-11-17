@@ -76,6 +76,12 @@ rust-coverage-summary.txt
 # Dated audits and snapshots; history up to 16483b7d still has them
 /docs/archive/
 /docs/DEPENDENCY_HEALTH_20*.md
+# Plans, design drafts, spikes, experiments, and qualification ledgers; history up to 90362c2e still has them
+/docs/design/
+/docs/AGENTIC_WORKSPACES_PLAN.md
+/docs/AGENT_OUTPUT_REVIEW.md
+/docs/FILE_CLAIM_CWD_EXPERIMENT.md
+/docs/QUALIFICATION.md
 
 # Session audit, build, wave, branch, test, and release reports, and idea dumps
 /AUDIT_REPORT*.md
@@ -183,8 +189,7 @@ IMPLEMENTATION_PLAN.md
 
 # DevMap and DevCouncil local state
 .devmap/
-.devcouncil/*
-!.devcouncil/
+.devcouncil/
 .devcouncil-skills.json
 .devcouncil-skills.lock
 opencode.json
@@ -215,25 +220,7 @@ opencode.json
 !/.claude-plugin/marketplace.json
 !/plugins/gitpulse/.claude-plugin/
 !/plugins/gitpulse/.claude-plugin/plugin.json
-.cursor/*
-!.cursor/
-!.cursor/rules/
-.cursor/rules/*
-!.cursor/rules/devmap.mdc
-!.cursor/skills/
-.cursor/skills/*
-!.cursor/skills/devmap/
-!.cursor/skills/devmap-debugging/
-!.cursor/skills/devmap-exploring/
-!.cursor/skills/devmap-impact/
-!.cursor/skills/devmap-refactoring/
-.cursor/skills/*/*
-!.cursor/skills/devmap/SKILL.md
-!.cursor/skills/devmap-debugging/SKILL.md
-!.cursor/skills/devmap-exploring/SKILL.md
-!.cursor/skills/devmap-impact/SKILL.md
-!.cursor/skills/devmap-refactoring/SKILL.md
-!.cursor/mcp.json
+.cursor/
 .openhands/
 .opencode/
 .conductor/
@@ -412,9 +399,6 @@ CLAUDE.md
 # Local DevMap preview input
 /harness/.devmap-preview.json
 
-# DevCouncil local state
-!.devcouncil/config.yaml
-
 # Additional generated, cache and test-runner artifacts
 .cache/
 .svelte-kit/
@@ -428,14 +412,5 @@ blob-report/
 *.stackdump
 *.pdb
 
-# Claude Code cloud sessions with one repository read this file
-# and do not read ~/.claude/settings.json. Machine-local overrides
-# stay in .claude/settings.local.json.
-!.claude/
-.claude/*
-!.claude/settings.json
 /crates/gitpulse-worktree/target/
 /crates/git-status-parity/target/
-
-# DevCouncil local state
-!/.devcouncil/

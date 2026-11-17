@@ -3,7 +3,7 @@
 
 use super::claude_hook;
 use super::WorkbenchError;
-use crate::engine::git_cli::{
+use crate::engine::process::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
 };
 use crate::ipc_error::CommandError;
@@ -763,6 +763,11 @@ pub fn session_id_args(provider: &str, session_id: &str) -> Result<Vec<String>, 
 /// Verified against Claude Code CLI `CLAUDE_FORK_VERIFIED_VERSION` (`2.1.325`)
 /// and [`CLAUDE_FORK_DOC_URL`].
 pub const CLAUDE_FORK_SESSION_FLAG: &str = "--fork-session";
+/// The Claude Code CLI flag that names the session a process runs as. This
+/// file builds it; a reader of another process's arguments (the session
+/// detector's fallback in `sysload::procscan`) takes the spelling from here,
+/// so the flag is written in one place.
+pub const CLAUDE_SESSION_ID_FLAG: &str = "--session-id";
 pub const CLAUDE_FORK_DOC_URL: &str = "https://code.claude.com/docs/en/cli-reference";
 pub const CLAUDE_FORK_VERIFIED_VERSION: &str = "2.1.325";
 
@@ -2411,7 +2416,7 @@ mod tests {
         let program = bin.to_str().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let spawns = |program: &str| {
-            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (_, labels) = crate::engine::process::spawn_labels_during(|| {
                 // The verdict is not the point (the fake advertises no flags);
                 // how many children were started to reach it is.
                 let _ = super::check(program, cwd, "claude", "ask", &opts(true, None));

@@ -17,6 +17,25 @@
 //! refuses. The setting that decides what to do with it is read from
 //! `tools.json` by the hook itself, after a command has been found heavy.
 //!
+//! # Disk headroom
+//!
+//! One thing is read live rather than from the verdict: free disk space on the
+//! volume the command writes to (the `cwd` the hook was given, not the hook
+//! process's own: for an orchestrated child terminal the hook runs inside the
+//! GitPulse app). A coverage build (any `cargo llvm-cov` in the line that
+//! builds) needs [`DiskFacts::coverage_headroom_bytes`] free before it starts,
+//! and any heavy build needs the disk rule's severe floor: on 2026-11-15 a
+//! coverage build took the disk from about 150 GiB to nothing in about fifteen
+//! minutes, and the published verdict is two seconds old by the time a build
+//! that writes 10 GiB a minute reads it. Each is its own input with a mode
+//! (refuse, shed = say so, off) from the settings, under the hook's `hook_mode`
+//! like every other refusal here. A reading that could not be taken is said
+//! once per session, never a pass.
+//!
+//! The two master switches bind it as they bind the load check:
+//! `host_load.enabled` off means nothing is measured and it says nothing, and
+//! `host_load.govern_launches` off means it advises and never refuses.
+//!
 //! # The answers
 //!
 //! | The command | The verdict | The hook |
@@ -56,7 +75,7 @@ use super::{
     decision, fnv1a, HookInput, HookOutput, HookSpecificOutput, PermissionDecision, PRE_TOOL_USE,
 };
 use crate::sysload::{
-    Binding, PublishedVerdict, Reading, SensorReport, SensorState, Snapshot, Tier,
+    Binding, InputMode, PublishedVerdict, Reading, SensorReport, SensorState, Snapshot, Tier,
 };
 use crate::tool_config::HostLoadHookMode;
 
@@ -96,6 +115,12 @@ pub(super) struct Gathered {
     /// Where the loop breaker keeps its markers.
     pub state_dir: PathBuf,
     pub now: SystemTime,
+    pub disk: DiskFacts,
+    /// Free bytes on the volume holding a path, `None` when it cannot be read;
+    /// the real reader, or a stand-in a test injects. It reads the volumes a
+    /// line names as its build directory, which are known only once the line
+    /// has been classified.
+    pub read_free: fn(&Path) -> Free,
     /// What the lease wrapper does for a build in this session.
     pub lease: LeaseSource,
 }
@@ -238,6 +263,55 @@ fn lease_lines(
     lines
 }
 
+/// What reading one location's free space found. A missing path is told from
+/// an unreadable one because only a missing path says nothing about the volume:
+/// the nearest ancestor that exists is read in its place, while an unreadable
+/// one is "could not read" and is never replaced by its ancestor's volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Free {
+    Bytes(u64),
+    Missing,
+    Unreadable,
+}
+
+/// What the disk checks need, read once per heavy command.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DiskFacts {
+    /// Free bytes on the volume the command runs in; `None` when unreadable.
+    pub free_bytes: Option<u64>,
+    /// The disk rule's severe floor, and what its mode makes of a breach.
+    pub floor_bytes: u64,
+    pub floor_mode: InputMode,
+    /// The headroom a coverage build needs, and its mode.
+    pub coverage_headroom_bytes: u64,
+    pub coverage_mode: InputMode,
+    /// `host_load.enabled`: whether GitPulse measures the host at all. Off,
+    /// the disk checks say nothing, as the load check does.
+    pub measuring: bool,
+    /// `host_load.govern_launches`: whether GitPulse refuses anything for
+    /// host pressure. Off, the disk checks advise and never refuse.
+    pub refusing: bool,
+}
+
+impl DiskFacts {
+    /// The facts the settings say, for `free_bytes` free. The numbers are the
+    /// resolved ones: the automatic floors already follow this machine's memory.
+    fn from_settings(free_bytes: Option<u64>) -> Self {
+        let settings = crate::tool_config::host_load_settings();
+        let thresholds = settings.thresholds;
+        let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
+        Self {
+            free_bytes,
+            floor_bytes: gib(thresholds.disk.severe_at),
+            floor_mode: thresholds.disk.mode,
+            coverage_headroom_bytes: gib(thresholds.disk_guard.coverage.headroom_gib),
+            coverage_mode: thresholds.disk_guard.coverage.mode,
+            measuring: settings.enabled,
+            refusing: settings.govern_launches,
+        }
+    }
+}
+
 /// The one line the SessionStart brief carries about host load, read from the
 /// published snapshot: never a sample of the host.
 pub(super) fn brief_line_live() -> String {
@@ -294,21 +368,35 @@ pub(super) fn brief_line(report: &SensorReport, snapshot: Option<&Snapshot>) -> 
 }
 
 /// What the real world says. Called only for a command that is in the table.
-pub(super) fn gather_live() -> Gathered {
+pub(super) fn gather_live(cwd: &str) -> Gathered {
     let mode = crate::tool_config::host_load_hook_mode();
-    let live = |availability, exempt| Gathered {
+    let live = |availability, exempt, disk| Gathered {
         mode,
         exempt,
         availability,
         state_dir: marker_dir(),
         now: SystemTime::now(),
+        disk,
+        read_free: real_free,
         lease: LeaseSource::Live,
     };
     if mode == HostLoadHookMode::Off {
-        return live(Availability::Unavailable(String::new()), false);
+        return live(
+            Availability::Unavailable(String::new()),
+            false,
+            DiskFacts::from_settings(None),
+        );
     }
     let exempt = std::env::var_os("MAC_HEAVY_LABEL").is_some_and(|label| !label.is_empty());
-    live(availability_live(), exempt)
+    live(
+        availability_live(),
+        exempt,
+        DiskFacts::from_settings(live_free_bytes(
+            cwd,
+            std::env::current_dir().ok(),
+            real_free,
+        )),
+    )
 }
 
 /// The app's held verdict as a reader may act on it, read from the published
@@ -323,6 +411,83 @@ pub(super) fn availability_live() -> Availability {
             let (report, snapshot) = crate::sysload::report(&path, crate::sysload::Clock::now());
             availability_of(&report, snapshot.as_ref())
         }
+    }
+}
+
+/// The real reader of [`Gathered::read_free`].
+fn real_free(path: &Path) -> Free {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Free::Missing,
+        Err(_) => Free::Unreadable,
+        Ok(_) => crate::sysload::free_bytes(path)
+            .value()
+            .map_or(Free::Unreadable, Free::Bytes),
+    }
+}
+
+/// Free bytes on the volume the command writes to, read now: the working
+/// directory the hook was given (`cwd`, which is the session's, and for an
+/// orchestrated child terminal is not this process's: the hook then runs inside
+/// the GitPulse app).
+///
+/// A `cwd` that was given and cannot be read (relative, missing, denied) is
+/// `None`, never another volume's number: the process's directory, or the
+/// snapshot's reading of the volume holding GitPulse's state, would be
+/// reported as room the command may not have. Only when no `cwd` was given is
+/// the process's own directory the best guess there is.
+fn live_free_bytes(
+    cwd: &str,
+    process_dir: Option<PathBuf>,
+    read: impl Fn(&Path) -> Free,
+) -> Option<u64> {
+    let dir = if cwd.is_empty() {
+        process_dir?
+    } else if Path::new(cwd).is_absolute() {
+        PathBuf::from(cwd)
+    } else {
+        return None;
+    };
+    match read(&dir) {
+        Free::Bytes(bytes) => Some(bytes),
+        Free::Missing | Free::Unreadable => None,
+    }
+}
+
+/// Free space on a build directory's volume: that of the nearest ancestor
+/// that exists, since the directory itself may not yet. An ancestor that exists
+/// and cannot be read stops the walk: that is "could not read", not the
+/// volume of a directory above it.
+fn free_at_or_above(dir: &Path, read: impl Fn(&Path) -> Free) -> Option<u64> {
+    for ancestor in dir.ancestors() {
+        match read(ancestor) {
+            Free::Bytes(bytes) => return Some(bytes),
+            Free::Missing => continue,
+            Free::Unreadable => return None,
+        }
+    }
+    None
+}
+
+/// What the free space of every location a heavy line writes to came to.
+struct Room {
+    /// The smallest reading among the locations that could be read.
+    lowest: Option<u64>,
+    /// Every location was read. "Has room" needs this; a location that was
+    /// read and is short may still refuse on its own number without it.
+    complete: bool,
+}
+
+/// The volume the line runs in and the build directories it names literally.
+fn room(cwd_free: Option<u64>, classified: &Classified, g: &Gathered) -> Room {
+    let mut readings: Vec<Option<u64>> = classified
+        .build_dirs
+        .iter()
+        .map(|dir| free_at_or_above(Path::new(dir), g.read_free))
+        .collect();
+    readings.push(cwd_free);
+    Room {
+        lowest: readings.iter().flatten().copied().min(),
+        complete: readings.iter().all(Option::is_some),
     }
 }
 
@@ -392,6 +557,105 @@ fn judge_classified(input: &HookInput, classified: &Classified, g: &Gathered) ->
         }
         return advise_rows(classified, &g.availability);
     };
+    let disk = disk_check(input, classified, heavy, g);
+    if let DiskCall::Refuse(output) = disk {
+        return output;
+    }
+    let verdict_answer = verdict_answer(input, classified, heavy, g);
+    match disk {
+        DiskCall::Say(text) => fold(verdict_answer, advice(&text)),
+        _ => verdict_answer,
+    }
+}
+
+/// What the disk checks make of a heavy command.
+enum DiskCall {
+    Nothing,
+    /// Said as context, refusing nothing.
+    Say(String),
+    Refuse(HookOutput),
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Whether the free space on the volume allows a heavy command to start: a
+/// coverage build needs its headroom and any heavy build the severe floor.
+///
+/// Both master switches bind it as they bind the load check: with measurement
+/// off it says nothing, and with launch refusal off it advises and never
+/// refuses, whatever each rule's own mode says.
+fn disk_check(input: &HookInput, classified: &Classified, heavy: &Hit, g: &Gathered) -> DiskCall {
+    let d = &g.disk;
+    if !d.measuring {
+        return DiskCall::Nothing;
+    }
+    let covers = classified.coverage_build && d.coverage_mode != InputMode::Off;
+    let floors = d.floor_mode != InputMode::Off;
+    if !covers && !floors {
+        return DiskCall::Nothing;
+    }
+    let refuses = |mode: InputMode| d.refusing && mode == InputMode::Refuse;
+    let room = room(d.free_bytes, classified, g);
+    let unread = || {
+        let why = "free disk space could not be read";
+        match first_notice(g, input, why) {
+            Notice::Repeat => DiskCall::Nothing,
+            notice => DiskCall::Say(format!(
+                "GitPulse did NOT check free disk space for this heavy command ({}): it could not be read for every place it writes to. \
+                 A full disk can hang this Mac; check df before a build that writes a lot.{}",
+                heavy.label,
+                notice.suffix()
+            )),
+        }
+    };
+    let Some(free) = room.lowest else {
+        return unread();
+    };
+    let mut reasons = Vec::new();
+    let mut refuse = false;
+    if covers && free < d.coverage_headroom_bytes {
+        reasons.push(format!(
+            "a coverage build writes tens of GiB of instrumented output and only {} is free, under the {} GitPulse requires before one starts",
+            gib(free),
+            gib(d.coverage_headroom_bytes)
+        ));
+        refuse |= refuses(d.coverage_mode);
+    }
+    if floors && free < d.floor_bytes {
+        reasons.push(format!(
+            "free disk space is {}, below GitPulse's {} floor for starting a heavy build",
+            gib(free),
+            gib(d.floor_bytes)
+        ));
+        refuse |= refuses(d.floor_mode);
+    }
+    if reasons.is_empty() {
+        // "Has room" is said only when every location was read.
+        return if room.complete {
+            DiskCall::Nothing
+        } else {
+            unread()
+        };
+    }
+    let why = reasons.join("; and ");
+    if refuse {
+        return DiskCall::Refuse(deny(input, heavy, &why, true, g));
+    }
+    DiskCall::Say(format!(
+        "Free disk space is low for this heavy command ({}): {why}. Free disk space first (remove build output such as cargo target directories, or run cargo llvm-cov clean).",
+        heavy.label
+    ))
+}
+
+/// What the app's published verdict says about a heavy command.
+fn verdict_answer(
+    input: &HookInput,
+    classified: &Classified,
+    heavy: &Hit,
+    g: &Gathered,
+) -> HookOutput {
     match &g.availability {
         Availability::Unavailable(why) => {
             let mut lines = lease_lines(input, heavy, &g.availability, g);
@@ -482,6 +746,17 @@ fn refusal(
         tier_word(verdict.tier),
         binding_phrase(verdict.binding)
     );
+    let disk = matches!(
+        verdict.binding,
+        Some(Binding::LowDisk | Binding::DiskFilling)
+    );
+    deny(input, heavy, &why, disk, g)
+}
+
+/// The refusal (or, in Advise, the same words as context) for a heavy command,
+/// for `why`. `disk` says the cause is disk space, which changes what the model
+/// is told to do: waiting does not free disk, deleting build output does.
+fn deny(input: &HookInput, heavy: &Hit, why: &str, disk: bool, g: &Gathered) -> HookOutput {
     if g.mode == HostLoadHookMode::Advise {
         return advice(&format!(
             "GitPulse would refuse this heavy command ({}) because {why}, but the command gate \
@@ -495,11 +770,14 @@ fn refusal(
         Some(n) if n >= LOOP_AT => (
             format!(
                 "STOP: you are looping. GitPulse has refused this same heavy command ({}) {n} times in the last {} minutes because {why}. \
-                 Do not run it again, and do not run any other build or test command, until the load has cleared. \
-                 Tell the user the host is overloaded and ask them to free memory or change the command gate in GitPulse Settings > Agents > Host load. \
+                 Do not run it again, and do not run any other build or test command, until {}. \
+                 Tell the user {} and ask them to {} or change the command gate in GitPulse Settings > Agents > Host load. \
                  This grants nothing.",
                 heavy.label,
-                LOOP_WINDOW.as_secs() / 60
+                LOOP_WINDOW.as_secs() / 60,
+                if disk { "disk space has been freed" } else { "the load has cleared" },
+                if disk { "the disk is nearly full" } else { "the host is overloaded" },
+                if disk { "free disk space" } else { "free memory" },
             ),
             Some(format!(
                 "GitPulse refused the same heavy command {n} times in {} minutes in one session: the agent appears to be retrying in a loop while the host is overloaded.",
@@ -509,9 +787,14 @@ fn refusal(
         _ => (
             format!(
                 "GitPulse refused this heavy command ({}) because {why}. \
-                 What to do: wait a few minutes, then run it again. Do not retry in a loop, and do not work around this by running the same work through another build tool, a wrapper script or a subshell{}. \
+                 What to do: {}. Do not retry in a loop, and do not work around this by running the same work through another build tool, a wrapper script or a subshell{}. \
                  If the work cannot wait, tell the user: they can set the command gate to Advise or Off in GitPulse Settings > Agents > Host load.",
                 heavy.label,
+                if disk {
+                    "free disk space first (remove build output such as cargo target directories, or run cargo llvm-cov clean), then run it again; waiting alone will not free any"
+                } else {
+                    "wait a few minutes, then run it again"
+                },
                 cap_sentence(heavy)
             ),
             None,
@@ -655,20 +938,10 @@ fn tier_word(tier: Tier) -> &'static str {
     }
 }
 
-/// The resource that bound the verdict, in words. Exhaustive on purpose: a new
-/// [`Binding`] must be given words here before it compiles.
+/// The resource that bound the verdict, in words: [`Binding::cause_phrase`],
+/// the one owner of how a cause is worded.
 fn binding_phrase(binding: Option<Binding>) -> &'static str {
-    match binding {
-        None => "no single resource is named",
-        Some(Binding::MemoryPressure) => "the kernel reports memory pressure",
-        Some(Binding::CompressorThrash) => "the memory compressor is thrashing",
-        Some(Binding::CompressorSegments) => "the memory compressor is nearly out of segments",
-        Some(Binding::Swap) => "swap in use is above GitPulse's limit for it",
-        Some(Binding::LowDisk) => "free disk space is below GitPulse's floor",
-        Some(Binding::Thermal) => "the Mac is thermally throttled",
-        Some(Binding::CpuLoad) => "the CPU load average is above GitPulse's limit for it",
-        Some(Binding::Battery) => "the Mac is running on battery",
-    }
+    binding.map_or("no single resource is named", Binding::cause_phrase)
 }
 
 fn cap_sentence(hit: &Hit) -> String {

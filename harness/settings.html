@@ -200,6 +200,28 @@
       // The Manvi model card's credential answer: an object in the wire shape,
       // or "throw" for a backend that could not answer.
       window.__gpClaudeStatus = { key_saved: false, account: null, account_error: null };
+      // "Connect your agent": cmd_agent_connect_plan / _apply as agent_connect.rs
+      // answers. `__gpConnect.applies` counts writes, so a click that skipped the
+      // confirmation shows up as a count, not as a guess.
+      const linkAction = (id, title, target, state) => ({ id, kind: "link", agent: null, title, target, state, detail: state === "done" ? "Already linked." : "Link into ~/.local/bin.", commands: [] });
+      const codexCommands = ["codex mcp remove gitpulse", "codex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"];
+      const connectPlan = (linkState) => ({
+        available: true, reason: "",
+        mcp_path: "/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+        hook_path: "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook",
+        agents_found: ["claude", "codex"],
+        agent_commands: [
+          { agent: "claude", label: "Claude Code", add: "claude mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp", verify: "claude mcp get gitpulse" },
+          { agent: "codex", label: "Codex", add: codexCommands[1], verify: "codex mcp get gitpulse" },
+        ],
+        actions: [
+          linkAction("link:gitpulse-mcp", "Link gitpulse-mcp", "~/.local/bin/gitpulse-mcp", linkState),
+          linkAction("link:gitpulse-hook", "Link gitpulse-hook", "~/.local/bin/gitpulse-hook", linkState),
+          { id: "register:claude", kind: "register", agent: "claude", title: "Register with Claude Code", target: "claude plugin list --json", state: "done", detail: "The gitpulse@gitpulse plugin already provides the server.", commands: [] },
+          { id: "register:codex", kind: "register", agent: "codex", title: "Register with Codex", target: "codex mcp add gitpulse", state: "blocked", detail: "gitpulse is registered with a different command.", commands: codexCommands },
+        ],
+      });
+      window.__gpConnect = { applies: 0, plans: 0, linked: false };
       localStorage.removeItem("gitpulse_ai_model");
       const { hostLoadSettingsFixture } = await import("./hostLoadFixture");
       window.__gpHost = { stored: hostLoadSettingsFixture(), reads: 0, attempts: [], failNext: null };
@@ -250,6 +272,21 @@
             agentDefaults = next;
             return agentView();
           }
+          if (cmd === "cmd_agent_connect_plan") {
+            window.__gpConnect.plans++;
+            return connectPlan(window.__gpConnect.linked ? "done" : "todo");
+          }
+          if (cmd === "cmd_agent_connect_apply") {
+            window.__gpConnect.applies++;
+            window.__gpConnect.linked = true;
+            return {
+              results: [
+                { id: "link:gitpulse-mcp", ok: true, message: "Linked gitpulse-mcp." },
+                { id: "link:gitpulse-hook", ok: true, message: "Linked gitpulse-hook." },
+              ],
+              plan: connectPlan("done"),
+            };
+          }
           if (cmd === "cmd_mcp_info") return mcpInfo;
           if (cmd === "cmd_devcouncil_suite_status") return suiteReport;
           if (cmd === "cmd_devmap_integration_survey") {
@@ -294,7 +331,7 @@
             window.__gpHost.stored = structuredClone(args.settings);
             return structuredClone(window.__gpHost.stored);
           }
-          if (cmd === "cmd_host_load_status") return hostLoadStatus;
+          if (cmd === "cmd_host_load_status") return structuredClone(hostLoadStatus);
           if (cmd === "cmd_lappi_settings") {
             return {
               settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
@@ -416,6 +453,54 @@
           check("the model card lists the resolved local endpoint", document.getElementById("manvi-section-model").textContent.includes("llama3.2:3b"));
           check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1);
 
+
+          // Connect your agent: rendered and clicked, through the app's own confirm dialog.
+          const connect = () => document.querySelector('[data-testid="agent-connect"]');
+          const connectText = () => (connect()?.textContent ?? "").replace(/\s+/g, " ");
+          const btn = (scope, label) => [...scope.querySelectorAll("button")].find((b) => b.textContent.trim() === label);
+          const prompt = () => document.querySelector('[role="dialog"][aria-label="Connect your agent?"]');
+          const clipboardWrites = [];
+          Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { clipboardWrites.push(text); } } });
+          check("Connect your agent renders its plan summary", await until(() => connectText().includes("2 changes to make")));
+          check("every planned action gets a row", connect().querySelectorAll('[data-testid="connect-action"]').length === 4);
+          const rows = [...connect().querySelectorAll('[data-testid="connect-action"]')];
+          const codexRow = rows.find((r) => r.textContent.includes("Register with Codex"));
+          const claudeRow = rows.find((r) => r.textContent.includes("Register with Claude Code"));
+          check("a done registration names the plugin that provides it", claudeRow.textContent.includes("gitpulse@gitpulse") && !claudeRow.querySelector('[data-testid="connect-commands"]'));
+          const codexCommandBlock = codexRow.querySelector('[data-testid="connect-commands"]');
+          check("a blocked registration shows both commands", codexCommandBlock && codexCommandBlock.textContent.includes("codex mcp remove gitpulse") && codexCommandBlock.textContent.includes("codex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"));
+          check("the commands block has a Copy button", Boolean(btn(codexCommandBlock, "Copy")));
+          btn(codexCommandBlock, "Copy").click();
+          check("Copy puts the commands on the clipboard, one per line", await until(() => clipboardWrites.at(-1) === "codex mcp remove gitpulse\ncodex mcp add gitpulse -- /Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp"));
+          check("nothing is applied before Connect is pressed", window.__gpConnect.applies === 0 && !prompt());
+          const connectButton = () => btn(connect(), "Connect");
+          check("Connect is offered while changes are pending", connectButton() && !connectButton().disabled);
+          connectButton().click();
+          check("Connect opens the app's confirm dialog", await until(() => prompt()));
+          check("the dialog lists both link targets", prompt().textContent.includes("~/.local/bin/gitpulse-mcp") && prompt().textContent.includes("~/.local/bin/gitpulse-hook"));
+          check("the dialog does not list work that is already done or blocked", !prompt().textContent.includes("Register with Codex"));
+          check("opening the dialog applies nothing", window.__gpConnect.applies === 0);
+          btn(prompt(), "Cancel").click();
+          check("Cancel closes the dialog", await until(() => !prompt()));
+          await wait(100);
+          check("Cancel applies nothing and the changes stay pending", window.__gpConnect.applies === 0 && connectText().includes("2 changes to make") && !connect().querySelector('[data-testid="connect-result"]'));
+          connectButton().click();
+          await until(() => prompt());
+          btn(prompt(), "Connect").click();
+          check("confirming applies exactly once", await until(() => window.__gpConnect.applies === 1));
+          await wait(150);
+          check("the apply was not repeated", window.__gpConnect.applies === 1);
+          check("after apply the summary stops offering changes", await until(() => !connectText().includes("changes to make") && connectText().includes("Nothing to change; some items were left alone")));
+          check("after apply Connect is disabled", connectButton().disabled);
+          const resultNodes = [...connect().querySelectorAll('[data-testid="connect-result"]')].map((n) => n.textContent);
+          check("each applied action shows its result", resultNodes.length === 2 && resultNodes.includes("Linked gitpulse-mcp.") && resultNodes.includes("Linked gitpulse-hook."));
+          btn(connect(), "Copy setup prompt").click();
+          check("Copy setup prompt writes the mcp path and the plugin check", await until(() => {
+            const text = clipboardWrites.at(-1) ?? "";
+            return text.includes("/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp") && text.includes("claude plugin list --json");
+          }));
+          check("copying the prompt confirms in the panel", await until(() => connectText().includes("Copied. Paste it into Claude Code or Codex.")));
+
           // Scan and pick.
           const scanButton = [...document.querySelectorAll("#manvi-section-model button")].find((b) => b.textContent.includes("Scan local servers"));
           scanButton.click();
@@ -498,7 +583,7 @@
             ["swap", "Swap used", "refuse", "0.5", "0.75", "x memory", "Slow background work at", "Refuse launches at"],
             ["compressor_segments", "Memory compressor", "refuse", "0.6", "0.8", "of limit", "Slow background work at", "Refuse launches at"],
             ["load", "CPU load", "shed", "3", "6", "per CPU", "Slow background work at", "Refuse launches at"],
-            ["disk", "Free disk space", "refuse", "20", "10", "GiB free", "Slow background work below", "Refuse launches below"],
+            ["disk", "Free disk space", "refuse", "32", "16", "GiB free", "Slow background work below", "Refuse launches below"],
           ];
           for (const [id, label, mode, elevated, severe, unit, elevatedLabel, severeLabel] of EXPECT) {
             const text = flatText(input(id));
@@ -521,16 +606,20 @@
           await pickMode("swap", "shed");
           check("changing Swap to slow-down saves exactly that input", H.attempts.length === 1 && Object.keys(H.attempts[0]).join() === "settings"
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.5, severe_at: 0.75 })
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 10 })
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 16 })
+            && lastSave().thresholds.disk_auto === true
             && lastSave().enabled === true && lastSave().govern_launches === true && lastSave().hook_mode === "enforce");
           check("a slow-down input disables its refuse threshold and offers a reset", thresholdField("swap", "severe_at").disabled && Boolean(resetButton("swap")));
           // A threshold change carries the other threshold and the mode through.
           await typeThreshold("swap", "elevated_at", "0.4");
           check("editing Swap's slow-down level saves 0.4 and keeps 0.75 and the mode", H.attempts.length === 2
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
+          check("the disk floors say they are automatic until a number is set", Boolean(document.querySelector('[data-testid="host-load-input-disk-auto"]')));
           await typeThreshold("disk", "severe_at", "5");
-          check("editing Free disk's refuse level saves 5 and keeps 20", H.attempts.length === 3
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 })
+          check("editing Free disk's refuse level saves 5, keeps 32 and takes both floors off automatic", H.attempts.length === 3
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 5 })
+            && lastSave().thresholds.disk_auto === false
+            && Boolean(document.querySelector('[data-testid="host-load-input-disk-explicit"]'))
             && JSON.stringify(lastSave().thresholds.swap) === JSON.stringify({ mode: "shed", elevated_at: 0.4, severe_at: 0.75 }));
           await pickMode("load", "off");
           check("turning CPU load off saves it and hides its thresholds", H.attempts.length === 4 && lastSave().thresholds.load.mode === "off"
@@ -541,6 +630,31 @@
             && JSON.stringify(lastSave().thresholds.load) === JSON.stringify({ mode: "shed", elevated_at: 3, severe_at: 6 }) && !resetButton("load"));
           await pickMode("battery", "shed");
           check("Battery saves a mode and no thresholds", H.attempts.length === 6 && JSON.stringify(lastSave().thresholds.battery) === JSON.stringify({ mode: "shed" }));
+
+          // The fill rule's row says what it is doing when it has no rate: each
+          // reason is its own sentence, and a measured zero is not any of them.
+          {
+            const { refreshHostLoad } = await import("../src/lib/stores/hostLoadStore");
+            const stateText = () => flatText(document.querySelector('[data-testid="host-load-guard-fill-state"]'));
+            const rate = hostLoadStatus.snapshot.disk_fill_rate;
+            const states = [
+              [{ status: "unavailable", value: "not_yet" }, "Fill rate: warming up"],
+              [{ status: "unavailable", value: "disabled" }, "Fill rate: off (host load measurement is switched off)"],
+              [{ status: "unavailable", value: "older" }, "Fill rate: not available (the app writing the snapshot is an older build)"],
+              [{ status: "unavailable", value: "unsupported" }, "Fill rate: not available on this platform"],
+              [{ status: "unavailable", value: "failed" }, "Fill rate: not available (free disk space can't be read)"],
+              [{ status: "value", value: 0 }, "Fill rate: not falling"],
+              [{ status: "value", value: 3 * 2 ** 30 }, "Fill rate: 3.00 GB/min"],
+            ];
+            for (const [reading, expected] of states) {
+              hostLoadStatus.snapshot.disk_fill_rate = reading;
+              await refreshHostLoad();
+              await wait(80);
+              check(`the fill row says "${expected}" for ${reading.status} ${reading.value}`, stateText() === expected);
+            }
+            hostLoadStatus.snapshot.disk_fill_rate = rate;
+            await refreshHostLoad();
+          }
 
           // Values the rules refuse are said so on screen, and nothing is saved.
           const before = H.attempts.length;
@@ -553,7 +667,7 @@
           check("a non-numeric threshold is refused with a sentence", inputError("compressor_segments").includes("both thresholds must be numbers"));
           await typeThreshold("compressor_segments", "severe_at", "1.5");
           check("a threshold above the input's maximum is refused with a sentence", inputError("compressor_segments").includes("at most 1 of limit"));
-          await typeThreshold("disk", "severe_at", "30");
+          await typeThreshold("disk", "severe_at", "40");
           check("a disk refuse level above its slow-down level is refused", inputError("disk").includes("must not be above the slow-down level"));
           check("none of the refused values reached the backend", H.attempts.length === before && thresholdField("disk", "severe_at").value === "5");
 
@@ -571,7 +685,9 @@
           await pickGate("Advise");
           check("choosing Advise saves hook_mode advise and nothing else changed", H.attempts.length === attempts + 1 && lastSave().hook_mode === "advise"
             && lastSave().enabled === true && lastSave().govern_launches === true
-            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 20, severe_at: 5 }));
+            && JSON.stringify(lastSave().thresholds.disk) === JSON.stringify({ mode: "refuse", elevated_at: 32, severe_at: 5 })
+            && lastSave().thresholds.disk_auto === false
+            && JSON.stringify(lastSave().thresholds.disk_guard) === JSON.stringify({ fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 }, coverage: { mode: "refuse", headroom_gib: 60 } }));
           check("Advise reads as the selected choice", gateShown() === "Advise");
           H.failNext = "the settings file is read-only";
           await pickGate("Off");

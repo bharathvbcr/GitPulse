@@ -3,7 +3,7 @@
 //! itself, so there is no hand-back to forget, leak or duplicate.
 
 use super::*;
-use crate::engine::git_cli::{refusal_message, Refusal};
+use crate::engine::process::{refusal_message, Refusal};
 use crate::ipc_error::CommandError;
 
 fn shed(label: &str) -> CommandError {

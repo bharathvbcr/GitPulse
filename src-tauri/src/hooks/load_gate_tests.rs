@@ -38,8 +38,32 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         availability,
         state_dir: dir.join("state"),
         now: SystemTime::now(),
+        disk: plenty_of_disk(),
+        read_free: |_| Free::Missing,
         lease: LeaseSource::Fixed(LeaseFacts::default()),
     }
+}
+
+const GIB: u64 = 1 << 30;
+
+/// 200 GiB free against a 16 GiB floor and a 60 GiB coverage headroom, both
+/// refusing: the numbers of a 64 GiB Mac at its defaults.
+fn plenty_of_disk() -> DiskFacts {
+    DiskFacts {
+        free_bytes: Some(200 * GIB),
+        floor_bytes: 16 * GIB,
+        floor_mode: InputMode::Refuse,
+        coverage_headroom_bytes: 60 * GIB,
+        coverage_mode: InputMode::Refuse,
+        measuring: true,
+        refusing: true,
+    }
+}
+
+fn with_free(dir: &Path, free_gib: u64) -> Gathered {
+    let mut g = gathered(verdict(Tier::Clear, None, true), dir);
+    g.disk.free_bytes = Some(free_gib * GIB);
+    g
 }
 
 fn severe(dir: &Path) -> Gathered {
@@ -135,6 +159,7 @@ fn every_binding_has_words_and_names_the_resource() {
         Some(Binding::Thermal),
         Some(Binding::CpuLoad),
         Some(Binding::Battery),
+        Some(Binding::DiskFilling),
     ] {
         let g = gathered(verdict(Tier::Severe, binding, false), dir.path());
         let out = judged("cargo build", &g);
@@ -712,7 +737,7 @@ fn load_stage_cost() {
     let long = format!("echo {}", "a".repeat(10_000));
     let heavy_line = "cd src-tauri && cargo test --lib -- hooks::";
     let live = |state: &Path| {
-        let mut g = gather_live();
+        let mut g = gather_live("");
         g.state_dir = state.to_path_buf();
         g
     };
@@ -978,6 +1003,537 @@ fn a_notice_that_cannot_be_counted_is_said_every_time() {
         );
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+#[test]
+fn a_coverage_build_is_refused_below_its_headroom_and_not_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = judged("cargo llvm-cov --lib", &with_free(dir.path(), 50));
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    let text = reason(&out);
+    for must in [
+        "coverage build",
+        "50.0 GiB",
+        "60.0 GiB",
+        "free disk space first",
+        "cargo llvm-cov clean",
+    ] {
+        assert!(text.contains(must), "lacks {must:?}: {text}");
+    }
+    assert!(!text.contains("free memory"), "{text}");
+    assert!(
+        judged("cargo llvm-cov --lib", &with_free(dir.path(), 70)).is_silent(),
+        "above the headroom, a clear host stays quiet"
+    );
+    // An ordinary build needs the floor, not the coverage headroom.
+    assert!(judged("cargo test --lib", &with_free(dir.path(), 50)).is_silent());
+}
+
+#[test]
+fn the_commands_that_give_the_disk_back_are_never_refused_for_a_full_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = with_free(dir.path(), 1);
+    for command in [
+        "cargo llvm-cov clean",
+        "cargo llvm-cov clean --workspace",
+        "cargo llvm-cov report --html",
+        "cargo llvm-cov show-env",
+        "cargo +nightly llvm-cov --manifest-path src-tauri/Cargo.toml clean",
+    ] {
+        assert!(judged(command, &full).is_silent(), "{command}");
+    }
+    for command in [
+        "cargo llvm-cov",
+        "cargo llvm-cov nextest",
+        "cargo llvm-cov --no-report --lib",
+        "cargo test report",
+        "cargo test clean",
+    ] {
+        assert_eq!(
+            decision_of(&judged(command, &full)),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn any_heavy_build_is_refused_below_the_severe_floor_with_the_disk_words() {
+    let dir = tempfile::tempdir().unwrap();
+    for command in ["cargo build", "go test ./...", "npm run test:browser"] {
+        let out = judged(command, &with_free(dir.path(), 12));
+        assert_eq!(
+            decision_of(&out),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+        let text = reason(&out);
+        assert!(
+            text.contains("12.0 GiB") && text.contains("16.0 GiB floor"),
+            "{text}"
+        );
+        assert!(!text.contains("wait a few minutes"), "{text}");
+    }
+    // Looping says disk, not memory.
+    let g = with_free(dir.path(), 12);
+    let mut last = String::new();
+    for n in 0..LOOP_AT {
+        let mut input = call("cargo build");
+        input.tool_use_id = format!("toolu_{n:02}");
+        last = reason(&judge(&input, || g.clone()));
+    }
+    assert!(
+        last.contains("STOP") && last.contains("free disk space"),
+        "{last}"
+    );
+    assert!(!last.contains("free memory"), "{last}");
+}
+
+#[test]
+fn the_disk_modes_refuse_say_or_stay_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shed = with_free(dir.path(), 12);
+    shed.disk.floor_mode = InputMode::Shed;
+    let out = judged("cargo build", &shed);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("Free disk space is low"),
+        "{}",
+        context(&out)
+    );
+
+    let mut off = with_free(dir.path(), 12);
+    off.disk.floor_mode = InputMode::Off;
+    off.disk.coverage_mode = InputMode::Off;
+    assert!(judged("cargo build", &off).is_silent());
+    assert!(judged("cargo llvm-cov", &off).is_silent());
+
+    // The hook's own Advise says the same and refuses nothing; Off adds nothing.
+    let mut advise = with_free(dir.path(), 12);
+    advise.mode = HostLoadHookMode::Advise;
+    let out = judged("cargo build", &advise);
+    assert_eq!(decision_of(&out), None);
+    assert!(context(&out).contains("would refuse"), "{}", context(&out));
+    let mut hook_off = with_free(dir.path(), 12);
+    hook_off.mode = HostLoadHookMode::Off;
+    assert!(judged("cargo build", &hook_off).is_silent());
+    // The heavy lane's holder is exempt from the disk check too.
+    let mut exempt = with_free(dir.path(), 12);
+    exempt.exempt = true;
+    assert!(judged("cargo build", &exempt).is_silent());
+}
+
+#[test]
+fn a_disk_reading_that_could_not_be_taken_is_said_once_never_a_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 200);
+    g.disk.free_bytes = None;
+    let first = judged("cargo build", &g);
+    assert_eq!(decision_of(&first), None);
+    assert!(
+        context(&first).contains("did NOT check free disk space"),
+        "{}",
+        context(&first)
+    );
+    assert!(
+        judged("cargo build", &g).is_silent(),
+        "said once per session"
+    );
+}
+
+#[test]
+fn a_disk_refusal_wins_over_a_clear_verdict_and_keeps_a_verdict_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    // The verdict refuses for swap while the disk is also short: one refusal,
+    // naming the disk, which the model can act on.
+    let mut g = severe(dir.path());
+    g.disk.free_bytes = Some(5 * GIB);
+    let out = judged("cargo test", &g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(reason(&out).contains("5.0 GiB"), "{}", reason(&out));
+    // A short disk below the Shed mode still lets the verdict refuse.
+    g.disk.floor_mode = InputMode::Shed;
+    let out = judged("cargo test", &g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(reason(&out).contains("swap in use"), "{}", reason(&out));
+    // A verdict bound by the disk filling tells the model to free disk.
+    let filling = gathered(
+        verdict(Tier::Severe, Some(Binding::DiskFilling), false),
+        dir.path(),
+    );
+    let text = reason(&judged("cargo build", &filling));
+    assert!(
+        text.contains("falling fast") && text.contains("free disk space first"),
+        "{text}"
+    );
+}
+
+/// What an installed hook built before the disk fill rule does when the
+/// binding byte is one it does not know: the whole verdict reads as `Failed`
+/// (`snapshot::ext_reading`), and the gate says "not load-checked" and refuses
+/// nothing. This is the fail-open the published `LowDisk` byte exists to avoid,
+/// pinned here on the code path that older reader runs.
+#[test]
+fn an_older_reader_that_cannot_place_the_binding_fails_open_which_is_why_the_byte_is_low_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot = snapshot_with(Reading::Unavailable(Why::Failed), true);
+    let availability = availability_of(&report(SensorState::Fresh, None), Some(&snapshot));
+    assert!(
+        matches!(&availability, Availability::Unavailable(why) if why.contains("no governor verdict")),
+        "{availability:?}"
+    );
+    let out = judged("cargo test", &gathered(availability, dir.path()));
+    assert_eq!(decision_of(&out), None, "never a refusal");
+    assert!(
+        context(&out).contains("did NOT load-check"),
+        "{}",
+        context(&out)
+    );
+
+    // The same snapshot carrying the byte an older reader knows is refused.
+    let published = PublishedVerdict {
+        tier: Tier::Severe,
+        binding: Some(Binding::LowDisk),
+        admit: false,
+        shed_background: true,
+        shed_reactive: true,
+    };
+    let snapshot = snapshot_with(Reading::Value(published), true);
+    let availability = availability_of(&report(SensorState::Fresh, None), Some(&snapshot));
+    let out = judged("cargo test", &gathered(availability, dir.path()));
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(
+        reason(&out).contains("free disk space is below"),
+        "{}",
+        reason(&out)
+    );
+}
+
+#[test]
+fn with_launch_refusal_off_the_disk_checks_advise_and_never_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 9);
+    g.disk.refusing = false;
+    for command in ["cargo build", "cargo llvm-cov --lib"] {
+        let out = judged(command, &g);
+        assert_eq!(decision_of(&out), None, "{command}: {out:?}");
+        assert!(
+            context(&out).contains("Free disk space is low"),
+            "{command}: {}",
+            context(&out)
+        );
+    }
+}
+
+#[test]
+fn with_host_load_measurement_off_the_disk_checks_say_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 9);
+    g.disk.measuring = false;
+    for command in ["cargo build", "cargo llvm-cov --lib"] {
+        let out = judged(command, &g);
+        assert!(out.is_silent(), "{command}: {out:?}");
+    }
+    g.disk.free_bytes = None;
+    assert!(
+        judged("cargo build", &g).is_silent(),
+        "nothing is measured, so an unreadable disk is not worth a notice"
+    );
+}
+
+#[test]
+fn a_coverage_build_after_another_heavy_command_gets_the_coverage_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    for command in [
+        "cargo check && cargo llvm-cov --lib",
+        "cargo test --lib; cargo llvm-cov",
+    ] {
+        let out = judged(command, &with_free(dir.path(), 30));
+        assert_eq!(
+            decision_of(&out),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+        assert!(
+            reason(&out).contains("coverage build"),
+            "{command}: {}",
+            reason(&out)
+        );
+    }
+    assert!(judged("cargo check && cargo build", &with_free(dir.path(), 30)).is_silent());
+}
+
+#[test]
+fn a_real_coverage_build_behind_a_subcommand_word_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for command in [
+        "cargo llvm-cov -- clean",
+        "cargo llvm-cov --test clean",
+        "cargo llvm-cov --bin report",
+        "cargo llvm-cov --exclude show-env",
+        "cargo llvm-cov -p clean",
+    ] {
+        assert_eq!(
+            decision_of(&judged(command, &with_free(dir.path(), 30))),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        decision_of(&judged(
+            "cargo llvm-cov clean && cargo build",
+            &with_free(dir.path(), 5)
+        )),
+        Some(PermissionDecision::Deny)
+    );
+}
+
+#[test]
+fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_volume() {
+    let there = Path::new("/volumes/small/work");
+    let here = PathBuf::from("/volumes/big/hook");
+    let read = |path: &Path| {
+        if path == there {
+            Free::Bytes(5 * GIB)
+        } else if path == here {
+            Free::Bytes(500 * GIB)
+        } else if path == Path::new("/denied") {
+            Free::Unreadable
+        } else {
+            Free::Missing
+        }
+    };
+    assert_eq!(
+        live_free_bytes("/volumes/small/work", Some(here.clone()), read),
+        Some(5 * GIB),
+        "the command's own directory wins"
+    );
+    assert_eq!(
+        live_free_bytes("", Some(here.clone()), read),
+        Some(500 * GIB),
+        "no cwd was given: the process's directory is the best guess"
+    );
+    // A cwd that was given and cannot be read is not "has room".
+    for cwd in ["/gone", "/denied", "relative/dir", "."] {
+        assert_eq!(
+            live_free_bytes(cwd, Some(here.clone()), read),
+            None,
+            "{cwd:?} must not fall back to the hook process's volume"
+        );
+    }
+    assert_eq!(live_free_bytes("", None, read), None);
+    assert_eq!(live_free_bytes("", Some(here), |_| Free::Unreadable), None);
+}
+
+/// A reader for the build-directory tests. `/` is 200 GiB (a reader that
+/// returned nothing for it would hide the walk-up), `/small` 5 GiB, `/big`
+/// 500; `/denied` and below exist and cannot be read; anything else does not
+/// exist.
+fn volumes(path: &Path) -> Free {
+    if path == Path::new("/small") {
+        Free::Bytes(5 * GIB)
+    } else if path == Path::new("/big") {
+        Free::Bytes(500 * GIB)
+    } else if path == Path::new("/") {
+        Free::Bytes(200 * GIB)
+    } else if path.starts_with("/denied") && path != Path::new("/denied/new") {
+        Free::Unreadable
+    } else {
+        Free::Missing
+    }
+}
+
+fn on_volumes(dir: &Path, cwd_free_gib: u64) -> Gathered {
+    let mut g = with_free(dir, cwd_free_gib);
+    g.read_free = volumes;
+    g
+}
+
+#[test]
+fn a_literal_absolute_build_directory_is_read_too_and_the_stricter_answer_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    // The working directory has room; the named target directory's volume (its
+    // nearest existing ancestor, since the directory is new) does not.
+    for command in [
+        "cargo build --target-dir /small/new/target",
+        "cargo test --target-dir=/small/new/target",
+        "CARGO_TARGET_DIR=/small/new/target cargo build",
+        "env CARGO_TARGET_DIR=/small/t cargo test --lib",
+        "cd /repo && cargo build --target-dir /small/t",
+    ] {
+        let out = judged(command, &on_volumes(dir.path(), 200));
+        assert_eq!(
+            decision_of(&out),
+            Some(PermissionDecision::Deny),
+            "{command}"
+        );
+        assert!(
+            reason(&out).contains("5.0 GiB"),
+            "{command}: {}",
+            reason(&out)
+        );
+    }
+    // The target directory has room, the working directory does not.
+    let out = judged(
+        "cargo build --target-dir /big/t",
+        &on_volumes(dir.path(), 5),
+    );
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    // Both have room: nothing to say.
+    assert!(judged(
+        "cargo build --target-dir /big/t",
+        &on_volumes(dir.path(), 200)
+    )
+    .is_silent());
+    // A directory that does not exist yet reads its nearest existing ancestor,
+    // and `/` is a real volume here: this is the walk-up, not a miss.
+    assert!(judged(
+        "cargo build --target-dir /nowhere/new/t",
+        &on_volumes(dir.path(), 200)
+    )
+    .is_silent());
+}
+
+#[test]
+fn has_room_needs_every_location_read_and_a_short_one_still_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    // The cwd could not be read, the target directory can and has room: not
+    // "has room" (advice that it could not check), and never a refusal.
+    let mut g = on_volumes(dir.path(), 200);
+    g.disk.free_bytes = None;
+    let out = judged("cargo build --target-dir /big/t", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+    // The same with the target directory the one that is short: its own
+    // number refuses, whatever the cwd did.
+    let out = judged("cargo build --target-dir /small/t", &g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(reason(&out).contains("5.0 GiB"), "{}", reason(&out));
+    // The cwd was read and has room; the target directory is unreadable. A
+    // fresh state directory: the first block already said so once this session.
+    let fresh = tempfile::tempdir().unwrap();
+    let g = on_volumes(fresh.path(), 200);
+    let out = judged("cargo build --target-dir /denied/t", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+}
+
+#[test]
+fn an_unreadable_directory_is_not_replaced_by_its_ancestors_volume() {
+    // `/denied/t` exists and cannot be read; `/` could be, and has room.
+    assert_eq!(free_at_or_above(Path::new("/denied/t"), volumes), None);
+    // `/denied/new` is missing, and `/denied` above it is unreadable: stop.
+    assert_eq!(free_at_or_above(Path::new("/denied/new/t"), volumes), None);
+    // Missing all the way up reads the first volume that exists.
+    assert_eq!(
+        free_at_or_above(Path::new("/nowhere/a/b"), volumes),
+        Some(200 * GIB)
+    );
+    assert_eq!(
+        free_at_or_above(Path::new("/small/a/b"), volumes),
+        Some(5 * GIB)
+    );
+}
+
+#[test]
+fn only_a_literal_absolute_directory_is_seen_never_one_the_hook_expands() {
+    let dir = tempfile::tempdir().unwrap();
+    // The lexer would expand these from this process's environment, which for
+    // an orchestrated terminal is the app's: they are not seen, so the working
+    // directory decides alone.
+    for command in [
+        "cargo build --target-dir ~/target",
+        "cargo build --target-dir=~/target",
+        "CARGO_TARGET_DIR=~/target cargo build",
+        "cargo build --target-dir $HOME/target",
+        "cargo build --target-dir \"$HOME/target\"",
+        "cargo build --target-dir ${HOME}/target",
+        "CARGO_TARGET_DIR=$TMPDIR/t cargo build",
+        "cargo build --target-dir /small/$X",
+    ] {
+        assert!(
+            classify(command).build_dirs.is_empty(),
+            "{command}: {:?}",
+            classify(command).build_dirs
+        );
+    }
+    assert_eq!(
+        classify("cargo build --target-dir /small/t").build_dirs,
+        ["/small/t"]
+    );
+    assert!(judged("cargo build --target-dir ~/t", &on_volumes(dir.path(), 200)).is_silent());
+}
+
+#[test]
+fn a_directory_changed_into_by_the_line_is_not_covered_and_the_docs_say_so() {
+    let dir = tempfile::tempdir().unwrap();
+    // `cd /small && cargo build` writes to /small, which the hook cannot know
+    // without evaluating the shell: only the cwd it was given is read.
+    assert!(judged("cd /small && cargo build", &on_volumes(dir.path(), 200)).is_silent());
+    let docs = include_str!("../../../docs/LOAD_GOVERNOR.md");
+    for named in [
+        "cd /elsewhere && cargo build",
+        "export CARGO_TARGET_DIR",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "build.target-dir",
+        "--target-dir=~/x",
+    ] {
+        assert!(
+            docs.contains(named),
+            "the uncovered case {named:?} is named"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_given_cwd_advises_and_never_refuses_or_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = with_free(dir.path(), 200);
+    g.disk.free_bytes = None;
+    let out = judged("cargo build", &g);
+    assert_eq!(decision_of(&out), None);
+    assert!(
+        context(&out).contains("could not be read"),
+        "{}",
+        context(&out)
+    );
+}
+
+#[test]
+fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relative_one() {
+    let serial = crate::test_support::env::env_serial();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let tools = root.path().join("tools.json");
+    std::fs::write(&tools, r#"{"version":1,"host_load_hook_mode":"enforce"}"#).unwrap();
+    let _env = crate::test_support::env::bind_env(&serial)
+        .set("HOME", &home)
+        .set("XDG_CONFIG_HOME", home.join(".config"))
+        .set(crate::tool_config::TOOL_CONFIG_ENV, &tools)
+        .invalidating(crate::tool_config::invalidate_cache);
+    let here = root.path().to_string_lossy().into_owned();
+    let free = gather_live(&here).disk.free_bytes;
+    assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+    let gone = root.path().join("missing").to_string_lossy().into_owned();
+    assert_eq!(
+        gather_live(&gone).disk.free_bytes,
+        None,
+        "a missing cwd is not has room"
+    );
+    assert_eq!(gather_live("relative/dir").disk.free_bytes, None);
+    assert!(
+        gather_live("").disk.free_bytes.is_some(),
+        "no cwd given: the process's own directory"
+    );
 }
 
 fn with_lease(mut g: Gathered, facts: LeaseFacts) -> Gathered {

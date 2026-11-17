@@ -29,7 +29,7 @@ import type { DevcouncilPreset } from "./devcouncilInstall";
 import { formatError } from "../ui/formatError";
 import { describeError } from "../ui/copy/describeFailure";
 
-export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "done";
+export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "connect" | "done";
 
 export interface SetupWizardState {
   open: boolean;
@@ -106,6 +106,25 @@ export async function refreshToolsStatus(): Promise<ToolsStatus | null> {
     loadError.set(describeError(e, "setup"));
     return null;
   }
+}
+
+let toolsStatusFirstRead: Promise<ToolsStatus | null> | null = null;
+
+/**
+ * The tools status for a surface that only needs it to exist: one read for
+ * every caller, attempted once. A failed read is not retried from here (its
+ * error is in `loadError`); `refreshToolsStatus` is what asks again.
+ */
+export function ensureToolsStatus(): Promise<ToolsStatus | null> {
+  const known = get(status);
+  if (known) return Promise.resolve(known);
+  toolsStatusFirstRead ??= refreshToolsStatus();
+  return toolsStatusFirstRead;
+}
+
+/** Test seam: forget the once-only first read. */
+export function resetEnsureToolsStatus(): void {
+  toolsStatusFirstRead = null;
 }
 
 export async function refreshToolConfig(): Promise<ToolConfigView | null> {

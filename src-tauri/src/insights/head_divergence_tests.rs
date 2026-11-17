@@ -16,7 +16,7 @@ fn is_head_read(argv: &[String]) -> bool {
 
 /// How many head reads have been spawned from `repo` so far (cumulative).
 fn head_reads(repo: &std::path::Path) -> usize {
-    crate::engine::git_cli::spawn_log::spawns_in(repo)
+    crate::engine::process::spawn_log::spawns_in(repo)
         .iter()
         .filter(|argv| is_head_read(argv))
         .count()

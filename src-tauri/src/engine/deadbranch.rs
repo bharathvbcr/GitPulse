@@ -17,13 +17,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::engine::git_cli::{canonicalize_plain, git_text, validate_repo};
+use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::{compute_default_base, default_base, GitReader};
 use crate::engine::git_writer::{
     checked_out_branches, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
     BranchDeleteJournal,
 };
 use crate::engine::object_quarantine::{merge_tree_candidate, merge_tree_resolved, MergeCandidate};
+use crate::engine::process::canonicalize_plain;
 use crate::ledger::Outcome;
 
 /// Largest backup file restore or listing will read. A branch costs about a
@@ -109,10 +110,19 @@ impl Default for DeadbranchConfig {
 /// Metadata and classification for a branch evaluated by deadbranch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StaleBranchInfo {
-    /// Full branch name (e.g. "feature/login" or "origin/feature/login")
+    /// Branch name as listed (e.g. "feature/login" or "origin/feature/login")
     pub name: String,
-    /// Short branch name without remote prefix (e.g. "feature/login")
+    /// The branch's full ref (`refs/heads/feature/login` or
+    /// `refs/remotes/origin/feature/login`). A cleanup names its targets by this
+    /// and nothing else: two branches can share a short name, and a short name
+    /// alone cannot say whether it means the local branch or a remote's.
+    pub full_ref: String,
+    /// Short branch name without the remote's name (e.g. "feature/login")
     pub short_name: String,
+    /// The remote a remote-tracking branch belongs to, read from the configured
+    /// remote names (a remote's own name may hold a slash); `None` for a local
+    /// branch.
+    pub remote_name: Option<String>,
     /// Whole days since the branch tip commit
     pub age_days: i64,
     /// Age severity category: "fresh" (0-30), "moderate" (31-90), "stale" (91+)
@@ -651,7 +661,7 @@ struct Scan {
 
 /// The scan itself. `checked_out` is one `git worktree list` the caller ran;
 /// `only`, when given, limits the result — and the per-branch merge-tree
-/// work — to branches named there by full or short name.
+/// work — to branches whose full ref is named there.
 ///
 /// `fresh_base` is for a scan whose default branch protects a delete: the base
 /// is then read from git (`compute_default_base`), not from the ref cache,
@@ -693,14 +703,18 @@ fn scan_branches(
             continue;
         }
 
-        let short_name = if branch.is_remote {
-            branch
-                .name
-                .strip_prefix("origin/")
-                .unwrap_or(&branch.name)
-                .to_string()
-        } else {
-            branch.name.clone()
+        let (full_ref, short_name) = match (branch.is_remote, branch.remote_name.as_deref()) {
+            (true, Some(remote)) => (
+                format!("refs/remotes/{}", branch.name),
+                branch
+                    .name
+                    .strip_prefix(remote)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .unwrap_or(&branch.name)
+                    .to_string(),
+            ),
+            (true, None) => (format!("refs/remotes/{}", branch.name), branch.name.clone()),
+            (false, _) => (format!("refs/heads/{}", branch.name), branch.name.clone()),
         };
 
         // Don't treat remote HEAD pointers as candidate branches
@@ -708,9 +722,7 @@ fn scan_branches(
             continue;
         }
 
-        if only.is_some_and(|only| {
-            !only.contains(branch.name.as_str()) && !only.contains(short_name.as_str())
-        }) {
+        if only.is_some_and(|only| !only.contains(full_ref.as_str())) {
             continue;
         }
 
@@ -742,7 +754,9 @@ fn scan_branches(
 
         candidates.push(StaleBranchInfo {
             name: branch.name,
+            full_ref,
             short_name,
+            remote_name: branch.remote_name,
             age_days,
             severity,
             is_merged: classify_merge(ancestry_merged, None).merged,
@@ -905,18 +919,21 @@ pub fn clean_mutation_argv(
     force: bool,
 ) -> Result<Vec<String>, CommandError> {
     if branch.is_remote {
-        let Some((remote, remote_branch)) = branch.name.split_once('/') else {
-            return Err("Invalid remote branch format".to_string().into());
+        let Some(remote) = branch.remote_name.as_deref().filter(|r| !r.is_empty()) else {
+            return Err(format!(
+                "Cannot delete '{}': its remote is not a configured remote",
+                branch.full_ref
+            )
+            .into());
         };
-        if remote.is_empty() || remote_branch.is_empty() {
-            return Err("Invalid remote branch format".to_string().into());
-        }
+        validate_ref_name(remote)?;
+        validate_ref_name(&branch.short_name)?;
         return Ok(vec![
             "git".to_string(),
             "push".to_string(),
             remote.to_string(),
             "--delete".to_string(),
-            remote_branch.to_string(),
+            branch.short_name.clone(),
         ]);
     }
     validate_ref_name(&branch.short_name)?;
@@ -933,7 +950,24 @@ pub fn clean_mutation_argv(
     ])
 }
 
+const LOCAL_REFS: &str = "refs/heads/";
+const REMOTE_REFS: &str = "refs/remotes/";
+
+/// The full ref a cleanup target names. A full ref stands for itself; a bare
+/// name is a local branch and only ever a local branch, so no caller that sends
+/// short names can reach a remote's branch.
+fn target_ref(name: &str) -> String {
+    if name.starts_with(LOCAL_REFS) || name.starts_with(REMOTE_REFS) {
+        name.to_string()
+    } else {
+        format!("{LOCAL_REFS}{name}")
+    }
+}
+
 /// Safely cleans the specified branches with pre-deletion backup.
+///
+/// Targets are full refs (`refs/heads/x`, `refs/remotes/<remote>/x`); a bare
+/// name means the local branch of that name.
 ///
 /// Does not consult the command gate. Production callers use
 /// [`clean_branches_with_gate`] so each argv is judged before any delete.
@@ -978,7 +1012,10 @@ where
     // One listing serves the scan's labels and the refusal below. Unlike the
     // read-only scan, a clean refuses when it cannot list worktrees.
     let checked_out = checked_out_branches(&repo)?;
-    let target_set: HashSet<&str> = branch_names.iter().map(String::as_str).collect();
+    let target_refs: Vec<String> = branch_names.iter().map(|n| target_ref(n)).collect();
+    let target_set: HashSet<&str> = target_refs.iter().map(String::as_str).collect();
+    // The remote-tracking refs are listed only when a target is one.
+    let wants_remote = target_refs.iter().any(|r| r.starts_with(REMOTE_REFS));
 
     // Rescan only the targets, for exact tips and squash-merge metadata. With
     // `force` every delete is `-D`, so the merge-tree pass would decide nothing.
@@ -988,7 +1025,7 @@ where
         &DeadbranchConfig {
             merged_only: false,
             days_threshold: 0,
-            include_remote: true,
+            include_remote: wants_remote,
             check_squash: !force,
             ..Default::default()
         },
@@ -998,6 +1035,64 @@ where
         Vec::new(),
     )?;
     let to_clean = scan.result.branches;
+
+    // A remote delete is judged against the remote names git reads right now,
+    // not the cached ones the scan labelled rows with: a remote removed or
+    // renamed since, or one that only a nested name stood in for, must not
+    // retarget the delete to another remote. A remote that exists only as a
+    // legacy `.git/remotes` file is not configured here and is refused.
+    if to_clean.iter().any(|b| b.is_remote) {
+        let remotes = crate::engine::git_reader::configured_remote_names_fresh(&repo)?;
+        let claims = crate::engine::remotes::FetchClaims::read(&repo)?;
+        for b in to_clean.iter().filter(|b| b.is_remote) {
+            let rest = b.full_ref.strip_prefix(REMOTE_REFS).unwrap_or(&b.full_ref);
+            let owned = crate::engine::remotes::configured_owner(&remotes, rest);
+            if owned != b.remote_name.as_deref().map(|r| (r, b.short_name.as_str())) {
+                return Err(format!(
+                    "Refusing to delete '{}': its remote is not a configured remote",
+                    b.full_ref
+                )
+                .into());
+            }
+            // The delete goes to the remote that fetches into this ref. Its
+            // name owner must be the one and only remote whose fetch refspec
+            // writes it: several claimants leave the owner a guess (`origin`
+            // and `origin/eu` both map onto refs/remotes/origin/eu/x), a lone
+            // other claimant means the name owner never fetched it, and none
+            // means the ref is stale. Every wrong guess deletes some other
+            // remote's branch. A remote with no `fetch` refspec has git's
+            // default, so for an ordinary remote this check changes nothing.
+            let owner = b.remote_name.as_deref().unwrap_or_default();
+            let claimants = claims.claimants(rest);
+            match claimants.as_slice() {
+                [only] if only == owner => {}
+                [] => {
+                    return Err(format!(
+                        "Refusing to delete '{}': no configured fetch refspec writes it, so its owner cannot be proven",
+                        b.full_ref
+                    )
+                    .into());
+                }
+                [only] => {
+                    return Err(format!(
+                        "Refusing to delete '{}': it is named for '{owner}' but only '{only}' fetches into it",
+                        b.full_ref
+                    )
+                    .into());
+                }
+                many => {
+                    let (last, rest_names) = many.split_last().expect("two or more");
+                    let quantity = if many.len() == 2 { "both" } else { "all" };
+                    return Err(format!(
+                        "Refusing to delete '{}': the remotes {} and {last} {quantity} fetch into it, so its owner is ambiguous",
+                        b.full_ref,
+                        rest_names.join(", ")
+                    )
+                    .into());
+                }
+            }
+        }
+    }
 
     if to_clean.is_empty() {
         return Ok(DeadbranchCleanResult {
@@ -1604,7 +1699,9 @@ mod tests {
     fn stale(name: &str, sha: &str) -> StaleBranchInfo {
         StaleBranchInfo {
             name: name.to_string(),
+            full_ref: format!("refs/heads/{name}"),
             short_name: name.to_string(),
+            remote_name: None,
             age_days: 400,
             severity: "stale".to_string(),
             is_merged: true,
@@ -1753,6 +1850,189 @@ mod tests {
         );
     }
 
+    /// A seeded repository whose remote `remote` (a bare repository next to it)
+    /// holds `branch` at the same commit as `main`, so the remote-tracking ref
+    /// `refs/remotes/<remote>/<branch>` exists and is merged.
+    fn repo_with_remote_branch(
+        remote: &str,
+        branch: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let (dir, repo) = seeded_repo();
+        let bare = tempfile::tempdir().unwrap();
+        git_in(bare.path(), &["init", "-q", "--bare"]);
+        git_in(
+            &repo,
+            &["remote", "add", remote, bare.path().to_str().unwrap()],
+        );
+        git_in(
+            &repo,
+            &["push", "-q", remote, &format!("HEAD:refs/heads/{branch}")],
+        );
+        (dir, bare, repo)
+    }
+
+    /// Every argv the gate is shown for one clean, and what the clean returned.
+    fn clean_judged(
+        repo: &Path,
+        names: &[&str],
+    ) -> (Vec<String>, Result<DeadbranchCleanResult, CommandError>) {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut judged = Vec::new();
+        let result =
+            clean_branches_with_gate(repo.to_str().unwrap(), &names, false, false, |argv| {
+                judged.push(argv.join(" "));
+                Ok(())
+            });
+        (judged, result)
+    }
+
+    /// The card's case: local `feature` and `refs/remotes/origin/feature` both
+    /// exist, and selecting the local one must never reach the shared remote.
+    #[test]
+    fn selecting_a_local_branch_never_deletes_its_same_named_remote_branch() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "feature");
+        git_in(&repo, &["branch", "feature"]);
+
+        let (judged, result) = clean_judged(&repo, &["feature"]);
+        assert_eq!(
+            judged,
+            vec!["git branch -d feature".to_string()],
+            "{result:?}"
+        );
+        assert_eq!(result.unwrap().deleted, vec!["feature".to_string()]);
+        assert!(rev(&repo, "refs/heads/feature").is_none());
+        assert!(rev(&repo, "refs/remotes/origin/feature").is_some());
+        assert!(rev(bare.path(), "refs/heads/feature").is_some());
+    }
+
+    /// A short name has always meant a local branch; naming `origin/feature`
+    /// is not a way to reach the remote either.
+    #[test]
+    fn a_remote_style_short_name_selects_no_remote_branch() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "feature");
+
+        let (judged, result) = clean_judged(&repo, &["origin/feature"]);
+        assert!(judged.is_empty(), "{judged:?}");
+        assert!(result.unwrap().deleted.is_empty());
+        assert!(rev(&repo, "refs/remotes/origin/feature").is_some());
+        assert!(rev(bare.path(), "refs/heads/feature").is_some());
+    }
+
+    /// Selecting only the remote ref deletes the remote branch and leaves the
+    /// local branch of the same name alone.
+    #[test]
+    fn selecting_a_remote_ref_deletes_only_the_remote_branch() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "feature");
+        git_in(&repo, &["branch", "feature"]);
+
+        let (judged, result) = clean_judged(&repo, &["refs/remotes/origin/feature"]);
+        assert_eq!(
+            judged,
+            vec!["git push origin --delete feature".to_string()],
+            "{result:?}"
+        );
+        assert_eq!(result.unwrap().deleted, vec!["origin/feature".to_string()]);
+        assert!(rev(&repo, "refs/heads/feature").is_some());
+        assert!(rev(bare.path(), "refs/heads/feature").is_none());
+    }
+
+    /// A remote whose own name holds a slash: the first slash is not the
+    /// remote's end.
+    #[test]
+    fn a_remote_named_with_a_slash_is_split_by_its_configured_name() {
+        let (_dir, bare, repo) = repo_with_remote_branch("team/eu", "x");
+
+        let (judged, result) = clean_judged(&repo, &["refs/remotes/team/eu/x"]);
+        assert_eq!(
+            judged,
+            vec!["git push team/eu --delete x".to_string()],
+            "{result:?}"
+        );
+        assert_eq!(result.unwrap().deleted, vec!["team/eu/x".to_string()]);
+        assert!(rev(bare.path(), "refs/heads/x").is_none());
+    }
+
+    /// The scan labels a branch of any remote, not only `origin`, by that
+    /// remote's own name.
+    #[test]
+    fn the_scan_names_a_non_origin_remote_branch_by_its_remote() {
+        let (_dir, _bare, repo) = repo_with_remote_branch("upstream", "feature");
+        let scan = scan_stale_branches(
+            repo.to_str().unwrap(),
+            &DeadbranchConfig {
+                include_remote: true,
+                merged_only: false,
+                days_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let listed: Vec<&StaleBranchInfo> = scan
+            .branches
+            .iter()
+            .filter(|b| b.name == "upstream/feature")
+            .collect();
+        assert_eq!(listed.len(), 1, "{:?}", scan.branches);
+        assert_eq!(listed[0].short_name, "feature");
+        assert_eq!(listed[0].full_ref, "refs/remotes/upstream/feature");
+        assert_eq!(listed[0].remote_name.as_deref(), Some("upstream"));
+    }
+
+    /// A remote whose name holds a slash is labelled by that name, and a local
+    /// branch carries no remote.
+    #[test]
+    fn the_scan_carries_each_branchs_full_ref_and_remote() {
+        let (_dir, _bare, repo) = repo_with_remote_branch("team/eu", "x");
+        git_in(&repo, &["branch", "x"]);
+        let scan = scan_stale_branches(
+            repo.to_str().unwrap(),
+            &DeadbranchConfig {
+                include_remote: true,
+                merged_only: false,
+                days_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let by_ref = |full_ref: &str| {
+            scan.branches
+                .iter()
+                .find(|b| b.full_ref == full_ref)
+                .unwrap_or_else(|| panic!("{full_ref} not scanned: {:?}", scan.branches))
+        };
+        let remote = by_ref("refs/remotes/team/eu/x");
+        assert_eq!(remote.short_name, "x");
+        assert_eq!(remote.remote_name.as_deref(), Some("team/eu"));
+        let local = by_ref("refs/heads/x");
+        assert_eq!(local.short_name, "x");
+        assert_eq!(local.remote_name, None);
+    }
+
+    /// Two remotes may hold the same branch name; only the one selected goes.
+    #[test]
+    fn a_remote_ref_selects_its_own_remote_among_same_named_branches() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "feature");
+        let other = tempfile::tempdir().unwrap();
+        git_in(other.path(), &["init", "-q", "--bare"]);
+        git_in(
+            &repo,
+            &["remote", "add", "upstream", other.path().to_str().unwrap()],
+        );
+        git_in(
+            &repo,
+            &["push", "-q", "upstream", "HEAD:refs/heads/feature"],
+        );
+
+        let (judged, result) = clean_judged(&repo, &["refs/remotes/upstream/feature"]);
+        assert_eq!(
+            judged,
+            vec!["git push upstream --delete feature".to_string()],
+            "{result:?}"
+        );
+        assert!(rev(other.path(), "refs/heads/feature").is_none());
+        assert!(rev(bare.path(), "refs/heads/feature").is_some());
+    }
+
     /// Two remotes whose HEADs name `main` and `develop`, with a local branch
     /// for each. Which one is "the default" is decided by
     /// `checkout.defaultRemote`, which the caller sets.
@@ -1870,7 +2150,7 @@ mod tests {
             names.push(name);
         }
 
-        let spawned = || crate::engine::git_cli::spawn_log::spawns_in(&repo);
+        let spawned = || crate::engine::process::spawn_log::spawns_in(&repo);
         let before = spawned().len();
         let result = clean_branches(repo.to_str().unwrap(), &names, false, true);
         let used: Vec<Vec<String>> = spawned()[before..].to_vec();

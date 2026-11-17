@@ -104,6 +104,35 @@ impl DirectoryIdentity {
     }
 }
 
+/// What makes two spellings of a directory one directory, for comparing them
+/// inside this process: the device and inode on Unix, the volume serial and file
+/// id on Windows. Not persisted, and not a grant: a grant also pins the birth
+/// time and the path (`DirectoryIdentity::same_persisted_object`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DirectoryKey {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    file_identity: (u64, [u8; 16]),
+}
+
+/// The [`DirectoryKey`] of the directory at `path`, read the way a grant reads
+/// it (`directory`), so two paths that resolve to one directory give one key
+/// whatever their spelling or case.
+pub(crate) fn directory_key(path: &Path) -> Result<DirectoryKey, CommandError> {
+    let identity = directory(path)?;
+    Ok(DirectoryKey {
+        #[cfg(unix)]
+        device: identity.device,
+        #[cfg(unix)]
+        inode: identity.inode,
+        #[cfg(windows)]
+        file_identity: identity.file_identity,
+    })
+}
+
 impl Identity {
     /// Persisted match for a pre-repository record. `version` stays with the
     /// caller, because version 1 is what that scheme means.
@@ -371,6 +400,48 @@ fn member_of_repository(current: &Identity) -> bool {
         .parent()
         .and_then(|holder| holder.canonicalize().ok())
         .is_some_and(|holder| holder == current.checkout.path)
+}
+
+/// Resolves `candidate` (absolute, or relative to `base_root`) if it is a
+/// registered checkout of the same repository as `base_root`.
+///
+/// Both checkouts must pass [`member_of_repository`] and share the same
+/// persisted common Git directory, with a non-symlink `.git` directory or
+/// gitfile directly under the canonical candidate directory. Bare
+/// repositories, subdirectories inside a worktree, symlinked `.git` entries,
+/// separate repositories, and forged backpointers return `None`.
+pub(crate) fn resolve_registered_worktree(base_root: &Path, candidate: &str) -> Option<PathBuf> {
+    if candidate.is_empty()
+        || candidate.starts_with('~')
+        || candidate.chars().any(char::is_control)
+        || candidate.contains('$')
+        || candidate.contains('`')
+    {
+        return None;
+    }
+    let raw_target = if Path::new(candidate).is_absolute() {
+        PathBuf::from(candidate)
+    } else {
+        base_root.join(candidate)
+    };
+    let canon_target = raw_target.canonicalize().ok()?;
+    let dotgit_meta = fs::symlink_metadata(canon_target.join(".git")).ok()?;
+    if dotgit_meta.file_type().is_symlink() || (!dotgit_meta.is_dir() && !dotgit_meta.is_file()) {
+        return None;
+    }
+    let base_id = identity(base_root.to_str()?).ok()?;
+    let cand_id = identity(canon_target.to_str()?).ok()?;
+    if !member_of_repository(&base_id)
+        || !member_of_repository(&cand_id)
+        || !cand_id
+            .common_dir
+            .same_persisted_object(&base_id.common_dir)
+        || cand_id.checkout == cand_id.common_dir
+        || cand_id.checkout.path != canon_target
+    {
+        return None;
+    }
+    Some(cand_id.checkout.path)
 }
 
 /// Where a repository's approval is stored.
@@ -3190,5 +3261,127 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&to).unwrap(), b"newer grant");
         assert!(from.exists(), "the source stays when the name is taken");
+    }
+
+    #[test]
+    fn registered_sibling_worktree_resolves_and_rejects_subdirs_links_and_forgeries() {
+        let base = tempfile::tempdir().unwrap();
+        let main = base.path().join("main");
+        let wt_b = base.path().join("wt-b");
+        let other = base.path().join("other");
+        let plain = base.path().join("plain");
+        let bare = base.path().join("bare.git");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&bare).unwrap();
+
+        let git = |dir: &Path, args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args);
+            let out = cmd.output_locked().expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} in {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("README.md"), "main\n").unwrap();
+        git(&main, &["add", "README.md"]);
+        git(&main, &["commit", "-m", "init"]);
+        git(
+            &main,
+            &["worktree", "add", "-b", "feat", wt_b.to_str().unwrap()],
+        );
+        fs::create_dir_all(wt_b.join("sub")).unwrap();
+
+        git(&other, &["init", "-b", "main"]);
+        git(&bare, &["init", "--bare"]);
+
+        let canon_main = main.canonicalize().unwrap();
+        let canon_wt_b = wt_b.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, "../wt-b"),
+            Some(canon_wt_b.clone())
+        );
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, wt_b.to_str().unwrap()),
+            Some(canon_wt_b.clone())
+        );
+        assert_eq!(
+            resolve_registered_worktree(&canon_wt_b, "../main"),
+            Some(canon_main.clone())
+        );
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, "../wt-b/sub"),
+            None
+        );
+        assert_eq!(resolve_registered_worktree(&canon_main, "../plain"), None);
+        assert_eq!(resolve_registered_worktree(&canon_main, "../other"), None);
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, "../bare.git"),
+            None
+        );
+        assert_eq!(resolve_registered_worktree(&canon_main, ".git"), None);
+        assert_eq!(resolve_registered_worktree(&canon_main, "$HOME"), None);
+        assert_eq!(resolve_registered_worktree(&canon_main, "~/wt-b"), None);
+
+        let forged_no_backptr = base.path().join("forged-no-backptr");
+        fs::create_dir_all(&forged_no_backptr).unwrap();
+        fs::write(
+            forged_no_backptr.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                canon_main.join(".git/worktrees/wt-b").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, "../forged-no-backptr"),
+            None
+        );
+
+        let forged_external = base.path().join("forged-external");
+        let forged_gitdir = base.path().join("forged-external-gitdir");
+        fs::create_dir_all(&forged_external).unwrap();
+        fs::create_dir_all(&forged_gitdir).unwrap();
+        fs::write(forged_gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            forged_gitdir.join("commondir"),
+            format!("{}\n", canon_main.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            forged_gitdir.join("gitdir"),
+            format!("{}\n", forged_external.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            forged_external.join(".git"),
+            format!("gitdir: {}\n", forged_gitdir.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_registered_worktree(&canon_main, "../forged-external"),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let symlinked = base.path().join("symlinked-wt");
+            fs::create_dir_all(&symlinked).unwrap();
+            std::os::unix::fs::symlink(canon_main.join(".git"), symlinked.join(".git")).unwrap();
+            assert_eq!(
+                resolve_registered_worktree(&canon_main, "../symlinked-wt"),
+                None
+            );
+        }
     }
 }

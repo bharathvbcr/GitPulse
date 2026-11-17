@@ -16,7 +16,7 @@
 //!   close nor a context read. It is never used for a keystroke or a resize:
 //!   a close can occupy a thread for seconds.
 //!
-//! None of this runs inside `git_cli::run_command_scope`. That scope exists so
+//! None of this runs inside `crate::engine::process::run_command_scope`. That scope exists so
 //! a pool thread does not carry one git command's admission class and marked
 //! repository into the next (`ADMISSION`, `MARKED_REPO`), and only the git spawn
 //! gate, `engine::worktree` and `engine::git_reader` read them. Nothing a lane
@@ -165,8 +165,8 @@ impl Executor {
     /// Queues `body` with nobody awaiting it: it reports its own result. For
     /// the terminal host, whose replies go back over a socket rather than to a
     /// future. Queued in call order, refused at once when the queue is full,
-    /// and a panic in `body` is contained like one in [`Executor::run`]'s.
-    #[cfg(unix)]
+    /// and a panic in `body` is contained like one in [`Executor::run`]'s. Not
+    /// Unix-only: the terminal's probe reply queues here on every host.
     pub(crate) fn spawn<F>(&self, operation: &'static str, body: F) -> Result<(), String>
     where
         F: FnOnce() -> Result<(), String> + Send + 'static,

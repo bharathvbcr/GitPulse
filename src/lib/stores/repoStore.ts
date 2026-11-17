@@ -1,10 +1,12 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, readable, writable, type Readable } from "svelte/store";
-import { invoke } from "../ipc/invoke";
+import { invoke, ipcErrorKind } from "../ipc/invoke";
+import { interfaceStore } from "./interfaceStore";
 import { formatErrorRaw } from "../ui/formatError";
 import { describeError, mirrorUserFacingError } from "../ui/copy/describeFailure";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore } from "./harnessStore";
+import { toastStore } from "./toastStore";
 import {
   type BranchInfo,
   type DeadbranchCleanResult,
@@ -228,7 +230,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let syncingFilter = false;
 
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
-  const { snapshotRuns, pollRuns } = sessionBook;
+  const { snapshotRuns, pollRuns, statusPollApplied, statsInflight } = sessionBook;
 
   let lastPersistedPayload: string | null = null;
   let lastSentRecentsJson: string | null = null;
@@ -424,7 +426,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return {
       ...session,
       generation: session.generation + 1,
-      statsPending: false,
+      // A drain still running for the old generation hands its work to the new
+      // one when it stops (`fetchBranchStats`), and that call decides when the
+      // numbers are complete. Clearing the flag here would show partial stats
+      // as finished until then.
+      statsPending: statsInflight.has(session.id) ? session.statsPending : false,
     };
   }
 
@@ -534,6 +540,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     applyToSession,
     refresh,
     holdsPath: (path) => mutationRunner.holdsPath(path),
+    watchScope: () => get(interfaceStore).watchScope,
+  });
+
+  // A changed watch scope applies to the live watches now, not at the next
+  // 60 s re-assert. The first emission only records the starting scope.
+  let appliedWatchScope: string | undefined;
+  interfaceStore.subscribe(({ watchScope }) => {
+    const changed = appliedWatchScope !== undefined && appliedWatchScope !== watchScope;
+    appliedWatchScope = watchScope;
+    if (changed) void watchCoordinator.reassertWatches();
   });
 
   const statusPoller = createStatusPoller({
@@ -548,6 +564,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     deletePollRun: (id) => {
       pollRuns.delete(id);
+    },
+    notePollApplied: (id) => {
+      statusPollApplied.set(id, (statusPollApplied.get(id) ?? 0) + 1);
     },
     acquireWatch: watchCoordinator.acquireWatch,
     hydrate: (id, path, generation) => hydration.hydrate(id, path, generation),
@@ -652,6 +671,31 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   });
 
   const { beginMutation, runMutating } = mutationRunner;
+
+  /** The secret scan refused the push: the one failure "Push anyway" answers. */
+  const secretScanRefused = (err: unknown) => ipcErrorKind(err) === "secret_scan_blocked";
+
+  /**
+   * A push the secret scan refused, offered once more past the scan. The
+   * toast carries the refusal (shape, commit, path and line, never a value);
+   * its "Push anyway" button is the only caller of `again`, which pushes the
+   * repository that was refused, not whichever tab is active by then. No
+   * member takes the override from a caller, so no other path can send it.
+   */
+  function offerPushPastSecretScan(
+    outcome: MutationOutcome,
+    again: () => Promise<MutationOutcome>,
+  ): MutationOutcome {
+    if (outcome.ok || !secretScanRefused(outcome.cause)) return outcome;
+    // Sticky (duration 0): an action toast otherwise expires, and this one is
+    // the only place the refusal's findings are shown.
+    toastStore.error(
+      outcome.error ?? "Push blocked by the secret scan.",
+      { label: "Push anyway", onClick: async () => (await again()).ok },
+      0,
+    );
+    return { ...outcome, surfaced: true };
+  }
 
   function repoFacts(): RepoFacts[] {
     return collectRepoFacts(internal.workspace.tabs, internal.sessions);
@@ -795,13 +839,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
         { target, ...WORKTREE_ONLY },
       ),
-    commit: async (message: string, amend: boolean = false) =>
+    // `allowSecrets` is the person's "Commit anyway" after the secret scan
+    // refused this commit (`secret_scan_blocked`); nothing else passes it.
+    commit: async (message: string, amend: boolean = false, allowSecrets: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
-        invokeFn("cmd_commit", { repoPath: path, message, amend }),
+        invokeFn("cmd_commit", { repoPath: path, message, amend, allowSecrets }),
       ),
-    quickCommit: async (message: string) =>
+    quickCommit: async (message: string, allowSecrets: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
-        invokeFn("cmd_quick_commit", { repoPath: path, message }),
+        invokeFn("cmd_quick_commit", { repoPath: path, message, allowSecrets }),
       ),
     checkoutBranch: async (branchName: string) =>
       runMutating("checkout", branchName, (path) =>
@@ -1266,13 +1312,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       branch?: string,
       force: boolean = false,
       target?: MutationTarget | null,
-    ) =>
-      runMutating(
-        force ? "push-force" : "push",
-        [remote, branch].filter(Boolean).join(" ") || "upstream",
-        (path) => invokeFn("cmd_push", { repoPath: path, remote, branch, force }),
-        { target },
-      ),
+    ): Promise<MutationOutcome> => {
+      const session = target === undefined ? activeSession() : undefined;
+      const refused: MutationTarget | null =
+        target !== undefined ? target : session ? { tabId: session.id, path: session.path } : null;
+      const run = (allowSecrets: boolean, at: MutationTarget | null | undefined) =>
+        runMutating(
+          force ? "push-force" : "push",
+          [remote, branch].filter(Boolean).join(" ") || "upstream",
+          (path) =>
+            invokeFn("cmd_push", {
+              repoPath: path,
+              remote,
+              branch,
+              force,
+              ...(allowSecrets ? { allowSecrets } : {}),
+            }),
+          { target: at, expected: allowSecrets ? undefined : secretScanRefused },
+        );
+      return offerPushPastSecretScan(await run(false, target), () => run(true, refused));
+    },
     reportIssue: async (
       title: string,
       body: string,
@@ -1302,9 +1361,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return { ok: false, error: describeError(err, "repo") };
       }
     },
-    publishRelease: async (tag: string, message: string) =>
+    // `allowSecrets` only from the release pane's "Publish anyway" button,
+    // under a `secret_scan_blocked` refusal of this tag's push.
+    publishRelease: async (tag: string, message: string, allowSecrets: boolean = false) =>
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
-        invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
+        invokeFn("cmd_publish_release", {
+          repoPath: path,
+          tag,
+          message,
+          ...(allowSecrets ? { allowSecrets } : {}),
+        }),
       ),
     stashSave: async (
       message?: string,

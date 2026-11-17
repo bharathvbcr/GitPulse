@@ -128,6 +128,11 @@ const R_BINDING: usize = 34;
 const R_ADMIT: usize = 35;
 const R_THERMAL: usize = 36;
 const R_POWER: usize = 37;
+// Bytes 38..40: the sustained disk fill rate (what Severe decides on) in 16 MiB
+// a minute plus one, a little endian 16-bit number; 0 is "not measured", which
+// is what every record written before it holds. The checksum covers it.
+const R_FILL_SUSTAINED: usize = 38;
+const FILL_SUSTAINED_MAX: u32 = 0xFFFF;
 const R_SWAP: usize = 40;
 const R_COMPRESSED: usize = 48;
 const R_LOAD: usize = 56;
@@ -137,7 +142,19 @@ const R_OBSERVED_N: usize = 76;
 const R_FOREIGN: usize = 80;
 const R_LAUNCHED_FP: usize = 88;
 const R_SEGMENTS: usize = 96;
-// Bytes 100..104 stay spare. A record written before the feed existed has
+// Byte 100 is the exact binding when `R_BINDING` holds the nearest one an
+// older build knows (`Binding::wire`), else 0: such a build rejects a record
+// whose binding code it does not know, which would drop exactly the records
+// that explain a disk filling. The checksum covers it, so older builds still
+// validate the record.
+const R_BINDING_EXACT: usize = 100;
+// Bytes 101..104: the disk fill rate in MiB a minute plus one, as a little
+// endian 24-bit number; 0 is "not measured". Zero in every record written
+// before it, which therefore reads as "not measured" rather than "not falling".
+// The checksum covers it. 16 TiB a minute is the most it holds.
+const R_FILL: usize = 101;
+const FILL_MAX: u32 = 0x00FF_FFFF;
+// A record written before the feed existed has
 // zeros here and in the next 16 bytes, which read as "nothing dropped", so
 // the layout needs no version bump and an older build still validates a record
 // that carries them (its checksum covers 0..120).
@@ -177,6 +194,14 @@ pub struct TraceRecord {
     pub power: Option<Power>,
     /// Compressor segments in use over its segment limit.
     pub segment_fraction: Option<f64>,
+    /// Bytes of free disk space lost per minute when this was taken (to the
+    /// MiB), or `None` when it was not measured: warming up, a gap, or a
+    /// record from before it was kept. Beside `free_disk` and `binding`, so a
+    /// window in which the disk emptied explains itself.
+    pub disk_fill_rate: Option<u64>,
+    /// The sustained rate Severe decides on, to 16 MiB a minute; `None` when
+    /// it was not measured.
+    pub disk_fill_sustained: Option<u64>,
     /// Records the sampler offered while the trace write was still busy, and
     /// so never reached the ring, since the previous record that did. Set by
     /// the feed when it takes the record; zero from [`TraceRecord::of`].
@@ -223,6 +248,8 @@ impl TraceRecord {
             power: value(host.power),
             segment_fraction: value(host.compressor_segments)
                 .and_then(|s| (s.limit > 0).then(|| s.total as f64 / s.limit as f64)),
+            disk_fill_rate: value(snapshot.disk_fill_rate),
+            disk_fill_sustained: value(snapshot.disk_fill_sustained),
             dropped_before: 0,
             dropped_total: 0,
         }
@@ -302,7 +329,9 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
     b[R_PRESSURE] = r.pressure.map_or(NONE8, |l| l.kernel() as u8);
     b[R_TIER] = r.tier.map_or(NONE8, Tier::code);
     // 0 is "no binding", a real value; an unknowable binding is not stored.
-    b[R_BINDING] = Binding::code_of(r.binding);
+    let (base, exact) = Binding::wire_codes(r.binding);
+    b[R_BINDING] = base;
+    b[R_BINDING_EXACT] = exact;
     b[R_ADMIT] = r.admit.map_or(NONE8, u8::from);
     b[R_THERMAL] = r.thermal.map_or(NONE8, Thermal::code);
     b[R_POWER] = r.power.map_or(NONE8, |p| match p {
@@ -336,6 +365,18 @@ fn encode_record(seq: u64, r: &TraceRecord) -> [u8; RECORD_LEN] {
                 ((f * 1_000_000.0).round() as u64).min(u64::from(NONE32 - 1)) as u32
             }),
     );
+    let fill = r.disk_fill_rate.map_or(0, |bytes| {
+        u32::try_from((bytes >> 20).saturating_add(1))
+            .unwrap_or(FILL_MAX)
+            .min(FILL_MAX)
+    });
+    b[R_FILL..R_FILL + 3].copy_from_slice(&fill.to_le_bytes()[..3]);
+    let sustained = r.disk_fill_sustained.map_or(0, |bytes| {
+        u32::try_from((bytes >> 24).saturating_add(1))
+            .unwrap_or(FILL_SUSTAINED_MAX)
+            .min(FILL_SUSTAINED_MAX)
+    });
+    b[R_FILL_SUSTAINED..R_FILL_SUSTAINED + 2].copy_from_slice(&sustained.to_le_bytes()[..2]);
     put_u64(&mut b, R_DROPPED_BEFORE, r.dropped_before);
     put_u64(&mut b, R_DROPPED_TOTAL, r.dropped_total);
     let sum = checksum(&b[..R_CHECKSUM]);
@@ -363,7 +404,7 @@ fn decode_record(b: &[u8]) -> Option<(u64, TraceRecord)> {
                 raw => Level::from_kernel(u32::from(raw)),
             },
             tier: Tier::of_code(b[R_TIER]),
-            binding: Binding::of_code(b[R_BINDING])?,
+            binding: Binding::of_wire(b[R_BINDING], b[R_BINDING_EXACT])?,
             admit: match b[R_ADMIT] {
                 0 => Some(false),
                 1 => Some(true),
@@ -384,6 +425,17 @@ fn decode_record(b: &[u8]) -> Option<(u64, TraceRecord)> {
                 _ => None,
             },
             segment_fraction: opt32(R_SEGMENTS).map(|ppm| f64::from(ppm) / 1_000_000.0),
+            disk_fill_rate: match u32::from_le_bytes([b[R_FILL], b[R_FILL + 1], b[R_FILL + 2], 0]) {
+                0 => None,
+                stored => Some(u64::from(stored - 1) << 20),
+            },
+            disk_fill_sustained: match u16::from_le_bytes([
+                b[R_FILL_SUSTAINED],
+                b[R_FILL_SUSTAINED + 1],
+            ]) {
+                0 => None,
+                stored => Some(u64::from(stored - 1) << 24),
+            },
             dropped_before: get_u64(b, R_DROPPED_BEFORE),
             dropped_total: get_u64(b, R_DROPPED_TOTAL),
         },

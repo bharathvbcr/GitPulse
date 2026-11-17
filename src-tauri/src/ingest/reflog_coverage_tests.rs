@@ -4,7 +4,7 @@
 
 use super::reflog_replay_tests::{git_at, reflog_rows, seeded_repo, T0};
 use super::*;
-use crate::engine::git_cli::spawn_log;
+use crate::engine::process::spawn_log;
 use crate::test_support::{commit_at, git_in, repo_with_worktrees};
 
 fn with_empty_transcripts<T>(f: impl FnOnce() -> T) -> T {
@@ -16,7 +16,7 @@ fn with_empty_transcripts<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn plain(path: &std::path::Path) -> String {
-    crate::engine::git_cli::canonicalize_plain(path)
+    crate::engine::process::canonicalize_plain(path)
         .expect("canonical")
         .to_string_lossy()
         .into_owned()

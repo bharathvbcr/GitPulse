@@ -15,6 +15,7 @@
     DEFAULT_HOST_LOAD_SETTINGS,
     DEFAULT_THRESHOLDS,
     hostLoadSettings,
+    thresholdsAreDefault as defaultThresholds,
     loadHostLoadSettings,
     updateHostLoadSettings,
     type HostLoadHookMode,
@@ -28,7 +29,7 @@
   // The shared copy: the input rows save through the same store, so a toggle
   // here never saves their thresholds back stale.
   const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
-  const thresholdsAreDefault = $derived(JSON.stringify(settings.thresholds) === JSON.stringify(DEFAULT_THRESHOLDS));
+  const thresholdsAreDefault = $derived(defaultThresholds(settings.thresholds));
   const HOOK_MODES: readonly { value: HostLoadHookMode; label: string; title: string }[] = [
     { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
     { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },

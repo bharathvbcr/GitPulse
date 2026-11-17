@@ -20,8 +20,9 @@
 use crate::codeintel::worktree_overlay::{
     compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr, DirtyNodeScan,
 };
-use crate::engine::git_cli::{resolve_git_common_dir, validate_repo, DEFAULT_TIMEOUT};
+use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
+use crate::engine::process::DEFAULT_TIMEOUT;
 use crate::engine::worktree::{list_worktrees, WorktreeInfo};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
@@ -816,9 +817,55 @@ pub fn lanes_messages_path(repo_path: &str, create_dir: bool) -> Result<PathBuf,
     Ok(lanes_dir.join(MESSAGES_FILE))
 }
 
+/// Who a bus message comes from, decided by the entry point that accepted it and never by
+/// the sender name the caller supplied.
+///
+/// Only the app's own Tauri commands (a person using the UI) pass [`MessageOrigin::Person`].
+/// Every MCP tool, CLI and hook passes [`MessageOrigin::Agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageOrigin {
+    /// A person acting in the GitPulse UI. Hop 0, and exempt from the hop limit.
+    Person,
+    /// An agent, whatever name it gives itself. Hop at least 1, and the hop limit applies.
+    Agent,
+}
+
+impl MessageOrigin {
+    /// The hop this origin may carry: a person's message is hop 0, an agent's is never below 1.
+    #[must_use]
+    pub fn effective_hop(self, requested: u32) -> u32 {
+        match self {
+            Self::Person => 0,
+            Self::Agent => requested.max(1),
+        }
+    }
+}
+
+/// Sender names the UI uses for a person. An agent may not post under one, because the
+/// receiving agent and the inbox view read them as "the person using GitPulse".
+fn is_reserved_person_name(name: &str) -> bool {
+    let name = name.trim();
+    ["developer", "human", "human-dev", "user"]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+/// Refuses a sender name reserved for a person. Every agent entry point calls this before it
+/// acts on the name, and [`post_peer_message`] calls it again for the posts it owns.
+pub fn require_agent_sender(from_agent: &str) -> Result<(), CommandError> {
+    if is_reserved_person_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is a name reserved for the person using GitPulse; an agent must send as its own peer id",
+        ));
+    }
+    Ok(())
+}
+
 /// Posts a bounded agent-to-agent coordination message with an optional thread key.
+#[allow(clippy::too_many_arguments)]
 pub fn post_thread_message(
     repo_path: &str,
+    origin: MessageOrigin,
     from_agent: &str,
     to_agent: Option<&str>,
     thread_key: Option<&str>,
@@ -826,13 +873,9 @@ pub fn post_thread_message(
     body: &str,
     branch: Option<&str>,
 ) -> Result<AgentBusMessage, CommandError> {
-    let is_human = matches!(
-        from_agent.trim(),
-        "developer" | "human" | "human-dev" | "user"
-    );
-    let hop = if is_human { 0 } else { 1 };
     post_peer_message(
         repo_path,
+        origin,
         from_agent,
         to_agent,
         thread_key,
@@ -840,15 +883,19 @@ pub fn post_thread_message(
         body,
         branch,
         None,
-        hop,
+        1,
         DEFAULT_MAX_HOPS,
     )
 }
 
 /// Posts a bounded peer message with explicit `msg_id`, `hop`, and `max_hops`.
+///
+/// `origin` fixes the hop (see [`MessageOrigin::effective_hop`]), and an
+/// [`MessageOrigin::Agent`] post is refused when `from_agent` is a name reserved for a person.
 #[allow(clippy::too_many_arguments)]
 pub fn post_peer_message(
     repo_path: &str,
+    origin: MessageOrigin,
     from_agent: &str,
     to_agent: Option<&str>,
     thread_key: Option<&str>,
@@ -859,6 +906,10 @@ pub fn post_peer_message(
     hop: u32,
     max_hops: u32,
 ) -> Result<AgentBusMessage, CommandError> {
+    if origin == MessageOrigin::Agent {
+        require_agent_sender(from_agent)?;
+    }
+    let hop = origin.effective_hop(hop);
     let from = sanitize_token("from_agent", from_agent, 128)?;
     let to = match to_agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(target) => Some(sanitize_token("to_agent", target, 128)?),
@@ -1699,13 +1750,16 @@ pub(crate) fn resolve_target_from_list(
 /// Posts a bounded agent-to-agent coordination message (broadcast when `to_agent` is `None`).
 pub fn post_message(
     repo_path: &str,
+    origin: MessageOrigin,
     from_agent: &str,
     to_agent: Option<&str>,
     kind: &str,
     body: &str,
     branch: Option<&str>,
 ) -> Result<AgentBusMessage, CommandError> {
-    post_thread_message(repo_path, from_agent, to_agent, None, kind, body, branch)
+    post_thread_message(
+        repo_path, origin, from_agent, to_agent, None, kind, body, branch,
+    )
 }
 
 /// Reads coordination messages addressed to `agent_id` (plus broadcasts where
@@ -1764,6 +1818,7 @@ pub fn read_messages(
 /// Withdraws an open structured ask under `thread_key`.
 pub fn withdraw_ask(
     repo_path: &str,
+    origin: MessageOrigin,
     from_agent: &str,
     thread_key: &str,
     reason: &str,
@@ -1777,6 +1832,7 @@ pub fn withdraw_ask(
     .to_string();
     post_thread_message(
         repo_path,
+        origin,
         from_agent,
         None,
         Some(&clean_thread_key),
@@ -1789,6 +1845,7 @@ pub fn withdraw_ask(
 /// Posts a developer or agent reply/answer to a thread or structured ask under `thread_key`.
 pub fn answer_ask(
     repo_path: &str,
+    origin: MessageOrigin,
     from_agent: &str,
     thread_key: &str,
     answer_body: &str,
@@ -1796,6 +1853,7 @@ pub fn answer_ask(
     let clean_thread_key = sanitize_token("thread_key", thread_key, 80)?;
     post_thread_message(
         repo_path,
+        origin,
         from_agent,
         None,
         Some(&clean_thread_key),
@@ -2245,6 +2303,7 @@ mod tests {
         // Post direct & broadcast messages from wt_a and read from wt_b; git status stays clean!
         let m1 = post_message(
             wt_a.to_str().unwrap(),
+            MessageOrigin::Agent,
             "claude-1",
             Some("codex-2"),
             "interface_change",
@@ -2256,6 +2315,7 @@ mod tests {
 
         let _m2 = post_message(
             wt_a.to_str().unwrap(),
+            MessageOrigin::Agent,
             "claude-1",
             Some("other-agent"),
             "private",
@@ -2271,6 +2331,7 @@ mod tests {
         // Adversarial validation: empty body and oversized body are rejected!
         assert!(post_message(
             wt_a.to_str().unwrap(),
+            MessageOrigin::Agent,
             "claude-1",
             None,
             "note",
@@ -2281,6 +2342,7 @@ mod tests {
         let huge = "x".repeat(MAX_MESSAGE_BODY_BYTES + 1);
         assert!(post_message(
             wt_a.to_str().unwrap(),
+            MessageOrigin::Agent,
             "claude-1",
             None,
             "note",
@@ -2776,6 +2838,7 @@ mod tests {
 
         let m1 = post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "claude-worker-1",
             Some("orchestrator"),
             Some("db-migration"),
@@ -2807,6 +2870,7 @@ mod tests {
         // 4. Answer the ask
         let m2 = answer_ask(
             anchor,
+            MessageOrigin::Person,
             "human-dev",
             "db-migration",
             "Selected option: SQLite",
@@ -2836,6 +2900,7 @@ mod tests {
 
         let m3 = post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "claude-worker-2",
             None,
             Some("db-seed"),
@@ -2848,6 +2913,7 @@ mod tests {
 
         let m4 = withdraw_ask(
             anchor,
+            MessageOrigin::Agent,
             "claude-worker-2",
             "db-seed",
             "Resolved automatically via migration script",
@@ -2881,6 +2947,7 @@ mod tests {
         );
         post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "agent-1",
             None,
             Some("t-emoji"),
@@ -2898,6 +2965,7 @@ mod tests {
         );
         post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "agent-2",
             None,
             Some("t-cjk"),
@@ -2915,6 +2983,7 @@ mod tests {
         );
         post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "agent-3",
             None,
             Some("t-accent"),
@@ -2928,6 +2997,7 @@ mod tests {
         let body_60 = "D".repeat(60);
         post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "agent-4",
             None,
             Some("t-60"),
@@ -2940,6 +3010,7 @@ mod tests {
         let body_61 = "E".repeat(61);
         post_thread_message(
             anchor,
+            MessageOrigin::Agent,
             "agent-5",
             None,
             Some("t-61"),
@@ -3159,6 +3230,68 @@ mod tests {
     }
 
     #[test]
+    fn origin_not_sender_name_decides_the_hop_and_who_may_use_a_person_name() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        // The app UI posts as a person: hop 0, whatever the argument asks for.
+        let person = post_peer_message(
+            anchor,
+            MessageOrigin::Person,
+            "developer",
+            Some("claude:peer"),
+            None,
+            "note",
+            "from the app",
+            None,
+            None,
+            5,
+            6,
+        )
+        .unwrap();
+        assert_eq!(person.hop, Some(0));
+
+        // An agent never gets a person's name, in any case or spacing...
+        for name in [
+            "developer",
+            "human",
+            "human-dev",
+            "user",
+            " USER ",
+            "Developer",
+        ] {
+            let refused = post_thread_message(
+                anchor,
+                MessageOrigin::Agent,
+                name,
+                Some("claude:peer"),
+                None,
+                "note",
+                "forged",
+                None,
+            );
+            assert!(refused.is_err(), "an agent must not post as {name:?}");
+        }
+        // ...and its hop is at least 1 even when it names 0.
+        let agent = post_peer_message(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:coder",
+            Some("claude:peer"),
+            None,
+            "note",
+            "from an agent",
+            None,
+            None,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(agent.hop, Some(1));
+    }
+
+    #[test]
     fn post_peer_message_hydrates_large_payload_idempotently_and_acks_unread() {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path().to_str().unwrap();
@@ -3170,6 +3303,7 @@ mod tests {
 
         let m1 = post_peer_message(
             anchor,
+            MessageOrigin::Agent,
             "agy:11111111-2222-4333-8444-555555555555",
             Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
             Some("a2a-review"),
@@ -3189,6 +3323,7 @@ mod tests {
         // Idempotent retry with identical msg_id + body + sender returns existing message.
         let m1_dup = post_peer_message(
             anchor,
+            MessageOrigin::Agent,
             "agy:11111111-2222-4333-8444-555555555555",
             Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
             Some("a2a-review"),
@@ -3205,6 +3340,7 @@ mod tests {
         // Conflicting payload on same msg_id fails closed.
         assert!(post_peer_message(
             anchor,
+            MessageOrigin::Agent,
             "agy:11111111-2222-4333-8444-555555555555",
             Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
             Some("a2a-review"),
@@ -3312,6 +3448,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: true,
                     terminal_session_id: None,
                 },
@@ -3328,6 +3466,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: Some("term-1".into()),
                 },
@@ -3344,6 +3484,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: None,
                 },
@@ -3360,6 +3502,8 @@ mod tests {
                     session_id: None,
                     proc_start: None,
                     registry_cwd: None,
+                    start_us: None,
+                    is_caller: false,
                     ide_hosted: false,
                     terminal_session_id: None,
                 },

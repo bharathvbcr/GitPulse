@@ -4,9 +4,10 @@
 
 use crate::engine::git_cli::git_text;
 use crate::engine::merge_tree::HeldReason;
+#[cfg(unix)]
+use crate::engine::worktree::merge_and_teardown_requiring;
 use crate::engine::worktree::{
-    add_worktree_extended, merge_and_teardown_requiring, merge_and_teardown_worktree,
-    MergeTeardownError, MergeTeardownResult,
+    add_worktree_extended, merge_and_teardown_worktree, MergeTeardownError, MergeTeardownResult,
 };
 use crate::ipc_error::CommandError;
 use std::path::{Path, PathBuf};

@@ -28,10 +28,12 @@
   } from "../../stores/hostLoadStore";
   import {
     admissionLine,
+    fillRateLine,
     governorLine,
     bytes,
     bytesPerSecond,
     describeReading,
+    fastestWriter,
     formatAge,
     levelLabel,
     memguardLine,
@@ -49,6 +51,7 @@
     { label: "Directory" },
     { label: "Started by" },
     { label: "Memory" },
+    { label: "Disk writes" },
   ]);
   const TRACE_COLUMNS = Object.freeze([
     { label: "Time" },
@@ -96,7 +99,9 @@
   const status = $derived($hostLoadStatus);
   const snap = $derived(status?.snapshot ?? null);
   const host = $derived(snap?.host ?? null);
+  const fillLine = $derived(status ? fillRateLine(snap, status.governor.disk_fill) : null);
   const procs = $derived(status?.procs ?? null);
+  const fastest = $derived(procs ? fastestWriter(procs.sessions, procs.sessions_truncated) : null);
 
   async function refresh() {
     try {
@@ -209,6 +214,9 @@
     <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
       <p class="text-textPrimary font-medium" data-testid="host-load-governor-shedding">{governorLine(status.governor)}</p>
       <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-warn'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
+      {#if fillLine}
+        <p class="{status.governor.disk_fill?.tier === 'severe' ? 'text-warn' : 'text-textMuted'}" data-testid="host-load-disk-fill">{fillLine}</p>
+      {/if}
       {#if status.governor.verdict.reason === "sensor_unavailable"}
         <p class="text-warn">New runs are admitted and nothing extra is shed while the sensor cannot be read.</p>
       {/if}
@@ -267,6 +275,13 @@
       {/each}
 
       {#if procs.sessions.length > 0}
+        {#if fastest}
+          <p class="text-textPrimary" data-testid="host-load-fastest-writer">{fastest.line}</p>
+          <p class="text-textMuted">
+            This is the session whose processes wrote the most over the last tick, not the folder that grew. A
+            process that started and ended between two ticks is not counted, so the rate is a floor.
+          </p>
+        {/if}
         <HealthTable caption="Agent sessions running on this machine" columns={SESSION_COLUMNS}>
           {#each keyedList(previewSlice(procs.sessions, expanded.sessions, LIST_PREVIEW_ROWS), (s) => `${s.pid}:${s.start_us}`) as { item: session, key } (key)}
             <tr>
@@ -275,6 +290,7 @@
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{session.cwd ?? "unknown"}</td>
               <td class="px-3 py-1.5 text-textMuted">{session.tree ? (session.run_id ? `task ${session.run_id}` : "GitPulse terminal") : "elsewhere"}</td>
               <td class="px-3 py-1.5 text-textMuted">{describeReading(session.footprint, bytes)}{session.unreadable_members > 0 ? ` (+${session.unreadable_members} unreadable)` : ""}</td>
+              <td class="px-3 py-1.5 text-textMuted">{describeReading(session.write_rate, (rate) => `at least ${bytesPerSecond(rate)}`)}</td>
             </tr>
           {/each}
         </HealthTable>

@@ -31,6 +31,7 @@
     DEVCOUNCIL_PRESETS,
     buildDevcouncilInstallCommand,
   } from "../../tools/devcouncilInstall";
+  import AgentConnectPanel from "../AgentConnectPanel.svelte";
   import { enqueueConsoleLaunch } from "../../terminal/consoleLaunches";
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { copyText } from "../../desktop/clipboard";
@@ -58,6 +59,7 @@
     { id: "preflight", label: t("setup.step.preflight") },
     { id: "install", label: t("setup.step.install") },
     { id: "verify", label: t("setup.step.verify") },
+    { id: "connect", label: t("setup.step.connect") },
     { id: "done", label: t("setup.step.done") },
   ];
 
@@ -88,10 +90,7 @@
 
   function runInstallInTerminal() {
     if (!installSpec?.runnable || !installSpec.command) return;
-    if (!repoPath) {
-      copyNote = "Open a repository first so Console has a working directory, or copy the command.";
-      return;
-    }
+    if (!repoPath) return;
     try {
       enqueueConsoleLaunch({
         command: installSpec.command,
@@ -302,23 +301,26 @@
                 <Clipboard size={12} />
                 Copy command
               </button>
-              <button
-                type="button"
-                class="gp-btn text-meta inline-flex items-center gap-1"
-                disabled={!repoPath || !installSpec.runnable}
-                title={
-                  !installSpec.runnable
-                    ? "This checkout path cannot be turned into a shell command"
-                    : repoPath
-                      ? installSpec.label
-                      : "Open a repository first so Console has a working directory"
-                }
-                onclick={() => runInstallInTerminal()}
-              >
-                <Terminal size={12} />
-                Run in terminal
-              </button>
+              {#if repoPath}
+                <button
+                  type="button"
+                  class="gp-btn text-meta inline-flex items-center gap-1"
+                  disabled={!installSpec.runnable}
+                  title={installSpec.runnable
+                    ? installSpec.label
+                    : "This checkout path cannot be turned into a shell command"}
+                  onclick={() => runInstallInTerminal()}
+                >
+                  <Terminal size={12} />
+                  Run in terminal
+                </button>
+              {/if}
             </div>
+            {#if !repoPath}
+              <p class="text-meta text-textMuted" data-testid="no-repo-terminal-note">
+                The Console runs in a repository, so Run in terminal appears once one is open. Copy the command and paste it into any terminal now.
+              </p>
+            {/if}
             {#if copyNote}
               <p class="text-meta text-textMuted">{copyNote}</p>
             {/if}
@@ -406,6 +408,11 @@
               <p class="font-mono text-micro break-all text-textMuted">{$verify.binary}</p>
             {/if}
           {/if}
+          <button type="button" class="gp-btn text-meta" onclick={() => setWizardStep("connect")}>
+            Continue
+          </button>
+        {:else if $wizard.step === "connect"}
+          <AgentConnectPanel />
           <button type="button" class="gp-btn text-meta" onclick={() => setWizardStep("done")}>
             Continue
           </button>
@@ -422,7 +429,12 @@
                 : "Setup finished; verify was skipped."}
             </p>
           {/if}
-          <button type="button" class="gp-btn text-meta" onclick={() => void finishSetup()}>Done</button>
+          <div class="flex gap-2">
+            <button type="button" class="gp-btn text-meta" onclick={() => setWizardStep("connect")}>
+              Connect your agent
+            </button>
+            <button type="button" class="gp-btn text-meta" onclick={() => void finishSetup()}>Done</button>
+          </div>
         {/if}
         {#if $actionError}
           <p class="text-danger text-meta" role="alert" data-testid="setup-action-error">{$actionError}</p>

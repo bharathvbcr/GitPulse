@@ -38,7 +38,7 @@ fn settled(target: usize) -> usize {
 /// call used to leave one descriptor behind per concurrent open.
 #[test]
 fn resolving_and_consolidating_concurrently_leaves_no_descriptor_behind() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::tempdir().expect("temp repository");
     let main = dir.path().canonicalize().expect("canonical repository");
     common::run_git(&main, &["init", "-q", "-b", "main"]);

@@ -61,10 +61,36 @@ describe("GlobalCleaner reclaim scopes and clone budget", () => {
       "Reclaim build caches in idle linked worktrees",
       "Judge uncommitted work per directory, not per repository",
       "Remove stale linked worktrees",
+      "Remove agent scratch builds",
     ]) expect(source).toContain(`ariaLabel="${label}"`);
-    for (const key of ["worktree_caches", "per_tree_vetoes", "prune_worktrees", "worktree_idle_days"]) expect(source).toContain(`"${key}"`);
+    for (const key of ["worktree_caches", "per_tree_vetoes", "prune_worktrees", "worktree_idle_days", "agent_scratch_builds", "agent_scratch_days"]) expect(source).toContain(`"${key}"`);
     expect(source).toContain("scopesOf(draft)");
     expect(source).toContain("[7, 14, 30, 90]");
+  });
+  it("shows the evidence for each agent scratch candidate, what was left alone, and temp directories it only lists", () => {
+    for (const marker of ["candidate-evidence", "kept-items", "leaked-temp", "never removed"]) expect(source).toContain(marker);
+    expect(source).toContain("row.evidence");
+    expect(source).toContain("inventory.kept");
+    expect(source).toContain("inventory.leaked_temp");
+  });
+  it("tells a folder that could not be checked from one left alone, and shows an absolute path once", () => {
+    expect(source).toContain('const COULD_NOT_CHECK = "could not be checked:"');
+    expect(source).toContain("unchecked-count");
+    expect(source).toContain('const SESSION_UNMATCHED = "cannot be matched to a session folder"');
+    expect(source).toContain("session-unmatched");
+  });
+  it("lists long-lived data as not cleaned by GitPulse, with no remove control, and lets the person add directories", () => {
+    expect(source).toContain('data-testid="long-lived"');
+    expect(source).toContain("not cleaned by GitPulse");
+    expect(source).toContain("at least ");
+    expect(source).toContain("long_lived_paths: paths(longLivedText)");
+    const section = source.slice(source.indexOf('data-testid="long-lived"'), source.indexOf("These are current logical sizes."));
+    expect(section).not.toMatch(/<button|onclick|Checkbox/);
+    expect(source).toContain("could not be checked");
+    expect(source).toContain('row.path.startsWith("/")');
+    expect(source).toContain("not limited to the roots above");
+    expect(source).toContain("folders that newly match since your inspection are included");
+    expect(source).toContain("approval lapses 30 days");
   });
 
   it("warns that no run uses a scope until the saved set was previewed", () => {

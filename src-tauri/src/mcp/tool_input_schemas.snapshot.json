@@ -533,6 +533,12 @@
         "minLength": 1,
         "type": "string"
       },
+      "expected_revision": {
+        "description": "With overwrite: true, only replace the task if it is still at this revision (from gitpulse_get_task or gitpulse_list_tasks); otherwise it is refused with revision_conflict, naming the current revision, so you can re-read it and merge. Pass it whenever you overwrite a task you read earlier; without it the overwrite replaces whatever the task has become since. Refused without overwrite: true, and for a task that is not on the board",
+        "maximum": 9007199254740991,
+        "minimum": 1,
+        "type": "integer"
+      },
       "kind": {
         "description": "Type, e.g. feature (default), bug, refactor, chore, spike",
         "maxLength": 64,
@@ -866,7 +872,7 @@
         "type": "string"
       },
       "hop": {
-        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; human messages reset to 0)",
+        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
         "maximum": 32,
         "minimum": 0,
         "type": "integer"
@@ -1878,6 +1884,27 @@
     ],
     "type": "object"
   },
+  "gitpulse_sessions": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "description": "Maximum live sessions to return (default 64, max 256)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_status": {
     "additionalProperties": false,
     "properties": {
@@ -2242,6 +2269,39 @@
     ],
     "type": "object"
   },
+  "gitpulse_turn_checkpoints": {
+    "additionalProperties": false,
+    "properties": {
+      "against": {
+        "description": "With `id`: another of this worktree's checkpoint ids to compare against, instead of the checkpoint's parent commit",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "id": {
+        "description": "A checkpoint id from the list (the digits of its stamp). With it, returns that checkpoint's patch instead of the list",
+        "maxLength": 20,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum number of checkpoints listed (default 20, max 50)",
+        "maximum": 50,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_worktree_claim": {
     "additionalProperties": false,
     "properties": {
@@ -2323,6 +2383,15 @@
         "description": "Optional command to execute in worktree upon completion",
         "maxLength": 1024,
         "minLength": 1,
+        "type": "string"
+      },
+      "layout": {
+        "description": "Worktree path layout: 'lane' (default, <repo>/.gitpulse/worktrees/<slug>) or 'sibling' (../<Repo>.<slug>)",
+        "enum": [
+          "lane",
+          "sibling"
+        ],
+        "maxLength": 32,
         "type": "string"
       },
       "repo_path": {

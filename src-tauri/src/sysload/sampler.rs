@@ -14,6 +14,7 @@
 //! switch on and ends on the tick that sees it off. Either request failing is
 //! recorded in the status, not hidden.
 
+use super::diskrate::FillTracker;
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
@@ -141,6 +142,10 @@ pub struct SamplerOptions {
     /// Opens where the pre-crash trace is written, on the trace thread. A seam
     /// so a test can make the write block.
     pub trace_opener: trace::TraceOpener,
+    /// The exec-latency reading, read once per tick and put on the governor's
+    /// input. Unsupported unless [`start_app`] starts the probe, so a sampler
+    /// started by a test or the soak never spawns a child of its own.
+    pub exec_latency: Box<dyn Fn() -> Reading<super::exec_probe::ExecLatency> + Send>,
 }
 
 impl SamplerOptions {
@@ -157,6 +162,7 @@ impl SamplerOptions {
                     .map(|activity| Box::new(activity) as Box<dyn Send>)
             }),
             trace_opener: trace::file_opener(),
+            exec_latency: Box::new(Reading::default),
         }
     }
 }
@@ -212,10 +218,15 @@ struct Shared {
 pub struct StopHandle {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The exec probe `start_app` started, stopped with the sampler.
+    probe: Option<super::exec_probe::ExecProbe>,
 }
 
 impl StopHandle {
     pub fn stop(mut self) {
+        if let Some(probe) = self.probe.take() {
+            probe.stop();
+        }
         self.shared.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
@@ -239,8 +250,23 @@ static APP_SAMPLER: OnceLock<Arc<Shared>> = OnceLock::new();
 /// Starts the app's sampler: the one [`status`] reports. Called once, from
 /// `lib.rs::run`; a second call is refused rather than starting a second
 /// writer candidate in the same process.
-pub fn start_app(options: SamplerOptions) -> Result<StopHandle, String> {
-    let handle = start(options)?;
+pub fn start_app(mut options: SamplerOptions) -> Result<StopHandle, String> {
+    // The probe belongs to the app's sampler only: it spawns a child every
+    // 15 s, which a sampler started by a test or a second process must not.
+    let probe = super::exec_probe::start();
+    if let Some(probe) = &probe {
+        options.exec_latency = Box::new(probe.reader());
+    }
+    let mut handle = match start(options) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(probe) = probe {
+                probe.stop();
+            }
+            return Err(error);
+        }
+    };
+    handle.probe = probe;
     if APP_SAMPLER.set(handle.shared.clone()).is_err()
         || !governor::register_app(handle.shared.governor.clone())
     {
@@ -276,6 +302,7 @@ pub fn start(options: SamplerOptions) -> Result<StopHandle, String> {
     Ok(StopHandle {
         shared,
         thread: Some(thread),
+        probe: None,
     })
 }
 
@@ -438,6 +465,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
     let mut trend = CompressorTrend::default();
+    // The free-space history behind the disk fill rate. Only the writer keeps
+    // one; its rate rides in the snapshot for everyone else.
+    let mut fill_tracker = FillTracker::default();
     let mut writer: Option<Writer> = None;
     let identity = own_identity();
     let cadence = options.cadence.max(Duration::from_millis(10));
@@ -520,11 +550,21 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 if enabled {
                     let view = scanner.scan(&ScanContext::here());
                     fill(&mut snap, &mut sensor, &mut trend, &view);
+                    let at_ms = snap.written.mono_ns / 1_000_000;
+                    fill_tracker.observe(snap.written.boot_id, at_ms, snap.host.free_disk);
+                    let rates = fill_tracker.rates(at_ms);
+                    snap.disk_fill_rate = rates.quick;
+                    snap.disk_fill_sustained = rates.sustained;
                     procs = Some(view);
                 } else {
                     // Off is not calm: the next run starts its thrash count
-                    // from nothing rather than from samples hours old.
+                    // and its free-space history from nothing rather than from
+                    // samples hours old.
                     trend = CompressorTrend::default();
+                    fill_tracker.reset();
+                    // Said as what it is: not an older build, not a calm disk.
+                    snap.disk_fill_rate = Reading::Unavailable(Why::Disabled);
+                    snap.disk_fill_sustained = Reading::Unavailable(Why::Disabled);
                 }
                 snap.tick = tick;
                 // The verdict the previous tick's count produced (pending on
@@ -555,12 +595,14 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 .governor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let input = Input::from_report(
+            let mut input = Input::from_report(
                 &status.sensor,
                 status.snapshot.as_ref(),
                 govern_launches,
                 thresholds,
             );
+            // Measured in this process, so it is not in the snapshot.
+            input.readings.exec_latency = (options.exec_latency)();
             let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
                 governor.observe(Instant::now(), input)
             } else {
@@ -882,6 +924,38 @@ mod tests {
         assert_eq!(previous.len(), 1, "the old boot's ring was kept");
         assert_eq!(previous[0].tier, Some(super::governor::Tier::Severe));
         assert_eq!(previous[0].admit, Some(false));
+    }
+
+    /// The exec-latency reading the options supply reaches the governor the
+    /// sampler feeds: a slow one sheds background work (here, as on any host,
+    /// unless something else already binds first, which sheds it too).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_exec_latency_option_reaches_the_governor() {
+        use super::super::exec_probe::ExecLatency;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.exec_latency = Box::new(|| {
+            Reading::Value(ExecLatency {
+                median_ms: 1_360,
+                n: 9,
+                slow: true,
+            })
+        });
+        let sampler = start(options).unwrap();
+        crate::test_support::wait_until(Duration::from_secs(30), || {
+            sampler
+                .status()
+                .is_some_and(|s| s.governor.verdict.shed.background)
+        });
+        let status = sampler.status().expect("a status");
+        assert!(
+            status.governor.verdict.shed.background,
+            "{:?}",
+            status.governor.verdict
+        );
+        sampler.stop();
     }
 
     /// Real: while the trace write is blocked the sampler keeps publishing at

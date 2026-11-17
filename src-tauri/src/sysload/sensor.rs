@@ -19,6 +19,11 @@ pub enum Why {
     Failed,
     /// A delta or rate that needs a previous sample.
     NotYet,
+    /// Measurement is switched off (`host_load.enabled`): nothing was tried.
+    Disabled,
+    /// The record that carried it was written by a build from before the
+    /// reading existed. Only a reader says this; no writer does.
+    Older,
 }
 
 impl Why {
@@ -28,6 +33,8 @@ impl Why {
             Self::Unreadable => 2,
             Self::Failed => 3,
             Self::NotYet => 4,
+            Self::Disabled => 5,
+            Self::Older => 6,
         }
     }
 
@@ -37,6 +44,8 @@ impl Why {
             2 => Some(Self::Unreadable),
             3 => Some(Self::Failed),
             4 => Some(Self::NotYet),
+            5 => Some(Self::Disabled),
+            6 => Some(Self::Older),
             _ => None,
         }
     }

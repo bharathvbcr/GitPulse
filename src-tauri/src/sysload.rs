@@ -39,6 +39,8 @@
 
 pub mod activity;
 mod disk;
+mod diskrate;
+mod exec_probe;
 mod governor;
 pub mod lease;
 mod probe;
@@ -49,21 +51,33 @@ mod snapshot;
 mod thresholds;
 mod trace;
 
-pub use thresholds::{InputMode, ModeRule, Readings, Rule, Thresholds};
+pub use exec_probe::ExecLatency;
+pub(crate) use thresholds::format_latency;
+pub use thresholds::{
+    auto_disk_floors, DiskFill, DiskGuard, HeadroomRule, HorizonRule, InputMode, ModeRule,
+    Readings, Rule, Thresholds,
+};
 pub use trace::{PreviousBoot, TracePeaks, TraceRecord};
 
-pub use disk::{block_size, free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
+pub use disk::{
+    block_size, free_bytes, physical_memory, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR,
+};
 pub use governor::{
-    admit, admit_anyway, admit_on, decide, grant_override, note_launch_advisory,
-    report as governor_report, shed, Admitted, Advisory, Binding, Governor, GovernorPulse,
-    GovernorReport, GovernorVerdict, Input as GovernorInput, Observation, Reason, Refused, Shed,
-    Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
+    admit, admit_anyway, admit_on, decide, disk_remedy_due, exec_latency, grant_override,
+    note_launch_advisory, report as governor_report, shed, shed_cause, shed_is_disk_only, Admitted,
+    Advisory, Binding, Governor, GovernorPulse, GovernorReport, GovernorVerdict,
+    Input as GovernorInput, Observation, Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES,
+    EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
 };
 #[cfg(test)]
-pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};
+pub(crate) use governor::{
+    inject as inject_governor, inject_with_history as inject_governor_with_history,
+    injected_input as injected_governor_input,
+};
 pub use procscan::{
-    observe_sessions, terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree,
-    MemguardHealth, Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
+    observe_sessions, observe_sessions_with_caller, process_start_us, terminate_orphan, AgentKind,
+    AgentSession, CallerIdentity, ForeignProcess, LaunchedTree, MemguardHealth, Orphan, ProcView,
+    ScanContext, Scanner as ProcessScanner, SessionCount, SessionScan,
 };
 pub use sampler::{
     pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput, Role,

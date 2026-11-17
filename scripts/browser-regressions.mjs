@@ -22,12 +22,14 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * runs the dock through its input, fit, renderer and synchronized-output
  * phases in one page, each with settled waits; the fit phase alone took ~72 s
  * and the synchronized-output phase (two seconds of frames in each of four
- * arms plus the real session) ~59 s cold. A page that is long by design gets
+ * arms plus the real session) ~59 s cold. `coverage` took 48-53 s of its 60 on
+ * the Linux runner (cold dependency optimisation, 163 checks) and timed out once
+ * in three; it passed six of six with the cap lifted. A page that is long by design gets
  * its own number here; the rest keep the minute, so a hang anywhere else is
  * still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120, terminal: 210 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120, terminal: 210, coverage: 120 }));
 
 /** @param {string} harness */
 export function harnessDeadlineSeconds(harness) {

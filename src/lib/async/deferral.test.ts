@@ -21,21 +21,24 @@ import {
 } from "./deferral";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const gitCli = readFileSync(join(repoRoot, "src-tauri", "src", "engine", "git_cli.rs"), "utf8");
+const processGate = readFileSync(
+  join(repoRoot, "src-tauri", "src", "engine", "process", "gate.rs"),
+  "utf8",
+);
 
 describe("deferred-under-load marker", () => {
   it("matches DEFERRED_MARKER in the Rust spawn gate", () => {
-    const match = gitCli.match(/const DEFERRED_MARKER:\s*&str\s*=\s*"([^"]*)"\s*;/);
-    expect(match, "DEFERRED_MARKER declaration not found in src-tauri/src/engine/git_cli.rs").not
+    const match = processGate.match(/const DEFERRED_MARKER:\s*&str\s*=\s*"([^"]*)"\s*;/);
+    expect(match, "DEFERRED_MARKER declaration not found in src-tauri/src/engine/process/gate.rs").not
       .toBeNull();
     expect(DEFERRED_UNDER_LOAD_MARKER).toBe(match?.[1]);
   });
 
   it("reads the timeout marker and slot-wait suffix from the Rust source", () => {
-    const marker = gitCli.match(/const TIMEOUT_MARKER:\s*&str\s*=\s*"([^"]*)"\s*;/);
-    const suffix = gitCli.match(/const SLOT_WAIT_SUFFIX:\s*&str\s*=\s*"([^"]*)"\s*;/);
-    expect(marker, "TIMEOUT_MARKER declaration not found in git_cli.rs").not.toBeNull();
-    expect(suffix, "SLOT_WAIT_SUFFIX declaration not found in git_cli.rs").not.toBeNull();
+    const marker = processGate.match(/const TIMEOUT_MARKER:\s*&str\s*=\s*"([^"]*)"\s*;/);
+    const suffix = processGate.match(/const SLOT_WAIT_SUFFIX:\s*&str\s*=\s*"([^"]*)"\s*;/);
+    expect(marker, "TIMEOUT_MARKER declaration not found in engine/process/gate.rs").not.toBeNull();
+    expect(suffix, "SLOT_WAIT_SUFFIX declaration not found in engine/process/gate.rs").not.toBeNull();
     expect(RUN_TIMEOUT_MARKER).toBe(marker?.[1]);
     expect(SLOT_WAIT_SUFFIX).toBe(suffix?.[1]);
   });

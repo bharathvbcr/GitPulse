@@ -33,7 +33,7 @@ fn page(root: &str, max: usize, known: Option<&str>) -> Result<CommitGraphPayloa
 }
 
 fn history_walks(root: &std::path::Path) -> usize {
-    crate::engine::git_cli::spawn_log::spawns_in(root)
+    crate::engine::process::spawn_log::spawns_in(root)
         .iter()
         .filter(|argv| argv.iter().any(|a| a == "--topo-order"))
         .count()
@@ -205,7 +205,7 @@ fn a_change_the_stamp_cannot_see_is_picked_up_once_the_token_expires() {
 
 fn spawn_shapes(root: &std::path::Path) -> Vec<Vec<String>> {
     let needle = root.to_string_lossy().into_owned();
-    let mut shapes: Vec<Vec<String>> = crate::engine::git_cli::spawn_log::spawns_in(root)
+    let mut shapes: Vec<Vec<String>> = crate::engine::process::spawn_log::spawns_in(root)
         .into_iter()
         .map(|argv| {
             argv.iter()

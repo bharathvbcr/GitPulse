@@ -197,7 +197,8 @@ function secretsScan(overrides: Partial<SecretsReport> = {}): SecretsReport {
     kingfisher_version_rejected: false, nested_repos_scanned: true, excluded_paths: [],
     completeness: "complete",
     findings: [], findings_total: 0, findings_unreadable: 0, findings_truncated: false,
-    git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1,
+    git_status_known: true, max_file_size_mb: 256, scanned_at_ms: 1, duration_ms: 1, engine: "dc-redact 0.2.5", skipped_total: 0, skipped: [],
+    second_opinion: { state: "ran", completeness: "complete", version: "2.7.0", findings_total: 0, confirmed: 0, added: 0 },
     ...overrides,
   };
 }
@@ -219,7 +220,7 @@ describe("formatSecretsAgentPrompt with the scan Health is showing", () => {
       findings_total: 2,
     });
     const prompt = formatSecretsAgentPrompt("/repo", report);
-    expect(prompt).toContain("GitPulse Health attached the Kingfisher secrets scan it is showing");
+    expect(prompt).toContain("GitPulse Health attached the in-process and Kingfisher secrets scan it is showing");
     expect(prompt).not.toContain("did not attach a secrets scan");
     expect(prompt).toContain("SECRETS SCAN");
     expect(prompt).toContain("- [Tracked] src/app.env:3 — github-pat (betterleaks.github-pat), high confidence, same value in 2 locations");

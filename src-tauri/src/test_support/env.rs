@@ -357,8 +357,10 @@ pub(crate) mod hermetic {
         "GIT_NAMESPACE",
         "GITPULSE_TOOL_CONFIG",
         "GITPULSE_TRANSCRIPT_ROOT",
+        "GITPULSE_CLAUDE_CONFIG_DIRS",
         "GITPULSE_CODEX_TRANSCRIPT_ROOT",
         "CODEX_HOME",
+        "ANTIGRAVITY_HOME",
         "GITPULSE_BACKUPS_DIR",
     ];
 

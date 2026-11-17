@@ -18,6 +18,8 @@ import { withDeferralRetry } from "../../ipc/invoke";
 import { jitteredRetryDelayMs } from "../../async/deferral";
 import { harnessStore } from "../harnessStore";
 import { gitActionCount } from "../../desktop/exitGuard";
+import { toastStore } from "../toastStore";
+import { readFileSync } from "node:fs";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -1742,23 +1744,34 @@ describe("repoStore branch stats", () => {
     expect(state.statsPending).toBe(false);
   });
 
-  it("discards a stats response that lands after the session generation moved on", async () => {
-    const stats = deferred<unknown>();
-    const invoke = makeInvoke({ cmd_branch_stats: async () => stats.promise as never });
+  it("discards a stats response that lands after the session generation moved on, then asks again for the live one", async () => {
+    const stale = deferred<unknown>();
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async (_cmd, args) => {
+        if (args?.repoPath !== "/r/race-a") return statsFor(String(args?.repoPath)) as never;
+        calls += 1;
+        return (calls === 1 ? stale.promise : statsFor("/r/race-a")) as never;
+      },
+    });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-a");
     expect(get(store).statsPending).toBe(true);
 
     await store.openRepo("/r/race-b");
     await store.activateTab(get(store).openTabs[0].id);
-    stats.resolve(statsFor("/r/race-a"));
-    await flushMicro();
+    const staleReport = statsFor("/r/race-a");
+    staleReport.updates[0].additions = 99;
+    stale.resolve(staleReport);
+    await vi.waitFor(() => expect(get(store).statsPending).toBe(false));
 
     const state = get(store);
     expect(state.currentPath).toBe("/r/race-a");
-    expect(state.branches[0].additions).toBe(0);
-    expect(state.branches[0].compared_to).toBeUndefined();
-    expect(state.statsPending).toBe(false);
+    // The response that landed late was dropped; the numbers are the live generation's own.
+    expect(state.branches[0].additions).toBe(10);
+    expect(state.branches[0].compared_to).toBe("/r/race-a-main");
+    // One drain for the old generation, one hand-over to the live one; no duplicate.
+    expect(calls).toBe(2);
   });
 
   it("runs one stats fetch while refreshes race and merges once it settles", async () => {
@@ -2023,23 +2036,29 @@ describe("repoStore branch stats", () => {
   });
 
   it("does not mark the active session statsFailed when an orphaned fetch aborts on generation", async () => {
-    const stats = deferred<unknown>();
-    const invoke = makeInvoke({ cmd_branch_stats: async () => stats.promise as never });
+    const aborted = deferred<unknown>();
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async () => {
+        calls += 1;
+        return (calls === 1 ? aborted.promise : statsFor("/r/race-fail")) as never;
+      },
+    });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-fail");
     expect(get(store).statsPending).toBe(true);
 
     await store.openRepo("/r/race-other");
     await store.activateTab(get(store).openTabs[0].id);
-    stats.reject(new Error("aborted"));
-    await flushMicro();
+    aborted.reject(new Error("aborted"));
+    await vi.waitFor(() => expect(get(store).statsPending).toBe(false));
 
     const state = get(store);
     expect(state.currentPath).toBe("/r/race-fail");
-    expect(state.statsPending).toBe(false);
-    // The abort is not a failure of THIS session's data; nothing was lost.
+    // The abort is not a failure of THIS session's data; the live generation drained on its own.
     expect(state.statsFailed).toBe(false);
     expect(state.error).toBeNull();
+    expect(state.branches[0].compared_to).toBe("/r/race-fail-main");
   });
 });
 
@@ -5645,5 +5664,69 @@ describe("repositoryTrustRefused reads the kind, never the wording", () => {
     expect(repositoryTrustRefused(new Error(text))).toBe(false);
     expect(repositoryTrustRefused(new IpcError("unclassified", text))).toBe(false);
     expect(repositoryTrustRefused(undefined)).toBe(false);
+  });
+});
+
+describe("a push the secret scan refused", () => {
+  afterEach(() => toastStore.clear());
+
+  it("offers Push anyway, which alone sends the override, to the repository that was refused", async () => {
+    const pushes: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_push: async (_cmd, args) => {
+          pushes.push({ ...(args ?? {}) });
+          if (!args?.allowSecrets) {
+            throw new IpcError(
+              "secret_scan_blocked",
+              "Push blocked by the secret scan. Nothing was pushed.\n1 added line looks like a credential:\n  aws access key id at 0123456789ab:k.env:1",
+              { gate: "push" },
+            );
+          }
+          return { policy: null, output: "pushed" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.push();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.surfaced).toBe(true);
+    expect(pushes).toEqual([{ repoPath: "/r/a", remote: undefined, branch: undefined, force: false }]);
+    const toast = get(toastStore).find((t) => t.action?.label === "Push anyway");
+    expect(toast?.kind).toBe("error");
+    expect(toast?.duration, "the findings stay until the person dismisses them").toBe(0);
+    expect(toast?.message).toContain("0123456789ab:k.env:1");
+    // The person moves to another repository before pressing the button.
+    await store.openRepo("/r/b");
+    expect(await toast!.action!.onClick()).toBe(true);
+    expect(pushes[1]).toEqual({ repoPath: "/r/a", remote: undefined, branch: undefined, force: false, allowSecrets: true });
+    expect(pushes).toHaveLength(2);
+  });
+
+  it("raises no override for any other failure", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_push: async () => {
+          throw new IpcError("unclassified", "rejected: non-fast-forward");
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.push();
+    expect(outcome.ok).toBe(false);
+    expect(get(toastStore).some((t) => t.action?.label === "Push anyway")).toBe(false);
+  });
+
+  it("takes no override from a caller", () => {
+    const source = readFileSync(new URL("../repoStore.ts", import.meta.url), "utf8");
+    const push = source.slice(source.indexOf("    push: async ("), source.indexOf("    reportIssue: async ("));
+    const signature = push.slice(0, push.indexOf("=> {"));
+    expect(signature).not.toContain("allowSecrets");
+    // `run(true, …)` is the override; it is reached only through the toast's button.
+    expect(push.match(/run\(true/g)).toHaveLength(1);
+    expect(push).toContain("offerPushPastSecretScan(await run(false, target), () => run(true, refused))");
+    const offer = source.slice(source.indexOf("function offerPushPastSecretScan"), source.indexOf("function repoFacts"));
+    expect(offer).toContain('label: "Push anyway"');
+    expect(offer).toContain('{ label: "Push anyway", onClick: async () => (await again()).ok }');
   });
 });

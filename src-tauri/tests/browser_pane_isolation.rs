@@ -53,6 +53,10 @@ mod hermetic_env;
 #[path = "common/nextest_list.rs"]
 mod nextest_list;
 
+#[cfg(target_os = "macos")]
+#[path = "common/quiet_app.rs"]
+mod quiet_app;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     if nextest_list::answer_list("browser_pane_isolation", false) {
@@ -947,10 +951,10 @@ mod mac {
         main_window.url = tauri::WebviewUrl::App("main".into());
         context.config_mut().app.windows.clear();
 
-        let app = tauri::Builder::default()
+        let mut app = tauri::Builder::default()
             // What GitPulse's page-load handler reads (step 9).
             .manage(gitpulse_lib::desktop::DesktopState::default())
-            .manage(gitpulse_lib::terminal::TerminalSessions::default())
+            .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
             .on_page_load(gitpulse_lib::desktop::handle_page_load)
             // The browser commands as `lib.rs` registers them (step 10).
             .invoke_handler(tauri::generate_handler![
@@ -968,6 +972,7 @@ mod mac {
             })
             .build(context)
             .expect("test application builds");
+        super::quiet_app::out_of_the_way(&mut app);
 
         // Taken once, on the first Ready: the run callback is called for every
         // event, and the receivers can only be moved out of it once.

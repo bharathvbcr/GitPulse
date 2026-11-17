@@ -1,7 +1,7 @@
 //! Transcript sources: the agents whose session logs the ledger replays.
 //!
 //! The pass reads files; what makes a file a Claude Code transcript or a Codex
-//! rollout is a source's. A source says where its files live ([`root`]), what
+//! rollout is a source's. A source says where its files live ([`roots`]), what
 //! one of its lines holds ([`RecordParser`], one per file, since a Codex line
 //! cannot be read without the `session_meta` line before it) and who the rows
 //! are attributed to ([`actor_id`]). Everything after a line is parsed is
@@ -9,13 +9,15 @@
 //! [`transcript::attribution_root`] / [`transcript::departed_root`] for every
 //! source, because a call's path or `cwd` says that whichever agent made it.
 //!
-//! [`root`]: TranscriptSource::root
+//! [`roots`]: TranscriptSource::roots
 //! [`actor_id`]: TranscriptSource::actor_id
 //! [`ToolCall`]: super::transcript::ToolCall
 //! [`transcript::attribution_root`]: super::transcript::attribution_root
 //! [`transcript::departed_root`]: super::transcript::departed_root
 
 use std::path::{Path, PathBuf};
+
+use crate::workbench::conversation::ClaudeConfigDirs;
 
 use super::transcript::{self, LineOutcome, ToolCall};
 
@@ -27,6 +29,25 @@ pub(super) struct SourceRoot {
     /// under the home directory. A default that is absent is a machine that
     /// never ran the agent; an override that is absent is a mistake.
     pub explicit: bool,
+}
+
+/// Every place a source looks, and what could not be listed of them.
+#[derive(Debug, Default)]
+pub(super) struct SourceRoots {
+    pub list: Vec<SourceRoot>,
+    /// Set when the list is not every place the agent may have written: a
+    /// listing that failed or was cut at its bound. The pass reports it and
+    /// does not call the walk complete.
+    pub gap: Option<String>,
+}
+
+impl SourceRoots {
+    pub(super) fn one(root: Option<SourceRoot>) -> Self {
+        SourceRoots {
+            list: root.into_iter().collect(),
+            gap: None,
+        }
+    }
 }
 
 /// What one line of a transcript turned out to hold.
@@ -86,9 +107,9 @@ pub(super) trait TranscriptSource: Sync {
     /// The `actor_id` of every row this source produces.
     fn actor_id(&self) -> &'static str;
 
-    /// Where the files are; `None` when there is nowhere to look (no home
+    /// Where the files are; empty when there is nowhere to look (no home
     /// directory and no override).
-    fn root(&self) -> Option<SourceRoot>;
+    fn roots(&self) -> SourceRoots;
 
     /// Whether the files this source lists are covered by the legacy baseline
     /// floor: the line the per-worktree watermark drew before offsets existed,
@@ -99,7 +120,9 @@ pub(super) trait TranscriptSource: Sync {
 
     /// Whether a root that cannot be walked is an error to report. Every source
     /// reports an override that points nowhere; a source that adopted this
-    /// after shipping without it (Claude) keeps the silence it had.
+    /// after shipping without it (Claude) keeps the silence it had for an
+    /// override. A root found by looking, rather than named, is reported
+    /// whatever this says: nobody asked for it, so nobody would know.
     fn reports_unwalkable_root(&self) -> bool;
 
     /// Whether the agent may simply not be installed: its default directory
@@ -127,10 +150,30 @@ pub(super) trait TranscriptSource: Sync {
     fn open(&self, path: &Path, start: u64, budget: &mut u64) -> Option<Box<dyn RecordParser>>;
 }
 
+/// Claude config directories whose transcripts one pass reads. Each root has
+/// its own file cap and entry budget in the walk, so this bounds the pass at
+/// that many walks; past it the roots left out are reported, not read.
+pub(super) const MAX_CLAUDE_ROOTS: usize = 16;
+
 /// Bytes of rollout start one pass may replay, across every file it resumes.
 pub(super) const RESUME_PASS_BYTES: u64 = 256 << 20;
 
-/// Claude Code: `~/.claude/projects/**/*.jsonl`.
+/// Claude Code: `<config dir>/projects/**/*.jsonl` for every configuration
+/// directory the account runs sessions under (`~/.claude`, `~/.claude-*`,
+/// `CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS`, seat mappings): the one
+/// resolver, [`conversation::claude_config_dirs`], that live-session
+/// observation uses.
+///
+/// [`conversation::claude_config_dirs`]: crate::workbench::conversation::claude_config_dirs
+///
+/// Known limit: a configuration directory that held transcripts and then
+/// vanishes (an unmounted volume) is not remembered. Cursors are keyed by a
+/// hash of the file path, so nothing says which cursors lay under it, and the
+/// next complete pass forgets them; when the directory returns each file is
+/// read again once and every row is refused as a duplicate, none recorded
+/// twice. Codex's roots are remembered (`pass::track_roots`) because its marker
+/// cursor was added with it; adding one for Claude changes the cursor count
+/// that existing readers and tests expect, so it needs a ledger field instead.
 pub(super) struct ClaudeSource;
 
 struct ClaudeParser(transcript::Reader);
@@ -169,17 +212,14 @@ impl TranscriptSource for ClaudeSource {
         "claude-code"
     }
 
-    fn root(&self) -> Option<SourceRoot> {
-        match std::env::var_os("GITPULSE_TRANSCRIPT_ROOT") {
-            Some(path) => Some(SourceRoot {
+    fn roots(&self) -> SourceRoots {
+        if let Some(path) = std::env::var_os("GITPULSE_TRANSCRIPT_ROOT").filter(|p| !p.is_empty()) {
+            return SourceRoots::one(Some(SourceRoot {
                 path: PathBuf::from(path),
                 explicit: true,
-            }),
-            None => super::dirs_home().map(|home| SourceRoot {
-                path: home.join(".claude").join("projects"),
-                explicit: false,
-            }),
+            }));
         }
+        claude_roots(super::claude_config_dirs())
     }
 
     fn legacy_floor(&self) -> bool {
@@ -201,6 +241,58 @@ impl TranscriptSource for ClaudeSource {
     fn open(&self, path: &Path, _start: u64, _budget: &mut u64) -> Option<Box<dyn RecordParser>> {
         Some(Box::new(ClaudeParser(transcript::Reader::for_path(path))))
     }
+}
+
+/// The `projects` directory of each configuration directory that has one,
+/// each real directory once however many spellings reach it. A candidate with
+/// no `projects` is a seat that never ran Claude, which says nothing; but when
+/// none has one the first is kept, so a machine whose transcripts have gone is
+/// still told so rather than treated as one that never had any.
+fn claude_roots(configs: ClaudeConfigDirs) -> SourceRoots {
+    let mut gap = configs.error;
+    let mut list: Vec<SourceRoot> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut skipped = 0usize;
+    let first = configs.dirs.first().map(|dir| dir.join("projects"));
+    for dir in &configs.dirs {
+        let path = dir.join("projects");
+        // Absent, and nothing there: a seat that never ran Claude. A link to
+        // nowhere is something there: it stays, and the pass reports it.
+        if matches!(std::fs::metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            && std::fs::symlink_metadata(&path).is_err()
+        {
+            continue;
+        }
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.contains(&identity) {
+            continue;
+        }
+        if list.len() == MAX_CLAUDE_ROOTS {
+            skipped += 1;
+            continue;
+        }
+        seen.push(identity);
+        list.push(SourceRoot {
+            path,
+            explicit: false,
+        });
+    }
+    if list.is_empty() {
+        list.extend(first.map(|path| SourceRoot {
+            path,
+            explicit: false,
+        }));
+    }
+    if skipped > 0 {
+        let note = format!(
+            "{skipped} more Claude config directories than the {MAX_CLAUDE_ROOTS} read per pass; their transcripts were not read"
+        );
+        gap = Some(match gap {
+            Some(earlier) => format!("{earlier}; {note}"),
+            None => note,
+        });
+    }
+    SourceRoots { list, gap }
 }
 
 /// Every source the pass reads, Claude first.

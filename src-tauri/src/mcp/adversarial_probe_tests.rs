@@ -150,3 +150,77 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
         Err(message) => assert!(message.contains("limit"), "{message}"),
     }
 }
+
+#[test]
+fn oversized_sessions_report_cuts_within_budget_and_conforms_to_schema() {
+    let sessions: Vec<crate::insights::SessionRow> = (0..400)
+        .map(|i| crate::insights::SessionRow {
+            kind: "claude".into(),
+            pid: 1000 + i,
+            start_us: Some(1_700_000_000_000 + u64::from(i)),
+            is_caller: i == 0,
+            worktree: format!("/tmp/worktree-{i}"),
+            cwd: format!("/tmp/worktree-{i}/sub/{}", "p".repeat(120)),
+            tree: Some("claude:42".into()),
+            run_id: Some(format!("run-{i}-{}", "r".repeat(64))),
+            task_id: Some(format!("ft-{i}")),
+            parent_pid: Some(500),
+            session_id: Some(format!("sid-{i}-{}", "s".repeat(64))),
+            entrypoint: Some("claude --print".into()),
+            state: "working".into(),
+            state_source: "registry".into(),
+            state_age_s: Some(3),
+        })
+        .collect();
+    let report = crate::insights::SessionsReport {
+        repo_path: "/tmp/repo".into(),
+        ok: true,
+        error: String::new(),
+        app_state: crate::insights::AppStateFacet {
+            ok: false,
+            error: "desktop app snapshot not found".into(),
+            updated_ms: None,
+        },
+        kinds: vec![
+            crate::insights::LiveKindStatus {
+                kind: "claude".into(),
+                ok: true,
+                error: String::new(),
+                sessions: 400,
+                unverified: 0,
+                truncated: false,
+            },
+            crate::insights::LiveKindStatus {
+                kind: "codex".into(),
+                ok: true,
+                error: String::new(),
+                sessions: 0,
+                unverified: 0,
+                truncated: false,
+            },
+        ],
+        cap: 256,
+        total: 400,
+        returned: 400,
+        truncated: false,
+        sessions,
+    };
+    let payload = serde_json::to_value(report).expect("serialize");
+    let raw_len = serde_json::to_string(&payload).expect("compact").len();
+    assert!(
+        raw_len > BUDGET,
+        "fixture payload should exceed budget ({raw_len} <= {BUDGET})"
+    );
+    let fitted = budget::fit(true, payload, BUDGET).expect("fits budget");
+    assert!(wire(&fitted) <= BUDGET, "{} bytes", wire(&fitted));
+    let structured = fitted.structured.expect("structured");
+    assert_eq!(structured["truncated"], true);
+    let returned = structured["returned"].as_u64().expect("returned");
+    assert!((1..400).contains(&returned), "returned={returned}");
+    assert!(structured[TRUNCATION_KEY].is_object());
+    let violations: Vec<String> = validate::validate(&structured, &schema_of("gitpulse_sessions"))
+        .iter()
+        .map(validate::Violation::render)
+        .collect();
+    assert!(violations.is_empty(), "{violations:?}");
+}

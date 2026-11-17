@@ -1,9 +1,23 @@
 import { describe, expect, it } from "vitest";
-import type { GovernorReport, HostLoadPulse, MemguardHealth } from "../stores/hostLoadStore";
+import type {
+  AgentSession,
+  GovernorReport,
+  HostLoadPulse,
+  MemguardHealth,
+  Reading,
+  Snapshot,
+} from "../stores/hostLoadStore";
 import {
+  FASTEST_WRITER_MIN_RATE,
   admissionLine,
+  fastestWriter,
   bytes,
+  bindingLabel,
   describeReading,
+  diskFillLine,
+  execLatencyLine,
+  fillRateLabel,
+  fillRateLine,
   formatAge,
   governorLine,
   memguardLine,
@@ -37,7 +51,7 @@ const pulse = (over: Partial<HostLoadPulse> = {}): HostLoadPulse => ({
 const report = (over: Partial<GovernorReport["verdict"]> = {}, rest: Partial<GovernorReport> = {}): GovernorReport => ({
   verdict: {
     admit: true,
-    shed: { background: false, reactive: false },
+    shed: { background: false, reactive: false, cause: null },
     reason: "healthy",
     tier: "clear",
     binding: null,
@@ -220,7 +234,7 @@ describe("the governor's lines", () => {
     const shedding = report({
       reason: "elevated",
       tier: "elevated",
-      shed: { background: true, reactive: false },
+      shed: { background: true, reactive: false, cause: null },
       binding: "memory_pressure",
       message: "memory pressure warn (kernel level 2): background work is shed, launches are admitted",
       warnings: ["stale 45s: governing on the last-known level"],
@@ -228,7 +242,7 @@ describe("the governor's lines", () => {
     expect(governorLine(shedding)).toBe(
       "Shedding background work: memory pressure warn (kernel level 2): background work is shed, launches are admitted (stale 45s: governing on the last-known level).",
     );
-    expect(governorLine(report({ shed: { background: true, reactive: true }, reason: "pressure" }))).toMatch(
+    expect(governorLine(report({ shed: { background: true, reactive: true, cause: null }, reason: "pressure" }))).toMatch(
       /^Shedding background and reactive work/,
     );
   });
@@ -279,5 +293,176 @@ describe("the governor's lines", () => {
     expect(
       statusChip(pulse({ level: "critical", pressure: "critical", governor: { ...gov, admit: false, overridden: true, shed_background: true, shed_reactive: true } }))?.text,
     ).toBe("Memory: critical · shedding");
+  });
+});
+
+describe("the disk fill line", () => {
+  const GIB = 2 ** 30;
+  const fill = (over: Partial<Parameters<typeof diskFillLine>[0]> = {}) => ({
+    rate_bytes_per_min: 2.7 * GIB,
+    eta_min: 10.7,
+    free_bytes: 45 * GIB,
+    floor_bytes: 16 * GIB,
+    tier: "elevated" as const,
+    ...over,
+  });
+
+  it("says the rate and the minutes until the floor", () => {
+    expect(diskFillLine(fill())).toBe("Disk filling: 2.70 GB/min, about 11 min until the 16.0 GB floor.");
+    expect(fillRateLabel(0.5 * GIB)).toBe("512 MB/min");
+  });
+
+  it("says under a minute, and when the floor is already reached", () => {
+    expect(diskFillLine(fill({ eta_min: 0.4 }))).toContain("under 1 min until");
+    expect(diskFillLine(fill({ eta_min: 0 }))).toBe("Disk filling: 2.70 GB/min, free space is at the 16.0 GB floor.");
+  });
+
+  it("names the binding in the status words", () => {
+    expect(bindingLabel("disk_filling")).toBe("disk filling");
+    expect(bindingLabel("low_disk")).toBe("low disk");
+  });
+});
+
+describe("the fill rate line tells not measured from not falling", () => {
+  const GIB = 2 ** 30;
+  // Only the one field the line reads: the rest of a snapshot is not its business.
+  const snapshot = (rate?: Reading<number>) => ({ disk_fill_rate: rate }) as unknown as Snapshot;
+  const projection = {
+    rate_bytes_per_min: 2.7 * GIB,
+    eta_min: 10.7,
+    free_bytes: 45 * GIB,
+    floor_bytes: 16 * GIB,
+    tier: "elevated" as const,
+  };
+
+  it("says warming up while the writer has too little history", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "not_yet" }), null)).toBe("Fill rate: warming up");
+  });
+
+  it("says the writing app is an older build only for an older record or an absent field", () => {
+    const older = "Fill rate: not available (the app writing the snapshot is an older build)";
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "older" }), null)).toBe(older);
+    expect(fillRateLine(snapshot(undefined), null)).toBe(older);
+  });
+
+  it("says a switched-off sensor is off, and an unsupported platform is unsupported", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "disabled" }), null)).toBe(
+      "Fill rate: off (host load measurement is switched off)",
+    );
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "unsupported" }), null)).toBe(
+      "Fill rate: not available on this platform",
+    );
+  });
+
+  it("says the disk can't be read when it can't, and not falling only when it measured that", () => {
+    expect(fillRateLine(snapshot({ status: "unavailable", value: "failed" }), null)).toBe(
+      "Fill rate: not available (free disk space can't be read)",
+    );
+    expect(fillRateLine(snapshot({ status: "value", value: 0 }), null)).toBe("Fill rate: not falling");
+    expect(fillRateLine(snapshot({ status: "value", value: 0.5 * GIB }), null)).toBe("Fill rate: 512 MB/min");
+  });
+
+  it("shows the sustained rate when it binds and the quick line reads lower", () => {
+    const both = (quick: number, sustained: Reading<number>) =>
+      ({
+        disk_fill_rate: { status: "value", value: quick },
+        disk_fill_sustained: sustained,
+      }) as unknown as Snapshot;
+    expect(fillRateLine(both(0, { status: "value", value: 2 * GIB }), null)).toBe(`Fill rate: ${fillRateLabel(2 * GIB)}`);
+    expect(fillRateLine(both(3 * GIB, { status: "value", value: 2 * GIB }), null)).toBe(`Fill rate: ${fillRateLabel(3 * GIB)}`);
+    expect(fillRateLine(both(0.5 * GIB, { status: "unavailable", value: "not_yet" }), null)).toBe(
+      "Fill rate: 512 MB/min",
+    );
+  });
+
+  it("gives the projection when the disk is heading for the floor, and nothing without a snapshot", () => {
+    expect(fillRateLine(snapshot({ status: "value", value: 2.7 * GIB }), projection)).toBe(diskFillLine(projection));
+    expect(fillRateLine(null, null)).toBeNull();
+  });
+});
+
+describe("fastestWriter", () => {
+  // humanBytes counts in 1024s and labels them MB.
+  const MB = 1_048_576;
+  const session = (
+    pid: number,
+    write_rate: Reading<number>,
+    over: Partial<AgentSession> = {},
+  ): AgentSession => ({
+    kind: "claude",
+    pid,
+    start_us: 1,
+    cwd: `/work/${pid}`,
+    tree: null,
+    run_id: null,
+    parent_pid: null,
+    footprint: { status: "value", value: 1 },
+    write_rate,
+    members: 1,
+    unreadable_members: 0,
+    ...over,
+  });
+  const rate = (value: number): Reading<number> => ({ status: "value", value });
+  const notYet: Reading<number> = { status: "unavailable", value: "not_yet" };
+
+  it("says nothing without a baseline or without any session", () => {
+    expect(fastestWriter([], false)).toBeNull();
+    expect(fastestWriter([session(1, notYet), session(2, { status: "unavailable", value: "unsupported" })], false)).toBeNull();
+  });
+
+  it("says nothing when no session writes above the threshold, zero included", () => {
+    expect(fastestWriter([session(1, rate(0)), session(2, rate(FASTEST_WRITER_MIN_RATE - 1))], false)).toBeNull();
+  });
+
+  it("names the fastest session, its kind, pid and directory, as a floor about its processes", () => {
+    const found = fastestWriter(
+      [session(1, rate(2 * MB)), session(2, rate(85 * MB), { kind: "codex", cwd: "/Users/me/app" }), session(3, notYet)],
+      false,
+    );
+    expect(found?.session.pid).toBe(2);
+    expect(found?.rate).toBe(85 * MB);
+    expect(found?.line).toBe("Writing fastest: Codex session 2 in /Users/me/app, at least 85.0 MB/s");
+    expect(found?.line).not.toMatch(/folder|growing/i);
+  });
+
+  it("breaks a tie toward the lower pid whatever the order", () => {
+    const a = session(9, rate(5 * MB));
+    const b = session(4, rate(5 * MB));
+    expect(fastestWriter([a, b], false)?.session.pid).toBe(4);
+    expect(fastestWriter([b, a], false)?.session.pid).toBe(4);
+  });
+
+  it("limits the claim to the sessions shown when the list was cut", () => {
+    const found = fastestWriter([session(7, rate(10 * MB))], true);
+    expect(found?.line).toBe("Writing fastest of the sessions shown: Claude session 7 in /work/7, at least 10.0 MB/s");
+  });
+
+  it("treats a launched and an observed session alike, and admits an unknown directory", () => {
+    const launched = session(10, rate(3 * MB), { tree: "run:r1", run_id: "r1" });
+    const observed = session(11, rate(6 * MB), { cwd: null });
+    expect(fastestWriter([launched, observed], false)?.line).toBe(
+      "Writing fastest: Claude session 11 in an unknown directory, at least 6.00 MB/s",
+    );
+    expect(fastestWriter([launched], false)?.session.run_id).toBe("r1");
+  });
+});
+
+describe("execLatencyLine", () => {
+  const report = (exec_latency?: GovernorReport["exec_latency"]): GovernorReport =>
+    ({ exec_latency }) as GovernorReport;
+
+  it("names the median and sample count, and says when background work is shed", () => {
+    expect(execLatencyLine(report({ median_ms: 1360, n: 12, slow: true }))).toBe(
+      "Process start-up time: median 1.4 s over 12 probes (slow: background work is shed).",
+    );
+    expect(execLatencyLine(report({ median_ms: 8, n: 1, slow: false }))).toBe(
+      "Process start-up time: median 8 ms over 1 probe.",
+    );
+  });
+
+  it("says unknown, never fast, when there is no reading", () => {
+    for (const value of [null, undefined]) {
+      expect(execLatencyLine(report(value))).toContain("unknown");
+    }
   });
 });

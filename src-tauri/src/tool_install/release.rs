@@ -9,7 +9,7 @@
 //! unavailable with a reason, and the source installs remain.
 
 use super::{ExternalTool, PUBLIC_DEVMAP_REPO, PUBLIC_MANVI_REPO};
-use crate::engine::git_cli;
+use crate::engine::process;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -24,7 +24,12 @@ use std::time::Duration;
 const CURL_HTTPS_ONLY: [&str; 4] = ["--proto", "=https", "--proto-redir", "=https"];
 
 const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(5 * 60);
+/// Largest asset accepted. Bounds the file, not curl's captured output: curl
+/// writes the body with `-o`, so what `run_bounded_capped` buffers is only its
+/// stderr. Passing this as that capture cap exceeded the runner's limit and
+/// failed every download before it started.
 const DOWNLOAD_CAP: usize = 256 * 1024 * 1024;
+const DOWNLOAD_OUTPUT_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +117,19 @@ fn platform_supported(tool: ExternalTool) -> Result<(), String> {
     Ok(())
 }
 
+/// How a pinned release asset is packaged. Declared by the pin, never guessed
+/// from the file name or the bytes: the digest vouches for the asset, and the
+/// pin vouches for what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetFormat {
+    /// `.tar.gz`, unpacked with `tar -xzf`; the binary is found inside.
+    TarGz,
+    /// `.tar.xz`, unpacked with `tar -xJf`; the binary is found inside.
+    TarXz,
+    /// The executable itself (Manvi publishes these): copied, not extracted.
+    Raw,
+}
+
 /// One prebuilt this build of GitPulse will install: a release tag, the asset
 /// in it for one target, and that asset's SHA-256 as recorded here.
 #[derive(Debug, Clone, Copy)]
@@ -121,19 +139,29 @@ pub struct PinnedRelease {
     pub version: &'static str,
     pub target: &'static str,
     pub asset_name: &'static str,
+    pub format: AssetFormat,
     /// 64 lowercase hex characters.
     pub sha256: &'static str,
 }
 
 /// The prebuilts GitPulse will install.
 ///
-/// Empty on purpose: the published DevCouncil/Manvi assets are not in the
-/// format this installer unpacks (devmap ships `devmap-cli-<target>.tar.xz`
-/// and `.zip`, this extracts `.tar.gz`), and a SHA-256 is only worth pinning
-/// for an artifact that was actually installed and checked. Add an entry
-/// (tool, tag, target, asset, digest) when a release in the supported format
-/// is published and verified; until then the rung reports itself unavailable
-/// and the pinned source installs are used.
+/// A SHA-256 is only worth pinning for an artifact that was downloaded,
+/// checked against its release's published sums, run, and found compatible
+/// with what this build reads. The unpacker handles every format the sibling
+/// projects publish (`devmap-cli-<target>.tar.xz`, Manvi's raw binaries), but
+/// no published release is compatible yet, so the table is empty:
+///
+/// - devmap: the latest release, v0.2.3, writes store schema 22 and this
+///   reader requires at least 29 (`MIN_READER_SCHEMA_VERSION`).
+/// - Manvi: the latest release, v0.0.5, was built against DevCouncil
+///   `97741aec`, whose dc-store is schema 9 with no workbench schema; this
+///   build's profile is dc-store 11 / workbench 17, and the profile migrates
+///   one way, so that Manvi would be a stale reader of the shared task store.
+///
+/// Pin a tool once a release that reads the current schemas is published,
+/// downloaded and checked; until then the rung reports itself unavailable and
+/// the pinned source installs are used.
 pub const PINNED_RELEASES: &[PinnedRelease] = &[];
 
 /// The pin for `tool` on `target`, if the table has one.
@@ -324,6 +352,8 @@ fn curl_download_args(url: &str, dest: &Path) -> Vec<String> {
     args.extend([
         "--max-time".to_string(),
         DOWNLOAD_DEADLINE.as_secs().to_string(),
+        "--max-filesize".to_string(),
+        DOWNLOAD_CAP.to_string(),
         "-o".to_string(),
         dest.display().to_string(),
         url.to_string(),
@@ -335,11 +365,11 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, CommandError> {
     #[cfg(test)]
     NETWORK_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let curl =
-        git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
+        process::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     let mut cmd = Command::new(&curl);
     cmd.args(curl_head_args(url));
     let run =
-        git_cli::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
+        process::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
     head_verdict(run.success, &run.stdout)
         .map_err(|e| format!("{e} (curl exit {})", run.status_code))
         .map_err(CommandError::from)
@@ -347,14 +377,19 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, CommandError> {
 
 fn download_to(url: &str, dest: &Path) -> Result<(), CommandError> {
     let curl =
-        git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
+        process::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let mut cmd = Command::new(&curl);
     cmd.args(curl_download_args(url, dest));
-    let run =
-        git_cli::run_bounded_capped(cmd, "curl download", DOWNLOAD_DEADLINE, None, DOWNLOAD_CAP)?;
+    let run = process::run_bounded_capped(
+        cmd,
+        "curl download",
+        DOWNLOAD_DEADLINE,
+        None,
+        DOWNLOAD_OUTPUT_CAP,
+    )?;
     if !run.success {
         let err = String::from_utf8_lossy(&run.stderr);
         return Err(format!(
@@ -366,6 +401,13 @@ fn download_to(url: &str, dest: &Path) -> Result<(), CommandError> {
     }
     if !dest.is_file() {
         return Err(format!("download produced no file at {}", dest.display()).into());
+    }
+    // `--max-filesize` only acts on a declared Content-Length, so the file that
+    // actually landed is measured too.
+    let size = fs::metadata(dest).map_err(|e| e.to_string())?.len();
+    if size > DOWNLOAD_CAP as u64 {
+        let _ = fs::remove_file(dest);
+        return Err(format!("download is {size} bytes, over the {DOWNLOAD_CAP} byte cap").into());
     }
     Ok(())
 }
@@ -417,20 +459,20 @@ pub fn bytes_sha256_hex(bytes: &[u8]) -> Result<String, CommandError> {
 fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, CommandError> {
     let try_cmd = |program: &str, args: &[&str]| -> Result<String, CommandError> {
         let bin =
-            git_cli::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
+            process::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
         let mut cmd = Command::new(&bin);
         cmd.args(args);
         if let Some(path) = path {
             cmd.arg(path);
         }
         let run =
-            git_cli::run_bounded_capped(cmd, program, Duration::from_secs(60), stdin, 64 * 1024)?;
+            process::run_bounded_capped(cmd, program, Duration::from_secs(60), stdin, 64 * 1024)?;
         digest_from_run(run, program)
     };
     try_cmd("shasum", &["-a", "256"]).or_else(|_| try_cmd("sha256sum", &[]))
 }
 
-fn digest_from_run(run: git_cli::BoundedRun, program: &str) -> Result<String, CommandError> {
+fn digest_from_run(run: process::BoundedRun, program: &str) -> Result<String, CommandError> {
     let run = run.require_complete(program)?;
     if !run.success {
         return Err(format!("{program} failed").into());
@@ -469,46 +511,62 @@ pub fn app_bin_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn extract_binary_from_tar_gz(
+/// Put the executable from a verified `archive` at `dest`, as `format` says it
+/// is packaged. The tar flag is explicit per format (no auto-detection), so an
+/// asset that is not what its pin declares fails instead of being guessed at.
+fn unpack_asset(
     archive: &Path,
+    format: AssetFormat,
     tool: ExternalTool,
     dest: &Path,
 ) -> Result<(), CommandError> {
-    let tar =
-        git_cli::find_external_tool("tar").ok_or_else(|| "tar is not installed".to_string())?;
-    let tmp = archive
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("extract-{}", tool.as_str()));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).map_err(|e| format!("extract dir: {e}"))?;
-    let mut cmd = Command::new(&tar);
-    cmd.args([
-        "-xzf",
-        &archive.display().to_string(),
-        "-C",
-        &tmp.display().to_string(),
-    ]);
-    let run = git_cli::run_bounded_capped(
-        cmd,
-        "tar extract",
-        Duration::from_secs(120),
-        None,
-        64 * 1024,
-    )?;
-    if !run.success {
-        return Err(format!(
-            "tar extract failed: {}",
-            String::from_utf8_lossy(&run.stderr)
-        )
-        .into());
-    }
-    let want = binary_name(tool);
-    let found = find_named_file(&tmp, want)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::copy(&found, dest).map_err(|e| format!("copy binary: {e}"))?;
+    match format {
+        AssetFormat::Raw => {
+            fs::copy(archive, dest).map_err(|e| format!("copy binary: {e}"))?;
+        }
+        AssetFormat::TarGz | AssetFormat::TarXz => {
+            let flag = if format == AssetFormat::TarGz {
+                "-xzf"
+            } else {
+                "-xJf"
+            };
+            let tar = process::find_external_tool("tar")
+                .ok_or_else(|| "tar is not installed".to_string())?;
+            let tmp = archive
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("extract-{}", tool.as_str()));
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp).map_err(|e| format!("extract dir: {e}"))?;
+            let mut cmd = Command::new(&tar);
+            cmd.args([
+                flag,
+                &archive.display().to_string(),
+                "-C",
+                &tmp.display().to_string(),
+            ]);
+            let run = process::run_bounded_capped(
+                cmd,
+                "tar extract",
+                Duration::from_secs(120),
+                None,
+                64 * 1024,
+            )?;
+            if !run.success {
+                return Err(format!(
+                    "tar extract failed: {}",
+                    String::from_utf8_lossy(&run.stderr)
+                )
+                .into());
+            }
+            let found = find_named_file(&tmp, binary_name(tool))?;
+            fs::copy(&found, dest).map_err(|e| format!("copy binary: {e}"))?;
+            let _ = fs::remove_dir_all(&tmp);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -516,7 +574,6 @@ fn extract_binary_from_tar_gz(
         perms.set_mode(0o755);
         fs::set_permissions(dest, perms).map_err(|e| e.to_string())?;
     }
-    let _ = fs::remove_dir_all(&tmp);
     Ok(())
 }
 
@@ -581,7 +638,16 @@ pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, CommandError> {
     // Verify before trusting — mismatch refuses; never fall back.
     verify_checksum(&archive, &sha256)?;
 
-    extract_binary_from_tar_gz(&archive, tool, &dest)?;
+    let format = pinned_for(PINNED_RELEASES, tool, platform_target())
+        .map(|pin| pin.format)
+        .ok_or_else(|| {
+            format!(
+                "no pinned {} release for {}",
+                tool.as_str(),
+                platform_target()
+            )
+        })?;
+    unpack_asset(&archive, format, tool, &dest)?;
     let _ = fs::remove_dir_all(&work);
     Ok(dest)
 }
@@ -613,14 +679,15 @@ mod tests {
             ("z".repeat(64), None),
             (
                 "a".repeat(64),
-                Some(crate::engine::git_cli::Incomplete::OverCap(64)),
+                Some(crate::engine::process::Incomplete::OverCap(64)),
             ),
         ] {
-            let run = crate::engine::git_cli::BoundedRun {
+            let run = crate::engine::process::BoundedRun {
                 stdout: digest.into_bytes(),
                 stderr: Vec::new(),
                 success: true,
                 status_code: 0,
+                signal: None,
                 incomplete,
                 stderr_incomplete: None,
                 cancelled: false,
@@ -733,6 +800,7 @@ mod tests {
             version: "v0.2.3",
             target: platform_target(),
             asset_name: "devmap-x.tar.gz",
+            format: AssetFormat::TarGz,
             sha256: Box::leak(digest.into_boxed_str()),
         }];
         if platform_supported(ExternalTool::Devmap).is_err() {
@@ -799,6 +867,29 @@ mod tests {
                 .expect("--proto-redir");
             assert_eq!(args[at + 1], "=https");
         }
+    }
+
+    /// The download used to hand `run_bounded_capped` the 256 MiB asset cap as
+    /// its output-capture cap, which the runner refuses (limit 64 MiB), so every
+    /// real download failed before curl started. The file is bounded by curl.
+    #[test]
+    fn the_download_capture_cap_is_accepted_and_the_file_is_bounded_by_curl() {
+        let mut cmd = Command::new("true");
+        cmd.arg("--version");
+        process::run_bounded_capped(
+            cmd,
+            "curl download",
+            DOWNLOAD_DEADLINE,
+            None,
+            DOWNLOAD_OUTPUT_CAP,
+        )
+        .expect("the runner must accept the download's capture cap");
+        let args = curl_download_args("https://example.com/a", Path::new("/tmp/a"));
+        let at = args
+            .iter()
+            .position(|a| a == "--max-filesize")
+            .expect("--max-filesize");
+        assert_eq!(args[at + 1], DOWNLOAD_CAP.to_string());
     }
 
     /// What curl printed for a HEAD, as `head_verdict` reads it: the headers,
@@ -875,5 +966,157 @@ mod tests {
     #[test]
     fn platform_target_is_concrete() {
         assert_ne!(platform_target(), "");
+    }
+
+    /// A one-file archive holding `name` (a shell script), made by the system
+    /// `tar` with `create_flag` (`-czf` or `-cJf`). Returns the archive path.
+    /// Panics with the tool's stderr when this machine cannot produce the
+    /// format, so an unsupported format is a loud failure and never a skip.
+    #[cfg(unix)]
+    fn fixture_archive(dir: &Path, create_flag: &str, archive: &str, name: &str) -> PathBuf {
+        let src = dir.join("src").join("nested");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join(name), "#!/bin/sh\necho fixture\n").unwrap();
+        let out = dir.join(archive);
+        let mut cmd = Command::new("tar");
+        cmd.arg(create_flag)
+            .arg(&out)
+            .arg("-C")
+            .arg(dir.join("src"))
+            .arg("nested");
+        let result = process::run_bounded_capped(
+            cmd,
+            "tar create",
+            Duration::from_secs(30),
+            None,
+            64 * 1024,
+        )
+        .expect("run tar");
+        assert!(
+            result.success,
+            "this machine cannot build {archive}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        out
+    }
+
+    #[cfg(unix)]
+    fn assert_installed_executable(dest: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(dest.is_file(), "{dest:?} was not installed");
+        let mode = fs::metadata(dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "{dest:?} mode {mode:o}");
+        let text = fs::read_to_string(dest).unwrap();
+        assert!(text.contains("echo fixture"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gzip_tarball_is_unpacked_and_the_binary_found_inside() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = fixture_archive(dir.path(), "-czf", "asset.tar.gz", "devmap");
+        let dest = dir.path().join("out").join("devmap");
+        unpack_asset(&archive, AssetFormat::TarGz, ExternalTool::Devmap, &dest).unwrap();
+        assert_installed_executable(&dest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_xz_tarball_is_unpacked_and_the_binary_found_inside() {
+        // `-cJf` needs liblzma/xz; the fixture panics (never skips) without it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = fixture_archive(dir.path(), "-cJf", "asset.tar.xz", "devmap");
+        let dest = dir.path().join("out").join("devmap");
+        unpack_asset(&archive, AssetFormat::TarXz, ExternalTool::Devmap, &dest).unwrap();
+        assert_installed_executable(&dest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_raw_binary_is_copied_not_extracted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let asset = dir.path().join("manvi-v0.0.5-darwin-arm64");
+        fs::write(&asset, "#!/bin/sh\necho fixture\n").unwrap();
+        let dest = dir.path().join("out").join("manvi");
+        unpack_asset(&asset, AssetFormat::Raw, ExternalTool::Manvi, &dest).unwrap();
+        assert_installed_executable(&dest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_that_is_not_the_declared_format_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Only bytes that are no archive at all are asserted. A gzip tarball
+        // declared as xz (or the reverse) is deliberately not: bsdtar, which
+        // macOS ships, sniffs the compression on read and ignores `-z`/`-J`,
+        // while GNU tar enforces them, so that outcome is platform-dependent.
+        // The pinned SHA-256 is what vouches for the asset's identity.
+        let junk = dir.path().join("junk");
+        fs::write(&junk, "not an archive").unwrap();
+        for (asset, format) in [(&junk, AssetFormat::TarGz), (&junk, AssetFormat::TarXz)] {
+            let dest = dir.path().join("out").join("devmap");
+            let err = unpack_asset(asset, format, ExternalTool::Devmap, &dest).unwrap_err();
+            assert!(err.contains("tar extract failed"), "{}", err.message());
+            assert!(!dest.exists(), "a refused asset left {dest:?} behind");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tarball_without_the_binary_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = fixture_archive(dir.path(), "-cJf", "asset.tar.xz", "something-else");
+        let dest = dir.path().join("out").join("devmap");
+        let err =
+            unpack_asset(&archive, AssetFormat::TarXz, ExternalTool::Devmap, &dest).unwrap_err();
+        assert!(err.contains("did not contain devmap"), "{}", err.message());
+        assert!(!dest.exists());
+    }
+
+    /// Manvi v0.0.5 links dc-store schema 9 (DevCouncil `97741aec`); this
+    /// build's task store is newer and migrates one way. Until a Manvi release
+    /// that links the current dc-store is pinned, the table must not install a
+    /// stale reader of the shared profile.
+    #[test]
+    fn no_manvi_pin_ships_while_the_published_release_links_an_older_dc_store() {
+        const PUBLISHED_MANVI_DC_STORE_SCHEMA: u32 = 9;
+        const {
+            assert!(
+                PUBLISHED_MANVI_DC_STORE_SCHEMA < dc_store::SCHEMA_VERSION,
+                "the published Manvi now links the current dc-store: pin it and delete this test"
+            );
+        }
+        assert!(
+            PINNED_RELEASES.iter().all(|pin| pin.tool != "manvi"),
+            "a manvi pin ships a stale reader of the shared task store"
+        );
+    }
+
+    #[test]
+    fn shipped_pins_name_a_unique_tool_and_target_and_their_own_version_in_the_asset() {
+        let mut seen = std::collections::HashSet::new();
+        for pin in PINNED_RELEASES {
+            assert!(seen.insert((pin.tool, pin.target)), "duplicate {pin:?}");
+            assert!(pin.asset_name.contains(pin.version), "{pin:?}");
+            assert!(pin.tool == "manvi" || pin.tool == "devmap", "{pin:?}");
+        }
+    }
+
+    /// Devmap v0.2.3 writes store schema 22; this reader needs 29. Until a
+    /// release that writes the current schema is pinned, the table must not
+    /// hand out an install that GitPulse then refuses.
+    #[test]
+    fn no_devmap_pin_ships_while_the_published_release_is_below_the_reader_minimum() {
+        const PUBLISHED_DEVMAP_SCHEMA: i32 = 22;
+        const {
+            assert!(
+                PUBLISHED_DEVMAP_SCHEMA < devmap_store::schema::MIN_READER_SCHEMA_VERSION,
+                "the published devmap now meets the reader minimum: pin it and delete this test"
+            );
+        }
+        assert!(
+            PINNED_RELEASES.iter().all(|pin| pin.tool != "devmap"),
+            "a devmap pin ships a binary this build rejects"
+        );
     }
 }

@@ -83,7 +83,7 @@ fn every_input_reaches_elevated_and_severe_at_its_threshold() {
         ),
         (
             "disk",
-            |i, severe| free_at(i, if severe { 5.0 } else { 15.0 }),
+            |i, severe| free_at(i, if severe { 5.0 } else { 25.0 }),
             Binding::LowDisk,
         ),
         (
@@ -187,7 +187,7 @@ fn equal_tiers_bind_in_the_documented_order() {
     input.thresholds.battery.mode = InputMode::Shed;
     swap_at(&mut input, 0.6);
     segments_at(&mut input, 0.65);
-    free_at(&mut input, 15.0);
+    free_at(&mut input, 25.0);
     input.readings.thermal = Reading::Value(Thermal::Serious);
     load_at(&mut input, 3.5);
     input.readings.power = Reading::Value(Power::Battery);
@@ -298,7 +298,7 @@ fn describe_names_each_resource_its_value_and_its_threshold() {
     let v = settle(input);
     assert!(
         v.message
-            .contains("free disk space is 4.0 GiB, below 10.0 GiB"),
+            .contains("free disk space is 4.0 GiB, below 16.0 GiB"),
         "{}",
         v.message
     );
@@ -350,8 +350,9 @@ fn disk_refuses_a_launch_only_in_refuse_mode_below_severe_at() {
         let refused = admit_on(site, &report).unwrap_err();
         assert_eq!(refused.verdict.binding, Some(Binding::LowDisk));
     }
-    // Between severe_at and elevated_at it only sheds.
-    free_at(&mut input, 15.0);
+    // Between the severe and elevated floors (16 and 32 GiB on a 64 GiB Mac)
+    // it only sheds.
+    free_at(&mut input, 25.0);
     let between = settle(input);
     assert!(between.admit && between.shed.background);
 }

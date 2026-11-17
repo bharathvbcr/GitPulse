@@ -4,9 +4,10 @@ use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
 use crate::engine::commit_signature::{read_walk_signatures, CommitSignature, WalkSignatures};
 use crate::engine::git_cli::{
     self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
-    sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
+    sandbox_join_canonical, sandbox_join_entry, validate_repo,
 };
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::process::{self, Incomplete};
 use crate::engine::ref_cache;
 use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
@@ -14,7 +15,7 @@ use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -937,7 +938,7 @@ impl GitReader {
 
     pub fn head_id(repo_path: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
-        Ok(git_cli::with_spawn_source("git_reader.head_id", || {
+        Ok(process::with_spawn_source("git_reader.head_id", || {
             ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])
         })?
         .trim()
@@ -2348,14 +2349,14 @@ impl GitReader {
     /// never inherits a refusal that only a background leader could get.
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, CommandError> {
         type Flights = crate::singleflight::SingleFlight<
-            (std::path::PathBuf, git_cli::Admission),
+            (std::path::PathBuf, process::Admission),
             Result<LanguageStatsReport, CommandError>,
         >;
         static FLIGHTS: OnceLock<Flights> = OnceLock::new();
         let repo = validate_repo(repo_path)?;
         let key = (
             repo.canonicalize().unwrap_or(repo),
-            git_cli::current_admission(),
+            process::current_admission(),
         );
         FLIGHTS.get_or_init(Flights::default).run(key, || {
             Self::get_repo_language_stats_bounded(repo_path, Some(lang_stats_deadline()))
@@ -2507,10 +2508,10 @@ impl GitReader {
         // `--use-mailmap`, so the log keeps its own format.
         let mut header_args = vec!["rev-list", count_arg.as_str(), "--topo-order", "--header"];
         header_args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
-        let admission = git_cli::current_admission();
+        let admission = process::current_admission();
         let (log, signatures) = std::thread::scope(|scope| {
             let headers = scope.spawn(|| {
-                git_cli::with_admission(admission, || read_walk_signatures(&repo, &header_args))
+                process::with_admission(admission, || read_walk_signatures(&repo, &header_args))
             });
             let log = git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES);
             // A reader that panicked is a walk with no signatures read: every
@@ -3851,18 +3852,29 @@ pub(crate) fn parse_pulse_stream(
 /// upstream remote, a lone configured remote, else "origin".
 #[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
-    default_remote_reads(repo, Reads::Cached).0
+    default_remote_from(
+        repo,
+        Reads::Cached,
+        config_snapshot_with(repo, Reads::Cached),
+    )
+    .0
 }
 
 /// [`resolve_default_remote`] plus the reason, when a read it depends on
 /// produced no answer (config, the current branch, the remote list). The name
 /// is then a guess built from "not set"; a caller guarding a destructive
-/// action refuses on the reason instead of trusting the guess.
-fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<CommandError>) {
+/// action refuses on the reason instead of trusting the guess. It takes a
+/// config the caller already read, so a caller that needed the config first
+/// (to name what it stamps) does not ask git for it a second time.
+fn default_remote_from(
+    repo: &Path,
+    reads: Reads,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> (String, Option<CommandError>) {
     let mut unread: Option<CommandError> = None;
     // One read of the effective config answers what used to be two
     // `config --get` processes and, usually, `git remote` too.
-    let config = match config_snapshot_with(repo, reads) {
+    let config = match config {
         Ok(config) => config,
         Err(error) => {
             unread = Some(error);
@@ -4185,6 +4197,107 @@ const DEFAULT_BASE_KEY: &str = "\0gitpulse:default-base";
 /// packed-ref files [`ref_cache`] always stamps.
 const DEFAULT_BASE_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
 
+/// The ref files [`default_base`] is a function of, named exactly, so that a
+/// branch another worktree commits on or a fetch of an unrelated remote branch
+/// does not move the stamp. Computing the answer reads the config, HEAD, the
+/// remote HEAD symref of whichever remote it settles on, and the oids of the
+/// candidate branches: `main`, `master`, `trunk` and `develop`, and the branch
+/// the remote HEAD names (as a local head and as a remote-tracking ref). With
+/// dozens of agents moving refs, the whole-namespace stamp was rarely three
+/// seconds old, so the answer was rarely kept and every catch-up pass paid the
+/// five-child lookup again.
+///
+/// The remote is a function of the config and HEAD's branch, so the candidates
+/// are every remote the config names, `origin` (the fallback), the configured
+/// default remote and the HEAD branch's remote. `None`, which makes the caller
+/// stamp the whole of [`DEFAULT_BASE_NAMESPACES`], when the files cannot name
+/// the inputs exactly: a reftable store, a legacy `.git/remotes` entry (no
+/// config key names it), a config that cannot be read, a name that is not a
+/// plain path, or a candidate that is itself a symref (it moves with another
+/// ref the single path does not see).
+fn narrow_default_base_namespaces(
+    repo: &Path,
+    config: Option<&HashMap<String, String>>,
+) -> Option<Vec<String>> {
+    let (private, common) = crate::repository_trust::git_directories(repo).ok()?;
+    if common.join("reftable").exists() || has_legacy_remotes(repo) {
+        return None;
+    }
+    let config = config?;
+    let mut remotes: BTreeSet<String> = configured_remotes(config).into_iter().collect();
+    remotes.insert("origin".to_string());
+    if let Some(default) = config.get("checkout.defaultremote") {
+        let default = default.trim();
+        if !default.is_empty() {
+            remotes.insert(default.to_string());
+        }
+    }
+    // HEAD is stamped on its own, so reading it here cannot go stale unseen.
+    let head = std::fs::read_to_string(private.join("HEAD")).ok();
+    let branch = head
+        .as_deref()
+        .and_then(|text| text.trim().strip_prefix("ref:"))
+        .and_then(|target| target.trim().strip_prefix("refs/heads/"));
+    if let Some(upstream) = branch.and_then(|branch| config.get(&format!("branch.{branch}.remote")))
+    {
+        let upstream = upstream.trim();
+        if !upstream.is_empty() {
+            remotes.insert(upstream.to_string());
+        }
+    }
+    let plain = |path: &str| {
+        Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    };
+    let read_ref = |path: &str| {
+        [&private, &common]
+            .into_iter()
+            .find_map(|dir| std::fs::read_to_string(dir.join(path)).ok())
+    };
+    let mut candidates: BTreeSet<String> = ["main", "master", "trunk", "develop"]
+        .iter()
+        .map(|name| format!("refs/heads/{name}"))
+        .collect();
+    let mut heads: BTreeSet<String> = BTreeSet::new();
+    for remote in &remotes {
+        let head_ref = remote_head_ref(remote);
+        if !plain(&head_ref) {
+            return None;
+        }
+        if let Some(content) = read_ref(&head_ref) {
+            if let Some(target) = content.trim().strip_prefix("ref:").map(str::trim) {
+                if let Some(short) = strip_remote_tracking(target, remote) {
+                    if !plain(target) || !plain(short) {
+                        return None;
+                    }
+                    candidates.insert(format!("refs/heads/{short}"));
+                    candidates.insert(target.to_string());
+                }
+            }
+        }
+        heads.insert(head_ref);
+    }
+    if candidates
+        .iter()
+        .any(|path| read_ref(path).is_some_and(|content| content.trim_start().starts_with("ref:")))
+    {
+        return None;
+    }
+    Some(candidates.into_iter().chain(heads).collect())
+}
+
+/// What [`default_base`] stamps: [`narrow_default_base_namespaces`], or the
+/// whole of [`DEFAULT_BASE_NAMESPACES`] when that cannot be said exactly.
+fn default_base_namespaces(repo: &Path, config: Option<&HashMap<String, String>>) -> Vec<String> {
+    narrow_default_base_namespaces(repo, config).unwrap_or_else(|| {
+        DEFAULT_BASE_NAMESPACES
+            .iter()
+            .map(|namespace| (*namespace).to_string())
+            .collect()
+    })
+}
+
 /// A complete answer's text, for the ref cache: six NUL-separated fields (the
 /// remote, then the remote HEAD and the base each as a presence flag followed
 /// by its value). Refnames, remote names and oids contain no NUL. An
@@ -4233,10 +4346,14 @@ fn decode_default_base(text: &str) -> Option<DefaultBase> {
 /// `refs/remotes` is seen at once, a stamp younger than the racy window is not
 /// trusted, and nothing is served past the cache's TTL. Never kept: an answer
 /// computed while any lookup was refused (it reads a refusal as "not set").
-fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> DefaultBase {
+fn default_base_cached(
+    repo: &Path,
+    stamp: Option<&ref_cache::Stamp>,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> DefaultBase {
     let mut computed = None;
     let answered = ref_cache::through_stamped(repo, &[DEFAULT_BASE_KEY], stamp, || {
-        let value = compute_default_base_with(repo, Reads::Cached);
+        let value = compute_default_base_from(repo, Reads::Cached, config);
         let keep = value.incomplete.is_none();
         let text = if keep {
             encode_default_base(&value)
@@ -4267,6 +4384,8 @@ fn default_base_cached(repo: &Path, stamp: Option<&ref_cache::Stamp>) -> Default
 struct SharedBase {
     generation: u64,
     stamp: ref_cache::Stamp,
+    /// What `stamp` was read over, so a queued caller stamps the same files.
+    namespaces: Vec<String>,
     value: DefaultBase,
 }
 
@@ -4324,21 +4443,46 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         std::sync::Arc::clone(turns.entry(repo.to_path_buf()).or_default())
     };
     let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-    let stamp = ref_cache::stamp(repo, DEFAULT_BASE_NAMESPACES);
-    if let Some(stamp) = &stamp {
-        let shared = last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(repo)
-            .filter(|entry| entry.generation > arrived && &entry.stamp == stamp)
-            .map(|entry| entry.value.clone());
-        if let Some(value) = shared {
-            return value;
+    // The namespaces are read before the stamp and again after it, as
+    // `ref_cache::git_text_head` does for HEAD: if what they name moved in
+    // between, the stamp may not cover what the lookup reads, so nothing is
+    // kept under it.
+    //
+    // A caller that queued behind a leader first asks whether anything the
+    // leader stamped moved, over the leader's own namespaces: deriving its own
+    // could differ for a reason that is not a change (the leader's config read
+    // was refused and it stamped the whole namespaces; the follower's was not).
+    let led = last
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(repo)
+        .filter(|entry| entry.generation > arrived)
+        .cloned();
+    if let Some(led) = led {
+        let named: Vec<&str> = led.namespaces.iter().map(String::as_str).collect();
+        if ref_cache::stamp(repo, &named).is_some_and(|stamp| stamp == led.stamp) {
+            return led.value;
         }
     }
+    //
+    // The config is read once, to name the remotes, and handed to the lookup
+    // so a repository whose config is too young to be kept does not pay for
+    // the listing twice. Two stamps of the config files and HEAD alone bracket
+    // that read: if either moved across it, the lookup's config is not the one
+    // the stamp describes, and nothing is kept.
+    let bracket = ref_cache::stamp(repo, &[]);
+    let config = config_snapshot_with(repo, Reads::Cached);
+    let known = config.as_ref().ok();
+    let namespaces = default_base_namespaces(repo, known);
+    let named: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    let stamp = ref_cache::stamp(repo, &named);
+    let steady = default_base_namespaces(repo, known) == namespaces
+        && bracket
+            .is_some_and(|before| ref_cache::stamp(repo, &[]).is_some_and(|after| after == before));
+    let stamp = stamp.filter(|_| steady);
     // Stamped before the lookup: a write that races it leaves a stamp that no
     // longer matches, so a later caller does not take this answer.
-    let value = default_base_cached(repo, stamp.as_ref());
+    let value = default_base_cached(repo, stamp.as_ref(), config);
     if let Some(stamp) = stamp {
         let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
         if last.len() >= MAX_MEMOIZED_REPOS && !last.contains_key(repo) {
@@ -4349,6 +4493,7 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
             SharedBase {
                 generation: GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                 stamp,
+                namespaces,
                 value: value.clone(),
             },
         );
@@ -4373,8 +4518,18 @@ pub fn compute_default_base(repo: &Path) -> DefaultBase {
 /// [`default_base`] computes with [`Reads::Cached`] because its own answer is
 /// already bounded by the ref cache's stamp and TTL.
 fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
-    let failures_before = git_cli::process_failures();
-    let (remote, mut unread) = default_remote_reads(repo, reads);
+    compute_default_base_from(repo, reads, config_snapshot_with(repo, reads))
+}
+
+/// [`compute_default_base_with`] over a config the caller already read. A
+/// refused read arrives as its `Err`, so it still sets `incomplete`.
+fn compute_default_base_from(
+    repo: &Path,
+    reads: Reads,
+    config: Result<HashMap<String, String>, CommandError>,
+) -> DefaultBase {
+    let failures_before = process::process_failures();
+    let (remote, mut unread) = default_remote_from(repo, reads, config);
     let head_ref = remote_head_ref(&remote);
     let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
         Ok(target) => target,
@@ -4385,8 +4540,8 @@ fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
     };
     let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
     let incomplete =
-        if git_cli::process_failures() != failures_before {
-            Some(git_cli::last_process_failure().unwrap_or_else(|| {
+        if process::process_failures() != failures_before {
+            Some(process::last_process_failure().unwrap_or_else(|| {
                 CommandError::from("a default-branch lookup produced no answer")
             }))
         } else {
@@ -4485,7 +4640,7 @@ pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
 /// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
 /// the writers would refuse to name in a command, `fix(ui)` among them, is
 /// still the one HEAD is on.
-fn head_branch_name(repo: &Path) -> Result<Option<String>, CommandError> {
+pub(crate) fn head_branch_name(repo: &Path) -> Result<Option<String>, CommandError> {
     symbolic_ref_target(repo, "HEAD")?
         .map(|target| branch_of_head_target(&target))
         .transpose()
@@ -5550,7 +5705,7 @@ pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T 
 /// cut: the engine's own backstop.
 #[cfg(not(test))]
 fn history_walk_cap() -> usize {
-    git_cli::MAX_OUTPUT_BYTES
+    process::MAX_OUTPUT_BYTES
 }
 
 #[cfg(test)]
@@ -5562,7 +5717,7 @@ thread_local! {
 fn history_walk_cap() -> usize {
     WALK_CAP_OVERRIDE
         .with(|cell| cell.get())
-        .unwrap_or(git_cli::MAX_OUTPUT_BYTES)
+        .unwrap_or(process::MAX_OUTPUT_BYTES)
 }
 
 /// Runs `body` with a small read-ahead cap, so a test can cut a window's walk
@@ -9385,7 +9540,7 @@ mod tests {
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_string_lossy().into_owned();
         let lookups = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            crate::engine::process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                 .count()
@@ -9421,6 +9576,296 @@ mod tests {
         );
     }
 
+    /// Every git child started in `repo`, whatever it asked: a default-base
+    /// lookup is five of them, and none of them may run for an unchanged
+    /// repository.
+    fn children_in(repo: &Path) -> usize {
+        crate::engine::process::spawn_log::spawns_in(repo).len()
+    }
+
+    /// Gives `repo` an `origin/HEAD` the way a clone leaves it.
+    fn point_origin_head_at_main(repo: &Path) {
+        git_in(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+
+    /// Asks for the default base once, lets the cache's write window pass, and
+    /// asks again over the same unchanged repository. Returns the two answers
+    /// and the children the second ask started. The window is waited out on a
+    /// manual clock, as the catch-up pass waits it out in production: the
+    /// first answer was computed inside it and is rightly not kept, so what
+    /// is measured is whether the answer is kept once the stamp has settled.
+    fn second_ask_over_unchanged_repo(ask: &Path) -> (DefaultBase, DefaultBase, usize) {
+        let clock = ref_cache::ManualClock::install();
+        let first = default_base(ask);
+        clock.advance(std::time::Duration::from_secs(4));
+        let settling = default_base(ask);
+        let before = children_in(ask);
+        let second = default_base(ask);
+        let spawned = children_in(ask) - before;
+        assert_eq!(
+            settling, second,
+            "an unchanged repository changed its answer"
+        );
+        (first, second, spawned)
+    }
+
+    #[test]
+    fn an_unchanged_repository_answers_the_default_base_without_a_child() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let plain = init_repo_with_remotes(&["origin"], "main");
+            let repo = plain.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(second.base.as_ref().map(|(n, _)| n.as_str()), Some("main"));
+            assert_eq!(spawned, 0, "plain repository with origin/HEAD");
+
+            let bare = init_repo_with_remotes(&[], "main");
+            let repo = bare.path().canonicalize().unwrap();
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(spawned, 0, "repository with no remote");
+
+            let no_head = init_repo_with_remotes(&["origin"], "main");
+            let repo = no_head.path().canonicalize().unwrap();
+            let (_, second, spawned) = second_ask_over_unchanged_repo(&repo);
+            assert_eq!(second.incomplete, None);
+            assert_eq!(second.remote_head, None);
+            assert_eq!(spawned, 0, "origin without an origin/HEAD");
+        });
+    }
+
+    #[test]
+    fn a_linked_worktree_and_a_symlinked_spelling_answer_without_a_child() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let main = init_repo_with_remotes(&["origin"], "main");
+            let main_path = main.path().canonicalize().unwrap();
+            point_origin_head_at_main(&main_path);
+            let linked = tempfile::TempDir::new().unwrap();
+            let linked_path = linked.path().canonicalize().unwrap().join("wt");
+            git_in(
+                &main_path,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "lane",
+                    linked_path.to_str().unwrap(),
+                ],
+            );
+            crate::test_support::trust_repo(&linked_path);
+            let (_, _, spawned) = second_ask_over_unchanged_repo(&linked_path);
+            assert_eq!(spawned, 0, "linked worktree");
+
+            // A directory symlink needs a Unix call (Windows gates it behind
+            // developer mode), so the second spelling is checked there only.
+            #[cfg(unix)]
+            {
+                let spelling = tempfile::TempDir::new().unwrap();
+                let link = spelling.path().join("via-link");
+                std::os::unix::fs::symlink(&main_path, &link).unwrap();
+                crate::test_support::trust_repo(&link);
+                let (_, _, spawned) = second_ask_over_unchanged_repo(&link);
+                assert_eq!(spawned, 0, "symlinked spelling of the repository");
+            }
+        });
+    }
+
+    /// What an agent fleet does to a repository all day: commits on its own
+    /// branches in other worktrees and fetches of remote branches the default
+    /// base never reads. None of it changes the answer, so none of it may cost
+    /// a recompute once the stamp has settled.
+    #[test]
+    fn refs_the_default_base_does_not_read_do_not_cause_a_recompute() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let lane_parent = tempfile::TempDir::new().unwrap();
+            let lane = lane_parent.path().canonicalize().unwrap().join("lane");
+            let clock = ref_cache::ManualClock::install();
+            let _ = default_base(&repo);
+            clock.advance(std::time::Duration::from_secs(4));
+            let answer = default_base(&repo);
+            let children = || children_in(&repo);
+
+            let quiet = |what: &str, change: &dyn Fn()| {
+                change();
+                clock.advance(std::time::Duration::from_secs(4));
+                let before = children();
+                let seen = default_base(&repo);
+                // The first look after a change that did not move the stamp's
+                // inputs is a cache hit; a stamp that saw it recomputes (five
+                // children) and the next look hits.
+                assert_eq!(children() - before, 0, "{what} caused a recompute");
+                assert_eq!(seen, answer, "{what} changed the answer");
+            };
+
+            quiet("a new branch", &|| {
+                git_in(&repo, &["branch", "feature-x"]);
+            });
+            quiet("a commit in another worktree", &|| {
+                git_in(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "feature-y",
+                        lane.to_str().unwrap(),
+                    ],
+                );
+                git_in(&lane, &["commit", "--allow-empty", "-m", "elsewhere"]);
+            });
+            quiet("a fetch of an unrelated remote branch", &|| {
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/feature-x", "HEAD"],
+                );
+            });
+            quiet("a fetch from an unrelated remote", &|| {
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/fork/feature-x", "HEAD"],
+                );
+            });
+        });
+    }
+
+    /// The stamp names the candidate branches and each remote's HEAD, and falls
+    /// back to the whole ref namespaces for the inputs it cannot name exactly:
+    /// a candidate that is a symref moves with a ref the stamp would not see.
+    #[test]
+    fn the_default_base_stamp_is_narrow_and_falls_back_when_it_cannot_name_its_inputs() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let config = config_snapshot_with(&repo, Reads::Cached).ok();
+            let narrow =
+                narrow_default_base_namespaces(&repo, config.as_ref()).expect("a plain repository");
+            for named in [
+                "refs/heads/main",
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/HEAD",
+            ] {
+                assert!(
+                    narrow.iter().any(|path| path == named),
+                    "{named}: {narrow:?}"
+                );
+            }
+            assert!(
+                !narrow
+                    .iter()
+                    .any(|path| path == "refs/heads" || path == "refs/remotes"),
+                "{narrow:?}"
+            );
+
+            git_in(
+                &repo,
+                &["symbolic-ref", "refs/heads/master", "refs/heads/main"],
+            );
+            assert_eq!(narrow_default_base_namespaces(&repo, config.as_ref()), None);
+            let whole = default_base_namespaces(&repo, config.as_ref());
+            assert_eq!(whole, ["refs/heads", "refs/remotes"]);
+        });
+    }
+
+    #[test]
+    fn a_change_to_what_the_default_base_reads_is_recomputed_exactly_once() {
+        let _kept = ref_cache::retention();
+        unhurried(|| {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            point_origin_head_at_main(&repo);
+            let clock = ref_cache::ManualClock::install();
+            let settle = |clock: &ref_cache::ManualClock| {
+                clock.advance(std::time::Duration::from_secs(4));
+                default_base(&repo)
+            };
+            let first = default_base(&repo);
+            assert_eq!(first.remote, "origin");
+            let _ = settle(&clock);
+            // The one child every computation starts whichever remote it
+            // settles on (the HEAD symref's name follows the remote).
+            let marker = |repo: &Path| {
+                crate::engine::process::spawn_log::spawns_in(repo)
+                    .iter()
+                    .filter(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
+                    .count()
+            };
+            let recomputes = |after: &dyn Fn()| {
+                let before = marker(&repo);
+                after();
+                let answer = settle(&clock);
+                let once = marker(&repo) - before;
+                let again_before = marker(&repo);
+                let steady = default_base(&repo);
+                assert_eq!(steady, answer);
+                assert_eq!(marker(&repo), again_before, "the new answer was not kept");
+                (answer, once)
+            };
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["branch", "release"]);
+                git_in(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/release", "HEAD"],
+                );
+                git_in(
+                    &repo,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/release",
+                    ],
+                );
+            });
+            assert_eq!(once, 1, "origin/HEAD moved");
+            assert_eq!(
+                answer.remote_head.as_deref(),
+                Some("refs/remotes/origin/release")
+            );
+            assert_eq!(answer.base.map(|(n, _)| n).as_deref(), Some("release"));
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "checkout.defaultRemote", "upstream"]);
+            });
+            assert_eq!(once, 1, "config edited");
+            assert_eq!(answer.remote, "upstream");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "--unset", "checkout.defaultRemote"]);
+                git_in(
+                    &repo,
+                    &["remote", "add", "second", "https://example.com/second.git"],
+                );
+            });
+            assert_eq!(once, 1, "remote added");
+            assert_eq!(answer.remote, "origin", "two remotes fall back to origin");
+
+            let (answer, once) = recomputes(&|| {
+                git_in(&repo, &["config", "branch.lane.remote", "second"]);
+                git_in(&repo, &["switch", "-c", "lane"]);
+            });
+            assert_eq!(once, 1, "branch switched");
+            assert_eq!(answer.remote, "second");
+        });
+    }
+
     /// The lookups read a failed spawn as "not set", so under load a refusal
     /// produced "origin" and no base. A memo must not keep that: the next ask
     /// after load falls has to see the repository, with nothing changed on
@@ -9437,12 +9882,12 @@ mod tests {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let lookups = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            crate::engine::process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                 .count()
         };
-        let refused = crate::engine::git_cli::with_forced_spawn_failure(|| default_base(&repo));
+        let refused = crate::engine::process::with_forced_spawn_failure(|| default_base(&repo));
         assert_eq!(
             refused.base, None,
             "every spawn failed, so nothing resolved"
@@ -9485,7 +9930,7 @@ mod tests {
     fn a_default_branch_read_through_a_refusal_is_an_error_not_none() {
         let dir = init_repo_with_remotes(&["origin"], "main");
         let path = dir.path().to_str().unwrap().to_string();
-        let refused = crate::engine::git_cli::with_forced_spawn_failure(|| {
+        let refused = crate::engine::process::with_forced_spawn_failure(|| {
             GitReader::default_branch_name(&path)
         });
         let error = refused.expect_err("a refusal is not an absent default branch");
@@ -9512,7 +9957,7 @@ mod tests {
         let lookups = {
             let repo = repo.clone();
             move || {
-                crate::engine::git_cli::spawn_log::spawns_in(&repo)
+                crate::engine::process::spawn_log::spawns_in(&repo)
                     .iter()
                     .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
                     .count()
@@ -9522,7 +9967,7 @@ mod tests {
         let leader = {
             let repo = repo.clone();
             std::thread::spawn(move || {
-                crate::engine::git_cli::with_forced_spawn_failure_then(
+                crate::engine::process::with_forced_spawn_failure_then(
                     move || {
                         let _ = entered_tx.send(());
                         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -9684,7 +10129,7 @@ mod tests {
         for caller in callers {
             caller.join().unwrap();
         }
-        let lookups = crate::engine::git_cli::spawn_log::spawns_in(&repo)
+        let lookups = crate::engine::process::spawn_log::spawns_in(&repo)
             .iter()
             .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
             .count();
@@ -10074,7 +10519,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let path = dir.path().to_str().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let listings = || {
-            git_cli::spawn_log::spawns_in(&root)
+            process::spawn_log::spawns_in(&root)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a.contains("%(ahead-behind:")))
                 .count()
@@ -10141,7 +10586,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let path = dir.path().to_str().unwrap();
         let atom = format!("%00%(ahead-behind:{})", oids["main"]);
         let listing_spawns = |name: &str| {
-            git_cli::spawn_log::spawns_in(&dir.path().canonicalize().unwrap())
+            process::spawn_log::spawns_in(&dir.path().canonicalize().unwrap())
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == name))
                 .count()
@@ -10150,7 +10595,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let branch_arg = format!("--format={BRANCH_LIST_FORMAT}{atom}");
         let before = listing_spawns("for-each-ref");
         let branches =
-            git_cli::with_forced_spawn_failure_of(&branch_arg, || GitReader::list_branches(path))
+            process::with_forced_spawn_failure_of(&branch_arg, || GitReader::list_branches(path))
                 .unwrap();
         assert_eq!(branches.len(), 5);
         assert!(branches
@@ -10164,7 +10609,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
 
         let tag_arg = format!("--format={TAG_LIST_FORMAT}{atom}");
         let tags =
-            git_cli::with_forced_spawn_failure_of(&tag_arg, || GitReader::list_tags(path)).unwrap();
+            process::with_forced_spawn_failure_of(&tag_arg, || GitReader::list_tags(path)).unwrap();
         assert_eq!(tags.tags.len(), 3);
         assert!(tags
             .tags
@@ -12876,7 +13321,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     /// the re-read, and an addition with no source stops after the pairing.
     #[test]
     fn one_file_diff_pays_for_pairing_only_when_the_file_is_added() {
-        use crate::engine::git_cli::spawn_log::spawns_in;
+        use crate::engine::process::spawn_log::spawns_in;
         let dir = init_repo_with_remotes(&[], "main");
         let path = dir.path().to_str().unwrap();
         let oid = merge_with_second_parent(
@@ -12890,7 +13335,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             },
             |_| {},
         );
-        let repo = crate::engine::git_cli::canonicalize_plain(dir.path()).unwrap();
+        let repo = crate::engine::process::canonicalize_plain(dir.path()).unwrap();
         // (all `show` spawns, those that are the pairing read)
         let shows = |file: &str| {
             let before = spawns_in(&repo).len();
@@ -13526,7 +13971,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     fn a_deadline_with_complete_commits_is_a_truncated_pulse_not_an_error() {
         let captured = super::assemble_pulse_capture(
             &two_commit_pulse_log(),
-            Some(crate::engine::git_cli::Incomplete::Deadline {
+            Some(crate::engine::process::Incomplete::Deadline {
                 message: "git log timed out after 90s".into(),
                 over_cap: None,
             }),
@@ -13548,7 +13993,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     fn a_deadline_with_no_complete_commit_is_still_an_error() {
         let err = super::assemble_pulse_capture(
             "",
-            Some(crate::engine::git_cli::Incomplete::Deadline {
+            Some(crate::engine::process::Incomplete::Deadline {
                 message: "git log timed out after 90s".into(),
                 over_cap: None,
             }),
@@ -13656,7 +14101,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     }
 
     fn blame_spawns(root: &Path) -> usize {
-        git_cli::spawn_log::spawns_in(root)
+        process::spawn_log::spawns_in(root)
             .iter()
             .filter(|argv| argv.iter().any(|a| a == "blame"))
             .count()
@@ -13913,7 +14358,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
         let log_skips = |since: usize| -> Vec<String> {
-            git_cli::spawn_log::spawns_in(&repo)[since..]
+            process::spawn_log::spawns_in(&repo)[since..]
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "log"))
                 .filter_map(|argv| argv.iter().find(|a| a.starts_with("--skip=")).cloned())
@@ -13932,11 +14377,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 let first =
                     GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
                         .unwrap();
-                let before = git_cli::spawn_log::spawns_in(&repo).len();
+                let before = process::spawn_log::spawns_in(&repo).len();
                 let second =
                     GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
                         .unwrap();
-                let middle = git_cli::spawn_log::spawns_in(&repo).len();
+                let middle = process::spawn_log::spawns_in(&repo).len();
                 (first, second, before, middle)
             })
         });
@@ -13981,7 +14426,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
         let logs = || -> usize {
-            git_cli::spawn_log::spawns_in(&repo)
+            process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "log"))
                 .count()
@@ -14025,7 +14470,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
         let logs = || -> usize {
-            git_cli::spawn_log::spawns_in(&repo)
+            process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "log"))
                 .count()
@@ -14099,13 +14544,13 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
         let log_argvs = |since: usize| -> Vec<Vec<String>> {
-            git_cli::spawn_log::spawns_in(&repo)[since..]
+            process::spawn_log::spawns_in(&repo)[since..]
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "log"))
                 .cloned()
                 .collect()
         };
-        let spawned = || git_cli::spawn_log::spawns_in(&repo).len();
+        let spawned = || process::spawn_log::spawns_in(&repo).len();
         let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
         let whole = with_history_chunk(usize::MAX, || {
             GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
@@ -14189,17 +14634,17 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         }
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
-        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let before = process::spawn_log::spawns_in(&repo).len();
         let (rows, argvs) = with_history_chunk(10, || {
             eager_unhurried(|| {
                 // Starts 0, 10, 20 are held after this.
                 GitReader::read_commit_history_paged(path, 0, 22, None, None, RefScope::Named)
                     .unwrap();
-                let mid = git_cli::spawn_log::spawns_in(&repo).len();
+                let mid = process::spawn_log::spawns_in(&repo).len();
                 let rows =
                     GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
                         .unwrap();
-                let argvs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[mid..]
+                let argvs: Vec<Vec<String>> = process::spawn_log::spawns_in(&repo)[mid..]
                     .iter()
                     .filter(|argv| argv.iter().any(|a| a == "log"))
                     .cloned()
@@ -14207,7 +14652,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 (rows, argvs)
             })
         });
-        assert!(git_cli::spawn_log::spawns_in(&repo).len() > before);
+        assert!(process::spawn_log::spawns_in(&repo).len() > before);
         assert_eq!(rows.len(), 45);
         assert_eq!(argvs.len(), 1, "starts 30 and 40 are one walk: {argvs:?}");
         assert!(
@@ -14322,7 +14767,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             GitReader::read_commit_history_paged(path, 0, 45, None, None, RefScope::Named)
         })
         .unwrap();
-        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let before = process::spawn_log::spawns_in(&repo).len();
         // 400 bytes is three records: the walk covers no whole chunk of ten.
         let rows = with_history_walk_cap(400, || {
             with_history_chunk(10, || {
@@ -14337,7 +14782,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             whole.iter().map(|r| &r.id).collect::<Vec<_>>(),
             "a cut walk changed the window"
         );
-        let logs: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..]
+        let logs: Vec<Vec<String>> = process::spawn_log::spawns_in(&repo)[before..]
             .iter()
             .filter(|argv| argv.iter().any(|a| a == "log"))
             .cloned()
@@ -14368,13 +14813,13 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         }
         let repo = dir.path().canonicalize().unwrap();
         let path = repo.to_str().unwrap();
-        let before = git_cli::spawn_log::spawns_in(&repo).len();
+        let before = process::spawn_log::spawns_in(&repo).len();
         let rows = eager_unhurried(|| {
             GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named)
         })
         .unwrap();
         assert_eq!(rows.len(), 10, "the page reaches the root commit");
-        let spawned: Vec<Vec<String>> = git_cli::spawn_log::spawns_in(&repo)[before..].to_vec();
+        let spawned: Vec<Vec<String>> = process::spawn_log::spawns_in(&repo)[before..].to_vec();
         assert_eq!(spawned.len(), 1, "one page, one process: {spawned:?}");
         assert!(spawned[0].iter().any(|a| a == "log"), "{spawned:?}");
     }
@@ -14520,7 +14965,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let path = dir.path().to_str().unwrap();
 
         let (report, labels) =
-            git_cli::spawn_labels_during(|| GitReader::dora_report(path, Some(90)));
+            process::spawn_labels_during(|| GitReader::dora_report(path, Some(90)));
         let report = report.expect("report");
         let count = |label: &str| labels.iter().filter(|l| l.as_str() == label).count();
         assert_eq!(count("git name-rev"), 1, "{labels:?}");
@@ -14542,7 +14987,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let dir = repo_with_commits(3);
         git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
         let path = dir.path().to_str().unwrap();
-        let error = git_cli::with_forced_spawn_failure_of("--format=%s%x00%ct", || {
+        let error = process::with_forced_spawn_failure_of("--format=%s%x00%ct", || {
             GitReader::dora_report(path, Some(90))
         })
         .expect_err("a failed commit scan must fail the report");
@@ -14709,7 +15154,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
     /// Every `diff --numstat` child recorded for `root` so far.
     fn numstat_spawns(root: &Path) -> Vec<Vec<String>> {
-        crate::engine::git_cli::spawn_log::spawns_in(root)
+        crate::engine::process::spawn_log::spawns_in(root)
             .into_iter()
             .filter(|argv| argv.iter().any(|arg| arg == "--numstat"))
             .collect()
@@ -15553,7 +15998,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
         let path = root.to_str().unwrap();
         let numstats = || -> (usize, usize) {
-            let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
+            let spawned = crate::engine::process::spawn_log::spawns_in(&root);
             let cached = spawned
                 .iter()
                 .filter(|argv| {
@@ -15690,7 +16135,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 rows
             };
             let rev_lists = |root: &Path| {
-                git_cli::spawn_log::spawns_in(root)
+                process::spawn_log::spawns_in(root)
                     .iter()
                     .filter(|argv| argv.iter().any(|a| a == "rev-list"))
                     .count()
@@ -15715,7 +16160,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             let (_two, walked_root) = build();
             let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
             let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
-            let walked = git_cli::with_forced_spawn_failure_of(&format, || {
+            let walked = process::with_forced_spawn_failure_of(&format, || {
                 GitReader::branch_stats(walked_root.to_str().unwrap())
             })
             .unwrap();
@@ -15840,7 +16285,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let dir = init_repo_with_remotes(&["upstream"], "Feature");
         let repo = dir.path().canonicalize().unwrap();
         let config_reads = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            crate::engine::process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.iter().any(|a| a == "config" || a == "remote"))
                 .count()
@@ -15890,7 +16335,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             _ => "origin".to_string(),
         };
         let remote_listings = || {
-            crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            crate::engine::process::spawn_log::spawns_in(&repo)
                 .iter()
                 .filter(|argv| argv.last().is_some_and(|a| a == "remote"))
                 .count()
@@ -15917,7 +16362,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// Children started in `repo` since `before`, counted by the spawn gate's
     /// own log rather than inferred from timing.
     fn spawned_since(repo: &Path, before: usize) -> Vec<Vec<String>> {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .into_iter()
             .skip(before)
             .collect()
@@ -15930,7 +16375,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         eager_unhurried(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
             let details = GitReader::get_commit_details(&path, &head).expect("details");
             assert_eq!(details.summary, "touch files");
             assert_eq!(details.body, "body text");
@@ -15955,7 +16400,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
             let first = GitReader::get_commit_details(&path, &head).expect("first");
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
             let again = GitReader::get_commit_details(&path, &head).expect("again");
             let spawned = spawned_since(&repo, before);
             assert!(spawned.is_empty(), "re-selecting spawned {spawned:?}");
@@ -15974,7 +16419,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             let path = repo.to_string_lossy().into_owned();
             let short = &head[..12];
             for round in 0..2 {
-                let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+                let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
                 let details = GitReader::get_commit_details(&path, short).expect("details");
                 assert_eq!(details.id, head);
                 assert_eq!(
@@ -16092,7 +16537,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             assert_eq!(details.total_additions, details.changed_files.len());
             assert_eq!(details.summary, "touch files");
 
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
             GitReader::commit_details_capped(&path, &head, cap).expect("cut again");
             assert_eq!(
                 spawned_since(&repo, before).len(),
@@ -16329,9 +16774,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         }
         git_in(path, &["update-ref", "refs/heads/main", &parent]);
         let root = path.canonicalize().unwrap();
-        let before = git_cli::spawn_log::spawns_in(&root).len();
+        let before = process::spawn_log::spawns_in(&root).len();
         let report = GitReader::pulse_report(path.to_str().unwrap(), None).unwrap();
-        let used = git_cli::spawn_log::spawns_in(&root)[before..].to_vec();
+        let used = process::spawn_log::spawns_in(&root)[before..].to_vec();
         assert_eq!(report.commits.len(), 31);
         assert!(
             report
@@ -16777,7 +17222,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     // ---- CARD 20 adversarial review ------------------------------------
 
     fn adv_lookups(repo: &Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| argv.iter().any(|arg| arg == DEFAULT_BASE_MARKER))
             .count()
@@ -16960,7 +17405,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             let dir = init_repo_with_remotes(&["origin"], "main");
             let repo = dir.path().canonicalize().unwrap();
             eager_unhurried(|| {
-                let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
+                let refused = crate::engine::process::with_forced_spawn_failure_of(needle, || {
                     default_base(&repo)
                 });
                 assert!(
@@ -17550,7 +17995,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         };
         let marked = GitReader::note_pairing_list_cut(
             whole.clone(),
-            Some(git_cli::Incomplete::OverCap(4 * 1024 * 1024).describe()),
+            Some(process::Incomplete::OverCap(4 * 1024 * 1024).describe()),
             PatchSource::Commit("abc"),
         );
         assert!(marked.truncated);
@@ -18255,12 +18700,12 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 fast_import(dir.path(), &[seed, hot]);
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
-                let before = git_cli::spawn_log::spawns_in(&root).len();
+                let before = process::spawn_log::spawns_in(&root).len();
                 let report = GitReader::knowledge_report(path, None).expect("cold");
-                let cold = git_cli::spawn_log::spawns_in(&root);
+                let cold = process::spawn_log::spawns_in(&root);
                 let cold_n = cold.len() - before;
                 GitReader::knowledge_report(path, None).expect("warm");
-                let warm = git_cli::spawn_log::spawns_in(&root);
+                let warm = process::spawn_log::spawns_in(&root);
                 let warm_n = warm.len() - before - cold_n;
                 let by = |log: &[Vec<String>], word: &str| {
                     log.iter().filter(|a| a.iter().any(|x| x == word)).count()
@@ -18546,14 +18991,14 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let arg = format!("--format=%(objectname)%00%(ahead-behind:{base})");
             let retry_arg = "--format=%(objectname)".to_string();
             let retries = || {
-                git_cli::spawn_log::spawns_in(&root)
+                process::spawn_log::spawns_in(&root)
                     .iter()
                     .filter(|argv| argv.contains(&retry_arg))
                     .count()
             };
             let before = retries();
             let got =
-                git_cli::with_forced_spawn_failure_of(&arg, || tip_counts_against(&root, &base));
+                process::with_forced_spawn_failure_of(&arg, || tip_counts_against(&root, &base));
             assert_eq!(got, None);
             assert_eq!(
                 retries(),
@@ -18826,7 +19271,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 git_in(other.path(), &["commit", "-m", "feat: a"]);
                 let other_root = other.path().canonicalize().unwrap();
                 let asks = |root: &Path| {
-                    git_cli::spawn_log::spawns_in(root)
+                    process::spawn_log::spawns_in(root)
                         .iter()
                         .filter(|argv| argv.iter().any(|a| a == "rev-parse"))
                         .count()
@@ -18925,5 +19370,523 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             });
             assert_eq!(extra, 1, "a HOME rebind brought back extra computations");
         }
+    }
+}
+
+#[cfg(test)]
+mod relocated_cli_cycle_tests {
+    use super::*;
+    use crate::engine::git_cli::{
+        git_text, sandbox_overwrite_edited_text, sandbox_save_edited_text,
+        sandbox_write_edited_text, FileWriteError, PINNED_GIT_CONFIG, STATUS_ARGV,
+    };
+    use crate::procguard::LockedSpawn;
+    use crate::test_support::{commit_at, git_in};
+    use std::path::Path;
+
+    /// S3-08. One status argv, shared by the file list and the worktree scans,
+    /// and `status.showUntrackedFiles=all` pinned beside the other settings a
+    /// developer's own config must not change.
+    #[test]
+    fn every_status_read_shares_one_argv_and_the_untracked_setting_is_pinned() {
+        assert_eq!(
+            crate::engine::git_reader::GitReader::STATUS_ARGV,
+            STATUS_ARGV
+        );
+        assert!(STATUS_ARGV.contains(&"-u") && STATUS_ARGV.contains(&"-z"));
+        assert!(PINNED_GIT_CONFIG.contains(&"status.showUntrackedFiles=all"));
+        assert!(
+            include_str!("git_reader.rs").contains("= crate::engine::git_cli::STATUS_ARGV;"),
+            "GitReader::STATUS_ARGV must alias the shared constant, not restate it"
+        );
+        assert!(
+            include_str!("worktree.rs").contains("crate::engine::git_cli::STATUS_ARGV.to_vec()"),
+            "the worktree scans must read status through the shared constant"
+        );
+    }
+
+    /// What the file editor's `<textarea>` hands back: the HTML spec's value
+    /// sanitization turns every CRLF pair and every lone CR into LF.
+    fn textarea_value(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    /// Open → edit one line → save, exactly as the file viewer does it.
+    fn editor_round_trip(
+        dir: &Path,
+        file: &str,
+        edit: impl Fn(&str) -> String,
+    ) -> Result<(), CommandError> {
+        let raw = dir.to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, file, None)?;
+        let shown = textarea_value(blob.text.as_deref().expect("text file"));
+        sandbox_write_edited_text(&raw, file, &edit(&shown)).map_err(CommandError::from)
+    }
+
+    #[test]
+    fn editor_round_trip_keeps_crlf_outside_and_inside_the_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("win.txt"), b"one\r\ntwo\r\nthree\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "win.txt", None).unwrap();
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Crlf));
+        assert_eq!(blob.invalid_utf8_bytes, 0);
+
+        editor_round_trip(dir.path(), "win.txt", |text| {
+            text.replace("two", "TWO\nand more")
+        })
+        .expect("save");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("win.txt")).unwrap(),
+            b"one\r\nTWO\r\nand more\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_keeps_lf_files_byte_exact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("unix.txt"), "one\ntwo\ncafé\n").unwrap();
+
+        editor_round_trip(dir.path(), "unix.txt", |text| text.replace("two", "TWO")).expect("save");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("unix.txt")).unwrap(),
+            "one\nTWO\ncafé\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_never_rewrites_latin1_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let original = b"caf\xe9\nna\xefve\n".to_vec();
+        std::fs::write(dir.path().join("latin1.txt"), &original).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "latin1.txt", None).unwrap();
+        assert_eq!(
+            blob.invalid_utf8_bytes, 2,
+            "the reader must report the lossy decode"
+        );
+
+        let err = editor_round_trip(dir.path(), "latin1.txt", |text| text.replace("na", "NA"))
+            .expect_err("a lossy decode must not be saved");
+        assert!(
+            err.contains("2 byte(s)") && err.contains("not valid UTF-8"),
+            "got: {err}",
+            err = err.message()
+        );
+
+        assert_eq!(
+            std::fs::read(dir.path().join("latin1.txt")).unwrap(),
+            original,
+            "a lossy decode must never be written back over the original bytes"
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_refuses_mixed_line_endings_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let original = b"one\r\ntwo\nthree\r\n".to_vec();
+        std::fs::write(dir.path().join("mixed.txt"), &original).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "mixed.txt", None).unwrap();
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Mixed));
+
+        let err = editor_round_trip(dir.path(), "mixed.txt", |text| text.replace("two", "TWO"))
+            .expect_err("mixed endings cannot be kept per line");
+        assert!(
+            err.contains("mixes line endings"),
+            "got: {err}",
+            err = err.message()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("mixed.txt")).unwrap(),
+            original
+        );
+    }
+
+    fn open_base(raw: &str, file: &str) -> String {
+        crate::engine::GitReader::get_file_blob(raw, file, None)
+            .unwrap()
+            .disk_base
+            .expect("a working-tree read carries a base")
+    }
+
+    #[test]
+    fn save_with_stale_base_is_refused_and_disk_keeps_external_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::write(dir.path().join("a.txt"), "agent wrote this\n").unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "my draft\n", Some(&base))
+            .expect_err("stale base");
+        match err {
+            FileWriteError::ChangedOnDisk {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, base);
+                assert_eq!(actual, open_base(&raw, "a.txt"));
+            }
+            other => panic!("expected changed_on_disk, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"agent wrote this\n"
+        );
+    }
+
+    #[test]
+    fn save_with_current_base_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).expect("current base");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn saved_returns_new_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        let saved = sandbox_save_edited_text(&raw, "a.txt", "two\n", Some(&base)).unwrap();
+        assert_eq!(saved.disk_base, open_base(&raw, "a.txt"));
+        // The returned base is the one the next save of the same draft carries.
+        sandbox_save_edited_text(&raw, "a.txt", "three\n", Some(&saved.disk_base))
+            .expect("chained save");
+    }
+
+    #[test]
+    fn view_only_reads_skip_the_base_and_the_editor_open_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let open = crate::engine::GitReader::get_file_blob(&raw, "a.txt", None).unwrap();
+        assert!(
+            open.disk_base.is_some(),
+            "the editor open must carry a base"
+        );
+        let view = crate::engine::GitReader::get_file_blob_view(&raw, "a.txt", None).unwrap();
+        assert_eq!(
+            view.disk_base, None,
+            "a view-only read must not pay for one"
+        );
+        assert_eq!(view.text, open.text);
+        assert_eq!(
+            crate::engine::GitReader::get_file_content(&raw, "a.txt", None).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn crlf_base_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("w.txt"), "a\r\nb\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "w.txt");
+        let saved = sandbox_save_edited_text(&raw, "w.txt", "a\nB\n", Some(&base)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("w.txt")).unwrap(),
+            b"a\r\nB\r\n"
+        );
+        assert_eq!(saved.disk_base, open_base(&raw, "w.txt"));
+    }
+
+    #[test]
+    fn a_file_renamed_while_open_reports_absent_and_overwrite_recreates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let base = open_base(&raw, "a.txt");
+        std::fs::rename(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
+        let err = sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&base)).expect_err("gone");
+        let FileWriteError::ChangedOnDisk { actual, .. } = err else {
+            panic!("expected changed_on_disk, got {err:?}");
+        };
+        assert_eq!(actual, "absent");
+        sandbox_save_edited_text(&raw, "a.txt", "x\n", Some(&actual)).expect("overwrite");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"x\n");
+    }
+
+    /// Overwrite keeps the user's buffer when the encoder cannot round-trip
+    /// what is on disk, and an ordinary save of the same file is still refused.
+    #[test]
+    fn overwrite_writes_the_buffer_byte_exactly_over_unencodable_disk_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let raw = dir.path().to_string_lossy().into_owned();
+        for (name, on_disk) in [
+            ("mixed.txt", b"a\r\nb\nc\r\n".as_slice()),
+            ("latin1.txt", b"caf\xe9\n".as_slice()),
+        ] {
+            std::fs::write(dir.path().join(name), on_disk).unwrap();
+            let base = open_base(&raw, name);
+            let refused = sandbox_save_edited_text(&raw, name, "mine\r\nline\n", Some(&base))
+                .expect_err("an ordinary save is still refused");
+            assert!(
+                matches!(refused, FileWriteError::Refused { .. }),
+                "{refused:?}"
+            );
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), on_disk);
+            let saved = sandbox_overwrite_edited_text(&raw, name, "mine\r\nline\n", Some(&base))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                b"mine\r\nline\n",
+                "{name}: the buffer, byte for byte"
+            );
+            assert_eq!(saved.disk_base, open_base(&raw, name));
+        }
+    }
+
+    #[test]
+    fn overwrite_still_judges_the_base_and_keeps_crlf_for_a_clean_crlf_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let raw = dir.path().to_string_lossy().into_owned();
+        std::fs::write(dir.path().join("w.txt"), "a\r\nb\r\n").unwrap();
+        let base = open_base(&raw, "w.txt");
+        std::fs::write(dir.path().join("w.txt"), "moved\r\n").unwrap();
+        let err = sandbox_overwrite_edited_text(&raw, "w.txt", "x\n", Some(&base))
+            .expect_err("a stale base is refused");
+        assert!(
+            matches!(err, FileWriteError::ChangedOnDisk { .. }),
+            "{err:?}"
+        );
+        let current = open_base(&raw, "w.txt");
+        sandbox_overwrite_edited_text(&raw, "w.txt", "x\ny\n", Some(&current)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("w.txt")).unwrap(),
+            b"x\r\ny\r\n"
+        );
+        assert!(sandbox_overwrite_edited_text(&raw, ".git/config", "x", None).is_err());
+    }
+
+    #[test]
+    fn get_file_blob_reports_no_text_shape_for_binary_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("data.bin"), b"\x00\xff\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "data.bin", None).unwrap();
+        assert!(blob.is_binary);
+        assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
+    }
+
+    fn init_plain_git_repo(dir: &Path) {
+        let output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir)
+            .output_locked()
+            .expect("spawn git init");
+        assert!(output.status.success());
+        crate::test_support::trust_repo(dir);
+    }
+
+    /// A history window is read as one long walk cut into chunks. Cancelled at that
+    /// walk, it keeps nothing in `ref_cache` and leaves no state for the next
+    /// call: a later call walks again and returns the whole window.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_history_read_ahead_keeps_nothing_and_leaks_nothing_into_the_next_call() {
+        use super::{with_history_chunk, GitReader};
+        use crate::graph::RefScope;
+        let repo = crate::test_support::git_repo();
+        for n in 0..12 {
+            crate::test_support::git_in(
+                repo.path(),
+                &["commit", "--allow-empty", "-q", "-m", &format!("c{n}")],
+            );
+        }
+        let path = repo.path().to_str().unwrap().to_string();
+        let window = |path: &str| {
+            GitReader::read_commit_history_paged(path, 0, 10, None, None, RefScope::Named)
+        };
+        crate::engine::ref_cache::eager(|| {
+            with_history_chunk(3, || {
+                // The window's first walk is cancelled as it starts, by the caller
+                // leaving: the hook is the caller's abort landing at that spawn.
+                let scope =
+                    crate::engine::process::read_cancel::ReadScope::open(Some("rc-readahead"));
+                let outcome = {
+                    let _in = scope.enter();
+                    crate::engine::process::with_forced_spawn_failure_then(
+                        || {
+                            crate::engine::process::read_cancel::cancel("rc-readahead");
+                        },
+                        || window(&path),
+                    )
+                };
+                assert!(
+                    outcome.is_err(),
+                    "the cancelled window must not return rows"
+                );
+                drop(scope);
+
+                // Nothing was kept: the same window, asked again, walks.
+                let (again, walks) = crate::engine::process::spawn_labels_during(|| window(&path));
+                let rows = again.expect("a later call is a fresh read");
+                assert_eq!(rows.len(), 10, "the whole window comes back");
+                assert!(
+                    walks.iter().any(|label| label == "git log"),
+                    "an answer was kept from the cancelled read: {walks:?}"
+                );
+
+                // And what that call kept is whole: asked a third time, it is served.
+                let (third, walks) = crate::engine::process::spawn_labels_during(|| window(&path));
+                assert_eq!(third.unwrap().len(), rows.len());
+                assert!(
+                    !walks.iter().any(|label| label == "git log"),
+                    "the control: a complete window is kept ({walks:?})"
+                );
+            })
+        });
+    }
+
+    fn repo_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        commit_at(dir.path(), "one", 1_700_000_000, "a@example.com");
+        git_in(dir.path(), &["branch", "x"]);
+        dir
+    }
+
+    // ---- unborn HEAD -------------------------------------------------------------
+
+    fn head_error(repo: &Path) -> String {
+        git_text(repo, &["log", "-n1", "--format=%H"])
+            .expect_err("HEAD does not resolve")
+            .into_message()
+    }
+
+    #[test]
+    fn fresh_init_and_orphan_branch_are_unborn() {
+        let fresh = tempfile::TempDir::new().unwrap();
+        git_in(fresh.path(), &["init", "-q", "-b", "main"]);
+        assert!(head_is_unborn(fresh.path(), &head_error(fresh.path())));
+        let p = fresh.path().to_str().unwrap();
+        assert!(GitReader::pulse_report(p, None).unwrap().commits.is_empty());
+        assert!(GitReader::dora_report(p, Some(90)).is_ok());
+
+        let repo = repo_with_commit();
+        git_in(repo.path(), &["checkout", "-q", "--orphan", "o"]);
+        assert!(head_is_unborn(repo.path(), &head_error(repo.path())));
+        // `main` still has history, so the named walk is an answer, not an error.
+        assert!(GitReader::pulse_report(repo.path().to_str().unwrap(), None).is_ok());
+    }
+
+    #[test]
+    fn a_linked_worktree_with_an_unborn_branch_is_unborn() {
+        let repo = repo_with_commit();
+        let wt_parent = tempfile::TempDir::new().unwrap();
+        let wt = wt_parent.path().join("wt");
+        git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--orphan",
+                "-b",
+                "wtb",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert!(head_is_unborn(&wt, &head_error(&wt)), "{}", head_error(&wt));
+    }
+
+    #[test]
+    fn a_damaged_loose_ref_is_not_unborn() {
+        for garbage in ["garbage\n", ""] {
+            let repo = repo_with_commit();
+            git_in(repo.path(), &["branch", "-D", "x"]);
+            std::fs::write(repo.path().join(".git/refs/heads/main"), garbage).unwrap();
+            let err = head_error(repo.path());
+            assert!(!head_is_unborn(repo.path(), &err), "{garbage:?}: {err}");
+            let p = repo.path().to_str().unwrap();
+            assert!(GitReader::pulse_report(p, None).is_err(), "{garbage:?}");
+            assert!(GitReader::dora_report(p, Some(90)).is_err(), "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn a_packed_only_ref_resolves_and_is_not_unborn() {
+        let repo = repo_with_commit();
+        git_in(repo.path(), &["pack-refs", "--all"]);
+        assert!(!repo.path().join(".git/refs/heads/main").exists());
+        let p = repo.path().to_str().unwrap();
+        assert_eq!(GitReader::pulse_report(p, None).unwrap().commits.len(), 1);
+    }
+
+    /// BREAK: git calls a branch whose ref path is an (empty) DIRECTORY unborn
+    /// (`your current branch 'main' does not have any commits yet`), but
+    /// `head_ref_is_absent` tests `Path::exists`, which is true for a directory. A
+    /// leftover empty `refs/heads/feature/` directory after `feature/x` was
+    /// deleted, with HEAD on a new unborn `feature`, is a real unborn repository
+    /// that is reported as an error.
+    #[test]
+    fn an_unborn_branch_whose_ref_path_is_an_empty_directory_is_unborn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.path().join(".git/refs/heads/main")).unwrap();
+        let err = head_error(dir.path());
+        assert!(err.contains("does not have any commits"), "{err}");
+        assert!(head_is_unborn(dir.path(), &err), "{err}");
+        let p = dir.path().to_str().unwrap();
+        assert!(GitReader::pulse_report(p, None).unwrap().commits.is_empty());
+        assert!(GitReader::dora_report(p, Some(90)).is_ok());
+    }
+
+    /// Reftable: refs are not files, so `rev-parse --git-path refs/heads/main`
+    /// names a path that never exists. An unborn branch is correctly unborn; the
+    /// absent-file test cannot tell a present-but-broken reftable ref from an
+    /// absent one (see the report: unverified, no way found to damage one).
+    #[test]
+    fn a_fresh_reftable_repo_is_unborn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", "--ref-format=reftable"])
+            .arg(dir.path())
+            .output_locked()
+            .unwrap();
+        if !init.status.success() {
+            return;
+        }
+        // GitPulse's repository trust gate refuses a reftable repository before
+        // any read, so the classifier is never asked: the git probe itself says so.
+        let error = git_text(dir.path(), &["log", "-n1", "--format=%H"]).expect_err("no commits");
+        assert!(
+            error.contains("REPOSITORY_TRUST_REQUIRED")
+                || head_is_unborn(dir.path(), error.message()),
+            "{error}",
+            error = error.message()
+        );
+    }
+
+    /// A deferred or timed-out probe never reads as unborn.
+    #[test]
+    fn a_probe_that_did_not_run_is_not_unborn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        for err in [
+        "git log timed out after 90s",
+        "git log deferred under load after 0.500s: the git spawn rate limit admitted nothing sooner",
+        "fatal: not a git repository",
+    ] {
+        assert!(!head_is_unborn(dir.path(), err), "{err}");
+    }
     }
 }

@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::engine::git_cli::{self, Incomplete};
+use crate::engine::git_cli;
+use crate::engine::process::{self, Incomplete};
 
 /// How close to "now" a stamped timestamp may be before the stamp is not
 /// trusted to tell two writes apart. Generous for 1–2 s filesystems.
@@ -441,6 +442,77 @@ pub(crate) fn git_text(
     })
 }
 
+/// What `HEAD` names in `repo`, read from the files themselves: the namespaces
+/// (a single loose ref, as a path relative to the git directory) its answer is
+/// a function of, or [`ALL_REFS`] when that cannot be said exactly.
+///
+/// The exact case is a `HEAD` that is a plain `ref: refs/...` line whose target
+/// is not itself a symref, or a detached object id (nothing to name: the
+/// answer is the id). The target is stamped as one path whether it is loose or
+/// only in `packed-refs`; the stamp always carries `HEAD`, `packed-refs`,
+/// config and the replace refs besides. A target that is itself a symref, a
+/// `HEAD` that is neither shape, a path that could leave the git directory,
+/// and a reftable repository (whose refs live in tables no single path names)
+/// all answer [`ALL_REFS`], the stamp that cannot be too narrow.
+fn head_namespaces(repo: &Path) -> (Vec<String>, Option<String>) {
+    let whole = || (vec![ALL_REFS.to_string()], None);
+    let Ok((private, common)) = crate::repository_trust::git_directories(repo) else {
+        return whole();
+    };
+    if common.join("reftable").exists() {
+        return whole();
+    }
+    let Ok(head) = std::fs::read_to_string(private.join("HEAD")) else {
+        return whole();
+    };
+    let head = head.trim();
+    let Some(target) = head.strip_prefix("ref:").map(str::trim) else {
+        let detached = matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit());
+        return if detached {
+            (Vec::new(), Some(head.to_string()))
+        } else {
+            whole()
+        };
+    };
+    let plain = target.starts_with("refs/")
+        && Path::new(target)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    if !plain {
+        return whole();
+    }
+    // A loose target that is itself a symref moves with another ref, which the
+    // single path does not see. Per-worktree refs live in the private
+    // directory and the rest in the common one; either may hold it.
+    for dir in [&private, &common] {
+        if let Ok(content) = std::fs::read_to_string(dir.join(target)) {
+            if content.trim_start().starts_with("ref:") {
+                return whole();
+            }
+        }
+    }
+    (vec![target.to_string()], Some(format!("ref: {target}")))
+}
+
+/// [`git_text`] for an answer that is a function of `HEAD` alone (`rev-parse
+/// --verify HEAD^{commit}`): the stamp covers `HEAD`, the one ref it names and
+/// `packed-refs`, not the whole ref store. With dozens of agents moving refs
+/// across a repository's worktrees, a whole-store stamp is invalidated by
+/// someone else's branch on nearly every read, and each miss is a process.
+///
+/// `HEAD` is read before the stamp and again after it. If it moved in between,
+/// the namespace chosen from the first read may not be the one the answer names,
+/// so that answer is computed and not kept.
+pub(crate) fn git_text_head(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
+    let (namespaces, first) = head_namespaces(repo);
+    let namespaces: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    let stamp = stamp(repo, &namespaces);
+    let steady = namespaces == [ALL_REFS] || head_namespaces(repo).1 == first;
+    through_stamped(repo, args, stamp.as_ref().filter(|_| steady), || {
+        git_cli::git_text_shared(repo, args).map(|text| (text, true))
+    })
+}
+
 /// [`git_cli::git_text_capped_shared`] for a ref listing over `namespaces`.
 /// Only a complete answer is kept: a stream cut at the cap may also have been
 /// cut by a timeout, and the two are not told apart here.
@@ -563,7 +635,7 @@ pub(crate) fn through_stamped_coalesced(
     coalesced_flights().run(key, || through_stamped(repo, args, stamp, run))
 }
 
-type CoalesceKey = (PathBuf, Vec<String>, u64, git_cli::Admission);
+type CoalesceKey = (PathBuf, Vec<String>, u64, process::Admission);
 // A waiter is handed the leader's answer, and a refusal in it carries its own
 // kind, so the waiter's command types it the way the leader's does.
 type CoalescedFlights =
@@ -579,7 +651,7 @@ fn coalesce_key(repo: &Path, args: &[&str], stamp: &Stamp) -> CoalesceKey {
         repo.to_path_buf(),
         args.iter().map(|arg| (*arg).to_string()).collect(),
         stamp.0.fingerprint(),
-        git_cli::current_admission(),
+        process::current_admission(),
     )
 }
 
@@ -783,7 +855,7 @@ mod tests {
 
     fn fixture(ref_format: Option<&str>) -> Option<Fixture> {
         let holder = tempfile::tempdir().unwrap();
-        let base = crate::engine::git_cli::canonicalize_plain(holder.path()).unwrap();
+        let base = crate::engine::process::canonicalize_plain(holder.path()).unwrap();
         let main = base.join("main");
         std::fs::create_dir(&main).unwrap();
         let mut init = vec!["init", "-q", "-b", "main"];
@@ -1128,7 +1200,7 @@ mod tests {
                 git_text(&fx.main, BRANCHES, BRANCH_ARGS).unwrap();
             }
         });
-        let spawned = git_cli::spawn_log::spawns_in(&fx.main)
+        let spawned = process::spawn_log::spawns_in(&fx.main)
             .into_iter()
             .filter(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
             .count();
@@ -1166,7 +1238,7 @@ mod tests {
                 crate::engine::GitReader::default_branch_name(path).unwrap();
             }
         });
-        let spawned = git_cli::spawn_log::spawns_in(&fx.main);
+        let spawned = process::spawn_log::spawns_in(&fx.main);
         let count = |needle: &str| {
             spawned
                 .iter()
@@ -1859,9 +1931,9 @@ mod tests {
                             {
                                 std::thread::yield_now();
                             }
-                            Err(git_cli::refusal_message(
+                            Err(process::refusal_message(
                                 "git log",
-                                git_cli::Refusal::Refused {
+                                process::Refusal::Refused {
                                     waited: Duration::from_millis(2000),
                                 },
                             ))

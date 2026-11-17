@@ -15,18 +15,19 @@ import { get } from "svelte/store";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
 import { interfaceStore } from "../src/lib/stores/interfaceStore";
+import { resetScanFailuresForTest } from "../src/lib/runtime/autoScan";
 import { terminalLaunchRequests } from "../src/lib/terminal/launchRequests";
 import { PROVIDER_LABELS } from "../src/lib/workbench/taskHandoff";
 import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
-import { hostLoadStatusFixture, idleReportFixture, leaseStatusFixture, previousBootFixture } from "./hostLoadFixture.ts";
+import { hostLoadStatusFixture, idleReportFixture, leaseStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
 import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
 const REPO = "/fixture/GitPulse";
 
 export async function runHealthChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setMode, setGithub } = ctx;
+  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS, setMode, setGithub } = ctx;
 
   const copied = [];
   const setClipboard = writeText => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
@@ -230,6 +231,10 @@ export async function runHealthChecks(ctx) {
     await settle();
 
     // ---- Scan lifecycle: one scan per visit, cache, no foreign data -------------
+    // Earlier checks failed scans on purpose, some on repositories used below. A
+    // failure holds automatic scans off (checked in the last block), so start
+    // from none rather than let those leak into these checks.
+    resetScanFailuresForTest();
     const visits = scanCalls("/fixture/Visit");
     const secretVisits = secretsScans("/fixture/Visit");
     await switchTo("/fixture/Visit");
@@ -242,9 +247,15 @@ export async function runHealthChecks(ctx) {
       secretsScans("/fixture/Visit") === secretVisits + 1 && scanCalls("/fixture/Visit") === visits + 1,
       () => `secrets ${secretsScans("/fixture/Visit") - secretVisits}, dependencies ${scanCalls("/fixture/Visit") - visits}`);
     knobs.scanDelay = 700;
+    const beforeRevisit = scanCalls(REPO);
     await switchTo("/fixture/Other");
     await switchTo(REPO);
-    check("a revisit shows the cached report while the fresh scan runs", () => !!section("summary") && button("Scan local").disabled);
+    // The dependency audit of a repository scanned a moment ago is still the
+    // answer (runtime/autoScan.ts owns "a moment"): a revisit shows it and runs
+    // no second audit. The rule's other side, a stale cache, is checked below.
+    await wait(300);
+    check("a revisit inside the freshness window shows the cached report and runs no new audit", () =>
+      !!section("summary") && scanCalls(REPO) === beforeRevisit, () => scanCalls(REPO) - beforeRevisit);
     await settle();
     await switchTo("/fixture/Fresh");
     check("a repository with nothing cached shows none of the previous repository's findings", () =>
@@ -360,6 +371,14 @@ export async function runHealthChecks(ctx) {
       secretsScans(REPO) === 1 && secretsScans("/fixture/Other") === 1);
     check("a clean secrets scan reads as clear in the summary", () =>
       has(section("summary"), "Secrets none") && has(section("secrets"), "No secrets reported"));
+    // The in-process engine found nothing and Kingfisher never ran: no finding,
+    // and nothing corroborated, so the facet is not clear either.
+    knobs.secrets = () => secretsReport([], { state: "not_run" });
+    button("Rescan secrets").click();
+    await until(() => !button("Rescan secrets").disabled && has(section("secrets"), "No known secret shapes matched"));
+    await wait();
+    check("an uncorroborated clean secrets scan reads as none matched, never clear", () =>
+      has(section("summary"), "Secrets none matched") && !has(section("secrets"), "No secrets reported"));
     knobs.secrets = () => {
       const findings = Array.from({ length: 12 }, (_, i) => finding(i));
       return { ...secretsReport(findings) };
@@ -392,6 +411,137 @@ export async function runHealthChecks(ctx) {
     button("Rescan secrets").click();
     await until(() => !button("Rescan secrets").disabled);
     await wait();
+
+    // ---- Automatic scans wait for the pane to settle (runtime/autoScan.ts) -------
+    // The checks above run with no settle so they can stay about their own
+    // subject; these run with the real one. A scan nobody looked at is work thrown
+    // away, so a visit shorter than the settle must start neither scan, a fresh
+    // result must start neither, and a click is never made to wait.
+    setAutoScanSettleMsForTest(null);
+    const pastSettle = () => wait(AUTO_SCAN_SETTLE_MS + 400);
+    const both = path => `secrets ${secretsScans(path)}, dependencies ${scanCalls(path)}`;
+    const counts = path => [secretsScans(path), scanCalls(path)].join("/");
+    try {
+      // A visit of ~170 ms (switchTo's own waits), left before the settle.
+      await switchTo("/fixture/Brief");
+      await detach();
+      await pastSettle();
+      check("a visit shorter than the settle starts no scan at all", () => counts("/fixture/Brief") === "0/0", () => both("/fixture/Brief"));
+
+      // The same repository again, and this time it stays.
+      await attach(); await wait();
+      check("a pane that has just mounted has not started a scan yet", () => counts("/fixture/Brief") === "0/0", () => both("/fixture/Brief"));
+      await pastSettle();
+      check("staying past the settle starts each scan exactly once, not once per visit", () => counts("/fixture/Brief") === "1/1", () => both("/fixture/Brief"));
+
+      // A valid result starts nothing, on any number of returns.
+      await remount(); await wait();
+      await remount(); await pastSettle();
+      check("returning to a repository with a fresh result starts no scan", () => counts("/fixture/Brief") === "1/1", () => both("/fixture/Brief"));
+      check("and shows that result at once", () => !!section("summary") && !!section("secrets"));
+
+      // Rapid A, B, A while the panel stays mounted: only the last survives.
+      await repoStore.openRepo("/fixture/SwitchA"); await wait(200);
+      await repoStore.openRepo("/fixture/SwitchB"); await wait(200);
+      await repoStore.openRepo("/fixture/SwitchA");
+      await pastSettle();
+      check("rapid A to B to A scans A once and B never", () =>
+        counts("/fixture/SwitchA") === "1/1" && counts("/fixture/SwitchB") === "0/0",
+        () => `A ${both("/fixture/SwitchA")}; B ${both("/fixture/SwitchB")}`);
+
+      // A click is immediate, and the wait it ended does not scan a second time.
+      await switchTo("/fixture/Clicked");
+      button("Scan local").click();
+      button("Rescan secrets").click();
+      await tick(); await wait(120);
+      check("a click scans at once, without waiting for the settle", () => counts("/fixture/Clicked") === "1/1", () => both("/fixture/Clicked"));
+      await pastSettle();
+      check("and the settle it cut short does not scan again", () => counts("/fixture/Clicked") === "1/1", () => both("/fixture/Clicked"));
+
+      // Leaving mid-scan keeps the result: the work that started is not thrown away.
+      knobs.scanDelay = 600;
+      knobs.secrets = () => new Promise(resolve => setTimeout(() => resolve(secretsReport()), 600));
+      await switchTo("/fixture/Leaver");
+      await wait(AUTO_SCAN_SETTLE_MS + 250);
+      check("both scans start once the pane has stayed", () => counts("/fixture/Leaver") === "1/1", () => both("/fixture/Leaver"));
+      await detach();
+      await wait(1000);
+      await attach(); await pastSettle();
+      knobs.scanDelay = 0;
+      knobs.secrets = null;
+      check("a scan finished after leaving is cached, so the return starts none", () => counts("/fixture/Leaver") === "1/1", () => both("/fixture/Leaver"));
+
+      // Back while the first scans are still running: they are joined, not repeated.
+      knobs.scanDelay = 2500;
+      knobs.secrets = () => new Promise(resolve => setTimeout(() => resolve(secretsReport()), 2500));
+      await switchTo("/fixture/Rejoin");
+      await wait(AUTO_SCAN_SETTLE_MS + 250);
+      check("the long scans are running", () => counts("/fixture/Rejoin") === "1/1", () => both("/fixture/Rejoin"));
+      await detach();
+      await wait(300);
+      await attach(); await wait(400);
+      check("a return while they run joins them and starts neither again", () => counts("/fixture/Rejoin") === "1/1", () => both("/fixture/Rejoin"));
+      await until(() => !!section("summary") && !!section("secrets")?.querySelector('[data-testid="secrets-verdict"]'));
+      await pastSettle();
+      knobs.scanDelay = 0;
+      knobs.secrets = null;
+      check("and shows their results, with no later second scan", () => counts("/fixture/Rejoin") === "1/1", () => both("/fixture/Rejoin"));
+
+      // A failed scan is not a scanned repository.
+      setMode("failed");
+      await switchTo("/fixture/Failing");
+      await pastSettle();
+      check("a failed audit is reported", () => has(root, "Fixture health scan failed"));
+      check("the failure says automatic scanning is paused and that a click retries", () =>
+        has(root, "Automatic scanning is paused after this failure") && has(root, "Rescan tries now."));
+      const failedOnce = scanCalls("/fixture/Failing");
+      const realNow = Date.now;
+      await remount(); await pastSettle();
+      // The visit that follows a failure is not another scan into the same failure.
+      check("a failed audit is not retried automatically on the next visit", () =>
+        scanCalls("/fixture/Failing") === failedOnce, () => both("/fixture/Failing"));
+      check("and the next visit still says the audit failed, never a clean report or 'not scanned yet'", () =>
+        has(root, "Fixture health scan failed") && has(root, "Automatic scanning is paused") && !section("summary"));
+      button("Scan local").click(); await tick(); await wait(150);
+      check("a click retries at once", () => scanCalls("/fixture/Failing") === failedOnce + 1, () => both("/fixture/Failing"));
+      setMode("findings");
+      Date.now = () => realNow() + 6 * 60_000;
+      try {
+        await remount(); await wait(300);
+        check("once the interval has passed the next visit waits for the settle, not for a click", () =>
+          scanCalls("/fixture/Failing") === failedOnce + 1, () => both("/fixture/Failing"));
+        await pastSettle();
+        check("and then scans again", () => scanCalls("/fixture/Failing") === failedOnce + 2 && !!section("summary"), () => both("/fixture/Failing"));
+      } finally {
+        Date.now = realNow;
+      }
+
+      // A result older than the freshness window is stale: it stays on screen
+      // through the wait and through the scan, and is then scanned again.
+      await switchTo("/fixture/Aged");
+      await pastSettle();
+      const agedScans = counts("/fixture/Aged");
+      Date.now = () => realNow() + 6 * 60_000;
+      try {
+        await remount(); await wait(300);
+        check("a stale result still waits for the settle", () => counts("/fixture/Aged") === agedScans, () => both("/fixture/Aged"));
+        check("and the stale report stays on screen during the wait", () => !!section("summary") && !button("Scan local").disabled);
+        knobs.scanDelay = 900;
+        await wait(AUTO_SCAN_SETTLE_MS - 300 + 250);
+        check("and stays on screen while the fresh scan runs", () =>
+          !!section("summary") && button("Scan local").disabled && scanCalls("/fixture/Aged") === 2);
+        await settle();
+        knobs.scanDelay = 0;
+        check("and is then scanned again", () => counts("/fixture/Aged") === "2/2", () => both("/fixture/Aged"));
+      } finally {
+        Date.now = realNow;
+      }
+    } finally {
+      setAutoScanSettleMsForTest(0);
+      knobs.scanDelay = 0;
+      knobs.secrets = null;
+      setMode("findings");
+    }
   } finally {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     reset();
@@ -492,6 +642,34 @@ export async function runHostLoadChecks(ctx) {
     // And back to none: the block goes.
     await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
     check("returning to no previous boot removes the block", () => !previous());
+
+    // Which session is writing to disk fastest. The rate is a floor and names
+    // a session, never a folder.
+    const fastest = () => root.querySelector('[data-testid="host-load-fastest-writer"]');
+    const rate = v => ({ status: "value", value: v });
+    const notYet = { status: "unavailable", value: "not_yet" };
+    const withProcs = (rates, truncated = false) =>
+      ({ ...hostLoadStatusFixture(), previous_boot: null, problems: [], procs: procViewFixture(rates, truncated) });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)]));
+    check("the session writing fastest is named with its pid, folder and a floor", () =>
+      !!fastest() && /^Writing fastest: Claude session 1202 in \/Users\/fixture\/code\/beta, at least 8\d(\.\d)? MB\/s$/.test(flat(fastest())));
+    check("the line says it is about a session, not a folder, and that the rate is a floor", () =>
+      has(card(), "not the folder that grew") && has(card(), "so the rate is a floor"));
+    check("each session row shows its own write rate as a floor", () => {
+      const rows = [...card().querySelectorAll("tbody tr")].filter(tr => /120[123]/.test(tr.textContent));
+      return rows.length === 3 && rows.filter(tr => tr.textContent.includes("at least")).length === 3 && !/NaN|undefined/.test(card().textContent);
+    });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)], true));
+    check("on a truncated session list the claim is only about the sessions shown", () =>
+      flat(fastest()).startsWith("Writing fastest of the sessions shown: Claude session 1202"));
+    await show(withProcs([rate(0), rate(0), rate(90 * 2 ** 20)]));
+    check("a session whose folder is unknown says so", () =>
+      has(fastest(), "Claude session 1203 in an unknown directory"));
+    await show(withProcs([notYet, notYet, notYet]));
+    check("with no baseline yet there is no fastest-writer line and no invented rate", () =>
+      !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
+    await show(withProcs([rate(0), rate(4096), rate(0)]));
+    check("when nobody writes above the threshold no session is named", () => !fastest());
   } finally {
     knobs.hostLoad = null;
     knobs.hostLoadLeases = null;

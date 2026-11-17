@@ -200,9 +200,10 @@ impl AgentDefaults {
         self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
     }
 
-    /// Whether terminals live in the terminal host rather than the app.
+    /// Whether managed agent runs live in a hosted Manvi rather than closing
+    /// with the app. (On Unix, terminal sessions always live in `gitpulse-ptyd`.)
     pub fn keeps_terminals_running(&self) -> bool {
-        self.keep_terminals_running.unwrap_or(false)
+        self.keep_terminals_running.unwrap_or(true)
     }
 
     /// The terminal session limit to apply: the stored one, or the default.
@@ -921,6 +922,20 @@ impl Default for HostLoadSettings {
 }
 
 impl HostLoadSettings {
+    /// These settings with the automatic disk floors worked out for this
+    /// machine's memory, so what a surface shows is what the governor decides
+    /// on. While the floors are automatic the numbers are not stored or read
+    /// back (`Thresholds::disk_auto`), so showing them costs nothing.
+    fn with_resolved_disk_floors(mut self) -> Self {
+        self.thresholds = self
+            .thresholds
+            .resolved(crate::sysload::physical_memory().map_or(
+                crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed),
+                crate::sysload::Reading::Value,
+            ));
+        self
+    }
+
     /// Whether the two switches are at their defaults: what decides whether
     /// the `host_load` block is written. The thresholds are stored apart.
     pub fn switches_default(&self) -> bool {
@@ -962,6 +977,24 @@ where
     thresholds.to_stored().serialize(serializer)
 }
 
+/// Reads `host_load_disk_guard` one guard at a time
+/// ([`crate::sysload::DiskGuard::from_stored`]).
+fn lenient_disk_guard<'de, D>(deserializer: D) -> Result<crate::sysload::DiskGuard, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(crate::sysload::DiskGuard::from_stored(raw))
+}
+
+/// Writes only the guards that differ from their default.
+fn write_disk_guard<S>(guard: &crate::sysload::DiskGuard, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    guard.to_stored().serialize(serializer)
+}
+
 /// Read leniently, like `lappi`: a malformed block keeps the default (on)
 /// and says so, rather than costing every other setting in the file.
 fn lenient_host_load<'de, D>(deserializer: D) -> Result<HostLoadSettings, D::Error>
@@ -975,6 +1008,41 @@ where
             "ignoring unreadable host_load block, the sensor stays on: {error}"
         );
         HostLoadSettings::default()
+    }))
+}
+
+/// Whether the hooks ask the app for a turn checkpoint at each agent turn
+/// boundary (`turn_checkpoints.enabled` in `tools.json`, under the platform
+/// config directory, or the file `GITPULSE_TOOL_CONFIG` names).
+///
+/// Off unless turned on: a checkpoint hashes the worktree's files, so it is
+/// the person's choice, never a default. A block this cannot read is read as
+/// off, and says so in the log. No UI sets it yet; write the key by hand:
+/// `{ "turn_checkpoints": { "enabled": true } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnCheckpointSettings {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl TurnCheckpointSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn lenient_turn_checkpoints<'de, D>(deserializer: D) -> Result<TurnCheckpointSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable turn_checkpoints block, checkpoints stay off: {error}"
+        );
+        TurnCheckpointSettings::default()
     }))
 }
 
@@ -1150,6 +1218,23 @@ pub struct ToolConfig {
         skip_serializing_if = "is_default_hook_mode"
     )]
     pub host_load_hook_mode: HostLoadHookMode,
+    /// The disk fill-rate horizon and the coverage headroom, a sibling of
+    /// `host_load_thresholds` rather than inside it: a build that predates them
+    /// rewrites that key from the inputs it knows and would drop these.
+    #[serde(
+        default,
+        deserialize_with = "lenient_disk_guard",
+        serialize_with = "write_disk_guard",
+        skip_serializing_if = "crate::sysload::DiskGuard::is_default"
+    )]
+    pub host_load_disk_guard: crate::sysload::DiskGuard,
+    /// Whether hooks take turn checkpoints. Off by default.
+    #[serde(
+        default,
+        deserialize_with = "lenient_turn_checkpoints",
+        skip_serializing_if = "TurnCheckpointSettings::is_default"
+    )]
+    pub turn_checkpoints: TurnCheckpointSettings,
     /// How heavy builds are leased (`sysload::lease`): only the fields that
     /// differ from their default are stored, at the top level so an older
     /// build keeps the key.
@@ -1191,6 +1276,8 @@ impl Default for ToolConfig {
             host_load: HostLoadSettings::default(),
             host_load_thresholds: crate::sysload::Thresholds::default(),
             host_load_hook_mode: HostLoadHookMode::default(),
+            host_load_disk_guard: crate::sysload::DiskGuard::default(),
+            turn_checkpoints: TurnCheckpointSettings::default(),
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
             unknown: serde_json::Map::new(),
@@ -1873,14 +1960,19 @@ pub fn set_verify_status(common_dir: &str, enabled: bool) -> Result<(), String> 
 /// read error is surfaced through [`view`].
 pub fn host_load_settings() -> HostLoadSettings {
     load()
-        .map(|cfg| HostLoadSettings {
-            thresholds: cfg.host_load_thresholds,
-            hook_mode: cfg.host_load_hook_mode,
-            leases: cfg.host_load_leases,
-            idle: cfg.host_load_idle,
-            ..cfg.host_load
+        .map(|cfg| {
+            let mut thresholds = cfg.host_load_thresholds;
+            thresholds.disk_guard = cfg.host_load_disk_guard;
+            HostLoadSettings {
+                thresholds,
+                hook_mode: cfg.host_load_hook_mode,
+                leases: cfg.host_load_leases,
+                idle: cfg.host_load_idle,
+                ..cfg.host_load
+            }
         })
         .unwrap_or_default()
+        .with_resolved_disk_floors()
 }
 
 /// What the `command-gate` hook does about load, or the default (enforce).
@@ -1909,6 +2001,28 @@ pub fn host_load_idle() -> HostLoadIdle {
     load().map(|cfg| cfg.host_load_idle).unwrap_or_default()
 }
 
+/// The stored turn-checkpoint switch. Any failure to read it is "off": a
+/// checkpoint is work the person opted into, and an unreadable file must not
+/// be what turns it on.
+pub fn turn_checkpoint_settings() -> TurnCheckpointSettings {
+    load().map(|cfg| cfg.turn_checkpoints).unwrap_or_default()
+}
+
+/// [`turn_checkpoint_settings`] read from `tools.json` in `dir`, for callers
+/// that already hold the profile directory (the hooks) and tests.
+pub fn turn_checkpoint_settings_in(dir: &Path) -> TurnCheckpointSettings {
+    read_disk(&dir.join("tools.json"))
+        .map(|cfg| cfg.turn_checkpoints)
+        .unwrap_or_default()
+}
+
+pub fn set_turn_checkpoint_settings(next: TurnCheckpointSettings) -> Result<(), String> {
+    update(|cfg| {
+        cfg.turn_checkpoints = next;
+        Ok(())
+    })
+}
+
 /// Stores the switches and the thresholds. A threshold that fails validation
 /// is refused with the reason, so the Settings row can show it; nothing is
 /// written then.
@@ -1921,6 +2035,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     }
     let mut cfg = load()?;
     cfg.host_load_thresholds = next.thresholds.clone();
+    cfg.host_load_disk_guard = next.thresholds.disk_guard;
     cfg.host_load_hook_mode = next.hook_mode;
     cfg.host_load_leases = next.leases.clone();
     cfg.host_load_idle = next.idle.clone();
@@ -2151,6 +2266,7 @@ mod tests {
         with_temp_config(|path| {
             let mut thresholds = Thresholds::default();
             thresholds.swap.mode = InputMode::Shed;
+            thresholds.disk_auto = false;
             thresholds.disk.severe_at = 5.0;
             set_host_load_settings(HostLoadSettings {
                 enabled: false,
@@ -2195,6 +2311,114 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert!(stored.get("host_load").is_none());
             assert!(stored.get("host_load_thresholds").is_some());
+        });
+    }
+
+    /// The disk guards (fill-rate horizon, coverage headroom) are stored as a
+    /// top-level `host_load_disk_guard` key of their own, because a build that
+    /// predates them rewrites `host_load_thresholds` from the keys it knows and
+    /// would drop these; and the automatic disk floors survive a round trip
+    /// through Settings that never touched them.
+    #[test]
+    fn the_disk_guards_have_their_own_key_and_automatic_floors_survive_a_settings_round_trip() {
+        use crate::sysload::{InputMode, Reading};
+        with_temp_config(|path| {
+            let mut settings = host_load_settings();
+            assert!(settings.thresholds.disk_auto);
+            // What Settings shows is what the governor decides on: resolved.
+            let shown = settings.thresholds.disk;
+            // Literal floors for a stated memory size, so this cannot agree
+            // with itself by running the same function twice.
+            let gib = |n: u64| Reading::Value(n << 30);
+            for (ram_gib, elevated, severe) in [
+                (8, 20.0, 10.0),
+                (32, 20.0, 10.0),
+                (64, 32.0, 16.0),
+                (128, 64.0, 32.0),
+            ] {
+                let at = settings.thresholds.resolved(gib(ram_gib)).disk;
+                assert_eq!(
+                    (at.elevated_at, at.severe_at),
+                    (elevated, severe),
+                    "{ram_gib} GiB of memory"
+                );
+            }
+            // A memory size nobody can read gives the smallest floors, never a
+            // guess; what this machine shows is whichever of those it is, and
+            // no assertion here depends on how much memory the test host has.
+            let unknown = settings
+                .thresholds
+                .resolved(Reading::Unavailable(crate::sysload::Why::Failed))
+                .disk;
+            assert_eq!((unknown.elevated_at, unknown.severe_at), (20.0, 10.0));
+            assert!(shown.elevated_at >= 20.0 && shown.severe_at >= 10.0);
+            // Load, change something else, save: the floors stay automatic and
+            // nothing is stored for them.
+            settings.thresholds.swap.mode = InputMode::Shed;
+            settings.thresholds.disk_guard.fill.elevated_within_min = 45.0;
+            settings.thresholds.disk_guard.coverage.headroom_gib = 80.0;
+            set_host_load_settings(settings).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored["host_load_thresholds"].get("disk").is_none());
+            assert_eq!(
+                stored["host_load_disk_guard"]["fill"]["elevated_within_min"],
+                45.0
+            );
+            assert_eq!(
+                stored["host_load_disk_guard"]["coverage"]["headroom_gib"],
+                80.0
+            );
+            assert!(
+                stored["host_load_thresholds"].get("disk_guard").is_none(),
+                "the guards never ride inside the key an older build rewrites"
+            );
+            let back = host_load_settings();
+            assert!(back.thresholds.disk_auto);
+            assert_eq!(back.thresholds.disk_guard.fill.elevated_within_min, 45.0);
+            assert_eq!(back.thresholds.disk_guard.coverage.headroom_gib, 80.0);
+            assert_eq!(back.thresholds.swap.mode, InputMode::Shed);
+
+            // A person's own floors are stored, and win over any memory size.
+            let mut explicit = back;
+            explicit.thresholds.disk_auto = false;
+            explicit.thresholds.disk.elevated_at = 20.0;
+            explicit.thresholds.disk.severe_at = 10.0;
+            set_host_load_settings(explicit).unwrap();
+            invalidate_cache();
+            let back = host_load_settings();
+            assert!(!back.thresholds.disk_auto);
+            assert_eq!(
+                (
+                    back.thresholds.disk.elevated_at,
+                    back.thresholds.disk.severe_at
+                ),
+                (20.0, 10.0)
+            );
+
+            // A value stored before the floors scaled has no `auto`: it stays
+            // the person's, whatever it equals.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_thresholds":{"disk":{"mode":"shed","elevated_at":25.0,"severe_at":12.0}}}"#,
+            );
+            let old = host_load_settings();
+            assert!(!old.thresholds.disk_auto);
+            assert_eq!(old.thresholds.disk.severe_at, 12.0);
+            assert_eq!(old.thresholds.disk.mode, InputMode::Shed);
+
+            // An unreadable guard keeps its default and costs nothing else.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_disk_guard":{"fill":"nope","coverage":{"mode":"shed","headroom_gib":-3}},"host_load_thresholds":{"swap":{"mode":"off","elevated_at":0.5,"severe_at":0.75}}}"#,
+            );
+            let lenient = host_load_settings();
+            assert_eq!(
+                lenient.thresholds.disk_guard,
+                crate::sysload::DiskGuard::default()
+            );
+            assert_eq!(lenient.thresholds.swap.mode, InputMode::Off);
         });
     }
 
@@ -2479,7 +2703,14 @@ mod tests {
                 path,
                 r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load_thresholds":[1,2]}"#,
             );
-            assert_eq!(host_load_settings().thresholds, defaults);
+            // Defaults, with the automatic disk floors shown for this machine.
+            assert_eq!(
+                host_load_settings().thresholds,
+                defaults.resolved(crate::sysload::physical_memory().map_or(
+                    crate::sysload::Reading::Unavailable(crate::sysload::Why::Failed),
+                    crate::sysload::Reading::Value
+                ))
+            );
             assert_eq!(
                 load().map(|c| c.devmap.binary).unwrap_or_default(),
                 Some("/tmp/fake".to_owned())
@@ -2487,6 +2718,7 @@ mod tests {
 
             // Saving an invalid value is refused with the reason, writing nothing.
             let mut bad = HostLoadSettings::default();
+            bad.thresholds.disk_auto = false;
             bad.thresholds.disk.severe_at = 99.0;
             let error = set_host_load_settings(bad).unwrap_err();
             assert!(error.starts_with("disk:"), "{error}");
@@ -2773,16 +3005,37 @@ mod tests {
     /// How many terminal sessions may be open is the user's: stored where the
     /// last release does not look, refused outside the terminal module's
     /// bounds at save, and degraded alone when a hand-edited value is bad.
-    /// "Keep terminals running when GitPulse quits": stored under
-    /// `agent_launch`, off when absent or unreadable, and what picks the
-    /// backend the app's registry is built on.
+    /// "Keep managed agent runs running when GitPulse quits": stored under
+    /// `agent_launch.keep_terminals_running`, on when absent or unreadable, and
+    /// independent of the terminal backend (which is unconditionally `host` on Unix).
     #[test]
-    fn keeping_terminals_running_is_stored_and_selects_the_terminal_host() {
+    fn keeping_terminals_running_is_stored_and_host_backend_stays_unconditional() {
         with_temp_config(|path| {
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
+            );
+            #[cfg(not(unix))]
             assert_eq!(
                 crate::terminal::TerminalSessions::from_settings().backend(),
                 "in-process"
+            );
+            let off = AgentDefaults {
+                keep_terminals_running: Some(false),
+                ..AgentDefaults::default()
+            };
+            set_agent_defaults(off.clone()).unwrap();
+            assert_eq!(agent_defaults(), off);
+            assert!(!agent_defaults().keeps_terminals_running());
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["keep_terminals_running"], false);
+            #[cfg(unix)]
+            assert_eq!(
+                crate::terminal::TerminalSessions::from_settings().backend(),
+                "host"
             );
             let on = AgentDefaults {
                 keep_terminals_running: Some(true),
@@ -2794,17 +3047,12 @@ mod tests {
             let written: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(written["agent_launch"]["keep_terminals_running"], true);
-            #[cfg(unix)]
-            assert_eq!(
-                crate::terminal::TerminalSessions::from_settings().backend(),
-                "host"
-            );
             // A value this build cannot read costs this setting alone.
             let mut text: serde_json::Value = written;
             text["agent_launch"]["keep_terminals_running"] = serde_json::json!("yes");
             text["agent_launch"]["max_terminal_sessions"] = serde_json::json!(40);
             fs::write(path, text.to_string()).unwrap();
-            assert!(!agent_defaults().keeps_terminals_running());
+            assert!(agent_defaults().keeps_terminals_running());
             assert_eq!(agent_defaults().terminal_sessions(), 40);
         });
     }
@@ -3317,3 +3565,7 @@ mod model_setting_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "tool_config_turn_checkpoint_tests.rs"]
+mod turn_checkpoint_tests;

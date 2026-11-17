@@ -59,7 +59,7 @@ fn an_integration_process_never_opens_the_per_user_spawn_budget() {
     // Opting in after the gate exists cannot take effect, and must say so
     // rather than leave a shipped binary silently on its own budget.
     let late = std::panic::catch_unwind(
-        gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget,
+        gitpulse_lib::engine::process::run_process_with_shared_spawn_budget,
     );
     assert!(late.is_err(), "a late opt-in was accepted");
     gitpulse_lib::engine::git_cli::git_global(&["--version"]).expect("git still runs");

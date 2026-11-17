@@ -33,6 +33,8 @@ export interface WatchCoordinatorDeps {
   refresh(repoPath?: string, facet?: HydrationFacet): Promise<void>;
   holdsPath(path: string): boolean;
   isHidden?: () => boolean;
+  /** The macOS watch scope to register with; absent means narrow. */
+  watchScope?: () => "narrow" | "whole";
   now?: () => number;
 }
 
@@ -55,11 +57,32 @@ export function createWatchCoordinator(deps: WatchCoordinatorDeps) {
 
   async function watch(path: string): Promise<WatchState> {
     try {
-      await invokeFn("cmd_watch_repo", { repoPath: path });
+      await invokeFn(
+        "cmd_watch_repo",
+        deps.watchScope?.() === "whole" ? { repoPath: path, scope: "whole" } : { repoPath: path },
+      );
       return WATCH_ACTIVE;
     } catch (err: unknown) {
       return watchFailed(err);
     }
+  }
+
+  /**
+   * Registers every admitted watch again, so a changed watch scope applies now
+   * rather than at the next 60 s re-assert. Goes through `serialWatch` per id.
+   */
+  async function reassertWatches(): Promise<void> {
+    await Promise.all(
+      watchPool.keys().map((id) =>
+        serialWatch(id, async () => {
+          if (!watchPool.has(id)) return;
+          const path = deps.sessionById(id)?.path;
+          if (!path) return;
+          const state = await watch(path);
+          if (watchPool.has(id)) setWatch(id, state);
+        }),
+      ),
+    );
   }
 
   async function noteTabActivated(path: string): Promise<void> {
@@ -230,6 +253,7 @@ export function createWatchCoordinator(deps: WatchCoordinatorDeps) {
 
   return {
     watch,
+    reassertWatches,
     noteTabActivated,
     admitWatch,
     hasWatch,

@@ -65,6 +65,7 @@ impl StormClassifier {
         let rules = IgnoreRules {
             prefixes,
             files: Default::default(),
+            dirs: Vec::new(),
             load_error: None,
             truncated,
         };

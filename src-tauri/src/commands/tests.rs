@@ -167,7 +167,8 @@ fn discard_is_never_shed_under_memory_pressure() {
         crate::sysload::shed(),
         crate::sysload::Shed {
             background: true,
-            reactive: true
+            reactive: true,
+            cause: Some(crate::sysload::Binding::MemoryPressure)
         },
         "the injected governor sheds reactive work"
     );
@@ -266,13 +267,13 @@ fn discard_probe_declares_modify_under_memory_pressure() {
     let root = dir.path().to_string_lossy().to_string();
     let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
     let unpromoted =
-        crate::engine::git_cli::run_command_scope(|| GitReader::is_tracked(&root, "README.md"));
+        crate::engine::process::run_command_scope(|| GitReader::is_tracked(&root, "README.md"));
     assert!(
         unpromoted.is_err(),
         "the probe is shed when unpromoted: {unpromoted:?}"
     );
     let declared =
-        crate::engine::git_cli::run_command_scope(|| Ok(discard_file_op(&root, "README.md")));
+        crate::engine::process::run_command_scope(|| Ok(discard_file_op(&root, "README.md")));
     assert_eq!(declared, Ok("modify"));
 }
 
@@ -286,7 +287,7 @@ fn a_clicked_file_write_is_judged_under_memory_pressure() {
     let dir = repo_with_tracked_and_untracked();
     let root = dir.path().to_string_lossy().to_string();
     let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
-    let unpromoted = crate::engine::git_cli::run_command_scope(|| {
+    let unpromoted = crate::engine::process::run_command_scope(|| {
         crate::harness::guard_file(&root, "README.md", "modify").map_err(CommandError::from)
     });
     assert!(
@@ -296,7 +297,7 @@ fn a_clicked_file_write_is_judged_under_memory_pressure() {
             .is_some_and(|e| e.contains("memory pressure")),
         "the lookup this guards against is shed when unpromoted: {unpromoted:?}"
     );
-    let clicked = crate::engine::git_cli::run_command_scope(|| {
+    let clicked = crate::engine::process::run_command_scope(|| {
         guard_file(&root, "README.md", "modify").map_err(CommandError::from)
     });
     assert!(
@@ -761,7 +762,7 @@ fn a_worktree_summary_whose_reads_failed_is_an_error_not_clean() {
     let path = repo.path().to_str().unwrap();
     let read = super::worktree_ai_summary(path, path, Some("main")).expect("summary");
     assert!(read.contains("HEAD±: clean"), "{read}");
-    let failed = crate::engine::git_cli::with_forced_spawn_failure(|| {
+    let failed = crate::engine::process::with_forced_spawn_failure(|| {
         super::worktree_ai_summary(path, path, Some("main"))
     });
     let error = failed.expect_err("no read answered, so there is no summary");
@@ -788,7 +789,7 @@ fn many_task_scopes_authenticate_the_repository_once() {
         crate::tasks::plant_task::plant(&store, id, "in_progress", "{}");
     }
     let listings = || {
-        crate::engine::git_cli::spawn_log::spawns_in(&repo)
+        crate::engine::process::spawn_log::spawns_in(&repo)
             .iter()
             .filter(|argv| argv.iter().any(|arg| arg == "worktree"))
             .count()
@@ -1056,7 +1057,7 @@ fn mainline_hint_detached_head_and_blank_ids() {
 fn spawns_naming(dirs: &[std::path::PathBuf], subcommand: &str) -> usize {
     dirs.iter()
         .map(|dir| {
-            crate::engine::git_cli::spawn_log::spawns_in(dir)
+            crate::engine::process::spawn_log::spawns_in(dir)
                 .iter()
                 .filter(|argv| argv.iter().any(|arg| arg == subcommand))
                 .count()
@@ -1070,7 +1071,7 @@ fn every_checkout(
     main: &std::path::Path,
     linked: &[std::path::PathBuf],
 ) -> Vec<std::path::PathBuf> {
-    let mut dirs = vec![crate::engine::git_cli::canonicalize_plain(main).unwrap()];
+    let mut dirs = vec![crate::engine::process::canonicalize_plain(main).unwrap()];
     dirs.extend(linked.iter().cloned());
     dirs
 }
@@ -1170,14 +1171,14 @@ fn worktree_listing_profile() {
         for _ in 0..5 {
             let before: usize = dirs
                 .iter()
-                .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+                .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
                 .sum();
             let started = std::time::Instant::now();
             list();
             best = best.min(started.elapsed());
             let after: usize = dirs
                 .iter()
-                .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+                .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
                 .sum();
             children = after - before;
         }
@@ -1393,7 +1394,7 @@ fn twenty_deep_branches() -> Vec<(String, usize)> {
 
 /// Rows of the spawn log for `repo` from `since` on.
 fn spawns_since(repo: &std::path::Path, since: usize) -> Vec<Vec<String>> {
-    crate::engine::git_cli::spawn_log::spawns_in(repo)[since..].to_vec()
+    crate::engine::process::spawn_log::spawns_in(repo)[since..].to_vec()
 }
 
 fn first_parent_walks(spawns: &[Vec<String>]) -> usize {
@@ -1424,7 +1425,7 @@ fn a_stack_refresh_repairs_twenty_branches_beyond_the_window_in_one_walk() {
     let _held = crate::engine::ref_cache::retention();
     let (_dir, repo) = stack_chain(150, &twenty_deep_branches(), false);
     let path = repo.to_str().unwrap();
-    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
     let payload = crate::engine::ref_cache::eager(|| {
         stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
     })
@@ -1460,7 +1461,7 @@ fn a_stack_refresh_with_no_ref_movement_spawns_nothing() {
     crate::engine::ref_cache::eager(|| {
         let first =
             stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION).expect("first tick");
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
         let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
             .expect("second tick");
         let spawned = spawns_since(&repo, before);
@@ -1485,7 +1486,7 @@ fn a_ref_that_moves_between_ticks_is_walked_again() {
         // b05 moves below b00: b00 now sits on it.
         let target = crate::engine::git_cli::git_text(&repo, &["rev-parse", "main~145"]).unwrap();
         run_git(&repo, &["update-ref", "refs/heads/b05", target.trim()]);
-        let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+        let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
         let second = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
             .expect("second tick");
         assert_eq!(parent_of(&second, "b00"), Some("b05".to_string()));
@@ -1568,7 +1569,7 @@ fn stack_shapes_that_need_no_walk_spawn_none_and_report_nothing_unresolved() {
     // A branch on main's tip is placed from the window alone.
     let (_b, repo_b) = stack_chain(30, &[("twin".to_string(), 29)], false);
     for (repo, nodes) in [(&repo_a, 1), (&repo_b, 2)] {
-        let before = crate::engine::git_cli::spawn_log::spawns_in(repo).len();
+        let before = crate::engine::process::spawn_log::spawns_in(repo).len();
         let payload = crate::engine::ref_cache::eager(|| {
             stack_hierarchy(
                 repo.to_str().unwrap(),
@@ -1635,7 +1636,7 @@ fn the_default_graph_page_is_one_history_walk() {
     let (_dir, repo) = stack_chain(40, &[], false);
     let path = repo.to_str().unwrap();
     let chunk = 10;
-    let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
+    let before = crate::engine::process::spawn_log::spawns_in(&repo).len();
     let rows = crate::engine::git_reader::with_history_chunk(chunk, || {
         crate::engine::ref_cache::eager(|| {
             GitReader::read_commit_history_paged(
@@ -2085,4 +2086,39 @@ fn every_off_thread_body_is_written_inside_its_command() {
         strays.is_empty(),
         "off_thread bodies outside their cmd_* function lose the command's name; use off_thread_for: {strays:?}"
     );
+}
+
+/// The app UI sends as `developer` through these Tauri commands, and that is the one
+/// entry point that may: the message is a person's (hop 0). The same name from an agent
+/// entry point is refused (see `mcp::a2a_tests`).
+#[test]
+fn the_app_ui_commands_still_post_as_a_person_at_hop_zero() {
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+
+    let sent = tauri::async_runtime::block_on(worktrees::cmd_worktree_send_message(
+        root.clone(),
+        "developer".into(),
+        Some("claude:peer".into()),
+        None,
+        Some("note".into()),
+        "from the app".into(),
+        None,
+    ))
+    .expect("the UI command accepts the person's name");
+    assert_eq!(sent.message.from_agent, "developer");
+    assert_eq!(sent.message.hop, Some(0));
+
+    let posted = tauri::async_runtime::block_on(worktrees::cmd_inbox_post(
+        root,
+        "developer".into(),
+        Some("claude:peer".into()),
+        "ui-thread".into(),
+        Some("reply".into()),
+        None,
+        "answer from the app".into(),
+        None,
+    ))
+    .expect("the inbox command accepts the person's name");
+    assert_eq!(posted.message.hop, Some(0));
 }

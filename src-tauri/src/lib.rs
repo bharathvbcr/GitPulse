@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adv_b2073_tests;
 // Unix only: it writes `#!/bin/sh` wrappers and sets `PermissionsExt` modes.
 #[cfg(all(test, unix))]
 mod adv_w3gb2_tests;
@@ -7,6 +9,7 @@ mod adv_w3gb2_tests;
 mod adv_w3l2_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod adv_w4b_tests;
+mod agent_connect;
 mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
@@ -35,6 +38,7 @@ pub mod ingest;
 pub mod insights;
 pub mod ipc_error;
 pub mod lappi;
+pub mod leak_scan;
 pub mod ledger;
 pub mod limits;
 #[cfg(unix)]
@@ -718,6 +722,8 @@ pub fn run() {
             cmd_move_path,
             cmd_delete_path,
             cmd_mcp_info,
+            cmd_agent_connect_plan,
+            cmd_agent_connect_apply,
             cmd_external_tools_status,
             cmd_external_tool_install,
             cmd_external_tool_install_cancel,

@@ -118,6 +118,12 @@ export type HydrationSessionPatch =
   | Partial<RepoSession>
   | ((current: RepoSession) => Partial<RepoSession>);
 
+function withoutStatuses(patch: Partial<RepoSession>): Partial<RepoSession> {
+  const kept = { ...patch };
+  delete kept.statuses;
+  return kept;
+}
+
 export interface HydrationDeps {
   invoke: InvokeFn;
   sessionById(id: string): RepoSession | undefined;
@@ -133,7 +139,7 @@ export interface HydrationDeps {
  */
 export function createHydrationController(deps: HydrationDeps) {
   const { invoke: invokeFn, sessionBook } = deps;
-  const { familyUnknown, snapshotRuns, statsInflight, statsDrained } = sessionBook;
+  const { familyUnknown, snapshotRuns, statusPollApplied, statsInflight, statsDrained } = sessionBook;
   const now = deps.now ?? (() => Date.now());
 
   async function loadFileStatusFacet(path: string): Promise<FileStatusFacetPayload> {
@@ -404,6 +410,9 @@ export function createHydrationController(deps: HydrationDeps) {
       !known.statsFailed &&
       statsDrained.get(id)?.signature === branchTipSignature(known.branches)
     ) {
+      // Complete for this generation: a pending flag carried over an
+      // activation (`bumped` keeps it while a drain runs) has nothing left to wait for.
+      if (known.statsPending) deps.applyToSession(id, generation, { statsPending: false });
       return;
     }
     statsInflight.add(id);
@@ -525,6 +534,20 @@ export function createHydrationController(deps: HydrationDeps) {
       flush(false, true);
     } finally {
       statsInflight.delete(id);
+      // A drain that stopped because the tab moved to a newer generation took
+      // its collected stats with it and the activation's own call was refused
+      // while it ran. Hand the work to the live generation, which sets
+      // `statsPending` again and clears it only when it has drained.
+      const live = deps.sessionById(id);
+      if (live && live.generation !== generation) {
+        if (live.hasHydrated && !live.error && !live.trustRequired) {
+          void fetchBranchStats(id, live.path, live.generation);
+        } else if (live.statsPending) {
+          // Nothing will drain it (the tab shows its error or trust prompt):
+          // do not leave the flag carried over by `bumped` spinning forever.
+          deps.applyToSession(id, live.generation, { statsPending: false });
+        }
+      }
     }
   }
 
@@ -537,6 +560,7 @@ export function createHydrationController(deps: HydrationDeps) {
     if (!deps.sessionById(id)) return;
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
+    const pollsAtStart = statusPollApplied.get(id) ?? 0;
     if (familyUnknown.has(id) && (facet === "all" || facet === "branches")) {
       await learnFamily(id, path, generation);
       if (snapshotRuns.get(id) !== run) return;
@@ -575,6 +599,10 @@ export function createHydrationController(deps: HydrationDeps) {
           patch = raw;
         }
       }
+
+      // A poll that started after this read began and applied before it landed
+      // holds newer statuses than this read; the rest of the patch still lands.
+      if ((statusPollApplied.get(id) ?? 0) !== pollsAtStart) patch = withoutStatuses(patch);
 
       deps.applyToSession(id, generation, {
         ...patch,

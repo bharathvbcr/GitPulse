@@ -150,18 +150,125 @@ default, and no run — scheduled, in-app or manual — uses any of them until a
 person has previewed the current set with **Inspect saved roots**. The preview
 is recorded in `hygiene/state.json` only by that command, never from the saved
 policy, and any change to the set clears it, so turning a scope off and on
-again needs a fresh preview. A run with scopes enabled but not previewed uses
-none of them and says so.
+again needs a fresh preview. Changing the roots or the exclusions clears it
+too, for every scope. A run with scopes enabled but not previewed uses none of
+them and says so.
+
+A run does not delete "exactly the previewed set". It applies the rules you
+previewed to what it finds when it runs: a folder that newly matches since the
+preview is included, one that stopped matching is not, and every candidate is
+judged again from scratch at delete time. For the agent scratch scope the
+approval also lapses 30 days after the last preview (`previewed_at`, written
+only while that scope is on); a run after that skips the scope and says so in
+its issues, and the Settings page stops showing the set as previewed.
 
 | Setting | What it adds | Vetoes kept |
 | --- | --- | --- |
 | **Reclaim build caches in idle linked worktrees** (`scopes.worktree_caches`) | Linked worktrees under the roots (including `.claude/worktrees/*` and `.gitpulse/worktrees/*`, which discovery never enters) are inventoried, and the caches worktree creation clones into them (`target`, `.turbo`) become candidates | No process working anywhere in the worktree; its tree clean; no task lease in the main checkout's store naming its branch (or naming none), and none at all in the worktree's own store; producer evidence, ignored and untracked; nothing open; nothing modified for the idle days. Budgeted by clone-private bytes, not logical size |
 | **Judge uncommitted work per project** (`scopes.per_tree_vetoes`) | Uncommitted work refuses a repository's output only when it is in the project directory that produced it | Task leases stay repository-wide; every other check unchanged |
 | **Remove stale linked worktrees** (`scopes.prune_worktrees`) | Linked worktrees the stale-worktree report calls stale are removed with `git worktree remove`, never forced; the branch is kept | No process inside, clean, unlocked, no task lease in either store, idle at least a day, and integrated into the main worktree's branch or idle past the idle days; a detached HEAD must be integrated |
+| **Remove agent scratch builds** (`scopes.agent_scratch_builds`) | Cargo build folders agents leave outside any repository scan: in `<temp>/claude-<uid>/<project>/<session>/scratchpad` of a session that is finished, in `.gitpulse/scratch` or `tmp` of a checkout (the repository and each of its linked worktrees under the roots) when git ignores them, and Cargo targets (`target` or `*-target`) directly under a checkout's `.claude/`, including the copy a new session worktree is seeded with (only the target folder, never config or skills; a never-built-in copy is called out as such) | producer evidence (`.rustc_info.json`, a file Cargo writes, beside a `CACHEDIR.TAG` carrying the cache-directory signature `8a477f597d28d172789f06886806bc55`; that signature is the generic one every tool following the cache-directory convention writes, not Cargo's own, so it is evidence of a cache directory and `.rustc_info.json` and the layout check carry the rest; a directory merely named `target` is kept); the folder's top level holds only what Cargo, rustdoc and the coverage tools write (`CACHEDIR.TAG`, `.rustc_info.json`, `.future-incompat-report.json`, `.rustdoc_fingerprint.json`, `*.profraw`, `*.profdata`, `.DS_Store`, profile directories recognised by `.cargo-lock`, `.fingerprint` or `deps`, a target-triple directory holding one, `doc`, `package`, `tmp`, and a nested marked target such as `llvm-cov-target`), so a folder anyone keeps their own files in, or a symlink at its top level, is kept and named; in a checkout's `.gitpulse/scratch` and `tmp` only folders named `target`, `<name>-target` or `target-<name>` are offered; in a session's scratchpad a plain folder with such a name that wraps real targets is looked into one level, each child judged as a target of its own and the wrapper never removed; no symlink on the way and the path inside the scope root; DevCouncil's `protected_artifact` on the path relative to the scope root (`<checkout>/tmp`, `<checkout>/.gitpulse/scratch`, the scratchpad, `.claude`: the root's own name is not consulted, every name between it and the target is) and `protected_entry` on every entry; no entry on a different device than the target (a mount point keeps it); a strict walk of at most 600,000 entries or 45 seconds, past which it is kept as "too large to verify"; no process uses it (working directory, executable, argument or environment) and none of your processes was unreadable; for a scratchpad, the folder name is a session id the Claude registry does not list as running, the Claude detector could look (a detector that could not look is **could not be checked**, not "kept"), and no running Claude session lacks an id (a session the registry names no id for is matched through the `--session-id` on its command line; the bundled ripgrep and the browser bridge are not sessions; one with neither keeps every session folder, is stated once as its own sentence naming how many, and the folders are offered again when that count is zero) (Codex, Antigravity, DevCouncil and Manvi sessions never keep a scratchpad: they cannot hold one); git's answers to "is it ignored" and "is anything tracked" are three-valued, and one git could not give (shed under load, untrusted repository, timeout) keeps the folder as **could not be checked**, counted as unexamined so the next run comes sooner, never as "not ignored"; nothing modified within `scopes.agent_scratch_days` (default 7, minimum 7). The scratchpad and every other file in it stay. A session folder must also be quiet: the newest file in the folder and in the top levels of its `tasks/` and `scratchpad/` is at least `scopes.agent_scratch_days` old (a running session writes there continually, so this holds for a Claude process the detector does not recognise or a session whose id changed after launch; a modification time in the future keeps it; a listing that could not be read, or one of more than 5,000 entries, is **could not be checked**). What could not be looked at follows one rule. A lasting property of one folder is an answer about it: permission denied on a folder or marker, or a listing over its entry bound (5,000 for a session folder's listings, 5,000 for a target's top level) is kept with a reason that says so ("GitPulse may not read it", "more than N entries"), listed, never offered, and the scan stays complete, so the other scopes stay approvable. A could-not-look that may clear on its own (the host shed the check, the process table or a process could not be read, a time budget ran out, a cancelled walk, any other I/O error) is **could not be checked**, never "kept" and never "fine", and marks the scan incomplete. Those folders are counted apart from repositories shed under load, and the "inspect again when the host is less busy" advice appears only when load was the reason. The worktree-cache scope's lease and main-checkout checks keep their plain "skipped" refusal. The delete step judges each candidate again from scratch, reads the process table once more immediately before the first deletion, and stops at the run's byte cap, which is charged the bytes actually removed: a removal that stopped part-way (a build that started in the folder, an entry that changed) is reported as **partly removed** with the bytes it did take, and those bytes count against the cap. Bytes are counted per file, not per name: Cargo hard-links heavily (an uplifted binary beside its `deps` copy), so a file counts once, and only when every one of its names is inside the folder; a file that keeps a name outside it is not freed and is not counted. Removing one name of a hard-linked file changes the change time of the others, which the removal expects for a file it has already unlinked a name of (size and modification time are still checked); a file none of whose names it has touched is checked in full, as before. This engine also removes local repository build folders, so the repository scope had the same defect and has the same fix. The recency guard excuses only the modification time of the directory whose entry the run itself removed (the scratchpad or the wrapper folder), only from the instant before its first removal there, and reads what is inside instead: a file a live session writes afterwards, in `scratchpad/`, in a wrapper or in `tasks/`, still keeps the folder. A partly removed target leaves itself with a new time, so its siblings are kept for that retention period and say so. The guard sees only the top level of the session folder, `tasks/` and `scratchpad/`, and Finder writing `.DS_Store` there keeps a folder "recent"; both are limits. For a parent directory the run itself removed from (recorded per directory, only once a removal there unlinked something), a session that only deletes files there, or moves in a file with an old date, leaves no trace for the guard; the process check is what covers a live session. The window that remains is stated plainly: a build that starts after that last reading and before the removal reaches its folder is not prevented. Removal stops at the first entry that changed since the review, so such a build can lose what the removal had already deleted from its folder before it noticed, and the run says so |
 
 The idle threshold (`scopes.worktree_idle_days`) defaults to 7 days and cannot
 go below DevCouncil's scheduled-retention minimum of 7. `node_modules` is never
 offered: DevCouncil's `protected_artifact` preserves it.
+
+With the scratch scope on, the inventory also lists every folder it left alone
+with the reason, and temp directories in the user temp area that nobody can
+account for. Those are report-only: an origin would be provable only from a
+creator marker naming a process that is gone, nothing writes one, and there is
+no deletion path for them. The SessionStart brief tells agents to put
+throwaway builds in `<their checkout>/.gitpulse/scratch/target-<label>`, as an
+absolute `--target-dir` or `CARGO_TARGET_DIR`, and never to put build output
+directly inside a checkout's `.claude/` folder, because new session worktrees
+are seeded with a copy of it. That path is per repository, on its volume,
+ignored by git here, and not on the preserved-name list (`tmp`, `.cache` and
+`.claude` are).
+
+The session scope is not limited by the configured roots: scratchpads live in
+the system temp directory. Exclusions still apply to every agent candidate, in
+the preview as in the run.
+
+### Long-lived data (report only)
+
+When the disk is full and the cleaner finds little, the space is usually in
+data GitPulse will not clean. The inventory therefore carries a **Not cleaned by
+GitPulse** list (`long_lived`): a fixed set of generic locations (model caches,
+agent configuration and transcript folders, toolchains) that exist on this
+machine, each with a size, plus up to 16 absolute directories the person adds in
+the cleaner settings (`long_lived_paths`). Paths the cleaner already manages (the
+shared caches) are not on it. It is only a list: it has no deletion path, no
+approval and no effect on any scope's preview or run, and it is measured only
+on the preview that measures (the inventory), not on a scheduled run.
+
+What a user-added path can make GitPulse read: the sizes (metadata only, never
+file contents) of one existing real directory. It is refused when it is not
+absolute, holds `.` or `..`, is a symlink or is reached through one, is not a
+directory, is `/`, the home directory or an ancestor of it, or contains a
+reclaim root; it is validated when saved and again when reported. Its walk
+never follows a symlink, never crosses onto another filesystem, counts a hard
+link once, and has its own budget (300,000 entries and 8 seconds per path, 1,000,000
+entries and 30 seconds for the whole report, and cancellation), separate from
+the agent scan's. A walk cut short, or a part it could not read, shows the size
+as "at least"; a path that could not be read at all shows an error, not zero.
+
+### The in-use check and disk relief
+
+**What the in-use check cannot see.** It reads working directory, executable,
+arguments and environment of the processes of the user running GitPulse.
+Relative `--target-dir rel`, `--target-dir=rel` and `CARGO_TARGET_DIR=rel` are
+resolved against the process's own working directory. Still invisible: the
+environment of Apple platform programs, which macOS withholds and which reads
+as empty (it cannot be told apart from a genuinely empty environment, so it is
+not marked unproven: doing so would keep every folder while any `/bin/sh` runs);
+a `target-dir` set only in a `.cargo/config` file; and other users' processes,
+which are counted and reported but not inspected. Worktree teardown uses the
+same check, and a process of yours it could not read refuses, after the unreadable
+ones are read again up to three times, 20 ms apart, so one caught mid-exit is not
+mistaken for one that cannot be read. A process whose
+owner the OS will not name is treated as yours and unreadable. A working
+directory the OS gives no path for, for any reason, is unproven, not "inside
+nothing". (macOS keeps answering with the old path for a directory removed
+under a process, measured, so such a process still counts as a user of that
+path.)
+
+When the disk remedy is due (`sysload::disk_remedy_due`: the disk is the only
+reason the host is shedding work, which is `shed_is_disk_only`, or free disk
+reads below the Severe floor on a fresh sensor whatever else is pressed,
+because a nearly full disk brings memory pressure with it; low disk at
+Elevated, or the fill projection alone, with something else pressed does not
+qualify, and it answers false on any doubt), an enabled in-app schedule is
+brought forward to now, at most once every 3 hours (it does not bump the policy revision, so a Settings page
+open at the time can still save). Under a persistently low disk this is a run
+every 3 hours, only for a schedule that is already enabled and only in the app:
+the headless launchd path never brings itself forward. The run that follows uses
+the saved, previewed scopes and every check it always makes, and its bounded
+read-only git checks (`check-ignore`, `ls-files`, `worktree list`, at preview
+and again at delete time) are admitted while that holds (`with_disk_relief` in
+the spawn gate, granted around each one spawn, never around a scan); under
+memory, swap, CPU or thermal pressure while the remedy is not due they are shed
+like any other spawn.
+`git worktree list` is not free of writes: `listed_worktrees` reaches
+`scan_listing`, which calls `remember_verified_member_paths`
+(`engine/worktree.rs`), and that stores the worktree family through
+`worktree_family_disk::store`, a small JSON file under the app's data
+directory. It does so under relief too. The spawn class (background or reactive) and the
+governor's answer (shed or not, and whether the disk remedy is due) are
+read once, when a spawn asks the gate (`acquire_judged`); a spawn that then
+waits in the gate for a slot or a rate token is not asked again, so pressure
+that changes during that wait does not change its admission. The reverse
+case is a due scheduled run under pressure the run does not relieve (memory,
+swap, CPU, thermal, or low disk only at Elevated, or a fill projection alone,
+beside other pressure): the in-app scheduler holds it back (logged once) and
+starts it when the host stops shedding or the disk remedy becomes due. While it
+waits, the cleaner's status carries the governor's reason (in memory only,
+never saved, dropped the moment the run starts, is disabled or is no longer
+due) and the panel says: "The scheduled clean is due and waiting: <reason>. It
+runs when that clears, or run it now." A person's own preview or run is never
+held back. One fact limits it: the headless run (`run_due_headless`) has no
+governor in its process, so the relief is moot there: its checks are never shed
+for load. With the disk input set to shed rather than refuse, the Severe branch
+of `disk_remedy_due` never fires and only the disk-only branch applies.
 
 ### Stale worktrees
 
@@ -193,7 +300,11 @@ walk every worktree.
 New policy fields are written to `state.json` only once they differ from their
 defaults, so a file this build writes with defaults stays readable by an older
 build. Once a scope or the clone budget is changed, an older build refuses the
-file as invalid and stops cleaning until this build is installed again.
+file as invalid and stops cleaning until this build is installed again. That
+includes turning on the agent scratch scope (its fields are then written), the
+preview timestamp that scope keeps, and a bring-forward still within its
+3-hour gap (the stamp is dropped afterwards): enabling the new scope makes the
+state unreadable to builds from before it existed.
 
 The newest 20 runs retain exact target paths, before/after logical bytes, skips,
 errors and partial outcomes. An item is journaled before mutation; failed journal
@@ -306,7 +417,7 @@ boundary and notices replacements, but cannot roll back partial deletion or
 freeze concurrent writers. Per-repository cleanup requires a preview; unattended
 cleanup requires an explicitly saved global schedule and still applies fresh checks.
 
-Sizes are **logical directory bytes**, not guaranteed disk-space savings.
+Sizes are **logical directory bytes** (each file counted once, only files wholly inside the folder), not guaranteed disk-space savings.
 Hardlinks, APFS clones, sparse files and concurrent activity can change physical
 space reclaimed. Shared-tool previews show current cache size, not how much a
 prune will remove. Missing post-operation measurements remain unavailable.

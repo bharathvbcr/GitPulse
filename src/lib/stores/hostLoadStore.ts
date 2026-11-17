@@ -18,7 +18,7 @@ import { diagnostics } from "../diagnostics/diagnostics";
  * reads.
  */
 
-export type Why = "unsupported" | "unreadable" | "failed" | "not_yet";
+export type Why = "unsupported" | "unreadable" | "failed" | "not_yet" | "disabled" | "older";
 /** `sysload::Reading<T>`: a value, or why there is none. */
 export type Reading<T> = { status: "value"; value: T } | { status: "unavailable"; value: Why };
 export type Level = "normal" | "warn" | "critical";
@@ -136,6 +136,14 @@ export interface Snapshot {
   orphans: number;
   tick: TickStats;
   /**
+   * Bytes of free disk lost per minute, as the writer measured it (the quick
+   * rate, which Elevated decides on). Optional only for a record an older build
+   * wrote: this backend always emits it, and says why when there is no value.
+   */
+  disk_fill_rate?: Reading<number>;
+  /** The sustained rate, which Severe decides on: one burst cannot fake it. */
+  disk_fill_sustained?: Reading<number>;
+  /**
    * The app's held governor verdict, for readers with no history (the hook,
    * `gitpulse-mcp`). One tick behind the readings: the sampler publishes, then
    * counts the sample. Pending on a writer's first tick; unsupported in a
@@ -168,6 +176,13 @@ export interface AgentSession {
   /** CPU nanoseconds per second since the previous tick; a full core is 1e9. */
   cpu_rate: Reading<number>;
   footprint: Reading<number>;
+  /**
+   * Bytes per second the session's own process and its attached descendants
+   * wrote since the previous tick. A floor, never the whole: a process that
+   * started and exited between two ticks is never read. It names who wrote,
+   * not which folder the bytes went to.
+   */
+  write_rate: Reading<number>;
   members: number;
   unreadable_members: number;
 }
@@ -245,8 +260,10 @@ export type Binding =
   | "compressor_segments"
   | "swap"
   | "low_disk"
+  | "disk_filling"
   | "thermal"
   | "cpu_load"
+  | "exec_latency"
   | "battery";
 export type Tier = "clear" | "elevated" | "severe";
 export type Reason =
@@ -262,6 +279,8 @@ export type Reason =
 export interface Shed {
   background: boolean;
   reactive: boolean;
+  /** What put the host in the tier that sheds; null when nothing is shed. */
+  cause: Binding | null;
 }
 
 export interface GovernorVerdict {
@@ -305,9 +324,40 @@ export type Advisory =
   | { reason: "disk_unknown" }
   | { reason: "several"; items: Advisory[] };
 
+/** `sysload::DiskFill`: where the disk is heading. */
+export interface DiskFill {
+  /** Bytes of free space lost per minute. */
+  rate_bytes_per_min: number;
+  /** Minutes until free space reaches the severe floor at that rate; 0 when it is there. */
+  eta_min: number;
+  free_bytes: number;
+  floor_bytes: number;
+  /** The tier the projection alone reaches, before the rule's mode caps it. */
+  tier: Tier;
+}
+
+/**
+ * `sysload::ExecLatency`: how long a trivial child takes to start, measured by
+ * the app's own probe. The median of the last `n` probes, and whether the
+ * latch (slow from 500 ms, clear below 300 ms) calls that slow.
+ */
+export interface ExecLatency {
+  median_ms: number;
+  n: number;
+  slow: boolean;
+}
+
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {
   verdict: GovernorVerdict;
+  /**
+   * The start-up time the governor last read, beside the memory pressure it
+   * reports. Absent or null when no probe runs in the process or it could not
+   * run: unknown, never fast.
+   */
+  exec_latency?: ExecLatency | null;
+  /** Present while the fill-rate rule is on and the projection is at least elevated. */
+  disk_fill?: DiskFill | null;
   refusing_for_s: number | null;
   notice: boolean;
   largest_foreign: number | null;
@@ -343,6 +393,10 @@ export interface TraceRecord {
   compressed_bytes: number | null;
   load_1m: number | null;
   free_disk: number | null;
+  /** Bytes of free space lost per minute, or null when it was not measured. */
+  disk_fill_rate?: number | null;
+  /** The sustained rate Severe decides on, or null when it was not measured. */
+  disk_fill_sustained?: number | null;
   launched_sessions: number | null;
   observed_sessions: number | null;
   largest_foreign: number | null;
@@ -425,6 +479,25 @@ export interface ModeRule {
   mode: InputMode;
 }
 
+/** `sysload::HorizonRule`: how soon the disk is projected to reach its severe floor. */
+export interface HorizonRule {
+  mode: InputMode;
+  elevated_within_min: number;
+  severe_within_min: number;
+}
+
+/** `sysload::HeadroomRule`: the free space a coverage build needs before it starts. */
+export interface HeadroomRule {
+  mode: InputMode;
+  headroom_gib: number;
+}
+
+/** `sysload::DiskGuard`: the disk guards beyond the level. */
+export interface DiskGuard {
+  fill: HorizonRule;
+  coverage: HeadroomRule;
+}
+
 /** `sysload::Thresholds`: every input the governor decides on besides pressure. */
 export interface Thresholds {
   swap: Rule;
@@ -432,7 +505,11 @@ export interface Thresholds {
   load: Rule;
   thermal: ModeRule;
   battery: ModeRule;
+  /** While `disk_auto`, the numbers are the automatic floors shown, not stored. */
   disk: Rule;
+  /** Whether the disk floors follow physical memory (swap shares the free-space pool). */
+  disk_auto: boolean;
+  disk_guard: DiskGuard;
 }
 
 /** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
@@ -490,7 +567,27 @@ export const DEFAULT_THRESHOLDS: Thresholds = {
   thermal: { mode: "shed" },
   battery: { mode: "off" },
   disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+  disk_auto: true,
+  disk_guard: {
+    fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 },
+    coverage: { mode: "refuse", headroom_gib: 60 },
+  },
 };
+
+/**
+ * Whether the settings equal the defaults, as the backend stores them. The
+ * automatic disk floors are shown as numbers for this computer's memory, so
+ * while they are automatic only the disk mode is compared, never its numbers.
+ */
+export function thresholdsAreDefault(thresholds: Thresholds): boolean {
+  const base = DEFAULT_THRESHOLDS;
+  const disk = (value: Thresholds) =>
+    value.disk_auto ? { auto: true, mode: value.disk.mode } : { auto: false, ...value.disk };
+  return (
+    JSON.stringify({ ...thresholds, disk: disk(thresholds) }) ===
+    JSON.stringify({ ...base, disk: disk(base) })
+  );
+}
 
 /** The event the app's sampler emits after every tick. */
 export const HOST_LOAD_PULSE_EVENT = "host-load-pulse";

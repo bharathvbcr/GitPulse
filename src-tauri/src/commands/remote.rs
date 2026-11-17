@@ -167,25 +167,34 @@ pub async fn cmd_pull(
 /// when that is what will run. A force push judges as `--force-with-lease
 /// --force-if-includes`; `--force-with-lease` is still the force flag the
 /// harness's `command.force_push` hard rule catches.
+///
+/// The commits the push would send are scanned for credentials first
+/// ([`crate::leak_scan::range`]); `allow_secrets` is the person's "Push
+/// anyway" after that scan refused (see `secret_policy`).
 #[tauri::command(async)]
 pub async fn cmd_push(
     repo_path: String,
     remote: Option<String>,
     branch: Option<String>,
     force: Option<bool>,
+    allow_secrets: Option<bool>,
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let force = force.unwrap_or(false);
         // A user action from here on, so the version probe a force push makes
         // while planning is admitted rather than shed under load; the command
         // guard would only mark it after the plan.
-        crate::engine::git_cli::mark_user_action(&repo_path);
+        crate::engine::process::mark_user_action(&repo_path);
         let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
         let argv: Vec<&str> = std::iter::once("git")
             .chain(args.iter().map(String::as_str))
             .collect();
         let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::push_planned(&repo_path, &args)?;
+        let output = GitWriter::push_planned_with_policy(
+            &repo_path,
+            &args,
+            super::staging::secret_policy(allow_secrets),
+        )?;
         Ok(Guarded { policy, output })
     })
     .await

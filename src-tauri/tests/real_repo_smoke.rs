@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 /// gate's 192-token burst partway through. The switch is order-independent and
 /// idempotent, like the other integration suites'.
 fn smoke_repo() -> String {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path")
 }
 

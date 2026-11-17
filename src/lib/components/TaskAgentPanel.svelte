@@ -244,6 +244,8 @@
     return orderMonitored(rows);
   });
   const live = $derived(monitored.map((row) => row.run));
+  /** Whether anything is working. A boolean, so a tick of `now` (which rebuilds `live` as a new array) wakes nothing that only asks this. */
+  const anyLive = $derived(live.length > 0);
   /** The attempt being prepared, until a run with its id is on the pane. */
   const pendingRow = $derived(preparing && !allRuns.some((run) => run.id === preparing?.id) ? preparing : null);
   const ended = $derived(allRuns.filter((run) => !runHoldsCheckout(run, clock)).sort((a, b) => b.created_at - a.created_at));
@@ -269,7 +271,10 @@
   $effect(() => {
     // Ticks only while there is a working attempt to describe and the page
     // is in front; a hidden sheet or a background window costs nothing.
-    if (!active || live.length === 0) return;
+    // Reads `anyLive`, never `live`: `start()` writes `now`, `now` rebuilds `live`, and an effect
+    // that depended on `live` would run again for every tick it wrote, for as long as the clock
+    // moved between two runs (always, on a slow host) until Svelte gave up with effect_update_depth_exceeded.
+    if (!active || !anyLive) return;
     let interval: ReturnType<typeof setInterval> | null = null;
     const start = () => { if (!interval && !readBackgroundDocument()) { now = Date.now(); interval = setInterval(() => { now = Date.now(); }, 1000); } };
     const stop = () => { if (interval) clearInterval(interval); interval = null; };

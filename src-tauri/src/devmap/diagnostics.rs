@@ -9,7 +9,7 @@
 //! the surface this module redacts at completion rather than forwards live.
 
 use super::cli::ResolvedDevmap;
-use crate::engine::git_cli::{BoundedRun, OutputStream, ProcessObserver};
+use crate::engine::process::{BoundedRun, OutputStream, ProcessObserver};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -297,6 +297,7 @@ mod tests {
                 stderr: Vec::new(),
                 success: true,
                 status_code: 0,
+                signal: None,
                 incomplete: None,
                 stderr_incomplete: None,
                 cancelled: false,

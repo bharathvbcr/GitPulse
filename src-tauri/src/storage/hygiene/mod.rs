@@ -1,13 +1,15 @@
 //! Reviewable repository hygiene and tool-owned shared-cache maintenance.
+pub(crate) mod agent;
 pub(crate) mod background;
 mod discovery;
 pub mod global;
+pub(crate) mod long_lived;
 pub mod providers;
 pub(crate) mod tree;
 
-use crate::engine::git_cli::{
-    build_capture_command, capture_command, git_with_stdin, run_observed, validate_repo,
-    ProcessObserver,
+use crate::engine::git_cli::{git_with_stdin, validate_repo};
+use crate::engine::process::{
+    build_capture_command, capture_command, run_observed, ProcessObserver,
 };
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
@@ -141,7 +143,7 @@ fn home_dir() -> Result<PathBuf, CommandError> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("Home directory unavailable")?;
-    crate::engine::git_cli::canonicalize_plain(Path::new(&home))
+    crate::engine::process::canonicalize_plain(Path::new(&home))
         .map_err(|e| e.to_string())
         .map_err(CommandError::from)
 }
@@ -192,8 +194,8 @@ fn cache_path(id: &str, home: &Path) -> Result<PathBuf, CommandError> {
 }
 
 fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, CommandError> {
-    let resolved = crate::engine::git_cli::canonicalize_plain(path).map_err(|e| e.to_string())?;
-    let home = crate::engine::git_cli::canonicalize_plain(home).map_err(|e| e.to_string())?;
+    let resolved = crate::engine::process::canonicalize_plain(path).map_err(|e| e.to_string())?;
+    let home = crate::engine::process::canonicalize_plain(home).map_err(|e| e.to_string())?;
     // macOS aliases /var to /private/var. Resolve that platform prefix, but
     // reject a symlink at the cache itself and below the user's home.
     if std::fs::symlink_metadata(path)
@@ -632,7 +634,7 @@ fn execute_with_activity<T>(
             .map(|s| s.bytes)
     };
     let success = result.is_ok();
-    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}", error = error.message()) };
+    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after, counting each file once and only files wholly inside the folder; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}", error = error.message()) };
     Ok((
         policy,
         HygieneOutcome {

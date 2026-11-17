@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { FAIL_VERDICTS, PASS_VERDICTS } from "../src/lib/provenance/badge";
+import { FAIL_VERDICTS, NARROWED_VERDICTS, PASS_VERDICTS } from "../src/lib/provenance/badge";
 
 /**
  * Every verdict GitPulse writes into a git note must be one the badge
@@ -24,7 +24,7 @@ import { FAIL_VERDICTS, PASS_VERDICTS } from "../src/lib/provenance/badge";
 // `fileURLToPath`, never `URL.pathname`: on Windows the latter yields
 // "/D:/a/..." and joining it back onto a path produces "D:\D:\a\...".
 const RUST_ROOT = fileURLToPath(new URL("../src-tauri/src/", import.meta.url));
-const KNOWN = new Set([...PASS_VERDICTS, ...FAIL_VERDICTS]);
+const KNOWN = new Set([...PASS_VERDICTS, ...FAIL_VERDICTS, ...NARROWED_VERDICTS]);
 
 function rustFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -103,6 +103,16 @@ describe("every verdict GitPulse writes is one the badge understands", () => {
     expect(writers.map((w) => w.file)).toContain("ci_local.rs");
   });
 
+  it("the narrowed verdict is written, and sits in neither the pass nor the fail set", () => {
+    const ci = writers.find((w) => w.file === "ci_local.rs");
+    expect(ci, "ci_local.rs must be a writer").toBeDefined();
+    const written = resolveVerdicts(ci!);
+    expect(written).toContain("passed-affected");
+    expect(NARROWED_VERDICTS).toContain("passed-affected");
+    expect(PASS_VERDICTS).not.toContain("passed-affected");
+    expect(FAIL_VERDICTS).not.toContain("passed-affected");
+  });
+
   for (const writer of writers) {
     it(`${writer.file}: ${writer.expression}`, () => {
       const verdicts = resolveVerdicts(writer);
@@ -118,10 +128,37 @@ describe("every verdict GitPulse writes is one the badge understands", () => {
           KNOWN.has(verdict.toLowerCase()),
           `${writer.file} writes verdict ${JSON.stringify(verdict)}, which ` +
             `freshnessBadge does not recognise — it would render "unrecognised" ` +
-            `forever. Add it to PASS_VERDICTS or FAIL_VERDICTS in ` +
+            `forever. Add it to PASS_VERDICTS, FAIL_VERDICTS or NARROWED_VERDICTS in ` +
             `src/lib/provenance/badge.ts.`,
         ).toBe(true);
       }
     });
   }
+});
+
+/**
+ * The Rust side classifies the same notes for `verified` and `confidence`
+ * (what `gitpulse_provenance` answers over MCP), and the badge classifies them
+ * for the screen. Two copies of one closed set drift apart the first time a
+ * verdict is added to only one, and then an agent and a person are told
+ * different things about the same commit. This holds them equal.
+ */
+describe("the Rust pass set matches the badge's", () => {
+  const source = productionSource(join(RUST_ROOT, "engine/provenance.rs"));
+
+  function rustSet(name: string): string[] {
+    const m = new RegExp(`const ${name}: &\\[&str\\] = &\\[([^\\]]*)\\];`).exec(source);
+    expect(m, `engine/provenance.rs must define ${name} as a &[&str] literal`).not.toBeNull();
+    return [...m![1].matchAll(/"([^"]*)"/g)].map((v) => v[1]);
+  }
+
+  // Rust asks only "a pass of the whole suite, or not", so it keeps only the
+  // pass set; narrowed, failed and unrecognised are all "not".
+  it("PASS_VERDICTS", () => {
+    expect([...rustSet("PASS_VERDICTS")].sort()).toEqual([...PASS_VERDICTS].sort());
+  });
+  it("the Rust pass set never admits a narrowed or failed verdict", () => {
+    const rust = rustSet("PASS_VERDICTS");
+    for (const v of [...NARROWED_VERDICTS, ...FAIL_VERDICTS]) expect(rust).not.toContain(v);
+  });
 });

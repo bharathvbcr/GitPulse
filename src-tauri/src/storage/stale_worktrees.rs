@@ -4,8 +4,10 @@
 //! opt-in prune scope, which goes through the same engine teardown.
 //!
 //! A worktree is stale when every one of these was checked and holds:
-//! - no process has its working directory inside it (the process scan, which
-//!   covers agent sessions, shells and builds alike);
+//! - no process uses it: none has its working directory or its executable
+//!   inside it and no argument or environment value names it, and every
+//!   process of the user's could be read (the process scan, which covers
+//!   agent sessions, shells and builds alike);
 //! - it is not locked and git does not already call it prunable;
 //! - its tree is clean (`git status` printed nothing);
 //! - no active task lease in the main checkout's store names its branch (or
@@ -85,7 +87,7 @@ pub fn stale_worktrees(
     stale_worktrees_with(
         repo_path,
         idle_days,
-        &crate::sysload::procscan::working_in,
+        &crate::sysload::procscan::processes_using,
         true,
         crate::storage::hygiene::global::current_time(),
     )
@@ -162,7 +164,7 @@ pub(crate) fn stale_worktrees_with(
                 row.processes = Some(u32::try_from(pids.len()).unwrap_or(u32::MAX));
                 if !pids.is_empty() {
                     row.reasons
-                        .push(format!("{} process(es) are working in it", pids.len()));
+                        .push(format!("{} process(es) use it", pids.len()));
                 }
             }
             Err(e) => row
@@ -311,7 +313,7 @@ mod tests {
     /// clean, one with a fresh unmerged commit, one dirty.
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let root = git_cli::canonicalize_plain(temp.path()).unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         git_cli::git_global(&["init", "-q", "-b", "main", repo.to_str().unwrap()]).unwrap();
@@ -507,6 +509,33 @@ mod tests {
             "{done:?}"
         );
     }
+    /// A process that builds into a worktree from another directory (its path
+    /// only in an argument) uses it. The report's own process read must see it,
+    /// not just processes standing in the worktree.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_process_naming_the_worktree_in_an_argument_keeps_it_in_use() {
+        let (_temp, root) = fixture();
+        let done = root.join("done");
+        let mut child = crate::sysload::procscan::tests::directory_use_child(&done, &root, true);
+        let seen = crate::test_support::env::wait_until(Duration::from_secs(20), || {
+            crate::sysload::procscan::processes_using(&done).is_ok_and(|pids| !pids.is_empty())
+        });
+        let report = stale_worktrees(root.join("repo").to_str().unwrap(), 7);
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "the fixture process was never visible to the scan");
+        let report = report.unwrap();
+        let done = row(&report, "done");
+        assert!(done.processes.is_some_and(|n| n >= 1), "{done:?}");
+        assert!(
+            done.reasons.iter().any(|r| r.contains("use it")),
+            "{done:?}"
+        );
+        assert!(!done.stale, "{done:?}");
+    }
+
     /// Asked from a linked worktree, the report still reads the main
     /// checkout's task store for branch leases, not the named worktree's.
     #[test]

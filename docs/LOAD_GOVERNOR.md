@@ -138,7 +138,7 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   the sampler publishes, then counts the sample, so a record carries the
   verdict the previous count produced (pending on a writer's first tick, and
   unsupported while the sensor is switched off). The hook reads it (see The command
-  gate). The extension opens with the magic `GPX2` and ends
+  gate). The extension opens with the magic `GPX3` (`GPX2` was the block before the two disk fill rates changed its layout; a branch build that reads `GPX2` ignores this one) and ends
   with a checksum of its own, which also covers the sequence.
 
 **Sequence lock.** The writer makes the head sequence odd, writes the body and
@@ -171,7 +171,7 @@ sequence at 656 and the version-1 checksum formula where they were, so:
   reader that *required* the new length would have read an older writer's record
   as `Short`, so the sensor would read dead and nothing would be governed while
   an older build still writes; this build does not do that.)
-- A record that does not open its extension with `GPX2` (a longer record from
+- A record that does not open its extension with `GPX3` (a longer record from
   some other newer writer) reads the same way. One that does but fails the
   extension's checksum is `Torn`, never decoded.
 - A writer that wins the election sizes the file to its own length, so an older
@@ -443,7 +443,7 @@ the same way by cards 3 and 4. The two callers are thin:
   build (`ensure_room`), and before an agent CLI's PTY opens
   (`terminal::spawn_session_inner`; the user's own shell is never gated).
   `tests/governor_sites.rs` pins those places by function name.
-- **1c, `sysload::shed`.** Read by the spawn gate (`git_cli::acquire_until`)
+- **1c, `sysload::shed`.** Read by the spawn gate (`process::gate::acquire_until`)
   and nowhere else. A shed spawn is refused at once with the existing
   "deferred under load" marker, so the frontend's retries resume it when the
   pressure clears. There is no new scheduler: the classes are the ones
@@ -477,13 +477,16 @@ logical CPUs) hung and reset with swap used at 0.9 times physical memory, a
 kernel level read only `warn` and the governor said "launches admitted". The
 sensor already published every one of those readings and nothing decided on
 them. Each has a mode and two thresholds, changeable in Settings. **The
-defaults are provisional: they were set from that one incident.**
+defaults are provisional: they were set from that one incident.** The disk
+floors are not fixed numbers: swap files share the volume, so unless a person
+sets them they follow this computer's memory (see Disk guards).
 
 | Input (`Binding`) | Measures | Default mode | Elevated | Severe |
 |---|---|---|---|---|
 | `compressor_segments` | `vm.compressor.segment.total / vm.compressor.segment.limit` | refuse | 0.60 | 0.80 |
 | `swap` | swap USED / PHYSICAL memory (never swap total: macOS grows swap on demand, so the total reads 0 after boot) | refuse | 0.50x | 0.75x |
-| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below 20 GiB | below 10 GiB |
+| `low_disk` | free space on the volume holding GitPulse's state; lower is worse | refuse | below the larger of 20 GiB and half of physical memory (32 GiB on a 64 GiB Mac) | below the larger of 10 GiB and a quarter of it (16 GiB on a 64 GiB Mac) |
+| `disk_filling` | how fast that free space is falling, as minutes until the severe floor (see Disk guards) | refuse | under 30 minutes | under 10 minutes |
 | `thermal` | `NSProcessInfo.thermalState` | shed | serious | critical (refuse mode only) |
 | `cpu_load` | 1-minute load average / logical CPUs | shed | 3.0 | 6.0 |
 | `battery` | running on battery | off | on battery | never |
@@ -496,7 +499,7 @@ off nothing ever refuses.
 
 The verdict takes the highest tier any input reaches. On equal tiers the
 binding is the first of: memory pressure, compressor thrash, compressor
-segments, swap, low disk, thermal, CPU load, battery. The sentence names the
+segments, swap, low disk, disk filling, thermal, CPU load, battery. The sentence names the
 resource, its value and the threshold, for example "swap used is 0.83x
 physical memory (53.4 GiB of 64.0 GiB), at or above 0.75x". While the
 hysteresis still holds a tier the reading has already left, it says "now back
@@ -906,6 +909,198 @@ build does with a newer `tools.json`: ignores `host_load_thresholds`, loses no
 other setting, keeps the key across its own saves, and governs on the old two
 inputs only.
 
+## Disk guards
+
+Free space is read two ways, because the 2026-11-15 coverage build took the
+disk from about 150 GiB to nothing in about fifteen minutes (about 10 GiB a
+minute), and an earlier one took it from 99 to 45 GiB in twenty (about 2.7 GiB a
+minute); the level rule alone says nothing until the floor is near.
+
+**Floors follow memory.** The `low_disk` thresholds are automatic: severe is the
+larger of 10 GiB and a quarter of physical memory, elevated the larger of 20
+GiB and half of it (32 and 16 GiB on a 64 GiB Mac). Whether they are automatic
+is a stored fact (`Thresholds::disk_auto`), never inferred from the numbers: a
+pair a person sets is kept as set, even when it equals the old 20 and 10, and
+wins over any memory size. Settings shows the numbers the governor is deciding
+on. A `disk` entry written before this existed has no `auto` marker and stays
+the person's own.
+
+**The fill rule** (`disk_filling`, `sysload/diskrate.rs`, `thresholds.rs`). The
+writer keeps a bounded history of free space and publishes two rates, in bytes
+of free space lost per minute, as readings in the snapshot. The pure assessment
+turns each into minutes until the severe floor and compares it with a horizon
+(30 and 10 minutes by default, each editable, with a mode of its own: off,
+slow, or also refuse). The two tiers ask different questions, because the
+original defect was a burst *refusing* launches while shedding on a burst was
+always acceptable:
+
+* **Elevated** uses the *quick* rate: the smaller of the least-squares falls
+  over the last minute and the last three, or the leave-one-burst-out rate
+  when that is larger.
+* **Severe** uses the *sustained* rate: the larger of the leave-one-burst-out
+  rate and the net fall over the last ten minutes. Leave-one-burst-out (three
+  minutes) is the net fall less the largest net fall inside any 60 s
+  sub-window, over the window less those 60 s: zero for one burst of a minute
+  or less however large, exact for a steady fall, and positive across pauses.
+  The net fall divides by the longer of its history and five minutes, so a
+  cold start does not inflate it and a lone burst reads as at most its size
+  over five minutes. Severe needs the floor under ten minutes away, so a lone
+  burst binds it only when the fall exceeds half of the headroom above the
+  floor that it leaves, on a cold history (under five minutes), and all of it
+  on a warm one (ten minutes). Pinned by
+  `a_lone_burst_binds_severe_at_half_the_headroom_cold_and_all_of_it_warm`:
+  on a 64 GiB Mac a 26 GiB burst (0.45 of the headroom it leaves) does not bind
+  on a cold history and a 30 GiB one (0.56) does; warm, 80 GiB (0.77) does not
+  and 100 GiB (1.19) does. A figure of a third on a cold history was not
+  reproduced: the test measures half.
+
+**Leaving a fill-caused Severe.** A Severe the fill rule caused is left only
+after the fill rule has read below Severe for 180 s without a break
+(`FILL_SEVERE_RELEASE`, 90 ticks), not the five ticks every other exit takes;
+the level, memory and CPU exits are unchanged. The hold follows the fill rule's
+own reading, whichever cause the held binding names: the governor counts the
+ticks since the fill rule last read Severe (armed once it read Severe for the
+three ticks entering a tier takes, so a one-tick blip under another cause's
+Severe arms nothing), and Severe is left only when both the ordinary five
+ticks and that count have run out. When memory pressure, swap or the disk level
+is Severe at the same time as the fill, the hold still applies; while it alone
+keeps Severe (every current reading lower) the verdict names the fill rule and
+says it is held after the reading recovered, not that a threshold is crossed.
+The count is forgotten when the sensor goes unavailable and does not advance on
+a re-read snapshot. The hold is disarmed when its 180 s run out, so a Severe
+another cause keeps is never labelled as the disk filling after that, and one
+fill-Severe blip hours later arms nothing: arming again takes three in a row.
+
+**Is the disk the only reason?** `sysload::shed_is_disk_only()` answers it for
+a caller that may do disk-freeing work while the disk is the whole problem and
+must keep shedding when anything else is pressed too (`shed_cause()` is one
+binding picked by priority, so it says disk for a disk Severe with CPU Severe
+or thermal Critical beside it). True only when the host is shedding, every
+other input (memory level normal, no compressor thrash, no other contribution
+above Clear, none unreadable) has read Clear for five counted ticks in a row
+and reads Clear now, and the disk is what is shedding: a disk input (low disk,
+disk filling) reads Elevated or above now, or the fill hold is armed and has
+not lapsed, or the held binding is still low disk or disk filling. The last
+two matter in a pause of a lumpy fill, where the disk inputs read lower but
+Severe is held: nothing but the disk is wrong then, so the cleaner's checks
+are admitted. Once the hold lapses and Severe is left nothing is shed and the
+answer is false. The count is reset when the run is forgotten and does not advance on a re-read
+snapshot. Any doubt is false: a process with no governor of its own (the
+headless cleaner run, the MCP server, a hook), a governor built from one
+sample (`Governor::instant`), an unavailable or stale-old sensor. The
+published snapshot does not carry the count, so a reader of it cannot answer
+this.
+
+Running on battery does not count against it: the battery input exists to save
+power, not to protect the machine, and spending some battery to free a nearly
+full disk is the right trade (an unreadable power source is no more a doubt
+than a reading of "on battery"). The tier, the binding and what is shed are
+untouched, and a laptop on battery with a healthy disk still sheds background
+work and is not disk only. Memory pressure, compressor thrash, compressor
+segments, swap, thermal and CPU load keep blocking exactly as before.
+
+**The disk remedy.** `sysload::disk_remedy_due()` is true when
+`shed_is_disk_only()` is, or when the low-disk level input itself reads Severe
+(free space under the Severe floor, under the configured or automatic floors
+and the input's mode) in a fresh reading, whatever else is pressed: a nearly
+full disk brings memory pressure with it on macOS because swap cannot grow, so
+the remedy must not wait on a symptom of what it fixes. It is for the cleaner's
+own work only (its read-only checks, its bring-forward, its scheduled run); it
+admits nothing else, and agent launches are refused at Severe as before. It
+does not cover the fill-rate projection alone (a burst can project Severe with
+plenty of space left) or low disk at Elevated, and it is false on any doubt: no
+governor in this process (the headless run, the MCP server, a hook), a sensor
+that is off, unavailable or stale, free space unreadable, the low-disk input
+turned off. It takes one short lock and does no IO.
+
+**What the hold costs.** A build that writes in lumps with pauses of up to 240 s is held at Severe from
+the first bind until free space reaches the floor, where the level rule takes
+over, rather than admitting launches in each pause. The cost is a linger: a
+finished write that left little room can keep refusing for at most the
+ten-minute net-fall window plus the 180 s hold, about 13 minutes (tested bound
+800 s). Measured on the real tracker and governor: 12 GiB over 30 s ending at
+28 GiB free refused for 742 s warm and 748 s cold; 20 GiB over 80 s ending at
+40 GiB, 276 s warm and 514 s cold; 40 GiB over 120 s ending at 67 GiB, 288 s
+warm and 454 s cold; a burst of a minute or less on a warm
+history that leaves 42 GiB or more free never refuses. Deleting the output
+also waits out the 180 s. Writes slower than 3 to 4 GiB a minute on average
+(20 GiB per 300 s, 30 GiB per 600 s from 150 GiB) are reported by the tests,
+not tuned for.
+
+**Which clock.** The history resets on a gap of more than ten seconds between
+samples, so a machine that sleeps comes back with an empty history and the
+rates read *warming up* until it has refilled. The gap is measured on the
+sampler's monotonic clock (`CLOCK_MONOTONIC` on macOS, `CLOCK_BOOTTIME` on
+Linux, per the code comments); whether macOS's monotonic clock counts sleep was
+not verified, and either way the first tick after a wake has a gap over ten
+seconds from the sampler's own cadence.
+
+What was rejected, from the model behind this: fitting the whole window reads a
+step of h GiB as about 1.5 h over the window and refused launches for a burst
+that was already over; requiring every slice of the window to fall reads zero
+whenever a pause covers a slice, so 5 GiB every 90 s never bound. A build that
+writes in lumps with pauses (5 GiB every 60 to 90 s, 8 GiB/min for 40 s of every
+120) is sustained by the net fall whatever the pauses: the tests ride through
+pauses of 80 s, and the net fall keeps a lump for ten minutes. A write of a few minutes
+(20 GiB/min for two minutes) is a fall while it lasts, and refuses then.
+
+Unknown is never a rate. Too few samples, a gap in the timestamps (a sampler
+that stalls over ten seconds every two minutes never builds a history), a new
+boot and a step no disk can make all leave it `NotYet`. Each reason is its own
+state, decided in Rust and worded by Health and the Settings row: *warming
+up*; *off* (`host_load.enabled` is off); *older build* (a record written before
+the readings existed); *not available on this platform*; *can't be read* (from
+the first tick). The rule is silent in each, and a measured zero says "not
+falling". The rates and the exact binding are in the trace record.
+
+**What an older reader does.** The snapshot's verdict byte carries `low_disk`
+for a disk-filling binding, which every build reads; the exact binding rides in
+spare bytes of the extension block. A byte an older build does not know would
+make it treat the verdict as unavailable (fail open: "did NOT load-check"), so
+the byte it does know is what it reads.
+
+**The command gate's disk checks** (`hooks/load_gate.rs`) read free space live,
+on the volume the command writes to: the `cwd` the hook is given, which for an
+orchestrated child terminal is not the hook process's own directory, and any
+build directory the line names literally and absolutely (`--target-dir
+/abs`, `--target-dir=/abs`, `CARGO_TARGET_DIR=/abs` ahead of the program),
+read at its nearest existing ancestor; the smaller reading decides. A `cwd`
+that was given but is relative, missing or unreadable is *could not read*
+(said once per session, never a refusal and never "has room"): the process's
+own directory is used only when no `cwd` was given. They refuse a coverage
+build below its headroom (60 GiB by default) and any heavy build below the
+severe floor. A coverage build is a `cargo llvm-cov` that builds anywhere in
+the line (also by its own binary name, `cargo-llvm-cov llvm-cov`) or a cargo
+build or test run with `RUSTFLAGS` containing `-C instrument-coverage` (also `-C instrument_coverage`, `-Cinstrument-coverage`) ahead
+of it; `clean`, `report`, `show-env`, `--help` and `--version` build nothing
+and are never refused. They follow the same two switches as everything else
+here: with `host_load.enabled` off nothing is measured and they say nothing,
+and with `host_load.govern_launches` off they advise and never refuse.
+
+**Not covered, by name.** `cd /elsewhere && cargo build` writes to
+`/elsewhere`, which the hook cannot know without evaluating the shell; only
+the `cwd` it was given and the literal build directories above are read.
+`sudo`, `xargs`, `env --chdir`, cargo aliases, a build directory the line names
+through a variable or `~` (`--target-dir ~/x`, `--target-dir=~/x`,
+`CARGO_TARGET_DIR=$HOME/x`), which is dropped and the line is then judged on
+the `cwd` alone,
+`export CARGO_TARGET_DIR=/x; cargo build`, a `CARGO_TARGET_DIR` already set in
+the session, `build.target-dir` in `.cargo/config.toml`, `RUSTFLAGS` exported
+earlier in the line, `CARGO_ENCODED_RUSTFLAGS`, and `eval "$(cargo llvm-cov show-env ...)"; cargo test` are not
+seen: that last one runs an *instrumented* build after a `show-env` that
+itself builds nothing, and it gets only the ordinary floor check, not the
+coverage headroom. Wrappers seen through: `env`, `time`, `nice`, `nohup`,
+`exec`, `command`, `timeout <duration>`, `caffeinate`, `rustup run
+<toolchain>`, `npx`, `pnpm`/`npm`/`bun` exec forms, and `bash -c` with option
+clusters such as `-o pipefail` or `-euo pipefail`.
+
+**Storage.** The guards (`fill`, `coverage`) are a top-level
+`host_load_disk_guard` key of their own, not inside `host_load_thresholds`: a
+build from before them rewrites that key from the inputs it knows and would drop
+them. That older build also drops the `auto` marker when it saves
+`host_load_thresholds`, which pins the floors at 20 and 10 GiB until the row is
+set back to automatic.
+
 ## Disk: two owner decisions
 
 2026-10-21: low disk is advice, never a refusal. It can skip the optional
@@ -914,7 +1109,8 @@ unchanged.
 
 2026-11-14: the governor's guards become configurable with protective defaults.
 Free disk is one of them (`low_disk`): with mode `refuse` (the default) and free
-space below the severe threshold (10 GiB) a launch is refused with that binding;
+space below the severe threshold (10 GiB then; now the larger of that and a
+quarter of physical memory) a launch is refused with that binding;
 with `off` or `shed` no launch is ever refused on disk, which is the 2026-10-21
 behaviour. The test that pinned the old rule is rewritten to pin both
 (`governor::tests::low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode`).

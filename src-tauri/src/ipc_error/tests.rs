@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::git_cli::{mark_user_action, refusal_message, Refusal};
+use crate::engine::process::{mark_user_action, refusal_message, Refusal};
 use crate::engine::stash::STALE_STACK_HINT;
 use crate::ipc_error::CommandError;
 use serde_json::{json, Value};
@@ -61,6 +61,26 @@ fn produced(kind: IpcErrorKind) -> IpcError {
         IpcErrorKind::LedgerFailed => {
             LedgerError::new("query_failed", "could not read the ledger").into()
         }
+        // The real producer, so the committed case is what a refused commit
+        // actually sends, detail included.
+        IpcErrorKind::SecretScanBlocked => {
+            let tally = crate::leak_scan::Tally {
+                hits: vec![crate::leak_scan::Hit {
+                    rule: "github personal access token",
+                    path: "src/a.rs".into(),
+                    line: 3,
+                }],
+                hits_total: 1,
+                ..Default::default()
+            };
+            let refused = crate::leak_scan::staged::refusal(
+                crate::leak_scan::staged::Gate::Commit,
+                Some(&tally),
+                None,
+            );
+            assert_eq!(refused.message(), message, "the committed message");
+            run_command(|| Err::<(), _>(refused)).expect_err("the body failed")
+        }
         _ => written_as(kind, message),
     }
 }
@@ -95,7 +115,8 @@ fn the_kind_list_is_the_whole_enum() {
             | IpcErrorKind::LedgerNotInitialised
             | IpcErrorKind::LedgerFailed
             | IpcErrorKind::AiEndpointUnconfirmed
-            | IpcErrorKind::ReadCancelled => {}
+            | IpcErrorKind::ReadCancelled
+            | IpcErrorKind::SecretScanBlocked => {}
         }
     }
     let mut names: Vec<String> = IpcErrorKind::ALL.into_iter().map(kind_name).collect();

@@ -23,6 +23,8 @@
     "opener:allow-default-urls",
     "autostart:default",
     "allow-cmd-add-worktree",
+    "allow-cmd-agent-connect-apply",
+    "allow-cmd-agent-connect-plan",
     "allow-cmd-agent-defaults",
     "allow-cmd-agent-defaults-save",
     "allow-cmd-agent-models",

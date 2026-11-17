@@ -150,7 +150,7 @@ fn schema_of(tool: &str) -> Value {
 }
 
 fn deferred_answer(tool: &str, repo: &str) -> Value {
-    crate::engine::git_cli::with_forced_deferral(|| {
+    crate::engine::process::with_forced_deferral(|| {
         handle_tool_call(tool, &json!({ "repo_path": repo })).expect(tool)
     })
 }

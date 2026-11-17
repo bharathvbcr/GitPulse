@@ -2,7 +2,7 @@
 //!
 //! # Why these exist
 //!
-//! The git engine's [`MAX_OUTPUT_BYTES`](crate::engine::git_cli::MAX_OUTPUT_BYTES)
+//! The git engine's [`MAX_OUTPUT_BYTES`](crate::engine::process::MAX_OUTPUT_BYTES)
 //! is a 64 MiB backstop against a runaway process. It is not a sane payload
 //! size, and treating it as one is how a "lightweight" client ends up holding
 //! well over a gigabyte. Measured, on a single real commit that rewrote a

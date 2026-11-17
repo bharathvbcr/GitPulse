@@ -27,13 +27,21 @@
       // Knobs for healthChecks.js; all null/zero outside its scenarios.
       const ipcLog = [], aiCalls = [], runs = [];
       const knobs = { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH", hostLoad: null, hostLoadLeases: null, hostLoadIdle: null };
-      // Health's secrets section scans on open. A complete, empty scan by
-      // default, so every other check reads a verdict secrets does not move.
-      const secretsReport = (findings = []) => ({
-        ok: true, error: null, diagnostic: null, kingfisher_present: true, kingfisher_version: "2.7.0",
-        kingfisher_version_rejected: false, nested_repos_scanned: true, completeness: "complete",
+      // Health's secrets section scans on open. A complete, empty scan that
+      // Kingfisher's second opinion corroborated by default, so every other
+      // check reads a verdict secrets does not move. Only a corroborated scan
+      // may read as clear; `uncorroborated` is the in-process engine alone.
+      const corroborated = findings => ({
+        state: "ran", completeness: "complete", version: "2.7.0",
+        findings_total: findings.length, confirmed: findings.length, added: 0,
+      });
+      const secretsReport = (findings = [], secondOpinion = corroborated(findings)) => ({
+        ok: true, engine: "dc-redact 0.2.5 (devcouncil@b9b2314d)", error: null, diagnostic: null,
+        kingfisher_present: true, kingfisher_version: "2.7.0", kingfisher_version_rejected: false,
+        nested_repos_scanned: true, excluded_paths: [], completeness: "complete",
         findings, findings_total: findings.length, findings_unreadable: 0, findings_truncated: false,
         git_status_known: true, max_file_size_mb: 256, scanned_at_ms: Date.now(), duration_ms: 3,
+        skipped_total: 0, skipped: [], second_opinion: secondOpinion,
       });
       const delayed = answer => knobs.scanDelay ? new Promise(resolve => setTimeout(() => resolve(answer), knobs.scanDelay)) : answer;
 
@@ -142,6 +150,10 @@
       };
 
       const deadSymbols = () => {
+        // The real backend refuses the dead-symbol query when there is no graph.
+        if (mode === "unrun") {
+          return { source_freshness: { fresh: null, reason: "no graph" }, available: false, reason: "no code graph has been built here", items: [], total: 0, shown: 0, truncated: false };
+        }
         if (mode === "empty") {
           return { source_freshness: { fresh: true, generation_id: 12 }, available: true, reason: null, items: [], total: 0, shown: 0, truncated: false, rungs: { deterministic: 0, high: 0, speculative: 0, filtered_out: 0 } };
         }
@@ -220,6 +232,12 @@
       const { get } = await import("svelte/store");
       const { diagnostics } = await import("../src/lib/diagnostics/diagnostics.ts");
       const HealthPanel = (await import("../src/lib/components/HealthPanel.svelte")).default;
+
+      // The automatic-scan settle (runtime/autoScan.ts) is shortened to nothing
+      // for every check that is about something else; the scan-lifecycle checks
+      // in healthChecks.js set the real settle themselves.
+      const { setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS } = await import("../src/lib/runtime/autoScan.ts");
+      setAutoScanSettleMsForTest(0);
 
       interfaceStore.setAutoScanGithubAlerts(true);
       await repoStore.openRepo("/fixture/Other");
@@ -588,7 +606,16 @@
             has(root, "did not run")
               && !has(root, "Every scan completed with no findings"));
           check("a missing code graph is named as missing", () =>
-            has(section("code-graph"), "No code map for this repository"));
+            has(section("code-graph"), "This repository has no code map yet.")
+              || has(section("code-graph"), "The code map tool is not installed."));
+          // The notice is the fix and not only the diagnosis: it carries the
+          // one button that matches the cause (the fixture reports no tools
+          // status, so the CLI is not known to be absent and Build is offered).
+          check("a missing code graph offers Build index or Set up", () =>
+            [...section("code-graph").querySelectorAll("button")]
+              .some(b => ["Build index", "Set up code map"].includes(b.textContent.trim())));
+          check("a missing code graph's notice is mounted on the dead-code card too", () =>
+            section("dead-code").querySelector('[data-testid="missing-tool-notice"]') !== null);
 
           // ---- Stress: failure and recovery ----------------------------------
           mode = "failed";
@@ -643,7 +670,7 @@
           const { runHealthChecks } = await import("./healthChecks.js");
           await runHealthChecks({
             check, root, section, has, flat, wait, until, button, scroller, header, agentBar, rescan,
-            ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach,
+            ipcLog, aiCalls, runs, knobs, tick, healthReport, secretsReport, remount, detach, attach, setAutoScanSettleMsForTest, AUTO_SCAN_SETTLE_MS,
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           const { runHostLoadChecks } = await import("./healthChecks.js");

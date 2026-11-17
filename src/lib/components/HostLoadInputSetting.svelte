@@ -33,8 +33,15 @@
   const stored = $derived(settings?.thresholds[input]);
   const reading = $derived(liveReading(input, $hostLoadStatus?.snapshot ?? null));
   const modes = $derived((["off", "shed", "refuse"] as const).filter((mode) => mode !== "refuse" || spec.canRefuse));
+  // The disk floors follow this computer's memory until a person sets one: the
+  // numbers shown are then the automatic ones, and only the mode can differ.
+  const automatic = $derived(input === "disk" && settings?.thresholds.disk_auto === true);
   const isDefault = $derived(
-    stored !== undefined && JSON.stringify(stored) === JSON.stringify(DEFAULT_THRESHOLDS[input]),
+    stored !== undefined &&
+      (automatic
+        ? stored.mode === DEFAULT_THRESHOLDS.disk.mode
+        : JSON.stringify(stored) === JSON.stringify(DEFAULT_THRESHOLDS[input]) &&
+          (input !== "disk" || settings?.thresholds.disk_auto === true)),
   );
 
   let busy = $state(false);
@@ -59,12 +66,12 @@
     return pollHostLoad();
   });
 
-  async function save(next: Thresholds[InputId], rejected?: () => void) {
+  async function save(next: Thresholds[InputId], rejected?: () => void, extra: Partial<Thresholds> = {}) {
     if (!settings) return;
     busy = true;
     error = "";
     try {
-      await updateHostLoadSettings({ thresholds: { ...settings.thresholds, [input]: next } });
+      await updateHostLoadSettings({ thresholds: { ...settings.thresholds, [input]: next, ...extra } });
     } catch (cause) {
       error = explainError(cause);
       rejected?.();
@@ -88,11 +95,12 @@
       field.value = String(stored[which]);
       return;
     }
-    void save(next, () => (field.value = String(stored[which])));
+    // Setting a disk number takes both floors off automatic: they are one pair.
+    void save(next, () => (field.value = String(stored[which])), input === "disk" ? { disk_auto: false } : {});
   }
 
   function reset() {
-    void save(DEFAULT_THRESHOLDS[input]);
+    void save(DEFAULT_THRESHOLDS[input], undefined, input === "disk" ? { disk_auto: true } : {});
   }
 </script>
 
@@ -138,6 +146,15 @@
       {/each}
     </div>
   {/if}
+  {#if automatic}
+    <p class="text-textMuted text-micro leading-snug" data-testid="host-load-input-disk-auto">
+      Automatic: these floors follow this computer's memory. Change a number to set your own.
+    </p>
+  {:else if input === "disk" && settings && !settings.thresholds.disk_auto}
+    <p class="text-textMuted text-micro leading-snug" data-testid="host-load-input-disk-explicit">
+      Your own floors, kept as you set them.
+    </p>
+  {/if}
   {#if !isDefault && stored}
     <button
       type="button"
@@ -146,7 +163,7 @@
       data-testid={`host-load-input-${input}-reset`}
       onclick={reset}
     >
-      Reset {spec.label.toLowerCase()} to default
+      {input === "disk" ? "Use the automatic floors" : `Reset ${spec.label.toLowerCase()} to default`}
     </button>
   {/if}
   {#if error}

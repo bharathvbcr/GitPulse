@@ -128,7 +128,8 @@ fn memory_pressure_critical_refuses_launches_and_sheds_both_classes_naming_the_v
         v.shed,
         Shed {
             background: true,
-            reactive: true
+            reactive: true,
+            cause: Some(Binding::MemoryPressure)
         }
     );
     assert!(
@@ -149,7 +150,8 @@ fn memory_pressure_warn_sheds_background_only_and_still_admits() {
         v.shed,
         Shed {
             background: true,
-            reactive: false
+            reactive: false,
+            cause: Some(Binding::MemoryPressure)
         }
     );
 }

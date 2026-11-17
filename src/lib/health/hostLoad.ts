@@ -9,7 +9,10 @@
  */
 import { humanBytes } from "../storage/format";
 import type {
+  AgentKind,
+  AgentSession,
   Binding,
+  DiskFill,
   GovernorPulse,
   Advisory,
   GovernorReport,
@@ -20,6 +23,7 @@ import type {
   Reading,
   TraceRecord,
   SensorState,
+  Snapshot,
   Why,
 } from "../stores/hostLoadStore";
 
@@ -33,6 +37,8 @@ const WHY_LABEL: Record<Why, string> = {
   unreadable: "unreadable",
   failed: "couldn't read",
   not_yet: "pending",
+  disabled: "switched off",
+  older: "not published by this writer",
 };
 
 /** A reading in words: its value formatted, or why there is none. */
@@ -244,6 +250,120 @@ export function refusalNotice(governor: GovernorPulse): string {
   return `Refusing agent launches for ${minutes} min under ${cause}; ${largest}.`;
 }
 
+/**
+ * The slowest session write rate worth naming, in bytes a second. Below it
+ * every session is ordinary background churn and a "fastest" line would only
+ * point at noise.
+ */
+export const FASTEST_WRITER_MIN_RATE = 1_048_576;
+
+const AGENT_LABEL: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  antigravity: "Antigravity",
+  dev_council: "DevCouncil",
+  manvi: "Manvi",
+};
+
+export interface FastestWriter {
+  session: AgentSession;
+  /** Bytes a second, a floor. */
+  rate: number;
+  line: string;
+}
+
+/**
+ * The session whose processes wrote fastest over the last tick, and the
+ * sentence that says so; null when there is nothing honest to say: no reading
+ * yet (no baseline), no session at or above the threshold, or no sessions.
+ *
+ * It is a statement about which session's processes are writing, never about
+ * which folder grows: the counters are per process, not per path. The rate is
+ * a floor (a process that started and exited between two ticks is never
+ * read), so the sentence says "at least". On a truncated list the claim is
+ * only about the sessions shown. A tie goes to the lower pid, so the answer
+ * does not flip between ticks.
+ */
+export function fastestWriter(sessions: AgentSession[], truncated: boolean): FastestWriter | null {
+  let best: { session: AgentSession; rate: number } | null = null;
+  for (const session of sessions) {
+    const rate = valueOf(session.write_rate);
+    if (rate === null || rate < FASTEST_WRITER_MIN_RATE) continue;
+    if (best === null || rate > best.rate || (rate === best.rate && session.pid < best.session.pid)) {
+      best = { session, rate };
+    }
+  }
+  if (best === null) return null;
+  const { session, rate } = best;
+  const where = session.cwd ? `in ${session.cwd}` : "in an unknown directory";
+  const lead = truncated ? "Writing fastest of the sessions shown" : "Writing fastest";
+  return {
+    session,
+    rate,
+    line: `${lead}: ${AGENT_LABEL[session.kind]} session ${session.pid} ${where}, at least ${bytesPerSecond(rate)}`,
+  };
+}
+
+/** A fill rate in bytes a minute: "2.7 GB/min". */
+export function fillRateLabel(bytesPerMin: number): string {
+  return `${humanBytes(bytesPerMin)}/min`;
+}
+
+/**
+ * Where the disk is heading, for Health: "Disk filling: 2.7 GB/min, about
+ * 11 min until the 16 GB floor." Says so when the floor is already reached.
+ */
+export function diskFillLine(fill: DiskFill): string {
+  const rate = fillRateLabel(fill.rate_bytes_per_min);
+  const floor = humanBytes(fill.floor_bytes);
+  if (fill.eta_min <= 0) {
+    return `Disk filling: ${rate}, free space is at the ${floor} floor.`;
+  }
+  const minutes = fill.eta_min < 1 ? "under 1" : `about ${Math.round(fill.eta_min)}`;
+  return `Disk filling: ${rate}, ${minutes} min until the ${floor} floor.`;
+}
+
+/**
+ * What the fill-rate rule is doing, for Health and the settings row: the
+ * projection when the disk is heading for the floor, otherwise the state of
+ * the measurement. A rule that has nothing to say because it has not measured
+ * yet must not read like one that measured a calm disk, so the reasons are
+ * said: warming up, the writing app is an older build, or the disk can't be
+ * read. Null only when there is no snapshot at all.
+ */
+export function fillRateLine(snapshot: Snapshot | null, fill: DiskFill | null | undefined): string | null {
+  if (fill) return diskFillLine(fill);
+  if (!snapshot) return null;
+  const reading = snapshot.disk_fill_rate;
+  // This backend always emits the field, so a missing one is only ever a
+  // record an older build wrote and something re-serialised without it.
+  if (!reading) return FILL_OLDER_BUILD;
+  if (reading.status === "value") {
+    // The sustained rate is what the severe rule binds on; when it is the
+    // higher of the two the line shows it, so the number on screen is the one
+    // deciding. Unavailable sustained readings leave the quick one as it was.
+    const sustained = snapshot.disk_fill_sustained;
+    const rate = sustained?.status === "value" ? Math.max(reading.value, sustained.value) : reading.value;
+    return rate > 0 ? `Fill rate: ${fillRateLabel(rate)}` : "Fill rate: not falling";
+  }
+  // Each reason is decided in Rust (`diskrate`, `sampler`, `snapshot`); this
+  // only words it.
+  switch (reading.value) {
+    case "not_yet":
+      return "Fill rate: warming up";
+    case "disabled":
+      return "Fill rate: off (host load measurement is switched off)";
+    case "older":
+      return FILL_OLDER_BUILD;
+    case "unsupported":
+      return "Fill rate: not available on this platform";
+    default:
+      return "Fill rate: not available (free disk space can't be read)";
+  }
+}
+
+const FILL_OLDER_BUILD = "Fill rate: not available (the app writing the snapshot is an older build)";
+
 /** The binding resource as a phrase after "under", for the refusal notice. */
 function bindingCause(binding: Binding | null): string {
   switch (binding) {
@@ -255,10 +375,14 @@ function bindingCause(binding: Binding | null): string {
       return "heavy swap use";
     case "low_disk":
       return "low disk space";
+    case "disk_filling":
+      return "disk space filling fast";
     case "thermal":
       return "heat";
     case "cpu_load":
       return "heavy CPU load";
+    case "exec_latency":
+      return "slow process start-up";
     case "battery":
       return "battery power";
     case "memory_pressure":
@@ -278,16 +402,35 @@ export function bindingLabel(binding: Binding | null): string {
       return "swap";
     case "low_disk":
       return "low disk";
+    case "disk_filling":
+      return "disk filling";
     case "thermal":
       return "heat";
     case "cpu_load":
       return "CPU load";
+    case "exec_latency":
+      return "slow start-up";
     case "battery":
       return "on battery";
     case "memory_pressure":
     case null:
       return "memory";
   }
+}
+
+/**
+ * Process start-up time in one line, to sit beside memory pressure in Health
+ * and in a diagnostics export. A probe that has not produced a reading says so
+ * rather than reading as fast.
+ */
+export function execLatencyLine(report: GovernorReport): string {
+  const latency = report.exec_latency;
+  if (latency === null || latency === undefined) {
+    return "Process start-up time: unknown (no probe reading).";
+  }
+  const took =
+    latency.median_ms < 1000 ? `${latency.median_ms} ms` : `${(latency.median_ms / 1000).toFixed(1)} s`;
+  return `Process start-up time: median ${took} over ${latency.n} probe${latency.n === 1 ? "" : "s"}${latency.slow ? " (slow: background work is shed)" : ""}.`;
 }
 
 /** What the governor adds to the status chip: refused launches outrank shedding. */

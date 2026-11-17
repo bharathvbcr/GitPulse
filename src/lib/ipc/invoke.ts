@@ -23,6 +23,7 @@ export const IPC_ERROR_KINDS = [
   "ledger_failed",
   "ai_endpoint_unconfirmed",
   "read_cancelled",
+  "secret_scan_blocked",
 ] as const;
 
 export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];
@@ -94,7 +95,7 @@ function isDeferred(error: unknown): boolean {
  *
  * Retrying here is safe because of a backend guarantee, not a guess: a
  * command that reached the mutation guard never returns the deferral marker
- * (`run_command_scope` in src-tauri/src/engine/git_cli.rs rewrites it), so a
+ * (`run_command_scope` in src-tauri/src/engine/process/gate.rs rewrites it), so a
  * deferred call is one that changed nothing.
  *
  * While a call is waiting to retry, an identical call (same command, same
@@ -108,7 +109,7 @@ function isDeferred(error: unknown): boolean {
  * answer, and the spawn budget it would spend is shared with every other
  * GitPulse process of this user — the agent servers (`gitpulse-mcp`), the
  * hooks and `gitpulsed` draw from the same per-user record
- * (`engine/git_cli/shared_budget.rs`). Agent sessions themselves do not: the
+ * (`engine/process/shared_budget.rs`). Agent sessions themselves do not: the
  * `git` an agent runs on its own never passes through this budget.
  */
 type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promise<T>;

@@ -159,6 +159,7 @@ fn session(kind: AgentKind, terminal: Option<&str>) -> AgentSession {
         parent_pid: None,
         cpu_rate: Reading::Value(0),
         footprint: Reading::Value(3 << 30),
+        write_rate: Reading::Value(0),
         members: 4,
         unreadable_members: 0,
         ide_hosted: false,

@@ -37,7 +37,8 @@
 pub mod apphosting;
 pub mod diagnose;
 
-use crate::engine::git_cli::{sandbox_join_canonical, validate_repo, CapturedOutput};
+use crate::engine::git_cli::{sandbox_join_canonical, validate_repo};
+use crate::engine::process::CapturedOutput;
 use crate::ipc_error::CommandError;
 use diagnose::{
     classify_failure, run_recorded, spawn_firebase, FirebaseAttempt, FirebaseFailure,
@@ -271,7 +272,7 @@ fn firebase_cli_probe_with(
             attempt: Some(attempt),
         },
         Ok(output) => {
-            let tail = crate::engine::git_cli::byte_tail(&output.stderr, MAX_FIREBASE_ERROR_BYTES);
+            let tail = crate::engine::process::byte_tail(&output.stderr, MAX_FIREBASE_ERROR_BYTES);
             let reason = if tail.trim().is_empty() {
                 format!("firebase --version exited {}", output.status_code)
             } else {
@@ -411,7 +412,7 @@ fn probe_rollout_listing(cli_present: bool) -> FirebaseCapability {
 /// A fake runner sees all three — and sees them without depending on this host
 /// getting a child process as far as `main` inside [`PROBE_TIMEOUT`], which is a
 /// measurement of machine load rather than of this module.
-/// `git_cli::capture_command` owns the other half, that a child really runs and
+/// `crate::engine::process::capture_command` owns the other half, that a child really runs and
 /// its output comes back.
 fn probe_rollout_listing_with(
     cli_present: bool,
@@ -744,7 +745,7 @@ Commands:
     /// every sidecar test while a process started, and a [`PROBE_TIMEOUT`] that
     /// a loaded host blows through without anything here being wrong. The
     /// remaining half is owned where it belongs, by
-    /// `git_cli::capture_command`'s own tests.
+    /// `crate::engine::process::capture_command`'s own tests.
     #[test]
     fn the_probe_asks_the_cli_and_reads_the_answer_it_gets() {
         for (help, expected_available) in [

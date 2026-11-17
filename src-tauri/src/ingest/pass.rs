@@ -336,6 +336,9 @@ fn ingest_family(
     let mut active: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
     // What could not be read of a source's root, for `error`.
     let mut gaps: Vec<String> = Vec::new();
+    // The active roots a person named by override, whose problems stay as quiet
+    // as they always were; every root found by looking is told about.
+    let mut explicit_roots: HashSet<std::path::PathBuf> = HashSet::new();
     // A root that is absent where it should not be: the listing is then not the
     // whole corpus, whatever the roots that are there say.
     let mut missing_root = false;
@@ -347,15 +350,28 @@ fn ingest_family(
     // is ordinary: "never installed" and "gone since the last pass" are told apart
     // by the source's marker, below.
     let mut any_root = false;
+    // Every place every source looks: Claude has one per config directory.
+    let mut located: Vec<(&'static dyn TranscriptSource, source::SourceRoot)> = Vec::new();
     for source in source::sources() {
-        let Some(root) = source.root() else { continue };
+        let found = source.roots();
+        if let Some(gap) = found.gap {
+            // Part of the corpus could not be located: what is read is not all
+            // of it, and no offset may be forgotten on that account.
+            any_root = true;
+            missing_root = true;
+            blocks_forget |= !source.optional();
+            gaps.push(gap);
+        }
+        located.extend(found.list.into_iter().map(|root| (source, root)));
+    }
+    for (source, root) in located {
         any_root = true;
         let name = source.name();
         let shown = root.path.display();
         let note = source.reports_unwalkable_root();
         // A root that is not an absolute path would be read against whatever
         // directory the app happens to be in.
-        if note && !root.path.is_absolute() {
+        if (note || !root.explicit) && !root.path.is_absolute() {
             missing_root = true;
             blocks_forget |= !source.optional();
             gaps.push(format!(
@@ -363,12 +379,20 @@ fn ingest_family(
             ));
             continue;
         }
+        // A root found by looking (a config directory under the home directory)
+        // that exists and cannot be read is said whichever source it is: only a
+        // named override and an absent default keep Claude's older silence.
         match std::fs::metadata(&root.path) {
-            Ok(meta) if meta.is_dir() => active.push((source, root.path)),
+            Ok(meta) if meta.is_dir() => {
+                if root.explicit {
+                    explicit_roots.insert(root.path.clone());
+                }
+                active.push((source, root.path));
+            }
             Ok(_) => {
                 missing_root = true;
                 blocks_forget |= !source.optional();
-                if note {
+                if note || !root.explicit {
                     gaps.push(format!(
                         "the {name} transcript root {shown} is not a directory, so its transcripts were not read"
                     ));
@@ -382,6 +406,12 @@ fn ingest_family(
                         gaps.push(format!(
                             "the {name} transcript root {shown} does not exist, so its transcripts were not read"
                         ));
+                    } else if !root.explicit && is_dangling_link(&root.path) {
+                        // Something is there and leads nowhere (a volume not
+                        // mounted): not a directory that was never made.
+                        gaps.push(format!(
+                            "the {name} transcript root {shown} is a link to a path that does not exist, so its transcripts were not read"
+                        ));
                     }
                 }
             }
@@ -391,7 +421,7 @@ fn ingest_family(
             Err(e) => {
                 missing_root = true;
                 blocks_forget |= !source.optional();
-                if note {
+                if note || !root.explicit {
                     gaps.push(format!(
                         "the {name} transcript root {shown} could not be read ({}), so its transcripts were not read",
                         e.kind()
@@ -425,6 +455,9 @@ fn ingest_family(
         }
     }
     let paths = &roots[..roots.len().min(MAX_PARTICIPANTS)];
+    // Prepared once for the pass: every call below is attributed by text alone.
+    let root_set = transcript::RootSet::new(&roots);
+    let path_set = root_set.first(paths.len());
     let mut participants = match participants(ledger_repo, paths, &mut out, expired) {
         Some(participants) => participants,
         None => return out,
@@ -456,7 +489,10 @@ fn ingest_family(
         let walked = super::collect_jsonl_until(root, &mut listed_here, 0, &mut || expired(&out));
         let counted_unlisted =
             walked.unlisted_depth > 0 || walked.unlisted_cap > 0 || walked.unlisted_lower_bound;
-        if source.reports_unwalkable_root() && !walked.complete && !walked.cut && !counted_unlisted
+        if (source.reports_unwalkable_root() || !explicit_roots.contains(root))
+            && !walked.complete
+            && !walked.cut
+            && !counted_unlisted
         {
             gaps.push(format!(
                 "the {} transcript root {} could not be read in full",
@@ -626,13 +662,13 @@ fn ingest_family(
                 // bytes ride the transaction of the deepest root that
                 // has a slot, whose cursor keeps them exactly-once.
                 let departed = if resolved {
-                    transcript::departed_root(&call, &roots)
+                    transcript::departed_root(&call, &root_set)
                 } else {
                     None
                 };
                 let (hosted_owner_root, live_host) = match &departed {
                     Some(departed) => (Some((departed.root, false)), departed.host),
-                    None => match transcript::attribution_root(&call, &roots) {
+                    None => match transcript::attribution_root(&call, &root_set) {
                         Some(root) if by_path.contains_key(root) => (None, root),
                         Some(root) => (Some((root, true)), root),
                         None => continue,
@@ -642,7 +678,7 @@ fn ingest_family(
                     Some(&index) => (index, false),
                     None => {
                         let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
-                        match transcript::deepest_root(owner, paths)
+                        match transcript::deepest_root(owner, &path_set)
                             .and_then(|root| by_path.get(root))
                         {
                             Some(&index) => (index, true),
@@ -945,6 +981,12 @@ fn marker_text(roots: &[(String, u32)]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether something is at `path` although it cannot be followed: a link whose
+/// target is not there. Asked only of a path that `metadata` found absent.
+fn is_dangling_link(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Whether `root` is confirmed gone: the filesystem says it does not exist.

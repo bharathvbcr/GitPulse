@@ -9,7 +9,10 @@ mod hermetic_env;
 
 use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::{engine::git_cli, repository_trust};
+use gitpulse_lib::{
+    engine::{git_cli, process},
+    repository_trust,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -18,7 +21,7 @@ fn git(repo: &Path, args: &[&str]) {
     // This suite is about trust admission, which is decided before the spawn
     // gate; a loaded parallel run must not defer a fixture's read at the gate
     // and fail it for a reason that is not trust.
-    git_cli::run_process_with_unlimited_spawn_rate();
+    process::run_process_with_unlimited_spawn_rate();
     let output = Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -85,7 +88,7 @@ fn global_probe_subprocess() {
     let inherited = std::env::current_dir().unwrap();
     assert!(git_cli::find_git_root(&inherited).is_some());
     let output =
-        git_cli::capture_command("pwd", &[], None, std::time::Duration::from_secs(2), &[]).unwrap();
+        process::capture_command("pwd", &[], None, std::time::Duration::from_secs(2), &[]).unwrap();
     assert!(output.success);
     let actual = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
@@ -93,7 +96,7 @@ fn global_probe_subprocess() {
         "/",
         "global probes must have an explicit neutral working directory"
     );
-    assert!(git_cli::capture_command(
+    assert!(process::capture_command(
         "pwd",
         &[],
         Some(&inherited),
@@ -123,7 +126,7 @@ fn direct_git_and_captured_tools_cannot_bypass_admission() {
     assert!(git_cli::git_with_stdin(repo, &["status"], b"").is_err());
     let subdir = repo.join("nested");
     std::fs::create_dir(&subdir).unwrap();
-    let run = git_cli::capture_command(
+    let run = process::capture_command(
         "sh",
         &["-c", "touch sentinel"],
         Some(&subdir),
@@ -135,7 +138,7 @@ fn direct_git_and_captured_tools_cannot_bypass_admission() {
     approve(repo);
     assert!(git_cli::git(repo, &["status", "--porcelain"]).is_ok());
     assert!(
-        git_cli::capture_command(
+        process::capture_command(
             "sh",
             &["-c", "touch sentinel"],
             Some(&subdir),
@@ -393,7 +396,20 @@ fn health_watchers_pty_and_mcp_are_denied_before_work_starts() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let terminals = gitpulse_lib::terminal::TerminalSessions::default();
+    let host_dir = tempfile::Builder::new()
+        .prefix("ph")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    let terminals = gitpulse_lib::terminal::TerminalSessions::with_host(
+        gitpulse_lib::terminal::host::client::HostConfig {
+            dir: host_dir.path().to_path_buf(),
+            binary: Some(env!("CARGO_BIN_EXE_gitpulse-ptyd").into()),
+            idle_exit: Some(std::time::Duration::from_secs(3)),
+            // Passed to gitpulse-ptyd as GITPULSE_LOG_DIR (logging::LOG_DIR_ENV),
+            // so the host logs into this temp directory, never the user's real log.
+            log_dir: Some(host_dir.path().join("logs")),
+        },
+    );
     let spawn = gitpulse_lib::terminal::spawn_session(
         app.handle(),
         &terminals,

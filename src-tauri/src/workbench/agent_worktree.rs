@@ -579,7 +579,7 @@ pub(super) fn reclaim(
     // Cancel and release give a tree back; under memory pressure that is the
     // last work to defer, so its git children run as the user action they
     // are, never shed with the refreshes (`sysload::governor`).
-    crate::engine::git_cli::with_admission(crate::engine::git_cli::Admission::Interactive, || {
+    crate::engine::process::with_admission(crate::engine::process::Admission::Interactive, || {
         reclaim_unshed(run, open_files)
     })
 }

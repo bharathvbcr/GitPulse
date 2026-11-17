@@ -19,6 +19,10 @@ const worktrees=[root,other].map((path,i)=>({path,name:path.split("/").pop(),bra
 const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
 const fixtures={
  cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ // The diff pane's missing-tool notice: no code index, devmap not installed.
+ cmd_codeintel_status:()=>({available:false,is_fresh:false,freshness_reason:null,source_freshness:false,analyzer_freshness:false,pending_count:0,db_path:null,generation_id:null,total_files:0,total_symbols:0,total_edges:0,reason:"no code index in this fixture"}),
+ cmd_tool_capability_refresh:()=>null,
+ cmd_external_tools_status:()=>({devmap:{tool:"devmap",installed:false,path:null,lookup:"missing",version:null,reason:"not installed in this fixture",source_checkout:null,install_ready:false,install_block:"Fixture does not install tools",install_command:""},manvi:{tool:"manvi",installed:false,path:null,lookup:"missing",version:null,reason:"not installed in this fixture",source_checkout:null,install_ready:false,install_block:"Fixture does not install tools",install_command:""}}),
  // Commands the diff and AI surfaces call that this harness does not exercise.
  // Each answers the way a build without the feature does: a fixed HEAD, no
  // code index, no on-device model. Refusing them as unconfigured failed the

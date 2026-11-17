@@ -9,6 +9,7 @@ import {
   DEFAULT_IDLE,
   DEFAULT_LEASES,
   DEFAULT_THRESHOLDS,
+  thresholdsAreDefault,
   ensureHostLoadSettings,
   hostLoadSettings,
   DEFAULT_HOST_LOAD_SETTINGS,
@@ -36,7 +37,7 @@ vi.mock("../platform", () => ({ isTauri: () => true }));
 const calmGovernor: HostLoadStatus["governor"] = {
   verdict: {
     admit: true,
-    shed: { background: false, reactive: false },
+    shed: { background: false, reactive: false, cause: null },
     reason: "healthy",
     tier: "clear",
     binding: null,
@@ -190,7 +191,7 @@ describe("hostLoadStore", () => {
         verdict: {
           ...calmGovernor.verdict,
           admit: false,
-          shed: { background: true, reactive: true },
+          shed: { background: true, reactive: true, cause: null },
           reason: "pressure",
           tier: "severe",
           binding: "compressor_thrash",
@@ -353,5 +354,32 @@ describe("hostLoadStore", () => {
       return undefined as never;
     });
     await expect(parkSession("term-1")).rejects.toThrow("not confirmed");
+  });
+
+  it("keeps the automatic disk floors on a round trip that never touched them", async () => {
+    // The backend shows the automatic floors as numbers for this computer.
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: shown };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    await updateHostLoadSettings({ thresholds: { ...get(hostLoadSettings)!.thresholds, swap } });
+    const saved = get(hostLoadSettings)!.thresholds;
+    expect(saved.disk_auto).toBe(true);
+    expect(saved.disk_guard).toEqual(DEFAULT_THRESHOLDS.disk_guard);
+    expect(saved.swap).toEqual(swap);
+  });
+
+  it("calls the thresholds default by what is stored, never by the numbers the automatic floors show", () => {
+    expect(thresholdsAreDefault(DEFAULT_THRESHOLDS)).toBe(true);
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    expect(thresholdsAreDefault(shown)).toBe(true);
+    expect(thresholdsAreDefault({ ...shown, disk: { ...shown.disk, mode: "shed" } })).toBe(false);
+    // The same numbers a person set are theirs, and not the default.
+    expect(thresholdsAreDefault({ ...shown, disk_auto: false })).toBe(false);
+    expect(thresholdsAreDefault({ ...DEFAULT_THRESHOLDS, disk_auto: false })).toBe(false);
+    const guard = { ...DEFAULT_THRESHOLDS.disk_guard, coverage: { mode: "refuse" as const, headroom_gib: 80 } };
+    expect(thresholdsAreDefault({ ...shown, disk_guard: guard })).toBe(false);
   });
 });

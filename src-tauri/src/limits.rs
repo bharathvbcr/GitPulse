@@ -63,7 +63,7 @@ impl LimitOutcome {
 }
 
 /// What we ask for first. Comfortably above anything the app can reach: the
-/// spawn gate in `engine::git_cli` caps concurrent children, so this only has
+/// spawn gate in `engine::process` caps concurrent children, so this only has
 /// to cover the steady-state cost of the webview, watchers, PTYs and SQLite.
 pub const TARGET_OPEN_FILES: u64 = 16_384;
 

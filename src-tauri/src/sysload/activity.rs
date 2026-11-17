@@ -77,6 +77,8 @@ fn why_unreadable(why: Why) -> String {
         Why::Unreadable => "the operating system would not say".into(),
         Why::Unsupported => "this platform cannot say".into(),
         Why::Failed => "reading it failed".into(),
+        Why::Disabled => "host-load measurement is switched off".into(),
+        Why::Older => "it came from an older GitPulse that did not measure it".into(),
     }
 }
 

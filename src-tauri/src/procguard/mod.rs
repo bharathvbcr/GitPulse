@@ -44,7 +44,7 @@
 //! A process group of its own is a *background* group with respect to the
 //! controlling terminal: a child in one that reads the tty gets SIGTTIN and
 //! stops. Every child spawned through this module is given piped or null stdio
-//! by its caller (`engine::git_cli::run_bounded_capped`,
+//! by its caller (`engine::process::run_bounded_capped`,
 //! `harness::sidecar::spawn`), so none of them has a tty to touch. A future
 //! caller that wants `Stdio::inherit()` on a terminal must not use [`spawn`].
 //!
@@ -244,6 +244,13 @@ fn shutting_down() -> bool {
     SHUTTING_DOWN.load(Ordering::SeqCst)
 }
 
+/// Whether [`reap_all`] has started, which is when this process signals every
+/// child it has registered. A child that died after this was possibly signalled
+/// by the sweep, not by anything it did itself.
+pub(crate) fn shutdown_started() -> bool {
+    shutting_down()
+}
+
 /// The repository trust refusal, carried inside the `io::Error` a refused
 /// spawn returns. It reads as the refusal's own text, as the plain message it
 /// replaced did, and [`trust_refusal`] gives the runner that words the spawn
@@ -423,11 +430,22 @@ impl Registration {
         child: &mut Child,
         wait: &mut dyn FnMut(Duration),
     ) -> io::Result<ExitStatus> {
+        self.ask_then_stop_and_reap_with_grace(child, CHILD_GRACE, wait)
+    }
+
+    /// [`Self::ask_then_stop_and_reap_waiting`] with an explicit soft-stop
+    /// grace period instead of the default [`CHILD_GRACE`].
+    pub fn ask_then_stop_and_reap_with_grace(
+        &self,
+        child: &mut Child,
+        grace: Duration,
+        wait: &mut dyn FnMut(Duration),
+    ) -> io::Result<ExitStatus> {
         let grace = if sys::CAN_ASK_TO_STOP {
             if let Some(pid) = *lock(&self.slot.pid) {
                 let _ = sys::request_stop(pid, &self.slot.label);
             }
-            CHILD_GRACE
+            grace
         } else {
             Duration::ZERO
         };
@@ -702,7 +720,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
 /// scheduling priority, throttled disk I/O, and throttled network I/O for
 /// sockets it opens afterwards. Elsewhere it is [`spawn`].
 ///
-/// The caller decides *whether* — `engine::git_cli` does, from the admission
+/// The caller decides *whether* — `engine::process` does, from the admission
 /// class, which is the single source of truth for "this work may be starved".
 /// This function never looks at who is asking, so a child it is not called for
 /// is never touched.
@@ -2461,7 +2479,7 @@ mod tests {
             command.arg("--ignored");
             command.arg("--test-threads=1");
             command.env(CHILD, "1");
-            let run = crate::engine::git_cli::run_bounded_capped(
+            let run = crate::engine::process::run_bounded_capped(
                 command,
                 "descriptor inheritance fixture",
                 Duration::from_secs(20 * 60),
