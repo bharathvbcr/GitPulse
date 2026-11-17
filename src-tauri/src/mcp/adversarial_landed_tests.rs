@@ -408,26 +408,40 @@ fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
 /// arrive as `verified: true` with confidence 1.0 at the tip.
 #[test]
 fn over_mcp_only_a_full_pass_is_verified_and_a_narrowed_pass_is_told_apart() {
+    use crate::engine::provenance::VerificationNote;
     let schema = schema_of("gitpulse_provenance");
-    for (verdict, verified) in [
-        ("passed", true),
-        ("passed-affected", false),
-        ("failed", false),
-    ] {
+    // Each verdict is a literal: provenance-verdict-contract reads every
+    // `VerificationNote` construction in this file and must resolve its verdict.
+    let passed = VerificationNote {
+        verdict: "passed".into(),
+        verified_at: 1_788_000_000,
+        checked_by: "ci.local".into(),
+        task_id: None,
+        details: None,
+    };
+    let cases = [
+        (passed.clone(), true),
+        (
+            VerificationNote {
+                verdict: "passed-affected".into(),
+                ..passed.clone()
+            },
+            false,
+        ),
+        (
+            VerificationNote {
+                verdict: "failed".into(),
+                ..passed.clone()
+            },
+            false,
+        ),
+    ];
+    for (note, verified) in cases {
+        let verdict = note.verdict.clone();
+        let verdict = verdict.as_str();
         let (_dir, repo) = repo_with_root();
         let sha = git(&repo, &["rev-parse", "HEAD"]);
-        crate::engine::provenance::write_verification_note(
-            &repo,
-            &sha,
-            &crate::engine::provenance::VerificationNote {
-                verdict: verdict.into(),
-                verified_at: 1_788_000_000,
-                checked_by: "ci.local".into(),
-                task_id: None,
-                details: None,
-            },
-        )
-        .expect("write note");
+        crate::engine::provenance::write_verification_note(&repo, &sha, &note).expect("write note");
         let args = json!({ "repo_path": repo, "commit_sha": sha, "base_branch": "main" });
         validate_arguments("gitpulse_provenance", &args).expect("arguments");
         let got = handle_tool_call("gitpulse_provenance", &args).expect("provenance");
