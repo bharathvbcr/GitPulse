@@ -11714,6 +11714,7 @@ done
             let large_body = "large-peer-payload-line\n".repeat(350);
             let posted = crate::engine::agent_bus::post_peer_message(
                 &repo.to_string_lossy(),
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 "claude:sender",
                 Some(&format!("antigravity:{AGY_SESSION}")),
                 Some("feat-thread"),

@@ -1399,7 +1399,7 @@ tool_args! {
             64,
         ),
         hop: Option<u32> = Spec::int(
-            "Explicit hop count (defaults to 1, or previous thread hop + 1; human messages reset to 0)",
+            "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
             0,
             32,
         ),
@@ -4613,6 +4613,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let kind = a.kind.as_deref().unwrap_or("note");
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 a.to_agent.as_deref(),
                 a.thread_key.as_deref(),
@@ -4791,6 +4792,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 };
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 a.to_agent.as_deref(),
                 Some(&a.thread_key),
@@ -4835,6 +4837,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
             let message = crate::engine::agent_bus::withdraw_ask(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 &a.thread_key,
                 &a.reason,
@@ -4851,6 +4854,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            // Refuse before the lane claim and task update below: a kickoff that is refused at
+            // the post must not leave them behind.
+            crate::engine::agent_bus::require_agent_sender(&a.from_agent)
+                .map_err(CommandError::into_message)?;
             let provider = a.provider.as_deref().unwrap_or("claude");
             let branch = a
                 .branch
@@ -4911,6 +4918,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             });
             let message = crate::engine::agent_bus::post_thread_message(
                 &a.repo_path,
+                crate::engine::agent_bus::MessageOrigin::Agent,
                 &a.from_agent,
                 Some(&a.to_agent),
                 Some(&thread_key),

@@ -872,7 +872,7 @@
         "type": "string"
       },
       "hop": {
-        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; human messages reset to 0)",
+        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
         "maximum": 32,
         "minimum": 0,
         "type": "integer"

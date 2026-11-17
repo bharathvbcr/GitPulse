@@ -356,13 +356,10 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     let target = agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer)
         .map_err(|e| e.into_command_error().into_message())?;
 
-    let is_human = matches!(
-        a.from_peer.trim(),
-        "developer" | "human" | "human-dev" | "user"
-    );
-    let hop = if is_human {
-        0
-    } else if let Some(explicit) = a.hop {
+    // An MCP caller is always an agent: it is never the person using GitPulse, whatever
+    // `from_peer` says. `post_peer_message` refuses the names reserved for a person.
+    let origin = agent_bus::MessageOrigin::Agent;
+    let requested_hop = if let Some(explicit) = a.hop {
         explicit
     } else if let Some(ref tk) = a.thread_key {
         agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
@@ -372,6 +369,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     } else {
         1
     };
+    let hop = origin.effective_hop(requested_hop);
     let max_hops = a.max_hops.unwrap_or(agent_bus::DEFAULT_MAX_HOPS);
 
     let root_repo = crate::engine::git_cli::find_git_root(Path::new(&a.repo_path))
@@ -380,6 +378,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 
     let message = agent_bus::post_peer_message(
         &a.repo_path,
+        origin,
         &a.from_peer,
         Some(&target.record.peer_id),
         a.thread_key.as_deref(),
@@ -409,20 +408,16 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
                 let (preview, truncated) =
                     crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
                 truncated_in_mailbox = truncated;
-                let provenance = if is_human {
-                    EnvelopeProvenance::HumanConfirmed
-                } else {
-                    EnvelopeProvenance::PeerAgent {
-                        msg_id: msg_id.clone(),
-                        from_peer: message.from_agent.clone(),
-                        provider: sender_provider,
-                        branch: message.branch.clone().unwrap_or_default(),
-                        thread_key: message.thread_key.clone().unwrap_or_default(),
-                        hop,
-                        max_hops,
-                        truncated_in_bus: truncated,
-                        repo_root: root_repo.clone(),
-                    }
+                let provenance = EnvelopeProvenance::PeerAgent {
+                    msg_id: msg_id.clone(),
+                    from_peer: message.from_agent.clone(),
+                    provider: sender_provider,
+                    branch: message.branch.clone().unwrap_or_default(),
+                    thread_key: message.thread_key.clone().unwrap_or_default(),
+                    hop,
+                    max_hops,
+                    truncated_in_bus: truncated,
+                    repo_root: root_repo.clone(),
                 };
                 let _ = mb.deposit_with_provenance(
                     sid,
@@ -437,7 +432,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 
     notify_in_process_waiters();
 
-    let delivery_outcome = if !is_human && hop >= max_hops {
+    let delivery_outcome = if hop >= max_hops {
         "paused_hop_limit".to_string()
     } else if target.liveness != "live" {
         if target.liveness == "resumable" {
