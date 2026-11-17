@@ -3,8 +3,9 @@
 //! reported skip rather than a clean result.
 
 use super::tests::github_pat;
-use super::worktree::{scan_worktree, WorktreeLimits};
+use super::worktree::{parse_listing, scan_worktree, WorktreeLimits};
 use super::{scans_completed, SkipReason};
+use crate::engine::git_cli::git;
 use crate::test_support::{git_in, git_repo, write};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -186,4 +187,65 @@ fn the_report_never_carries_the_secret() {
         !wire.contains(&token) && !wire.contains(&token[..12]),
         "{wire}"
     );
+}
+
+/// A real conflicted file: two branches edit one line, the merge stops, and
+/// git lists the path once per stage (1, 2 and 3) under `-t`.
+fn conflicted_repo(secret_line: &str) -> TempDir {
+    let dir = repo();
+    write(dir.path(), "a.txt", "line\n");
+    git_in(dir.path(), &["add", "a.txt"]);
+    git_in(dir.path(), &["commit", "-q", "-m", "base"]);
+    git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+    write(dir.path(), "a.txt", "line from side\n");
+    git_in(dir.path(), &["commit", "-q", "-am", "side"]);
+    git_in(dir.path(), &["checkout", "-q", "main"]);
+    write(dir.path(), "a.txt", &format!("{secret_line}\n"));
+    git_in(dir.path(), &["commit", "-q", "-am", "main"]);
+    let merged = git(dir.path(), &["merge", "side"]);
+    assert!(merged.is_err(), "the merge was expected to conflict");
+    dir
+}
+
+#[test]
+fn a_conflicted_file_is_listed_scanned_and_counted_once() {
+    let dir = conflicted_repo(&format!("let t = \"{}\";", github_pat()));
+    let raw = git(
+        dir.path(),
+        &[
+            "ls-files",
+            "-z",
+            "-t",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )
+    .expect("listing runs");
+    let stages = raw
+        .split(|b| *b == 0)
+        .filter(|e| e.get(2..) == Some(b"a.txt".as_slice()))
+        .count();
+    assert_eq!(stages, 3, "the fixture did not produce a three-stage entry");
+    let listed = parse_listing(&raw).expect("listing parses");
+    assert_eq!(
+        listed.iter().filter(|l| l.path == "a.txt").count(),
+        1,
+        "a.txt listed more than once"
+    );
+    assert!(listed.iter().all(|l| l.tracked));
+    let scan = scan_worktree(dir.path(), limits()).expect("scan runs");
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally);
+    assert_eq!(scan.tally.hits.len(), 1, "{:?}", scan.tally);
+}
+
+#[test]
+fn a_listing_keeps_an_untracked_path_distinct_from_a_tracked_one() {
+    let raw = b"H a.txt\0? b.txt\0M a.txt\0";
+    let listed = parse_listing(raw).expect("listing parses");
+    let paths: Vec<_> = listed
+        .iter()
+        .map(|l| (l.path.as_str(), l.tracked))
+        .collect();
+    assert_eq!(paths, vec![("a.txt", true), ("b.txt", false)]);
 }

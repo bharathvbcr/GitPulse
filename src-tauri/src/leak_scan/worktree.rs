@@ -20,7 +20,7 @@
 
 use super::{note_scan_completed, BlobLines, SkipReason, Tally};
 use crate::engine::git_cli::git;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -71,24 +71,35 @@ pub struct WorktreeScan {
 }
 
 /// One entry of `git ls-files -z -t`.
-struct Listed {
-    path: String,
-    tracked: bool,
+pub(super) struct Listed {
+    pub(super) path: String,
+    pub(super) tracked: bool,
 }
 
 /// Parse `git ls-files -z -t` output: `<tag> <path>` NUL-separated. `?` marks
 /// a file that is not in the index; every other tag is an index entry.
-fn parse_listing(raw: &[u8]) -> Option<Vec<Listed>> {
-    let mut out = Vec::new();
+///
+/// One entry per path, in first-listed order, tracked winning. An unmerged
+/// path is listed once per index stage, and `--deduplicate` does not apply
+/// with `-t`, so without this a conflicted file is read and counted up to
+/// three times.
+pub(super) fn parse_listing(raw: &[u8]) -> Option<Vec<Listed>> {
+    let mut out: Vec<Listed> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
     for entry in raw.split(|b| *b == 0).filter(|e| !e.is_empty()) {
         let (tag, path) = (entry.first()?, entry.get(2..)?);
         if entry.get(1) != Some(&b' ') || path.is_empty() {
             return None;
         }
-        out.push(Listed {
-            path: String::from_utf8_lossy(path).into_owned(),
-            tracked: *tag != b'?',
-        });
+        let path = String::from_utf8_lossy(path).into_owned();
+        let tracked = *tag != b'?';
+        match at.get(&path) {
+            Some(&index) => out[index].tracked |= tracked,
+            None => {
+                at.insert(path.clone(), out.len());
+                out.push(Listed { path, tracked });
+            }
+        }
     }
     Some(out)
 }
