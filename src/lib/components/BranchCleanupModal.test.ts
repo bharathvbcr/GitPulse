@@ -77,3 +77,21 @@ describe("BranchCleanupModal scan trigger", () => {
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("void runScan();"));
   });
 });
+
+describe("BranchCleanupModal selection", () => {
+  it("selects and sends branches by full ref, never by listed name", () => {
+    // A local `feature` and `origin/feature` are two rows; the name alone
+    // cannot tell the backend which one the person ticked.
+    expect(source).toContain("let selectedRefs = $state<Set<string>>(new Set());");
+    expect(source).toContain("selectedRefs.has(branch.full_ref)");
+    expect(source).toContain("toggleBranch(branch.full_ref)");
+    expect(source).toContain("next.add(b.full_ref);");
+    expect(source).toContain("const branchesToClean = Array.from(selectedRefs);");
+    expect(source).not.toContain("selectedNames");
+    expect(source).not.toMatch(/selectedRefs\.(has|add)\((b|branch)\.name\)/);
+  });
+
+  it("reports the deleted count against the selection", () => {
+    expect(source).toContain("cleanedToast(res.deleted.length, branchesToClean.length)");
+  });
+});
