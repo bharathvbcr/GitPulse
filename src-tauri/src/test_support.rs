@@ -1022,8 +1022,10 @@ mod hermetic_canary {
         let _serial = env_serial();
         for key in [
             "GITPULSE_TRANSCRIPT_ROOT",
+            "GITPULSE_CLAUDE_CONFIG_DIRS",
             "GITPULSE_CODEX_TRANSCRIPT_ROOT",
             "CODEX_HOME",
+            "ANTIGRAVITY_HOME",
         ] {
             assert!(
                 std::env::var_os(key).is_none(),

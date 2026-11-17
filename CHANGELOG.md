@@ -31,6 +31,8 @@ before that tag is pushed.
   has no option to honour `.gitignore`, so its scope still includes ignored
   files.
 
+- `gitpulse_provenance`: `verified` is now true only when the commit's verification note records a pass of the whole suite, and `confidence` is null whenever `verified` is false. A note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict used to come back as `verified: true` with confidence 1.0 at the tip; it now reads `verified: false`, with the note still in `verification` so the verdict can be read. An MCP client that read `verified` as "a note is attached" should check `verification` instead. The Rust pass set is held equal to the freshness badge's by `provenance-verdict-contract`.
+
 ### Fixed
 
 - **A conflicted file was scanned and counted up to three times.**

@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::source::{Parsed, RecordParser, SourceRoot, TranscriptSource};
+use super::source::{Parsed, RecordParser, SourceRoot, SourceRoots, TranscriptSource};
 use super::transcript::ToolCall;
 
 mod js;
@@ -78,23 +78,23 @@ impl TranscriptSource for CodexSource {
         "codex"
     }
 
-    fn root(&self) -> Option<SourceRoot> {
+    fn roots(&self) -> SourceRoots {
         if let Some(path) = std::env::var_os(ROOT_ENV).filter(|p| !p.is_empty()) {
-            return Some(SourceRoot {
+            return SourceRoots::one(Some(SourceRoot {
                 path: PathBuf::from(path),
                 explicit: true,
-            });
+            }));
         }
         // Codex's own home: `CODEX_HOME`, else `~/.codex`; an empty value is
         // unset (`codex-rs/utils/home-dir/src/lib.rs`). Its sessions are below it.
         let home = std::env::var_os("CODEX_HOME")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
-            .or_else(|| super::dirs_home().map(|home| home.join(".codex")))?;
-        Some(SourceRoot {
+            .or_else(|| super::dirs_home().map(|home| home.join(".codex")));
+        SourceRoots::one(home.map(|home| SourceRoot {
             path: home.join("sessions"),
             explicit: false,
-        })
+        }))
     }
 
     fn legacy_floor(&self) -> bool {

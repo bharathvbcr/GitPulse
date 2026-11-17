@@ -801,8 +801,11 @@ fn a_hostile_cwd_is_attributed_without_panic_or_a_departed_root() {
         let out = nested.pass(&nested.base, &[]);
         assert_eq!(out.error, "", "{out:?}");
         // `{base}/../../etc` resolves to `/etc`, outside the worktree: it used to
-        // be attributed here by its byte prefix, and is now nobody's.
-        assert_eq!(out.recorded, 4, "{out:?}");
+        // be attributed here by its byte prefix, and is now nobody's. The 64 KiB
+        // cwd is longer than a path is read at (`MAX_PATH_BYTES`, as a departed
+        // worktree's already was), so it is nobody's too: it used to be the live
+        // root's, and a length that no checkout has is not worth a walk.
+        assert_eq!(out.recorded, 3, "{out:?}");
     });
     let rows = nested.rows();
     assert!(rows.iter().all(|row| row.0.is_none()), "{rows:?}");

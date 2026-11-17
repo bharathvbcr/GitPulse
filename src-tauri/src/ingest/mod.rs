@@ -211,13 +211,26 @@ pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// callers that count failures leave it out, and callers that show errors keep it.
 pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts cannot be located";
 
-/// Where each transcript source looks, by name, for the hermetic canary that
+/// Every place each transcript source looks, by name, one entry per root (a
+/// source with none is listed once, with `None`), for the hermetic canary that
 /// checks every per-user directory resolves under the test process's own root.
+/// Claude reads one root per configuration directory, so a canary that saw only
+/// the first would pass while another still pointed at a real account.
 #[cfg(test)]
 pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     source::sources()
         .iter()
-        .map(|source| (source.name(), source.root().map(|root| root.path)))
+        .flat_map(|source| {
+            let roots = source.roots().list;
+            if roots.is_empty() {
+                vec![(source.name(), None)]
+            } else {
+                roots
+                    .into_iter()
+                    .map(|root| (source.name(), Some(root.path)))
+                    .collect()
+            }
+        })
         .collect()
 }
 
@@ -226,7 +239,21 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     if home_hidden::on_this_thread() {
         return None;
     }
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    let var = |name: &str| std::env::var_os(name).filter(|home| !home.is_empty());
+    var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// The Claude configuration directories to read transcripts under, from the
+/// one resolver live-session observation uses. Nothing when the machine has no
+/// home directory and no override, as [`dirs_home`] says it for the others.
+fn claude_config_dirs() -> crate::workbench::conversation::ClaudeConfigDirs {
+    #[cfg(test)]
+    if home_hidden::on_this_thread() {
+        return Default::default();
+    }
+    crate::workbench::conversation::claude_config_dirs()
 }
 
 /// A test's way to say "this machine has no home directory" to the transcript
@@ -3205,6 +3232,11 @@ mod catch_up_progress_tests;
 #[cfg(test)]
 mod codex_tests;
 #[cfg(test)]
+#[path = "config_dir_adv_tests.rs"]
+mod config_dir_adv_tests;
+#[cfg(test)]
+mod config_dir_tests;
+#[cfg(test)]
 mod event_time_tests;
 #[cfg(test)]
 mod family_tests;
@@ -3222,6 +3254,9 @@ mod reflog_replay_tests;
 mod source_tests;
 #[cfg(test)]
 mod transcript_bench_tests;
+#[cfg(test)]
+#[path = "under_adv2_tests.rs"]
+mod under_adv2_tests;
 #[cfg(test)]
 mod walk_tests;
 
