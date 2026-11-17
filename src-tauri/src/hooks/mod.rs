@@ -9312,7 +9312,7 @@ done
         assert!(output.is_silent());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn session_start_input(cwd: &str) -> HookInput {
         HookInput {
             hook_event_name: SESSION_START.to_string(),
@@ -9322,7 +9322,7 @@ done
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn brief_context(output: &HookOutput) -> &str {
         output
             .hook_specific_output

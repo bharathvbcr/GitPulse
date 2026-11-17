@@ -12,6 +12,10 @@ mod hermetic_env;
 #[path = "common/nextest_list.rs"]
 mod nextest_list;
 
+#[cfg(target_os = "macos")]
+#[path = "common/quiet_app.rs"]
+mod quiet_app;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     if nextest_list::answer_list("native_status_material", false) {
@@ -49,7 +53,7 @@ fn main() {
         .expect("the config declares the main window");
     main_window.visible = false;
     context.config_mut().app.windows.clear();
-    let app = tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .manage(DesktopState::default())
         .setup(move |app| {
             // Phase 0: the main window's webview backdrop is clear.
@@ -112,6 +116,7 @@ fn main() {
         })
         .build(context)
         .expect("native test application builds");
+    quiet_app::out_of_the_way(&mut app);
     app.run(|app, event| {
         if !matches!(event, RunEvent::Ready) {
             return;

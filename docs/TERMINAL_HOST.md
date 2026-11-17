@@ -674,7 +674,8 @@ holding managed Codex and Claude runs.
    the engine for both backends, and exit receipts in the host.
 2. **Done (prior change):** Settings → Agents selected the host as an opt-in
    (`default off`) while both backends ran under `GITPULSE_TEST_TERMINAL_BACKEND=host`
-   (`bun run test:terminal-host`).
+   (a `test:terminal-host` runner, removed once step 3 made every suite use the
+   host, which left it re-running the same seven suites).
 3. **Done (2026-11-14):** `gitpulse-ptyd` is the unconditional Unix default
    and the Unix in-process app PTY path (`TerminalSessions` owning `Engine` on
    Unix and Unix fallback branches) has been deleted in the same change. Unix

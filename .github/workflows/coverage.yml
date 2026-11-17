@@ -62,6 +62,10 @@ jobs:
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          # Saved after a red or cancelled run too: the cache is written only
+          # by a green job otherwise, and an instrumented build is the
+          # expensive one to lose.
+          cache-on-failure: true
 
       # Bun installs and runs the package scripts; Vitest still executes on
       # Node through its own shebang.

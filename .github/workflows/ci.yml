@@ -18,14 +18,20 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Build & Test (${{ matrix.os }})
+  # One job per OS used to run everything in a row: the contract checks, the
+  # frontend suites, the browser sweeps, clippy, and the Rust suite. Every one of
+  # them needs only the checkout and a toolchain, never another's output, so the
+  # leg took the sum of all of them: 56 minutes on Linux, and macOS reached the
+  # 120-minute limit inside the Rust suite (run 43351016929). Three jobs with no
+  # `needs` between them run side by side, so a leg takes as long as its slowest
+  # job, and a red clippy no longer hides behind a 22-minute WKWebView sweep.
+  #
+  # The Rust suite is still `cargo test --test-threads=1`: scripts/
+  # check-workflows.test.ts pins that line, for the fixture timeouts it names.
+  frontend:
+    name: Frontend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # fec1e008: ubuntu reached the serial 6,099-test lib suite at 39 min and
-    # was cancelled; macOS reached it at 33 min (after the WKWebView harness)
-    # and was cancelled at 40. The same suite took 20 min at eight threads on
-    # the macOS runner, so serial it needs well over that.
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -35,34 +41,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
-      - name: Install System Dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: clippy, rustfmt
-
-      # ImageOS/ImageVersion are runner process env vars. They are not in the
-      # workflow `env` context, so interpolating env.ImageOS as the cache
-      # prefix was the empty string and rust-cache kept the default Windows
-      # key. Restored MSVC artifacts from older VS then failed `--lib`
-      # with 0xc0000139.
-      - name: Key the Rust cache to this runner image
-        shell: bash
-        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          workspaces: |
-            src-tauri
-            crates/gitpulse-worktree
-          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
       # Bun installs and runs the package scripts; Vitest, Vite and
       # svelte-check still execute on Node through their own shebangs.
@@ -79,9 +57,9 @@ jobs:
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 
-      # The three contract checkers are pure Node and run in well under a
-      # second, so they gate the slow steps rather than trailing them: they
-      # catch Rust<->TS drift that neither svelte-check nor cargo can see.
+      # The contract checkers are pure Node and run in well under a second,
+      # so they gate the slow steps rather than trailing them: they catch
+      # Rust<->TS drift that neither svelte-check nor cargo can see.
       # release.yml runs only on a `v*` tag, so nothing else in CI ever reads
       # it — a syntax error there would surface when a release is cut. Lint the
       # workflows here instead. Linux-only: the result is platform-independent
@@ -104,7 +82,7 @@ jobs:
       # failure hides all of them, so a red build reports one problem per push
       # and each fix reveals the next. That is how a Windows clippy failure sat
       # invisible behind a Vitest failure on the same leg. Same reasoning as
-      # `--no-fail-fast` below, applied one level up.
+      # `--no-fail-fast` in the Rust job, applied one level up.
       - name: IPC Contract Check
         if: ${{ !cancelled() }}
         run: bun run check:ipc
@@ -152,25 +130,78 @@ jobs:
         if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
         run: bun run test:webkit:all
 
-      # Backlog B2, investigated and declined. The frontend bundle is
-      # platform-independent, so in principle one leg could build it and share
-      # `dist/` with the others through upload-artifact/download-artifact.
-      # Measured locally: a cold `npm run build` is ~5.0s producing 1.2MB
-      # across 12 files, and a warm build is no faster, so there is ~5s per leg
-      # to win. (Runner hardware is slower than the machine measured on, but
-      # the figure is the right order of magnitude.)
-      #
-      # An artifact round trip is an upload step plus a download step plus both
-      # actions' own setup, which does not plausibly come in under the rebuild
-      # it replaces. The structural cost is worse than the transfer cost: the
-      # matrix legs currently depend on nothing, and sharing `dist/` would make
-      # each of them wait on a build job, turning parallel work into a
-      # serialized edge. Every leg building from its own checkout is also one
-      # less way for a stale artifact to be tested.
-      #
-      # Revisit if the bundle grows enough that the build stops being cheap.
       - name: Frontend Vite Build
         if: ${{ !cancelled() }}
+        run: bun run build
+
+  # fmt and clippy of both Rust workspaces. Clippy builds `check` artifacts, not
+  # the test profile's, so it shares nothing with the test job but dependencies,
+  # and the two compile side by side instead of one after the other.
+  #
+  # `cache-on-failure`: rust-cache saves in a post step that runs only after a
+  # successful job. The old single job was red or cancelled on every push in the
+  # last twelve runs, so its cache was never written: macOS logged "No cache
+  # found" and spent 14 minutes in clippy and 24 in the test build, every time.
+  # Only the benches and deep-checks jobs, which finish green, had a cache.
+  rust-lint:
+    name: Rust Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+
+      # ImageOS/ImageVersion are runner process env vars. They are not in the
+      # workflow `env` context, so interpolating env.ImageOS as the cache
+      # prefix was the empty string and rust-cache kept the default Windows
+      # key. Restored MSVC artifacts from older VS then failed `--lib`
+      # with 0xc0000139.
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          cache-on-failure: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # tauri.conf.json's frontendDist is ../dist, which the Rust build embeds,
+      # so the bundle has to exist before cargo runs.
+      - name: Frontend Vite Build
         run: bun run build
 
       - name: Rust Cargo Format Check
@@ -180,6 +211,99 @@ jobs:
       - name: Rust Cargo Clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      # crates/gitpulse-worktree is its own workspace with its own Cargo.lock and
+      # its own target dir (crates/gitpulse-worktree/target), so it never contends
+      # with src-tauri/target. Nothing else builds it: before these steps the
+      # zero-copy build cache (gitpulse-rustc) shipped with no CI at all. The
+      # subprocess tests it ships are Unix-only, hence no Windows run.
+      - name: Worktree Crate Format Check
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo fmt --manifest-path crates/gitpulse-worktree/Cargo.toml -- --check
+
+      - name: Worktree Crate Clippy
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo clippy --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --all-targets -- -D warnings
+
+  # Linux and Windows run the suite in one process, one test at a time:
+  # `cargo test --test-threads=1`, the gate scripts/check-workflows.test.ts pins.
+  # macOS cannot: in run 43351016929 it logged 6,623 of the lib suite's 7,474
+  # tests in 52 minutes and hit the job limit. It runs the same suite as three
+  # `cargo nextest` shards instead (`rust-test-macos`), each one bucket of
+  # `--partition hash:M/3`, each serial (`--profile ci`,
+  # src-tauri/.config/nextest.toml), so a leg takes about a third of the suite
+  # rather than the whole of it. `rust-test-complete` then fails unless the three
+  # buckets between them ran every listed test once.
+  #
+  # What the shards do not see, ubuntu and windows still do: a test that fails
+  # only beside another in the same process, which nextest's one-process-per-test
+  # cannot show, and which ci-local's `cargo-tests` gate and test-parallel.yml
+  # also run.
+  #
+  # These are separate jobs, not one matrix with `if: matrix.shard == 1` steps,
+  # because the release-gate rule (scripts/check-workflows.mjs) accepts a step
+  # condition only as `!cancelled()` or a platform selector over a matrix list:
+  # a check that can skip reads as a pass to release-state.mjs.
+  rust-test:
+    name: Rust Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # fec1e008: ubuntu reached the serial 6,099-test lib suite at 39 min and
+    # was cancelled. The same suite took 20 min at eight threads on a macOS
+    # runner, so serial it needs well over that.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # tauri.conf.json's frontendDist is ../dist, which the Rust build embeds,
+      # so the bundle has to exist before cargo runs. Every leg builds it from
+      # its own checkout rather than sharing an artifact: a cold build is ~5 s,
+      # an upload and a download are not cheaper, and a shared `dist/` would
+      # make this job wait on another.
+      - name: Frontend Vite Build
+        run: bun run build
 
       - name: Rust Unit & Integration Tests
         if: ${{ !cancelled() }}
@@ -197,19 +321,6 @@ jobs:
           else
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
-
-      # crates/gitpulse-worktree is its own workspace with its own Cargo.lock and
-      # its own target dir (crates/gitpulse-worktree/target), so it never contends
-      # with src-tauri/target. Nothing above builds it: before these steps the
-      # zero-copy build cache (gitpulse-rustc) shipped with no CI at all. The
-      # subprocess tests it ships are Unix-only, hence no Windows run.
-      - name: Worktree Crate Format Check
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
-        run: cargo fmt --manifest-path crates/gitpulse-worktree/Cargo.toml -- --check
-
-      - name: Worktree Crate Clippy
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
-        run: cargo clippy --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --all-targets -- -D warnings
 
       - name: Worktree Crate Tests
         if: ${{ !cancelled() && runner.os != 'Windows' }}
@@ -233,18 +344,209 @@ jobs:
           fi
           grep -q "test result: ok. 1 passed" <<<"$out"
 
-      - name: Terminal Suites Against the Terminal Host
-        # The same terminal suites, every session registry backed by a real
-        # gitpulse-ptyd rather than the engine in the test process
-        # (docs/TERMINAL_HOST.md, migration step 2). The host is Unix-only.
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+  # The macOS suite as three serial nextest shards. Three, because the macOS
+  # runner allowance is five concurrent jobs and the frontend, lint and extras
+  # jobs hold the rest.
+  rust-test-macos:
+    name: Rust Tests (macOS, shard ${{ matrix.shard }}/3)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      # `shared-key` names the cache for the OS alone, so the three shards and
+      # the extras job restore and save one cache. Without it the key carries the
+      # job id but no matrix value, which makes the shards collide the same way
+      # by accident.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      # Pinned to the version this was written against (and ci:local runs), so a
+      # nextest release cannot change the partition hash or the report between
+      # two pushes and move a test to a different shard.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # The Rust build embeds ../dist (see rust-test).
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # This shard's bucket of the suite. `--profile ci` is one test at a time
+      # and writes target/nextest/ci/junit.xml, which the completeness job reads.
+      - name: Rust Unit & Integration Tests (nextest shard)
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --manifest-path src-tauri/Cargo.toml --locked --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
+
+      # `if-no-files-found: error`: a shard that wrote no report must turn this
+      # red, not leave the completeness job one report short without a word.
+      - name: Upload this shard's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: junit-shard-${{ matrix.shard }}
+          path: src-tauri/target/nextest/ci/junit.xml
+          if-no-files-found: error
+
+  # What nextest does not run, once: doctests, the worktree crate and the
+  # descriptor burst, all serial like the gate, plus the whole suite listed
+  # unpartitioned for the completeness job to hold the shard reports against.
+  rust-test-macos-extras:
+    name: Rust Tests (macOS, doctests and one-off checks)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # nextest does not run doctests.
+      - name: Rust Doctests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --doc -- --test-threads=1
+
+      - name: Worktree Crate Tests
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
+
+      - name: Descriptor inheritance under concurrent spawns
+        # As in rust-test: the #[ignore]d burst, run by name, failing when it
+        # collects nothing.
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a dbus-run-session -- bun run test:terminal-host
-          else
-            bun run test:terminal-host
-          fi
+          set -euo pipefail
+          out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
+          grep -q "test result: ok. 1 passed" <<<"$out"
+
+      # Builds nothing new: the test binaries are the ones just built.
+      - name: List the whole Rust suite
+        if: ${{ !cancelled() }}
+        run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
+
+      - name: Upload the suite list
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-list
+          path: nextest-list.json
+          if-no-files-found: error
+
+  # Fails unless the macOS buckets between them ran every test in the suite
+  # exactly once. A green shard says only that its own bucket passed: a shard
+  # whose build broke or whose report is missing leaves the others green and the
+  # suite short, and nothing else in the run would say so.
+  #
+  # No job-level `if`: a skipped job leaves the run concluding success (see the
+  # release-gate rule). With `needs`, this job is skipped only when a shard
+  # failed or was cancelled, and then the run is red anyway; when every shard is
+  # green, it always runs.
+  rust-test-complete:
+    name: Rust Tests (macOS, every shard ran)
+    needs: [rust-test-macos, rust-test-macos-extras]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Download the suite list
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nextest-list
+          path: shards/list
+
+      # A shard that uploaded nothing is not an error at this step: the check
+      # below fails on the missing report and names its path, which says which
+      # shard is short where a failed download would not.
+      - name: Download the shard reports
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: junit-shard-*
+          path: shards
+
+      - name: Every listed test ran in exactly one shard
+        run: node scripts/check-shard-coverage.mjs --list shards/list/nextest-list.json --shards 3 shards/junit-shard-1/junit.xml shards/junit-shard-2/junit.xml shards/junit-shard-3/junit.xml
 
   # release.yml builds Linux aarch64 and Windows arm64 only on a tag, so a
   # broken ARM leg would first fail with every other platform already on the
