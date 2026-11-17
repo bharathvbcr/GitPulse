@@ -2403,6 +2403,104 @@ mod family_cost_tests {
         );
     }
 
+    /// rv1116-hook-hash-object. A sibling the anchor has never imported has no
+    /// row and no stored label, so the read-only check (asked by the agent hook
+    /// on every tool call, in a process with no memo) fell through to
+    /// `git hash-object --stdin` for it: a linked worktree that records before
+    /// the next consolidation cost one child per tool call, and under a
+    /// saturated spawn budget the child was refused and every hook failed with
+    /// `legacy_source_key_failed`. On 32294f44 this check counts 1 hash-object.
+    #[test]
+    fn a_sibling_never_imported_costs_the_readonly_check_no_git() {
+        let (dir, repo, mut siblings) = family_with_legacy_ledgers(2);
+        let address = repository_address(&repo).expect("first pass");
+        let fresh = linked(dir.path());
+        record(&fresh.1);
+        siblings.push(fresh);
+        crate::ledger::tests_support::forget_family_keys();
+        let members: Vec<std::path::PathBuf> = siblings
+            .iter()
+            .map(|(_, worktree)| std::path::PathBuf::from(worktree))
+            .collect();
+
+        let (pending, spawned) = spawned_by(&repo, || {
+            crate::ledger::unconsolidated_legacy_ledger(&address.anchor, &members)
+        });
+        assert_eq!(
+            pending.expect("the readonly check answers without git"),
+            None,
+            "a git.commit row can set no binding, so nothing is pending"
+        );
+        assert!(
+            spawned.is_empty(),
+            "the readonly check spawned git for a never-imported sibling: {spawned:?}"
+        );
+    }
+
+    /// The read-only lookup finds an imported sibling's row by its path alone,
+    /// under the very key Git gave it, so it can never miss a row the memo or a
+    /// stored label would have found (which would read imported rows as pending).
+    #[test]
+    fn the_readonly_lookup_finds_each_imported_row_by_its_path() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        repository_address(&repo).expect("first pass");
+        for (_, worktree) in &siblings {
+            let by_key = crate::ledger::with_conn(&repo, |conn| {
+                conn.query_row(
+                    "SELECT source_cursor, source_label FROM ledger_family_imports
+                     WHERE source_key = ?1",
+                    [real_key(&repo, worktree)],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| LedgerError::new("query_failed", error.to_string()))
+            })
+            .expect("the row Git's key names");
+            assert_eq!(
+                crate::ledger::tests_support::row_by_path(&repo, worktree),
+                Some(by_key),
+                "{worktree}"
+            );
+        }
+    }
+
+    /// The same in a SHA-256 repository, whose sources Git names with 64-digit
+    /// ids: the 64-digit name is the one the lookup must find.
+    #[test]
+    fn the_readonly_lookup_finds_a_sha256_repository_s_rows_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(
+            dir.path(),
+            &["init", "-b", "main", "--object-format=sha256"],
+        );
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "seed.txt"]);
+        crate::test_support::git_in(dir.path(), &["commit", "-m", "seed"]);
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        record(&worktree);
+        repository_address(&repo).expect("GitPulse consolidates");
+        let key = real_key(&repo, &worktree);
+        assert_eq!(
+            key.len(),
+            64,
+            "git names a SHA-256 repository's source in 64 digits"
+        );
+        let by_key = crate::ledger::with_conn(&repo, |conn| {
+            conn.query_row(
+                "SELECT source_cursor, source_label FROM ledger_family_imports
+                 WHERE source_key = ?1",
+                [&key],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| LedgerError::new("query_failed", error.to_string()))
+        })
+        .expect("the row Git's 64-digit key names");
+        assert_eq!(
+            crate::ledger::tests_support::row_by_path(&repo, &worktree),
+            Some(by_key)
+        );
+    }
+
     /// The key is what Git's own `hash-object --stdin` returns: persisted rows
     /// are keyed by it, so no path to a key may disagree with it.
     #[test]
