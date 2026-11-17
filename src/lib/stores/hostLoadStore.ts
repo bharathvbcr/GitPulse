@@ -380,7 +380,7 @@ export interface GovernorPulse {
 
 /** `sysload::ProfileTier`: how much headroom the machine has. */
 export type ProfileTier = "compact" | "standard" | "roomy";
-/** `host_load.profile`: `auto` derives the tier from memory, the others pin it. */
+/** `host_load_profile`: `auto` derives the tier from memory, the others pin it. */
 export type ProfileChoice = "auto" | ProfileTier;
 /**
  * `sysload::ProfileBasis`: how the tier was decided. `memory_unreadable` is a

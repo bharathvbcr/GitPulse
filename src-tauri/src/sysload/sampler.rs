@@ -76,7 +76,7 @@ pub struct HostLoadStatus {
     /// why (`sysload::governor`).
     pub governor: GovernorReport,
     /// What this machine can afford GitPulse to hold, sized from the memory
-    /// this sensor reads and `host_load.profile` (`sysload::profile`).
+    /// this sensor reads and `host_load_profile` (`sysload::profile`).
     pub profile: ResourceProfile,
     pub snapshot_path: Option<String>,
     pub writer: Option<WriterIdentity>,
@@ -135,7 +135,7 @@ pub struct SamplerOptions {
     /// `host_load.govern_launches`, read once per tick: whether severe
     /// pressure refuses agent launches.
     pub govern_launches: Box<dyn Fn() -> bool + Send>,
-    /// `host_load.profile`, read once per tick: the tier the user asked for.
+    /// `host_load_profile`, read once per tick: the tier the user asked for.
     pub profile_choice: Box<dyn Fn() -> ProfileChoice + Send>,
     /// Each input's mode and thresholds, read once per tick like
     /// `govern_launches`.
@@ -380,13 +380,13 @@ pub fn status() -> HostLoadStatus {
     }
 }
 
-/// The user's `host_load.profile`, as stored.
+/// The user's `host_load_profile`, as stored.
 fn stored_profile_choice() -> ProfileChoice {
     crate::tool_config::host_load_settings().profile
 }
 
 /// What this machine can afford GitPulse to hold: its installed memory under
-/// the stored `host_load.profile`. Like [`governor::shed`], it answers in
+/// the stored `host_load_profile`. Like [`governor::shed`], it answers in
 /// every process, sampling or not: installed memory is read from the
 /// operating system directly, so the "Measure memory pressure" switch and the
 /// sampler's first tick do not change it. `memory_unreadable` means that read

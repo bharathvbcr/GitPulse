@@ -511,7 +511,7 @@ export function traceRow(record: TraceRecord): string[] {
   ];
 }
 
-/** The memory profile select's options (`host_load.profile`), in the order shown. */
+/** The memory profile select's options (`host_load_profile`), in the order shown. */
 export const PROFILE_CHOICES: readonly { value: ProfileChoice; label: string }[] = [
   { value: "auto", label: "Automatic (from this computer's memory)" },
   { value: "compact", label: "Compact (8 GB of memory or less)" },

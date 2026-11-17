@@ -547,6 +547,26 @@ where
     }))
 }
 
+/// Reads `host_load_profile`; a value this build does not know (a newer tier,
+/// or not a string) is `auto` and costs no other setting.
+fn lenient_profile<'de, D>(deserializer: D) -> Result<crate::sysload::ProfileChoice, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load_profile, the profile is automatic: {error}"
+        );
+        crate::sysload::ProfileChoice::Auto
+    }))
+}
+
+fn is_default_profile(choice: &crate::sysload::ProfileChoice) -> bool {
+    *choice == crate::sysload::ProfileChoice::default()
+}
+
 /// Whether builds take a slot (`sysload::lease`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -887,7 +907,10 @@ pub struct HostLoadSettings {
     pub govern_launches: bool,
     /// Which resource profile sizes GitPulse's own caches (`auto` derives it
     /// from physical memory; the others pin it). Capacity only: it never
-    /// changes another stored setting.
+    /// changes another stored setting. Carried over IPC with the switches but
+    /// stored at the top level of the file as `host_load_profile`, for the same
+    /// reason as `thresholds`: `write_host_load` writes only the two switches,
+    /// and an older build meeting it inside the block would discard the block.
     #[serde(default)]
     pub profile: crate::sysload::ProfileChoice,
     /// What the `command-gate` hook does about a heavy command under load.
@@ -1224,6 +1247,15 @@ pub struct ToolConfig {
         skip_serializing_if = "is_default_hook_mode"
     )]
     pub host_load_hook_mode: HostLoadHookMode,
+    /// Which resource profile sizes GitPulse's caches: a sibling of
+    /// `host_load`, so an older build keeps it in `unknown` and never meets it
+    /// inside that block's strict reader. Written only when it is not `auto`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_profile",
+        skip_serializing_if = "is_default_profile"
+    )]
+    pub host_load_profile: crate::sysload::ProfileChoice,
     /// The disk fill-rate horizon and the coverage headroom, a sibling of
     /// `host_load_thresholds` rather than inside it: a build that predates them
     /// rewrites that key from the inputs it knows and would drop these.
@@ -1282,6 +1314,7 @@ impl Default for ToolConfig {
             host_load: HostLoadSettings::default(),
             host_load_thresholds: crate::sysload::Thresholds::default(),
             host_load_hook_mode: HostLoadHookMode::default(),
+            host_load_profile: crate::sysload::ProfileChoice::Auto,
             host_load_disk_guard: crate::sysload::DiskGuard::default(),
             turn_checkpoints: TurnCheckpointSettings::default(),
             host_load_leases: HostLoadLeases::default(),
@@ -1972,6 +2005,7 @@ pub fn host_load_settings() -> HostLoadSettings {
             HostLoadSettings {
                 thresholds,
                 hook_mode: cfg.host_load_hook_mode,
+                profile: cfg.host_load_profile,
                 leases: cfg.host_load_leases,
                 idle: cfg.host_load_idle,
                 ..cfg.host_load
@@ -2043,6 +2077,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     cfg.host_load_thresholds = next.thresholds.clone();
     cfg.host_load_disk_guard = next.thresholds.disk_guard;
     cfg.host_load_hook_mode = next.hook_mode;
+    cfg.host_load_profile = next.profile;
     cfg.host_load_leases = next.leases.clone();
     cfg.host_load_idle = next.idle.clone();
     cfg.host_load = next;
@@ -2261,10 +2296,12 @@ mod tests {
         });
     }
 
-    /// `host_load.profile` is `auto` for a tools.json written before it
-    /// existed, round-trips when chosen, is not written while `auto`, and an
-    /// unrecognised value reads as `auto` without costing the block's other
-    /// switches.
+    /// The profile is `auto` for a tools.json written before it existed,
+    /// round-trips when chosen as the top-level `host_load_profile` (never
+    /// inside `host_load`, which `write_host_load` limits to the two switches),
+    /// survives a later save of another setting, is not written while `auto`,
+    /// and an unrecognised value reads as `auto` without costing any other
+    /// setting.
     #[test]
     fn the_host_load_profile_defaults_to_auto_and_round_trips() {
         use crate::sysload::ProfileChoice;
@@ -2293,26 +2330,48 @@ mod tests {
             assert_eq!(host_load_settings().profile, ProfileChoice::Compact);
             let stored: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(stored["host_load"]["profile"], "compact");
+            assert_eq!(stored["host_load_profile"], "compact");
+            assert!(
+                stored.get("host_load").is_none(),
+                "the profile never rides inside the block an older build reads strictly"
+            );
+            // Another setting saved later keeps it.
+            set_host_load_settings(HostLoadSettings {
+                govern_launches: false,
+                ..host_load_settings()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_settings().profile, ProfileChoice::Compact);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                stored["host_load"],
+                serde_json::json!({"enabled": true, "govern_launches": false})
+            );
 
             set_host_load_settings(HostLoadSettings::default()).unwrap();
             let stored: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert!(
-                stored.get("host_load").is_none(),
+                stored.get("host_load").is_none() && stored.get("host_load_profile").is_none(),
                 "auto is the default and is not written"
             );
 
-            write_raw(
-                path,
-                r#"{"version":1,"host_load":{"enabled":false,"profile":"tiny"}}"#,
-            );
-            let unknown = host_load_settings();
-            assert_eq!(unknown.profile, ProfileChoice::Auto);
-            assert!(
-                !unknown.enabled,
-                "an unknown profile does not reset the block"
-            );
+            for raw in [r#""tiny""#, "7", r#"{"tier":"compact"}"#] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"host_load":{{"enabled":false}},"host_load_profile":{raw}}}"#
+                    ),
+                );
+                let unknown = host_load_settings();
+                assert_eq!(unknown.profile, ProfileChoice::Auto, "{raw}");
+                assert!(
+                    !unknown.enabled,
+                    "an unknown profile ({raw}) costs no other setting"
+                );
+            }
         });
     }
 

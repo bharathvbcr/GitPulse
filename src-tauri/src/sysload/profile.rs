@@ -43,7 +43,7 @@ pub const COMPACT_MAX_BYTES: u64 = 8 * GIB;
 /// is `standard`; anything larger is `roomy`.
 pub const STANDARD_MAX_BYTES: u64 = 16 * GIB;
 
-/// What `host_load.profile` asks for. `Auto` derives the tier from memory.
+/// What `host_load_profile` asks for. `Auto` derives the tier from memory.
 ///
 /// An unrecognised stored value reads as `Auto`, so a settings file written
 /// by a newer build cannot cost the rest of the `host_load` block.
@@ -74,7 +74,7 @@ pub enum ProfileTier {
 pub enum ProfileBasis {
     /// From a readable physical-memory reading.
     Memory,
-    /// The user chose the tier (`host_load.profile`).
+    /// The user chose the tier (`host_load_profile`).
     Override,
     /// Memory could not be read and nothing was chosen: the tier is a
     /// default (`standard`), not an answer.
