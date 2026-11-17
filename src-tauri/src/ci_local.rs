@@ -791,12 +791,13 @@ fn executed_test_count(step_name: &str, stdout: &str) -> Option<u64> {
 }
 
 /// Why a successful exit does not count as a pass: the runner executed no
-/// tests. `None` when tests ran, and for a non-test step.
+/// tests, or printed no summary this module can read. `None` when tests ran,
+/// and for a non-test step.
 ///
-/// A cargo test step with no readable summary is also refused — `cargo test`
-/// always prints one, so its absence means the output is not what it seems.
-/// Frontend and Python steps with no readable summary are not judged: those
-/// runners are whatever the repository's `test` script invokes.
+/// Every test family is held to this, not only cargo. An unreadable summary is
+/// a check whose outcome is unknown, and that must never read as a pass; a
+/// runner whose summary is not parsed yet gets a parser in
+/// [`executed_test_count`], never an exemption.
 fn unexecuted_tests(step: &CiStep, output: &CapturedOutput) -> Option<String> {
     if !is_test_step_name(&step.name) {
         return None;
@@ -804,10 +805,10 @@ fn unexecuted_tests(step: &CiStep, output: &CapturedOutput) -> Option<String> {
     let family = base_test_step_name(&step.name);
     match executed_test_count(&step.name, &output.stdout_text()) {
         Some(0) => Some(format!("{family} exited 0 but executed 0 tests")),
-        None if family == "Rust tests" => Some(format!(
-            "{family} exited 0 but printed no `test result:` summary"
+        None => Some(format!(
+            "{family} exited 0 but printed no test summary this build can read"
         )),
-        _ => None,
+        Some(_) => None,
     }
 }
 
@@ -1168,6 +1169,20 @@ mod tests {
         }
     }
 
+    /// Real output, captured from `npm test -- src/lib/provenance/badge.test.ts`
+    /// on this repository under `CI=1` (vitest 5.1.0, ANSI colour stripped).
+    const VITEST_PASS: &str = include_str!("ci_local_fixtures/vitest_run_pass.txt");
+    /// Real stdout of `cargo test --lib ci_local -- --test-threads=1` here.
+    const CARGO_PASS: &str = include_str!("ci_local_fixtures/cargo_test_pass.txt");
+    /// A cargo run whose filter matched nothing (the shape cargo prints for it).
+    const CARGO_NONE: &str = include_str!("ci_local_fixtures/cargo_test_none.txt");
+    /// vitest with no test files. NOT captured: the format is vitest's own.
+    const VITEST_NONE: &str = include_str!("ci_local_fixtures/vitest_none.txt");
+    /// pytest is not installed on this machine, so these two are written in
+    /// pytest's documented summary format, NOT captured from a run.
+    const PYTEST_PASS: &str = include_str!("ci_local_fixtures/pytest_pass.txt");
+    const PYTEST_NONE: &str = include_str!("ci_local_fixtures/pytest_none.txt");
+
     fn captured(success: bool, code: i32, stdout: &str, stderr: &str) -> CapturedOutput {
         CapturedOutput {
             stdout: stdout.as_bytes().to_vec(),
@@ -1179,7 +1194,7 @@ mod tests {
 
     #[test]
     fn a_successful_step_carries_no_detail() {
-        let r = step_result(&step(), Ok(captured(true, 0, "all good", "")), 120);
+        let r = step_result(&step(), Ok(captured(true, 0, VITEST_PASS, "")), 120);
         assert_eq!(r.status, "passed");
         assert_eq!(r.detail, "");
         assert_eq!(r.duration_ms, 120);
@@ -1348,7 +1363,7 @@ mod tests {
     #[test]
     fn the_status_vocabulary_is_exactly_these_three() {
         let produced: Vec<String> = vec![
-            step_result(&step(), Ok(captured(true, 0, "", "")), 1).status,
+            step_result(&step(), Ok(captured(true, 0, VITEST_PASS, "")), 1).status,
             step_result(&step(), Ok(captured(false, 1, "", "boom")), 1).status,
             step_result(&step(), Err("spawn failed".into()), 1).status,
             skipped_result(&step()).status,
@@ -1780,6 +1795,48 @@ mod tests {
         let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s\ntest result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s\n";
         let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, out, "")), 1);
         assert_eq!(r.status, "passed", "{}", r.detail);
+    }
+
+    /// Each runner's real (or documented, see the constants) summary parses to
+    /// the number of tests it executed, so the zero check is judging real text.
+    #[test]
+    fn every_runner_summary_fixture_parses_to_its_executed_count() {
+        let count = |name: &str, out: &str| executed_test_count(name, out);
+        assert_eq!(count("Rust tests", CARGO_PASS), Some(40));
+        assert_eq!(count("Rust tests", CARGO_NONE), Some(0));
+        assert_eq!(count("Frontend unit tests", VITEST_PASS), Some(22));
+        assert_eq!(count("Frontend unit tests", VITEST_NONE), None);
+        assert_eq!(count("Python tests", PYTEST_PASS), Some(5));
+        assert_eq!(count("Python tests", PYTEST_NONE), Some(0));
+    }
+
+    #[test]
+    fn a_test_step_with_no_readable_summary_is_not_a_pass() {
+        for (name, program, out) in [
+            ("Frontend unit tests", "npm", "all good"),
+            ("Frontend unit tests", "npm", VITEST_NONE),
+            ("Python tests", "pytest", "ok"),
+            ("Rust tests", "cargo", "ok"),
+        ] {
+            let step = CiStep {
+                name: name.into(),
+                program: program.into(),
+                args: Vec::new(),
+            };
+            let r = step_result(&step, Ok(captured(true, 0, out, "")), 1);
+            assert_eq!(r.status, "failed", "{name}: {}", r.detail);
+            assert!(r.detail.starts_with(COULD_NOT_RUN), "{name}: {}", r.detail);
+        }
+        let build = CiStep {
+            name: "Frontend build".into(),
+            program: "npm".into(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            step_result(&build, Ok(captured(true, 0, "built", "")), 1).status,
+            "passed",
+            "only test steps are judged by a test summary"
+        );
     }
 
     #[test]

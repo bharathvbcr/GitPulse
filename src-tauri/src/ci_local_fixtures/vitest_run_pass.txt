@@ -1,0 +1,13 @@
+
+> gitpulse@1.99.0 test
+> vitest run src/lib/provenance/badge.test.ts
+
+
+ RUN  v5.1.0 /Users/bharath/Code/devtools/GitPulse/.claude/worktrees/build1116-b5393529-ci-local
+
+
+ Test Files  1 passed (1)
+      Tests  22 passed (22)
+   Start at  22:38:41
+   Duration  281ms (import 36%, worker 31%, transform 20%, tests 14%)
+

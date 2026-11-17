@@ -1,0 +1,4 @@
+
+ RUN  v5.1.0 /tmp/x
+
+ No test files found, exiting with code 0
