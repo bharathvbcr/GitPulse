@@ -2,7 +2,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SCHEMAS, devmapReading, judge, rustConstant, schemasAt, summarize } from "./check-schema-parity.mjs";
+import { devmapReading, judge, rustConstant, schemasAt, summarize } from "./check-schema-parity.mjs";
 import { readCliSchema } from "./check-vendor-schema.mjs";
 
 const C = "STACK_FORMAT_VERSION";
