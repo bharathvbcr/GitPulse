@@ -7219,6 +7219,198 @@ pub fn reap_processes_in_dir(dir: &Path, dry_run: bool) -> Result<ProcessReapRep
     })
 }
 
+/// Why a worktree is not removed out from under a live process: one stands in
+/// it, runs from it, or names it in its arguments or environment. A process
+/// table that could not be read in full refuses too.
+///
+/// The same scan guards the app's remove button
+/// (`WorkbenchState::refuse_if_in_use`); the MCP teardowns word the answer for
+/// a caller that has no dialog to read.
+pub(crate) fn live_process_refusal(path: &Path) -> Option<String> {
+    match crate::sysload::procscan::processes_using(path) {
+        Err(e) => Some(format!("could not check for live processes: {e}")),
+        Ok(pids) if !pids.is_empty() => Some(format!(
+            "{} live process(es) use it ({}; pids {pids:?}): their working directory, \
+             executable, arguments or environment is inside or names it; stop them first",
+            pids.len(),
+            crate::terminal::foreground::describe_pids(&pids),
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// What [`reap_then_hold`] did to the processes in a worktree, and whether
+/// anything still holds it.
+pub(crate) struct ReapHold {
+    /// Processes terminated (in a dry run, the ones that would be).
+    pub terminated: Vec<i32>,
+    /// The reaper's `pids_spared`: an agent session, an interactive shell, a
+    /// supervisor-owned launch, `memguard`, another user's process. Never
+    /// signalled, so each one still works in the worktree.
+    pub spared: Vec<i32>,
+    /// Why the worktree must stay, when it must.
+    pub hold: Option<String>,
+}
+
+/// Terminates what may be terminated in `dir`, then says whether the worktree
+/// can still be torn down. A spared process is a hold: the reaper leaves it
+/// running on purpose, so removing the directory takes it from under its
+/// owner. After a real reap, what was signalled gets a moment to exit, and
+/// whatever still uses the directory holds it too. An `Err` is the process
+/// table not being readable: never "nothing is there".
+pub(crate) fn reap_then_hold(dir: &Path, dry_run: bool) -> Result<ReapHold, CommandError> {
+    let report = reap_processes_in_dir(dir, dry_run)?;
+    let mut out = ReapHold {
+        terminated: report.pids_terminated,
+        spared: report.pids_spared,
+        hold: None,
+    };
+    if !out.spared.is_empty() {
+        out.hold = Some(format!(
+            "{} process(es) the reaper does not terminate still work in it ({}; pids {:?}): an \
+             agent session, an interactive shell, a supervisor-owned launch or another user's \
+             process",
+            out.spared.len(),
+            crate::terminal::foreground::describe_pids(&out.spared),
+            out.spared,
+        ));
+        return Ok(out);
+    }
+    if dry_run {
+        return Ok(out);
+    }
+    // Reaping signals only processes standing in the worktree. One that merely
+    // names it (a build run from elsewhere) is not signalled, and one that was
+    // is given a moment to exit: removal waits for neither.
+    let mut reason = live_process_refusal(dir);
+    for _ in 0..20 {
+        if reason.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reason = live_process_refusal(dir);
+    }
+    out.hold = reason.map(|r| format!("after terminating processes: {r}"));
+    Ok(out)
+}
+
+/// Whether a lane claim names the worktree `path` (by directory) or, when it
+/// names no directory, its `branch`.
+fn claim_names_worktree(
+    claim: &crate::engine::agent_bus::AgentLaneClaim,
+    path: &Path,
+    branch: Option<&str>,
+) -> bool {
+    match claim.worktree_path.as_deref() {
+        Some(claimed) => {
+            let claimed = Path::new(claimed);
+            claimed == path
+                || matches!(
+                    (claimed.canonicalize(), path.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        }
+        None => branch.is_some_and(|b| claim.branch == b),
+    }
+}
+
+/// The first lane claim naming the worktree, as a reason to keep it.
+fn claim_hold(
+    claims: &[crate::engine::agent_bus::AgentLaneClaim],
+    path: &Path,
+    branch: Option<&str>,
+) -> Option<String> {
+    claims
+        .iter()
+        .find(|c| claim_names_worktree(c, path, branch))
+        .map(|c| {
+            format!(
+                "agent {} holds a lane claim on it (branch {}); the agent releases it with \
+                 gitpulse_worktree_release, or the person removes the worktree in the app",
+                c.agent_id, c.branch
+            )
+        })
+}
+
+/// A reason to keep a worktree because an agent session is attributed to it,
+/// or because none could be ruled out. A detector that could not look, or an
+/// entry that could not be judged, is not "no session here".
+fn session_hold(facet: &crate::insights::LiveSessionFacet) -> Option<String> {
+    let sessions: Vec<String> = facet
+        .worktrees
+        .iter()
+        .flat_map(|w| w.sessions.iter())
+        .map(|s| format!("{} pid {} ({})", s.kind, s.pid, s.status))
+        .collect();
+    if !sessions.is_empty() {
+        return Some(format!(
+            "{} live agent session(s) are attributed to it: {}",
+            sessions.len(),
+            sessions.join("; ")
+        ));
+    }
+    if !facet.attribution_error.is_empty() {
+        return Some(format!(
+            "could not tell whether an agent session is attributed to it: {}",
+            facet.attribution_error
+        ));
+    }
+    let unjudged: Vec<String> = facet
+        .kinds
+        .iter()
+        .filter(|k| !k.ok || k.unverified > 0 || k.truncated)
+        .map(|k| {
+            if k.error.is_empty() {
+                format!("{} ({} unverified)", k.kind, k.unverified)
+            } else {
+                format!("{} ({})", k.kind, k.error)
+            }
+        })
+        .collect();
+    if unjudged.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "could not rule out a live agent session in it: {}",
+            unjudged.join("; ")
+        ))
+    }
+}
+
+/// Why an MCP caller may not tear `worktree_path` down while an agent works in
+/// it, checked before anything is signalled: a live session attributed to the
+/// worktree and, when `honour_claims`, a lane claim naming it. Neither is
+/// overridden by `force`. The app's remove button does not ask this: its
+/// dialog is the person's confirmation, which an MCP call has no channel for.
+///
+/// A merge passes `honour_claims: false`. Its teardown releases the merged
+/// lane's claims itself when it succeeds, so a claim is the lane's own record,
+/// not a process that would lose its files.
+///
+/// A claim file or session scan that could not be read is a hold.
+pub(crate) fn agent_hold(
+    repo_path: &str,
+    worktree_path: &str,
+    branch: Option<&str>,
+    honour_claims: bool,
+) -> Option<String> {
+    let path = Path::new(worktree_path);
+    if honour_claims {
+        match crate::engine::agent_bus::list_lanes(repo_path) {
+            Err(e) => return Some(format!("could not read the lane claims: {}", e.message())),
+            Ok(claims) => {
+                if let Some(hold) = claim_hold(&claims, path, branch) {
+                    return Some(hold);
+                }
+            }
+        }
+    }
+    let observation = crate::insights::live_sessions::observe();
+    let facet =
+        crate::insights::live_sessions::attribute(&observation, &[worktree_path.to_string()]);
+    session_hold(&facet)
+}
+
 /// Result of automated worktree merge pipeline execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeMergeResult {
@@ -7228,6 +7420,10 @@ pub struct WorktreeMergeResult {
     pub squashed_commit: Option<String>,
     pub merged_sha: Option<String>,
     pub worktree_removed: bool,
+    /// Why the source worktree (and its branch) was left in place when
+    /// removal was asked for. The merge itself still happened.
+    #[serde(default)]
+    pub worktree_kept_reason: Option<String>,
     pub error: Option<String>,
 }
 
@@ -7500,6 +7696,7 @@ pub fn merge_worktree_pipeline(
     };
 
     let mut wt_removed = false;
+    let mut kept_reason: Option<String> = None;
     if remove_wt {
         let current_source_sha = git_text(
             &anchor,
@@ -7521,17 +7718,46 @@ pub fn merge_worktree_pipeline(
                 if still_clean {
                     let remove_argv = remove_worktree_argv(wt_path, true);
                     let remove_refs: Vec<&str> = remove_argv.iter().map(String::as_str).collect();
-                    if crate::harness::guard_command(anchor_str, &remove_refs).is_ok() {
-                        let _ = reap_processes_in_dir(Path::new(wt_path), false);
-                        if remove_worktree(anchor_str, wt_path, true).is_ok() {
-                            wt_removed = true;
-                        } else {
+                    match crate::harness::guard_command(anchor_str, &remove_refs) {
+                        Ok(_) => {
+                            // The merge is done and stays done. Whatever is
+                            // still working in the lane keeps its worktree
+                            // and its branch; nothing is signalled before an
+                            // agent attributed to the lane has been ruled out.
+                            let hold = agent_hold(anchor_str, wt_path, Some(source_branch), false)
+                                .or_else(|| match reap_then_hold(Path::new(wt_path), false) {
+                                    Ok(reaped) => reaped.hold,
+                                    Err(e) => Some(format!(
+                                        "could not check or reap its processes: {}",
+                                        e.message()
+                                    )),
+                                });
+                            match hold {
+                                Some(reason) => {
+                                    kept_reason = Some(reason);
+                                    safe_to_delete_branch = false;
+                                }
+                                None => match remove_worktree(anchor_str, wt_path, true) {
+                                    Ok(_) => wt_removed = true,
+                                    Err(e) => {
+                                        kept_reason = Some(format!(
+                                            "git could not remove it: {}",
+                                            e.message()
+                                        ));
+                                        safe_to_delete_branch = false;
+                                    }
+                                },
+                            }
+                        }
+                        Err(e) => {
+                            kept_reason = Some(format!("refused by the command gate: {e}"));
                             safe_to_delete_branch = false;
                         }
-                    } else {
-                        safe_to_delete_branch = false;
                     }
                 } else {
+                    kept_reason = Some(
+                        "it has uncommitted changes, or its status could not be read".to_string(),
+                    );
                     safe_to_delete_branch = false;
                 }
             }
@@ -7563,6 +7789,7 @@ pub fn merge_worktree_pipeline(
         squashed_commit: squashed_sha,
         merged_sha: final_sha,
         worktree_removed: wt_removed,
+        worktree_kept_reason: kept_reason,
         error: None,
     })
 }
@@ -8092,6 +8319,123 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    fn lane(
+        agent: &str,
+        branch: &str,
+        path: Option<&str>,
+    ) -> crate::engine::agent_bus::AgentLaneClaim {
+        crate::engine::agent_bus::AgentLaneClaim {
+            agent_id: agent.to_string(),
+            branch: branch.to_string(),
+            worktree_path: path.map(str::to_string),
+            sparse_cone: Vec::new(),
+            claimed_files: Vec::new(),
+            claimed_symbols: Vec::new(),
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_lane_claim_holds_its_worktree_by_directory_or_by_branch_when_it_names_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("lane");
+        std::fs::create_dir_all(&wt).unwrap();
+        let by_path = [lane("a1", "feat/x", wt.to_str())];
+        let hold = claim_hold(&by_path, &wt, Some("other")).expect("the directory is claimed");
+        assert!(
+            hold.contains("a1") && hold.contains("gitpulse_worktree_release"),
+            "{hold}"
+        );
+        // The same directory through a symlink is the same worktree.
+        let link = dir.path().join("alias");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&wt, &link).unwrap();
+            assert!(claim_hold(&by_path, &link, None).is_some());
+        }
+        // A claim on another directory does not hold this one, even on the same branch name.
+        let elsewhere = [lane("a2", "feat/x", Some("/nowhere/else"))];
+        assert!(claim_hold(&elsewhere, &wt, Some("feat/x")).is_none());
+        // A claim with no directory holds the worktree on that branch only.
+        let by_branch = [lane("a3", "feat/x", None)];
+        assert!(claim_hold(&by_branch, &wt, Some("feat/x")).is_some());
+        assert!(claim_hold(&by_branch, &wt, Some("feat/y")).is_none());
+        assert!(claim_hold(&by_branch, &wt, None).is_none());
+        assert!(claim_hold(&[], &wt, Some("feat/x")).is_none());
+    }
+
+    fn facet(
+        kinds: Vec<crate::insights::LiveKindStatus>,
+        sessions: Vec<crate::insights::LiveSession>,
+    ) -> crate::insights::LiveSessionFacet {
+        let worktrees = if sessions.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::insights::LiveWorktree {
+                path: "/w".to_string(),
+                sessions,
+                children: Vec::new(),
+                children_truncated: false,
+            }]
+        };
+        crate::insights::LiveSessionFacet {
+            ok: true,
+            sessions: worktrees.iter().map(|w| w.sessions.len() as u32).sum(),
+            kinds,
+            worktrees,
+            attribution_error: String::new(),
+        }
+    }
+
+    fn kind(ok: bool, unverified: u32, truncated: bool) -> crate::insights::LiveKindStatus {
+        crate::insights::LiveKindStatus {
+            kind: "claude".to_string(),
+            ok,
+            error: String::new(),
+            sessions: 0,
+            unverified,
+            truncated,
+        }
+    }
+
+    #[test]
+    fn an_attributed_session_or_one_that_cannot_be_ruled_out_holds_the_worktree() {
+        let session = crate::insights::LiveSession {
+            kind: "claude".to_string(),
+            pid: 4242,
+            entrypoint: "cli".to_string(),
+            status: "busy".to_string(),
+            cwd: "/w".to_string(),
+            tree: None,
+            run_id: None,
+            parent_pid: None,
+            session_id: None,
+            proc_start: None,
+            registry_cwd: None,
+            start_us: None,
+            is_caller: false,
+            ide_hosted: false,
+            terminal_session_id: None,
+        };
+        let held = session_hold(&facet(vec![kind(true, 0, false)], vec![session]))
+            .expect("an attributed session holds it");
+        assert!(held.contains("4242") && held.contains("busy"), "{held}");
+        assert!(session_hold(&facet(vec![kind(true, 0, false)], Vec::new())).is_none());
+        for (label, k) in [
+            ("a detector that could not look", kind(false, 0, false)),
+            ("an unverified entry", kind(true, 1, false)),
+            ("a truncated registry", kind(true, 0, true)),
+        ] {
+            assert!(
+                session_hold(&facet(vec![k], Vec::new())).is_some(),
+                "{label} is not \"no session here\""
+            );
+        }
+        let mut unread = facet(vec![kind(true, 0, false)], Vec::new());
+        unread.attribution_error = "hook claims not read".to_string();
+        assert!(session_hold(&unread).is_some());
+    }
 
     #[test]
     fn test_branch_template_rendering_and_sanitization() {
@@ -16479,7 +16823,9 @@ mod scan_once_tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
             .unwrap();
-        // A changed path that cannot be read.
+        // A changed path that cannot be read. Unix only: the block below
+        // removes the directory's permissions, which Windows has no mode for.
+        #[cfg(unix)]
         let unreadable: Arc<str> = Arc::from(" M sub/f.txt\0");
         #[cfg(unix)]
         {

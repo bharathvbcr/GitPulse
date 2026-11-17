@@ -53,6 +53,10 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
     { reason: "internally tagged enum, not a struct; parseAutoFetchOutcome in src/lib/repos/autoFetch.ts refuses any shape but the two variants, pinned by autoFetch.test.ts and the Rust auto_fetch test" },
   ],
   [
+    "ClaudeCredentialStatus",
+    { reason: "the TS interface is the camelCase result of claudeCredentialStatus in src/lib/workbench/claudeKey.ts, not the wire shape: it reads each snake_case key (key_saved, account, account_error) and throws on a malformed answer, pinned by claudeKey.test.ts. A CONTRACTS row would report the renaming as drift." },
+  ],
+  [
     "ConventionalCommit",
     { reason: "returned only by an orphaned command", orphanCommand: "cmd_parse_conventional_commit" },
   ],

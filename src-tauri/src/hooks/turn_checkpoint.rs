@@ -33,7 +33,8 @@ pub(super) enum Outcome {
     /// The setting is off (or unreadable): nothing was attempted.
     Disabled,
     /// The app answered: `captured`, `unchanged`, `coalesced`, `skipped` or
-    /// `failed`, with its reason.
+    /// `failed`, with its reason. Built only where the app-side recorder exists.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Answered {
         outcome: String,
         reason: Option<String>,
@@ -95,13 +96,7 @@ fn at_boundary_in<R>(
     reach: R,
 ) -> Outcome
 where
-    R: FnOnce(
-            PathBuf,
-            crate::desktop::instance::Request,
-            Duration,
-        ) -> Result<serde_json::Value, String>
-        + Send
-        + 'static,
+    R: FnOnce(PathBuf, AppRequest, Duration) -> Result<serde_json::Value, String> + Send + 'static,
 {
     let Some(dir) = dir else {
         return Outcome::Disabled;
@@ -135,10 +130,17 @@ where
     }
 }
 
+/// What the hook sends the app. `desktop::instance` exists on macOS only, so
+/// elsewhere there is no request to build, and this says so in the type.
+#[cfg(target_os = "macos")]
+type AppRequest = crate::desktop::instance::Request;
+#[cfg(not(target_os = "macos"))]
+type AppRequest = std::convert::Infallible;
+
 #[cfg(target_os = "macos")]
 fn reach_app(
     dir: PathBuf,
-    request: crate::desktop::instance::Request,
+    request: AppRequest,
     deadline: Duration,
 ) -> Result<serde_json::Value, String> {
     crate::desktop::instance::reach_owner(&dir, deadline)
@@ -149,7 +151,7 @@ fn reach_app(
 #[cfg(not(target_os = "macos"))]
 fn reach_app(
     _dir: PathBuf,
-    _request: crate::desktop::instance::Request,
+    _request: AppRequest,
     _deadline: Duration,
 ) -> Result<serde_json::Value, String> {
     Err("the app-side recorder is unavailable off macOS".into())

@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+// Bare `Duration` is named by the macOS-only `AskerDeadline::new` and, through
+// `use super::*`, by macOS-only tests; everything else spells the path.
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -2053,26 +2057,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
 
         let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-        // A step whose commit is not reachable from the HEAD being rebased
-        // would transplant a foreign commit onto the new base; refuse before
-        // any state is touched.
-        for step in steps {
-            let is_ancestor = git_text(
-                &repo,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &step.commit_id,
-                    &original_head,
-                ],
-            );
-            if is_ancestor.is_err() {
-                return Err(format!(
-                    "Rebase step {} is not an ancestor of HEAD; refusing to transplant foreign commits",
-                    step.commit_id
-                ).into());
-            }
-        }
+        // The replay builds the branch from the steps alone, so a plan that
+        // leaves a commit of onto..HEAD out would delete it from the branch,
+        // and one that names a foreign or repeated commit would transplant or
+        // duplicate it. Refuse before any state is touched.
+        require_plan_covers_range(&repo, onto_commit, &original_head, steps)?;
         // A refused read is an error: taking it for "detached" would skip the
         // final `branch -f` and report success with HEAD left detached.
         let original_branch = crate::engine::git_reader::head_branch(&repo)?;
@@ -3417,6 +3406,93 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
+/// Refuses a rebase plan that is not a permutation of `onto..head`: every
+/// commit of the range exactly once, nothing else. Steps may be abbreviated
+/// oids or any revision naming a commit; they are resolved before comparing.
+///
+/// The range is read with at most [`MAX_REPLAY_COMMITS`] + 1 entries, the same
+/// ceiling a cherry-pick or revert replay has, and a longer one is refused
+/// rather than truncated. A merge commit in the range is refused too: the replay
+/// is cherry-pick based and cannot carry one, and refusing here leaves the
+/// branch and the working tree untouched.
+fn require_plan_covers_range(
+    repo: &std::path::Path,
+    onto: &str,
+    head: &str,
+    steps: &[RebaseStep],
+) -> Result<(), CommandError> {
+    let listing = git_text(
+        repo,
+        &[
+            "rev-list",
+            "--parents",
+            &format!("--max-count={}", MAX_REPLAY_COMMITS + 1),
+            &format!("{onto}..{head}"),
+        ],
+    )?;
+    let mut range = std::collections::HashSet::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(oid) = fields.next() else { continue };
+        if fields.nth(1).is_some() {
+            return Err(format!(
+                "Rebase refused: {onto}..HEAD contains the merge commit {oid}, which a replay cannot carry"
+            )
+            .into());
+        }
+        range.insert(oid.to_string());
+    }
+    if range.len() > MAX_REPLAY_COMMITS {
+        return Err(format!(
+            "Rebase refused: {onto}..HEAD holds more than {MAX_REPLAY_COMMITS} commits"
+        )
+        .into());
+    }
+    if steps.len() != range.len() {
+        return Err(format!(
+            "Rebase plan covers {} commit(s) but {onto}..HEAD holds {}; refusing a plan that would drop or add commits",
+            steps.len(),
+            range.len()
+        )
+        .into());
+    }
+    let mut planned = std::collections::HashSet::new();
+    for step in steps {
+        let oid = git_text(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{}^{{commit}}", step.commit_id),
+            ],
+        )
+        .map_err(|_| {
+            CommandError::from(format!(
+                "Rebase step {} does not name a commit",
+                step.commit_id
+            ))
+        })?
+        .trim()
+        .to_string();
+        if !range.contains(&oid) {
+            return Err(format!(
+                "Rebase step {} is not in {onto}..HEAD; refusing to transplant a foreign commit",
+                step.commit_id
+            )
+            .into());
+        }
+        if !planned.insert(oid) {
+            return Err(format!(
+                "Rebase step {} appears more than once in the plan",
+                step.commit_id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a plan in which a squash or fixup has no kept commit before it, as
 /// git does ("cannot 'squash' without a previous commit"). A dropped step is
 /// not a commit to fold into: with only drops ahead of it the fold would amend
@@ -4530,7 +4606,7 @@ fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
     let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
     op_snapshot_test_failures()
@@ -4558,7 +4634,9 @@ pub(crate) struct AskerDeadline {
 }
 
 impl AskerDeadline {
-    /// `budget` from `start`, on the real clock.
+    /// `budget` from `start`, on the real clock. Only the macOS op-record
+    /// handler builds one.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(start: Instant, budget: Duration) -> Self {
         Self {
             expires_at: start + budget,
@@ -4566,7 +4644,7 @@ impl AskerDeadline {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
         Self { expires_at, now }
     }
@@ -4593,7 +4671,9 @@ pub(crate) const OP_DEADLINE_PASSED: &str =
 
 impl GitWriter {
     /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
-    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]). Only the macOS
+    /// op-record handler calls it.
+    #[cfg(target_os = "macos")]
     pub(crate) fn record_op_snapshot(
         repo_path: &str,
         command: &str,
@@ -5097,6 +5177,7 @@ impl GitWriter {
     /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
     /// logged like any other failure (under the request's id), which is also
     /// what settles the hook's "unknown" row for the same write.
+    #[cfg(target_os = "macos")]
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
         not_after_send: Instant,
@@ -6998,6 +7079,211 @@ mod tests {
         });
         GitWriter::stage_file(dir.path().to_str().unwrap(), "tracked.txt")
             .expect("stage must succeed after the contended lock is released");
+    }
+
+    /// `feature`, `count` commits above `main`'s one commit, left checked out.
+    /// Returns the directory, `main`'s tip and the commits oldest first.
+    fn feature_ahead_of_main(count: usize) -> (tempfile::TempDir, String, Vec<String>) {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "base.txt", "base\n", "base commit");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let commits = (0..count)
+            .map(|i| {
+                write_commit(
+                    &dir,
+                    &format!("f{i:02}.txt"),
+                    &format!("{i}\n"),
+                    &format!("feature {i:02}"),
+                )
+            })
+            .collect();
+        (dir, base, commits)
+    }
+
+    fn picks(commits: &[String]) -> Vec<RebaseStep> {
+        commits
+            .iter()
+            .map(|commit_id| RebaseStep {
+                commit_id: commit_id.clone(),
+                action: RebaseActionKind::Pick,
+            })
+            .collect()
+    }
+
+    fn commits_above(dir: &tempfile::TempDir, onto: &str) -> usize {
+        git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{onto}..feature")],
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+    }
+
+    /// The modal plans from the newest 12 graph rows. On a branch 20 commits
+    /// ahead that plan used to succeed and `branch -f` dropped the 8 oldest.
+    #[test]
+    fn rebase_refuses_a_plan_that_covers_only_the_newest_part_of_the_range() {
+        let (dir, _base, commits) = feature_ahead_of_main(20);
+        let tip = head_oid(&dir);
+
+        let err = GitWriter::execute_rebase_sequence(
+            dir.path().to_str().unwrap(),
+            "main",
+            &picks(&commits[8..]),
+        )
+        .expect_err("a plan that omits the 8 oldest commits must be refused");
+
+        let message = err.message();
+        assert!(
+            message.contains("12") && message.contains("20"),
+            "the refusal names both counts: {message}"
+        );
+        assert_eq!(head_oid(&dir), tip, "feature must keep its tip");
+        assert_eq!(commits_above(&dir, "main"), 20);
+        let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "feature", "HEAD must stay on its branch");
+    }
+
+    /// A plan that names every commit still works, with drops and squashes,
+    /// and `onto` may be an oid.
+    #[test]
+    fn rebase_accepts_a_full_permutation_with_a_drop_and_a_squash() {
+        let (dir, base, commits) = feature_ahead_of_main(20);
+        let mut steps = picks(&commits);
+        steps[5].action = RebaseActionKind::Drop;
+        steps[7].action = RebaseActionKind::Squash;
+
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("a plan naming all 20 commits is applied");
+
+        assert_eq!(
+            commits_above(&dir, &base),
+            18,
+            "20 less a drop and a squash"
+        );
+        assert!(
+            !dir.path().join("f05.txt").exists(),
+            "the dropped file is gone"
+        );
+        assert!(
+            dir.path().join("f07.txt").exists(),
+            "the squashed file is kept"
+        );
+    }
+
+    /// Abbreviated oids and a branch name for `onto` resolve to the same
+    /// range and are accepted.
+    #[test]
+    fn rebase_resolves_abbreviated_oids_and_a_branch_name_for_onto() {
+        let (dir, _base, commits) = feature_ahead_of_main(5);
+        let short: Vec<String> = commits.iter().map(|c| c[..12].to_string()).collect();
+
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), "main", &picks(&short))
+            .expect("abbreviated oids naming the whole range are accepted");
+
+        assert_eq!(commits_above(&dir, "main"), 5);
+    }
+
+    #[test]
+    fn rebase_refuses_a_duplicated_step() {
+        let (dir, base, commits) = feature_ahead_of_main(4);
+        let tip = head_oid(&dir);
+        // Same length as the range, one commit twice and one missing.
+        let mut same_length = picks(&commits);
+        same_length[3].commit_id = commits[0].clone();
+        // Every commit once, then one of them again.
+        let mut longer = picks(&commits);
+        longer.push(RebaseStep {
+            commit_id: commits[1].clone(),
+            action: RebaseActionKind::Drop,
+        });
+
+        for steps in [same_length, longer] {
+            let result =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps);
+            assert!(
+                result.is_err(),
+                "a duplicated step was accepted: {result:?}"
+            );
+            assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        }
+    }
+
+    /// A commit from another branch, standing in for one of the range.
+    #[test]
+    fn rebase_refuses_a_commit_that_is_not_in_the_range() {
+        let (dir, base, commits) = feature_ahead_of_main(4);
+        let tip = head_oid(&dir);
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "other", &base]);
+        let foreign = write_commit(&dir, "other.txt", "x\n", "elsewhere");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "feature"]);
+        let mut steps = picks(&commits);
+        steps[2].commit_id = foreign;
+
+        let result =
+            GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps);
+
+        assert!(result.is_err(), "a foreign commit was accepted: {result:?}");
+        assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        assert!(!dir.path().join("other.txt").exists());
+    }
+
+    #[test]
+    fn rebase_refuses_when_the_range_is_empty() {
+        let (dir, _base, commits) = feature_ahead_of_main(3);
+        let tip = head_oid(&dir);
+
+        let result = GitWriter::execute_rebase_sequence(
+            dir.path().to_str().unwrap(),
+            &tip,
+            &picks(&commits[2..]),
+        );
+
+        assert!(result.is_err(), "an empty range was accepted: {result:?}");
+        assert_eq!(head_oid(&dir), tip);
+    }
+
+    /// The replay is cherry-pick based, which cannot carry a merge commit, so
+    /// a range holding one is refused before any state is touched.
+    #[test]
+    fn rebase_refuses_a_range_that_holds_a_merge_commit() {
+        let (dir, base, commits) = feature_ahead_of_main(2);
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "side", &base]);
+        write_commit(&dir, "side.txt", "s\n", "side work");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "feature"]);
+        crate::test_support::git_in(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge side",
+                "side",
+            ],
+        );
+        let tip = head_oid(&dir);
+        let range = git_text(
+            dir.path(),
+            &["rev-list", "--reverse", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        let steps = picks(&range.lines().map(str::to_string).collect::<Vec<_>>());
+        assert!(steps.len() > commits.len(), "the range holds the merge too");
+
+        let err = GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect_err("a merge commit in the range must be refused");
+
+        assert!(err.message().contains("merge"), "{}", err.message());
+        assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "feature");
     }
 
     #[test]
@@ -9616,17 +9902,25 @@ mod bound_to_checked_state {
         let dir = repo_on("main");
         let p = dir.path();
         let c1 = commit_file(p, "a.txt");
-        commit_file(p, "b.txt");
+        let c2 = commit_file(p, "b.txt");
         let c3 = commit_file(p, "c.txt");
 
+        // The plan covers all of c1..HEAD, so the refusal comes from the
+        // failed HEAD read and not from the plan check.
         let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_rebase_sequence(
                 p.to_str().unwrap(),
                 &c1,
-                &[RebaseStep {
-                    commit_id: c3.clone(),
-                    action: RebaseActionKind::Pick,
-                }],
+                &[
+                    RebaseStep {
+                        commit_id: c2.clone(),
+                        action: RebaseActionKind::Pick,
+                    },
+                    RebaseStep {
+                        commit_id: c3.clone(),
+                        action: RebaseActionKind::Pick,
+                    },
+                ],
             )
         });
 
@@ -9991,6 +10285,7 @@ mod bound_to_checked_state {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
         let (_dir, repo) = repo_with_unprunable_expired_snapshot();
@@ -10046,7 +10341,8 @@ mod adv_tests;
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
 
-#[cfg(test)]
+// Every case builds a `desktop::instance::Request`, which exists on macOS only.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "git_writer_op_deadline_tests.rs"]
 mod op_deadline_tests;
 

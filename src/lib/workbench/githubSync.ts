@@ -176,7 +176,7 @@ export async function listGitHubIssueSync(filter: {
   if (filter.task_id !== undefined) payload.task_id = filter.task_id;
   const response = await hostRequest("github_sync.list", payload);
   if (!Array.isArray(response.items)) {
-    throw new WorkbenchError("protocol_error", "github_sync.list omitted the items array.");
+    throw new WorkbenchError("protocol_error", "The GitHub sync list reply omitted the items array.");
   }
   return {
     items: response.items as IssueSyncLink[],

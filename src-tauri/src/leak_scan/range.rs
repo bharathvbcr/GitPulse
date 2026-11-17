@@ -52,7 +52,10 @@
 //! whose objects are not all here fails the scan.
 
 use super::staged::{refusal, scan_blobs, Gate, Policy, ScanFailure};
-use super::{note_scan_completed, parse_patch, parse_raw, RawEntry, SkipReason, Tally, ENGINE};
+use super::{
+    note_scan_completed, pair_sections, parse_patch, parse_raw, Paired, RawEntry, SkipReason,
+    Tally, ENGINE,
+};
 use crate::engine::git_cli::{git, git_captured, git_observed, git_with_stdin, without_lazy_fetch};
 use crate::engine::process::{is_timed_out, Incomplete, DEFAULT_TIMEOUT, MAX_OUTPUT_BYTES};
 use crate::ipc_error::CommandError;
@@ -641,26 +644,39 @@ pub fn scan_range(
             let entries = parse_raw(listing).ok_or_else(|| {
                 ScanFailure("a commit's change listing was not in the expected form".into())
             })?;
-            if sections.len() != entries.len() {
-                // Which lines belong to which file is unknown. A merge's
-                // remerge listing is the one known way to get here.
-                if commit.parents > 1 {
-                    tally.skip(commit.short(), SkipReason::Unsupported, None);
-                    continue;
+            let pairs = match pair_sections(&sections, &entries) {
+                Ok(pairs) => pairs,
+                Err(mismatch) => {
+                    // Which lines belong to which file is unknown. A merge's
+                    // remerge listing is the one known way to get here.
+                    if commit.parents > 1 {
+                        tally.skip(commit.short(), SkipReason::Unsupported, None);
+                        continue;
+                    }
+                    return Err(ScanFailure(format!(
+                        "commit {}: {}",
+                        commit.short(),
+                        mismatch.describe()
+                    )));
                 }
-                return Err(ScanFailure(format!(
-                    "commit {}'s diff named {} files and its listing {}",
-                    commit.short(),
-                    sections.len(),
-                    entries.len()
-                )));
-            }
+            };
             commits_scanned += 1;
-            for (section, entry) in sections.iter().zip(entries) {
+            for Paired {
+                section,
+                entry,
+                removed_half,
+            } in pairs
+            {
                 let path = format!("{}:{}", commit.short(), entry.path);
                 if section.binary {
-                    if entry.has_blob() && seen_blobs.insert(entry.dst_oid.clone()) {
-                        blobs.push(RawEntry { path, ..entry });
+                    // A removed binary is history, and `entry` names the
+                    // blob that replaced it.
+                    if !removed_half && entry.has_blob() && seen_blobs.insert(entry.dst_oid.clone())
+                    {
+                        blobs.push(RawEntry {
+                            path,
+                            ..entry.clone()
+                        });
                     }
                     continue;
                 }

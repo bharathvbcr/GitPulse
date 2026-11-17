@@ -26,6 +26,7 @@
     filterStaleBranches,
     formatBackupTimestamp,
     formatBranchAge,
+    cleanedToast,
     preselectMerged,
     severityBadge,
   } from "../branches/deadbranch";
@@ -65,7 +66,7 @@
   let backupsError = $state<string | null>(null);
   /** A read is in flight; Try again says so, since a repeated identical failure changes nothing else. */
   let backupsLoading = $state(false);
-  let selectedNames = $state<Set<string>>(new Set());
+  let selectedRefs = $state<Set<string>>(new Set());
 
   // Filter state
   let query = $state("");
@@ -132,7 +133,7 @@
 
   const allSelected = $derived(
     selectableBranches.length > 0 &&
-      selectableBranches.every((b) => selectedNames.has(b.name)),
+      selectableBranches.every((b) => selectedRefs.has(b.full_ref)),
   );
 
   async function runScan() {
@@ -154,7 +155,7 @@
 
       // By default select the un-protected, non-worktree branches that are merged.
       // A gone upstream alone is not merged, so it is not pre-selected.
-      selectedNames = preselectMerged(res.branches);
+      selectedRefs = preselectMerged(res.branches);
     } catch (err: unknown) {
       if (seq !== scanSeq) return;
       actionBanner = {
@@ -215,35 +216,35 @@
     }
   });
 
-  function toggleBranch(name: string) {
-    const next = new Set(selectedNames);
-    if (next.has(name)) {
-      next.delete(name);
+  function toggleBranch(fullRef: string) {
+    const next = new Set(selectedRefs);
+    if (next.has(fullRef)) {
+      next.delete(fullRef);
     } else {
-      next.add(name);
+      next.add(fullRef);
     }
-    selectedNames = next;
+    selectedRefs = next;
   }
 
   function toggleAll() {
     if (allSelected) {
-      selectedNames = new Set();
+      selectedRefs = new Set();
     } else {
       const next = new Set<string>();
       for (const b of selectableBranches) {
-        next.add(b.name);
+        next.add(b.full_ref);
       }
-      selectedNames = next;
+      selectedRefs = next;
     }
   }
 
   async function executeClean() {
-    if (selectedNames.size === 0 || actionInProgress) return;
+    if (selectedRefs.size === 0 || actionInProgress) return;
     const target = liveTarget(scanTarget, "Couldn't clean the branches");
     if (!target) return;
     actionInProgress = true;
     actionBanner = null;
-    const branchesToClean = Array.from(selectedNames);
+    const branchesToClean = Array.from(selectedRefs);
 
     try {
       const outcome = await repoStore.deadbranchClean(branchesToClean, forceDelete, createBackup, target);
@@ -258,7 +259,7 @@
       };
 
       if (res.deleted.length > 0) {
-        toastStore.info(`Cleaned ${plural(res.deleted.length, "branch", "branches")}.`);
+        toastStore.info(cleanedToast(res.deleted.length, branchesToClean.length));
         await runScan();
         await loadBackups();
       }
@@ -544,8 +545,8 @@
               <span class="w-36">Last commit author</span>
             </div>
 
-            {#each displayedBranches as branch (branch.name)}
-              {@const isSelected = selectedNames.has(branch.name)}
+            {#each displayedBranches as branch (branch.full_ref)}
+              {@const isSelected = selectedRefs.has(branch.full_ref)}
               {@const badge = severityBadge(branch.severity)}
               {@const disabled = branch.is_protected || branch.is_current_or_worktree}
 
@@ -555,7 +556,7 @@
                 <Checkbox
                   checked={isSelected}
                   {disabled}
-                  onchange={() => toggleBranch(branch.name)}
+                  onchange={() => toggleBranch(branch.full_ref)}
                   ariaLabel="Select {branch.short_name}"
                 />
 
@@ -641,7 +642,7 @@
 
           <div class="flex items-center gap-3">
             <span class="text-textMuted font-medium">
-              {selectedNames.size} of {selectableBranches.length} selected
+              {selectedRefs.size} of {selectableBranches.length} selected
             </span>
 
             <button
@@ -650,10 +651,10 @@
               data-variant="danger"
               data-size="md"
               onclick={() => void executeClean()}
-              disabled={selectedNames.size === 0 || actionInProgress}
+              disabled={selectedRefs.size === 0 || actionInProgress}
             >
               <Trash2 size={13} />
-              <span>{actionInProgress ? "Cleaning…" : `Clean selected (${selectedNames.size})`}</span>
+              <span>{actionInProgress ? "Cleaning…" : `Clean selected (${selectedRefs.size})`}</span>
             </button>
           </div>
         </div>

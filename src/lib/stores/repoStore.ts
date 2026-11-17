@@ -1,6 +1,7 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, readable, writable, type Readable } from "svelte/store";
 import { invoke, ipcErrorKind } from "../ipc/invoke";
+import { interfaceStore } from "./interfaceStore";
 import { formatErrorRaw } from "../ui/formatError";
 import { describeError, mirrorUserFacingError } from "../ui/copy/describeFailure";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -229,7 +230,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let syncingFilter = false;
 
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
-  const { snapshotRuns, pollRuns } = sessionBook;
+  const { snapshotRuns, pollRuns, statusPollApplied, statsInflight } = sessionBook;
 
   let lastPersistedPayload: string | null = null;
   let lastSentRecentsJson: string | null = null;
@@ -425,7 +426,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return {
       ...session,
       generation: session.generation + 1,
-      statsPending: false,
+      // A drain still running for the old generation hands its work to the new
+      // one when it stops (`fetchBranchStats`), and that call decides when the
+      // numbers are complete. Clearing the flag here would show partial stats
+      // as finished until then.
+      statsPending: statsInflight.has(session.id) ? session.statsPending : false,
     };
   }
 
@@ -535,6 +540,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     applyToSession,
     refresh,
     holdsPath: (path) => mutationRunner.holdsPath(path),
+    watchScope: () => get(interfaceStore).watchScope,
+  });
+
+  // A changed watch scope applies to the live watches now, not at the next
+  // 60 s re-assert. The first emission only records the starting scope.
+  let appliedWatchScope: string | undefined;
+  interfaceStore.subscribe(({ watchScope }) => {
+    const changed = appliedWatchScope !== undefined && appliedWatchScope !== watchScope;
+    appliedWatchScope = watchScope;
+    if (changed) void watchCoordinator.reassertWatches();
   });
 
   const statusPoller = createStatusPoller({
@@ -549,6 +564,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     deletePollRun: (id) => {
       pollRuns.delete(id);
+    },
+    notePollApplied: (id) => {
+      statusPollApplied.set(id, (statusPollApplied.get(id) ?? 0) + 1);
     },
     acquireWatch: watchCoordinator.acquireWatch,
     hydrate: (id, path, generation) => hydration.hydrate(id, path, generation),

@@ -423,7 +423,12 @@ fn adversarial_signal_blast_radius_guard_blocks_host_tree() {
     assert!(me.pid > 1, "me.pid={}", me.pid);
     assert!(me.ppid > 1, "me.ppid={}", me.ppid);
     assert!(me.pgrp > 1, "me.pgrp={}", me.pgrp);
-    assert!(me.sid > 1, "me.sid={}", me.sid);
+    // A job started by a service manager can share launchd's session: the macOS
+    // GitHub runner reports `me.sid=1`. The session id is then also a boundary id,
+    // which the loops below still refuse, so the guard stays exercised; what that
+    // host cannot show is a refusal by session membership alone, which step 5b
+    // proves with ids no boundary check could explain.
+    assert!(me.sid >= 1, "me.sid={}", me.sid);
 
     // Host tree IDs: me.pid, me.ppid, me.pgrp, me.sid
     let host_ids = [me.pid, me.ppid, me.pgrp, me.sid];
@@ -489,6 +494,32 @@ fn adversarial_signal_blast_radius_guard_blocks_host_tree() {
     let vet_ppid = signal::vet_group(me.ppid, Basis::Spawned, me, &mock_pgid_ppid, &mock_sid_ppid);
     assert!(vet_ppid.is_err(), "vet_group must refuse parent PID");
     assert!(signal::is_refusal(&vet_ppid.unwrap_err()));
+
+    // 5b. The same refusals for a host whose ids are all above the boundary
+    // (`plain_id` rejects pgid <= 1 first), so each is refused as a member of
+    // the host tree, whatever session this process happens to run in.
+    let host = Me {
+        pid: 40_001,
+        ppid: 40_000,
+        pgrp: 40_002,
+        sid: 40_003,
+    };
+    for member in [host.pid, host.ppid, host.pgrp, host.sid] {
+        let pgid_of = |pid: i32| (pid == member).then_some(member);
+        let sid_of = |pid: i32| (pid == member).then_some(host.sid);
+        for basis in [Basis::Spawned, Basis::Session(host.sid)] {
+            let refused = signal::vet_group(member, basis, host, &pgid_of, &sid_of)
+                .expect_err("a host tree member must be refused");
+            assert!(
+                signal::is_refusal(&refused),
+                "member {member} of the host tree must be refused as a host tree group: {refused}"
+            );
+            assert!(
+                refused.to_string().contains("host process tree"),
+                "member {member} was refused for another reason: {refused}"
+            );
+        }
+    }
 
     // 6. Verify that our host process and parent remain completely intact
     assert!(alive(me.pid), "this process must remain alive");

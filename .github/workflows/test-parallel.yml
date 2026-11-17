@@ -59,6 +59,9 @@ jobs:
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          # Saved after a red or cancelled run too: the cache is written only
+          # by a green job otherwise, and this suite is not always green.
+          cache-on-failure: true
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7

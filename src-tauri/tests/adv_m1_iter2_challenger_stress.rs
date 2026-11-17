@@ -276,7 +276,14 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     let repo_path = repo.path().to_str().unwrap();
 
     // 1. Direct Rust API: withdraw_ask with empty string
-    let err_wd_empty = withdraw_ask(repo_path, "agent-1", "", "Valid reason").unwrap_err();
+    let err_wd_empty = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "",
+        "Valid reason",
+    )
+    .unwrap_err();
     assert!(
         err_wd_empty
             .message()
@@ -286,7 +293,14 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     );
 
     // 2. Direct Rust API: withdraw_ask with whitespace-only string
-    let err_wd_ws = withdraw_ask(repo_path, "agent-1", "   \t\n  ", "Valid reason").unwrap_err();
+    let err_wd_ws = withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "   \t\n  ",
+        "Valid reason",
+    )
+    .unwrap_err();
     assert!(
         err_wd_ws.message().contains("thread_key must not be empty"),
         "withdraw_ask must reject whitespace-only thread_key, got: {}",
@@ -294,7 +308,14 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     );
 
     // 3. Direct Rust API: answer_ask with empty string
-    let err_ans_empty = answer_ask(repo_path, "agent-1", "", "Valid answer").unwrap_err();
+    let err_ans_empty = answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "",
+        "Valid answer",
+    )
+    .unwrap_err();
     assert!(
         err_ans_empty
             .message()
@@ -304,7 +325,14 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     );
 
     // 4. Direct Rust API: answer_ask with whitespace-only string
-    let err_ans_ws = answer_ask(repo_path, "agent-1", "   \r\n  ", "Valid answer").unwrap_err();
+    let err_ans_ws = answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent-1",
+        "   \r\n  ",
+        "Valid answer",
+    )
+    .unwrap_err();
     assert!(
         err_ans_ws
             .message()
@@ -377,6 +405,7 @@ fn test_adversarial_thread_key_validation_across_bus_and_mcp() {
     // 8. post_thread_message normalizes whitespace-only thread_key to None (unthreaded broadcast)
     let msg_ws = gitpulse_lib::engine::agent_bus::post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("   \t\n  "),

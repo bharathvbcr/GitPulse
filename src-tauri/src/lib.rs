@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adv_b2073_tests;
 // Unix only: it writes `#!/bin/sh` wrappers and sets `PermissionsExt` modes.
 #[cfg(all(test, unix))]
 mod adv_w3gb2_tests;

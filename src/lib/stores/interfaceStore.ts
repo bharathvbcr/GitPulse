@@ -95,6 +95,17 @@ import type { CodePercentageMode } from "../language/barStats";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
+/**
+ * How much of a worktree the macOS FSEvents stream covers. "narrow" leaves out
+ * the build and dependency trees git ignores (cargo `target/`, `node_modules/`,
+ * nested worktree folders); "whole" covers everything. Other platforms ignore it.
+ */
+export type WatchScope = "narrow" | "whole";
+
+export function isWatchScope(value: unknown): value is WatchScope {
+  return value === "narrow" || value === "whole";
+}
+
 export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Which accent tint the window wears. Applied as an inline `--c-accent`
@@ -419,6 +430,12 @@ export interface InterfacePrefs extends AppearancePrefs {
    * the opt-in on afterwards stays `true`.
    */
   bellAsksForReaderRev: number;
+  /**
+   * Watch scope sent with `cmd_watch_repo`. Narrow by default; an unknown
+   * stored value reads as narrow. Changing it re-registers every live watch
+   * (`repoStore` subscribes).
+   */
+  watchScope: WatchScope;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -538,6 +555,7 @@ const DEFAULTS: InterfacePrefs = {
   autoScanGithubAlerts: true,
   bellAsksForReader: false,
   bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
+  watchScope: "narrow",
 };
 
 /**
@@ -747,6 +765,7 @@ function readPrefs(): InterfacePrefs {
         parsed.bellAsksForReaderRev,
       ),
       bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
+      watchScope: isWatchScope(parsed.watchScope) ? parsed.watchScope : DEFAULTS.watchScope,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -1067,6 +1086,7 @@ function createInterfaceStore() {
       patch((prefs) => ({ seenCoachMarks: { ...prefs.seenCoachMarks, [id]: true } })),
     resetCoachMarks: () => patch({ seenCoachMarks: {} }),
     setBellAsksForReader: (on: boolean) => patch({ bellAsksForReader: on }),
+    setWatchScope: (scope: WatchScope) => patch({ watchScope: isWatchScope(scope) ? scope : "narrow" }),
     reset: () => commit(freshDefaults()),
   };
 }
