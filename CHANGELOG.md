@@ -11,6 +11,10 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- `gitpulse_provenance`: `verified` is now true only when the commit's verification note records a pass of the whole suite, and `confidence` is null whenever `verified` is false. A note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict used to come back as `verified: true` with confidence 1.0 at the tip; it now reads `verified: false`, with the note still in `verification` so the verdict can be read. An MCP client that read `verified` as "a note is attached" should check `verification` instead. The Rust pass set is held equal to the freshness badge's by `provenance-verdict-contract`.
+
 ## [1.99.0] - 2026-11-15
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
