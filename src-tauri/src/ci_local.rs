@@ -361,40 +361,82 @@ fn frontend_test_args(paths: &[String]) -> Vec<String> {
     args
 }
 
-fn rust_test_args(manifest: &str, paths: &[String]) -> Vec<String> {
+/// How a narrowed `cargo test` can honestly name a set of affected Rust test
+/// files. Cargo has no multi-file path filter and `--test` excludes the lib
+/// target, so only two shapes exist; every other shape is [`Err`] so the planner
+/// widens to the full suite instead of silently running something smaller than
+/// what was asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum RustScope {
+    /// Integration targets only: `--test a --test b`.
+    Integration(Vec<String>),
+    /// Exactly one unit-test file, named by a module-path substring filter.
+    UnitFilter(String),
+}
+
+/// Stems that are not module names: `src/x/mod.rs`, `src/lib.rs` and
+/// `src/main.rs` would become the cargo filter `mod`/`lib`/`main`, which matches
+/// (nearly) no test, so the step would exit 0 having run nothing.
+const NON_FILTER_STEMS: &[&str] = &["mod", "lib", "main"];
+
+fn rust_scope(paths: &[String]) -> Result<RustScope, String> {
+    let mut integration = Vec::new();
+    let mut unit = Vec::new();
+    for path in paths {
+        match rust_integration_test_name(path) {
+            Some(name) => integration.push(name),
+            None => unit.push(path.as_str()),
+        }
+    }
+    integration.sort();
+    integration.dedup();
+    unit.sort_unstable();
+    unit.dedup();
+
+    if !integration.is_empty() && !unit.is_empty() {
+        return Err(format!(
+            "affected Rust tests mix integration targets ({}) with unit-test files ({}) — cargo cannot run both as one narrowed command",
+            integration.join(", "),
+            unit.join(", ")
+        ));
+    }
+    if unit.len() > 1 {
+        return Err(format!(
+            "affected Rust unit-test files cannot be path-filtered together ({})",
+            unit.join(", ")
+        ));
+    }
+    if let Some(path) = unit.first() {
+        let stem = Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().replace('-', "_"))
+            .filter(|s| !s.is_empty() && !NON_FILTER_STEMS.contains(&s.as_str()));
+        return match stem {
+            Some(stem) => Ok(RustScope::UnitFilter(stem)),
+            None => Err(format!(
+                "affected Rust unit-test file {path} has no module name a cargo filter could match"
+            )),
+        };
+    }
+    Ok(RustScope::Integration(integration))
+}
+
+fn rust_test_args(manifest: &str, scope: &RustScope) -> Vec<String> {
     let mut args = vec![
         "test".into(),
         "--manifest-path".into(),
         manifest.to_string(),
     ];
-    let mut integration = Vec::new();
-    let mut filters = Vec::new();
-    for path in paths {
-        if let Some(name) = rust_integration_test_name(path) {
-            integration.push(name);
-        } else if let Some(stem) = Path::new(path).file_stem() {
-            filters.push(stem.to_string_lossy().replace('-', "_"));
+    match scope {
+        RustScope::Integration(names) => {
+            for name in names {
+                args.push("--test".into());
+                args.push(name.clone());
+            }
         }
-    }
-    integration.sort();
-    integration.dedup();
-    filters.sort();
-    filters.dedup();
-    for name in &integration {
-        args.push("--test".into());
-        args.push(name.clone());
-    }
-    if !filters.is_empty() {
-        args.push("--".into());
-        // One OR-ish filter is not expressible; pass the first and rely on
-        // cargo's substring match. Multiple unit-test files fall back via the
-        // uncovered-family check when we cannot name them as `--test` targets.
-        if integration.is_empty() && filters.len() == 1 {
-            args.push(filters[0].clone());
-        } else if integration.is_empty() {
-            // Multiple lib-unit paths: cargo has no multi-file path filter.
-            // Callers must fail closed before reaching here.
-            args.push(filters.join("|"));
+        RustScope::UnitFilter(stem) => {
+            args.push("--".into());
+            args.push(stem.clone());
         }
     }
     args
@@ -477,30 +519,24 @@ pub fn plan_ci_from_affected(
         };
     }
 
-    // Multiple Rust unit-test files (not integration targets) cannot be
-    // expressed as a single honest cargo filter — fail closed rather than
-    // pretend `|` joins module paths.
-    if let Some(rust_paths) = by_family.get(&TestRunnerFamily::Rust) {
-        let unit_only: Vec<_> = rust_paths
-            .iter()
-            .filter(|p| rust_integration_test_name(p).is_none())
-            .collect();
-        if unit_only.len() > 1 {
-            let reason = format!(
-                "affected Rust unit-test files cannot be path-filtered together ({}) — running the full suite",
-                unit_only
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+    // A Rust path set cargo cannot name as one narrowed command (mixed
+    // integration + unit files, several unit files, a `mod`/`lib`/`main` stem)
+    // fails closed: narrowing it would drop a file or run zero tests.
+    let rust_scope = match by_family
+        .get(&TestRunnerFamily::Rust)
+        .map(|p| rust_scope(p))
+    {
+        Some(Err(why)) => {
+            let reason = format!("{why} — running the full suite");
             annotate_full_suite_steps(&mut steps, &reason);
             return CiPlan {
                 steps,
                 test_scope: CiTestScope::full_suite(reason, seed_owned),
             };
         }
-    }
+        Some(Ok(scope)) => Some(scope),
+        None => None,
+    };
 
     let has_frontend = steps.iter().any(|s| s.name == "Frontend unit tests");
     let has_rust = steps.iter().any(|s| s.name == "Rust tests");
@@ -554,11 +590,13 @@ pub fn plan_ci_from_affected(
                 }
             }
             "Rust tests" => {
-                if let (Some(paths), Some(manifest)) =
-                    (by_family.get(&TestRunnerFamily::Rust), manifest.as_deref())
-                {
+                if let (Some(paths), Some(scope), Some(manifest)) = (
+                    by_family.get(&TestRunnerFamily::Rust),
+                    rust_scope.as_ref(),
+                    manifest.as_deref(),
+                ) {
                     step.name = format!("Rust tests ({} affected)", paths.len());
-                    step.args = rust_test_args(manifest, paths);
+                    step.args = rust_test_args(manifest, scope);
                 }
             }
             "Python tests" => {
@@ -649,7 +687,13 @@ fn step_result(
     duration_ms: u64,
 ) -> CiStepResult {
     let (status, detail) = match outcome {
-        Ok(output) if output.success => ("passed", String::new()),
+        Ok(output) if output.success => match unexecuted_tests(step, &output) {
+            // Exit 0 with nothing executed is a check that did not happen, not
+            // one that passed: it takes the same "could not run" path a spawn
+            // failure does.
+            Some(why) => ("failed", format!("{COULD_NOT_RUN}{why}")),
+            None => ("passed", String::new()),
+        },
         Ok(output) => {
             // The detail is the capped output tail: enough to name the
             // failure without a terminal, never the whole log. When the
@@ -676,6 +720,88 @@ fn step_result(
         status: status.into(),
         detail,
         duration_ms,
+    }
+}
+
+/// Sum of the `passed` and `failed` counts a runner summary line reports, e.g.
+/// `1 failed, 4 passed, 5 total` or `4 passed (5)`. Skipped, ignored and
+/// filtered-out tests are deliberately not counted: they did not execute.
+fn outcome_count(line: &str) -> u64 {
+    let words: Vec<&str> = line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| matches!(w[1], "passed" | "failed"))
+        .filter_map(|w| w[0].parse::<u64>().ok())
+        .sum()
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Tests the runner reports it executed, or `None` when the output carries no
+/// summary this module can read.
+fn executed_test_count(step_name: &str, stdout: &str) -> Option<u64> {
+    let text = strip_ansi(stdout);
+    match base_test_step_name(step_name) {
+        // One `test result:` line per test binary and per doctest run.
+        "Rust tests" => {
+            let lines: Vec<u64> = text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("test result:"))
+                .map(outcome_count)
+                .collect();
+            (!lines.is_empty()).then(|| lines.iter().sum())
+        }
+        // vitest `Tests  4 passed (5)`, jest `Tests:  4 passed, 5 total`.
+        "Frontend unit tests" => text
+            .lines()
+            .map(str::trim_start)
+            .rfind(|l| l.starts_with("Tests ") || l.starts_with("Tests:"))
+            .map(outcome_count),
+        // pytest `=== 5 passed, 1 skipped in 0.1s ===` or `no tests ran`.
+        "Python tests" => text
+            .lines()
+            .rfind(|l| l.contains("no tests ran") || outcome_count(l) > 0)
+            .map(outcome_count),
+        _ => None,
+    }
+}
+
+/// Why a successful exit does not count as a pass: the runner executed no
+/// tests. `None` when tests ran, and for a non-test step.
+///
+/// A cargo test step with no readable summary is also refused — `cargo test`
+/// always prints one, so its absence means the output is not what it seems.
+/// Frontend and Python steps with no readable summary are not judged: those
+/// runners are whatever the repository's `test` script invokes.
+fn unexecuted_tests(step: &CiStep, output: &CapturedOutput) -> Option<String> {
+    if !is_test_step_name(&step.name) {
+        return None;
+    }
+    let family = base_test_step_name(&step.name);
+    match executed_test_count(&step.name, &output.stdout_text()) {
+        Some(0) => Some(format!("{family} exited 0 but executed 0 tests")),
+        None if family == "Rust tests" => Some(format!(
+            "{family} exited 0 but printed no `test result:` summary"
+        )),
+        _ => None,
     }
 }
 
@@ -1542,6 +1668,159 @@ mod tests {
             seeds,
             vec!["src/new.rs".to_string(), "src/old.rs".to_string()]
         );
+    }
+
+    fn rust_dir() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"1.2.3\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn rust_step(plan: &CiPlan) -> Option<&CiStep> {
+        plan.steps.iter().find(|s| s.name.starts_with("Rust tests"))
+    }
+
+    /// `--test foo --` used to be emitted here: the `bar` unit filter was
+    /// dropped and the lib target (where `bar`'s tests live) was excluded.
+    #[test]
+    fn integration_targets_mixed_with_a_unit_file_fail_closed() {
+        let dir = rust_dir();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/bar.rs".into()],
+            &ok_affected(&["tests/foo.rs", "src/bar.rs"]),
+        );
+        assert!(plan.test_scope.fail_closed, "{}", plan.test_scope.reason);
+        assert_eq!(plan.test_scope.mode, "full_suite");
+        let rust = rust_step(&plan).expect("rust tests");
+        assert_eq!(
+            rust.args.len(),
+            3,
+            "full suite, no narrowing: {:?}",
+            rust.args
+        );
+    }
+
+    /// `mod`/`lib`/`main` as a cargo filter matches ~nothing, exits 0, and
+    /// the step "passes" having run no test.
+    #[test]
+    fn a_unit_file_named_mod_lib_or_main_fails_closed() {
+        for file in ["src/x/mod.rs", "src/lib.rs", "src/main.rs"] {
+            let dir = rust_dir();
+            let plan = plan_ci_from_affected(dir.path(), &[file.into()], &ok_affected(&[file]));
+            assert!(
+                plan.test_scope.fail_closed,
+                "{file}: {}",
+                plan.test_scope.reason
+            );
+            let rust = rust_step(&plan).expect("rust tests");
+            assert!(
+                !rust.args.contains(&"--".to_string()),
+                "{file}: {:?}",
+                rust.args
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_named_unit_file_still_narrows_to_its_filter() {
+        let dir = rust_dir();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/bar.rs".into()],
+            &ok_affected(&["src/bar.rs"]),
+        );
+        assert_eq!(plan.test_scope.mode, "affected");
+        let rust = rust_step(&plan).expect("rust tests");
+        assert_eq!(rust.args.last().map(String::as_str), Some("bar"));
+    }
+
+    fn rust_step_for_run() -> CiStep {
+        CiStep {
+            name: "Rust tests".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        }
+    }
+
+    #[test]
+    fn a_cargo_run_that_executed_zero_tests_is_not_a_pass() {
+        let out = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, out, "")), 1);
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        assert!(r.detail.starts_with(COULD_NOT_RUN), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_cargo_run_with_tests_in_any_binary_is_a_pass() {
+        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s\ntest result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s\n";
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, out, "")), 1);
+        assert_eq!(r.status, "passed", "{}", r.detail);
+    }
+
+    #[test]
+    fn a_cargo_run_with_no_summary_is_not_a_pass() {
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, "ok", "")), 1);
+        assert_eq!(r.status, "failed");
+        assert!(r.detail.starts_with(COULD_NOT_RUN), "{}", r.detail);
+    }
+
+    #[test]
+    fn frontend_and_python_zero_test_summaries_are_not_a_pass() {
+        let vitest = CiStep {
+            name: "Frontend unit tests (2 affected)".into(),
+            program: "npm".into(),
+            args: vec!["test".into()],
+        };
+        let r = step_result(
+            &vitest,
+            Ok(captured(
+                true,
+                0,
+                " Test Files  1 skipped (1)\n      Tests  3 skipped (3)\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        let ok = step_result(
+            &vitest,
+            Ok(captured(
+                true,
+                0,
+                "      Tests  4 passed | 1 skipped (5)\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(ok.status, "passed", "{}", ok.detail);
+
+        let py = CiStep {
+            name: "Python tests".into(),
+            program: "pytest".into(),
+            args: Vec::new(),
+        };
+        let r = step_result(
+            &py,
+            Ok(captured(true, 0, "=== no tests ran in 0.01s ===\n", "")),
+            1,
+        );
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        let ok = step_result(
+            &py,
+            Ok(captured(
+                true,
+                0,
+                "=== 5 passed, 1 skipped in 0.1s ===\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(ok.status, "passed", "{}", ok.detail);
     }
 }
 
