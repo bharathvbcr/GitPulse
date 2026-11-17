@@ -401,6 +401,52 @@ fn the_session_fields_validate_against_the_output_schema_attributed_or_not() {
     assert!(got["session_basis"].is_string() && got["session_ambiguous"].is_boolean());
 }
 
+/// Over the wire, a note is `verified` only when it records a pass of the
+/// whole suite. A pass of the affected tests only must be told apart from a
+/// full pass by an MCP caller (the verdict is echoed and `verified` is false),
+/// and a failure must never come back verified or confident. Both used to
+/// arrive as `verified: true` with confidence 1.0 at the tip.
+#[test]
+fn over_mcp_only_a_full_pass_is_verified_and_a_narrowed_pass_is_told_apart() {
+    let schema = schema_of("gitpulse_provenance");
+    for (verdict, verified) in [
+        ("passed", true),
+        ("passed-affected", false),
+        ("failed", false),
+    ] {
+        let (_dir, repo) = repo_with_root();
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+        crate::engine::provenance::write_verification_note(
+            &repo,
+            &sha,
+            &crate::engine::provenance::VerificationNote {
+                verdict: verdict.into(),
+                verified_at: 1_788_000_000,
+                checked_by: "ci.local".into(),
+                task_id: None,
+                details: None,
+            },
+        )
+        .expect("write note");
+        let args = json!({ "repo_path": repo, "commit_sha": sha, "base_branch": "main" });
+        validate_arguments("gitpulse_provenance", &args).expect("arguments");
+        let got = handle_tool_call("gitpulse_provenance", &args).expect("provenance");
+        assert_conforms(verdict, &got, &schema);
+        assert_eq!(got["notes_readable"], true, "{verdict}: {got}");
+        assert_eq!(got["distance"], 0, "{verdict}: measured at the tip: {got}");
+        assert_eq!(got["verified"], verified, "{verdict}: {got}");
+        assert_eq!(
+            got["verification"]["verdict"], verdict,
+            "{verdict}: the verdict is echoed so a caller can tell it apart: {got}"
+        );
+        if verified {
+            assert_eq!(got["confidence"], 1.0, "{verdict}: {got}");
+        } else {
+            assert!(got["confidence"].is_null(), "{verdict}: {got}");
+        }
+    }
+}
+
 /// One ledger row for the every-basis test: a transcript command or a reflog
 /// entry, stamped (or not) the way the case needs.
 fn put_row(
