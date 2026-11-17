@@ -4233,8 +4233,10 @@ fn peer_inbox_commit(input: &HookInput, ready: PeerInboxReady) -> HookOutput {
     // for the messages this call took. It is a repository-trust check and a bus
     // write, run here after the claim, so it gets its own short budget: the
     // answer is printed whether or not the acknowledgement finished.
-    let taken: Vec<crate::agent_mailbox::ClaimedEnvelope> =
-        claimed.iter().map(|(envelope, _)| envelope.clone()).collect();
+    let taken: Vec<crate::agent_mailbox::ClaimedEnvelope> = claimed
+        .iter()
+        .map(|(envelope, _)| envelope.clone())
+        .collect();
     if within_budget(PEER_INBOX_ACK_BUDGET, move || {
         for envelope in &taken {
             deliver::acknowledge_read(envelope, Some(&root), Some(&reader_id));

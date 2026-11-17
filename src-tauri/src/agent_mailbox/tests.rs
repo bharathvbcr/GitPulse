@@ -942,7 +942,13 @@ fn a_prepared_delivery_consumes_nothing_until_it_is_committed() {
         .unwrap();
 
     let prepared = mailbox
-        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.to_uppercase())
+        .prepare_delivery(
+            SESSION,
+            8,
+            now,
+            |_| true,
+            |env| env.claim.text.to_uppercase(),
+        )
         .unwrap();
     assert!(!prepared.is_empty());
     assert_eq!(mailbox.pending(SESSION), 1, "preparing is a peek");
@@ -953,7 +959,13 @@ fn a_prepared_delivery_consumes_nothing_until_it_is_committed() {
     assert_eq!(mailbox.status(SESSION, "ui-1"), Delivery::Pending);
 
     let prepared = mailbox
-        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.to_uppercase())
+        .prepare_delivery(
+            SESSION,
+            8,
+            now,
+            |_| true,
+            |env| env.claim.text.to_uppercase(),
+        )
         .unwrap();
     let won = prepared.commit().unwrap();
     assert_eq!(won.len(), 1);

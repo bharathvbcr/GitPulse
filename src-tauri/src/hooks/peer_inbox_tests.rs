@@ -59,8 +59,8 @@ fn wait_for_worker<T>(held: &Arc<T>) {
 }
 
 #[test]
-fn a_budget_missed_while_the_text_is_built_leaves_the_message_pending_and_the_next_call_delivers_it()
-{
+fn a_budget_missed_while_the_text_is_built_leaves_the_message_pending_and_the_next_call_delivers_it(
+) {
     let serial = crate::test_support::env::env_serial();
     let (_dir, home, repo) = trusted_repo();
     let _env = crate::test_support::env::bind_env(&serial)
@@ -147,7 +147,12 @@ fn two_hook_processes_racing_on_one_session_deliver_a_message_once() {
         .remove(AGENT_KIND_ENV);
     let mailbox = Mailbox::at_default().unwrap();
     mailbox
-        .deposit(SESSION, "human-1", "one message, two readers", SystemTime::now())
+        .deposit(
+            SESSION,
+            "human-1",
+            "one message, two readers",
+            SystemTime::now(),
+        )
         .unwrap();
     let input = boundary_input(&repo);
     let rendezvous = Arc::new(Rendezvous {
@@ -264,4 +269,3 @@ fn a_peer_message_is_marked_read_on_the_bus_only_when_it_is_delivered() {
     );
     assert!(!read_by().is_empty(), "delivered, so acknowledged");
 }
-

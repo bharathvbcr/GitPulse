@@ -162,10 +162,9 @@ pub(crate) fn render_message(envelope: &ClaimedEnvelope, repo_root: Option<&Path
             let mut body = envelope.claim.text.clone();
             if *truncated_in_bus {
                 if let Some(root) = trusted_bus_root(repo_root, prov_repo_root) {
-                    if let Ok(Some(full)) = crate::engine::agent_bus::get_message_by_id(
-                        &root.to_string_lossy(),
-                        msg_id,
-                    ) {
+                    if let Ok(Some(full)) =
+                        crate::engine::agent_bus::get_message_by_id(&root.to_string_lossy(), msg_id)
+                    {
                         body = full.body;
                     }
                 }

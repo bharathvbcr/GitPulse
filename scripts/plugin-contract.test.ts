@@ -638,6 +638,22 @@ function notifyRunSeconds(event: string): number {
 }
 
 /**
+ * What one `peer-inbox` run waits out after stdin: the prepare work inside the
+ * constant `run_peer_inbox` hands to `deliver_within`, then the bus
+ * acknowledgement inside `PEER_INBOX_ACK_BUDGET`, run after the claim.
+ */
+function peerInboxSeconds(): number {
+  const fnBlock = /fn run_peer_inbox\b[\s\S]*?\n\}/.exec(hookSource)?.[0] ?? "";
+  const work = /(?:within_budget|deliver_within)\(\s*([A-Z_]+)/.exec(fnBlock);
+  expect(work, "run_peer_inbox no longer names its budget constant; update this contract").toBeTruthy();
+  expect(
+    /fn peer_inbox_commit\b[\s\S]*?within_budget\(\s*PEER_INBOX_ACK_BUDGET/.exec(hookSource),
+    "peer_inbox_commit no longer bounds the acknowledgement by PEER_INBOX_ACK_BUDGET; update this contract",
+  ).toBeTruthy();
+  return hookDurationSeconds(work![1]) + hookDurationSeconds("PEER_INBOX_ACK_BUDGET");
+}
+
+/**
  * What one `stop-or-notify` run waits out: `read_for`'s `PEER_INBOX_BUDGET`
  * stdin walk plus `run_stop_or_notify`'s explicit `turn_finished` socket budget.
  */
@@ -678,6 +694,7 @@ function budgetSecondsFor(subcommand: string, argument = ""): number {
   if (subcommand === "deliver") return deliverWaitSeconds();
   if (subcommand === "worktree-create" || subcommand === "worktree-remove") return worktreeBudgetSeconds();
   if (subcommand === "stop-or-notify") return stopOrNotifySeconds();
+  if (subcommand === "peer-inbox") return peerInboxSeconds();
   const fnBlock = new RegExp(
     `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?\\n\\}`,
   ).exec(hookSource)?.[0];
@@ -700,7 +717,7 @@ function minHostTimeoutSeconds(subcommand: string, argument = ""): number {
     return worktreeBudgetSeconds() + margin;
   }
   if (subcommand === "peer-inbox") {
-    return hookDurationSeconds("PEER_INBOX_BUDGET") + margin;
+    return peerInboxSeconds() + margin;
   }
   if (subcommand === "stop-or-notify") {
     return stopOrNotifySeconds() + margin;
