@@ -12,24 +12,25 @@
   const secretsCache = createRepoPanelCache<SecretsReport>();
 
   /**
-   * The scan in flight for each repository, in-process or deep.
+   * The scan in flight for each repository.
    *
    * Module-level, not per instance. Health renders this section from more
    * than one branch (the local scan loading, failed, or loaded), so a
    * dependency scan that finishes remounts it. A per-instance guard let the
-   * new instance see no cache and start a second full Kingfisher scan beside
-   * the first; now it joins the one already running.
+   * new instance see no cache and start a second scan beside the first; now
+   * it joins the one already running.
    */
   const inflightScans = createScanJoin<SecretsReport>();
 
-  // A deep scan is a different request from the in-process one, so it is
-  // joined under its own key: a click on "Deep scan" must not attach itself
-  // to a scan of the other kind already running.
-  const DEEP_KEY = "\0deep";
+  // A click on Rescan also asks Kingfisher for a second opinion, which is a
+  // different request from the automatic in-process scan, so it is joined
+  // under its own key: a click must not attach itself to an automatic scan
+  // that never starts Kingfisher.
+  const SECOND_OPINION_KEY = "\0second-opinion";
 
-  function scanRepository(repoPath: string, deep: boolean): Promise<SecretsReport> {
-    return inflightScans.run(deep ? repoPath + DEEP_KEY : repoPath, () =>
-      invoke<unknown>("cmd_scan_secrets", deep ? { repoPath, deep: true } : { repoPath }).then((payload) => {
+  function scanRepository(repoPath: string, secondOpinion: boolean): Promise<SecretsReport> {
+    return inflightScans.run(secondOpinion ? repoPath + SECOND_OPINION_KEY : repoPath, () =>
+      invoke<unknown>("cmd_scan_secrets", secondOpinion ? { repoPath, secondOpinion: true } : { repoPath }).then((payload) => {
         const next = parseSecretsReport(payload);
         if (shouldCache(secretsCache.get(repoPath), next)) secretsCache.set(repoPath, next);
         return next;
@@ -46,6 +47,7 @@
     AlertTriangle,
     LoaderCircle,
     ShieldCheck,
+    Info,
     FolderSearch,
     Clipboard,
     Check,
@@ -72,7 +74,6 @@
     engineLabel,
     isStale,
     isSuperseded,
-    offersDeepScan,
     locationChips,
     locationLabel,
     scopeNotes,
@@ -99,8 +100,8 @@
    * Working-tree secrets, as a section of Health.
    *
    * Findings located against Git: tracked, untracked, ignored, nested
-   * repository. The in-process scanner answers; Kingfisher is the opt-in deep
-   * scan, offered once a result is on screen and Kingfisher is installed. No
+   * repository. The in-process scanner answers on its own; Rescan also asks
+   * Kingfisher, when it is installed, for a second opinion. No
    * secret value is ever read or shown — a finding is a rule, a path and a
    * line.
    *
@@ -128,8 +129,6 @@
   } = $props();
 
   let loading = $state(false);
-  /** The scan in flight is the deep one, so its own button carries the spinner. */
-  let deepRunning = $state(false);
   let errorMsg = $state<string | null>(null);
   let filter = $state<LocationFilter>("all");
   let expanded = $state(false);
@@ -163,7 +162,7 @@
       : "",
   );
   /**
-   * The heading count. `total` is Kingfisher's own count and a floor when it
+   * The heading count. `total` is the union of both engines' rows and a floor when it
    * dropped or could not read rows, so the heading never states only the rows
    * that reached the table.
    */
@@ -195,7 +194,8 @@
     pending = false;
   }
 
-  async function scan(path?: string, deep = false) {
+  /** `secondOpinion` is true only for a click: an automatic scan never starts Kingfisher. */
+  async function scan(path?: string, secondOpinion = false) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     stopPending();
@@ -203,12 +203,11 @@
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
-    deepRunning = deep;
     errorMsg = null;
     held = null;
     const failureKey = `secrets:${repoPath}`;
     try {
-      const next = await scanRepository(repoPath, deep);
+      const next = await scanRepository(repoPath, secondOpinion);
       if (!next.ok) recordFailure(scanFailureCopy(next));
       // Per repository, not per pane: it must be recorded even when this pane
       // was left before the scan returned. A scan a newer one replaced is
@@ -232,7 +231,6 @@
       // has taken over; otherwise a closed-then-reopened path spins forever.
       if (inflight === guard) {
         loading = false;
-        deepRunning = false;
       }
     }
   }
@@ -395,33 +393,16 @@
           Fix with agent
         </button>
       {/if}
-      {#if report && offersDeepScan(report) && $repoStore.currentPath}
-        <button
-          type="button"
-          class="gp-btn"
-          data-size="sm"
-          data-testid="secrets-deep-scan"
-          title="Run Kingfisher over the whole working tree, ignored files included. Slower, and starts a separate program."
-          onclick={() => scan(undefined, true)}
-          disabled={loading}
-        >
-          {#if loading && deepRunning}
-            <LoaderCircle size={13} class="animate-spin" />
-            Deep scanning…
-          {:else}
-            Deep scan with Kingfisher
-          {/if}
-        </button>
-      {/if}
       <button
         type="button"
         class="gp-btn"
         data-size="sm"
-        onclick={() => scan()}
+        onclick={() => scan(undefined, true)}
+        title="Rescan the working tree, then ask Kingfisher (when installed) for a second opinion"
         disabled={loading || !$repoStore.currentPath}
         aria-label="Rescan secrets"
       >
-        {#if loading && !deepRunning}
+        {#if loading}
           <LoaderCircle size={13} class="animate-spin" />
           {report ? "Rescanning…" : "Scanning…"}
         {:else}
@@ -470,12 +451,14 @@
 
     <div
       class="gp-notice"
-      role={headline.tone === "ok" ? "status" : "alert"}
+      role={headline.tone === "ok" || headline.tone === "neutral" ? "status" : "alert"}
       data-testid="secrets-verdict"
-      data-tone={headline.tone}
+      data-tone={headline.tone === "neutral" ? "unknown" : headline.tone}
     >
       {#if headline.tone === "ok"}
         <ShieldCheck size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
+      {:else if headline.tone === "neutral"}
+        <Info size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {:else}
         <AlertTriangle size={14} class="shrink-0 mt-0.5" style="color: var(--gp-notice-ink)" />
       {/if}

@@ -18,7 +18,8 @@ mod report;
 mod run;
 
 pub use parse::{
-    ScanCompleteness, SecretFinding, SecretLocation, SecretSkip, SecretsReport, ENGINE_KINGFISHER,
+    ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation, SecretSkip, SecretsReport,
+    ENGINE_KINGFISHER,
 };
 pub use primary::scan_working_tree;
 pub use report::MAX_FINDINGS;

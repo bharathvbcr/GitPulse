@@ -15,7 +15,7 @@ import type {
 import type { CodeintelStatus } from "../codeintel/types";
 import type { SecretsReport } from "../secrets/types";
 
-/** A complete Kingfisher scan that found nothing: the only clear secrets input. */
+/** A complete in-process scan that Kingfisher corroborated with nothing: the only clear secrets input. */
 function cleanSecrets(overrides: Partial<SecretsReport> = {}): SecretsReport {
   return {
     ok: true,
@@ -35,7 +35,8 @@ function cleanSecrets(overrides: Partial<SecretsReport> = {}): SecretsReport {
     max_file_size_mb: 256,
     scanned_at_ms: 1_000_000,
     duration_ms: 10,
-    engine: "kingfisher",
+    engine: "dc-redact 0.2.5",
+    second_opinion: { state: "ran", completeness: "complete", version: "2.7.0", findings_total: 0, confirmed: 0, added: 0 },
     skipped_total: 0,
     skipped: [],
     ...overrides,
@@ -151,6 +152,9 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     ["the secrets scan did not report its completeness", { secrets: cleanSecrets({ completeness: "unverified" }) }],
     ["the secrets scanner was unavailable", { secrets: cleanSecrets({ ok: false, error: "kingfisher not found", kingfisher_present: false }) }],
     ["the secrets scan lost rows it could not read", { secrets: cleanSecrets({ findings_unreadable: 2 }) }],
+    ["the clean secrets scan was never corroborated by Kingfisher", { secrets: cleanSecrets({ second_opinion: { state: "not_run" } }) }],
+    ["Kingfisher was not installed to corroborate a clean secrets scan", { secrets: cleanSecrets({ second_opinion: { state: "not_installed" } }) }],
+    ["Kingfisher's second opinion was unavailable", { secrets: cleanSecrets({ second_opinion: { state: "unavailable", reason: "kingfisher output was truncated" } }) }],
   ])("refuses an all-clear when %s", (_why, override) => {
     const summary = summarizeHealth(cleanInput(override));
     expect(summary.clearClaimable).toBe(false);

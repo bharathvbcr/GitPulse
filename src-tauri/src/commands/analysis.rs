@@ -102,17 +102,22 @@ pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport,
 
 /// On-demand secrets scan of the working tree.
 ///
-/// The in-process scanner answers by default. `deep` (absent means false, so
-/// an older caller keeps working) runs Kingfisher instead: the opt-in scan that
-/// also reads ignored files. Kingfisher stdout is parsed in memory and dropped
-/// — never logged. A missed or truncated scan returns `ok: false`, and a scan
-/// that skipped inputs is `partial`; neither is ever implied clean.
+/// The in-process scanner always answers. `second_opinion` (absent means
+/// false) is set by a person's Rescan click only: it then also runs
+/// Kingfisher, when installed, and merges its findings. An automatic scan
+/// starts no process. A failed Kingfisher never changes the in-process result;
+/// the report says it was unavailable and why. Kingfisher stdout is parsed in
+/// memory and dropped, never logged. A scan that skipped inputs is `partial`;
+/// no failure or gap is ever implied clean.
 #[tauri::command(async)]
 pub async fn cmd_scan_secrets(
     repo_path: String,
-    deep: Option<bool>,
+    second_opinion: Option<bool>,
 ) -> Result<crate::secrets::SecretsReport, IpcError> {
-    off_thread(move || crate::secrets::scan_working_tree(&repo_path, deep.unwrap_or(false))).await
+    off_thread(move || {
+        crate::secrets::scan_working_tree(&repo_path, second_opinion.unwrap_or(false))
+    })
+    .await
 }
 
 /// Full disk-usage scan of the repository (git internals, build/cache

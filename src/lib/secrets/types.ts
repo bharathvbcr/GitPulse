@@ -44,6 +44,29 @@ export interface SecretSkip {
   bytes: number | null;
 }
 
+/**
+ * What Kingfisher said as the second opinion beside the in-process scan.
+ * `not_run` is an automatic scan (no process is started for one);
+ * `unavailable` is a Kingfisher run that did not finish, with the reason, and
+ * never changes the primary result.
+ */
+export type SecondOpinion =
+  | { state: "not_installed" }
+  | { state: "not_run" }
+  | { state: "unavailable"; reason: string }
+  | {
+      state: "ran";
+      /** Kingfisher's own account of whether it read every input. */
+      completeness: ScanCompleteness;
+      version: string | null;
+      /** Rows Kingfisher reported, before they were merged with the primary's. */
+      findings_total: number;
+      /** Of those, rows at a path and line the primary already reported. */
+      confirmed: number;
+      /** Of those, rows the primary had not reported; they are in `findings`. */
+      added: number;
+    };
+
 export interface SecretsReport {
   ok: boolean;
   /**
@@ -80,6 +103,7 @@ export interface SecretsReport {
   /** Inputs not read, all counted; `skipped` lists the first of them. */
   skipped_total: number;
   skipped: SecretSkip[];
+  second_opinion: SecondOpinion;
 }
 
 /** `report::MAX_EXCLUSIONS` in the backend. */
@@ -112,6 +136,38 @@ function boundedText(value: unknown, max: number): string | null {
   const trimmed = redactDiagnosticText(value).trim();
   if (!trimmed) return null;
   return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
+}
+
+/**
+ * Fails closed: a missing or malformed second opinion is `not_run` or
+ * `unavailable`, never `ran`, so it can never lift the headline to green.
+ */
+function parseSecondOpinion(value: unknown): SecondOpinion {
+  if (value === undefined || value === null) return { state: "not_run" };
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  switch (raw?.state) {
+    case "not_installed":
+      return { state: "not_installed" };
+    case "not_run":
+      return { state: "not_run" };
+    case "unavailable":
+      return {
+        state: "unavailable",
+        reason: boundedText(raw.reason, 500) ?? "Kingfisher did not finish.",
+      };
+    case "ran": {
+      if (typeof raw.completeness !== "string" || !COMPLETENESS.has(raw.completeness)) break;
+      return {
+        state: "ran",
+        completeness: raw.completeness as ScanCompleteness,
+        version: typeof raw.version === "string" ? boundedText(raw.version, 64) : null,
+        findings_total: count(raw.findings_total),
+        confirmed: count(raw.confirmed),
+        added: count(raw.added),
+      };
+    }
+  }
+  return { state: "unavailable", reason: "Kingfisher's result couldn't be read." };
 }
 
 function count(value: unknown): number {
@@ -216,5 +272,6 @@ export function parseSecretsReport(value: unknown): SecretsReport {
     duration_ms: count(raw.duration_ms),
     skipped_total: Math.max(count(raw.skipped_total), skipped.length),
     skipped,
+    second_opinion: parseSecondOpinion(raw.second_opinion),
   };
 }

@@ -5,8 +5,8 @@
 //! without spawning anything. [`git_view`] is the one function that reads Git.
 
 use super::parse::{
-    Envelope, RawFinding, ScanCompleteness, SecretFinding, SecretLocation, SecretsReport,
-    ENGINE_KINGFISHER,
+    Envelope, RawFinding, ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation,
+    SecretsReport, ENGINE_KINGFISHER,
 };
 use crate::ipc_error::CommandError;
 use std::collections::{HashMap, HashSet};
@@ -133,7 +133,7 @@ fn locate(
 /// Most actionable first: a credential in `.git/config` is read by every Git
 /// command and pushed nowhere, a tracked one is (or will be) in history, an
 /// unknown one might be either; ignored build output comes last.
-fn rank(location: SecretLocation) -> u8 {
+pub(super) fn rank(location: SecretLocation) -> u8 {
     match location {
         SecretLocation::GitMetadata => 0,
         SecretLocation::Tracked => 1,
@@ -323,5 +323,6 @@ pub(crate) fn assemble(
         duration_ms: facts.duration_ms,
         skipped_total: 0,
         skipped: Vec::new(),
+        second_opinion: SecondOpinion::NotRun,
     }
 }

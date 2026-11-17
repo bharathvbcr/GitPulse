@@ -63,7 +63,7 @@ describe("SecretsSection", () => {
     // scan() itself outside the join of a scan already running.
     expect(source).toContain("scheduleAutoScan({");
     expect(source).toContain("stillNeeded:");
-    expect(source).toContain("onclick={() => scan()}");
+    expect(source).toContain("onclick={() => scan(undefined, true)}");
     const effect = source.slice(source.indexOf("$effect(() => {"), source.indexOf("function recordFailure"));
     expect(effect.match(/scan\(path\)/g)).toHaveLength(2);
     expect(effect.indexOf("inflightScans.has(path)")).toBeLessThan(effect.indexOf("void scan(path)"));
@@ -78,17 +78,20 @@ describe("SecretsSection", () => {
     expect(source).toContain("total: report.findings_total");
   });
 
-  it("names the engine and offers Kingfisher only as a secondary deep scan", () => {
-    // The default scan sends no `deep` argument; the deep scan sends it
-    // explicitly, and is offered through the tested `offersDeepScan` rule.
-    expect(source).toContain('invoke<unknown>("cmd_scan_secrets", deep ? { repoPath, deep: true } : { repoPath })');
-    expect(source).toContain("offersDeepScan(report)");
-    expect(source).toContain("Deep scan with Kingfisher");
+  it("names the engines and asks Kingfisher for a second opinion only on a click", () => {
+    // An automatic scan sends no `secondOpinion` argument; the Rescan click
+    // sends it, and there is no second button for the same thing.
+    expect(source).toContain(
+      'invoke<unknown>("cmd_scan_secrets", secondOpinion ? { repoPath, secondOpinion: true } : { repoPath })',
+    );
     expect(source).toContain("onclick={() => scan(undefined, true)}");
+    expect(source).not.toContain("Deep scan with Kingfisher");
+    expect(source).not.toContain("offersDeepScan");
     expect(source).toContain('data-testid="secrets-engine"');
     expect(source).toContain("{engineLabel(report)}");
-    // A deep scan never attaches itself to an in-process scan already running.
-    expect(source).toContain("deep ? repoPath + DEEP_KEY : repoPath");
+    // A click never attaches itself to an automatic scan already running,
+    // which never starts Kingfisher.
+    expect(source).toContain("secondOpinion ? repoPath + SECOND_OPINION_KEY : repoPath");
     // The automatic scan is still the primary one.
     expect(source).toContain("run: () => void scan(path)");
   });

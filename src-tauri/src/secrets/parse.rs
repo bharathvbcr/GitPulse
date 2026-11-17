@@ -91,6 +91,37 @@ pub struct SecretSkip {
     pub bytes: Option<u64>,
 }
 
+/// What Kingfisher said as the second opinion beside the in-process scan.
+///
+/// An automatic scan never starts Kingfisher (`NotRun`); a person's Rescan
+/// does, when it is installed. Whatever Kingfisher does, the in-process result
+/// beside this stands: a Kingfisher that failed, was killed, timed out or was
+/// truncated is `Unavailable` with the reason, and never changes the primary
+/// findings or their completeness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SecondOpinion {
+    /// Kingfisher is not installed, so there is no second opinion to ask for.
+    NotInstalled,
+    /// Not asked for: an automatic scan starts no process.
+    NotRun,
+    /// Asked for and not obtained. `reason` is fixed wording, never output.
+    Unavailable { reason: String },
+    /// Kingfisher finished and its rows are merged into `findings`.
+    Ran {
+        /// Kingfisher's own account of whether it read every input.
+        completeness: ScanCompleteness,
+        version: Option<String>,
+        /// Rows Kingfisher reported before the merge.
+        findings_total: u32,
+        /// Of its listed rows, those at a path and line the primary already
+        /// reported (kept once).
+        confirmed: u32,
+        /// Of its listed rows, those the primary had not reported.
+        added: u32,
+    },
+}
+
 /// Result of a working-tree secrets scan.
 ///
 /// `ok: false` means the scan did not complete successfully — missing binary,
@@ -156,6 +187,8 @@ pub struct SecretsReport {
     /// scan `partial`.
     pub skipped_total: u32,
     pub skipped: Vec<SecretSkip>,
+    /// Kingfisher beside the in-process scan; see [`SecondOpinion`].
+    pub second_opinion: SecondOpinion,
 }
 
 impl SecretsReport {
@@ -181,6 +214,7 @@ impl SecretsReport {
             duration_ms: 0,
             skipped_total: 0,
             skipped: Vec::new(),
+            second_opinion: SecondOpinion::NotRun,
         }
     }
 
