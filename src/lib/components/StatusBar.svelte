@@ -26,7 +26,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { resolveStatusBarMode } from "../ui/statusBarMode";
   import { hostLoadPulse, startHostLoad } from "../stores/hostLoadStore";
-  import { startResourceBudgets } from "../stores/resourceBudgetWiring";
+  import { diagnostics } from "../diagnostics/diagnostics";
   import { statusChip } from "../health/hostLoad";
   import { onMount } from "svelte";
   import { Gauge } from "@lucide/svelte";
@@ -80,7 +80,13 @@
   let loadChip = $derived(statusChip($hostLoadPulse));
   onMount(() => {
     startHostLoad();
-    startResourceBudgets();
+    // Loaded, not imported: the wiring reaches the terminal's GPU renderer,
+    // which otherwise loads only with the terminal panel, and would put it in
+    // the entry chunk. Until it binds, the pool and the graph cache hold the
+    // compact budgets they were created with, as before the first status.
+    void import("../stores/resourceBudgetWiring")
+      .then(({ startResourceBudgets }) => startResourceBudgets())
+      .catch((error) => diagnostics.warn("hostLoad", `couldn't size caches from the resource profile: ${String(error)}`));
   });
   let watchLabel = $derived(watchMarker(watchState));
 
