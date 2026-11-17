@@ -135,3 +135,30 @@ describe("every verdict GitPulse writes is one the badge understands", () => {
     });
   }
 });
+
+/**
+ * The Rust side classifies the same notes for `verified` and `confidence`
+ * (what `gitpulse_provenance` answers over MCP), and the badge classifies them
+ * for the screen. Two copies of one closed set drift apart the first time a
+ * verdict is added to only one, and then an agent and a person are told
+ * different things about the same commit. This holds them equal.
+ */
+describe("the Rust pass set matches the badge's", () => {
+  const source = productionSource(join(RUST_ROOT, "engine/provenance.rs"));
+
+  function rustSet(name: string): string[] {
+    const m = new RegExp(`const ${name}: &\\[&str\\] = &\\[([^\\]]*)\\];`).exec(source);
+    expect(m, `engine/provenance.rs must define ${name} as a &[&str] literal`).not.toBeNull();
+    return [...m![1].matchAll(/"([^"]*)"/g)].map((v) => v[1]);
+  }
+
+  // Rust asks only "a pass of the whole suite, or not", so it keeps only the
+  // pass set; narrowed, failed and unrecognised are all "not".
+  it("PASS_VERDICTS", () => {
+    expect([...rustSet("PASS_VERDICTS")].sort()).toEqual([...PASS_VERDICTS].sort());
+  });
+  it("the Rust pass set never admits a narrowed or failed verdict", () => {
+    const rust = rustSet("PASS_VERDICTS");
+    for (const v of [...NARROWED_VERDICTS, ...FAIL_VERDICTS]) expect(rust).not.toContain(v);
+  });
+});

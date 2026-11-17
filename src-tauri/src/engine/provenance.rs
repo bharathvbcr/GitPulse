@@ -112,10 +112,16 @@ pub struct ProvenanceFreshness {
     /// be read" arrive as the same empty answer, and a badge would have to
     /// render an unexamined commit as an unverified one.
     pub notes_readable: bool,
-    /// True when a verification note is attached to the commit. It says that a
-    /// verification was recorded, not what it found (`verification.verdict`
-    /// does), and it is false both for a commit nobody verified and for notes
-    /// that could not be read (`notes_readable` tells those two apart).
+    /// True only when a verification note is attached *and* it records a pass
+    /// of the whole suite (`VerificationNote::passed_in_full`). A note that
+    /// recorded a failure, a pass of the affected tests only, or a verdict
+    /// this build does not recognise is `false` here, with the note itself
+    /// still in `verification` to say what it found. It is also false for a
+    /// commit nobody verified and for notes that could not be read
+    /// (`notes_readable` tells those apart).
+    ///
+    /// This used to be true for any note, so a commit whose check failed was
+    /// reported over MCP as `verified: true`.
     pub verified: bool,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
@@ -378,14 +384,43 @@ impl ProvenanceFreshness {
     }
 }
 
-/// The confidence a verification note keeps at `distance`: `1 / (1 + 0.1 d)`,
-/// and none without a note (owner decision 5: unverified is null, not 1.0).
+/// Verdicts read as a pass of the whole suite. A closed set: a word nobody
+/// listed here is not a pass, so a narrowed run (`passed-affected`), a failure
+/// and a verdict nobody has heard of all fall outside it.
+/// `scripts/provenance-verdict-contract.test.ts` holds it equal to `badge.ts`'s
+/// `PASS_VERDICTS`, which classifies the same notes for the badge.
+pub(crate) const PASS_VERDICTS: &[&str] = &["passed", "pass", "ok", "green", "success"];
+
+impl VerificationNote {
+    /// Whether this note records a pass of the whole suite, compared the way
+    /// the badge compares it (trimmed, lower-cased). A failure, a narrowed
+    /// pass and a verdict this build has never heard of are all `false`:
+    /// a note is evidence of what it found, not merely that it exists.
+    pub fn passed_in_full(&self) -> bool {
+        let verdict = self.verdict.trim().to_lowercase();
+        PASS_VERDICTS.contains(&verdict.as_str())
+    }
+}
+
+/// The confidence a passing verification keeps at `distance`:
+/// `1 / (1 + 0.1 d)`, and none without one (owner decision 5: unverified is
+/// null, not 1.0). A note that recorded a failure, a narrowed run or an
+/// unrecognised verdict is not a verification to decay: it gets none either,
+/// or a commit that failed at the tip would read as fully confident.
 fn decayed_confidence(
     verification: Option<&VerificationNote>,
     distance: Option<u32>,
 ) -> Option<f32> {
-    verification?;
+    if !verification.is_some_and(VerificationNote::passed_in_full) {
+        return None;
+    }
     distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32))
+}
+
+/// Whether `verification` is a recorded pass of the whole suite: the one
+/// owner of `ProvenanceFreshness::verified`.
+fn passed_verification(verification: Option<&VerificationNote>) -> bool {
+    verification.is_some_and(VerificationNote::passed_in_full)
 }
 
 /// Computes provenance freshness and confidence decay against a base branch.
@@ -2470,7 +2505,7 @@ fn measured_rows(
                     distance,
                     confidence: decayed_confidence(verification.as_ref(), distance),
                     is_fresh: distance == Some(0),
-                    verified: verification.is_some(),
+                    verified: passed_verification(verification.as_ref()),
                     verification,
                     session,
                     ..ProvenanceFreshness::unexamined(sha, reason.into_message())
@@ -2485,7 +2520,7 @@ fn measured_rows(
                 is_fresh: distance == Some(0),
                 unmeasured_reason,
                 notes_readable: true,
-                verified: verification.is_some(),
+                verified: passed_verification(verification.as_ref()),
                 verification,
                 session: session.unwrap_or(None),
                 commit_sha: sha,
@@ -2723,6 +2758,49 @@ mod batch_tests {
         let c = got[1].confidence.expect("measured");
         assert!(c < 1.0 && c > 0.0, "confidence should decay, got {c}");
         assert!(got[1].unmeasured_reason.is_empty());
+    }
+
+    /// `verified` and `confidence` are about what a note found, not that one
+    /// exists. Both were derived from the note's presence alone, so a commit
+    /// whose check failed at the tip came back over MCP as `verified: true`
+    /// with confidence 1.0, and a pass of the affected tests only read as a
+    /// pass of the whole suite.
+    #[test]
+    fn only_a_full_pass_is_verified_or_confident() {
+        let repo = Repo::new(5);
+        // (rev, verdict, is a full pass)
+        let cases = [
+            ("HEAD", "failed", false),
+            ("HEAD~1", "passed-affected", false),
+            ("HEAD~2", "green-ish", false),
+            ("HEAD~3", " Passed ", true),
+            ("HEAD~4", "blocked", false),
+        ];
+        for (rev, verdict, _) in cases {
+            repo.verify(rev, verdict);
+        }
+        let shas: Vec<String> = cases.iter().map(|(rev, _, _)| repo.rev(rev)).collect();
+        let batch = freshness_batch(repo.as_str(), &shas, Some("main"));
+        assert_eq!(batch.len(), cases.len());
+
+        for (((rev, verdict, passed), sha), batched) in cases.iter().zip(&shas).zip(&batch) {
+            let single = compute_freshness(repo.as_str(), sha, Some("main"));
+            for (path, f) in [("single", &single), ("batch", batched)] {
+                assert!(f.notes_readable, "{path} {rev}: {f:?}");
+                assert_eq!(
+                    f.verification.as_ref().map(|v| v.verdict.as_str()),
+                    Some(*verdict),
+                    "{path} {rev}: the note itself is still reported"
+                );
+                assert!(f.distance.is_some(), "{path} {rev}: measured: {f:?}");
+                assert_eq!(f.verified, *passed, "{path} {rev} {verdict:?}: {f:?}");
+                assert_eq!(
+                    f.confidence.is_some(),
+                    *passed,
+                    "{path} {rev} {verdict:?}: only a full pass has confidence: {f:?}"
+                );
+            }
+        }
     }
 
     /// The batch is a faster path to the same answer, not a different answer.
