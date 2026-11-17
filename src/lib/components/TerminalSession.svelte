@@ -240,6 +240,7 @@
     launcher,
     initialPrompt,
     initialAutoWake = false,
+    purpose,
     startDir,
     taskRunId,
     resume,
@@ -272,6 +273,8 @@
     launcher: LauncherKind;
     initialPrompt?: string;
     initialAutoWake?: boolean;
+    /** What this session was launched for; selects the model it starts on (`cmd_terminal_spawn`'s `purpose`). */
+    purpose?: "commit";
     /** Directory below the checkout to start in; absent starts at its root. */
     startDir?: string;
     taskRunId?: string;
@@ -1191,6 +1194,7 @@
             resume: spawnResume,
             sessionId: !spawnResume || spawnResume.fork ? hostedId : null,
             reopenRowId,
+            purpose: purpose ?? null,
             onOutput,
           }));
         },

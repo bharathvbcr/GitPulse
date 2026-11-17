@@ -114,6 +114,8 @@ export interface TerminalTab {
   snippet?: { title: string; content: string };
   /** Pre-arms quiescent peer auto-wake on unattended kickoff sessions. */
   autoWake?: boolean;
+  /** What the session was launched for; sent with every spawn of this tab so a restart keeps its model. */
+  purpose?: "commit";
 }
 
 /**
@@ -550,6 +552,12 @@ export function setTabStartDir(state: TabState, id: string, startDir: string | n
 export function setTabAutoWake(state: TabState, id: string, autoWake: boolean): TabState {
   if (!state.tabs.some((tab) => tab.id === id)) return state;
   return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, autoWake } : tab)) };
+}
+
+/** Records what a newly opened tab was launched for (`purpose` of `cmd_terminal_spawn`). */
+export function setTabPurpose(state: TabState, id: string, purpose: "commit"): TabState {
+  if (!state.tabs.some((tab) => tab.id === id)) return state;
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, purpose } : tab)) };
 }
 
 /** Sets typed resume metadata (and optional display name) on a newly opened tab. */

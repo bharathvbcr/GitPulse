@@ -123,7 +123,16 @@ export interface AgentDefaults {
    * which flag carries them is `model_control` in `terminal_command.rs`.
    */
   models?: Partial<Record<LauncherKind, ModelChoice>>;
+  /**
+   * The model an agent CLI starts with when GitPulse launches it to write a
+   * commit. An entry replaces that launcher's `models` entry whole for the
+   * launch (fields are never merged); absent means `models`, unchanged.
+   */
+  commit_models?: Partial<Record<LauncherKind, ModelChoice>>;
 }
+
+/** Which stored model map a choice lives in: the main one, or the commit launch's. */
+export type ModelSlot = "models" | "commit_models";
 
 /**
  * One launcher's model settings. Mirrors `tool_config::ModelChoice`; which
@@ -326,38 +335,45 @@ export function sanitizeAgentDefaults(
   if (typeof raw.keep_terminals_running === "boolean") sanitized.keep_terminals_running = raw.keep_terminals_running;
   const sources = canonicalSettingSources(raw.claude_setting_sources);
   if (sources) sanitized.claude_setting_sources = sources;
-  if (raw.models && typeof raw.models === "object" && !Array.isArray(raw.models)) {
+  for (const slot of ["models", "commit_models"] as const) {
+    const stored = raw[slot];
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) continue;
     const models: Partial<Record<LauncherKind, ModelChoice>> = {};
-    for (const [launcher, choice] of Object.entries(raw.models)) {
+    for (const [launcher, choice] of Object.entries(stored)) {
       const fields = modelFields[launcher as LauncherKind];
       if (!fields) continue;
       const clean = sanitizeModelChoice(choice, fields);
       if (clean) models[launcher as LauncherKind] = clean;
     }
-    if (Object.keys(models).length) sanitized.models = models;
+    if (Object.keys(models).length) sanitized[slot] = models;
   }
   return sanitized;
 }
 
-/** The stored model choice for `launcher`, or an empty one. */
-export function modelChoiceOf(defaults: AgentDefaults, launcher: LauncherKind): ModelChoice {
-  return defaults.models?.[launcher] ?? {};
+/** The stored model choice for `launcher` in `slot` (the main one by default), or an empty one. */
+export function modelChoiceOf(defaults: AgentDefaults, launcher: LauncherKind, slot: ModelSlot = "models"): ModelChoice {
+  return defaults[slot]?.[launcher] ?? {};
 }
 
 /**
  * The defaults with `launcher`'s model choice replaced — removed when the
  * choice is empty, so "the CLI's own choice" is stored as absence.
  */
-export function withModelChoice(defaults: AgentDefaults, launcher: LauncherKind, choice: ModelChoice): AgentDefaults {
-  const models = { ...(defaults.models ?? {}) };
+export function withModelChoice(
+  defaults: AgentDefaults,
+  launcher: LauncherKind,
+  choice: ModelChoice,
+  slot: ModelSlot = "models",
+): AgentDefaults {
+  const models = { ...(defaults[slot] ?? {}) };
   const kept = Object.fromEntries(
     Object.entries(choice).filter(([, value]) => value !== undefined && value !== "" && !(Array.isArray(value) && value.length === 0)),
   ) as ModelChoice;
   if (Object.keys(kept).length) models[launcher] = kept;
   else delete models[launcher];
   const next: AgentDefaults = { ...defaults };
-  if (Object.keys(models).length) next.models = models;
-  else delete next.models;
+  if (Object.keys(models).length) next[slot] = models;
+  else delete next[slot];
   return next;
 }
 

@@ -201,7 +201,9 @@ export async function launchAgentCommit(
   }
 
   try {
-    const requestPromise = terminalLaunchRequests.request(repoPath, launcher, prompt, signal);
+    const requestPromise = terminalLaunchRequests.request(repoPath, launcher, prompt, signal, {
+      purpose: "commit",
+    });
     openTerminal(true);
     await requestPromise;
     const providerName = PROVIDER_LABELS[launcher] ?? launcher;

@@ -37,6 +37,7 @@
     withModelChoice,
     type ModelChoice,
     type ModelField,
+    type ModelSlot,
   } from "../terminal/agentDefaults";
   import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
   import { agentModelCatalogs, listedModel, loadAgentModels, type AgentModelCatalog, type CatalogState } from "../terminal/agentModelCatalog";
@@ -151,8 +152,13 @@
     return choice[field] ?? "";
   }
 
-  async function commit(launcher: LauncherKind, field: ModelField, input: HTMLInputElement | HTMLSelectElement) {
-    const current = modelChoiceOf(view.defaults, launcher);
+  async function commit(
+    launcher: LauncherKind,
+    field: ModelField,
+    input: HTMLInputElement | HTMLSelectElement,
+    slot: ModelSlot = "models",
+  ) {
+    const current = modelChoiceOf(view.defaults, launcher, slot);
     const text = input.value.trim();
     if (text === valueOf(current, field)) return;
     const problem = refusal(field, text);
@@ -167,7 +173,7 @@
     errors = { ...errors, [launcher]: "" };
     busy = true;
     try {
-      await saveAgentDefaults(withModelChoice(view.defaults, launcher, next));
+      await saveAgentDefaults(withModelChoice(view.defaults, launcher, next, slot));
     } catch (err) {
       errors = { ...errors, [launcher]: formatError(err) };
       input.value = valueOf(current, field);
@@ -176,13 +182,80 @@
     }
   }
 
-  function onKey(event: KeyboardEvent, launcher: LauncherKind, field: ModelField) {
+  function onKey(event: KeyboardEvent, launcher: LauncherKind, field: ModelField, slot: ModelSlot = "models") {
     if (event.key === "Enter") {
       event.preventDefault();
-      void commit(launcher, field, event.currentTarget as HTMLInputElement);
+      void commit(launcher, field, event.currentTarget as HTMLInputElement, slot);
     }
   }
 </script>
+
+<!-- One launcher's model controls for one slot: the main model, or the one a commit launch uses. -->
+<!-- The warning for a stored model the account's listing does not know, for the main slot or the commit one. -->
+{#snippet unlistedWarning(launcher: LauncherKind, slot: ModelSlot)}
+  {@const model = modelChoiceOf(view.defaults, launcher, slot).model}
+  {#if view.modelListing[launcher] === "listed" && listedModel(catalogs[launcher], model) === false}
+    <div class="flex items-start gap-1.5 text-warn text-micro" data-testid={slot === "models" ? `agent-models-${launcher}-unlisted` : `agent-commit-models-${launcher}-unlisted`}>
+      <AlertTriangle size={12} class="shrink-0 mt-px" />
+      <span>
+        {#if slot === "models"}"{model}" is not in the list your account returned. Antigravity would start with its default model instead.{:else}The commit model "{model}" is not in the list your account returned. Antigravity would start commits with its default model instead.{/if}
+      </span>
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet fieldGrid(row: { kind: LauncherKind; fields: readonly ModelField[] }, slot: ModelSlot)}
+  {@const choice = modelChoiceOf(view.defaults, row.kind, slot)}
+  {@const prefix = slot === "models" ? "agent-model" : "agent-commit-model"}
+  <!-- A commit entry replaces the main one whole, so "same as above" is true only while it is entirely empty. -->
+  {@const inherits = slot === "commit_models" && Object.keys(choice).length === 0}
+  <div class="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] items-center gap-x-2 gap-y-1">
+    {#each row.fields as field (field)}
+      {@const id = `${prefix}-${row.kind}-${field}`}
+      <label for={id} class="text-micro text-textMuted">{FIELD_LABELS[field]}</label>
+      {#if field === "effort"}
+        <select
+          {id}
+          class="gp-select text-meta min-w-0" data-size="sm"
+          data-testid={id}
+          disabled={busy}
+          value={choice.effort ?? ""}
+          onchange={(event) => void commit(row.kind, field, event.currentTarget, slot)}
+        >
+          <option value="">{inherits ? "Same as above" : "CLI default"}</option>
+          {#each view.effortLevels as level (level)}
+            <option value={level}>{level}</option>
+          {/each}
+        </select>
+      {:else}
+        {@const suggestions = suggestionsFor(row.kind, field)}
+        <input
+          {id}
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          class="gp-field text-meta min-w-0 font-mono" data-size="sm"
+          data-testid={id}
+          disabled={busy}
+          placeholder={inherits
+            ? "Same as above"
+            : field === "advisor" ? "Off unless your settings turn it on" : field === "fallback" ? "None" : "CLI default"}
+          list={suggestions.length ? `${id}-suggestions` : undefined}
+          value={valueOf(choice, field)}
+          onchange={(event) => void commit(row.kind, field, event.currentTarget, slot)}
+          onkeydown={(event) => onKey(event, row.kind, field, slot)}
+        />
+        {#if suggestions.length}
+          <datalist id={`${id}-suggestions`}>
+            {#each suggestions as suggestion (suggestion.id)}
+              <option value={suggestion.id}>{suggestion.label ?? ""}</option>
+            {/each}
+          </datalist>
+        {/if}
+      {/if}
+    {/each}
+  </div>
+{/snippet}
 
 <fieldset>
   <legend class="text-textPrimary text-meta">Agent models</legend>
@@ -193,57 +266,14 @@
   {:else}
     <div class="mt-1.5 flex flex-col gap-2.5" data-testid="agent-models">
       {#each rows as row (row.kind)}
-        {@const choice = modelChoiceOf(view.defaults, row.kind)}
         <div class="flex flex-col gap-1" data-testid={`agent-models-${row.kind}`}>
           <span class="text-meta text-textPrimary font-medium">{row.label}</span>
-          <div class="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] items-center gap-x-2 gap-y-1">
-            {#each row.fields as field (field)}
-              {@const id = `agent-model-${row.kind}-${field}`}
-              <label for={id} class="text-micro text-textMuted">{FIELD_LABELS[field]}</label>
-              {#if field === "effort"}
-                <select
-                  {id}
-                  class="gp-select text-meta min-w-0" data-size="sm"
-                  data-testid={id}
-                  disabled={busy}
-                  value={choice.effort ?? ""}
-                  onchange={(event) => void commit(row.kind, field, event.currentTarget)}
-                >
-                  <option value="">CLI default</option>
-                  {#each view.effortLevels as level (level)}
-                    <option value={level}>{level}</option>
-                  {/each}
-                </select>
-              {:else}
-                {@const suggestions = suggestionsFor(row.kind, field)}
-                <input
-                  {id}
-                  type="text"
-                  spellcheck="false"
-                  autocomplete="off"
-                  class="gp-field text-meta min-w-0 font-mono" data-size="sm"
-                  data-testid={id}
-                  disabled={busy}
-                  placeholder={field === "advisor" ? "Off unless your settings turn it on" : field === "fallback" ? "None" : "CLI default"}
-                  list={suggestions.length ? `${id}-suggestions` : undefined}
-                  value={valueOf(choice, field)}
-                  onchange={(event) => void commit(row.kind, field, event.currentTarget)}
-                  onkeydown={(event) => onKey(event, row.kind, field)}
-                />
-                {#if suggestions.length}
-                  <datalist id={`${id}-suggestions`}>
-                    {#each suggestions as suggestion (suggestion.id)}
-                      <option value={suggestion.id}>{suggestion.label ?? ""}</option>
-                    {/each}
-                  </datalist>
-                {/if}
-              {/if}
-            {/each}
-          </div>
+          {@render fieldGrid(row, "models")}
+          <span class="text-micro text-textMuted mt-1" data-testid={`agent-commit-models-${row.kind}-heading`}>When asking this agent to commit</span>
+          {@render fieldGrid(row, "commit_models")}
           {#if view.modelListing[row.kind]}
             {@const status = catalogStatus(row.kind)}
             {@const listed = view.modelListing[row.kind] === "listed"}
-            {@const known = listedModel(catalogs[row.kind], choice.model)}
             <div class="flex items-start gap-2 text-micro">
               {#if status}
                 <span class={status.problem ? "text-warn" : "text-textMuted"} data-testid={`agent-models-${row.kind}-catalog`}>{status.text}</span>
@@ -260,12 +290,8 @@
                 </button>
               {/if}
             </div>
-            {#if listed && known === false}
-              <div class="flex items-start gap-1.5 text-warn text-micro" data-testid={`agent-models-${row.kind}-unlisted`}>
-                <AlertTriangle size={12} class="shrink-0 mt-px" />
-                <span>"{choice.model}" is not in the list your account returned. Antigravity would start with its default model instead.</span>
-              </div>
-            {/if}
+            {@render unlistedWarning(row.kind, "models")}
+            {@render unlistedWarning(row.kind, "commit_models")}
           {/if}
           {#if errors[row.kind]}
             <div class="flex items-start gap-1.5 text-warn text-micro">
@@ -283,6 +309,7 @@
     GitPulse checks that a name is well-formed, not that the model exists — the CLI reports a model it cannot use in the session.
     Antigravity does not stop for an unknown name: it falls back to its default model and prints a warning in the terminal. Its names are the ones <span class="font-mono">agy models</span> lists.
     Claude's advisor needs access to the advisor model, and Claude Code reports a pairing it cannot use (the advisor must be at least as capable as the main model).
+    "Ask agent to commit" can start on a smaller model than the one above: a commit entry replaces the whole entry above for that launch (nothing is carried over from it, so name the advisor again if you want one), and leaving it empty means the model above.
     Managed sessions are not affected: Manvi starts those with the CLI's own model.
   </p>
 </fieldset>
