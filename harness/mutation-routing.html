@@ -72,7 +72,7 @@ mockIPCWithEvents(async (cmd, args) => {
       if (cmd === "cmd_remove_worktree") return guarded({ cleanup_error: null, sweep_problems: [] });
       if (cmd === "cmd_worktree_merge_teardown") return guarded({ merged: true, merged_branch: "claude/lane", target_branch: "main", commits_merged: 1, before_oid: "a", after_oid: "b", base_oid: null, worktree_removed: true, removal_error: null, branch_deleted: true, branch_error: null, hook_error: null });
       if (cmd === "cmd_delete_branch") return null;
-      if (cmd === "cmd_deadbranch_clean") return guarded({ deleted: args.branches, failed: [], backup_path: args.createBackup ? `${args.repoPath}/.backup/new.json` : null, message: "Cleaned" });
+      if (cmd === "cmd_deadbranch_clean") return guarded({ deleted: args.branches.map(ref => ref.replace(/^refs\/(heads|remotes)\//, "")), failed: [], backup_path: args.createBackup ? `${args.repoPath}/.backup/new.json` : null, message: "Cleaned" });
       if (cmd === "cmd_deadbranch_restore") return guarded({ restored: ["stale/from-a"], failed: [], message: "Restored" });
       return guarded(null);
     }
@@ -194,7 +194,7 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   button("Clean selected (1)").click();
   await until(() => sentTo("cmd_deadbranch_clean").length === 1, "clean sent");
   check("a pending clean is counted by the quit guard and names A", () => busy() === 1 && sentTo("cmd_deadbranch_clean")[0].repoPath === A);
-  check("and sends the branches shown, with the backup on and force off as the dialog had them", () => JSON.stringify(sentTo("cmd_deadbranch_clean")[0].branches) === '["stale/from-a"]' && sentTo("cmd_deadbranch_clean")[0].force === false && sentTo("cmd_deadbranch_clean")[0].createBackup === true);
+  check("and sends the branches shown, with the backup on and force off as the dialog had them", () => JSON.stringify(sentTo("cmd_deadbranch_clean")[0].branches) === '["refs/heads/stale/from-a"]' && sentTo("cmd_deadbranch_clean")[0].force === false && sentTo("cmd_deadbranch_clean")[0].createBackup === true);
   check("a second click while it runs sends nothing more", () => { button("Cleaning…")?.click(); return sentTo("cmd_deadbranch_clean").length === 1; });
   releaseAll("cmd_deadbranch_clean");
   await until(() => busy() === 0, "clean settled");

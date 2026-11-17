@@ -503,24 +503,83 @@ fn adv_local_and_remote_of_same_name_yield_exactly_two_argv() {
 #[test]
 fn adv_nested_remote_names_origin_and_origin_eu() {
     let _env = bind_env_owned(env_serial());
-    // `origin/eu` holds x; `origin` holds a branch eu/y.
+    // `origin/eu` holds x; `origin` holds a branch eu/y. Both fetch into
+    // refs/remotes/origin/eu/*, so neither ref has a provable owner.
     let f = cleanup_fixture(&[("origin", &["eu/y"]), ("origin/eu", &["x"])]);
-    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/eu/x"], false);
-    assert_eq!(judged, vec!["git push origin/eu --delete x"], "{r:?}");
-    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/eu/y"], false);
-    // Ambiguous by construction (refs/remotes/origin/eu/y could belong to either
-    // remote): it must not delete anything from the wrong remote.
-    // Ambiguous by construction; the longest configured remote wins and the
-    // other remote's branch must survive.
+    for target in ["refs/remotes/origin/eu/x", "refs/remotes/origin/eu/y"] {
+        let (judged, r) = clean(&f.repo, &[target], false);
+        assert!(judged.is_empty(), "{target}: {judged:?} {r:?}");
+        let message = r.expect_err("an ambiguous owner is refused").into_message();
+        assert!(
+            message.contains("origin")
+                && message.contains("origin/eu")
+                && message.contains("ambiguous"),
+            "{message}"
+        );
+    }
+    for (bare, branch) in [(&f.bares[0].1, "eu/y"), (&f.bares[1].1, "x")] {
+        assert!(try_g(
+            bare,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/{branch}")
+            ]
+        )
+        .is_some());
+    }
+}
+
+/// A remote removed from config after its tracking refs were fetched has no
+/// owner; nothing reaches the gate.
+#[test]
+fn adv_remote_removed_from_config_after_scan_fails_closed() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["feature"])]);
+    git_in(&f.repo, &["config", "--remove-section", "remote.origin"]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/feature"], false);
     assert!(
-        !judged.iter().any(|j| j == "git push origin --delete eu/y")
-            || try_g(
-                &f.bares[0].1,
-                &["rev-parse", "--verify", "-q", "refs/heads/eu/y"]
-            )
-            .is_none(),
-        "{judged:?} {r:?}"
+        judged.is_empty(),
+        "pushed to an unconfigured remote: {judged:?} {r:?}"
     );
+    assert!(try_g(
+        &f.bares[0].1,
+        &["rev-parse", "--verify", "-q", "refs/heads/feature"]
+    )
+    .is_some());
+}
+
+/// A single nested-name remote with no overlapping remote still deletes.
+#[test]
+fn a_lone_nested_remote_still_deletes_its_branch() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("team/fork", &["x"])]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/team/fork/x"], false);
+    assert_eq!(judged, vec!["git push team/fork --delete x"], "{r:?}");
+    assert!(try_g(
+        &f.bares[0].1,
+        &["rev-parse", "--verify", "-q", "refs/heads/x"]
+    )
+    .is_none());
+}
+
+/// An ordinary remote and a slashed branch still delete.
+#[test]
+fn an_ordinary_remote_with_a_slashed_branch_still_deletes() {
+    let _env = bind_env_owned(env_serial());
+    let f = cleanup_fixture(&[("origin", &["feature/login"])]);
+    let (judged, r) = clean(&f.repo, &["refs/remotes/origin/feature/login"], false);
+    assert_eq!(
+        judged,
+        vec!["git push origin --delete feature/login"],
+        "{r:?}"
+    );
+    assert!(try_g(
+        &f.bares[0].1,
+        &["rev-parse", "--verify", "-q", "refs/heads/feature/login"]
+    )
+    .is_none());
 }
 
 #[test]

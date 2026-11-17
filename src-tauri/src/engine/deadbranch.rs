@@ -1036,6 +1036,40 @@ where
     )?;
     let to_clean = scan.result.branches;
 
+    // A remote delete is judged against the remote names git reads right now,
+    // not the cached ones the scan labelled rows with: a remote removed or
+    // renamed since, or one that only a nested name stood in for, must not
+    // retarget the delete to another remote. A remote that exists only as a
+    // legacy `.git/remotes` file is not configured here and is refused.
+    if to_clean.iter().any(|b| b.is_remote) {
+        let remotes = crate::engine::git_reader::configured_remote_names_fresh(&repo)?;
+        let claims = crate::engine::remotes::FetchClaims::read(&repo)?;
+        for b in to_clean.iter().filter(|b| b.is_remote) {
+            let rest = b.full_ref.strip_prefix(REMOTE_REFS).unwrap_or(&b.full_ref);
+            let owned = crate::engine::remotes::configured_owner(&remotes, rest);
+            if owned != b.remote_name.as_deref().map(|r| (r, b.short_name.as_str())) {
+                return Err(format!(
+                    "Refusing to delete '{}': its remote is not a configured remote",
+                    b.full_ref
+                )
+                .into());
+            }
+            // Two remotes whose fetch refspecs write the same tracking ref
+            // (`origin` and `origin/eu` both map onto refs/remotes/origin/eu/x)
+            // leave the ref's owner a guess, and the wrong guess deletes
+            // another remote's branch.
+            let claimants = claims.claimants(rest);
+            if claimants.len() > 1 {
+                return Err(format!(
+                    "Refusing to delete '{}': the remotes {} both fetch into it, so its owner is ambiguous",
+                    b.full_ref,
+                    claimants.join(" and ")
+                )
+                .into());
+            }
+        }
+    }
+
     if to_clean.is_empty() {
         return Ok(DeadbranchCleanResult {
             deleted: Vec::new(),

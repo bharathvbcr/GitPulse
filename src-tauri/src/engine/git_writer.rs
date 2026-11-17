@@ -3402,11 +3402,6 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
-/// Refuses a plan in which a squash or fixup has no kept commit before it, as
-/// git does ("cannot 'squash' without a previous commit"). A dropped step is
-/// not a commit to fold into: with only drops ahead of it the fold would amend
-/// the onto commit itself and `branch -f` would then move the branch onto that
-/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
 /// Refuses a rebase plan that is not a permutation of `onto..head`: every
 /// commit of the range exactly once, nothing else. Steps may be abbreviated
 /// oids or any revision naming a commit; they are resolved before comparing.
@@ -3494,6 +3489,11 @@ fn require_plan_covers_range(
     Ok(())
 }
 
+/// Refuses a plan in which a squash or fixup has no kept commit before it, as
+/// git does ("cannot 'squash' without a previous commit"). A dropped step is
+/// not a commit to fold into: with only drops ahead of it the fold would amend
+/// the onto commit itself and `branch -f` would then move the branch onto that
+/// rewritten copy of the base. Pick and reword keep a commit; drop does not.
 fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), CommandError> {
     let mut has_kept_commit = false;
     for step in steps {
