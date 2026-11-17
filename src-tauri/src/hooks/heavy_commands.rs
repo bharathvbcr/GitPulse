@@ -62,6 +62,10 @@ pub(super) struct Row {
     scripts: &'static [&'static str],
     when: Cond,
     pub kind: Kind,
+    /// Whether a build the row matches takes a build slot (`sysload::lease`).
+    /// Only a program the lease wrapper is installed in front of (`cargo`,
+    /// `go`) can: a package script or a test runner has no slot to take.
+    pub lease: bool,
     /// How to run it smaller, when there is a documented way.
     pub cap: Option<&'static str>,
     /// What to tell the model about an [`Kind::Advise`] row.
@@ -76,15 +80,27 @@ pub(super) const ROWS: &[Row] = &[
     Row {
         id: "cargo",
         programs: &["cargo"],
+        // The slot-gate shim's own set (`~/.claude-bin/cargo`): every verb that
+        // compiles a crate graph. `run`/`r` are left out on purpose, see
+        // `NEVER_LEASED`.
         verbs: &[
-            "build", "b", "check", "c", "clippy", "test", "t", "bench", "nextest", "llvm-cov",
-            "doc",
+            "build", "b", "check", "c", "clippy", "test", "t", "bench", "doc", "d", "rustc",
+            "rustdoc", "fix", "install", "nextest", "llvm-cov", "mutants", "fuzz", "miri",
         ],
-        value_flags: &["-Z", "-C", "--config", "--color"],
+        value_flags: &[
+            "-Z",
+            "-C",
+            "--config",
+            "--color",
+            "--manifest-path",
+            "--target-dir",
+            "--explain",
+        ],
         script_verbs: NONE,
         scripts: NONE,
         when: Cond::Always,
         kind: Kind::Heavy,
+        lease: true,
         cap: Some("prefix it with CARGO_BUILD_JOBS=2, and for tests add -- --test-threads=2"),
         advice: "",
     },
@@ -97,6 +113,7 @@ pub(super) const ROWS: &[Row] = &[
         scripts: NONE,
         when: Cond::Always,
         kind: Kind::Heavy,
+        lease: true,
         cap: Some("prefix it with GOMAXPROCS=4 and pass -p 2"),
         advice: "",
     },
@@ -109,6 +126,7 @@ pub(super) const ROWS: &[Row] = &[
         scripts: &["test*", "ci:local"],
         when: Cond::Always,
         kind: Kind::Heavy,
+        lease: false,
         cap: None,
         advice: "",
     },
@@ -121,6 +139,7 @@ pub(super) const ROWS: &[Row] = &[
         scripts: NONE,
         when: Cond::Always,
         kind: Kind::Heavy,
+        lease: false,
         cap: Some("pass --maxWorkers=2 to jest; vitest has no cap GitPulse has confirmed"),
         advice: "",
     },
@@ -133,6 +152,7 @@ pub(super) const ROWS: &[Row] = &[
         scripts: NONE,
         when: Cond::ArgsContain(&["/vitest/", "/jest/", "/jest-cli/"]),
         kind: Kind::Heavy,
+        lease: false,
         cap: None,
         advice: "",
     },
@@ -151,6 +171,7 @@ pub(super) const ROWS: &[Row] = &[
             ]),
         ]),
         kind: Kind::Advise,
+        lease: false,
         cap: None,
         advice: "a recursive grep without --exclude-dir, or with -z/-a/--null-data, once grew to \
                  21 GiB on this host. Use rg with -g '!target*' and --max-filesize, or add \
@@ -169,6 +190,7 @@ pub(super) const ROWS: &[Row] = &[
             Cond::NoArgPrefix(&["!", "--glob=!", "--iglob=!", "-g!"]),
         ]),
         kind: Kind::Advise,
+        lease: false,
         cap: None,
         advice: "rg with -uu or --no-ignore and no exclusion reads build output and was killed \
                  at 40.8 GiB on this host. Add -g '!target*' (and the other build directories) \
@@ -186,6 +208,7 @@ pub(super) const ROWS: &[Row] = &[
             Cond::NoFlags(&["-timeout"]),
         ]),
         kind: Kind::Advise,
+        lease: false,
         cap: None,
         advice: "go test ./... or -fuzz with no -timeout reached 120 GiB on this host. Pass \
                  -timeout (for example -timeout 10m) and set GOMEMLIMIT.",
@@ -199,6 +222,7 @@ pub(super) const ROWS: &[Row] = &[
         scripts: NONE,
         when: Cond::ArgsContain(&["train", "bench"]),
         kind: Kind::Advise,
+        lease: false,
         cap: None,
         advice: "a Python training or benchmark run once reached 74.8 GiB on this host. Bound \
                  its memory (a smaller batch or sample, or a ulimit) before running it.",
@@ -389,6 +413,74 @@ pub(super) fn classify(command: &str) -> Classified {
     out.build_dirs
         .retain(|dir| !dir.contains(['$', '`', '~']) && command.contains(dir.as_str()));
     out
+}
+
+/// Reads one program and its arguments, already split, against the table: what
+/// the lease wrapper has when it is the program being run. No shell line is
+/// parsed, so nothing here can be a quoted word or a chained command.
+pub(super) fn classify_argv(program: &str, args: &[String]) -> Classified {
+    let mut out = Classified::default();
+    let mut words = Vec::with_capacity(args.len() + 1);
+    words.push(program.to_string());
+    words.extend_from_slice(args);
+    classify_words(&words, 0, &mut out);
+    out
+}
+
+/// Verbs that never take a build slot, whatever the table says about the
+/// program. `run` can start a server that never exits and would hold its slot
+/// for good; the rest build nothing. A verb added to a row above that belongs
+/// here too is still refused a slot: this list is read first.
+const NEVER_LEASED: &[(&str, &[&str])] = &[
+    (
+        "cargo",
+        &["run", "r", "clean", "fmt", "metadata", "tree", "help"],
+    ),
+    ("go", &["run", "env", "mod", "version"]),
+];
+
+/// Whether `program args` is a build that takes a slot: heavy by the table, on
+/// a row that leases, and not a verb that never does.
+pub(super) fn leased(program: &str, args: &[String]) -> bool {
+    let name = base_name(program);
+    // A call that only prints help builds nothing. After `--` the words belong
+    // to the program being run, so `cargo test -- --help` still builds.
+    if args
+        .iter()
+        .take_while(|word| word.as_str() != "--")
+        .any(|word| word == "--help" || word == "-h")
+    {
+        return false;
+    }
+    // `cargo llvm-cov clean`, `report` and `show-env` build nothing, and
+    // cleaning has to work on a full disk: the owner's shim exempts them too.
+    if name == "cargo" {
+        let value_flags = ROWS
+            .iter()
+            .find(|row| row.programs.contains(&"cargo"))
+            .map_or(NONE, |row| row.value_flags);
+        if let Some(at) = first_operand(args, value_flags) {
+            if args[at] == "llvm-cov"
+                && args
+                    .get(at + 1)
+                    .is_some_and(|sub| matches!(sub.as_str(), "clean" | "report" | "show-env"))
+            {
+                return false;
+            }
+        }
+    }
+    if let Some((_, verbs)) = NEVER_LEASED.iter().find(|(p, _)| *p == name) {
+        let value_flags = ROWS
+            .iter()
+            .find(|row| row.programs.contains(&name))
+            .map_or(NONE, |row| row.value_flags);
+        if first_operand(args, value_flags).is_some_and(|at| verbs.contains(&args[at].as_str())) {
+            return false;
+        }
+    }
+    classify_argv(name, args)
+        .heavy
+        .is_some_and(|hit| hit.row.lease)
 }
 
 /// A cheap read of the raw line: whether any program the table knows appears at

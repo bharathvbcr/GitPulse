@@ -547,6 +547,318 @@ where
     }))
 }
 
+/// Whether builds take a slot (`sysload::lease`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseMode {
+    /// A heavy `cargo` or `go` build waits for a free slot.
+    #[default]
+    On,
+    /// The wrapper runs the build at once and says nothing.
+    Off,
+}
+
+/// How builds are leased (card 1d). Stored as its own top-level key,
+/// `host_load_leases`, holding only the fields that differ from their default,
+/// for the reason `host_load_hook_mode` is: an older build keeps an unknown
+/// top-level key, and would discard a `host_load` block over a field it does
+/// not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLoadLeases {
+    #[serde(default)]
+    pub mode: LeaseMode,
+    /// How many builds run at once while the host is healthy. The governor
+    /// lowers it under load (`sysload::lease::capacity`).
+    #[serde(default = "default_lease_slots")]
+    pub slots: u32,
+    /// Seconds a build waits before it starts without a slot.
+    #[serde(default = "default_lease_wait_max")]
+    pub wait_max_s: u64,
+    /// Seconds a build may wait while the governor refuses, before it gives up.
+    #[serde(default = "default_lease_wait_hard")]
+    pub wait_hard_s: u64,
+    /// Whether the wrapper turns incremental compilation off for the builds it
+    /// leases (`CARGO_INCREMENTAL=0`). Off by default: it trades build time
+    /// for the disk the incremental directories take.
+    #[serde(default)]
+    pub incremental_off: bool,
+}
+
+fn default_lease_slots() -> u32 {
+    crate::sysload::lease::DEFAULT_SLOTS
+}
+
+fn default_lease_wait_max() -> u64 {
+    crate::sysload::lease::DEFAULT_WAIT_MAX_S
+}
+
+fn default_lease_wait_hard() -> u64 {
+    crate::sysload::lease::DEFAULT_WAIT_HARD_S
+}
+
+impl Default for HostLoadLeases {
+    fn default() -> Self {
+        Self {
+            mode: LeaseMode::On,
+            slots: default_lease_slots(),
+            wait_max_s: default_lease_wait_max(),
+            wait_hard_s: default_lease_wait_hard(),
+            incremental_off: false,
+        }
+    }
+}
+
+impl HostLoadLeases {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Why these values cannot be saved, or `None`.
+    pub fn problem(&self) -> Option<String> {
+        if !(1..=crate::sysload::lease::MAX_SLOTS).contains(&self.slots) {
+            return Some(format!(
+                "Build slots must be between 1 and {}.",
+                crate::sysload::lease::MAX_SLOTS
+            ));
+        }
+        if self.wait_max_s > MAX_LEASE_WAIT_S || self.wait_hard_s > MAX_LEASE_WAIT_S {
+            return Some(format!(
+                "A build may not wait longer than {MAX_LEASE_WAIT_S} seconds."
+            ));
+        }
+        if self.wait_hard_s < self.wait_max_s {
+            return Some(
+                "The give-up time must not be shorter than the time before a build starts without a slot."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Reads a stored block one field at a time: a field that cannot be read
+    /// or fails validation keeps its own default and says so, and costs no
+    /// other setting.
+    pub fn from_stored(raw: serde_json::Value) -> Self {
+        let mut leases = Self::default();
+        let Some(object) = raw.as_object() else {
+            if !raw.is_null() {
+                log::warn!(target: "tool_config", "ignoring a host_load_leases that is not an object");
+            }
+            return leases;
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            object: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            into: &mut T,
+        ) {
+            if let Some(value) = object.get(name) {
+                match serde_json::from_value(value.clone()) {
+                    Ok(read) => *into = read,
+                    Err(error) => log::warn!(
+                        target: "tool_config",
+                        "ignoring unreadable host_load_leases.{name}, keeping its default: {error}"
+                    ),
+                }
+            }
+        }
+        field(object, "mode", &mut leases.mode);
+        field(object, "slots", &mut leases.slots);
+        field(object, "wait_max_s", &mut leases.wait_max_s);
+        field(object, "wait_hard_s", &mut leases.wait_hard_s);
+        field(object, "incremental_off", &mut leases.incremental_off);
+        // Validated one field at a time: a value out of range falls back to
+        // its own default and leaves the others as stored. (A block reset as
+        // a whole would turn leasing back on for `{"mode":"off","slots":12}`.)
+        let default = Self::default();
+        if !(1..=crate::sysload::lease::MAX_SLOTS).contains(&leases.slots) {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.slots {}: out of range", leases.slots);
+            leases.slots = default.slots;
+        }
+        if leases.wait_max_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.wait_max_s {}: too long", leases.wait_max_s);
+            leases.wait_max_s = default.wait_max_s;
+        }
+        if leases.wait_hard_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_leases.wait_hard_s {}: too long", leases.wait_hard_s);
+            leases.wait_hard_s = default.wait_hard_s;
+        }
+        if leases.wait_hard_s < leases.wait_max_s {
+            log::warn!(
+                target: "tool_config",
+                "host_load_leases.wait_hard_s {} is shorter than wait_max_s {}: raising it",
+                leases.wait_hard_s,
+                leases.wait_max_s
+            );
+            leases.wait_hard_s = default.wait_hard_s.max(leases.wait_max_s);
+        }
+        debug_assert!(leases.problem().is_none());
+        leases
+    }
+
+    /// Only the fields that differ from their default.
+    pub fn to_stored(&self) -> serde_json::Value {
+        let default = Self::default();
+        let mut object = serde_json::Map::new();
+        if self.mode != default.mode {
+            object.insert("mode".into(), serde_json::json!(self.mode));
+        }
+        if self.slots != default.slots {
+            object.insert("slots".into(), self.slots.into());
+        }
+        if self.wait_max_s != default.wait_max_s {
+            object.insert("wait_max_s".into(), self.wait_max_s.into());
+        }
+        if self.wait_hard_s != default.wait_hard_s {
+            object.insert("wait_hard_s".into(), self.wait_hard_s.into());
+        }
+        if self.incremental_off != default.incremental_off {
+            object.insert("incremental_off".into(), self.incremental_off.into());
+        }
+        serde_json::Value::Object(object)
+    }
+}
+
+/// The longest a build may be told to wait: a day.
+pub const MAX_LEASE_WAIT_S: u64 = 86_400;
+
+fn lenient_leases<'de, D>(deserializer: D) -> Result<HostLoadLeases, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(HostLoadLeases::from_stored(raw))
+}
+
+fn write_leases<S>(leases: &HostLoadLeases, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    leases.to_stored().serialize(serializer)
+}
+
+/// How an idle session is recognised and what is done about it. Stored as its
+/// own top-level key, `host_load_idle`, only where it differs from the
+/// default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLoadIdle {
+    /// Seconds a session must have been waiting, and its terminal quiet,
+    /// before it is called idle.
+    #[serde(default = "default_idle_after")]
+    pub idle_after_s: u64,
+    /// Seconds idle before Health offers Park for it. Nothing is parked on
+    /// its own: a park is always a person's click and a system dialog.
+    #[serde(default = "default_park_after")]
+    pub park_after_s: u64,
+}
+
+fn default_idle_after() -> u64 {
+    900
+}
+
+fn default_park_after() -> u64 {
+    3_600
+}
+
+impl Default for HostLoadIdle {
+    fn default() -> Self {
+        Self {
+            idle_after_s: default_idle_after(),
+            park_after_s: default_park_after(),
+        }
+    }
+}
+
+impl HostLoadIdle {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if !(60..=MAX_LEASE_WAIT_S).contains(&self.idle_after_s) {
+            return Some("A session is idle after at least 60 seconds and at most a day.".into());
+        }
+        if self.park_after_s < self.idle_after_s || self.park_after_s > MAX_LEASE_WAIT_S {
+            return Some("A session is parked no sooner than it is idle, and within a day.".into());
+        }
+        None
+    }
+
+    pub fn from_stored(raw: serde_json::Value) -> Self {
+        let mut idle = Self::default();
+        let Some(object) = raw.as_object() else {
+            if !raw.is_null() {
+                log::warn!(target: "tool_config", "ignoring a host_load_idle that is not an object");
+            }
+            return idle;
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            object: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            into: &mut T,
+        ) {
+            if let Some(value) = object.get(name) {
+                match serde_json::from_value(value.clone()) {
+                    Ok(read) => *into = read,
+                    Err(error) => log::warn!(
+                        target: "tool_config",
+                        "ignoring unreadable host_load_idle.{name}, keeping its default: {error}"
+                    ),
+                }
+            }
+        }
+        field(object, "idle_after_s", &mut idle.idle_after_s);
+        field(object, "park_after_s", &mut idle.park_after_s);
+        // One field at a time, as for the leases: a bad value costs only itself.
+        let default = Self::default();
+        if !(60..=MAX_LEASE_WAIT_S).contains(&idle.idle_after_s) {
+            log::warn!(target: "tool_config", "ignoring host_load_idle.idle_after_s {}: out of range", idle.idle_after_s);
+            idle.idle_after_s = default.idle_after_s;
+        }
+        if idle.park_after_s > MAX_LEASE_WAIT_S {
+            log::warn!(target: "tool_config", "ignoring host_load_idle.park_after_s {}: too long", idle.park_after_s);
+            idle.park_after_s = default.park_after_s;
+        }
+        if idle.park_after_s < idle.idle_after_s {
+            log::warn!(
+                target: "tool_config",
+                "host_load_idle.park_after_s {} is shorter than idle_after_s {}: raising it",
+                idle.park_after_s,
+                idle.idle_after_s
+            );
+            idle.park_after_s = default.park_after_s.max(idle.idle_after_s);
+        }
+        debug_assert!(idle.problem().is_none());
+        idle
+    }
+
+    pub fn to_stored(&self) -> serde_json::Value {
+        let default = Self::default();
+        let mut object = serde_json::Map::new();
+        if self.idle_after_s != default.idle_after_s {
+            object.insert("idle_after_s".into(), self.idle_after_s.into());
+        }
+        if self.park_after_s != default.park_after_s {
+            object.insert("park_after_s".into(), self.park_after_s.into());
+        }
+        serde_json::Value::Object(object)
+    }
+}
+
+fn lenient_idle<'de, D>(deserializer: D) -> Result<HostLoadIdle, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(HostLoadIdle::from_stored(raw))
+}
+
+fn write_idle<S>(idle: &HostLoadIdle, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    idle.to_stored().serialize(serializer)
+}
+
 /// The host-load sensor's kill switch (`host_load.enabled`).
 ///
 /// On unless the user turns it off. The sampler publishes the value in every
@@ -578,6 +890,14 @@ pub struct HostLoadSettings {
     /// file as `host_load_hook_mode`, for the same reason as `thresholds`.
     #[serde(default)]
     pub hook_mode: HostLoadHookMode,
+    /// How heavy builds are leased. Carried over IPC with the switches but
+    /// stored at the top level as `host_load_leases`, like `hook_mode`.
+    #[serde(default)]
+    pub leases: HostLoadLeases,
+    /// What GitPulse does about an idle session. Stored at the top level as
+    /// `host_load_idle`.
+    #[serde(default)]
+    pub idle: HostLoadIdle,
 }
 
 fn is_default_hook_mode(mode: &HostLoadHookMode) -> bool {
@@ -595,6 +915,8 @@ impl Default for HostLoadSettings {
             enabled: true,
             govern_launches: true,
             hook_mode: HostLoadHookMode::default(),
+            leases: HostLoadLeases::default(),
+            idle: HostLoadIdle::default(),
         }
     }
 }
@@ -913,6 +1235,24 @@ pub struct ToolConfig {
         skip_serializing_if = "TurnCheckpointSettings::is_default"
     )]
     pub turn_checkpoints: TurnCheckpointSettings,
+    /// How heavy builds are leased (`sysload::lease`): only the fields that
+    /// differ from their default are stored, at the top level so an older
+    /// build keeps the key.
+    #[serde(
+        default,
+        deserialize_with = "lenient_leases",
+        serialize_with = "write_leases",
+        skip_serializing_if = "HostLoadLeases::is_default"
+    )]
+    pub host_load_leases: HostLoadLeases,
+    /// What GitPulse does about an idle agent session.
+    #[serde(
+        default,
+        deserialize_with = "lenient_idle",
+        serialize_with = "write_idle",
+        skip_serializing_if = "HostLoadIdle::is_default"
+    )]
+    pub host_load_idle: HostLoadIdle,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -938,6 +1278,8 @@ impl Default for ToolConfig {
             host_load_hook_mode: HostLoadHookMode::default(),
             host_load_disk_guard: crate::sysload::DiskGuard::default(),
             turn_checkpoints: TurnCheckpointSettings::default(),
+            host_load_leases: HostLoadLeases::default(),
+            host_load_idle: HostLoadIdle::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1624,6 +1966,8 @@ pub fn host_load_settings() -> HostLoadSettings {
             HostLoadSettings {
                 thresholds,
                 hook_mode: cfg.host_load_hook_mode,
+                leases: cfg.host_load_leases,
+                idle: cfg.host_load_idle,
                 ..cfg.host_load
             }
         })
@@ -1641,6 +1985,20 @@ pub fn host_load_hook_mode() -> HostLoadHookMode {
     load()
         .map(|cfg| cfg.host_load_hook_mode)
         .unwrap_or_default()
+}
+
+/// How builds are leased, or the defaults (on, 4 slots).
+///
+/// An unreadable file is the defaults, which lease: a broken config must not
+/// be what quietly turns the build gate off. Read by the lease wrapper itself,
+/// once, after it has found a build.
+pub fn host_load_leases() -> HostLoadLeases {
+    load().map(|cfg| cfg.host_load_leases).unwrap_or_default()
+}
+
+/// What GitPulse does about an idle session, or the defaults (advise).
+pub fn host_load_idle() -> HostLoadIdle {
+    load().map(|cfg| cfg.host_load_idle).unwrap_or_default()
 }
 
 /// The stored turn-checkpoint switch. Any failure to read it is "off": a
@@ -1672,10 +2030,15 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     if let Some(problem) = next.thresholds.problem() {
         return Err(problem);
     }
+    if let Some(problem) = next.leases.problem().or_else(|| next.idle.problem()) {
+        return Err(problem);
+    }
     let mut cfg = load()?;
     cfg.host_load_thresholds = next.thresholds.clone();
     cfg.host_load_disk_guard = next.thresholds.disk_guard;
     cfg.host_load_hook_mode = next.hook_mode;
+    cfg.host_load_leases = next.leases.clone();
+    cfg.host_load_idle = next.idle.clone();
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -2138,6 +2501,167 @@ mod tests {
             // An unreadable file enforces: a broken config does not turn the guard off.
             write_raw(path, "{ not json");
             assert_eq!(host_load_hook_mode(), HostLoadHookMode::Enforce);
+        });
+    }
+
+    /// The lease and idle settings are their own top-level keys holding only
+    /// what differs, so an older build keeps them and the default is never
+    /// written (a later default change reaches a person who never chose one).
+    #[test]
+    fn the_lease_and_idle_settings_are_stored_apart_and_only_where_they_differ() {
+        with_temp_config(|path| {
+            assert_eq!(host_load_leases(), HostLoadLeases::default());
+            assert_eq!(host_load_leases().slots, 4, "the shim's own healthy count");
+            assert_eq!(host_load_idle(), HostLoadIdle::default());
+            set_host_load_settings(HostLoadSettings {
+                leases: HostLoadLeases {
+                    slots: 2,
+                    incremental_off: true,
+                    ..HostLoadLeases::default()
+                },
+                idle: HostLoadIdle {
+                    park_after_s: 7_200,
+                    ..HostLoadIdle::default()
+                },
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                stored["host_load_leases"],
+                serde_json::json!({"slots": 2, "incremental_off": true})
+            );
+            assert_eq!(
+                stored["host_load_idle"],
+                serde_json::json!({"park_after_s": 7200})
+            );
+            assert!(
+                stored.get("host_load").is_none(),
+                "the switches are untouched"
+            );
+            let loaded = host_load_settings();
+            assert_eq!((loaded.leases.slots, loaded.leases.wait_max_s), (2, 1_800));
+            assert_eq!(loaded.idle.park_after_s, 7_200);
+            assert_eq!(host_load_leases().slots, 2);
+
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load_leases").is_none());
+            assert!(stored.get("host_load_idle").is_none());
+
+            // A field that differs is the only one written: the slot count
+            // stays unwritten so a later default change still reaches this
+            // person.
+            set_host_load_settings(HostLoadSettings {
+                leases: HostLoadLeases {
+                    wait_max_s: 900,
+                    ..HostLoadLeases::default()
+                },
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                stored["host_load_leases"],
+                serde_json::json!({"wait_max_s": 900})
+            );
+        });
+    }
+
+    /// `{"mode":"off","slots":12}` must not turn leasing back on: the bad slot
+    /// count falls back alone, and the other stored fields stand.
+    #[test]
+    fn an_out_of_range_field_resets_only_itself() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_leases":{"mode":"off","slots":12,"wait_max_s":600,"incremental_off":true},
+                    "host_load_idle":{"idle_after_s":120,"park_after_s":999999}}"#,
+            );
+            let leases = host_load_leases();
+            assert_eq!(leases.mode, LeaseMode::Off, "the stored mode stands");
+            assert_eq!(leases.slots, 4, "the bad count is its default");
+            assert_eq!(leases.wait_max_s, 600);
+            assert!(leases.incremental_off);
+            let idle = host_load_idle();
+            assert_eq!(idle.idle_after_s, 120, "the stored time stands");
+            assert_eq!(idle.park_after_s, 3_600, "the bad time is its default");
+            // A pair that contradicts itself keeps the stored first value and
+            // raises the second.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load_leases":{"wait_max_s":20000,"wait_hard_s":100}}"#,
+            );
+            let leases = host_load_leases();
+            assert_eq!((leases.wait_max_s, leases.wait_hard_s), (20_000, 20_000));
+            assert_eq!(leases.problem(), None);
+        });
+    }
+
+    #[test]
+    fn a_bad_lease_or_idle_value_costs_only_itself_and_a_bad_save_is_refused() {
+        with_temp_config(|path| {
+            // One field unreadable, one out of range: each keeps its own
+            // default, and the other fields and settings in the file are
+            // untouched.
+            write_raw(
+                path,
+                r#"{"version":1,"host_load":{"enabled":false},
+                    "host_load_leases":{"slots":"many","wait_max_s":60,"incremental_off":true},
+                    "host_load_idle":{"idle_after_s":10}}"#,
+            );
+            let leases = host_load_leases();
+            assert_eq!(leases.slots, 4, "unreadable: its default");
+            assert_eq!(leases.wait_max_s, 60, "the good fields stand");
+            assert!(leases.incremental_off);
+            assert_eq!(
+                host_load_idle(),
+                HostLoadIdle::default(),
+                "the one bad field falls back to its default"
+            );
+            assert!(!host_load_settings().enabled);
+            write_raw(path, r#"{"version":1,"host_load_leases":[1,2]}"#);
+            assert_eq!(host_load_leases(), HostLoadLeases::default());
+            // An unreadable file leases: a broken config is not an off switch.
+            write_raw(path, "{ not json");
+            assert_eq!(host_load_leases().mode, LeaseMode::On);
+
+            for bad in [
+                HostLoadLeases {
+                    slots: 0,
+                    ..HostLoadLeases::default()
+                },
+                HostLoadLeases {
+                    slots: 9,
+                    ..HostLoadLeases::default()
+                },
+                HostLoadLeases {
+                    wait_max_s: 100,
+                    wait_hard_s: 50,
+                    ..HostLoadLeases::default()
+                },
+            ] {
+                let error = set_host_load_settings(HostLoadSettings {
+                    leases: bad,
+                    ..HostLoadSettings::default()
+                })
+                .unwrap_err();
+                assert!(!error.is_empty());
+            }
+            assert!(set_host_load_settings(HostLoadSettings {
+                idle: HostLoadIdle {
+                    idle_after_s: 600,
+                    park_after_s: 300,
+                },
+                ..HostLoadSettings::default()
+            })
+            .is_err());
         });
     }
 

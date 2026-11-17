@@ -461,3 +461,105 @@ fn the_underscore_spelling_of_instrument_coverage_counts_and_rustup_run_options_
     );
     assert_eq!(heavy("rustup run --install nightly rustc -V"), None);
 }
+
+#[test]
+fn cargo_install_rustc_miri_are_heavy() {
+    // The verbs the slot-gate shim has always gated and this table lacked:
+    // each one compiles a crate graph, so each one is a build.
+    for (command, label) in [
+        ("cargo install --path .", "cargo install"),
+        ("cargo rustc --release -- --emit asm", "cargo rustc"),
+        ("cargo rustdoc", "cargo rustdoc"),
+        ("cargo fix --allow-dirty", "cargo fix"),
+        ("cargo miri test", "cargo miri"),
+        ("cargo mutants", "cargo mutants"),
+        ("cargo fuzz run target", "cargo fuzz"),
+        ("cargo d", "cargo d"),
+        (
+            "cargo --manifest-path src-tauri/Cargo.toml test",
+            "cargo test",
+        ),
+        ("cargo --target-dir /tmp/t build", "cargo build"),
+        ("cargo --color never check", "cargo check"),
+    ] {
+        assert_eq!(heavy(command).as_deref(), Some(label), "{command}");
+    }
+}
+
+#[test]
+fn cargo_run_and_clean_are_never_leased() {
+    // `run` can start a server that never exits: it would hold a slot forever.
+    // The rest build nothing.
+    for (program, args) in [
+        ("cargo", vec!["run"]),
+        ("cargo", vec!["r", "--release"]),
+        ("cargo", vec!["clean"]),
+        ("cargo", vec!["fmt", "--check"]),
+        ("cargo", vec!["metadata", "--format-version", "1"]),
+        ("cargo", vec!["tree"]),
+        ("cargo", vec!["--version"]),
+        ("cargo", vec!["help", "test"]),
+        ("cargo", vec![]),
+        ("go", vec!["run", "main.go"]),
+        ("go", vec!["env", "GOPATH"]),
+        ("go", vec!["mod", "tidy"]),
+        ("go", vec!["version"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(!leased(program, &args), "{program} {args:?} must not lease");
+    }
+}
+
+#[test]
+fn a_build_by_argv_is_leased_whatever_path_named_the_program() {
+    for (program, args) in [
+        ("cargo", vec!["build", "--release"]),
+        ("/Users/x/.cargo/bin/cargo", vec!["+nightly", "test"]),
+        ("cargo", vec!["--manifest-path", "a/Cargo.toml", "clippy"]),
+        ("cargo", vec!["install", "--path", "."]),
+        ("go", vec!["test", "./..."]),
+        ("go", vec!["-C", "sub", "build"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(leased(program, &args), "{program} {args:?} must lease");
+    }
+    // Heavy, but not a lease row: a package script is not something this
+    // wrapper is installed in front of, and a test runner has no slot.
+    for (program, args) in [("npm", vec!["test"]), ("vitest", vec!["run"])] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(
+            classify_argv(program, &args).heavy.is_some(),
+            "{program} stays heavy"
+        );
+        assert!(!leased(program, &args), "{program} has no lease row");
+    }
+}
+
+#[test]
+fn llvm_cov_report_clean_and_show_env_and_help_only_calls_are_never_leased() {
+    // The owner's shim lets these straight through: they build nothing, and a
+    // clean has to work on a full disk.
+    for (program, args) in [
+        ("cargo", vec!["llvm-cov", "report"]),
+        (
+            "cargo",
+            vec!["+nightly", "llvm-cov", "clean", "--workspace"],
+        ),
+        ("cargo", vec!["llvm-cov", "show-env"]),
+        ("cargo", vec!["build", "--help"]),
+        ("cargo", vec!["test", "-h"]),
+        ("go", vec!["build", "-h"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(!leased(program, &args), "{program} {args:?} must not lease");
+    }
+    // A coverage run and a help flag meant for the test binary still build.
+    for (program, args) in [
+        ("cargo", vec!["llvm-cov", "--workspace"]),
+        ("cargo", vec!["llvm-cov", "nextest"]),
+        ("cargo", vec!["test", "--", "--help"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(leased(program, &args), "{program} {args:?} must lease");
+    }
+}

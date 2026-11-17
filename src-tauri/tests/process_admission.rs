@@ -227,6 +227,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("agent_notify_socket.rs", "subprocess-only: the socket protocol against built binaries; alerts::bridge parsers"),
     ("ai_transport_integration.rs", "no git spawn: ai::http URL parsing"),
     ("browser_pane_isolation.rs", "no git spawn: a webview in a native window against a loopback test server"),
+    ("build_leases.rs", "subprocess-only: drives gitpulse-hook as the build-lease wrapper against a fake cargo; the library supplies the sysload snapshot writer and types and LockedSpawn, and nothing here reaches the metered git gate"),
     ("cli_io_process.rs", "subprocess-only: drives built binaries; hooks and mcp parsers"),
     ("codeintel_real_store.rs", "no git spawn: codeintel reads a store; validate_repo only reads the filesystem"),
     ("command_rendering_integration.rs", "no git spawn: harness::render_command renders text"),

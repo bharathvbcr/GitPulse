@@ -10,6 +10,24 @@
 use crate::procguard::LockedSpawn;
 pub(crate) mod env;
 
+/// Writes an executable stand-in for `gitpulse-hook` at `path` that answers
+/// `--version` the way a build with lease mode does, for tests of the
+/// `lease-bin` links, which only link to a binary that says it is a lease
+/// wrapper. Written to a temporary name and renamed into place, so nothing
+/// runs a half-written file.
+#[cfg(unix)]
+pub(crate) fn fake_lease_hook(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let body = "#!/bin/sh\n\
+        if [ \"$1\" = --version ]; then\n\
+        printf 'gitpulse-hook 0.0.0-test\\nsubcommands: collision-guard, command-gate, lease\\n'\n\
+        fi\n";
+    let tmp = path.with_extension("tmp-hook");
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

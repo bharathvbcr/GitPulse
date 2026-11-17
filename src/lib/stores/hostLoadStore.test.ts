@@ -6,6 +6,8 @@ import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
+  DEFAULT_IDLE,
+  DEFAULT_LEASES,
   DEFAULT_THRESHOLDS,
   thresholdsAreDefault,
   ensureHostLoadSettings,
@@ -15,6 +17,9 @@ import {
   HOST_LOAD_PULSE_EVENT,
   hostLoadPulse,
   hostPressure,
+  loadIdleReport,
+  loadLeaseStatus,
+  parkSession,
   pulseOf,
   refreshHostLoad,
   resetHostLoadForTests,
@@ -136,32 +141,32 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS };
     vi.mocked(invoke).mockResolvedValue(stored);
     await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
     expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
   });
 
   it("saves one row's change on top of the latest settings, not a stale copy", async () => {
-    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS };
     vi.mocked(invoke).mockResolvedValueOnce(first);
     await ensureHostLoadSettings();
     // A row saves a new swap rule; the store takes what the backend returns.
     const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
-    await updateHostLoadSettings({ thresholds: { ...DEFAULT_THRESHOLDS, swap } });
+    await updateHostLoadSettings({ leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap } });
     // A toggle elsewhere carries only its own change: the swap edit survives.
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
     await updateHostLoadSettings({ govern_launches: false });
     expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", thresholds: { ...DEFAULT_THRESHOLDS, swap } },
+      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap } },
     });
     expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
   });
 
   it("saves the command gate's mode on top of the latest settings, and defaults to enforcing", async () => {
     expect(DEFAULT_HOST_LOAD_SETTINGS.hook_mode).toBe("enforce");
-    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS };
     vi.mocked(invoke).mockResolvedValueOnce(first);
     await ensureHostLoadSettings();
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
@@ -174,7 +179,7 @@ describe("hostLoadStore", () => {
 
   it("reads the settings once however many rows ask at the same time", async () => {
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, hook_mode: "enforce", thresholds: DEFAULT_THRESHOLDS });
+    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS });
     await Promise.all([ensureHostLoadSettings(), ensureHostLoadSettings(), ensureHostLoadSettings()]);
     expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings")).toHaveLength(1);
   });
@@ -323,6 +328,32 @@ describe("hostLoadStore", () => {
     vi.mocked(invoke).mockRejectedValue(new Error("backend down"));
     await expect(refreshHostLoad()).rejects.toThrow("backend down");
     expect(get(hostPressure)).toBe("unavailable");
+  });
+
+  it("reads build slots and idle sessions from their own commands and parks by terminal session id", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_host_load_leases") return { on: true, holders: [] } as never;
+      if (cmd === "cmd_host_load_idle") return { sessions: [], idle: 0 } as never;
+      if (cmd === "cmd_host_load_park") return "Parked." as never;
+      return undefined as never;
+    });
+    expect(await loadLeaseStatus()).toMatchObject({ on: true });
+    expect(await loadIdleReport()).toMatchObject({ idle: 0 });
+    expect(await parkSession("term-1")).toBe("Parked.");
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_park", { sessionId: "term-1" });
+    // The terminal pill asks for the queue alone: no process-table read.
+    await loadLeaseStatus(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: true });
+    await loadLeaseStatus();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: false });
+  });
+
+  it("does not swallow a refused park: a No or a changed session rejects", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_host_load_park") throw new Error("not confirmed");
+      return undefined as never;
+    });
+    await expect(parkSession("term-1")).rejects.toThrow("not confirmed");
   });
 
   it("keeps the automatic disk floors on a round trip that never touched them", async () => {

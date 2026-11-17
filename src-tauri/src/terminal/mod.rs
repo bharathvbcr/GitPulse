@@ -479,6 +479,17 @@ struct SessionEntry {
     child_launcher: Option<String>,
     child_title: Option<String>,
     token_hash_hex: Option<String>,
+    /// [`clock_ms`] when the reader last got output from the child: the
+    /// session's own clock for "this terminal has been quiet for".
+    last_output_ms: Arc<AtomicU64>,
+}
+
+/// Milliseconds on a clock that only this process reads, from its first use:
+/// a session's quiet time is a difference of two readings, so no wall clock
+/// (which can step) is involved.
+fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Which backend holds the terminals, as Settings and the quit dialog read it.
@@ -2585,6 +2596,12 @@ pub struct TerminalListing {
     /// Parent terminal session id when spawned via Option A child orchestration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Milliseconds since the session's child last wrote output (or since it
+    /// started, if it never has). `None` when the engine holding the session
+    /// cannot say (an older terminal host), which a reader must never treat as
+    /// "quiet".
+    #[serde(default)]
+    pub quiet_ms: Option<u64>,
 }
 
 /// Every session the terminal host (or non-Unix engine) still owns, live or
@@ -2619,6 +2636,7 @@ pub(in crate::terminal) fn engine_list_sessions(
             // listed, so it reads as detached.
             detached: s.flow.is_detached() || s.dead.load(Ordering::Acquire),
             parent_session_id: s.parent_session_id.clone(),
+            quiet_ms: Some(clock_ms().saturating_sub(s.last_output_ms.load(Ordering::Relaxed))),
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3365,6 +3383,23 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
             None => cmd.env_remove(name),
         }
     }
+    // An agent CLI's builds go through the build-lease wrapper: its PATH
+    // starts with the app's `lease-bin` links. A plain shell tab is a person's
+    // own and is not gated.
+    if launcher_kind(&resolved).is_some() {
+        let existing = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+        let enabled =
+            crate::tool_config::host_load_leases().mode == crate::tool_config::LeaseMode::On;
+        let config = crate::tool_config::default_config_dir();
+        for (name, value) in
+            crate::sysload::lease::launch_env(config.as_deref(), existing.as_deref(), enabled)
+        {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            }
+        }
+    }
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
@@ -3429,6 +3464,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
         .telemetry_for(&session_id)
         .unwrap_or_else(new_shared_telemetry);
     let (input, geometry) = session_lanes();
+    let last_output_ms = Arc::new(AtomicU64::new(clock_ms()));
     let writer_arc = Arc::new(Mutex::new(writer));
     let probe_lane = input.clone();
     let probe_writer = writer_arc.clone();
@@ -3461,6 +3497,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
         child_launcher,
         child_title,
         token_hash_hex,
+        last_output_ms: last_output_ms.clone(),
     };
 
     {
@@ -3676,6 +3713,7 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
                         break;
                     }
                     Ok(n) => {
+                        last_output_ms.store(clock_ms(), Ordering::Relaxed);
                         // Read before the liveness check below: a session being
                         // torn down can still be asking for attention, and this
                         // costs one pass over bytes already in cache.

@@ -173,6 +173,8 @@ export interface AgentSession {
    * session above it that the scan could see", not "started by a person".
    */
   parent_pid: number | null;
+  /** CPU nanoseconds per second since the previous tick; a full core is 1e9. */
+  cpu_rate: Reading<number>;
   footprint: Reading<number>;
   /**
    * Bytes per second the session's own process and its attached descendants
@@ -193,6 +195,7 @@ export interface LaunchedTree {
   unreadable_members: number;
   footprint: Reading<number>;
   write_rate: Reading<number>;
+  cpu_rate: Reading<number>;
 }
 
 export interface ForeignProcess {
@@ -512,6 +515,24 @@ export interface Thresholds {
 /** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
 export type HostLoadHookMode = "enforce" | "advise" | "off";
 
+/** `tool_config::LeaseMode`. */
+export type LeaseMode = "on" | "off";
+
+/** `tool_config::HostLoadLeases`: how heavy builds are leased. Stored as `host_load_leases`. */
+export interface HostLoadLeases {
+  mode: LeaseMode;
+  slots: number;
+  wait_max_s: number;
+  wait_hard_s: number;
+  incremental_off: boolean;
+}
+
+/** `tool_config::HostLoadIdle`: when a session counts as idle and when Health offers Park. Stored as `host_load_idle`. */
+export interface HostLoadIdle {
+  idle_after_s: number;
+  park_after_s: number;
+}
+
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
@@ -519,7 +540,21 @@ export interface HostLoadSettings {
   /** Stored as the top-level `host_load_hook_mode`, never inside `host_load`. */
   hook_mode: HostLoadHookMode;
   thresholds: Thresholds;
+  leases: HostLoadLeases;
+  idle: HostLoadIdle;
 }
+
+/** Mirrors `HostLoadLeases::default` in Rust. */
+export const DEFAULT_LEASES: HostLoadLeases = {
+  mode: "on",
+  slots: 4,
+  wait_max_s: 1800,
+  wait_hard_s: 14400,
+  incremental_off: false,
+};
+
+/** Mirrors `HostLoadIdle::default` in Rust. */
+export const DEFAULT_IDLE: HostLoadIdle = { idle_after_s: 900, park_after_s: 3600 };
 
 /**
  * Mirrors `Thresholds::default` in Rust. Provisional: each default was set
@@ -692,12 +727,128 @@ export async function admitAnyway(): Promise<string> {
   return message;
 }
 
+/** `sysload::lease::Record`: what a slot or a ticket says about its build. */
+/** `sysload::lease::Priority`: terminals first, then task runs, then sessions only observed. */
+export type Priority = "terminal" | "run" | "observed";
+
+export interface LeaseRecord {
+  pid: number;
+  start_us: number;
+  session_key: string;
+  priority: Priority;
+  terminal_session: string | null;
+  run_id: string | null;
+  cwd: string;
+  label: string;
+  enqueued_mono_ns: number;
+  granted_mono_ns: number | null;
+  tier_at_grant: Tier | null;
+  verdict_unavailable_reason: string | null;
+  overflow: boolean;
+}
+
+export interface LeaseHolder {
+  slot: number;
+  pid: number;
+  /** Null is a lock with no readable record of whose it is. */
+  record: LeaseRecord | null;
+}
+
+export interface LeaseWaiter {
+  name: string;
+  record: LeaseRecord;
+}
+
+/** `sysload::lease::Capacity`. */
+export interface LeaseCapacity {
+  configured: number;
+  slots: number;
+  refuses: boolean;
+  tier: Tier | null;
+  note: string | null;
+}
+
+/** `sysload::lease::Status`: every field that could not be read says why instead of reading zero. */
+export interface LeaseStatus {
+  on: boolean;
+  configured: number;
+  capacity: LeaseCapacity;
+  holders: LeaseHolder[];
+  queue: LeaseWaiter[];
+  unreadable: string[];
+  error: string | null;
+  links_missing: string | null;
+  misses: number | null;
+  /** The marker directory held more than one read looks at: `misses` is a floor. */
+  misses_truncated: boolean;
+  misses_error: string | null;
+  unleased_running: number | null;
+  unleased_error: string | null;
+  now_mono_ns: number;
+}
+
+/**
+ * Reads the build leases; never writes. `queueOnly` skips the process-table
+ * read and the miss count (what the terminal pill needs is the queue), and
+ * the fields it skipped say so instead of reading zero.
+ */
+export function loadLeaseStatus(queueOnly = false): Promise<LeaseStatus | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  return invoke<LeaseStatus>("cmd_host_load_leases", { queueOnly });
+}
+
+/** `sysload::activity::SessionActivity`. */
+export type SessionActivity =
+  | { state: "busy"; why: string }
+  | { state: "idle"; since_ms: number; why: string }
+  | { state: "unknown"; why: string };
+
+export interface IdleSession {
+  terminal_session: string | null;
+  kind: AgentKind;
+  pid: number;
+  start_us: number;
+  cwd: string | null;
+  footprint: Reading<number>;
+  activity: SessionActivity;
+  /** Why it cannot be parked, or null when it can. */
+  park_blocked: string | null;
+}
+
+/** `sysload::activity::Report`. */
+export interface IdleReport {
+  sessions: IdleSession[];
+  idle: number;
+  unknown: number;
+  idle_after_s: number;
+  park_after_s: number;
+  error: string | null;
+}
+
+export function loadIdleReport(): Promise<IdleReport | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  return invoke<IdleReport>("cmd_host_load_idle");
+}
+
+/**
+ * A person's "Park" on one idle session. The backend checks it again, asks in a
+ * native dialog that page script cannot answer, and checks once more; a No or
+ * a changed session rejects, so a caller must not retry on a rejection.
+ */
+export async function parkSession(terminalSession: string): Promise<string> {
+  const message = await invoke<string>("cmd_host_load_park", { sessionId: terminalSession });
+  refreshAfterChange();
+  return message;
+}
+
 /** Mirrors `HostLoadSettings::default` in Rust: on. */
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
   hook_mode: "enforce",
   thresholds: DEFAULT_THRESHOLDS,
+  leases: DEFAULT_LEASES,
+  idle: DEFAULT_IDLE,
 };
 
 /**

@@ -20,7 +20,7 @@ import { terminalLaunchRequests } from "../src/lib/terminal/launchRequests";
 import { PROVIDER_LABELS } from "../src/lib/workbench/taskHandoff";
 import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
-import { hostLoadStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
+import { hostLoadStatusFixture, idleReportFixture, leaseStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
 import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
@@ -560,6 +560,8 @@ export async function runHostLoadChecks(ctx) {
   const card = () => section("host-load");
   const show = async status => {
     knobs.hostLoad = () => status;
+    knobs.hostLoadLeases = () => leaseStatusFixture();
+    knobs.hostLoadIdle = () => idleReportFixture();
     await refreshHostLoad();
     await tick();
     await wait(120);
@@ -626,6 +628,17 @@ export async function runHostLoadChecks(ctx) {
         && previous().querySelector("tbody") === null && !has(previous(), "Swap used, at most")
         && previous().querySelector("p.text-warn") !== null);
 
+    // Build slots and idle sessions read their own commands, and a count
+    // that was read says so.
+    await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
+    await until(() => !!root.querySelector('[data-testid="host-load-lease-capacity"]'));
+    check("the Build slots block states the effective slot count", () =>
+      has(root.querySelector('[data-testid="host-load-lease-capacity"]'), "4 of 4 build slots may run."));
+    check("a clean lease read says no build ran unleased and none holds no slot", () =>
+      has(root.querySelector('[data-testid="host-load-lease-misses"]'), "No build ran without a lease")
+      && has(root.querySelector('[data-testid="host-load-lease-unleased"]'), "Every running heavy build holds a slot"));
+    check("the Idle sessions summary says how many sessions are not known either way", () =>
+      has(root.querySelector('[data-testid="host-load-idle-summary"]'), "0 idle for 15 min or more, 0 not known either way"));
     // And back to none: the block goes.
     await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
     check("returning to no previous boot removes the block", () => !previous());
@@ -659,5 +672,7 @@ export async function runHostLoadChecks(ctx) {
     check("when nobody writes above the threshold no session is named", () => !fastest());
   } finally {
     knobs.hostLoad = null;
+    knobs.hostLoadLeases = null;
+    knobs.hostLoadIdle = null;
   }
 }

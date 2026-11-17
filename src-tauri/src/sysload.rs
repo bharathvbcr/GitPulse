@@ -37,10 +37,12 @@
 //! been verified on a real Linux host. Windows reports unavailable. See
 //! [`Platform`].
 
+pub mod activity;
 mod disk;
 mod diskrate;
 mod exec_probe;
 mod governor;
+pub mod lease;
 mod probe;
 pub(crate) mod procscan;
 mod sampler;

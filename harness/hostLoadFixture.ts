@@ -1,4 +1,4 @@
-import type { HostLoadSettings, HostLoadStatus, PreviousBoot, ProcView, Reading, TracePeaks, TraceRecord } from "../src/lib/stores/hostLoadStore";
+import type { HostLoadSettings, HostLoadStatus, IdleReport, LeaseStatus, PreviousBoot, ProcView, Reading, TracePeaks, TraceRecord } from "../src/lib/stores/hostLoadStore";
 
 /**
  * What `cmd_host_load_status` returns on a calm Mac where another GitPulse
@@ -102,6 +102,8 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
     enabled: true,
     govern_launches: true,
     hook_mode: "enforce",
+    leases: { mode: "on", slots: 4, wait_max_s: 1800, wait_hard_s: 14400, incremental_off: false },
+    idle: { idle_after_s: 900, park_after_s: 3600 },
     thresholds: {
       swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
       compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },
@@ -117,6 +119,34 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
       },
     },
   };
+}
+
+/**
+ * `cmd_host_load_leases` on a calm Mac with nothing building: every count
+ * read, none held, none waiting.
+ */
+export function leaseStatusFixture(): LeaseStatus {
+  return {
+    on: true,
+    configured: 4,
+    capacity: { configured: 4, slots: 4, refuses: false, tier: "clear", note: null },
+    holders: [],
+    queue: [],
+    unreadable: [],
+    error: null,
+    links_missing: null,
+    misses: 0,
+    misses_truncated: false,
+    misses_error: null,
+    unleased_running: 0,
+    unleased_error: null,
+    now_mono_ns: 5_000_000_000_000,
+  };
+}
+
+/** `cmd_host_load_idle` with no agent session running. */
+export function idleReportFixture(): IdleReport {
+  return { sessions: [], idle: 0, unknown: 0, idle_after_s: 900, park_after_s: 3600, error: null };
 }
 
 const GIB = 2 ** 30;
@@ -169,6 +199,7 @@ export function procViewFixture(rates: [Reading<number>, Reading<number>, Readin
     tree,
     run_id: null,
     parent_pid: null,
+    cpu_rate: value(0),
     footprint: value(600 << 20),
     write_rate: rate,
     members: 3,

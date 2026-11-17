@@ -9,6 +9,7 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { portal } from "../dom/portal";
   import { invoke } from "../ipc/invoke";
+  import { loadLeaseStatus, type LeaseWaiter } from "../stores/hostLoadStore";
   import { isTauri } from "../platform";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { CONTEXT_READ_MS } from "../terminal/inputQueue";
@@ -34,6 +35,8 @@
   let pillEl = $state<HTMLButtonElement | null>(null);
   let menuEl = $state<HTMLDivElement | null>(null);
   let activity = $state<Record<string, TerminalContext | null>>({});
+  /** Builds waiting for a slot, read with the host contexts; empty when it could not be read. */
+  let buildQueue = $state<LeaseWaiter[]>([]);
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
 
   let pillSessions = $derived(
@@ -53,6 +56,7 @@
       open: $repoStore.terminalOpen,
       repoPath: $repoStore.currentPath,
       activity,
+      buildQueue,
     }),
   );
   let pillLabel = $derived.by(() => {
@@ -235,6 +239,13 @@
       let cancelled = false;
       void (async () => {
         const next: Record<string, TerminalContext | null> = {};
+        try {
+          const leases = await loadLeaseStatus(true);
+          if (!cancelled) buildQueue = leases?.queue ?? [];
+        } catch {
+          // An unread queue says nothing: no session is called queued on a guess.
+          if (!cancelled) buildQueue = [];
+        }
         for (const session of targets) {
           if (cancelled) return;
           try {

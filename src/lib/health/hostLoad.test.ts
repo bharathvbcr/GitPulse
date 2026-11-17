@@ -396,6 +396,7 @@ describe("fastestWriter", () => {
     tree: null,
     run_id: null,
     parent_pid: null,
+    cpu_rate: { status: "value", value: 0 },
     footprint: { status: "value", value: 1 },
     write_rate,
     members: 1,

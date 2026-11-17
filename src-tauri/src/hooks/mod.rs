@@ -49,6 +49,15 @@ use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 pub mod advisory_once;
 pub mod deliver;
 mod heavy_commands;
+#[cfg(unix)]
+pub mod lease_wrapper;
+
+/// Whether `program args` is a build that takes a build slot: the one reading
+/// of the heavy table (`heavy_commands::leased`) the lease wrapper acts on and
+/// Health counts unleased builds by.
+pub(crate) fn build_is_leased(program: &str, args: &[String]) -> bool {
+    heavy_commands::leased(program, args)
+}
 mod load_gate;
 pub(crate) mod notify_drops;
 mod notify_input;
@@ -3657,12 +3666,23 @@ fn run_session_brief_with(
         ));
     };
     report_agent_session_meta(&here, input);
+    let load_line = load_gate::brief_line_live();
+    #[cfg(unix)]
+    let load_line = {
+        let route = lease_wrapper::route_session(
+            &input.session_id,
+            std::env::var_os("CLAUDE_ENV_FILE").as_deref(),
+            crate::tool_config::default_config_dir().as_deref(),
+            std::env::var_os(lease_wrapper::BIN_ENV).is_some(),
+        );
+        format!("{load_line}; {}", route.describe())
+    };
     let brief = session_brief_with(
         &snapshot,
         &here,
         &input.source,
         app_age_ms,
-        Some(&load_gate::brief_line_live()),
+        Some(&load_line),
     );
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
@@ -3904,11 +3924,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// source-only contract test cannot see, because it reads the source rather
 /// than whatever executable a host will actually spawn.
 pub fn identity() -> String {
+    let served: Vec<&str> = SUBCOMMANDS.iter().chain(&BINARY_MODES).copied().collect();
     format!(
         "gitpulse-hook {VERSION}\nsubcommands: {}\n",
-        SUBCOMMANDS.join(", ")
+        served.join(", ")
     )
 }
+
+/// What this binary does besides answer a hook: it is the build-lease wrapper
+/// (`gitpulse-hook lease -- cargo build`, `lease_wrapper`). Advertised on the
+/// `--version` line so `mcp:doctor` can tell a binary that has it from an older
+/// one, but not a hook subcommand: no host sends it and `dispatch` refuses it.
+pub const BINARY_MODES: [&str; 1] = ["lease"];
 
 /// Routes one parsed payload to its handler.
 ///
@@ -10676,8 +10703,14 @@ done
             .expect("the subcommand line keeps its prefix");
         let served: Vec<&str> = listed.split(", ").collect();
         // Derived from SUBCOMMANDS rather than spelled out, so a hook added to
-        // the dispatcher is advertised without anyone editing this test.
-        assert_eq!(served, SUBCOMMANDS.to_vec());
+        // the dispatcher is advertised without anyone editing this test. The
+        // binary's own modes follow the hooks.
+        let mut expected = SUBCOMMANDS.to_vec();
+        expected.extend(BINARY_MODES);
+        assert_eq!(served, expected);
+        assert!(served.contains(&"lease"), "the lease wrapper is advertised");
+        #[cfg(unix)]
+        assert_eq!(BINARY_MODES, [lease_wrapper::SUBCOMMAND]);
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 

@@ -270,6 +270,78 @@ pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, Ip
     off_thread(|| Ok(crate::sysload::status())).await
 }
 
+/// The build leases as Health shows them: who holds each slot, who waits, how
+/// many may run and why, builds that ran unleased, and heavy builds running
+/// with no slot. Read-only: nothing here takes, frees or moves a slot.
+#[tauri::command(async)]
+pub async fn cmd_host_load_leases(
+    queue_only: Option<bool>,
+) -> Result<crate::sysload::lease::LeaseStatus, IpcError> {
+    // A caller that only wants the queue (the terminal pill) skips the process
+    // table and the marker directory; what it did not read says so.
+    let full = !queue_only.unwrap_or(false);
+    off_thread(move || {
+        let report = crate::sysload::governor_report();
+        let verdict = &report.verdict;
+        let load = if verdict.sensor.governs() {
+            crate::sysload::lease::Load::Verdict(crate::sysload::PublishedVerdict::of(verdict))
+        } else {
+            crate::sysload::lease::Load::Unknown(verdict.message.clone())
+        };
+        #[cfg(unix)]
+        let misses = if full {
+            crate::hooks::lease_wrapper::misses()
+        } else {
+            Err("not read: this was a queue-only read".to_string())
+        };
+        #[cfg(not(unix))]
+        let misses = Err("build leases are not supported on this platform".to_string());
+        Ok(crate::sysload::lease::status(
+            crate::tool_config::default_config_dir().as_deref(),
+            &crate::tool_config::host_load_leases(),
+            &load,
+            misses,
+            full,
+        ))
+    })
+    .await
+}
+
+/// Which agent sessions are idle, and why each other one is not
+/// (`sysload::activity`). Read-only.
+#[tauri::command(async)]
+pub async fn cmd_host_load_idle(
+    state: tauri::State<'_, crate::terminal::TerminalSessions>,
+) -> Result<crate::sysload::activity::IdleReport, IpcError> {
+    let sessions = state.inner().clone();
+    off_thread(move || Ok(crate::sysload::activity::report(&sessions))).await
+}
+
+/// Parks one idle session a person chose in Health: after a Yes in a native
+/// dialog that page script cannot click, its terminal is closed and its
+/// conversation is offered for reopening. Everything is checked again after the
+/// dialog. Click-only: there is no agent path to this.
+#[tauri::command(async)]
+pub async fn cmd_host_load_park(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+) -> Result<String, IpcError> {
+    let sessions = state.inner().clone();
+    let ledger = sessions.session_ledger().clone();
+    let message = off_thread(move || {
+        crate::sysload::activity::park_session(
+            &sessions,
+            &session_id,
+            &crate::desktop::confirm::native,
+        )
+        .map_err(CommandError::from)
+    })
+    .await?;
+    ledger.emit_view(&app);
+    Ok(message)
+}
+
 /// Sends SIGTERM to a foreign orphan Health listed, after the person clicked
 /// Terminate on it and then answered Yes in a native dialog the webview cannot
 /// click. Every condition is re-checked on the live process before and after
