@@ -825,21 +825,34 @@ export function appConfigDir({ home = homedir(), platform = process.platform, xd
  * ahead, such as the owner's own slot-gate shim, shadows it), so `resolved` is
  * what such a shell finds for `cargo` with the folder put first.
  *
- *   gated      the shell finds the wrapper's link first
+ *   gated      the link's target answers `--version` as a lease wrapper, and
+ *              the shell finds the link first
+ *   stale      the link's target answered, and is not a lease wrapper: an
+ *              older gitpulse-hook run as `cargo build` exits 0 having built
+ *              nothing, so every build through it "passes"
  *   shadowed   it finds another cargo first (named): builds are not leased
  *   absent     the app has not made the link (not running, or never installed)
- *   unverifiable  the shell could not be asked
+ *   unverifiable  the link's target or the shell could not be asked
  *
  * Only `gated` is a pass. `absent` is a note that this half did not run, as
- * for the plugin cache; `shadowed` and `unverifiable` fail.
+ * for the plugin cache; `stale`, `shadowed` and `unverifiable` fail.
  *
- * @param {{ binDir: string, linkTarget: string | null, resolved: string | null, error: string | null }} observed
- * @returns {{ status: "gated" | "shadowed" | "absent" | "unverifiable", detail: string }}
+ * @param {{ binDir: string, linkTarget: string | null, servesLease?: boolean | null, targetIdentity?: string | null, resolved: string | null, error: string | null }} observed
+ * @returns {{ status: "gated" | "stale" | "shadowed" | "absent" | "unverifiable", detail: string }}
  */
-export function classifyLease({ binDir, linkTarget, resolved, error }) {
+export function classifyLease({ binDir, linkTarget, servesLease = null, targetIdentity = null, resolved, error }) {
   const link = path.join(binDir, "cargo");
   if (linkTarget === null) {
     return { status: "absent", detail: `${link} does not exist: GitPulse has not made its lease links, so builds are not leased` };
+  }
+  if (servesLease === false) {
+    return {
+      status: "stale",
+      detail: `${link} points at ${linkTarget}, which is not a build-lease wrapper (its --version says ${targetIdentity ? JSON.stringify(targetIdentity) : "nothing"}): run as cargo it exits 0 without building. Restart a current GitPulse so it removes the link, or delete ${binDir}`,
+    };
+  }
+  if (servesLease !== true) {
+    return { status: "unverifiable", detail: `could not ask ${linkTarget} whether it is a build-lease wrapper${targetIdentity ? ` (${targetIdentity})` : ""}` };
   }
   if (resolved === null) {
     return { status: "unverifiable", detail: `could not ask a login shell which cargo it runs${error ? ` (${error})` : ""}` };
@@ -867,7 +880,28 @@ export function probeLease(binDir, { shell = process.env.SHELL || "/bin/zsh", ti
   } catch {
     linkTarget = null;
   }
-  if (linkTarget === null) return { binDir, linkTarget, resolved: null, error: null };
+  if (linkTarget === null) return { binDir, linkTarget, servesLease: null, targetIdentity: null, resolved: null, error: null };
+  // The link resolving is not enough: the binary behind it must be a lease
+  // wrapper, or `cargo build` through it is a silent exit 0. Asked by its own
+  // path, so it answers as gitpulse-hook rather than as cargo.
+  const identity = spawnSync(linkTarget, ["--version"], {
+    encoding: "utf8",
+    timeout: Math.min(timeoutMs, 10_000),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  /** @type {boolean | null} */
+  let servesLease = null;
+  /** @type {string | null} */
+  let targetIdentity = null;
+  if (identity.error || identity.status !== 0) {
+    targetIdentity = identity.error?.message ?? `exit ${identity.status}`;
+  } else {
+    const firstLine = (identity.stdout ?? "").trim().split("\n")[0] ?? "";
+    targetIdentity = firstLine === "" ? null : firstLine.slice(0, 120);
+    const { version, subcommands } = parseHookIdentity(identity.stdout ?? "");
+    servesLease = version !== null && subcommands !== null && subcommands.includes("lease");
+  }
+  if (servesLease !== true) return { binDir, linkTarget, servesLease, targetIdentity, resolved: null, error: null };
   const asked = spawnSync(shell, ["-lc", "command -v cargo"], {
     env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
     encoding: "utf8",
@@ -875,13 +909,13 @@ export function probeLease(binDir, { shell = process.env.SHELL || "/bin/zsh", ti
   });
   const out = (asked.stdout ?? "").trim().split("\n").pop() ?? "";
   if (asked.error || asked.status !== 0 || out === "") {
-    return { binDir, linkTarget, resolved: null, error: asked.error?.message ?? `exit ${asked.status}` };
+    return { binDir, linkTarget, servesLease, targetIdentity, resolved: null, error: asked.error?.message ?? `exit ${asked.status}` };
   }
-  return { binDir, linkTarget, resolved: out, error: null };
+  return { binDir, linkTarget, servesLease, targetIdentity, resolved: out, error: null };
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] } }} result
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] }, lease?: { status: string, detail: string, resolved: string | null, ok: boolean } }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
@@ -1030,7 +1064,7 @@ export function usage() {
       { flag: "--json", description: "print the result as JSON" },
       { flag: "--help, -h", description: "print this message and exit 0" },
     ],
-    exits: "0 the installed server matches · 1 absent, stale, unresponsive, unverifiable, the installed plugin cache has drifted, or a login shell would not run the lease wrapper for cargo · 2 the check could not run",
+    exits: "0 the installed server matches · 1 absent, stale, unresponsive, unverifiable, the installed plugin cache has drifted, or cargo would not run a working lease wrapper (a stale link target, or a login shell that finds another cargo first) · 2 the check could not run",
   });
 }
 

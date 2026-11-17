@@ -491,34 +491,169 @@ fn parse_record(bytes: &[u8]) -> Option<LeaseRecord> {
 /// The programs the app links into [`bin_dir`].
 pub const LINKED_PROGRAMS: [&str; 2] = ["cargo", "go"];
 
+/// How long `gitpulse-hook --version` may take before the binary is taken as
+/// unverified. It answers from a constant, so this is only ever spent on a
+/// binary that is not the one it claims to be, or a machine too loaded to
+/// start it, and it has to fit inside the session-start hook's budget.
+const HOOK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `gitpulse-hook --version` output names `lease` among what the
+/// binary serves (`hooks::identity`, `hooks::BINARY_MODES`). `Err` says what it
+/// printed instead.
+pub fn identity_serves_lease(stdout: &str) -> Result<(), String> {
+    let mut lines = stdout.lines().map(str::trim);
+    let first = lines.next().unwrap_or("");
+    if !first.starts_with("gitpulse-hook ") {
+        let shown: String = first.chars().take(80).collect();
+        return Err(if shown.is_empty() {
+            "it printed no identity for --version (a gitpulse-hook older than its --version flag answers any argument it does not know by exiting 0 and doing nothing)".into()
+        } else {
+            format!("its --version answer is not a gitpulse-hook identity: {shown:?}")
+        });
+    }
+    let served = lines
+        .find_map(|line| line.strip_prefix("subcommands:"))
+        .map(|list| list.split(',').map(str::trim).any(|name| name == "lease"));
+    match served {
+        Some(true) => Ok(()),
+        Some(false) => Err(format!(
+            "{first} does not serve lease mode: it predates build leases, and run as cargo or go it would do nothing and exit 0"
+        )),
+        None => Err(format!(
+            "{first} lists no subcommands, so it predates build leases: run as cargo or go it would do nothing and exit 0"
+        )),
+    }
+}
+
+/// What asking a binary whether it is a lease wrapper found.
+enum HookAnswer {
+    /// It answered, and the answer is final for this file.
+    Known(Result<(), String>),
+    /// It could not be asked (no spawn, a timeout, a crash): ask again later.
+    Unknown(String),
+}
+
+fn ask_hook(target: &Path) -> HookAnswer {
+    let Some(program) = target.to_str() else {
+        return HookAnswer::Known(Err(format!(
+            "{} is not a UTF-8 path, so it cannot be run to ask what it is",
+            target.display()
+        )));
+    };
+    match crate::engine::process::capture_command(
+        program,
+        &["--version"],
+        None,
+        HOOK_PROBE_TIMEOUT,
+        &[],
+    ) {
+        Err(error) => HookAnswer::Unknown(format!(
+            "could not ask {} what it is: {}",
+            target.display(),
+            error.message()
+        )),
+        Ok(out) if !out.success => HookAnswer::Unknown(format!(
+            "{} --version exited {}",
+            target.display(),
+            out.status_code
+        )),
+        Ok(out) => HookAnswer::Known(identity_serves_lease(&out.stdout_text())),
+    }
+}
+
+/// Whether the binary at `target` is a build-lease wrapper: it is run with
+/// `--version`, and only an answer naming `lease` passes. A `cargo` link to
+/// anything else is the worst outcome there is: an older `gitpulse-hook` takes
+/// `cargo build` for a hook subcommand it does not know and exits 0, so the
+/// build "passes" without having run.
+///
+/// A final answer is remembered per file (device, inode, size, mtime), so the
+/// app's Health read and each terminal launch ask once per binary. A probe that
+/// could not run is never remembered and never a pass.
+pub fn hook_serves_lease(target: &Path) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (PathBuf, u64, u64, u64, i128);
+    static KNOWN: OnceLock<Mutex<HashMap<Key, Result<(), String>>>> = OnceLock::new();
+    let meta =
+        std::fs::metadata(target).map_err(|e| format!("cannot read {}: {e}", target.display()))?;
+    let key: Key = {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(-1, |d| d.as_nanos() as i128);
+        (target.to_path_buf(), dev, ino, meta.len(), mtime)
+    };
+    let known = KNOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(answer) = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return answer.clone();
+    }
+    match ask_hook(target) {
+        HookAnswer::Known(answer) => {
+            let mut known = known
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Bounded: a binary replaced over and over is a new key each time.
+            if known.len() >= 32 {
+                known.clear();
+            }
+            known.insert(key, answer.clone());
+            answer
+        }
+        HookAnswer::Unknown(why) => Err(why),
+    }
+}
+
+/// Why one link does not reach a build-lease wrapper, or `None` when it does.
+fn link_problem(link: &Path, want: Option<&Path>) -> Option<String> {
+    if link.symlink_metadata().is_err() {
+        return Some(format!("{} does not exist", link.display()));
+    }
+    let Ok(target) = std::fs::canonicalize(link) else {
+        return Some(format!(
+            "{} points at something that does not exist",
+            link.display()
+        ));
+    };
+    if !target.is_file() {
+        return Some(format!("{} does not point at a file", link.display()));
+    }
+    if want.is_some_and(|want| want != target) {
+        return Some(format!(
+            "{} points at {}, not at this GitPulse's gitpulse-hook",
+            link.display(),
+            target.display()
+        ));
+    }
+    hook_serves_lease(&target).err().map(|why| {
+        format!(
+            "{} points at {}, which is not verified as a build-lease wrapper: {why}",
+            link.display(),
+            target.display()
+        )
+    })
+}
+
 /// Why the links in `bin` do not work, or `None` when every one resolves to a
-/// file (a dangling link is not a link) and, where `hook` is known, to that
-/// binary.
+/// file (a dangling link is not a link) that answers `--version` as a
+/// build-lease wrapper and, where `hook` is known, to that binary.
 pub fn links_problem(bin: &Path, hook: Option<&Path>) -> Option<String> {
     let want = hook.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
-    for name in LINKED_PROGRAMS {
-        let link = bin.join(name);
-        if link.symlink_metadata().is_err() {
-            return Some(format!("{} does not exist", link.display()));
-        }
-        let Ok(target) = std::fs::canonicalize(&link) else {
-            return Some(format!(
-                "{} points at something that does not exist",
-                link.display()
-            ));
-        };
-        if !target.is_file() {
-            return Some(format!("{} does not point at a file", link.display()));
-        }
-        if want.as_ref().is_some_and(|want| *want != target) {
-            return Some(format!(
-                "{} points at {}, not at this GitPulse's gitpulse-hook",
-                link.display(),
-                target.display()
-            ));
-        }
-    }
-    None
+    LINKED_PROGRAMS
+        .iter()
+        .find_map(|name| link_problem(&bin.join(name), want.as_deref()))
 }
 
 /// `PATH` with `bin` first, once: an entry already there is moved to the
@@ -558,6 +693,13 @@ pub fn launch_env(
 /// Makes `<config>/lease-bin/{cargo,go}` symlinks to `hook`, replacing a
 /// wrong or missing one by rename so a build never finds the folder half made.
 /// `Err` says what could not be done; links already right are left alone.
+///
+/// `hook` must answer `--version` as a build-lease wrapper
+/// ([`hook_serves_lease`]). When it does not, nothing is linked to it, and every
+/// link already in the folder that does not reach a wrapper is removed: a
+/// session whose PATH already starts with the folder then finds the real
+/// `cargo` behind it instead of a binary that answers `cargo test` with exit 0
+/// and no build. A link that reaches another install's working wrapper stays.
 #[cfg(unix)]
 pub fn ensure_links(config_dir: &Path, hook: &Path) -> Result<(), String> {
     let bin = bin_dir(config_dir);
@@ -565,11 +707,41 @@ pub fn ensure_links(config_dir: &Path, hook: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", config_dir.display()))?;
     crate::hooks::advisory_once::private_dir(&bin)
         .map_err(|why| format!("cannot use {}: {why}", bin.display()))?;
-    if !hook.is_file() {
-        return Err(format!(
+    let usable = if hook.is_file() {
+        hook_serves_lease(hook)
+    } else {
+        Err(format!(
             "{} does not exist, so there is nothing for the cargo and go links to point at",
             hook.display()
-        ));
+        ))
+    };
+    if let Err(why) = usable {
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+        for name in LINKED_PROGRAMS {
+            let link = bin.join(name);
+            if link.symlink_metadata().is_err() || link_problem(&link, None).is_none() {
+                continue;
+            }
+            match std::fs::remove_file(&link) {
+                Ok(()) => removed.push(name),
+                Err(error) => kept.push(format!("{}: {error}", link.display())),
+            }
+        }
+        let mut message = why;
+        if !removed.is_empty() {
+            message.push_str(&format!(
+                "; removed the {} link(s) that did not reach a lease wrapper, so those builds run unleased",
+                removed.join(" and ")
+            ));
+        }
+        if !kept.is_empty() {
+            message.push_str(&format!(
+                "; and could NOT remove {}, so a build through it may do nothing",
+                kept.join(", ")
+            ));
+        }
+        return Err(message);
     }
     for name in LINKED_PROGRAMS {
         let link = bin.join(name);
@@ -680,6 +852,10 @@ mod unix {
     #[derive(Debug)]
     pub struct Ticket {
         pub name: String,
+        /// Why the ticket's record could not be written, when it could not
+        /// (a full disk). The ticket still holds its place: its lock is what
+        /// makes it a waiter. Other readers cannot order it until it is.
+        pub record_error: Option<String>,
         path: PathBuf,
         file: File,
     }
@@ -704,6 +880,12 @@ mod unix {
     pub struct Grant {
         pub slot: usize,
         pub record: LeaseRecord,
+        /// Why the slot's record could not be written, when it could not (a
+        /// full disk). The slot is held all the same: the lock is the slot,
+        /// and a reader counts a held slot with no record of its holder as
+        /// held. Giving it back would run the build unleased beside every
+        /// other one, on the machine least able to take it.
+        pub record_error: Option<String>,
         file: File,
     }
 
@@ -885,8 +1067,14 @@ mod unix {
                 if !try_lock(&file).map_err(|e| format!("could not lock a ticket: {e}"))? {
                     return Err("another process holds this process's own ticket".into());
                 }
-                file.write_all(&body)
-                    .map_err(|e| format!("could not write a ticket: {e}"))?;
+                // A ticket whose record cannot be written (a full disk) keeps
+                // its place: the lock makes it a waiter, and a waiter that gave
+                // up here would run its build unleased. Emptied, so no reader
+                // parses half a record; readers skip it until it has one.
+                let record_error = file.write_all(&body).err().map(|e| {
+                    let _ = file.set_len(0);
+                    format!("could not write the queue entry {}: {e}", path.display())
+                });
                 // A reader that saw the file in the instant before the lock
                 // took it for dead and deleted it: this ticket is then in no
                 // queue, so make another.
@@ -898,7 +1086,12 @@ mod unix {
                     })
                     .unwrap_or(false);
                 if same {
-                    return Ok(Ticket { name, path, file });
+                    return Ok(Ticket {
+                        name,
+                        record_error,
+                        path,
+                        file,
+                    });
                 }
             }
             Err("a ticket was deleted three times as it was made".into())
@@ -915,7 +1108,9 @@ mod unix {
 
         /// Tries to take `slot`. `Ok(None)` when another process holds it (the
         /// race was lost: ask again after the next read), `Err` when the file
-        /// cannot be used at all.
+        /// cannot be used at all. Once the lock is taken the slot is this
+        /// process's, whether or not its record could be written
+        /// ([`Grant::record_error`]).
         pub fn take(&self, slot: usize, record: &LeaseRecord) -> Result<Option<Grant>, String> {
             let path = self.slot_path(slot);
             let file = fs_entry::open_private_record(&path)?;
@@ -924,10 +1119,11 @@ mod unix {
                 Ok(false) => return Ok(None),
                 Err(error) => return Err(format!("could not lock {}: {error}", path.display())),
             }
-            self.write_record(slot, record)?;
+            let record_error = self.write_record(slot, record).err();
             Ok(Some(Grant {
                 slot,
                 record: record.clone(),
+                record_error,
                 file,
             }))
         }
@@ -961,11 +1157,18 @@ mod unix {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp)
                 .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-            file.write_all(&body)
+            let written = file
+                .write_all(&body)
                 .and_then(|()| file.flush())
-                .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-            std::fs::rename(&tmp, &target)
-                .map_err(|e| format!("could not publish {}: {e}", target.display()))
+                .map_err(|e| format!("could not write {}: {e}", tmp.display()))
+                .and_then(|()| {
+                    std::fs::rename(&tmp, &target)
+                        .map_err(|e| format!("could not publish {}: {e}", target.display()))
+                });
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            written
         }
     }
 }

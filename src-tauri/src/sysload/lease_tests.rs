@@ -199,7 +199,7 @@ fn a_launched_session_is_pointed_at_the_links_only_when_they_exist_and_leases_ar
     let none = launch_env(Some(config), Some(OsStr::new("/bin")), true);
     assert_eq!(none, [("GITPULSE_LEASE_BIN", None)]);
     let hook = temp.path().join("gitpulse-hook");
-    std::fs::write(&hook, "x").unwrap();
+    crate::test_support::fake_lease_hook(&hook);
     ensure_links(config, &hook).unwrap();
     let env = launch_env(Some(config), Some(OsStr::new("/bin")), true);
     assert_eq!(names(&env), ["PATH", "GITPULSE_LEASE_BIN"]);
@@ -224,7 +224,7 @@ fn the_links_are_made_repaired_by_rename_and_refused_without_a_hook_to_point_at(
     let hook = temp.path().join("gitpulse-hook");
     let missing = ensure_links(config, &hook).unwrap_err();
     assert!(missing.contains("does not exist"), "{missing}");
-    std::fs::write(&hook, "x").unwrap();
+    crate::test_support::fake_lease_hook(&hook);
     ensure_links(config, &hook).unwrap();
     let cargo = bin_dir(config).join("cargo");
     assert_eq!(std::fs::read_link(&cargo).unwrap(), hook);
@@ -513,4 +513,74 @@ fn a_queue_only_status_does_not_claim_to_have_counted_what_it_skipped() {
     // A capped miss count is carried as a floor.
     let capped = status(Some(temp.path()), &settings, &load, Ok((7, true)), false);
     assert_eq!((capped.misses, capped.misses_truncated), (Some(7), true));
+}
+
+#[test]
+fn only_an_identity_that_names_lease_is_a_lease_wrapper() {
+    // What `hooks::identity` prints on this tree.
+    assert_eq!(
+        identity_serves_lease(&crate::hooks::identity()),
+        Ok(()),
+        "this build's own --version answer passes"
+    );
+    assert_eq!(
+        identity_serves_lease(
+            "gitpulse-hook 1.2.3\nsubcommands: collision-guard, command-gate, lease\n"
+        ),
+        Ok(())
+    );
+    // A build from before leases: it answers, and does not serve lease mode.
+    let old = identity_serves_lease(
+        "gitpulse-hook 1.0.0\nsubcommands: collision-guard, command-gate, session-brief\n",
+    )
+    .unwrap_err();
+    assert!(old.contains("does not serve lease mode"), "{old}");
+    // `lease` must be a whole entry, not part of one.
+    assert!(identity_serves_lease("gitpulse-hook 1\nsubcommands: release, leases\n").is_err());
+    // A build older than --version answers nothing at all.
+    let silent = identity_serves_lease("").unwrap_err();
+    assert!(silent.contains("no identity"), "{silent}");
+    // Something else entirely.
+    assert!(identity_serves_lease("cargo 1.91.0 (abc 2025-10-10)\n").is_err());
+    assert!(identity_serves_lease("gitpulse-hook 1.0.0\n").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_is_not_a_lease_wrapper_is_never_linked_and_takes_its_stale_links_with_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let other = temp.path().join("other-install-hook");
+    crate::test_support::fake_lease_hook(&other);
+    // Links an earlier install made to its own, working, wrapper.
+    ensure_links(&config, &other).unwrap();
+    // This install's hook predates leases.
+    let stale = temp.path().join("gitpulse-hook");
+    std::fs::write(
+        &stale,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 1.0.0\\nsubcommands: collision-guard\\n'; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let refused = ensure_links(&config, &stale).unwrap_err();
+    assert!(refused.contains("does not serve lease mode"), "{refused}");
+    let cargo = bin_dir(&config).join("cargo");
+    assert_eq!(
+        std::fs::read_link(&cargo).unwrap(),
+        other,
+        "a link that reaches a working wrapper is not taken away"
+    );
+    assert_eq!(links_problem(&bin_dir(&config), None), None);
+    // The other install's wrapper goes stale as well (an in-place downgrade):
+    // now nothing in the folder reaches a wrapper, and it is emptied.
+    std::fs::remove_file(&other).unwrap();
+    std::fs::copy(&stale, &other).unwrap();
+    let refused = ensure_links(&config, &stale).unwrap_err();
+    assert!(
+        refused.contains("removed the cargo and go link(s)"),
+        "{refused}"
+    );
+    assert!(cargo.symlink_metadata().is_err());
+    assert!(bin_dir(&config).join("go").symlink_metadata().is_err());
 }

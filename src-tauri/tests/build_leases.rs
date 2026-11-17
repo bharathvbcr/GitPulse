@@ -31,6 +31,9 @@ const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
 /// A cargo that says when it started and stopped, and holds its slot until the
 /// test releases it.
 const FAKE_CARGO: &str = r#"#!/bin/sh
+# A test may start the wrapper under a zero soft file-size limit (a disk that
+# takes no more bytes); the build itself writes its log, so it lifts that.
+ulimit -S -f unlimited 2>/dev/null
 echo "start $TAG verb=$1 held=$GITPULSE_LEASE_HELD shim=$CARGO_SLOT_HELD jobs=$CARGO_BUILD_JOBS inc=$CARGO_INCREMENTAL" >> "$LOG"
 if [ -n "$SIGPIPE_FILE" ]; then
   perl -e 'print defined($SIG{PIPE}) ? $SIG{PIPE} : "DEFAULT"' > "$SIGPIPE_FILE"
@@ -469,5 +472,255 @@ fn a_leased_build_does_not_inherit_an_ignored_sigpipe() {
         std::fs::read_to_string(&seen).unwrap(),
         "DEFAULT",
         "the build must start with SIGPIPE at its default"
+    );
+}
+
+/// Writes an executable at `path` by rename, so nothing runs it half written.
+fn install_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("tmp-script");
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// `gitpulse-hook` as it was before build leases: `--version` names no
+/// `lease`, and an argument it does not know (`build`) is answered with exit 0
+/// and nothing done. Run as `cargo`, every build "passes" without running.
+const STALE_HOOK: &str = "#!/bin/sh\n\
+if [ \"$1\" = --version ]; then\n\
+  printf 'gitpulse-hook 0.4.0\\nsubcommands: collision-guard, command-gate, session-brief\\n'\n\
+fi\n\
+exit 0\n";
+
+/// The PATH value in `env`, from `launch_env`.
+fn path_of(env: &[(&'static str, Option<std::ffi::OsString>)]) -> Option<std::ffi::OsString> {
+    env.iter()
+        .find(|(name, _)| *name == "PATH")
+        .and_then(|(_, value)| value.clone())
+}
+
+/// Runs `cargo build` the way an agent's shell does: by PATH lookup.
+fn shell_build(world: &World, path: &std::ffi::OsStr, tag: &str) -> std::process::Output {
+    Command::new("/bin/sh")
+        .args(["-c", "cargo build"])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", &world.home)
+        .env("TMPDIR", &world.tmp)
+        .env("XDG_CONFIG_HOME", world.home.join(".config"))
+        .env("GITPULSE_TOOL_CONFIG", &world.tools)
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, world.home.join("logs"))
+        .env("LOG", &world.log)
+        .env("RELEASE", &world.release)
+        .env("TAG", tag)
+        .env("NO_WAIT", "1")
+        .stdin(Stdio::null())
+        .output_locked()
+        .expect("run a shell")
+}
+
+#[test]
+fn a_stale_hook_behind_the_links_never_passes_a_build_it_did_not_run() {
+    use gitpulse_lib::sysload::lease;
+    use std::ffi::OsStr;
+    let world = World::new(r#"{"slots":2}"#);
+    let config = config_dir(&world.home);
+    let app = world.home.join("App");
+    std::fs::create_dir_all(&app).unwrap();
+    let hook = app.join("gitpulse-hook");
+    std::os::unix::fs::symlink(HOOK, &hook).unwrap();
+    lease::ensure_links(&config, &hook).expect("a current hook is linked");
+    let bin = lease::bin_dir(&config);
+    let base = format!("{}:/usr/bin:/bin", world.bin.display());
+    // The PATH an agent GitPulse launches is given, from the product.
+    let routed = path_of(&lease::launch_env(
+        Some(&config),
+        Some(OsStr::new(&base)),
+        true,
+    ))
+    .expect("the links work, so a launched session is routed through them");
+    assert_eq!(std::env::split_paths(&routed).next().unwrap(), bin);
+
+    // The app's gitpulse-hook is replaced by one from before leases (a
+    // downgrade, or a tree that rebuilt the app and not the hook), and the app
+    // starts again, which is when it makes its links.
+    std::fs::remove_file(&hook).unwrap();
+    install_script(&hook, STALE_HOOK);
+    let relinked = lease::ensure_links(&config, &hook);
+
+    // A session routed before the swap runs a build. Either the real cargo
+    // runs, or the call fails loudly: never exit 0 with nothing built.
+    let out = shell_build(&world, &routed, "stale");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        world.started() == ["stale"] || (!out.status.success() && !said.is_empty()),
+        "a build through a stale gitpulse-hook exited {:?} having run nothing (stderr: {said:?}); ensure_links said {relinked:?}",
+        out.status.code()
+    );
+    assert_eq!(out.status.code(), Some(0), "the real cargo ran: {said}");
+
+    let refused = relinked.expect_err("a hook without lease mode is never linked");
+    assert!(refused.contains("lease"), "{refused}");
+    for name in ["cargo", "go"] {
+        assert!(
+            bin.join(name).symlink_metadata().is_err(),
+            "the {name} link to a binary that is not a lease wrapper is removed"
+        );
+    }
+    let problem = lease::links_problem(&bin, None).expect("the links do not work");
+    assert!(problem.contains("does not exist"), "{problem}");
+    assert!(
+        path_of(&lease::launch_env(
+            Some(&config),
+            Some(OsStr::new(&base)),
+            true
+        ))
+        .is_none(),
+        "a new session is not routed through a folder with no wrapper in it"
+    );
+}
+
+#[test]
+fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
+    use gitpulse_lib::sysload::lease;
+    use std::ffi::OsStr;
+    let world = World::new(r#"{"slots":2}"#);
+    let config = config_dir(&world.home);
+    let bin = lease::bin_dir(&config);
+    std::fs::create_dir_all(&bin).unwrap();
+    // Links the app made earlier, to a binary that is now a stale hook, a
+    // binary that prints something else, or one that never answers.
+    let bodies = [
+        ("stale", STALE_HOOK.to_string()),
+        (
+            "garbage",
+            "#!/bin/sh\necho 'cargo 1.91.0 (not gitpulse)'\nexit 0\n".to_string(),
+        ),
+        ("hangs", "#!/bin/sh\nexec sleep 30\n".to_string()),
+    ];
+    for (kind, body) in bodies {
+        let target = world.home.join(format!("hook-{kind}"));
+        install_script(&target, &body);
+        for name in ["cargo", "go"] {
+            let link = bin.join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        }
+        let started = Instant::now();
+        let problem = lease::links_problem(&bin, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{kind}: the probe is bounded"
+        );
+        let problem = problem.unwrap_or_else(|| panic!("{kind}: reported as working"));
+        assert!(
+            problem.contains("not verified as a build-lease wrapper"),
+            "{kind}: {problem}"
+        );
+        assert!(
+            path_of(&lease::launch_env(
+                Some(&config),
+                Some(OsStr::new("/usr/bin:/bin")),
+                true
+            ))
+            .is_none(),
+            "{kind}: not routed"
+        );
+    }
+}
+
+/// Starts `world`'s wrapper for `tag` as if on a disk that takes no more
+/// bytes: a zero soft file-size limit, so every write past the first byte
+/// fails (SIGXFSZ ignored, as for EFBIG), while creating an empty file works.
+fn start_on_a_full_disk(world: &mut World, tag: &str) -> Child {
+    use std::os::unix::process::CommandExt;
+    let (mut command, _) = world.command(tag, &["build"]);
+    command.stderr(Stdio::piped());
+    // SAFETY: between fork and exec this calls only getrlimit, setrlimit and
+    // signal, which are async-signal-safe, and allocates nothing.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = 0;
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    command.spawn_locked().expect("spawn gitpulse-hook")
+}
+
+#[test]
+fn a_disk_that_takes_no_more_bytes_still_leases_every_build() {
+    let mut world = World::new(r#"{"slots":1}"#);
+    // The lease directory exists already, private, as the first build left it
+    // (one other users could write is refused, which is another test).
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(world.lease_dir().join("queue"))
+            .unwrap();
+    }
+    let a = start_on_a_full_disk(&mut world, "a");
+    wait_for("a to start", || world.started() == ["a"]);
+    let b = start_on_a_full_disk(&mut world, "b");
+    settle();
+    assert_eq!(
+        world.started(),
+        ["a"],
+        "b started beside a with one slot: a full disk let a build run unleased"
+    );
+    world.release();
+    let mut said = Vec::new();
+    for child in [a, b] {
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        said.push(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    assert_eq!(world.started(), ["a", "b"], "{:?}", world.lines());
+    assert_eq!(world.peak(), 1, "{:?}", world.lines());
+    for text in &said {
+        assert!(!text.contains("did NOT lease"), "{text}");
+    }
+    assert!(
+        said.iter()
+            .any(|text| text.contains("could not be written")),
+        "the slot it holds without a record is said: {said:?}"
+    );
+}
+
+#[test]
+fn an_unleased_build_that_cannot_be_counted_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new(r#"{"slots":1}"#);
+    std::fs::create_dir_all(world.lease_dir()).unwrap();
+    std::fs::set_permissions(world.lease_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Where Health counts unleased builds is not a directory.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let markers = world.tmp.join(format!("gitpulse-hook-advisories-{uid}"));
+    std::fs::write(&markers, b"not a directory").unwrap();
+    let mut world = world;
+    let (mut command, stderr) = world.command("a", &["build"]);
+    command.env("NO_WAIT", "1");
+    let status = command.spawn_locked().unwrap().wait().unwrap();
+    assert_eq!(status.code(), Some(0), "the build ran");
+    assert_eq!(world.started(), ["a"]);
+    let said = std::fs::read_to_string(stderr).unwrap();
+    assert!(said.contains("did NOT lease this build"), "{said}");
+    assert!(
+        said.contains("could NOT be counted"),
+        "a miss Health cannot count is said, not dropped: {said}"
     );
 }

@@ -513,6 +513,48 @@ fn lease_sessions() -> (Vec<String>, bool) {
     (Vec::new(), false)
 }
 
+/// Closes a parked session's terminal and marks its row to be offered for
+/// reopening. `Ok(marked)` says whether a row was marked.
+///
+/// The row is marked first. Closing can take longer than the close allows (a
+/// terminal whose cleanup has not finished by its deadline is still on its way
+/// out), and a mark made only after a close that reported success would be
+/// lost with that error, taking the reopen offer, the point of parking, with
+/// it. When the close fails and the terminal is still running, the mark is
+/// taken back: a live terminal offered for reopening would start a second copy
+/// of its conversation.
+fn close_parked(
+    kill: impl FnOnce() -> Result<(), String>,
+    mark: impl FnOnce() -> bool,
+    still_running: impl FnOnce() -> bool,
+    unmark: impl FnOnce(),
+) -> Result<bool, String> {
+    let marked = mark();
+    match kill() {
+        Ok(()) => Ok(marked),
+        Err(why) if still_running() => {
+            if marked {
+                unmark();
+            }
+            Err(format!(
+                "could not close it ({why}); it is still running, so it was not parked"
+            ))
+        }
+        // The hangup reached it and it is going away; only its cleanup was slow.
+        Err(_) => Ok(marked),
+    }
+}
+
+/// Whether `session_id` is still listed and not on its way out.
+fn still_running(state: &crate::terminal::TerminalSessions, session_id: &str) -> bool {
+    match crate::terminal::list_sessions(state) {
+        Ok(listed) => listed.iter().any(|s| s.id == session_id && !s.detached),
+        // Not known to have closed: treated as running, so a live terminal is
+        // never offered for reopening.
+        Err(_) => true,
+    }
+}
+
 /// Parks one session: the check, the native dialog, the check again, then the
 /// terminal is closed, its row is marked for reopening, and the ledger says so.
 /// Only ever called from a click (`cmd_host_load_park`).
@@ -538,9 +580,15 @@ pub fn park_session(
                 .ok()
                 .and_then(|l| l.into_iter().find(|s| s.id == session_id))
                 .map(|s| s.repo);
-            crate::terminal::kill_session(state, session_id)?;
             let ledger = state.session_ledger();
-            let marked = ledger.mark_parked(session_id);
+            let marked = close_parked(
+                || crate::terminal::kill_session(state, session_id),
+                || ledger.mark_parked(session_id),
+                || still_running(state, session_id),
+                || {
+                    ledger.undo_park(session_id);
+                },
+            )?;
             let recorded = repo.is_some_and(|repo| {
                 crate::ledger::record(crate::ledger::Draft {
                     repo_path: repo,

@@ -459,3 +459,58 @@ fn park_enforces_the_park_after_time_itself_not_only_what_health_offers() {
     );
     assert_eq!(late.unwrap(), "parked");
 }
+
+/// What `close_parked` did, in order.
+fn park_steps(
+    kill: Result<(), String>,
+    running_after: bool,
+) -> (Result<bool, String>, Vec<&'static str>) {
+    let steps = std::cell::RefCell::new(Vec::new());
+    let out = close_parked(
+        || {
+            steps.borrow_mut().push("kill");
+            kill
+        },
+        || {
+            steps.borrow_mut().push("mark");
+            true
+        },
+        || {
+            steps.borrow_mut().push("check");
+            running_after
+        },
+        || steps.borrow_mut().push("unmark"),
+    );
+    (out, steps.into_inner())
+}
+
+#[test]
+fn a_park_marks_the_row_before_it_closes_the_terminal() {
+    let (out, steps) = park_steps(Ok(()), false);
+    assert_eq!(out, Ok(true));
+    assert_eq!(steps, ["mark", "kill"]);
+}
+
+#[test]
+fn a_park_whose_close_is_only_slow_keeps_the_reopen_offer() {
+    // The hangup was sent and the terminal is on its way out; its cleanup
+    // missed the close deadline. The session is gone, so it must be offered
+    // back: that offer is the point of parking.
+    let (out, steps) = park_steps(
+        Err("Terminal process has not finished cleanup; retry Close".into()),
+        false,
+    );
+    assert_eq!(out, Ok(true), "{steps:?}");
+    assert_eq!(steps, ["mark", "kill", "check"]);
+}
+
+#[test]
+fn a_park_whose_close_never_landed_takes_the_offer_back() {
+    // The terminal is still running: offering it for reopening would start a
+    // second copy of a live conversation.
+    let (out, steps) = park_steps(Err("could not signal the terminal".into()), true);
+    let why = out.unwrap_err();
+    assert!(why.contains("could not signal the terminal"), "{why}");
+    assert!(why.contains("still running"), "{why}");
+    assert_eq!(steps, ["mark", "kill", "check", "unmark"]);
+}
