@@ -3,7 +3,7 @@
 use super::parse::{parse_kingfisher_json, SecretsReport};
 use super::report::{assemble, git_view, scan_exclusions, RunFacts};
 use crate::engine::git_cli::validate_repo;
-use crate::engine::process::{run_observed, Incomplete, OutputStream, ProcessObserver};
+use crate::engine::process::{run_observed, ExitFacts, Incomplete, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -313,6 +313,10 @@ pub struct ScanTicket {
     cancel: Arc<AtomicBool>,
     stdout_bytes: u64,
     stderr_bytes: u64,
+    /// How the last process this ticket observed was waited on, as the runner
+    /// saw it. Cleared with the byte counts, so a version probe's death is
+    /// never read as the scan's.
+    exit: Option<ExitFacts>,
 }
 
 impl ScanTicket {
@@ -327,6 +331,7 @@ impl ScanTicket {
             cancel: flag,
             stdout_bytes: 0,
             stderr_bytes: 0,
+            exit: None,
         }
     }
 
@@ -339,6 +344,7 @@ impl ScanTicket {
     fn reset_output_counts(&mut self) {
         self.stdout_bytes = 0;
         self.stderr_bytes = 0;
+        self.exit = None;
     }
 }
 
@@ -355,6 +361,10 @@ impl ProcessObserver for ScanTicket {
         };
         *slot = slot.saturating_add(n);
     }
+
+    fn exited(&mut self, facts: &ExitFacts) {
+        self.exit = Some(*facts);
+    }
 }
 
 /// Facts a failed scan can name without quoting Kingfisher. Byte counts are
@@ -367,6 +377,11 @@ pub(super) struct ScanDiagnostic {
     pub elapsed_ms: u64,
     pub stdout_bytes_captured: u64,
     pub stderr_bytes_captured: u64,
+    /// What the runner knew about how the scanner's wait ended; `None` when
+    /// the run never got as far as a wait.
+    pub exit: Option<ExitFacts>,
+    /// Whether a newer scan had claimed the ticket by the time this was read.
+    pub superseded: bool,
 }
 
 /// One diagnostic field.
@@ -405,7 +420,47 @@ pub(super) fn format_scan_diagnostic(facts: &ScanDiagnostic) -> String {
         facts.stdout_bytes_captured,
         facts.stderr_bytes_captured,
     );
+    let raw = format!("{raw}\n{}", exit_lines(facts));
     crate::ledger::redact::text(&raw)
+}
+
+/// `NAME (n)` for a known signal, `signal n` otherwise, so a number is never
+/// printed twice.
+fn signal_label(signal: i32) -> String {
+    let name = signal_name(signal);
+    if name.starts_with("signal ") {
+        name
+    } else {
+        format!("{name} ({signal})")
+    }
+}
+
+/// The lines that say how the scanner's wait ended. A scan that "was terminated
+/// before it finished" has no exit status to quote, and the cause was not
+/// recoverable from the banner; these are every fact the runner holds, each
+/// printed whether or not it is interesting, so an absent fact reads as absent
+/// and a line that says `none` was observed to be none.
+fn exit_lines(facts: &ScanDiagnostic) -> String {
+    let token = facts.superseded || facts.exit.is_some_and(|exit| exit.cancelled);
+    let Some(exit) = facts.exit else {
+        return format!("wait_status_raw: not observed\ncancel_token_fired: {token}");
+    };
+    let raw = exit.raw_wait_status.map_or_else(
+        || "none (no status was read)".to_string(),
+        |raw| format!("{raw:#06x}"),
+    );
+    let signal = exit.signal.map_or_else(|| "none".to_string(), signal_label);
+    let stopped = exit
+        .stopped_signal
+        .map_or_else(|| "none".to_string(), signal_label);
+    format!(
+        "wait_status_raw: {raw}\nexit_signal: {signal}\ncore_dumped: {}\nstopped_signal: {stopped}\ncontinued: {}\ncancel_token_fired: {token}\nrunner_signalled_group: {}\ndeadline_expired: {}\nshutdown_sweep_started: {}",
+        exit.core_dumped,
+        exit.continued,
+        exit.runner_signalled_group,
+        exit.deadline_expired,
+        exit.shutdown_sweep_started,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -577,6 +632,8 @@ fn current_diagnostic(
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         stdout_bytes_captured: ticket.stdout_bytes,
         stderr_bytes_captured: ticket.stderr_bytes,
+        exit: ticket.exit,
+        superseded: ticket.superseded(),
     }
 }
 

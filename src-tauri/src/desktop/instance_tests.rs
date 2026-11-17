@@ -871,6 +871,171 @@ fn an_undelivered_answer_stays_loud_unless_the_ask_was_read_only_and_its_asker_l
 }
 
 #[test]
+fn an_op_record_asker_that_gave_up_is_not_a_refused_launch() {
+    // The installed log's "instance mailbox refused a launch: write: Broken
+    // pipe" lines carry no "ms after asking", so they are not an asked read:
+    // they are the op log. A git write's hook waits `OP_RECORD_DEADLINE`, lets
+    // the write run and leaves; the snapshot's ack then meets a closed socket.
+    // Nothing was refused and no launch was involved.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let control = server.try_clone().unwrap();
+    *shared.op_record.lock().unwrap() = Some(Arc::new(move |_, _| {
+        wait_for_hang_up(&control);
+        Ok(serde_json::json!({ "snapshotted": true }))
+    }));
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: op_request("op-gone"),
+    })
+    .unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        read_frame(&mut reader).unwrap().expect("greeting");
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        drop(writer);
+        drop(reader);
+        served.join().unwrap()
+    });
+    let Err(ended) = outcome else {
+        panic!("an answer nobody was left to read was not delivered")
+    };
+    let (level, line) = ended.log_line();
+    assert_eq!(level, log::Level::Info, "{line}");
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+    assert!(!line.contains("refused a launch"), "{line}");
+    assert!(line.contains("the op log"), "names what was asked: {line}");
+    assert!(line.contains(" ms"), "says how long it took: {line}");
+}
+
+/// A pair whose client end is gone, waited for until the server's socket says
+/// so. The ask is then abandoned before the owner so much as looks at it, which
+/// is the state a handler reaches after queueing behind a busy pool.
+fn abandoned_pair() -> (UnixStream, Shared) {
+    let (server, client) = UnixStream::pair().unwrap();
+    let control = server.try_clone().unwrap();
+    drop(client);
+    wait_for_hang_up(&control);
+    // SAFETY: `getuid` has no preconditions.
+    (server, Shared::new(unsafe { libc::getuid() }))
+}
+
+#[test]
+fn a_read_only_ask_whose_asker_hung_up_before_its_verdict_is_not_computed() {
+    // The asker of a gate, a scan or an insights read gives up after a few
+    // seconds and works the answer out itself, so an owner that computes it
+    // anyway does the work twice and feeds the git spawn budget for nothing.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reply = || Ok(serde_json::json!({ "decision": "allow" }));
+
+    let (mut server, shared) = abandoned_pair();
+    let seen = Arc::clone(&calls);
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        reply()
+    }));
+    let gate = answer_gate(&mut server, &shared, "g1", "/", "ls");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the gate verdict was computed"
+    );
+    assert!(gate.is_err(), "nothing was answered: {gate:?}");
+
+    let (mut server, shared) = abandoned_pair();
+    let seen = Arc::clone(&calls);
+    *shared.collision.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        reply()
+    }));
+    let scan = answer_scan(&mut server, &shared, "s1", "/", "a");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the collision scan ran");
+    assert!(scan.is_err(), "nothing was answered: {scan:?}");
+
+    let (mut server, shared) = abandoned_pair();
+    let seen = Arc::clone(&calls);
+    *shared.insights.lock().unwrap() = Some(Arc::new(move |_: &str| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        reply()
+    }));
+    let insights = answer_insights(&mut server, &shared, "i1", "/");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the insights read ran");
+    let reason = insights.expect_err("nothing was answered");
+
+    // Logged once, at INFO, as the asker leaving, with the same shape as the
+    // line a late answer gets.
+    let ended = Ended::after_ask(&server, "the insights read", true, Instant::now(), reason);
+    let (level, line) = ended.log_line();
+    assert!(matches!(ended, Ended::Unheard(_)), "{line}");
+    assert_eq!(level, log::Level::Info, "{line}");
+    assert!(line.contains("no answer was worked out"), "{line}");
+}
+
+#[test]
+fn an_ask_that_acts_is_still_carried_out_when_its_asker_hung_up() {
+    // A delivery or an op record does its work for the world, not for the
+    // asker: skipping it because nobody is left to hear the ack would lose it.
+    let (mut server, shared) = abandoned_pair();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    *shared.op_record.lock().unwrap() = Some(Arc::new(move |_, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "snapshotted": true }))
+    }));
+    let _ = answer_op_record(
+        &mut server,
+        &shared,
+        "op-1",
+        &op_request("op-1"),
+        Instant::now(),
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the op record was skipped");
+}
+
+#[test]
+fn a_read_only_ask_whose_asker_is_still_connected_is_answered_as_before() {
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, command: &str| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({ "decision": "allow", "command": command }))
+    }));
+    answer_gate(&mut server, &shared, "g2", "/", "ls").expect("answered");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let mut reader = BufReader::new(client);
+    let ack: Ack = serde_json::from_str(&read_frame(&mut reader).unwrap().expect("ack")).unwrap();
+    assert!(ack.accepted, "{:?}", ack.reason);
+    assert_eq!(ack.id.as_deref(), Some("g2"));
+    assert_eq!(ack.reply.unwrap()["command"], "ls");
+}
+
+#[test]
+fn a_write_error_says_its_peer_left_only_for_the_errors_a_departed_peer_causes() {
+    let os = |code: i32| {
+        format!(
+            "write: {} (os error {code})",
+            std::io::Error::from_raw_os_error(code)
+        )
+    };
+    for code in [libc::EPIPE, libc::ECONNRESET, libc::ENOTCONN] {
+        assert!(write_says_peer_left(&os(code)), "{}", os(code));
+    }
+    // A timeout is a peer that is still there and slow; a full disk or a
+    // permission error is ours. Both stay refusals.
+    for code in [libc::EAGAIN, libc::ETIMEDOUT, libc::EACCES, libc::ENOSPC] {
+        assert!(!write_says_peer_left(&os(code)), "{}", os(code));
+    }
+    assert!(!write_says_peer_left("the op log is not attached"));
+    assert!(!write_says_peer_left("write: Broken pipe"));
+}
+
+#[test]
 fn a_valid_frame_is_handled_and_logs_nothing() {
     let (mut server, client) = UnixStream::pair().unwrap();
     // SAFETY: `getuid` has no preconditions.

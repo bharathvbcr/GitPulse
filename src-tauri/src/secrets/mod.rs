@@ -435,6 +435,98 @@ mod tests {
     }
 
     #[test]
+    fn a_diagnostic_prints_every_fact_the_runner_held_about_the_scanners_end() {
+        let facts = |exit, superseded| run::ScanDiagnostic {
+            version: None,
+            binary: "/opt/homebrew/bin/kingfisher".into(),
+            jobs: "9".into(),
+            deadline_s: 300,
+            elapsed_ms: 2258,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 0,
+            exit,
+            superseded,
+        };
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+
+        // The case with no cause: a wait status that is neither an exit nor a
+        // signal, here a stop (0x137f is SIGSTOP), which the banner could not say.
+        let stopped = run::format_scan_diagnostic(&facts(
+            Some(crate::engine::process::ExitFacts {
+                raw_wait_status: Some(0x137f),
+                stopped_signal: Some(19),
+                shutdown_sweep_started: true,
+                ..Default::default()
+            }),
+            false,
+        ));
+        let stopped = lines(&stopped);
+        assert!(
+            stopped.contains(&"wait_status_raw: 0x137f".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"exit_signal: none".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"stopped_signal: signal 19".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"shutdown_sweep_started: true".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"cancel_token_fired: false".to_string()),
+            "{stopped:?}"
+        );
+
+        // A core dump and a runner-sent stop are both printed as what they are.
+        let cored = lines(&run::format_scan_diagnostic(&facts(
+            Some(crate::engine::process::ExitFacts {
+                raw_wait_status: Some(0x0086),
+                signal: Some(6),
+                core_dumped: true,
+                runner_signalled_group: true,
+                ..Default::default()
+            }),
+            true,
+        )));
+        assert!(
+            cored.contains(&"wait_status_raw: 0x0086".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"exit_signal: SIGABRT (6)".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"core_dumped: true".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"runner_signalled_group: true".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"cancel_token_fired: true".to_string()),
+            "{cored:?}"
+        );
+
+        // Nothing observed is said to be nothing observed, not a clean exit.
+        let unseen = lines(&run::format_scan_diagnostic(&facts(None, false)));
+        assert!(
+            unseen.contains(&"wait_status_raw: not observed".to_string()),
+            "{unseen:?}"
+        );
+        assert!(
+            !unseen.iter().any(|line| line.starts_with("exit_signal:")),
+            "{unseen:?}"
+        );
+    }
+
+    #[test]
     fn a_failure_diagnostic_names_the_run_and_drops_a_planted_token() {
         let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
         let text = run::format_scan_diagnostic(&run::ScanDiagnostic {
@@ -445,6 +537,8 @@ mod tests {
             elapsed_ms: 300_012,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 48,
+            exit: None,
+            superseded: false,
         });
         assert!(text.contains("kingfisher: 2.7.0"), "{text}");
         assert!(text.contains("jobs: 4"), "{text}");
@@ -462,6 +556,8 @@ mod tests {
                 elapsed_ms: 1000,
                 stdout_bytes_captured: 0,
                 stderr_bytes_captured: 0,
+                exit: None,
+                superseded: false,
             })
             .lines()
             .next(),
@@ -482,6 +578,8 @@ mod tests {
             elapsed_ms: 300_012,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 48,
+            exit: None,
+            superseded: false,
         });
         let count = |prefix: &str| text.lines().filter(|line| line.starts_with(prefix)).count();
         assert_eq!(count("stdout_bytes_captured:"), 1, "{text}");
@@ -490,7 +588,9 @@ mod tests {
         assert!(text.contains("stdout_bytes_captured: 0"), "{text}");
         assert!(text.contains("stderr_bytes_captured: 48"), "{text}");
         assert!(text.contains("elapsed_ms: 300012"), "{text}");
-        assert_eq!(text.lines().count(), 7, "{text}");
+        // Seven lines of facts, then the two the wait adds when nothing was
+        // observed of it; a forged line would make it ten.
+        assert_eq!(text.lines().count(), 9, "{text}");
     }
 
     /// Capping a field before redaction keeps the head of a token that no
@@ -511,6 +611,8 @@ mod tests {
             elapsed_ms: 1,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 0,
+            exit: None,
+            superseded: false,
         });
         assert!(!text.contains(token), "{text}");
         assert!(
