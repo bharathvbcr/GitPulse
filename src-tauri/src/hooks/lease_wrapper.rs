@@ -209,6 +209,7 @@ pub fn acquire(
 ) -> Result<Acquired, String> {
     let started = ports.now_ns();
     let mut ticket = dir.enqueue(template)?;
+    say_record_error(ports, &ticket);
     let mut last_said: Option<u64> = None;
     let mut rounds: u64 = 0;
     loop {
@@ -219,6 +220,7 @@ pub fn acquire(
             // Deleted under us by a reader that raced the lock: queue again,
             // keeping the original time, so the wait is not lost.
             ticket = dir.enqueue(template)?;
+            say_record_error(ports, &ticket);
         }
         let load = ports.load();
         let cap = capacity(policy.slots, &load);
@@ -300,6 +302,16 @@ pub fn acquire(
         let spread =
             Duration::from_millis((u64::try_from(template.pid).unwrap_or(0) * 37 + rounds) % 120);
         ports.sleep(policy.poll + spread);
+    }
+}
+
+/// Says that a queue entry holds its place without a record (a full disk):
+/// the build still waits its turn, but other builds cannot see it waiting.
+fn say_record_error(ports: &mut dyn Ports, ticket: &lease::Ticket) {
+    if let Some(why) = &ticket.record_error {
+        ports.say(&format!(
+            "gitpulse: waiting for a build slot, but this build's queue entry could not be written ({why}): it keeps its place, and other builds cannot see it waiting."
+        ));
     }
 }
 
@@ -669,6 +681,14 @@ fn run(program: &str, args: &[OsString]) -> i32 {
             return EXIT_GAVE_UP;
         }
     };
+    if let Some((slot, why)) = grant
+        .as_ref()
+        .and_then(|g| g.record_error.as_ref().map(|why| (g.slot, why)))
+    {
+        say_stderr(&format!(
+            "gitpulse: holding build slot {slot}, but its record could not be written ({why}): Health shows the slot held by an unnamed process."
+        ));
+    }
     let slot = grant
         .as_ref()
         .map_or_else(|| "overflow".to_string(), |g| g.slot.to_string());
@@ -702,7 +722,11 @@ fn finish(error: std::io::Error, real: &Path) -> i32 {
 /// The build runs, unleased, and the person and Health are told.
 fn unleased(real: &Path, program: &str, args: &[OsString], why: &str) -> i32 {
     say_stderr(&format!("gitpulse: did NOT lease this build: {why}"));
-    record_miss(why);
+    if let Err(error) = record_miss(why) {
+        say_stderr(&format!(
+            "gitpulse: and this unleased build could NOT be counted for Health ({error}), so Health will not show it."
+        ));
+    }
     finish(
         exec(real, program, args, std::env::vars_os().collect()),
         real,
@@ -714,22 +738,24 @@ const MISS_PREFIX: &str = "leasemiss-";
 /// One marker per distinct reason a build ran without a lease, in the same
 /// private directory as the hook's other markers (15 minute prune). Health
 /// counts them: a lease that quietly never happens is the failure this exists
-/// to make visible.
-fn record_miss(why: &str) {
+/// to make visible. `Err` when the marker could not be made, which the caller
+/// says: a miss Health cannot count must not look like no miss at all.
+fn record_miss(why: &str) -> Result<(), String> {
     let dir = marker_dir();
-    if private_dir(&dir).is_err() {
-        return;
-    }
+    private_dir(&dir).map_err(|e| format!("cannot use {}: {e}", dir.display()))?;
     let name = format!(
         "{MISS_PREFIX}{:016x}-{}",
         super::fnv1a(why),
         std::process::id()
     );
-    let _ = std::fs::OpenOptions::new()
+    let made = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(dir.join(name));
+        .open(dir.join(&name))
+        .map(drop)
+        .map_err(|e| format!("cannot create {}: {e}", dir.join(&name).display()));
     prune(&dir, std::time::SystemTime::now());
+    made
 }
 
 /// How many builds ran unleased in the last 15 minutes, counted from the

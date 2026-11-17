@@ -852,6 +852,10 @@ mod unix {
     #[derive(Debug)]
     pub struct Ticket {
         pub name: String,
+        /// Why the ticket's record could not be written, when it could not
+        /// (a full disk). The ticket still holds its place: its lock is what
+        /// makes it a waiter. Other readers cannot order it until it is.
+        pub record_error: Option<String>,
         path: PathBuf,
         file: File,
     }
@@ -876,6 +880,12 @@ mod unix {
     pub struct Grant {
         pub slot: usize,
         pub record: LeaseRecord,
+        /// Why the slot's record could not be written, when it could not (a
+        /// full disk). The slot is held all the same: the lock is the slot,
+        /// and a reader counts a held slot with no record of its holder as
+        /// held. Giving it back would run the build unleased beside every
+        /// other one, on the machine least able to take it.
+        pub record_error: Option<String>,
         file: File,
     }
 
@@ -1057,8 +1067,14 @@ mod unix {
                 if !try_lock(&file).map_err(|e| format!("could not lock a ticket: {e}"))? {
                     return Err("another process holds this process's own ticket".into());
                 }
-                file.write_all(&body)
-                    .map_err(|e| format!("could not write a ticket: {e}"))?;
+                // A ticket whose record cannot be written (a full disk) keeps
+                // its place: the lock makes it a waiter, and a waiter that gave
+                // up here would run its build unleased. Emptied, so no reader
+                // parses half a record; readers skip it until it has one.
+                let record_error = file.write_all(&body).err().map(|e| {
+                    let _ = file.set_len(0);
+                    format!("could not write the queue entry {}: {e}", path.display())
+                });
                 // A reader that saw the file in the instant before the lock
                 // took it for dead and deleted it: this ticket is then in no
                 // queue, so make another.
@@ -1070,7 +1086,12 @@ mod unix {
                     })
                     .unwrap_or(false);
                 if same {
-                    return Ok(Ticket { name, path, file });
+                    return Ok(Ticket {
+                        name,
+                        record_error,
+                        path,
+                        file,
+                    });
                 }
             }
             Err("a ticket was deleted three times as it was made".into())
@@ -1087,7 +1108,9 @@ mod unix {
 
         /// Tries to take `slot`. `Ok(None)` when another process holds it (the
         /// race was lost: ask again after the next read), `Err` when the file
-        /// cannot be used at all.
+        /// cannot be used at all. Once the lock is taken the slot is this
+        /// process's, whether or not its record could be written
+        /// ([`Grant::record_error`]).
         pub fn take(&self, slot: usize, record: &LeaseRecord) -> Result<Option<Grant>, String> {
             let path = self.slot_path(slot);
             let file = fs_entry::open_private_record(&path)?;
@@ -1096,10 +1119,11 @@ mod unix {
                 Ok(false) => return Ok(None),
                 Err(error) => return Err(format!("could not lock {}: {error}", path.display())),
             }
-            self.write_record(slot, record)?;
+            let record_error = self.write_record(slot, record).err();
             Ok(Some(Grant {
                 slot,
                 record: record.clone(),
+                record_error,
                 file,
             }))
         }
@@ -1133,11 +1157,18 @@ mod unix {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp)
                 .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-            file.write_all(&body)
+            let written = file
+                .write_all(&body)
                 .and_then(|()| file.flush())
-                .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-            std::fs::rename(&tmp, &target)
-                .map_err(|e| format!("could not publish {}: {e}", target.display()))
+                .map_err(|e| format!("could not write {}: {e}", tmp.display()))
+                .and_then(|()| {
+                    std::fs::rename(&tmp, &target)
+                        .map_err(|e| format!("could not publish {}: {e}", target.display()))
+                });
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            written
         }
     }
 }

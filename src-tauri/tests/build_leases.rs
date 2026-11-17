@@ -31,6 +31,9 @@ const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
 /// A cargo that says when it started and stopped, and holds its slot until the
 /// test releases it.
 const FAKE_CARGO: &str = r#"#!/bin/sh
+# A test may start the wrapper under a zero soft file-size limit (a disk that
+# takes no more bytes); the build itself writes its log, so it lifts that.
+ulimit -S -f unlimited 2>/dev/null
 echo "start $TAG verb=$1 held=$GITPULSE_LEASE_HELD shim=$CARGO_SLOT_HELD jobs=$CARGO_BUILD_JOBS inc=$CARGO_INCREMENTAL" >> "$LOG"
 if [ -n "$SIGPIPE_FILE" ]; then
   perl -e 'print defined($SIG{PIPE}) ? $SIG{PIPE} : "DEFAULT"' > "$SIGPIPE_FILE"
@@ -625,4 +628,99 @@ fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
             "{kind}: not routed"
         );
     }
+}
+
+/// Starts `world`'s wrapper for `tag` as if on a disk that takes no more
+/// bytes: a zero soft file-size limit, so every write past the first byte
+/// fails (SIGXFSZ ignored, as for EFBIG), while creating an empty file works.
+fn start_on_a_full_disk(world: &mut World, tag: &str) -> Child {
+    use std::os::unix::process::CommandExt;
+    let (mut command, _) = world.command(tag, &["build"]);
+    command.stderr(Stdio::piped());
+    // SAFETY: between fork and exec this calls only getrlimit, setrlimit and
+    // signal, which are async-signal-safe, and allocates nothing.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = 0;
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    command.spawn_locked().expect("spawn gitpulse-hook")
+}
+
+#[test]
+fn a_disk_that_takes_no_more_bytes_still_leases_every_build() {
+    let mut world = World::new(r#"{"slots":1}"#);
+    // The lease directory exists already, private, as the first build left it
+    // (one other users could write is refused, which is another test).
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(world.lease_dir().join("queue"))
+            .unwrap();
+    }
+    let a = start_on_a_full_disk(&mut world, "a");
+    wait_for("a to start", || world.started() == ["a"]);
+    let b = start_on_a_full_disk(&mut world, "b");
+    settle();
+    assert_eq!(
+        world.started(),
+        ["a"],
+        "b started beside a with one slot: a full disk let a build run unleased"
+    );
+    world.release();
+    let mut said = Vec::new();
+    for child in [a, b] {
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        said.push(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    assert_eq!(world.started(), ["a", "b"], "{:?}", world.lines());
+    assert_eq!(world.peak(), 1, "{:?}", world.lines());
+    for text in &said {
+        assert!(!text.contains("did NOT lease"), "{text}");
+    }
+    assert!(
+        said.iter()
+            .any(|text| text.contains("could not be written")),
+        "the slot it holds without a record is said: {said:?}"
+    );
+}
+
+#[test]
+fn an_unleased_build_that_cannot_be_counted_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new(r#"{"slots":1}"#);
+    std::fs::create_dir_all(world.lease_dir()).unwrap();
+    std::fs::set_permissions(world.lease_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Where Health counts unleased builds is not a directory.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let markers = world.tmp.join(format!("gitpulse-hook-advisories-{uid}"));
+    std::fs::write(&markers, b"not a directory").unwrap();
+    let mut world = world;
+    let (mut command, stderr) = world.command("a", &["build"]);
+    command.env("NO_WAIT", "1");
+    let status = command.spawn_locked().unwrap().wait().unwrap();
+    assert_eq!(status.code(), Some(0), "the build ran");
+    assert_eq!(world.started(), ["a"]);
+    let said = std::fs::read_to_string(stderr).unwrap();
+    assert!(said.contains("did NOT lease this build"), "{said}");
+    assert!(
+        said.contains("could NOT be counted"),
+        "a miss Health cannot count is said, not dropped: {said}"
+    );
 }

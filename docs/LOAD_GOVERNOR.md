@@ -759,7 +759,18 @@ for leased builds; nothing is deleted.
 it cannot use, or a verdict it cannot read, prints "did NOT lease this build:
 <why>" and writes a `leasemiss-` marker; Health counts markers from the last 15
 minutes (a read looks at a bounded number of entries, and when the folder holds
-more, Health says "At least N" and never "No build"). Health also counts running
+more, Health says "At least N" and never "No build"). A marker that cannot be
+written is said on the same stderr ("could NOT be counted for Health"), not
+dropped.
+
+**A full disk does not unlease a build.** The slot is the lock on its slot file;
+the record beside it only names the holder. When the lock is taken and the
+record cannot be written, the slot is kept and the wrapper says "holding build
+slot N, but its record could not be written"; readers count a held slot with no
+record as held (Health shows an unnamed holder). A queue entry whose record
+cannot be written keeps its place the same way, though other builds cannot see
+it waiting until it has one. Only a slot or queue file that cannot be created
+or locked at all runs the build unleased, with the line above. Health also counts running
 `cargo` and `go` processes that hold no slot ("N cargo processes hold no slot"),
 or says it could not count them. A wrapper that is still waiting for a slot, a
 build's own children, and a proxy's child (rustup's `cargo`) are not counted.
