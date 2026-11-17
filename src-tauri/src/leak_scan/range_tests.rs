@@ -590,6 +590,74 @@ fn the_users_diff_and_log_configuration_cannot_hide_a_key() {
     );
 }
 
+/// Commit `name` as a symlink to `target`, replacing whatever was there, with
+/// plain git.
+#[cfg(unix)]
+fn commit_symlink(pair: &Pair, name: &str, target: &str, message: &str) -> String {
+    let path = pair.work.path().join(name);
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::os::unix::fs::symlink(target, &path).unwrap();
+    git_in(pair.work.path(), &["add", "--", name]);
+    git_in(pair.work.path(), &["commit", "-q", "-m", message]);
+    pair.head()
+}
+
+/// Commit `name` as a regular file of `content`, replacing a symlink there.
+#[cfg(unix)]
+fn commit_file_over_symlink(pair: &Pair, name: &str, content: &str, message: &str) -> String {
+    std::fs::remove_file(pair.work.path().join(name)).unwrap();
+    pair.commit(name, content, message)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_push_carrying_a_type_change_either_way_is_scanned_and_goes() {
+    let pair = Pair::new();
+    commit_symlink(&pair, "link", "README.md", "add link");
+    pair.commit("cfg.txt", "mode=plain\n", "add cfg");
+    git_in(pair.work.path(), &["push", "-q", "origin", "HEAD:main"]);
+    // One raw entry and two patch sections per type change, in two commits.
+    commit_file_over_symlink(&pair, "link", "now a plain file\n", "link becomes a file");
+    let tip = commit_symlink(&pair, "cfg.txt", "README.md", "file becomes a link");
+    let range =
+        resolve_push(pair.work.path(), Some("origin"), PushRefs::Branch(None)).expect("resolves");
+    let scan = scan_range(pair.work.path(), &range, RangeLimits::DEFAULT)
+        .expect("a type change is scannable");
+    assert!(scan.tally.is_clean(), "{:?}", scan.tally);
+    assert_eq!(scan.commits_scanned, 2);
+    assert_eq!(scan.tally.inputs_scanned, 2, "{:?}", scan.tally);
+    GitWriter::push(&pair.path(), None, None, false).expect("a clean type change pushes");
+    assert_eq!(pair.remote_main(), tip);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_secret_in_the_new_file_of_a_pushed_type_change_is_found() {
+    let pair = Pair::new();
+    commit_symlink(&pair, "link", "README.md", "add link");
+    git_in(pair.work.path(), &["push", "-q", "origin", "HEAD:main"]);
+    let remote_before = pair.remote_main();
+    let token = github_pat();
+    let leaked =
+        commit_file_over_symlink(&pair, "link", &format!("{token}\n"), "link becomes a file");
+    let err = GitWriter::push(&pair.path(), None, None, false).expect_err("refused");
+    assert_eq!(err.kind(), IpcErrorKind::SecretScanBlocked);
+    let at = format!("{}:link:1", short(&leaked));
+    assert!(err.message().contains(&at), "{}", err.message());
+    assert!(
+        !err.message().contains("could not be scanned"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(
+        pair.remote_main(),
+        remote_before,
+        "nothing reached the remote"
+    );
+}
+
 #[test]
 fn a_merge_conflict_note_with_no_change_pairs_and_scans_clean() {
     let pair = Pair::new();

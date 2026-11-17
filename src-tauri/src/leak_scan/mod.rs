@@ -285,6 +285,10 @@ pub struct Section {
     /// CONFLICT …` lines and nothing else): git prints it with no `--raw`
     /// entry, because the merge recorded no change to that path.
     pub remerge_only: bool,
+    /// The header says `deleted file mode`: the section is the path's removal.
+    pub deleted: bool,
+    /// The header says `new file mode`: the section is the path's creation.
+    pub created: bool,
 }
 
 /// Why a patch could not be read. Any of these fails the scan: a section the
@@ -390,6 +394,11 @@ pub fn parse_patch(patch: &[u8]) -> Result<Vec<Section>, PatchError> {
                 if line.starts_with(b"Binary files ") && line.ends_with(b" differ") {
                     section.binary = true;
                 }
+                if line.starts_with(b"deleted file mode ") {
+                    section.deleted = true;
+                } else if line.starts_with(b"new file mode ") {
+                    section.created = true;
+                }
                 if line.starts_with(b"remerge ") {
                     section.remerge_only = !content;
                 } else {
@@ -482,6 +491,86 @@ pub fn parse_raw(raw: &[u8]) -> Option<Vec<RawEntry>> {
         });
     }
     Some(entries)
+}
+
+/// One diff section with the listing entry it belongs to.
+#[derive(Debug, Clone, Copy)]
+pub struct Paired<'a> {
+    pub section: &'a Section,
+    pub entry: &'a RawEntry,
+    /// The section is the removal half of a type change: what the path was,
+    /// not what the commit makes it. Its bytes are history; `entry` describes
+    /// the other half, so a binary removal must not be read from `entry`'s blob.
+    pub removed_half: bool,
+}
+
+/// Sections and entries that do not pair. Which lines belong to which file is
+/// then unknown, and so is the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairMismatch {
+    pub sections: usize,
+    pub entries: usize,
+}
+
+impl PairMismatch {
+    pub fn describe(&self) -> String {
+        format!(
+            "the diff had {} sections for {} listed files, which do not pair up",
+            self.sections, self.entries
+        )
+    }
+}
+
+/// Pair a patch's sections with the raw listing's entries, in order. This is
+/// the one place the two listings are matched.
+///
+/// Both come from one diff queue, so they name the same paths in the same
+/// order, with one exception: a path whose type changes (status `T`: regular
+/// file, symlink or submodule commit, to another of the three) is one entry
+/// but two sections, the removal and then the creation. A `T` entry
+/// takes both, and only if they are that removal followed by that creation.
+/// Every other entry takes one. Anything left over, missing, or in another
+/// shape is a mismatch, never a guess: the caller fails the scan.
+pub fn pair_sections<'a>(
+    sections: &'a [Section],
+    entries: &'a [RawEntry],
+) -> Result<Vec<Paired<'a>>, PairMismatch> {
+    let mismatch = PairMismatch {
+        sections: sections.len(),
+        entries: entries.len(),
+    };
+    let mut remaining = sections.iter();
+    let mut paired = Vec::with_capacity(sections.len());
+    for entry in entries {
+        let first = remaining.next().ok_or(mismatch)?;
+        if entry.status != b'T' {
+            paired.push(Paired {
+                section: first,
+                entry,
+                removed_half: false,
+            });
+            continue;
+        }
+        let second = remaining.next().ok_or(mismatch)?;
+        let in_order = first.deleted && !first.created && second.created && !second.deleted;
+        if !in_order {
+            return Err(mismatch);
+        }
+        paired.push(Paired {
+            section: first,
+            entry,
+            removed_half: true,
+        });
+        paired.push(Paired {
+            section: second,
+            entry,
+            removed_half: false,
+        });
+    }
+    if remaining.next().is_some() {
+        return Err(mismatch);
+    }
+    Ok(paired)
 }
 
 #[cfg(test)]
