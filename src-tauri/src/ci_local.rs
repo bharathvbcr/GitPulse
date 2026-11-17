@@ -126,6 +126,12 @@ impl CiTestScope {
         }
     }
 
+    /// True when test steps ran only the affected files, so a pass says nothing
+    /// about the rest of the suite. A fail-closed run executed the full suite.
+    fn is_narrowed(&self) -> bool {
+        self.mode == "affected" && !self.fail_closed
+    }
+
     fn affected(test_files: Vec<String>, seeds: Vec<String>) -> Self {
         let n = test_files.len();
         Self {
@@ -990,10 +996,14 @@ pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'
     if report.recorded_commit.is_empty() {
         return None;
     }
-    Some(match run_verdict(report) {
-        "passed" => ("ci_passed", "success"),
-        _ => ("ci_failed", "failure"),
-    })
+    match run_verdict(report) {
+        "passed" => Some(("ci_passed", "success")),
+        // A narrowed pass is neither CI passing nor failing, and the signal
+        // vocabulary has no neutral kind, so the task is told nothing rather
+        // than being told the whole suite passed.
+        "passed-affected" => None,
+        _ => Some(("ci_failed", "failure")),
+    }
 }
 
 /// The verdict a completed run records.
@@ -1001,13 +1011,23 @@ pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'
 /// Derived from the steps themselves, not from the counts. A future change to
 /// `run_plan` that introduced a fourth status would silently make a count-based
 /// verdict wrong in the direction that matters — everything not-failed reading
-/// as a pass — so "passed" here means every single step passed, and nothing
+/// as a pass — so a pass here means every single step passed, and nothing
 /// else does.
+///
+/// A pass whose tests were narrowed to the affected files is
+/// `"passed-affected"`, never `"passed"`: every step passed but the rest of the
+/// suite never ran, so a note about part of the suite must not read as one about
+/// all of it. `badge.ts` classifies it apart from both `PASS_VERDICTS` and
+/// `FAIL_VERDICTS`. The literal stays inside this function because
+/// `provenance-verdict-contract` resolves the writer's verdicts from the string
+/// literals in its body, so no other literal may appear there.
 pub(crate) fn run_verdict(report: &CiLocalReport) -> &'static str {
-    if report.steps.iter().all(|s| s.status == "passed") {
-        "passed"
-    } else {
+    if !report.steps.iter().all(|s| s.status == "passed") {
         "failed"
+    } else if report.test_scope.is_narrowed() {
+        "passed-affected"
+    } else {
+        "passed"
     }
 }
 
@@ -2130,6 +2150,55 @@ mod verification_note_tests {
             "passed",
             "an empty plan cannot reach here: run_ci_local refuses it earlier"
         );
+    }
+
+    fn narrowed(statuses: &[(&str, &str)]) -> CiLocalReport {
+        let mut r = report(statuses);
+        r.test_scope =
+            CiTestScope::affected(vec!["tests/foo.rs".into()], vec!["src/foo.rs".into()]);
+        r
+    }
+
+    /// A narrowed run's note must not read as a full-suite pass.
+    #[test]
+    fn a_narrowed_pass_is_not_a_full_pass() {
+        let full = run_verdict(&report(&[("Tests", "passed")]));
+        let narrow = run_verdict(&narrowed(&[("Tests", "passed")]));
+        assert_eq!(full, "passed");
+        assert_eq!(narrow, "passed-affected");
+        assert_ne!(narrow, full);
+        assert_eq!(
+            run_verdict(&narrowed(&[("Tests", "failed")])),
+            "failed",
+            "narrowing never softens a failure"
+        );
+        let mut closed = report(&[("Tests", "passed")]);
+        closed.test_scope = CiTestScope::full_suite("graph untrusted", Vec::new());
+        assert_eq!(
+            run_verdict(&closed),
+            "passed",
+            "a fail-closed run executed the full suite"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_pass_is_recorded_as_such_and_signals_neither_pass_nor_failure() {
+        let dir = repo();
+        let r = narrowed(&[("Tests", "passed")]);
+        let (commit, reason) =
+            record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
+        assert_eq!(reason, "");
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("a note");
+        assert_eq!(note.verdict, "passed-affected");
+
+        let mut recorded = narrowed(&[("Tests", "passed")]);
+        recorded.recorded_commit = commit;
+        assert_eq!(attempt_signal(&recorded), None);
     }
 
     /// A cleanliness check that could not run must not be read as "clean".

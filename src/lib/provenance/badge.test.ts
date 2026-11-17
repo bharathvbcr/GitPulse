@@ -4,6 +4,7 @@ import {
   FAIL_VERDICTS,
   freshnessBadge,
   isNoteworthy,
+  NARROWED_VERDICTS,
   PASS_VERDICTS,
   type FreshnessKind,
 } from "./badge";
@@ -18,6 +19,7 @@ import type { ProvenanceFreshness, SessionEpisodeNote, VerificationNote } from "
 const ALL_KINDS: readonly FreshnessKind[] = [
   "unknown",
   "failed",
+  "narrowed",
   "unrecognised",
   "unmeasured",
   "fresh",
@@ -79,6 +81,7 @@ describe("freshnessBadge", () => {
     const reached = new Set<FreshnessKind>([
       freshnessBadge(fresh({ notes_readable: false })).kind,
       freshnessBadge(fresh({ verification: note("failed") })).kind,
+      freshnessBadge(fresh({ verification: note("passed-affected") })).kind,
       freshnessBadge(fresh({ verification: note("pending-review") })).kind,
       freshnessBadge(
         fresh({ verification: note("passed"), distance: null, confidence: null, is_fresh: false }),
@@ -175,6 +178,28 @@ describe("freshnessBadge", () => {
     for (const verdict of FAIL_VERDICTS) {
       expect(freshnessBadge(fresh({ verification: note(verdict) })).kind).toBe("failed");
       expect(freshnessBadge(fresh({ verification: note(` ${verdict} `) })).kind).toBe("failed");
+    }
+  });
+
+  it("reads a narrowed pass as its own warning, never a pass and never a failure", () => {
+    for (const distance of [0, 3, null]) {
+      const b = freshnessBadge(
+        fresh({ verification: note("passed-affected"), distance, is_fresh: distance === 0 }),
+      );
+      expect(b.kind, `distance ${distance}`).toBe("narrowed");
+      expect(b.tone).toBe("warn");
+      expect(b.label).toContain("affected tests only");
+    }
+    expect(freshnessBadge(fresh({ verification: note(" PASSED-AFFECTED ") })).kind).toBe(
+      "narrowed",
+    );
+    expect(freshnessBadge(fresh({ verification: note("passed") })).kind).toBe("fresh");
+  });
+
+  it("the narrowed vocabulary is in neither the pass nor the fail one", () => {
+    for (const verdict of NARROWED_VERDICTS) {
+      expect(PASS_VERDICTS).not.toContain(verdict);
+      expect(FAIL_VERDICTS).not.toContain(verdict);
     }
   });
 
