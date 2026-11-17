@@ -561,6 +561,19 @@ fn ask_hook(target: &Path) -> HookAnswer {
     }
 }
 
+/// What asking whether a binary is a build-lease wrapper found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookCheck {
+    /// It answered `--version` as a lease wrapper.
+    Serves,
+    /// It is not one, for certain: it answered without `lease`, or it is not
+    /// there to run.
+    NotAWrapper(String),
+    /// It could not be asked: a spawn refused or deferred under load, a
+    /// timeout, a crash. Not a pass, and not grounds to take a link away.
+    Unverified(String),
+}
+
 /// Whether the binary at `target` is a build-lease wrapper: it is run with
 /// `--version`, and only an answer naming `lease` passes. A `cargo` link to
 /// anything else is the worst outcome there is: an older `gitpulse-hook` takes
@@ -571,12 +584,22 @@ fn ask_hook(target: &Path) -> HookAnswer {
 /// app's Health read and each terminal launch ask once per binary. A probe that
 /// could not run is never remembered and never a pass.
 pub fn hook_serves_lease(target: &Path) -> Result<(), String> {
+    match check_hook(target) {
+        HookCheck::Serves => Ok(()),
+        HookCheck::NotAWrapper(why) | HookCheck::Unverified(why) => Err(why),
+    }
+}
+
+/// [`hook_serves_lease`], keeping "is not one" apart from "could not be asked".
+pub fn check_hook(target: &Path) -> HookCheck {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     type Key = (PathBuf, u64, u64, u64, i128);
     static KNOWN: OnceLock<Mutex<HashMap<Key, Result<(), String>>>> = OnceLock::new();
-    let meta =
-        std::fs::metadata(target).map_err(|e| format!("cannot read {}: {e}", target.display()))?;
+    let meta = match std::fs::metadata(target) {
+        Ok(meta) => meta,
+        Err(e) => return HookCheck::NotAWrapper(format!("cannot read {}: {e}", target.display())),
+    };
     let key: Key = {
         #[cfg(unix)]
         let (dev, ino) = {
@@ -593,12 +616,16 @@ pub fn hook_serves_lease(target: &Path) -> Result<(), String> {
         (target.to_path_buf(), dev, ino, meta.len(), mtime)
     };
     let known = KNOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    let as_check = |answer: &Result<(), String>| match answer {
+        Ok(()) => HookCheck::Serves,
+        Err(why) => HookCheck::NotAWrapper(why.clone()),
+    };
     if let Some(answer) = known
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
     {
-        return answer.clone();
+        return as_check(answer);
     }
     match ask_hook(target) {
         HookAnswer::Known(answer) => {
@@ -609,41 +636,64 @@ pub fn hook_serves_lease(target: &Path) -> Result<(), String> {
             if known.len() >= 32 {
                 known.clear();
             }
-            known.insert(key, answer.clone());
-            answer
+            let check = as_check(&answer);
+            known.insert(key, answer);
+            check
         }
-        HookAnswer::Unknown(why) => Err(why),
+        HookAnswer::Unknown(why) => HookCheck::Unverified(why),
     }
 }
 
-/// Why one link does not reach a build-lease wrapper, or `None` when it does.
-fn link_problem(link: &Path, want: Option<&Path>) -> Option<String> {
+/// What one link reaches.
+enum LinkState {
+    Works,
+    /// It does not reach a wrapper, for certain.
+    Broken(String),
+    /// Its target could not be asked.
+    Unverified(String),
+}
+
+fn link_state(link: &Path, want: Option<&Path>) -> LinkState {
     if link.symlink_metadata().is_err() {
-        return Some(format!("{} does not exist", link.display()));
+        return LinkState::Broken(format!("{} does not exist", link.display()));
     }
     let Ok(target) = std::fs::canonicalize(link) else {
-        return Some(format!(
+        return LinkState::Broken(format!(
             "{} points at something that does not exist",
             link.display()
         ));
     };
     if !target.is_file() {
-        return Some(format!("{} does not point at a file", link.display()));
+        return LinkState::Broken(format!("{} does not point at a file", link.display()));
     }
     if want.is_some_and(|want| want != target) {
-        return Some(format!(
+        return LinkState::Broken(format!(
             "{} points at {}, not at this GitPulse's gitpulse-hook",
             link.display(),
             target.display()
         ));
     }
-    hook_serves_lease(&target).err().map(|why| {
-        format!(
-            "{} points at {}, which is not verified as a build-lease wrapper: {why}",
+    match check_hook(&target) {
+        HookCheck::Serves => LinkState::Works,
+        HookCheck::NotAWrapper(why) => LinkState::Broken(format!(
+            "{} points at {}, which is not a build-lease wrapper: {why}",
             link.display(),
             target.display()
-        )
-    })
+        )),
+        HookCheck::Unverified(why) => LinkState::Unverified(format!(
+            "{} points at {}, which is not verified as a build-lease wrapper (it could not be asked): {why}",
+            link.display(),
+            target.display()
+        )),
+    }
+}
+
+/// Why one link does not reach a build-lease wrapper, or `None` when it does.
+fn link_problem(link: &Path, want: Option<&Path>) -> Option<String> {
+    match link_state(link, want) {
+        LinkState::Works => None,
+        LinkState::Broken(why) | LinkState::Unverified(why) => Some(why),
+    }
 }
 
 /// Why the links in `bin` do not work, or `None` when every one resolves to a
@@ -694,12 +744,15 @@ pub fn launch_env(
 /// wrong or missing one by rename so a build never finds the folder half made.
 /// `Err` says what could not be done; links already right are left alone.
 ///
-/// `hook` must answer `--version` as a build-lease wrapper
-/// ([`hook_serves_lease`]). When it does not, nothing is linked to it, and every
-/// link already in the folder that does not reach a wrapper is removed: a
-/// session whose PATH already starts with the folder then finds the real
-/// `cargo` behind it instead of a binary that answers `cargo test` with exit 0
-/// and no build. A link that reaches another install's working wrapper stays.
+/// `hook` must answer `--version` as a build-lease wrapper ([`check_hook`]).
+/// When it does not, nothing is linked to it, and every link already in the
+/// folder that certainly does not reach a wrapper is removed: a session whose
+/// PATH already starts with the folder then finds the real `cargo` behind it
+/// instead of a binary that answers `cargo test` with exit 0 and no build. A
+/// link that reaches another install's working wrapper stays. A hook or a link
+/// target that could not be asked (a spawn deferred under load) changes
+/// nothing: a probe that did not run is not grounds to take a working link
+/// away, nor to make one.
 #[cfg(unix)]
 pub fn ensure_links(config_dir: &Path, hook: &Path) -> Result<(), String> {
     let bin = bin_dir(config_dir);
@@ -707,20 +760,30 @@ pub fn ensure_links(config_dir: &Path, hook: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", config_dir.display()))?;
     crate::hooks::advisory_once::private_dir(&bin)
         .map_err(|why| format!("cannot use {}: {why}", bin.display()))?;
-    let usable = if hook.is_file() {
-        hook_serves_lease(hook)
+    let check = if hook.is_file() {
+        check_hook(hook)
     } else {
-        Err(format!(
+        HookCheck::NotAWrapper(format!(
             "{} does not exist, so there is nothing for the cargo and go links to point at",
             hook.display()
         ))
     };
-    if let Err(why) = usable {
+    let why = match check {
+        HookCheck::Serves => None,
+        HookCheck::NotAWrapper(why) => Some(why),
+        HookCheck::Unverified(why) => Some(format!(
+            "{} could not be verified as a build-lease wrapper, so no link was made or changed for it: {why}",
+            hook.display()
+        )),
+    };
+    if let Some(why) = why {
         let mut removed = Vec::new();
         let mut kept = Vec::new();
         for name in LINKED_PROGRAMS {
             let link = bin.join(name);
-            if link.symlink_metadata().is_err() || link_problem(&link, None).is_none() {
+            if link.symlink_metadata().is_err()
+                || !matches!(link_state(&link, None), LinkState::Broken(_))
+            {
                 continue;
             }
             match std::fs::remove_file(&link) {

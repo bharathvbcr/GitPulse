@@ -584,3 +584,49 @@ fn a_hook_that_is_not_a_lease_wrapper_is_never_linked_and_takes_its_stale_links_
     assert!(cargo.symlink_metadata().is_err());
     assert!(bin_dir(&config).join("go").symlink_metadata().is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_cannot_be_asked_makes_and_takes_away_no_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let good = temp.path().join("other-install-hook");
+    crate::test_support::fake_lease_hook(&good);
+    ensure_links(&config, &good).unwrap();
+    let cargo = bin_dir(&config).join("cargo");
+    // A hook that never answers --version, as a spawn deferred under load or
+    // a wedged binary looks to the probe: unknown, which is not a verdict.
+    let silent = temp.path().join("gitpulse-hook");
+    std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        hook_serves_lease(&silent).is_err(),
+        "unknown is never a pass"
+    );
+    let first = ensure_links(&config, &silent).unwrap_err();
+    assert_eq!(
+        std::fs::read_link(&cargo).unwrap(),
+        good,
+        "a working link is not replaced by one that could not be checked: {first}"
+    );
+    // Links whose own target could not be asked are not taken away either.
+    for name in ["cargo", "go"] {
+        let link = bin_dir(&config).join(name);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&silent, &link).unwrap();
+    }
+    let second = ensure_links(&config, &silent).unwrap_err();
+    for name in ["cargo", "go"] {
+        assert_eq!(
+            std::fs::read_link(bin_dir(&config).join(name)).ok(),
+            Some(silent.clone()),
+            "{name}: a probe that did not run is not grounds to remove a link: {second}"
+        );
+    }
+    assert!(first.contains("could not be verified"), "{first}");
+    assert!(!second.contains("removed"), "{second}");
+    // Health and routing still say the links are not verified.
+    let problem = links_problem(&bin_dir(&config), None).unwrap();
+    assert!(problem.contains("not verified"), "{problem}");
+}

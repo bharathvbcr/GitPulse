@@ -742,12 +742,15 @@ link's target is run with `--version` and must list `lease` among what it
 serves (`sysload::lease::hook_serves_lease`). A `gitpulse-hook` from before
 leases takes `cargo build` for an unknown hook subcommand and exits 0, so a
 `cargo test` through it would "pass" without running. A target that does not
-answer that way is never linked, and a link already in the folder that does not
-reach a wrapper is removed, so a session whose `PATH` already starts with the
-folder finds the real `cargo` behind it. A link to another install's working
-wrapper is left alone. A probe that could not run (a timeout of 2 s, a spawn
-refused under load) is "not verified", never a pass, and is asked again next
-time; a definite answer is remembered per file (device, inode, size, mtime).
+answer that way is never linked, and a link already in the folder that
+certainly does not reach a wrapper is removed, so a session whose `PATH`
+already starts with the folder finds the real `cargo` behind it. A link to
+another install's working wrapper is left alone. A probe that could not run (a
+timeout of 2 s, a spawn refused or deferred under load) is "not verified":
+never a pass, so nothing is routed through it, and never a verdict, so no link
+is made or removed on it; it is asked again next time. A definite answer is
+remembered per file (device, inode, size, mtime). The app makes the links on a
+thread of their own at launch, so a slow probe never holds startup.
 
 A leased build gets `GITPULSE_LEASE_HELD=<slot>`, `CARGO_SLOT_HELD=gitpulse-lease`
 (so the owner's shim does not queue it a second time), and, unless the caller
